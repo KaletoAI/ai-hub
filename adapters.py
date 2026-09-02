@@ -2059,6 +2059,15 @@ def normalize_delivery(blobs: list, rig: Optional[str],
                            f"'{b.name}' — delivering as produced: {e}")
 
 
+def _delivered_names(blobs: list) -> str:
+    """What actually arrived, for a failure message. "no GLB was delivered" on its
+    own sends you into the backend's ComfyUI history to find out what the node
+    DID produce — measured 2026-09-02: a Trellis2→mesh-mia chain shipped
+    `<name>_mia.fbx`, because MIAAutoRig reports only the FBX while writing a
+    same-stem .glb beside it (what `output_ext` exists for)."""
+    return ", ".join((b.name or "?") for b in blobs) or "nothing"
+
+
 def validate_delivery(blobs: list, rig: Optional[str]) -> list:
     """Gate a case-mode delivery before reporting success (returns warnings; raises
     on hard failure). Per the character-model spec:
@@ -2076,7 +2085,11 @@ def validate_delivery(blobs: list, rig: Optional[str]) -> list:
     if rig == "mixamo":
         glb = next((b for b in blobs if b.mime == "model/gltf-binary"), None)
         if glb is None:
-            raise RuntimeError("humanoid (mixamo) result: no GLB was delivered")
+            hint = (" — a rigger that reports only its FBX usually writes a same-stem "
+                    ".glb beside it: set the alias's deliver file type to 'glb'"
+                    if any((b.name or "").lower().endswith(".fbx") for b in blobs) else "")
+            raise RuntimeError(f"humanoid (mixamo) result: no GLB was delivered "
+                               f"(delivered: {_delivered_names(blobs)}){hint}")
         info = _glb_info(glb.data)
         if info is None:
             raise RuntimeError(f"humanoid result '{glb.name}': not a valid GLB")
@@ -2094,12 +2107,14 @@ def validate_delivery(blobs: list, rig: Optional[str]) -> list:
         fbx = next((b for b in blobs if (b.name or "").lower().endswith(".fbx")), None)
         png = next((b for b in blobs if (b.mime or "").startswith("image/")), None)
         if fbx is None:
-            raise RuntimeError("non-humanoid (generic) result: no rigged FBX was delivered")
+            raise RuntimeError(f"non-humanoid (generic) result: no rigged FBX was delivered "
+                               f"(delivered: {_delivered_names(blobs)})")
         if not (fbx.data[:23].find(b"Kaydara FBX") != -1 or fbx.data[:4] == b"; FB"):
             warnings.append(f"{fbx.name}: does not look like an FBX (magic missing)")
         if png is None:
-            raise RuntimeError("non-humanoid (generic) result: no basecolor PNG — the FBX only "
-                               "references its texture by a temp path, so the PNG must ship with it")
+            raise RuntimeError(f"non-humanoid (generic) result: no basecolor PNG — the FBX only "
+                               f"references its texture by a temp path, so the PNG must ship with it "
+                               f"(delivered: {_delivered_names(blobs)})")
     return warnings
 
 
