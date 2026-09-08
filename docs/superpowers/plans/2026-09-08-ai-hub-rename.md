@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Rename the project `llm-gateway` → **AI-Hub** everywhere that is alive (code, unit, deploy, remotes, prod path, docs), move the tests into `tests/`, archive finished plans, verify the living docs against the code, and prove a README-only installation on the empty container 192.168.8.148 with chat completions over LocalAI and OpenRouter.
+**Goal:** Rename the project `llm-gateway` → **AI-Hub** everywhere that is alive (code, unit, deploy, remotes, prod path, docs), move the tests into `tests/`, archive finished plans, verify the living docs against the code, and prove a README-only installation on the empty container <test-vm> with chat completions over LocalAI and OpenRouter.
 
 **Architecture:** Three phases that must stay separable. Phase 1 is one branch (`ai-hub-rename`) that is fully testable locally. Phase 2 is one maintenance step on the prod box .10 (move dir, swap unit, rename bare repo) plus the GitHub rename. Phase 3 is a clean-room install on .148 following the README literally; every README gap found there is a README fix committed on the spot.
 
@@ -17,7 +17,7 @@
 - Historical documents under `docs/superpowers/` and `docs/archive/` keep the old name verbatim — never rewrite history.
 - No functional change to the gateway in any task. If a task needs one, stop and report.
 - Never commit `config.yaml`, `store.db`, `secret.key`, `stats.db*`, `jobs.db*`, `jobs/`, `voiceref/`, `*.key`. The OpenRouter key lives only in .148's `config.yaml` and is removed after Phase 3.
-- Remotes are **two**: `github` (KaletoAI) and `lxc` (root@192.168.8.10). "Merge" means push to both. The former `origin` (Forgejo .110) was removed on 2026-09-08 and is not to be re-added.
+- Remotes are **two**: `github` (KaletoAI) and `lxc` (root@<prod-host>). "Merge" means push to both. The former `origin` (Forgejo .110) was removed on 2026-09-08 and is not to be re-added.
 - Prod work on .10 only when idle (`curl -s localhost:4000/health` shows no in-flight work); always a backup first; always compile-gate before deploy.
 - Every commit message ends with:
   ```
@@ -390,8 +390,8 @@ git ls-remote github HEAD | head -1        # must answer
 - [ ] **Step 3: Rename the LXC bare repo** (on .10; harmless while the service runs)
 
 ```bash
-ssh root@192.168.8.10 'mv /opt/llm-gateway.git /opt/ai-hub.git && ls -d /opt/ai-hub.git'
-git remote set-url lxc root@192.168.8.10:/opt/ai-hub.git
+ssh root@<prod-host> 'mv /opt/llm-gateway.git /opt/ai-hub.git && ls -d /opt/ai-hub.git'
+git remote set-url lxc root@<prod-host>:/opt/ai-hub.git
 git ls-remote lxc HEAD | head -1
 ```
 
@@ -407,38 +407,38 @@ Expected: exactly two remotes, both `ai-hub`.
 
 ### Task 9: Prod migration on .10 (one maintenance step)
 
-**Preconditions:** .10 idle (`ssh root@192.168.8.10 "curl -s localhost:4000/health" | python3 -c "import sys,json; d=json.load(sys.stdin); print({k:v for k,v in d.items() if 'inflight' in k or 'parked' in k})"` shows nothing in flight); Task 8 done.
+**Preconditions:** .10 idle (`ssh root@<prod-host> "curl -s localhost:4000/health" | python3 -c "import sys,json; d=json.load(sys.stdin); print({k:v for k,v in d.items() if 'inflight' in k or 'parked' in k})"` shows nothing in flight); Task 8 done.
 
 - [ ] **Step 1: Backup**
 
 ```bash
-ssh root@192.168.8.10 'set -e; d=/root/ai-hub-migration-$(date +%Y%m%d-%H%M); mkdir -p $d; cd /opt/llm-gateway; cp -a store.db secret.key config.yaml jobs.db stats.db $d/ 2>/dev/null || true; ls -la $d; curl -s localhost:4000/health | python3 -c "import sys,json;print(\"backends before:\", len(json.load(sys.stdin)[\"backends\"]))"'
+ssh root@<prod-host> 'set -e; d=/root/ai-hub-migration-$(date +%Y%m%d-%H%M); mkdir -p $d; cd /opt/llm-gateway; cp -a store.db secret.key config.yaml jobs.db stats.db $d/ 2>/dev/null || true; ls -la $d; curl -s localhost:4000/health | python3 -c "import sys,json;print(\"backends before:\", len(json.load(sys.stdin)[\"backends\"]))"'
 ```
 Record the backend count (expected 14).
 
 - [ ] **Step 2: Stop, move, drop the venv, keep everything else**
 
 ```bash
-ssh root@192.168.8.10 'set -e; systemctl stop llm-gateway; mv /opt/llm-gateway /opt/ai-hub; rm -rf /opt/ai-hub/venv; ls /opt/ai-hub | head -30'
+ssh root@<prod-host> 'set -e; systemctl stop llm-gateway; mv /opt/llm-gateway /opt/ai-hub; rm -rf /opt/ai-hub/venv; ls /opt/ai-hub | head -30'
 ```
 
 - [ ] **Step 3: Deploy** (recreates the venv, installs the new unit, starts it)
 
 ```bash
-cd /home/dev/projekte/llm-gateway && venv/bin/python -m py_compile *.py && DEPLOY_HOST=root@192.168.8.10 ./deploy.sh 2>&1 | tail -15
+cd /home/dev/projekte/llm-gateway && venv/bin/python -m py_compile *.py && DEPLOY_HOST=root@<prod-host> ./deploy.sh 2>&1 | tail -15
 ```
 Expected: `active` for `ai-hub`.
 
 - [ ] **Step 4: Retire the old unit**
 
 ```bash
-ssh root@192.168.8.10 'systemctl disable llm-gateway 2>/dev/null; rm -f /etc/systemd/system/llm-gateway.service; systemctl daemon-reload; systemctl is-enabled ai-hub; systemctl is-active ai-hub'
+ssh root@<prod-host> 'systemctl disable llm-gateway 2>/dev/null; rm -f /etc/systemd/system/llm-gateway.service; systemctl daemon-reload; systemctl is-enabled ai-hub; systemctl is-active ai-hub'
 ```
 
 - [ ] **Step 5: Prove it**
 
 ```bash
-ssh root@192.168.8.10 'sleep 5; curl -s localhost:4000/health | python3 -c "import sys,json;print(\"backends after:\", len(json.load(sys.stdin)[\"backends\"]))"; journalctl -u ai-hub --since "-3 min" --no-pager | grep -ci "traceback\|error"; journalctl -u ai-hub --since "-3 min" --no-pager | grep -m1 "Starting"'
+ssh root@<prod-host> 'sleep 5; curl -s localhost:4000/health | python3 -c "import sys,json;print(\"backends after:\", len(json.load(sys.stdin)[\"backends\"]))"; journalctl -u ai-hub --since "-3 min" --no-pager | grep -ci "traceback\|error"; journalctl -u ai-hub --since "-3 min" --no-pager | grep -m1 "Starting"'
 ```
 Expected: same backend count as Step 1, `0` errors, `Starting AI-Hub`. Then one real chat call through an alias (key from `/opt/ai-hub/config.yaml`), and `/ui/backends` renders with the `AI-Hub` brand.
 
@@ -466,9 +466,9 @@ cp -a /home/dev/.claude/projects/-home-dev-projekte-llm-gateway /home/dev/.claud
 
 ---
 
-## Phase 3 — Fresh install on 192.168.8.148
+## Phase 3 — Fresh install on <test-vm>
 
-**Precondition:** `ssh root@192.168.8.148 true` works (the user installs the dev key via `pct exec` on the Proxmox host; the plan cannot do this).
+**Precondition:** `ssh root@<test-vm> true` works (the user installs the dev key via `pct exec` on the Proxmox host; the plan cannot do this).
 
 ### Task 11: Install exactly as the README says
 
@@ -479,27 +479,27 @@ cp -a /home/dev/.claude/projects/-home-dev-projekte-llm-gateway /home/dev/.claud
 - [ ] **Step 1: Snapshot the container**
 
 ```bash
-ssh root@192.168.8.148 'grep PRETTY /etc/os-release; python3 --version; which git rsync systemctl pip3; python3 -c "import venv" && echo venv-ok; free -m | sed -n 2p; df -h / | tail -1'
+ssh root@<test-vm> 'grep PRETTY /etc/os-release; python3 --version; which git rsync systemctl pip3; python3 -c "import venv" && echo venv-ok; free -m | sed -n 2p; df -h / | tail -1'
 ```
 Write the output into the protocol under `## Ausgangszustand`.
 
 - [ ] **Step 2: Follow README "Quick start" literally.** Run each README line via ssh, in order, from a fresh shell. The first line that fails or presupposes something (`git` missing, `python3-venv` missing, `pip` missing) is a README gap: fix the README **now** (add the prerequisite line `apt install -y git python3 python3-venv` under Quick start with a sentence that says which Debian it was verified on), commit, and continue.
 
 ```bash
-ssh root@192.168.8.148 'git clone https://github.com/KaletoAI/ai-hub.git && cd ai-hub && python3 -m venv venv && venv/bin/pip install -r requirements.txt 2>&1 | tail -3'
+ssh root@<test-vm> 'git clone https://github.com/KaletoAI/ai-hub.git && cd ai-hub && python3 -m venv venv && venv/bin/pip install -r requirements.txt 2>&1 | tail -3'
 ```
 
-- [ ] **Step 3: Configure.** Read the OpenRouter key from the prod box (`ssh root@192.168.8.10 "grep -n -i openrouter -A6 /opt/ai-hub/config.yaml"`; if backends live in the store, `venv/bin/python -c "import store; ..."` to read the `openrouter` backend's key — decrypting is what `store` does). Write `/root/ai-hub/config.yaml` on .148 from `config.example.yaml` with:
+- [ ] **Step 3: Configure.** Read the OpenRouter key from the prod box (`ssh root@<prod-host> "grep -n -i openrouter -A6 /opt/ai-hub/config.yaml"`; if backends live in the store, `venv/bin/python -c "import store; ..."` to read the `openrouter` backend's key — decrypting is what `store` does). Write `/root/ai-hub/config.yaml` on .148 from `config.example.yaml` with:
 
 ```yaml
 api_key: "sk-test-aihub"
 backends:
   - name: localai-strix
-    url: http://192.168.8.38:8080/v1
+    url: http://<localai-1>:8080/v1
     type: openai
     local: true
   - name: localai-phoenix
-    url: http://192.168.8.39:8080/v1
+    url: http://<localai-2>:8080/v1
     type: openai
     local: true
   - name: openrouter
@@ -518,7 +518,7 @@ Every key name above must be checked against `config.example.yaml` — if the RE
 - [ ] **Step 4: Start**
 
 ```bash
-ssh root@192.168.8.148 'cd ai-hub && nohup venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000 > /root/aihub.log 2>&1 & sleep 6; tail -5 /root/aihub.log'
+ssh root@<test-vm> 'cd ai-hub && nohup venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000 > /root/aihub.log 2>&1 & sleep 6; tail -5 /root/aihub.log'
 ```
 
 ---
@@ -528,7 +528,7 @@ ssh root@192.168.8.148 'cd ai-hub && nohup venv/bin/uvicorn main:app --host 0.0.
 - [ ] **Step 1: Health and models**
 
 ```bash
-B=http://192.168.8.148:4000; K=sk-test-aihub
+B=http://<test-vm>:4000; K=sk-test-aihub
 curl -s $B/health | python3 -c "import sys,json; d=json.load(sys.stdin); print([(b['name'], b.get('healthy')) for b in d['backends']])"
 curl -s $B/v1/models -H "Authorization: Bearer $K" | python3 -c "import sys,json; ids=[m['id'] for m in json.load(sys.stdin)['data']]; print(len(ids), [i for i in ids if 'chat-test' in i or 'openrouter' in i][:5])"
 ```
@@ -542,7 +542,7 @@ for M in "localai-strix/<model>" "openrouter/openai/gpt-4o-mini" "chat-test"; do
    -d "{\"model\":\"$M\",\"messages\":[{\"role\":\"user\",\"content\":\"Antworte mit einem Wort: Hauptstadt von Frankreich?\"}],\"stream\":$S,\"max_tokens\":20}" | grep -i "x-gateway-backend\|\"content\"\|data: \[DONE\]" | head -4; done; done
 ```
 
-- [ ] **Step 3: Failover.** Edit `.148`'s `config.yaml`: point `localai-strix` and `localai-phoenix` URLs at `http://192.168.8.250:9/v1` (dead), save (hot reload), wait one `health_check_interval`, repeat the `chat-test` call: `x-gateway-backend` must say `openrouter`. Restore the URLs afterwards and confirm the header goes back to a LocalAI backend.
+- [ ] **Step 3: Failover.** Edit `.148`'s `config.yaml`: point `localai-strix` and `localai-phoenix` URLs at `http://192.168.1.250:9/v1` (dead), save (hot reload), wait one `health_check_interval`, repeat the `chat-test` call: `x-gateway-backend` must say `openrouter`. Restore the URLs afterwards and confirm the header goes back to a LocalAI backend.
 
 - [ ] **Step 4: Console.** `curl -s -o /dev/null -w "%{http_code}\n" $B/ui` → 200 (bootstrap: sign in with the api_key). Log in with the key, open `/ui/backends` and `/ui?tab=statistic` (find the exact paths in `admin.TABS`) and confirm the three backends and the calls from Step 2 appear. Use the CDP harness from memory `project_ui_verification_cdp` if a rendered check is needed; otherwise curl with the session cookie.
 
@@ -555,15 +555,15 @@ for M in "localai-strix/<model>" "openrouter/openai/gpt-4o-mini" "chat-test"; do
 - [ ] **Step 1: Stop the nohup instance on .148**, then deploy from the dev checkout:
 
 ```bash
-ssh root@192.168.8.148 'pkill -f "uvicorn main:app" || true; rm -rf /root/ai-hub'
-cd /home/dev/projekte/ai-hub && DEPLOY_HOST=root@192.168.8.148 ./deploy.sh 2>&1 | tail -12
+ssh root@<test-vm> 'pkill -f "uvicorn main:app" || true; rm -rf /root/ai-hub'
+cd /home/dev/projekte/ai-hub && DEPLOY_HOST=root@<test-vm> ./deploy.sh 2>&1 | tail -12
 ```
 Expected: venv created, `ai-hub.service` installed, `active`. (`config.yaml` is excluded by deploy.sh — copy the test config to `/opt/ai-hub/config.yaml` first or the service starts bootstrap-open; that is itself a README point: say so under "Running & deploying" if it is not said.)
 
 - [ ] **Step 2: Prove via systemd**
 
 ```bash
-ssh root@192.168.8.148 'systemctl is-active ai-hub; journalctl -u ai-hub --since "-2 min" --no-pager | grep -m1 "Starting"; curl -s localhost:4000/health | head -c 120'
+ssh root@<test-vm> 'systemctl is-active ai-hub; journalctl -u ai-hub --since "-2 min" --no-pager | grep -m1 "Starting"; curl -s localhost:4000/health | head -c 120'
 ```
 
 - [ ] **Step 3: Clean the key.** Remove the OpenRouter key from `/opt/ai-hub/config.yaml` on .148 (replace with `"REMOVED"`) and note in the protocol that the container keeps a keyless install.
@@ -581,6 +581,6 @@ git commit -m "docs: fresh-install test on a clean Debian container — protocol
 git push github master && git push lxc master
 ```
 
-- [ ] **Step 2: Deploy the doc changes to prod** (docs only; harmless): `DEPLOY_HOST=root@192.168.8.10 ./deploy.sh` when idle — or skip if only docs changed and say so.
+- [ ] **Step 2: Deploy the doc changes to prod** (docs only; harmless): `DEPLOY_HOST=root@<prod-host> ./deploy.sh` when idle — or skip if only docs changed and say so.
 
 - [ ] **Step 3: Report** — what was renamed, what the install test found (each gap + fix), the two remotes, the new prod path, and the one manual step left for the user (restart the Claude session in `~/projekte/ai-hub`).

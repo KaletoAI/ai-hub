@@ -62,7 +62,7 @@ und kollidiert in der Kette (siehe `main.py`, Kommentar zu `s2_params`).
 | `input_image_back` | `95` | `image` | — | ja |
 | `input_image_left` | `96` | `image` | — | ja |
 | `input_image_right` | `97` | `image` | — | ja |
-| `input_name` | `89` | `value` | `'kira'` | ja |
+| `input_name` | `89` | `value` | `'sample'` | ja |
 | `input_face_num` | `90` | `value` | `50000` | ja |
 | `input_steps` | `91` | `value` | `35` | ja |
 | `input_remove_background` | `92` | `value` | `True` | ja |

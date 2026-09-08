@@ -4,7 +4,7 @@ Datum: 2026-07-30 · Status: freigegeben (Kai)
 
 ## Anlass
 
-Am 30.07.2026 ab 06:27 fiel auf `k12-gpu` (192.168.8.37, RTX 3090 Passthrough) die
+Am 30.07.2026 ab 06:27 fiel auf `k12-gpu` (192.168.1.37, RTX 3090 Passthrough) die
 GPU vom PCIe-Bus (`NV_ERR_GPU_IS_LOST`); der ComfyUI-`prompt_worker` starb mit
 `CUDA error: unspecified launch failure`. Der HTTP-Server von ComfyUI antwortete
 weiter mit 200, `discover()` (nur `/object_info`) hielt das Backend daher für

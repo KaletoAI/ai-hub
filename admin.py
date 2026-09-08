@@ -6144,7 +6144,7 @@ def _reasoning_testbox(rules: list, qp) -> str:
             "Takes an <b>alias or a real model id</b>; aliases resolve to the backend's model first, "
             "exactly like the API.</p>"
             "<form method='get' action='/ui/reasoning' style='display:flex;gap:8px;align-items:center;flex-wrap:wrap'>"
-            f"{_inp('test_model', tm, placeholder='alias or model id, e.g. tool / qwen3.5-9b-heretic')}"
+            f"{_inp('test_model', tm, placeholder='alias or model id, e.g. tool / qwen3.5-9b')}"
             f"<select name='test_backend'><option value=''>backend…</option>{bopts}</select>"
             f"{_btn('Resolve', submit=True, kind='secondary')}</form>{res}")
 

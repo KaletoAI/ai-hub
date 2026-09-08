@@ -173,7 +173,7 @@
   },
   "119": {
     "inputs": {
-      "unet_name": "Qwen-Edit-NSFW-v16-fp8.safetensors",
+      "unet_name": "Qwen-Image-Edit-2509-fp8.safetensors",
       "weight_dtype": "default"
     },
     "class_type": "UNETLoader",
@@ -183,7 +183,7 @@
   },
   "120": {
     "inputs": {
-      "gguf_name": "Qwen-Edit-NSFW-v23_Q5_K.gguf"
+      "gguf_name": "Qwen-Image-Edit-2509-Q5_K.gguf"
     },
     "class_type": "LoaderGGUF",
     "_meta": {
@@ -192,7 +192,7 @@
   },
   "121": {
     "inputs": {
-      "clip_name": "Qwen2.5-VL-7B-Instruct-abliterated_merged.safetensors",
+      "clip_name": "Qwen2.5-VL-7B-Instruct.safetensors",
       "type": "qwen_image",
       "device": "default"
     },

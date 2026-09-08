@@ -11,7 +11,7 @@
   },
   "2": {
     "inputs": {
-      "clip_name": "qwen3-VL-4B-Abliterated.safetensors",
+      "clip_name": "qwen3-VL-4B-Instruct.safetensors",
       "type": "krea2",
       "device": "default"
     },
@@ -82,7 +82,7 @@
   },
   "17": {
     "inputs": {
-      "image": "Kira_1771187718.png"
+      "image": "source.png"
     },
     "class_type": "LoadImage",
     "_meta": {
@@ -208,7 +208,7 @@
   },
   "29": {
     "inputs": {
-      "value": "a candid full-body photo with natural light and high detail of a single woman Kira standing, Kira is 26 years young female, short athletic frame, light skin, large breasts, round perfect breasts, small butt, blonde medium hair, blue eyes, Kira is naked, standing with one hand on hip, weight shifted to one leg, shoulder slightly raised, chin up, bright focused eyes, slight knowing smile, head tilted, inspired engaged expression"
+      "value": "a candid full-body photo with natural light and high detail of a single person standing in a park, casual outdoor clothing, one hand on hip, weight shifted to one leg, relaxed posture, slight smile, sharp focus, realistic skin texture"
     },
     "class_type": "PrimitiveStringMultiline",
     "_meta": {
@@ -226,7 +226,7 @@
   },
   "31": {
     "inputs": {
-      "image": "Kira_1771187718.png"
+      "image": "source.png"
     },
     "class_type": "LoadImage",
     "_meta": {
@@ -235,7 +235,7 @@
   },
   "32": {
     "inputs": {
-      "image": "Kira_1771187718.png"
+      "image": "source.png"
     },
     "class_type": "LoadImage",
     "_meta": {
@@ -253,7 +253,7 @@
   },
   "34": {
     "inputs": {
-      "lora_01": "krea2-KNPV3_1.safetensors",
+      "lora_01": "None",
       "strength_01": 1,
       "lora_02": "None",
       "strength_02": 1,

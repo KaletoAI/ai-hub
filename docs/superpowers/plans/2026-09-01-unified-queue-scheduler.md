@@ -542,7 +542,7 @@ def _entry_can_use(entry: dict, backend: dict) -> bool:
   races around the no-await claim invariant, removed-symbol leftovers, UI strings).
 - [ ] Fix findings, `venv/bin/python -m py_compile *.py`, `venv/bin/python
   test_scheduler.py`, `venv/bin/python test_prune_branch.py`.
-- [ ] Deploy `DEPLOY_HOST=root@192.168.8.10 ./deploy.sh`; verify `/health` (backends
+- [ ] Deploy `DEPLOY_HOST=root@<prod-host> ./deploy.sh`; verify `/health` (backends
   show `paid`, no `priority`), journal clean, one real generation through the queue.
 - [ ] Post-deploy: set `paid: true` on claude/openrouter/together in the prod config
   (UI or config.yaml — hot-reloaded), set `affinity_max_wait_s` if 120 is not wanted.

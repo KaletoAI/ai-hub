@@ -1,7 +1,7 @@
 # AI-Hub: Umbenennung, Repo-Struktur, Doku-Review, Frischinstallation — Design
 
 Stand 2026-09-08. Beschlossen im Gespräch (Rename-Tiefe „vollständig“, Module bleiben
-flach, Tests nach `tests/`, Archiv statt Löschen, Test-VM 192.168.8.148, lokale KI =
+flach, Tests nach `tests/`, Archiv statt Löschen, Test-VM <test-vm>, lokale KI =
 LocalAI .38/.39, OpenRouter-Key aus der Prod-Config).
 
 ## Ziel
@@ -85,7 +85,7 @@ Reihenfolge, jeweils mit Prüfung:
 3. `mv /opt/llm-gateway /opt/ai-hub`; `rm -rf /opt/ai-hub/venv` (Shebangs tragen den
    alten absoluten Pfad).
 4. Bare-Repo: `mv /opt/llm-gateway.git /opt/ai-hub.git`.
-5. Deploy vom Branch: `DEPLOY_HOST=root@192.168.8.10 ./deploy.sh` — legt venv neu an,
+5. Deploy vom Branch: `DEPLOY_HOST=root@<prod-host> ./deploy.sh` — legt venv neu an,
    synct `ai-hub.service`, `systemctl enable --now ai-hub`.
 6. `systemctl disable llm-gateway`; alte Unit-Datei entfernen.
 7. Nachweis: `/health` 200 mit derselben Backend-Zahl wie vorher (14), Journal ohne
@@ -107,7 +107,7 @@ Verzeichnis `~/.claude/projects/-home-dev-projekte-llm-gateway` wird nach
 `-home-dev-projekte-ai-hub` kopiert (nicht verschoben, bis die neue Session es liest);
 Memory-Einträge mit Pfaden (`/opt/llm-gateway`, Dev-Pfad) werden aktualisiert.
 
-### Phase 3 — Frischinstallation auf 192.168.8.148
+### Phase 3 — Frischinstallation auf <test-vm>
 
 Als neuer Nutzer, exakt nach README (jede Abweichung = README-Fehler, der zurückfließt):
 
@@ -116,8 +116,8 @@ Als neuer Nutzer, exakt nach README (jede Abweichung = README-Fehler, der zurüc
 1. Voraussetzungen laut README installieren (python3, venv, git; was fehlt, steht dann
    in der README).
 2. `git clone` von GitHub (`KaletoAI/ai-hub`), venv, `pip install -r requirements.txt`.
-3. `config.yaml` aus `config.example.yaml`: Backends `localai-strix` (192.168.8.38),
-   `localai-phoenix` (192.168.8.39), `openrouter` (Key aus der Prod-Config auf .10, nur
+3. `config.yaml` aus `config.example.yaml`: Backends `localai-strix` (<localai-1>),
+   `localai-phoenix` (<localai-2>), `openrouter` (Key aus der Prod-Config auf .10, nur
    in die VM-Config kopiert, nie ins Repo), ein Alias über beide Wege, `api_key` gesetzt.
 4. Start per `uvicorn main:app`, dann Nachweise:
    - `GET /health` 200, alle drei Backends healthy;
@@ -127,7 +127,7 @@ Als neuer Nutzer, exakt nach README (jede Abweichung = README-Fehler, der zurüc
    - Failover: Alias mit LocalAI zuerst, LocalAI-Backend im Config auf eine tote URL →
      Antwort kommt von OpenRouter, `x-gateway-backend` belegt es;
    - `/ui`: Login, Backends-Tab, Statistic-Tab zeigt die Calls.
-5. Zweiter Weg: `deploy.sh` gegen .148 (`DEPLOY_HOST=root@192.168.8.148`) — Unit,
+5. Zweiter Weg: `deploy.sh` gegen .148 (`DEPLOY_HOST=root@<test-vm>`) — Unit,
    venv, Restart, `/health` über systemd.
 6. Ergebnisprotokoll in `docs/install-test-2026-09.md` (Kommandos, Antworten gekürzt,
    gefundene README-Lücken + ihre Fixes).

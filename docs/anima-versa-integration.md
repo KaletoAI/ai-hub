@@ -19,7 +19,7 @@ gen-alias statt Modellname).
 
 | | |
 |---|---|
-| Base-URL (prod) | `http://192.168.8.10:4000` |
+| Base-URL (prod) | `http://<ai-hub-host>:4000` |
 | Auth | HTTP-Header `Authorization: Bearer <API_KEY>` — **auf jedem** Request (auch beim Abholen von Result-URLs) |
 | `model` | Der **Generierungs-Alias** des Gateways, **nicht** ein ComfyUI-Checkpoint. Aktuell verfügbar: `Qwen`. Die Liste der erlaubten Aliase hängt am API-Key (User-Allow-List). |
 
@@ -93,7 +93,7 @@ kein zweiter, auth-pflichtiger Abruf nötig — siehe §5).
   "data": [
     { "mime": "image/png", "b64_json": "<base64-PNG>" }   // bei response_format "b64_json"
     // ODER bei "url":
-    // { "mime": "image/png", "url": "http://192.168.8.10:4000/v1/jobs/<id>/result/0" }
+    // { "mime": "image/png", "url": "http://<ai-hub-host>:4000/v1/jobs/<id>/result/0" }
   ]
 }
 ```
@@ -101,7 +101,7 @@ kein zweiter, auth-pflichtiger Abruf nötig — siehe §5).
 ### curl
 
 ```bash
-curl -s -m 240 http://192.168.8.10:4000/v1/images/generations \
+curl -s -m 240 http://<ai-hub-host>:4000/v1/images/generations \
   -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
   -d '{"model":"Qwen","prompt":"a red apple on a table","size":"512x512","n":1,"response_format":"b64_json"}'
 ```
@@ -139,7 +139,7 @@ Inpaint also: Referenzbild als erstes `image`, Maske als `mask` (oder zweites `i
 ### curl
 
 ```bash
-curl -s -m 240 http://192.168.8.10:4000/v1/images/edits \
+curl -s -m 240 http://<ai-hub-host>:4000/v1/images/edits \
   -H "Authorization: Bearer $KEY" \
   -F model=Qwen -F prompt="make it watercolor" -F response_format=b64_json \
   -F image=@ref1.png -F image=@ref2.png \
@@ -198,7 +198,7 @@ auf Gateway-Seite, nicht in anima-versa hartzucodieren. Ein anima-versa-UI-Feld
 
 - **`b64_json` (empfohlen):** Bild ist base64-kodiert direkt im Response-JSON. Ein
   Request, kein Folge-Abruf. Robust.
-- **`url`:** Liefert `http://192.168.8.10:4000/v1/jobs/<id>/result/<n>`. Diese URL ist
+- **`url`:** Liefert `http://<ai-hub-host>:4000/v1/jobs/<id>/result/<n>`. Diese URL ist
   **NICHT öffentlich** — der Abruf verlangt denselben `Authorization: Bearer`-Header
   (Job-Owner-Check). Wenn anima-versa `url` nutzt, muss der Image-Downloader den
   API-Key mitschicken. Anders als bei LocalAI (offene URLs). Im Zweifel `b64_json`.
@@ -297,7 +297,7 @@ Flow gewünscht ist. Für die Standard-Anbindung reichen §2/§3.
 
 ```bash
 KEY=<gateway-api-key>
-BASE=http://192.168.8.10:4000
+BASE=http://<ai-hub-host>:4000
 
 # 1) Text2Img, inline b64 — erwartet HTTP 200, data[0].b64_json gesetzt
 curl -s -m 240 "$BASE/v1/images/generations" \

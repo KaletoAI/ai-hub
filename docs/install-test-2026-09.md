@@ -7,7 +7,7 @@ Spec: `superpowers/specs/2026-09-08-ai-hub-rename-design.md`, Phase 3.
 
 ## Ausgangszustand
 
-Proxmox-LXC `192.168.8.148`, frisch angelegt, nie benutzt:
+Proxmox-LXC `<test-vm>`, frisch angelegt, nie benutzt:
 
 ```
 PRETTY_NAME="Debian GNU/Linux 13 (trixie)"
@@ -20,7 +20,7 @@ Mem: 512 MB total, 350 MB free
 
 Lokale KI: die LocalAI-Backends .38/.39 aus der Spec sind seit dem Morgen DOWN (LocalAI wird
 laut Betriebsnotizen durch llama-swap abgelöst); der Test nutzt stattdessen
-`llamaswap-strix` (`http://192.168.8.31:8080`) und `llamaswap-phoenix` (`http://192.168.8.32:8080`).
+`llamaswap-strix` (`http://<llama-swap-1>:8080`) und `llamaswap-phoenix` (`http://<llama-swap-2>:8080`).
 OpenRouter-Key: aus dem Prod-Store auf .10 gelesen und **nur** in die `config.yaml` der
 Test-VM geschrieben (nach dem Test entfernt, siehe unten).
 
@@ -124,7 +124,7 @@ GET /ui/jobs?sub=llm → 1 Zeile chat-test      (stats.db 24 KB angelegt)
 ### Schritt 6 — zweiter Weg: `deploy.sh` gegen die VM
 
 ```
-DEPLOY_HOST=root@192.168.8.148 ./deploy.sh
+DEPLOY_HOST=root@<test-vm> ./deploy.sh
 rsync error: error in rsync protocol data stream (code 12) at io.c(232) [sender=3.2.7]   → exit 12
 ```
 
@@ -133,7 +133,7 @@ rsync error: error in rsync protocol data stream (code 12) at io.c(232) [sender=
 Mit korrigiertem `deploy.sh` (`e8360d7`):
 
 ```
-==> rsync missing locally or on root@192.168.8.148 — falling back to tar-over-ssh (no --delete)
+==> rsync missing locally or on root@<test-vm> — falling back to tar-over-ssh (no --delete)
     synced (stale remote files are NOT removed without rsync)
 ==> Ensuring venv + installing requirements + syncing systemd unit
 ==> Restarting ai-hub → active

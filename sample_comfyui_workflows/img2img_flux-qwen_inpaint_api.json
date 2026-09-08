@@ -146,7 +146,7 @@
   },
   "119": {
     "inputs": {
-      "unet_name": "Qwen-Edit-NSFW-v16-fp8.safetensors",
+      "unet_name": "Qwen-Image-Edit-2509-fp8.safetensors",
       "weight_dtype": "default"
     },
     "class_type": "UNETLoader",

@@ -359,7 +359,7 @@
   },
   "89": {
     "inputs": {
-      "value": "kira"
+      "value": "sample"
     },
     "class_type": "PrimitiveString",
     "_meta": {

@@ -51,7 +51,7 @@ alles Backend-Config, im `json`-Blob).
 
 **Ableitung (keine Migration):** der Host wird bei jedem `rebuild_backends()`
 frisch berechnet — explizites Feld `host`, sonst `urlparse(url).hostname`
-(z. B. `192.168.8.37`), sonst der Backend-Name als Fallback (`main.backend_host`).
+(z. B. `192.168.1.37`), sonst der Backend-Name als Fallback (`main.backend_host`).
 Gleiche IP = gleicher Host, ohne dass jemand klicken muss; damit sind k12-gpu
 (openai+comfyui) und die evo-Paare sofort korrekt gruppiert. Nichts davon wird
 gespeichert, sodass eine geänderte URL sofort regruppiert. In den Store kommt ein

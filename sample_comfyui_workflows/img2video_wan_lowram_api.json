@@ -235,7 +235,7 @@
   },
   "148": {
     "inputs": {
-      "clip_name": "wan_nsfw_umt5-xxl_fp8_scaled.safetensors",
+      "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
       "type": "wan",
       "device": "default"
     },
