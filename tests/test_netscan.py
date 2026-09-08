@@ -277,5 +277,68 @@ class MainState(unittest.TestCase):
             main.scan_cidrs, main.scan_ports = saved
 
 
+class Console(unittest.TestCase):
+    def _f(self, **kw):
+        f = {"host": "192.168.8.36", "port": 8080, "url": "http://192.168.8.36:8080",
+             "type": "openai", "flavor": "llama-swap", "models": 6, "needs_key": False,
+             "known_as": None, "hostname": "gx10-40f5"}
+        f.update(kw)
+        return f
+
+    def test_running_panel_shows_progress(self):
+        html = admin._scan_panel({"running": True, "findings": [], "cidrs": ["192.168.8.0/24"],
+                                  "ports": [8080], "hosts_total": 254, "hosts_done": 17,
+                                  "truncated": False, "error": None, "no_range": False})
+        self.assertIn("17 / 254", html)
+        self.assertIn('data-sk="scan"', html)
+
+    def test_add_link_carries_the_prefill(self):
+        link = admin._scan_add_link(self._f())
+        self.assertIn("/ui/backends?new=1&amp;", link)
+        self.assertIn("url=http%3A%2F%2F192.168.8.36%3A8080", link)
+        self.assertIn("type=openai", link)
+        self.assertIn("name=gx10-40f5", link)
+
+    def test_name_suggestion_without_hostname(self):
+        link = admin._scan_add_link(self._f(hostname=None))
+        self.assertIn("name=192-168-8-36-8080", link)
+
+    def test_done_panel_offers_add_or_names_the_registered_backend(self):
+        st = {"running": False, "cidrs": ["192.168.8.0/24"], "ports": [8080], "hosts_total": 254,
+              "hosts_done": 254, "truncated": False, "error": None, "no_range": False,
+              "findings": [self._f(), self._f(host="192.168.8.35", url="http://192.168.8.35:8080",
+                                             known_as="dx10-01", hostname=None)]}
+        html = admin._scan_panel(st)
+        self.assertEqual(html.count("/ui/backends?new=1&amp;"), 1)      # one Add, one registered
+        self.assertIn("registered as", html)
+        self.assertIn("dx10-01", html)
+        self.assertIn("llama-swap", html)
+        self.assertIn("6 models", html)
+
+    def test_panel_names_truncation_no_range_and_error(self):
+        base = {"running": False, "cidrs": [], "ports": [], "hosts_total": 0, "hosts_done": 0,
+                "findings": [], "truncated": False, "error": None, "no_range": True}
+        self.assertIn("scan_cidrs", admin._scan_panel(base))
+        self.assertIn("1024", admin._scan_panel({**base, "no_range": False, "truncated": True}))
+        self.assertIn("boom", admin._scan_panel({**base, "no_range": False, "error": "boom"}))
+
+    def test_needs_key_is_said(self):
+        st = {"running": False, "cidrs": ["x"], "ports": [1], "hosts_total": 1, "hosts_done": 1,
+              "truncated": False, "error": None, "no_range": False,
+              "findings": [self._f(models=None, needs_key=True)]}
+        self.assertIn("needs api key", admin._scan_panel(st))
+
+    def test_form_prefill(self):
+        html = admin._backend_form(None, [], prefill={"name": "gx10-40f5", "type": "comfyui",
+                                                      "url": "http://192.168.8.36:8188"})
+        self.assertIn('name="name" value="gx10-40f5"', html)
+        self.assertIn('value="http://192.168.8.36:8188"', html)
+        self.assertIn('<option value="comfyui" selected>', html)
+
+    def test_form_prefill_ticks_local_for_openai(self):
+        html = admin._backend_form(None, [], prefill={"name": "n", "type": "openai", "url": "http://h:8080"})
+        self.assertIn('name="local" value="1" checked', html)
+
+
 if __name__ == "__main__":
     unittest.main()

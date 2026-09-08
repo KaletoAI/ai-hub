@@ -1129,9 +1129,14 @@ def _image_fields(wf: dict) -> list:
 
 # ── Tab: Backends ───────────────────────────────────────────────────────────────
 
-def _backend_form(b: Optional[dict], hosts: list) -> str:
-    g = lambda k, d="": str((b or {}).get(k) if (b or {}).get(k) is not None else d)
-    gb = lambda k: bool((b or {}).get(k))
+def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None) -> str:
+    # A scan finding arrives as `prefill` (name/type/url; `local` ticked for an openai
+    # find — a LAN server is local by definition, the operator may untick). It reads
+    # like a stored backend for rendering, but the title stays "Add Backend" and no
+    # `orig` hidden field is emitted, so Save creates instead of renaming.
+    src = b or ({**prefill, "local": prefill.get("type", "openai") == "openai"} if prefill else {})
+    g = lambda k, d="": str(src.get(k) if src.get(k) is not None else d)
+    gb = lambda k: bool(src.get(k))
     title = "Edit Backend" if b else "Add Backend"
     orig = f'<input type="hidden" name="orig" value="{_esc(_bid(b))}">' if b else ""
     hlist = "".join(f'<option value="{_esc(h)}">' for h in hosts)
@@ -1451,14 +1456,20 @@ async def backends_page(request: Request):
         if group:
             items += f'<div class="grouphdr">{label}</div>' + "".join(render(b) for b in group)
     items = items or "<p class='muted'>No backends.</p>"
-    list_html = (f'<div class="bar"><h2>Backends</h2>{_btn("+ New", "/ui/backends?new=1")}</div>'
+    scan_st = _scan_status()
+    list_html = (f'<div class="bar"><h2>Backends</h2>{_btn("+ New", "/ui/backends?new=1")}'
+                 f'<form action="/ui/backends/scan" method="post" style="display:inline">'
+                 f'{_btn("Scan network", kind="secondary", submit=True)}</form></div>'
                  f"<p class='hint'>Edit a backend to manage it here (editing a config one creates an "
                  f"editable copy that overrides it).</p>{items}"
-                 + _hosts_panel(binfo, qp.get("host", "")))
+                 + _hosts_panel(binfo, qp.get("host", ""))
+                 + _scan_panel(scan_st))
     hosts = sorted({b["host"] for b in binfo if b.get("host")})
     edit_host = qp.get("host", "")
     if editing or qp.get("new"):
-        detail = _backend_form(editing, hosts)
+        prefill = ({"name": qp.get("name", ""), "type": qp.get("type", "openai"), "url": qp.get("url", "")}
+                   if (not editing and qp.get("url")) else None)
+        detail = _backend_form(editing, hosts, prefill=prefill)
     elif edit_host:
         detail = _host_form(edit_host, shared=_host_is_shared([b for b in binfo if b.get("host") == edit_host]))
     else:
@@ -1467,7 +1478,67 @@ async def backends_page(request: Request):
     body = (f'<div class="cols"><div class="col">{list_html}</div>'
             f'<div class="col">{detail}</div></div>')
     draining_now = any(b.get("draining") for b in binfo)      # watch the count drain → offline
-    return HTMLResponse(_page("Backends", body, "backends", refresh=4 if draining_now else None))
+    return HTMLResponse(_page("Backends", body, "backends",
+                              refresh=4 if draining_now else (2 if scan_st.get("running") else None)))
+
+
+def _scan_add_link(f: dict) -> str:
+    """The Add link of one finding: the existing new-backend form, pre-filled. Name
+    suggestion = short hostname, else host-port (unique per type is what Save checks)."""
+    host = (f.get("hostname") or "").split(".")[0]
+    name = host or f"{str(f['host']).replace('.', '-')}-{f['port']}"
+    q = urlencode({"new": "1", "url": f["url"], "type": f["type"], "name": name})
+    return f'<a class="btn" href="/ui/backends?{_esc(q)}">Add</a>'
+
+
+def _scan_panel(st: dict) -> str:
+    """Scan network: progress while it runs, one row per finding when done. Keyed
+    `data-sk="scan"` so the live morph treats it as one logical table."""
+    head = '<div class="grouphdr">Scan network</div>'
+    cidrs = ", ".join(st.get("cidrs") or []) or "—"
+    ports = ", ".join(str(p) for p in (st.get("ports") or [])) or "—"
+    if st.get("running"):
+        return (f'<div data-sk="scan">{head}<p class="hint">Scanning {_esc(cidrs)} on ports '
+                f'{_esc(ports)} … <b>{st.get("hosts_done", 0)} / {st.get("hosts_total", 0)}</b> hosts</p></div>')
+    notes = ""
+    if st.get("no_range"):
+        notes += ("<p class='bad'>No address range: this host reports no IPv4 subnet (no <code>ip</code> "
+                  "command?) and <b>scan_cidrs</b> in the <a href='/ui/server'>Server tab</a> is blank.</p>")
+    if st.get("error"):
+        notes += f"<p class='bad'>Scan failed: {_esc(st['error'])}</p>"
+    if st.get("truncated"):
+        notes += ("<p class='bad'>Range cut at 1024 hosts — narrow <b>scan_cidrs</b> "
+                  "(<a href='/ui/server'>Server tab</a>) to scan the rest.</p>")
+    rows = ""
+    for f in st.get("findings") or []:
+        who = _esc(f.get("hostname") or f["host"])
+        ip = f" <span class='muted'>{_esc(f['host'])}</span>" if f.get("hostname") else ""
+        if f.get("needs_key"):
+            detail = "needs api key"
+        elif f.get("models") is not None:
+            detail = f"{f['models']} models"
+        else:
+            detail = ""
+        act = (f"<span class='muted'>registered as <b>{_esc(f['known_as'])}</b></span>"
+               if f.get("known_as") else _scan_add_link(f))
+        rows += (f"<tr><td>{who}{ip}</td><td>{f['port']}</td>"
+                 f"<td>{_type_badge(f['type'])} {_esc(f['flavor'])}</td>"
+                 f"<td>{_esc(detail)}</td><td>{act}</td></tr>")
+    if st.get("hosts_total") and not rows and not st.get("error"):
+        rows = "<tr><td colspan='5' class='muted'>nothing found</td></tr>"
+    table = (f"<table><tr><th>host</th><th>port</th><th>type</th><th></th><th></th></tr>{rows}</table>"
+             if rows else "")
+    done = (f"<p class='hint'>Last scan: {_esc(cidrs)} on ports {_esc(ports)}, "
+            f"{st.get('hosts_total', 0)} hosts.</p>" if st.get("hosts_total") else
+            "<p class='hint'>Finds llama-swap / llama.cpp / vLLM / Ollama / ComfyUI servers on this "
+            "host's subnet and offers each as a pre-filled backend form. Nothing is added by itself.</p>")
+    return f'<div data-sk="scan">{head}{done}{notes}{table}</div>'
+
+
+async def backend_scan(request: Request):
+    """Backends tab → Scan network: start one scan (no-op while one runs), back to the tab."""
+    _scan_start()
+    return RedirectResponse("/ui/backends", status_code=303)
 
 
 def _hosts_panel(binfo: list, sel_host: str) -> str:
@@ -6727,6 +6798,7 @@ def register(app) -> None:
     app.add_api_route("/ui/logout", logout, methods=["GET"])
     app.add_api_route("/ui/backends", backends_page, methods=["GET"])
     app.add_api_route("/ui/backends/save", backend_save, methods=["POST"])
+    app.add_api_route("/ui/backends/scan", backend_scan, methods=["POST"])
     app.add_api_route("/ui/backends/host-save", host_save, methods=["POST"])
     app.add_api_route("/ui/backends/delete", backend_del, methods=["GET"])
     app.add_api_route("/ui/backends/drain", backend_drain, methods=["GET"])
