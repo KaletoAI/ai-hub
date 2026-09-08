@@ -20,16 +20,25 @@ Alle Aufrufe mit `Authorization: Bearer <key>`.
 | Abbrechen | `POST /v1/jobs/{job_id}/cancel` |
 
 Mesh-Jobs laufen minutenlang — **`mode: "async"` verwenden** und `GET /v1/jobs/{id}`
-pollen (`elapsed_s`/`progress` sind enthalten). Ist das Backend belegt, wird der Job
-**geparkt** statt abgelehnt (Status bleibt `queued`); erst nach Ablauf der Park-Zeit
-kommt `503` mit `Retry-After`.
+pollen (`elapsed_s` ist bei `queued`/`running` immer dabei; `progress`, `eta_s` und
+`progress_step` nur, wenn das Backend Live-Schritte meldet oder der Alias schon
+Laufzeit-Historie hat — sonst fehlen die Felder ganz, ein Client darf sie nicht
+voraussetzen). Ist das Backend belegt, wird der Job **geparkt** statt abgelehnt
+(Status bleibt `queued`); läuft die Park-Zeit ab, endet der Job mit
+`status: "failed"` und `error: "park timeout: backend busy for >…s"` — nicht mit
+`503`. Ein `503` kommt nur beim Start und nur dann, wenn für den Alias überhaupt kein
+gesundes Backend existiert (ohne `Retry-After`). Im `sync`-Modus antwortet
+`POST /v1/generations` auf einen fehlgeschlagenen Job mit HTTP `502` und der Job-View
+im Body.
 
 Parameter werden unter ihrem **öffentlichen Namen** (dem Label aus dem Schema)
 gesendet — bei den Mesh-Aliasen durchgehend `input_*`. Unbekannte Namen werden
 **still ignoriert** (dann greift der Default); nach Client-Updates lohnt ein
 Abgleich gegen das Schema. `input_image` ist bei allen `img2mesh`-Aliasen Pflicht
-(`on_empty: required` — fehlt es, wird der Request abgelehnt, es entsteht kein
-stilles Schwarz-Mesh).
+(`on_empty: required`): fehlt es, setzt das Gateway **kein** Platzhalterbild ein — es
+entsteht kein stilles Schwarz-Mesh. Der Request wird dabei nicht mit `400` abgelehnt;
+der Job wird angelegt und endet mit `status: "failed"` und der Fehlermeldung des
+Backends.
 
 **Dateien** reisen nie in `params`, sondern in eigenen Objekten: Bilder unter
 `images`, alle übrigen Dateien (Meshes) unter `files` — Schlüssel ist der
@@ -114,7 +123,9 @@ Weitere Zusicherungen des Gateways:
   werden die Karten **unverändert wie vom Backend erzeugt** durchgereicht
   (immer PNG); dort gilt die Orientierung des jeweiligen Bakes.
 * Dateien über ~30 MB erzeugen einen Eintrag in `warnings` (Hinweis auf
-  Web-Tauglichkeit, kein Fehler).
+  Web-Tauglichkeit, kein Fehler) — bei ComfyUI-Auslieferungen.
+  **Cloud-Auslieferungen (Meshy, Tripo, und Ketten mit `rig: "meshy"`/`"tripo"`)
+  prüft das Gateway nicht**; dort fehlt `warnings` auch bei großen Dateien.
 * `sha256` je Result für Integritätsprüfung.
 * **Eingangs-Isolation (Zusicherung):** Gleichzeitig laufende Jobs teilen sich
   keinen Eingangs-Zustand — auch nicht bei verschiedenen Aliasen auf derselben
@@ -140,7 +151,7 @@ Jede `img2mesh`-Familie gibt es in bis zu drei Varianten, die über das
 | Variante | Pipeline | Auslieferung | Pflicht zu speichern |
 |---|---|---|---|
 | `-Object` | nur Mesh | `<name>_00001_.glb` (Textur eingebettet) + `*_basecolor*.png` + `*_metallic*.png` (unverändert, siehe Abschnitt 2) | **das GLB**; Karten optional (nur wenn die Engine eigene Maps will) |
-| `-Generic` | Mesh → UniRig (Auto-Rig, FBX) | `<name>_articulationxl.fbx` + `*_basecolor*` + `*_metallic*` (V-korrigiert, ggf. JPEG); Job-Feld `rig: "generic"` | **FBX + Basecolor-Bild, untrennbar**: die FBX referenziert ihre Textur nur über einen Temp-Pfad, der beim Client ins Leere zeigt — über den gelieferten Dateinamen neu binden. Ohne das Bild ist das Asset unbrauchbar und nicht wiederherstellbar. Das Gateway garantiert das Paar in der Auslieferung (sonst schlägt der Job fehl) — das Speichern liegt beim Client. |
+| `-Generic` | Mesh → UniRig (Auto-Rig, FBX) | `<name>_articulationxl.fbx` + `*_basecolor*` + `*_metallic*` (V-korrigiert, ggf. JPEG); Job-Feld `rig: "generic"` | **FBX + Basecolor-Bild, untrennbar**: die FBX referenziert ihre Textur nur über einen Temp-Pfad, der beim Client ins Leere zeigt — über den gelieferten Dateinamen neu binden. Ohne das Bild ist das Asset unbrauchbar und nicht wiederherstellbar. Das Gateway lässt den Job fehlschlagen, wenn die FBX **oder jedes Bild** fehlt — es prüft die Anwesenheit eines Bildes, nicht welche Karte es ist. Das Zuordnen (Token `_basecolor`) und das Speichern liegen beim Client. |
 | `-Humanoid` | Mesh → Make-It-Animatable (mixamo-Rig, GLB) | ein GLB `*_rigged.glb` (technischer Name!) mit mixamorig-Skin und **eingebetteter** Textur (+ `*_metallic*.png` optional); Job-Feld `rig: "mixamo"` | **das GLB — genügt allein.** Das Gateway validiert Skin und Textur hart (bekannter Node-Bug „2×2-Dummy-Textur" → Job `failed` statt kaputtem Asset). |
 
 `input_no_fingers` wird bei allen Familien angenommen, wirkt aber **nur** in der
@@ -189,7 +200,7 @@ bei Bildern mit sauberem Alphakanal auf false setzbar), `input_no_fingers` (bool
 | `Meshy-Humanoid`, `Meshy-Humanoid-Multiview` | wie oben | 2048 | Cloud-Mesh (t-pose) → **lokales** Rigging mit Make-It-Animatable, Kette wie `Trellis2-Humanoid-*`: Auslieferung ein `*_rigged.glb`, Job-Feld `rig: "mixamo"`, Speicher-Kontrakt der `-Humanoid`-Zeile in 3.1. `-Multiview` nimmt dieselben vier Bild-Slots wie `Meshy-Multiview`. |
 | `Meshy-Humanoid-Cloud` | wie oben | 2048 | Cloud-Mesh (t-pose) → **Cloud**-Rigging (`Meshy-Rig`, 3.5), das Mesh verlässt Meshy nie. Auslieferung `rigged.glb` (+ optionale Clips), Job-Feld `rig: "meshy"` — nicht normalisiert, nicht validiert (3.1). Ein mitgeschicktes `input_height_m` wird an die Rig-Stufe durchgereicht (Default 1.7 m); zwei Tasks = Mesh-Credits + 5 Credits. |
 | `Tripo-Object`, `Tripo-Multiview` | Tripo-Default (adaptiv) | 2048 | Cloud (Tripo3D, bezahlt pro Task, wie Meshy nur als Fallback oder gezielt). `-Multiview` nimmt `input_image_front` (**Pflicht**) **plus mindestens eine weitere** Ansicht (`input_image_back` / `_left` / `_right`) — mit nur einem Bild lehnt das Gateway ab, bevor irgendetwas hochgeladen wird (Tripo verlangt zwei Ansichten). `input_name`, `input_remove_background`, `input_no_fingers` werden angenommen, wirken nicht; `input_texture_prompt` und `input_pose` gibt es bei Tripo nicht (still ignoriert). Kein `files`-Upload (`400` — Bilder gehören unter `images`). Liefert `model.glb` (Textur eingebettet) + `preview.png`; jedes weitere vom Betreiber bestellte Format kommt als `model.<fmt>` dazu. |
-| `Tripo-Humanoid` | wie oben, Betreiber-Budget 150000 | 2048 | Cloud-Mesh → **Cloud**-Rigging (`Tripo-Rig`, 3.5), das Mesh verlässt Tripo nie. Auslieferung `rigged.glb` (+ konfigurierte Clips wie `walk.glb`), Job-Felder `rig: "tripo"` und `rig_spec` — nicht normalisiert, nicht validiert (3.1). Ein mitgeschicktes `input_rig_type` wird an die Rig-Stufe durchgereicht; zwei bezahlte Tasks = Mesh-Credits + 25 Credits (die Rig-Prüfung davor ist gratis). |
+| `Tripo-Humanoid` | wie oben, Betreiber-Budget 150000 | 2048 | Cloud-Mesh → **Cloud**-Rigging (`Tripo-Rig`, 3.5), das Mesh verlässt Tripo nie. Auslieferung `rigged.glb` (+ konfigurierte Clips wie `walk.glb`), Job-Felder `rig: "tripo"` und `rig_spec` — nicht normalisiert, nicht validiert (3.1). Ein mitgeschicktes `input_rig_type` wird an die Rig-Stufe durchgereicht; bezahlt werden der Mesh-Task + 25 Credits für den Rig (die Rig-Prüfung davor ist gratis), dazu je konfiguriertem Clip ein Retarget-Task à 10 Credits und je zusätzlichem Ausgabeformat ein Convert-Task à 5 Credits. |
 
 **`input_face_num` bei den Meshy-Aliasen.** Hier gibt es — anders als bei den
 ComfyUI-Familien — keinen vom Gateway gesetzten Default: Bleibt der Parameter weg,
@@ -365,7 +376,7 @@ Wunsch **Mixamo-kompatibel** (Betreiber-Option `spec`, Default `mixamo`; das Job
 | Punkt | Regel |
 |---|---|
 | Eingang | `files.input_mesh_path` — **Pflicht**, und ausschließlich ein **binäres glTF** (`.glb`). Das Gateway prüft die Container-Signatur, bevor die Datei überhaupt hochgeladen wird; eine umbenannte OBJ kostet nichts. |
-| Vorprüfung | Vor dem Rig läuft Tripos **Rig-Check** (0 Credits). Hält er das Mesh für nicht riggbar, endet der Job **vor** den 25 Credits mit einer Meldung, die den erkannten Rig-Typ nennt. |
+| Vorprüfung | Vor dem Rig läuft Tripos **Rig-Check** (0 Credits) — sofern der Betreiber ihn am Alias nicht abgeschaltet hat (Option `rig_check`, Default an). Hält er das Mesh für nicht riggbar, endet der Job **vor** den 25 Credits mit einer Meldung, die den erkannten Rig-Typ nennt. |
 | Parameter | `input_rig_type` — welcher Typ zulässig ist, hängt vom Rig-Modell des Alias ab: `v1.0-20240301` kann **nur `biped`** (das Schema führt dann auch nur diese Auswahl), `v2.5-20260210` kann `biped`, `quadruped`, `hexapod`, `octopod`, `avian`, `serpentine`, `aquatic`. Ein nicht unterstützter Wert lässt den Job scheitern, **bevor** der Rig-Task angelegt wird (also ohne Credits) — er wird nicht stillschweigend auf `biped` gebogen. `input_name` und `input_no_fingers` werden angenommen und ignoriert; die Mesh-Optionen gibt es hier nicht. |
 | Auslieferung | `rigged.<Format>` für das **erste** vom Betreiber geführte Ausgabeformat (glb oder fbx — mehr kann das Rigging nicht), Textur eingebettet. Jedes **weitere** geführte Format ist bei Tripo ein eigener Convert-Task und kommt als `rigged.<fmt>` dazu; schlägt einer fehl, scheitert der Job (die Lieferung schrumpft nie stillschweigend). Sind **Animations-Presets** konfiguriert, kommt je Preset ein Result `<preset>.<fmt>` dazu (`preset:walk` → `walk.glb`) — Zugabe, kein garantierter Bestandteil. |
 | Grenzen | Der Rig-Check ist die Grenze: was er ablehnt, wird nicht gerigt. Ein `failed` Task ist endgültig — kein blinder Retry. `/v1/jobs/{id}/cancel` beendet nur den Gateway-Job; Tripo hat in V3 keinen Cancel-Endpunkt und rechnet den Task ab. |
@@ -386,9 +397,10 @@ Dateisystem, das Mesh reist als Datei mit (`required: true` im Schema).
 | Symptom | Bedeutung / Reaktion |
 |---|---|
 | `status: "failed"` + `error` | Workflow-/Validierungsfehler (z. B. „no basecolor PNG", „embedded texture is a 2x2 dummy", per-Node-Fehler des Backends). Nicht blind retrien — Fehlertext auswerten. |
-| `503` + `Retry-After` beim Start | Park-Zeit abgelaufen, alle Backends belegt — nach `Retry-After` neu einreichen. |
+| `503` beim Start | Für den Alias existiert kein gesundes Backend (bzw. keines, das das geforderte `backend`-Pin/LoRA erfüllt) — Alias und `/health` prüfen, kein blinder Retry. |
+| `status: "failed"`, `error` beginnt mit `park timeout:` | Alle Backends waren die ganze Park-Zeit belegt — später neu einreichen. |
 | Job hängt lange in `running` | Mesh-Jobs dauern Minuten; `progress` beachten. Hunyuan3D mit `face_num` > 40000: siehe 3.2 — vermeiden. |
-| `status: "failed"` bei `Meshy-Rig` / `Meshy-Humanoid-Cloud` | Meshys Rigging hat abgelehnt (kein erkennbarer Biped, zu viele Dreiecke, unbrauchbare Pose) — endgültig, Credits werden erstattet. Mesh prüfen (3.5), nicht retrien. `400` schon beim Start heißt: Datei fehlt oder ist kein binäres glTF. |
+| `status: "failed"` bei `Meshy-Rig` / `Meshy-Humanoid-Cloud` | Meshys Rigging hat abgelehnt (kein erkennbarer Biped, zu viele Dreiecke, unbrauchbare Pose) — endgültig, Credits werden erstattet. Mesh prüfen (3.5), nicht retrien. Fehlt `files.input_mesh_path` oder ist die Datei kein binäres glTF, scheitert der Job mit `status: "failed"` (Meldung „`files.input_mesh_path` is required" bzw. „Meshy rigging takes a binary glTF (.glb) mesh") — **bevor** ein Task angelegt wird, also ohne Credits. `400` beim Start heißt dagegen: unbekannter `files`-Schlüssel oder unlesbarer Wert; ab 64 MB kommt `413`. |
 | `status: "failed"` bei `Tripo-Rig` / `Tripo-Humanoid` | Enthält der Fehlertext **`rig-check: mesh is not riggable`**, hat Tripos kostenlose Vorprüfung abgelehnt (der erkannte Rig-Typ steht dabei) — es wurden keine Rig-Credits verbraucht; Mesh prüfen, nicht retrien. Eine fehlende Datei, eine, die kein binäres glTF ist, und ein `input_rig_type`, das nicht zum Rig-Modell des Alias passt, lassen den Job ebenfalls scheitern, bevor ein bezahlter Task entsteht (3.5); `400` schon beim Start heißt: unbekannter `files`-Schlüssel oder unlesbarer Wert. |
 | `404` auf `result/{n}` | Job-TTL abgelaufen (Default **24 h**, `ttl_s` 86400) — Artefakte werden serverseitig aufgeräumt; Ergebnisse zeitnah abholen und selbst speichern. |
 
