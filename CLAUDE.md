@@ -478,7 +478,7 @@ they need via injected callables, staying hot-reload-safe.
   reads `12.0 s / ~1.7 min`, so "stuck or just slow?" needs no click. The estimate is a
   SIBLING of `.jdur` — `_JOB_TICK` overwrites that element's text every second.
 - **`stats.py`** — optional SQLite (WAL) call log + body store. The dashboard is
-  **in the `/ui` Statistic/Routing tabs** (no separate port — the old standalone
+  **in the `/ui` Statistic and Input & Routing tabs** (no separate port — the old standalone
   :4001 server was folded into the console; its `stats_app` + `/`, `/routing`, `/healthz`
   handlers still sit at the bottom of the file, mounted by nothing). Zero new
   dependencies — keep it.
@@ -779,8 +779,9 @@ maps the alias, and exposes the resolved model. Recurring concepts:
 - **Allow-list filtering**: `/v1/models` authenticates the caller and filters by
   their allow-list (entries may be aliases, model ids, or **backend names** =
   all that backend's models); image aliases are included; `?type=chat|image`.
-- **Alias/model-name collisions** (`alias_model_conflicts`): surfaced in `/health`
-  + Routing tab, split `covered` vs actionable `shadowed`.
+- **Alias/model-name collisions** (`alias_model_conflicts`): surfaced in the
+  Input & Routing tab, split `covered` vs actionable `shadowed` (`/health` carries
+  the shadowing entries only).
 - **Host coordination** (every box with a ComfyUI backend — the LLM-vs-media policies
   matter on SHARED boxes, the VRAM policy on all; `docs/host-coordination-plan.md`):
   backends group by physical box (`backend_host`: explicit `host` field, else URL

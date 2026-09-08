@@ -193,7 +193,7 @@ narrows by namespace too.
   blocked when exceeded. Needs stats enabled and priced backends; streaming calls
   are costed from the backend's usage chunk (the gateway always requests
   `stream_options.include_usage`) and fall back to gateway estimates only on a
-  backend that reports nothing.
+  backend that reports nothing or all zeros (as LocalAI does).
 
 ---
 
@@ -1277,6 +1277,21 @@ journalctl -u ai-hub -f
 `deploy.sh` is an rsync-over-SSH helper (`DEPLOY_HOST=root@host ./deploy.sh`):
 syncs code (excluding `config.yaml`, `venv/`), installs requirements in a remote
 venv, syncs the systemd unit, restarts.
+
+**Upgrading an install from before 2026-09-08** (the rename) — do this BEFORE the
+first `deploy.sh`, because a deploy into a fresh `/opt/ai-hub` brings none of the
+excluded state with it (`config.yaml`, `store.db`, `secret.key`, `jobs/` are never
+synced), and the `secret.key` a fresh install generates cannot decrypt the old
+store's API keys. So MOVE the install, never re-create it beside the old one:
+
+```bash
+sudo systemctl stop llm-gateway.service
+sudo mv /opt/llm-gateway /opt/ai-hub
+sudo rm -rf /opt/ai-hub/venv          # its shebangs carry the old absolute path
+DEPLOY_HOST=root@host ./deploy.sh     # rebuilds the venv, installs ai-hub.service
+sudo systemctl disable llm-gateway.service
+sudo rm /etc/systemd/system/llm-gateway.service
+```
 
 > **Secrets & data never to commit:** `config.yaml`, `store.db` (+ `secret.key` —
 > they travel together, keys encrypted at rest), `stats.db*`, `jobs.db*`,

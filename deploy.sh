@@ -16,7 +16,8 @@ RSYNC_EXCLUDES=(
     # Lives ON the prod box and in no checkout — without these, --delete wipes it on
     # every deploy: agent/tool state, and the raw workflow originals .gitignore
     # deliberately keeps out of git ("keep raw originals out of git").
-    --exclude='.remember/'   --exclude='.superpowers/'
+    --exclude='.remember/'   --exclude='.superpowers/'  --exclude='.agents/'
+    --exclude='skills-lock.json*'
     --exclude='sample_comfyui_workflows/org/'
     --exclude='__pycache__/' --exclude='*.pyc'
     --exclude='.venv/'       --exclude='venv/'        --exclude='.env'
@@ -29,7 +30,8 @@ RSYNC_EXCLUDES=(
 )
 TAR_EXCLUDES=(
     --exclude='./.git'        --exclude='./.claude'
-    --exclude='./.remember'   --exclude='./.superpowers'
+    --exclude='./.remember'   --exclude='./.superpowers' --exclude='./.agents'
+    --exclude='./skills-lock.json*'
     --exclude='./sample_comfyui_workflows/org'
     --exclude='__pycache__'   --exclude='*.pyc'
     --exclude='./.venv'       --exclude='./venv'        --exclude='./.env'
