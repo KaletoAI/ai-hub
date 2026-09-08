@@ -78,6 +78,12 @@ code, image clients like anima-verse, …) and a fleet of backends.
 
 ## Quick start
 
+Prerequisites: Python 3.10+ with the `venv` module, `git`, and — only for `deploy.sh` —
+`rsync`. A minimal Debian/Ubuntu has none of the three:
+`apt install -y git python3 python3-venv rsync` (verified 2026-09-08 on a fresh Debian 13
+container with 512 MB RAM and 2 GB disk — the install needs ~450 MB of it, most of that
+`faster-whisper`/`ctranslate2`/`onnxruntime` for the voice library).
+
 ```bash
 git clone https://github.com/KaletoAI/ai-hub.git
 cd ai-hub
@@ -1068,7 +1074,7 @@ locked). Tabs:
 | **Reasoning** | the normalized-thinking rule list (model glob × backend set → adapter) + test resolver |
 | **Playground** | one tab, sub-tabs **Chat** (default — chat completion through `/v1/chat/completions`), **Media** (generation via `POST /v1/generations` — image/video/audio, upload refs + mesh files, or an earlier job's artifact) and **Voice** (TTS via `POST /v1/audio/speech`, inline player + download) — all as **real API clients** (auth, routing, parking, stats all apply) |
 | **Jobs & Calls** | sub-tabs **LLM Calls** (per-call history with stored request/response bodies — LLM endpoints only), **Media Jobs** (list + detail of generation jobs, inputs + outputs, within TTL, plus the media requests that were refused before they became a job) and **Voice Calls** |
-| **Statistic** | the call-stats dashboard (search, aggregates, drilldown) |
+| **Statistic** | the call-stats dashboard (search, aggregates, drilldown) — empty until `stats.enabled: true` (the example config ships it `false`; set it in `config.yaml` or the Server tab, then restart — the flag is read at startup only). The same switch feeds the LLM Calls list under Jobs & Calls. |
 | **Users** | multi-user keys, allow-lists, quotas, IP aliases |
 
 **Live views update in place — an update never reloads the page.** Anything that
