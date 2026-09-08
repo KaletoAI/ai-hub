@@ -142,5 +142,81 @@ class Known(unittest.TestCase):
         self.assertIsNone(netscan.host_port("nonsense"))
 
 
+class _Swap(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        if self.path == "/v1/models":
+            body = json.dumps({"data": [{"id": "glm", "owned_by": "llama-swap"}]}).encode()
+            self.send_response(200)
+        else:
+            body = b"{}"
+            self.send_response(404)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class Scan(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = HTTPServer(("127.0.0.1", 0), _Swap)
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        cls.port = cls.srv.server_port
+        import socket
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        cls.closed_port = s.getsockname()[1]
+        s.close()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+
+    def test_end_to_end_against_a_real_socket(self):
+        import httpx
+
+        async def go():
+            async with httpx.AsyncClient(timeout=2.0) as c:
+                async def fetch(url):
+                    r = await c.get(url)
+                    try:
+                        return r.status_code, r.json()
+                    except ValueError:
+                        return r.status_code, None
+                progress = []
+                res = await netscan.scan(["127.0.0.1"], [self.port, self.closed_port], fetch=fetch,
+                                         resolve=lambda h: "localhost",
+                                         backends=[{"name": "me", "url": f"http://127.0.0.1:{self.port}"}],
+                                         on_progress=lambda d, t: progress.append((d, t)))
+                return res, progress
+        res, progress = asyncio.run(go())
+        self.assertFalse(res.running)
+        self.assertEqual(len(res.findings), 1)
+        f = res.findings[0]
+        self.assertEqual((f.host, f.port, f.flavor, f.known_as, f.hostname),
+                         ("127.0.0.1", self.port, "llama-swap", "me", "localhost"))
+        self.assertEqual(progress[-1], (1, 1))
+        self.assertEqual((res.hosts_done, res.hosts_total), (1, 1))
+        self.assertGreater(res.finished, 0)
+
+    def test_result_is_filled_in_place_and_errors_are_recorded(self):
+        async def fetch(url):
+            return 404, None
+        res = netscan.ScanResult(cidrs=["x"], ports=[1], hosts_total=1)
+
+        async def resolve(host):
+            raise RuntimeError("dns down")
+        out = asyncio.run(netscan.scan(["127.0.0.1"], [self.closed_port], fetch=fetch, resolve=resolve,
+                                       result=res))
+        self.assertIs(out, res)
+        self.assertEqual(res.findings, [])
+        self.assertIsNone(res.error)           # a closed port and a failing resolver are normal
+        self.assertFalse(res.running)
+
+
 if __name__ == "__main__":
     unittest.main()

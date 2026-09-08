@@ -6,9 +6,12 @@ can register as a backend — llama-swap / llama.cpp / vLLM / Ollama (`openai`) 
 ComfyUI (`comfyui`) — and whether each one is registered already. It never adds
 anything: the console offers each finding as a pre-filled form.
 """
+import asyncio
+import inspect
 import ipaddress
 import re
 import subprocess
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -148,3 +151,87 @@ def known_backend_for(url: str, backends: list[dict]) -> Optional[str]:
         if host_port(b.get("url", "")) == want:
             return b.get("name")
     return None
+
+
+@dataclass
+class ScanResult:
+    cidrs: list[str]
+    ports: list[int]
+    hosts_total: int
+    hosts_done: int = 0
+    findings: list = field(default_factory=list)
+    truncated: bool = False
+    started: float = 0.0
+    finished: float = 0.0
+    error: Optional[str] = None
+
+    @property
+    def running(self) -> bool:
+        return self.finished == 0.0 and self.error is None
+
+
+async def _open(host: str, port: int, timeout: float) -> bool:
+    try:
+        _r, w = await asyncio.wait_for(asyncio.open_connection(host, port), timeout)
+    except Exception:
+        return False
+    w.close()
+    try:
+        await w.wait_closed()
+    except Exception:
+        pass
+    return True
+
+
+async def _maybe_await(fn, *a):
+    out = fn(*a)
+    return await out if inspect.isawaitable(out) else out
+
+
+async def scan(hosts: list[str], ports: list[int], *, fetch, resolve=None, backends=None,
+               result: Optional[ScanResult] = None, concurrency: int = 256,
+               connect_timeout: float = 0.5, on_progress=None) -> ScanResult:
+    """Phase 1: TCP-connect every (host, port) — `concurrency` at a time, `connect_timeout`
+    each; phase 2: fingerprint() every open port. `result` (when given) is filled IN
+    PLACE so a console can show progress while the scan runs. A resolver or progress
+    hook that raises is ignored; only a crash of the sweep itself lands in `error`."""
+    res = result or ScanResult(cidrs=[], ports=list(ports), hosts_total=len(hosts))
+    res.started, res.hosts_total, res.hosts_done, res.findings = time.time(), len(hosts), 0, []
+    sem = asyncio.Semaphore(max(1, concurrency))
+
+    async def probe_host(host: str):
+        open_ports = []
+        for port in ports:
+            async with sem:
+                if await _open(host, port, connect_timeout):
+                    open_ports.append(port)
+        found = []
+        for port in open_ports:
+            f = await fingerprint(fetch, f"http://{host}:{port}")
+            if f is not None:
+                found.append(f)
+        if found and resolve is not None:
+            try:
+                name = await _maybe_await(resolve, host)
+            except Exception:
+                name = None
+            for f in found:
+                f.hostname = name or None
+        for f in found:
+            f.known_as = known_backend_for(f.url, backends or [])
+        res.findings.extend(found)
+        res.hosts_done += 1
+        if on_progress:
+            try:
+                on_progress(res.hosts_done, res.hosts_total)
+            except Exception:
+                pass
+
+    try:
+        await asyncio.gather(*(probe_host(h) for h in hosts))
+        res.findings.sort(key=lambda f: (tuple(int(x) for x in f.host.split(".")), f.port))
+    except Exception as e:                      # the sweep itself broke — say so, stay usable
+        res.error = f"{type(e).__name__}: {e}"
+    finally:
+        res.finished = time.time()
+    return res
