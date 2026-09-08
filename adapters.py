@@ -1,6 +1,6 @@
 """Backend adapters — the pluggable per-backend protocol layer.
 
-Phase 0 of the multimodal-gateway plan (see docs/multimodal-gateway-plan.md):
+Phase 0 of the multimodal-gateway plan (see docs/archive/multimodal-gateway-plan.md):
 introduce the seam *without any behaviour change*. `OpenAIAdapter` is a 1:1 move
 of the former module-level `proxy()` (dispatch) and the `/v1/models` discovery
 helpers (`extract_models` / `extract_pricing` / …). New protocols (ComfyUI, …)
