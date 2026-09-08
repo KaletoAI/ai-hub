@@ -31,7 +31,7 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
   restart for backend/alias changes. Read **only at startup**:
   `stats.enabled` and the stats/jobs DB paths.
 - **No linter or build step, and no blanket test suite** — only targeted stdlib
-  `unittest` files for the mechanisms that fail SILENTLY (see the twenty-two listed under
+  `unittest` files for the mechanisms that fail SILENTLY (see the twenty-three listed under
   `anthropic_bridge.py`): `venv/bin/python -m unittest discover -s tests -t .`.
   Everything else is verified by running the server and hitting endpoints with
   `curl` (README "Try it"), `curl localhost:4000/health` for a routing snapshot, or
@@ -535,7 +535,7 @@ they need via injected callables, staying hot-reload-safe.
   silently answer about content the model never saw (documents/PDFs). Covered by
   `test_anthropic_bridge.py` (stdlib `unittest` — a streaming tool-call bridge fails
   silently rather than crashing). `ls tests/test_*.py` is the count of record —
-  **twenty-two** files today — and each exists for that same reason: the mechanism it
+  **twenty-three** files today — and each exists for that same reason: the mechanism it
   guards fails SILENTLY, so it is named next to that mechanism above.
   `test_anthropic_bridge.py`, `test_prune_branch.py` (a
   dead-branch prune that cascades one node too far or too few surfaces as an aborted
@@ -581,6 +581,14 @@ they need via injected callables, staying hot-reload-safe.
   same three through a SYMLINKED config.yaml, the shape the stub-instance harness ships,
   where resolving the link before watching leaves the operator's own save — in the lexical
   parent — unwatched entirely).
+  `test_context_length.py` (the `context_length` every `/v1/models` entry carries: a
+  client that finds none does not error, it ASSUMES one — Oh My Pi 128k — and builds a
+  33k prompt for a 32k model, so the backend's 400 is the first anyone hears of it
+  (measured 2026-09-08, glm-5.3-flash on dx10-01); it pins every listing shape
+  `adapters.extract_context` reads, the `model_context` rule beating the learned value,
+  the llama-swap enrichment asking `/upstream/<model>/v1/models` for LOADED models only —
+  asking an unloaded one would load it — the merge that keeps what this poll did not see,
+  and the MINIMUM a bare id or alias publishes over its backends).
   And one guards the project's own NAME (`test_project_name.py`): a stale mention of the
   pre-rename name left in `deploy.sh` points a deploy at a path that no longer exists, in
   `ai-hub.service` at a `WorkingDirectory` that is gone, in the README at a clone URL that
@@ -809,6 +817,14 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   — a billed task may have failed AFTER creation, and re-running the job would buy the
   same mesh twice (the invariant `tripo.py` protects). Covered by
   `test_gen_quarantine.py` + `test_run_job_failover.py`.
+- **Context windows**: every `/v1/models` entry carries `context_length` when known
+  (`main.model_context` → `adapters.model_context_for`: the backend's `model_context`
+  `glob=tokens` rules first, then what discovery LEARNED — `adapters.extract_context`
+  over the listing, plus for llama-swap each LOADED model's `/upstream/<m>/v1/models`;
+  kept in `backend_context`, merged by `merge_learned_context`, persisted like
+  `backend_models`). A bare id or alias publishes the MINIMUM over its backends.
+  Unknown = absent, never 0. Clients that find none assume a default (Oh My Pi 128k)
+  and their over-long prompts 400 at the backend — `test_context_length.py`.
 - **Allow-list filtering**: `/v1/models` authenticates the caller and filters by
   their allow-list (entries may be aliases, model ids, or **backend names** =
   all that backend's models); image aliases are included; `?type=chat|image`.

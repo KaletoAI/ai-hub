@@ -204,6 +204,10 @@ backend_healthy: dict[str, bool] = {}                          # name → bool
 backend_error: dict[str, dict] = {}                            # bid → why discovery failed (see _classify_error)
 backend_pricing: dict[str, dict[str, dict[str, float]]] = {}   # name → {model_id → {input, output}}
 backend_loras: dict[str, set[str]] = {}                        # id → {lora filename, ...} (ComfyUI)
+# id → {model_id → context window (tokens)} as LEARNED by discovery (persisted, merged —
+# a llama-swap model says its n_ctx only while loaded). The admin's per-backend
+# `model_context` rules sit above this; adapters.model_context_for() resolves both.
+backend_context: dict[str, dict[str, int]] = {}
 backend_inflight: dict[str, int] = {}                          # name → current in-flight requests
 backend_hosts: dict[str, str] = {}                             # bid → host (explicit `host` or URL IP)
 backend_tps: dict[str, float] = {}                             # bid → EWMA output tok/s (speed routing; runtime-only, resets on restart)
@@ -579,6 +583,49 @@ def _classify_error(e: Exception) -> dict:
     return {"kind": kind, "status": status, "detail": detail[:300], "since": int(time.time())}
 
 
+def merge_learned_context(old: Optional[dict], new: Optional[dict]) -> dict[str, int]:
+    """Fold one discovery poll's context values into what earlier polls learned. A
+    model absent from THIS poll keeps its value (llama-swap reports n_ctx only for
+    loaded models); a model present again overwrites (the operator may have changed
+    --ctx-size). Pure, so test_context_length.py can pin it."""
+    merged = dict(old or {})
+    for k, v in (new or {}).items():
+        if isinstance(v, (int, float)) and v > 0:
+            merged[str(k)] = int(v)
+    return merged
+
+
+def model_context(backend: dict, model: str) -> Optional[int]:
+    """Context window of `model` on `backend` — admin rule first, learned value second,
+    None when neither knows (see adapters.model_context_for)."""
+    return adapters.model_context_for(backend, model, backend_context.get(backend_id(backend), {}))
+
+
+def _context_min(pairs) -> Optional[int]:
+    """The catalog value for an entry SEVERAL backends may serve (a bare id, an alias):
+    the smallest known window, because the client cannot pick the backend — a prompt
+    sized for the largest one 400s on the smallest. Unknown backends do not vote."""
+    vals = [v for v in (model_context(b, m) for b, m in pairs) if v]
+    return min(vals) if vals else None
+
+
+def _alias_context(alias: str, candidates: list) -> Optional[int]:
+    """Smallest known window over the backends an alias resolves on (see _context_min)."""
+    pairs = []
+    for b in candidates:
+        real, _prio = alias_entry(alias, b["name"])
+        if real is not None and real in backend_models.get(backend_id(b), set()):
+            pairs.append((b, real))
+    return _context_min(pairs)
+
+
+def _with_context(entry: dict, ctx: Optional[int]) -> dict:
+    """Attach `context_length` only when known — never 0, never a guess."""
+    if ctx:
+        entry["context_length"] = ctx
+    return entry
+
+
 async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
     """Poll a backend's capabilities via its adapter and update discovery state.
 
@@ -601,6 +648,11 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
         backend_models[bid] = caps.models
         backend_pricing[bid] = caps.pricing
         backend_loras[bid] = getattr(caps, "loras", set()) or set()
+        learned = merge_learned_context(backend_context.get(bid), getattr(caps, "context", None))
+        if learned != backend_context.get(bid, {}):
+            backend_context[bid] = learned
+            if store.is_active():
+                await asyncio.to_thread(store.save_backend_context, bid, learned)
         if changed:
             rebuild_route_index()          # model set changed → refresh routing candidates
         was_healthy = backend_healthy.get(bid, False)
@@ -759,6 +811,7 @@ async def lifespan(app: FastAPI):
     store.init(jobs_cfg.get("store_path", "store.db"))
     store.bootstrap(image_models)
     backend_models.update(store.load_backend_models())   # seed last-known models (offline → 503, not 403)
+    backend_context.update(store.load_backend_context())  # learned context windows survive a restart
     apply_server_settings()            # overlay UI-managed server settings onto config
     rebuild_users()                    # load multi-user identities from the store
     rebuild_backends()                 # merge UI-added backends from the store
@@ -1274,6 +1327,7 @@ def routing_snapshot() -> dict:
                 "busy": healthy and backend_busy(b),
                 "tps": round(backend_tps.get(backend_id(b), 0.0), 1),
                 "paid": bool(b.get("paid")),
+                "ctx": model_context(b, mid),   # admin rule or learned; None = unknown
             })
     models = []
     for mid, hosts in sorted(model_hosts.items(), key=lambda kv: kv[0].lower()):
@@ -1897,10 +1951,9 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
     # CHAT/LLM catalog = LLM backends only (ComfyUI "models" are checkpoints, not
     # chat-callable). Names are unique within the LLM type, so the prefix is unambiguous.
     if typ != "image":
-        for backend in enabled_backends():
-            if (_is_gen(backend) or is_draining(backend)
-                    or not backend_healthy.get(backend_id(backend))):
-                continue                          # comfy / draining / down → not offered
+        offered = [b for b in enabled_backends()
+                   if not (_is_gen(b) or is_draining(b) or not backend_healthy.get(backend_id(b)))]
+        for backend in offered:                   # comfy / draining / down → not offered
             bname = backend["name"]
             expose_bare = backend.get("local", False)
             for mid in sorted(backend_models.get(backend_id(backend), set())):
@@ -1909,17 +1962,25 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
                 disp = f"{bname}/{mid}" if model_prefix else mid
                 if disp not in seen and visible({disp, mid, bname}):
                     seen.add(disp)
-                    data.append({"id": disp, "object": "model", "created": now, "owned_by": bname})
+                    data.append(_with_context(
+                        {"id": disp, "object": "model", "created": now, "owned_by": bname},
+                        model_context(backend, mid)))
                 # `local: true` backends ALSO list the bare id; a bare request routes
-                # across every backend that exposes it (like a virtual alias).
+                # across every backend that exposes it (like a virtual alias) — so its
+                # context_length is the SMALLEST of theirs.
                 if expose_bare and mid not in seen and visible({mid, bname}):
                     seen.add(mid)
-                    data.append({"id": mid, "object": "model", "created": now, "owned_by": bname})
+                    data.append(_with_context(
+                        {"id": mid, "object": "model", "created": now, "owned_by": bname},
+                        _context_min((b2, mid) for b2 in offered
+                                     if mid in backend_models.get(backend_id(b2), set()))))
         # Virtual chat aliases are cross-backend → always listed bare (no prefix).
         for alias in virtual_models:
             if alias not in seen and visible({alias}):
                 seen.add(alias)
-                data.append({"id": alias, "object": "model", "created": now, "owned_by": "ai-hub (virtual)"})
+                data.append(_with_context(
+                    {"id": alias, "object": "model", "created": now, "owned_by": "ai-hub (virtual)"},
+                    _alias_context(alias, offered)))
 
     # IMAGE generation aliases (separate namespace) — listed so image clients (anima-verse)
     # can discover them; granted by alias name. `?type=image` returns only these.
@@ -1938,18 +1999,23 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
 async def get_model(model_id: str, authorization: Optional[str] = Header(None)):
     check_auth(authorization)
     now = int(time.time())
-    if model_id in virtual_models:
-        return {"id": model_id, "object": "model", "created": now, "owned_by": "ai-hub (virtual)"}
     llm = [b for b in enabled_backends() if not _is_gen(b)]
+    if model_id in virtual_models:
+        return _with_context(
+            {"id": model_id, "object": "model", "created": now, "owned_by": "ai-hub (virtual)"},
+            _alias_context(model_id, llm))
     bname, bare = split_backend_prefix(model_id)
     if bname is not None:
         b = next((b for b in llm if b["name"] == bname), None)
         if b is not None and bare in backend_models.get(backend_id(b), set()):
-            return {"id": model_id, "object": "model", "created": now, "owned_by": bname}
+            return _with_context({"id": model_id, "object": "model", "created": now, "owned_by": bname},
+                                 model_context(b, bare))
     else:
-        for backend in llm:
-            if model_id in backend_models.get(backend_id(backend), set()):
-                return {"id": model_id, "object": "model", "created": now, "owned_by": backend["name"]}
+        hosts = [b for b in llm if model_id in backend_models.get(backend_id(b), set())]
+        if hosts:      # a bare id routes across every host → the smallest window, as in the listing
+            return _with_context(
+                {"id": model_id, "object": "model", "created": now, "owned_by": hosts[0]["name"]},
+                _context_min((b, model_id) for b in hosts))
     raise HTTPException(404, f"Model '{model_id}' not found")
 
 

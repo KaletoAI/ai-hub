@@ -169,6 +169,13 @@ def init(db_path: str = "store.db") -> None:
                 updated     INTEGER NOT NULL
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS backend_context (
+                bid          TEXT PRIMARY KEY,
+                context_json TEXT NOT NULL,
+                updated      INTEGER NOT NULL
+            )
+        """)
     _active = True
     logger.info(f"store: generation aliases at {_DB_PATH}")
 
@@ -408,6 +415,24 @@ def load_backend_models() -> dict:
     with _conn() as c:
         rows = c.execute("SELECT bid, models_json FROM backend_models").fetchall()
     return {r["bid"]: set(json.loads(r["models_json"] or "[]")) for r in rows}
+
+
+def save_backend_context(bid: str, context: dict) -> None:
+    """Persist a backend's LEARNED context windows {model: tokens}. A llama-swap model
+    reports its n_ctx only while loaded, so what one poll learned must outlive the
+    unload and a gateway restart — that is what makes the value dependable."""
+    _row_upsert("backend_context", ("bid",), (bid,), "context_json",
+                json.dumps({str(k): int(v) for k, v in (context or {}).items()}, sort_keys=True))
+
+
+def load_backend_context() -> dict:
+    """{bid: {model: tokens}} as last persisted by save_backend_context()."""
+    if not _active:
+        return {}
+    with _conn() as c:
+        rows = c.execute("SELECT bid, context_json FROM backend_context").fetchall()
+    return {r["bid"]: {k: int(v) for k, v in json.loads(r["context_json"] or "{}").items()}
+            for r in rows}
 
 
 def get_settings() -> dict:

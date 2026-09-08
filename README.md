@@ -264,6 +264,32 @@ sent. Busy state shows in `/health` and the **Input & Routing → Chat aliases**
 | `chat_only` | keep only `type == "chat"` models (drops image/video/embedding). Understands Together's `type` and OpenRouter's `architecture.output_modalities`. Backends without those fields (llama-swap, vLLM) are unaffected — so **don't** set it on a backend whose embedding models you want routable. |
 | `serverless_only` | keep only models with non-zero pricing (Together's dedicated-only models are `0/0`; on OpenRouter this also drops `:free`). |
 
+### Context windows (`context_length` in `/v1/models`)
+
+Every `/v1/models` entry (and `GET /v1/models/{id}`) carries `context_length` when
+the gateway knows it — the number agent clients (Oh My Pi, Hermes, OpenCode) size
+their prompts by. Without it a client assumes a default (Oh My Pi: 128k) and a
+33k prompt to a 32k model comes back as a `400 exceed_context_size_error`. Two
+sources, in this order:
+
+1. **`model_context`** on the backend (Backends tab → *context windows*, or
+   config): one `model-glob=tokens` per line, first match wins.
+   ```yaml
+   model_context: |
+     glm-*=32768
+     qwen3.8-flash-next-ple4=131072
+   ```
+2. **Discovery** — read from the listing where it carries the value: OpenRouter /
+   Together `context_length`, vLLM `max_model_len`, llama-server `meta.n_ctx`. A
+   **llama-swap** listing has none, so the gateway also asks `/running` and reads
+   each **loaded** model's `/upstream/<model>/v1/models` (never an unloaded one —
+   that would load it). Learned values are remembered across unloads and restarts.
+
+A bare id served by several backends, and a chat alias, publish the **smallest**
+window among them — the client cannot pick the backend. Unknown stays absent,
+never `0`. The **Input & Routing → LLM models** tab shows the value on each
+backend chip (`ctx 32k`), so "why does my client think 128k?" is answerable there.
+
 ### Sampling defaults (`sampling_defaults`)
 
 Some backends sample with bare server defaults when a request carries no sampling

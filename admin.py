@@ -1252,6 +1252,17 @@ def _backend_form(b: Optional[dict], hosts: list) -> str:
               "again every turn. Off by default: the breakpoints turn a message into a content-part list, "
               "which a strict server may reject. Irrelevant for local models (no token billing) and for "
               "OpenAI models (they cache automatically).</p>"
+            + _field("context windows",
+                     _textarea("model_context", g("model_context"), rows=3,
+                               placeholder="glm-*=32768\nqwen3.8-flash-next-ple4=131072"))
+            + "<p class='hint'><b>context windows</b>: one <code>model-glob=tokens</code> per line, "
+              "published as <code>context_length</code> in <code>/v1/models</code> — the number a "
+              "client (Oh My Pi, Hermes, OpenCode) sizes its prompts by; without one it assumes "
+              "128k and a 33k prompt to a 32k model 400s. A rule beats what discovery learned "
+              "(OpenRouter/Together <code>context_length</code>, vLLM <code>max_model_len</code>, "
+              "llama-server <code>n_ctx</code> — read through llama-swap for <b>loaded</b> models "
+              "only, and remembered). Write a rule for a llama-swap model that is rarely loaded, or "
+              "when the server's value is not what clients should use.</p>"
             + f'<details class="optblock"{" open" if (b or {}).get("sampling_defaults") else ""}>'
             + "<summary>Sampling defaults <span class='muted'>— used when the caller sends none"
               "</span></summary>"
@@ -1721,6 +1732,11 @@ async def backend_save(request: Request):
         b.pop("comfy_input_dir", None)         # blank = derive from the output dir
     if (f.get("api_key", "") or "").strip():
         b["api_key"] = f["api_key"].strip()
+    mctx = (f.get("model_context", "") or "").strip()
+    if mctx:
+        b["model_context"] = mctx               # `glob=tokens` lines; parsed on every read
+    else:
+        b.pop("model_context", None)
     # boolean flags: checkbox present → True, absent → drop the key (= False)
     for flag in ("chat_only", "serverless_only", "local", "auto_restart",
                  "prompt_cache"):
@@ -1999,7 +2015,19 @@ def _host_chip(h: dict) -> str:
         kind, suffix = "ok", ""
     tps = h.get("tps") or 0
     spd = f" · {tps:g} tok/s" if tps else ""
-    return f'<span class="badge {kind}">{_esc(h["backend"])}{spd}{suffix}</span>'
+    ctx = h.get("ctx") or 0
+    win = f" · ctx {_ctx_text(ctx)}" if ctx else ""
+    return f'<span class="badge {kind}">{_esc(h["backend"])}{spd}{win}{suffix}</span>'
+
+
+def _ctx_text(n: int) -> str:
+    """32768 → 32k, 1048576 → 1M, 202752 → 198k — the way model cards write it."""
+    if n >= 1024 * 1024 and n % (1024 * 1024) == 0:
+        return f"{n // (1024 * 1024)}M"
+    if n >= 1024:
+        k = n / 1024
+        return f"{int(k)}k" if k == int(k) else f"{k:.0f}k"
+    return str(n)
 
 
 def _models_table(models: list, sk: str = "routing-image-models") -> str:

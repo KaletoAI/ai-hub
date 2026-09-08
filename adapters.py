@@ -162,6 +162,57 @@ def extract_pricing(payload) -> dict[str, dict[str, float]]:
     return out
 
 
+def extract_context(payload) -> dict[str, int]:
+    """Per-model context window (tokens) from a /v1/models response, keyed by id —
+    the number a client sizes its prompts by. ONE reader for every listing shape:
+    OpenRouter / Together `context_length`, vLLM `max_model_len`, llama-server
+    `meta.n_ctx` (the SERVING size — `n_ctx_train` is what the weights could do,
+    not what this server accepts). Models without a usable number are absent, never
+    0: a client treats 0 as "unknown" at best and as "no room" at worst."""
+    data = payload["data"] if isinstance(payload, dict) else payload
+    out: dict[str, int] = {}
+    for m in data or []:
+        if not isinstance(m, dict) or "id" not in m:
+            continue
+        meta = m.get("meta") if isinstance(m.get("meta"), dict) else {}
+        for v in (m.get("context_length"), m.get("max_model_len"), meta.get("n_ctx")):
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0:
+                out[m["id"]] = int(v)
+                break
+    return out
+
+
+def parse_model_context(text) -> list[tuple[str, int]]:
+    """The backend's `model_context` rules: one `glob=tokens` per line (blank lines and
+    `#` comments skipped). A line that does not parse is DROPPED, not fatal — a typo
+    must not take the whole backend's rules with it. Order is kept: the first
+    matching rule wins in model_context_for()."""
+    rules: list[tuple[str, int]] = []
+    for line in str(text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        pat, _, num = line.partition("=")
+        pat, num = pat.strip(), num.strip()
+        if not pat or not num.isdigit() or int(num) <= 0:
+            continue
+        rules.append((pat, int(num)))
+    return rules
+
+
+def model_context_for(backend: dict, model: str, learned: dict) -> Optional[int]:
+    """Context window for `model` on `backend`: the admin's `model_context` rule
+    (first glob match) beats the discovery-learned value — the rule exists for the
+    llama-swap model that is not loaded right now and never reported its n_ctx, and
+    for the operator who knows better than a listing. None = unknown; the catalog
+    then omits `context_length` rather than invent one."""
+    for pat, n in parse_model_context(backend.get("model_context")):
+        if fnmatch.fnmatchcase(model, pat):
+            return n
+    v = (learned or {}).get(model)
+    return int(v) if isinstance(v, (int, float)) and v > 0 else None
+
+
 def _is_chat_model(m: dict) -> bool:
     """True unless the model is clearly not chat-completions routable.
 
@@ -206,6 +257,7 @@ class Capabilities:
     models: set[str]
     pricing: dict[str, dict[str, float]]
     loras: set = field(default_factory=set)         # ComfyUI: installed LoRA filenames
+    context: dict = field(default_factory=dict)     # model → context window (tokens), where the listing says
 
 
 @dataclass
@@ -713,8 +765,47 @@ class OpenAIAdapter(BackendAdapter):
         )
         resp.raise_for_status()
         payload = resp.json()
+        context = extract_context(payload)
+        context.update(await self._llamaswap_context(client, b))
         return Capabilities(models=extract_models(payload, b),
-                            pricing=extract_pricing(payload))
+                            pricing=extract_pricing(payload), context=context)
+
+    async def _llamaswap_context(self, client: httpx.AsyncClient, b: dict) -> dict[str, int]:
+        """llama-swap's own /v1/models carries no n_ctx (only the llama-server behind
+        each model knows it), so ask `/running` which models are loaded and read each
+        one's `/upstream/<model>/v1/models` through the same extract_context(). ONLY
+        loaded (`state == ready`) models are asked: `/upstream/…` on an unloaded model
+        makes llama-swap LOAD it, and a discovery poll must never swap a model in.
+        Every failure is silent — a server without `/running` (vLLM, OpenRouter,
+        LocalAI: 404) is the normal case, and the listing's own values still count."""
+        out: dict[str, int] = {}
+        try:
+            r = await client.get(f"{b['url']}/running", headers=self.ctx.auth_headers(b),
+                                 timeout=_DISCOVERY_TIMEOUT)
+            if r.status_code != 200:
+                return out
+            running = r.json().get("running") or []
+        except Exception:
+            return out
+        for ent in running:
+            if not isinstance(ent, dict) or ent.get("state") != "ready" or not ent.get("model"):
+                continue
+            mid = str(ent["model"])
+            try:
+                r = await client.get(f"{b['url']}/upstream/{mid}/v1/models",
+                                     headers=self.ctx.auth_headers(b), timeout=_DISCOVERY_TIMEOUT)
+                if r.status_code != 200:
+                    continue
+                found = extract_context(r.json())
+            except Exception:
+                continue
+            # The upstream answers with ITS id (the --alias), which llama-swap keys the
+            # same way; if it differs, the value still belongs to the model we asked for.
+            if mid in found:
+                out[mid] = found[mid]
+            elif len(found) == 1:
+                out[mid] = next(iter(found.values()))
+        return out
 
     async def dispatch(self, req: NormalizedRequest):
         if req.path.startswith("/v1/messages"):
