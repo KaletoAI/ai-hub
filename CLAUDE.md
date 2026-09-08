@@ -2,6 +2,8 @@
 
 Guidance for Claude Code (claude.ai/code) when working in this repository.
 
+Renamed from llm-gateway on 2026-09-08 (prod: /opt/ai-hub, unit ai-hub.service).
+
 ## What this is
 
 An OpenAI-compatible reverse proxy that fans one endpoint out across many
@@ -42,12 +44,12 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
 
 ## Architecture
 
-Fifteen self-contained Python files hold everything (`ls *.py` minus the tests is the
-count of record). `main.py` owns app state; the others (`adapters`, `meshy`, `tripo`,
-`cloudtask`, `jobs`, `store`, `stats`, `admin`, `reasoning`, `scheduler`,
-`responses_bridge`, `anthropic_bridge`, `openai_image_bridge`, `previewanim`) never
-import `main` — they receive what they need via injected callables, staying
-hot-reload-safe.
+Fifteen self-contained Python files hold everything (`ls *.py` is the count of
+record; the tests live in `tests/`). `main.py` owns app state; the others
+(`adapters`, `meshy`, `tripo`, `cloudtask`, `jobs`, `store`, `stats`, `admin`,
+`reasoning`, `scheduler`, `responses_bridge`, `anthropic_bridge`,
+`openai_image_bridge`, `previewanim`) never import `main` — they receive what
+they need via injected callables, staying hot-reload-safe.
 
 - **`main.py`** — config loading, health/discovery loop, routing, all HTTP
   endpoints, auth/quotas, call parking, generation orchestration, the Responses

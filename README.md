@@ -1,4 +1,6 @@
-# llm-gateway
+# AI-Hub
+
+*(formerly `llm-gateway` — renamed 2026-09-08; the old GitHub URL redirects.)*
 
 An OpenAI-compatible reverse proxy that fans one endpoint out across many
 backends — local LLM servers (llama.cpp / llama-swap / vLLM / Ollama …), cloud
@@ -77,8 +79,8 @@ code, image clients like anima-verse, …) and a fleet of backends.
 ## Quick start
 
 ```bash
-git clone https://github.com/KaletoAI/llm-gateway.git
-cd llm-gateway
+git clone https://github.com/KaletoAI/ai-hub.git
+cd ai-hub
 python3 -m venv venv && venv/bin/pip install -r requirements.txt
 cp config.example.yaml config.yaml
 $EDITOR config.yaml                    # set backends + api_key
@@ -1255,14 +1257,14 @@ curl $B/health
 
 ## Running & deploying
 
-`llm-gateway.service` is an example systemd unit (assumes `/opt/llm-gateway` with
+`ai-hub.service` is an example systemd unit (assumes `/opt/ai-hub` with
 `venv/` next to `main.py`):
 
 ```bash
-sudo install -m 0644 llm-gateway.service /etc/systemd/system/
+sudo install -m 0644 ai-hub.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now llm-gateway
-journalctl -u llm-gateway -f
+sudo systemctl enable --now ai-hub
+journalctl -u ai-hub -f
 ```
 
 `deploy.sh` is an rsync-over-SSH helper (`DEPLOY_HOST=root@host ./deploy.sh`):

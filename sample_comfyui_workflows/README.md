@@ -17,7 +17,7 @@ liegen in `org/backups/`.
 
 ---
 
-## 1. Sicht LLM-Gateway
+## 1. Sicht AI-Hub
 
 ### 1.1 Eingaben (Bindepunkte)
 

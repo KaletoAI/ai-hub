@@ -875,7 +875,7 @@ async def _ui_guard(request: Request, call_next):
 def _login_page(error: str = "", nxt: str = "/ui") -> str:
     err = f"<p class='bad'>{_esc(error)}</p>" if error else ""
     body = (f"<div style='max-width:360px;margin:8vh auto;text-align:left'>"
-            f"<h2>Gateway login</h2><p class='hint'>Enter an <b>admin API key</b> to access the console.</p>"
+            f"<h2>AI-Hub login</h2><p class='hint'>Enter an <b>admin API key</b> to access the console.</p>"
             f"{err}<form action='/ui/login' method='post'>"
             f"<input type='hidden' name='next' value='{_esc(nxt)}'>"
             f"{_field('admin key', _inp('key', '', placeholder='Bearer token', typ='password'))}"
@@ -6516,7 +6516,7 @@ _SRV_RUNTIME = [
      "check interval (blank = 3; 0 = off)"),
 ]
 _SRV_RESTART = [
-    ("__grp", "", "Gateway", ""),
+    ("__grp", "", "AI-Hub", ""),
     ("port", "int", "port", "set by launch cmd (uvicorn --port / systemd)"),
     ("__grp", "", "Stats (call log)", ""),
     ("stats_enabled", "bool", "enabled", "record calls (dashboard in Statistic tab)"),
@@ -6593,7 +6593,7 @@ async def server_page(request: Request):
     restart_form = (
         '<form action="/ui/server/save" method="post"><input type="hidden" name="_form" value="restart">'
         f'<div class="formbar"><h2>Restart-required{mark(any_restart)}</h2>{_btn("Save", submit=True)}</div>'
-        f"<p class='hint'>Gateway is listening on port <b>{_esc(running_port or '?')}</b>. "
+        f"<p class='hint'>AI-Hub is listening on port <b>{_esc(running_port or '?')}</b>. "
         "These take effect on the next restart.</p>" + restart_rows + "</form>")
 
     info = ("<h2>Server</h2><p class='hint'>These override <code>config.yaml</code> and are stored in "

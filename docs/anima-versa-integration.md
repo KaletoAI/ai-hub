@@ -1,7 +1,7 @@
-# Arbeitsanweisung: LLM-Gateway als Image-Backend in anima-versa einbinden
+# Arbeitsanweisung: AI-Hub als Image-Backend in anima-versa einbinden
 
 **Für:** Claude Code im `anima-versa`-Repo
-**Ziel:** Das LLM-Gateway (OpenAI-kompatibler Reverse-Proxy vor ComfyUI) als
+**Ziel:** Den AI-Hub (OpenAI-kompatibler Reverse-Proxy vor ComfyUI) als
 Bild-Generierungs-Backend in anima-versa anbinden — über die **OpenAI Images API**.
 Das Gateway übersetzt OpenAI-Image-Requests intern auf ComfyUI-Workflows und liefert
 fertige Bilder zurück.
@@ -31,7 +31,7 @@ es schickt `model: "<alias>"` und einen Prompt.
 
 `GET /v1/models` ist der gemeinsame OpenAI-Katalog: ohne Beschränkung listet er **alle**
 Chat-/LLM-Modelle aller Backends (400+) **plus** die Image-Generierungs-Aliase
-(`owned_by: "llm-gateway (image)"`). Zwei Hebel, damit anima-versa nur das Relevante sieht:
+(`owned_by: "ai-hub (image)"`). Zwei Hebel, damit anima-versa nur das Relevante sieht:
 
 1. **Eigenen anima-versa-User mit Allow-List** (empfohlen). Im `/ui` → **Users** einen
    User anlegen, dessen Häkchen **nur** die Image-Aliase (z.B. `Qwen`) — oder ein ganzes
@@ -234,7 +234,7 @@ Flow gewünscht ist. Für die Standard-Anbindung reichen §2/§3.
 
 ## 8. Implementierungs-Aufgaben in anima-versa
 
-1. **Provider-Type anlegen** (z.B. `llm_gateway` / `comfyui_gateway`). Alternativ den
+1. **Provider-Type anlegen** (z.B. `ai_hub` / `comfyui_gateway`). Alternativ den
    bestehenden `openai_diffusion`-Provider wiederverwenden — das Gateway ist auf
    `/v1/images/generations` LocalAI-kompatibel (akzeptiert `ref_images` + Extra-Params).
    Eigener Type ist sauberer wegen Auth-auf-Result-URLs + gen-alias-Semantik.
