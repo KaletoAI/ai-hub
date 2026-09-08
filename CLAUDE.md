@@ -31,7 +31,7 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
   restart for backend/alias changes. Read **only at startup**:
   `stats.enabled` and the stats/jobs DB paths.
 - **No linter or build step, and no blanket test suite** — only targeted stdlib
-  `unittest` files for the mechanisms that fail SILENTLY (see the twenty-one listed under
+  `unittest` files for the mechanisms that fail SILENTLY (see the twenty-two listed under
   `anthropic_bridge.py`): `venv/bin/python -m unittest discover -s tests -t .`.
   Everything else is verified by running the server and hitting endpoints with
   `curl` (README "Try it"), `curl localhost:4000/health` for a routing snapshot, or
@@ -535,7 +535,7 @@ they need via injected callables, staying hot-reload-safe.
   silently answer about content the model never saw (documents/PDFs). Covered by
   `test_anthropic_bridge.py` (stdlib `unittest` — a streaming tool-call bridge fails
   silently rather than crashing). `ls tests/test_*.py` is the count of record —
-  **twenty-one** files today — and each exists for that same reason: the mechanism it
+  **twenty-two** files today — and each exists for that same reason: the mechanism it
   guards fails SILENTLY, so it is named next to that mechanism above.
   `test_anthropic_bridge.py`, `test_prune_branch.py` (a
   dead-branch prune that cascades one node too far or too few surfaces as an aborted
@@ -571,7 +571,13 @@ they need via injected callables, staying hot-reload-safe.
   BROADCASTS every prompt's progress to every listener, so a missing prompt_id gate
   shows a job a stranger's step count — a lying feature, not an absent one — and an ETA
   looks plausible whatever it says, which is how timing the steps from job start
-  predicted 250 s for a 15 s job).
+  predicted 250 s for a 15 s job);
+  `test_config_watch.py` (the config hot reload's own watch: `awatch` on the config FILE
+  keeps a watch on that file's INODE, and sed/vim/most editors save by renaming a sibling
+  over it — measured 2026-09-08 on a fresh Debian 13 install, one of four edits detected,
+  then nothing ever again, while the gateway went on serving the config it read first and
+  said so nowhere; so the test performs the three saves that got it wrong — rename-replace,
+  an in-place append after it, a second rename-replace — and counts the reloads).
   And one guards the project's own NAME (`test_project_name.py`): a stale mention of the
   pre-rename name left in `deploy.sh` points a deploy at a path that no longer exists, in
   `ai-hub.service` at a `WorkingDirectory` that is gone, in the README at a clone URL that

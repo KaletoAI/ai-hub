@@ -691,10 +691,35 @@ def reload_config() -> None:
     log_config_summary()
 
 
+async def watch_config(path, on_change: Callable[[], None]) -> None:
+    """Call `on_change` once per save of `path`, for the life of the process.
+
+    Watches the config's DIRECTORY and filters events down to the one file, because an
+    inotify watch on a FILE dies with that file's inode — and nearly every editor saves
+    by writing a sibling and renaming it over the original, which mints a new one.
+    Measured 2026-09-08 on a fresh Debian 13 / Python 3.13 / watchfiles 1.2.0 install:
+    the old `awatch(CONFIG_PATH)` form reported exactly ONE of four edits — the first
+    `sed -i`; `stat` showed the inode had changed, and from then on nothing was seen,
+    not an in-place `echo >>`, not a second `sed -i`, not a `cp good config.yaml`. The
+    failure is SILENT: the gateway keeps serving the config it read first while README
+    and CLAUDE.md promise a hot reload on save, so the operator "restoring" a bad edit
+    gets no reload and no complaint. A directory watch survives the rename-replace.
+    `recursive=False` keeps jobs/ and its artifacts out of the watch entirely; the
+    store/stats/jobs DB files that sit beside config.yaml still raise events, and the
+    filter drops them before anything reloads.
+    """
+    target = Path(path).resolve()
+    async for _ in awatch(target.parent, recursive=False,
+                          watch_filter=lambda _change, p: Path(p).resolve() == target):
+        on_change()
+
+
 async def watch_config_loop() -> None:
-    async for _ in awatch(CONFIG_PATH):
+    def _reload() -> None:
         logger.info(f"Detected change in {CONFIG_PATH} — reloading")
         reload_config()
+
+    await watch_config(CONFIG_PATH, _reload)
 
 
 @asynccontextmanager
