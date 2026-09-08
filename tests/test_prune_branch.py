@@ -9,7 +9,7 @@ Fixture mirrors the shape of img2mesh-trellis2_multiview_api.json (verified agai
 the live /object_info of a Trellis2 backend, 2026-08-30):
     loader → PreProcess(image required) → MultiView(front required, back/left/right optional)
 
-    venv/bin/python -m unittest test_prune_branch -v
+    venv/bin/python -m unittest tests.test_prune_branch -v
 """
 import unittest
 

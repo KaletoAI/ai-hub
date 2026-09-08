@@ -23,3 +23,10 @@ calls/
 voiceref/
 # Sample workflows: ship the curated ones directly; keep raw originals out of git
 sample_comfyui_workflows/org/
+# Agent/tool state and session artefacts
+.claude/
+.agents/
+skills-lock.json
+skills-lock.json.bak
+# Never ship documents that landed in the samples folder by accident
+sample_comfyui_workflows/*.pdf

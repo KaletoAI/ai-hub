@@ -7,7 +7,7 @@ feature fixes); a dropped upload filename turns a .fbx into `application/octet-s
 and the API can no longer recover the extension, so ComfyUI's loader refuses a file
 that looks fine in the UI.
 
-    venv/bin/python -m unittest test_playground_files -v
+    venv/bin/python -m unittest tests.test_playground_files -v
 """
 import asyncio
 import os

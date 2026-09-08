@@ -1,5 +1,5 @@
 """Chain hooks: what a stage-1 / stage-2 adapter contributes to a workflow chain.
-run: /home/dev/projekte/llm-gateway/venv/bin/python -m unittest test_chain_hooks -v"""
+run: venv/bin/python -m unittest tests.test_chain_hooks -v"""
 import asyncio
 import unittest
 

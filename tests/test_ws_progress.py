@@ -11,14 +11,14 @@ that finished in 15 (measured 2026-09-04, before the fix pinned here).
 
 Message shapes below are verbatim captures from ComfyUI 0.30.2.
 
-Run: venv/bin/python -m unittest test_ws_progress -v
+Run: venv/bin/python -m unittest tests.test_ws_progress -v
 """
 import os
 import sys
 import tempfile
 import unittest
 
-_here = os.path.dirname(os.path.abspath(__file__))
+_here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # repo root (tests/ is one level down)
 _prev = os.getcwd()
 _tmp = tempfile.TemporaryDirectory()
 with open(os.path.join(_tmp.name, "config.yaml"), "w") as _f:

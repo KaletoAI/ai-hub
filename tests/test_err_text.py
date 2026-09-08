@@ -7,7 +7,7 @@ off the transport is constructed with an empty message, so `str(e)` is "". `_err
 falls back to the class name, which is a poor message but an infinitely better one than
 none. These tests pin that fallback and the two renderings that reach a job row.
 
-Run: /home/dev/projekte/llm-gateway/venv/bin/python -m unittest test_err_text -v
+Run: venv/bin/python -m unittest tests.test_err_text -v
 """
 import os
 import sys
@@ -19,7 +19,7 @@ import httpx
 # `import main` reads ./config.yaml at import time — give it a minimal one in a temp cwd
 # (same dance as test_gen_backend_for.py; the dir goes away in the same finally, or
 # -W error::ResourceWarning trips on the finalizer).
-_here = os.path.dirname(os.path.abspath(__file__))
+_here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # repo root (tests/ is one level down)
 _prev = os.getcwd()
 _tmp = tempfile.TemporaryDirectory()
 with open(os.path.join(_tmp.name, "config.yaml"), "w") as _f:

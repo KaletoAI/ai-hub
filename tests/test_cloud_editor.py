@@ -4,7 +4,7 @@ three fail SILENTLY in the browser — a job view that renders nothing for a Tri
 editor that offers the wrong backends, a type select whose JS never reveals the cloud
 option block — so they are pinned here.
 
-Run: python -m unittest test_cloud_editor -v
+Run: python -m unittest tests.test_cloud_editor -v
 """
 import os
 import sys
@@ -14,7 +14,7 @@ import unittest
 # `import main` reads ./config.yaml at import time — give it a minimal one in a temp cwd.
 # The dir is needed ONLY for that import, so it is removed in the same finally that
 # restores the cwd; leaving it to the finalizer raises a ResourceWarning under -W error.
-_here = os.path.dirname(os.path.abspath(__file__))
+_here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # repo root (tests/ is one level down)
 _prev = os.getcwd()
 _tmp = tempfile.TemporaryDirectory()
 with open(os.path.join(_tmp.name, "config.yaml"), "w") as _f:

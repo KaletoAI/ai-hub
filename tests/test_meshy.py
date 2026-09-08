@@ -1,4 +1,4 @@
-"""Unit tests for meshy.py — run: /home/dev/projekte/llm-gateway/venv/bin/python -m unittest test_meshy -v"""
+"""Unit tests for meshy.py — run: venv/bin/python -m unittest tests.test_meshy -v"""
 import base64
 import unittest
 

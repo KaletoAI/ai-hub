@@ -1,5 +1,5 @@
 """Adapter I/O tests for TripoAdapter against a local HTTP stub.
-run: /home/dev/projekte/llm-gateway/venv/bin/python -m unittest test_tripo_adapter -v"""
+run: venv/bin/python -m unittest tests.test_tripo_adapter -v"""
 import asyncio
 import json
 import re

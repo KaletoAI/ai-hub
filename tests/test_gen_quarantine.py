@@ -1,5 +1,5 @@
 """Unit tests for the execution-fault quarantine — run:
-   venv/bin/python -m unittest test_gen_quarantine
+   venv/bin/python -m unittest tests.test_gen_quarantine
 
 Why this file exists (the mechanism fails SILENTLY): a generation backend that
 ANSWERS but cannot EXECUTE is invisible to every existing signal. Discovery only

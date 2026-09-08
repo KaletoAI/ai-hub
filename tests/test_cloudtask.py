@@ -1,4 +1,4 @@
-"""Unit tests for cloudtask.py — run: /home/dev/projekte/llm-gateway/venv/bin/python -m unittest test_cloudtask -v"""
+"""Unit tests for cloudtask.py — run: venv/bin/python -m unittest tests.test_cloudtask -v"""
 import asyncio
 import unittest
 

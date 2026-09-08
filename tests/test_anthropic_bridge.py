@@ -1,6 +1,6 @@
 """Tests for the Anthropic Messages ↔ Chat Completions bridge.
 
-stdlib only, no server needed:  venv/bin/python -m unittest test_anthropic_bridge -v
+stdlib only, no server needed:  venv/bin/python -m unittest tests.test_anthropic_bridge -v
 
 The bridge is what a non-Anthropic backend (OpenRouter, LocalAI, …) sees when Claude
 Code talks to the gateway, so these cases mirror real Claude Code traffic: system

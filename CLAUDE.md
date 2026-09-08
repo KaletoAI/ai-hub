@@ -30,7 +30,7 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
   `stats.enabled` and the stats/jobs DB paths.
 - **No linter or build step, and no blanket test suite** — only targeted stdlib
   `unittest` files for the mechanisms that fail SILENTLY (see the six listed under
-  `anthropic_bridge.py`): `venv/bin/python -m unittest discover -p 'test_*.py'`.
+  `anthropic_bridge.py`): `venv/bin/python -m unittest discover -s tests -t .`.
   Everything else is verified by running the server and hitting endpoints with
   `curl` (README "Try it"), `curl localhost:4000/health` for a routing snapshot, or
   compile-gating (`venv/bin/python -m py_compile *.py`) before deploy.
@@ -505,7 +505,7 @@ hot-reload-safe.
   server-side tools), raise `UnsupportedContent` → 400 where dropping would
   silently answer about content the model never saw (documents/PDFs). Covered by
   `test_anthropic_bridge.py` (stdlib `unittest` — a streaming tool-call bridge fails
-  silently rather than crashing). `ls test_*.py` is the count of record —
+  silently rather than crashing). `ls tests/test_*.py` is the count of record —
   **twenty** files today — and each exists for that same reason: the mechanism it
   guards fails SILENTLY, so it is named next to that mechanism above.
   `test_anthropic_bridge.py`, `test_prune_branch.py` (a
@@ -543,7 +543,7 @@ hot-reload-safe.
   shows a job a stranger's step count — a lying feature, not an absent one — and an ETA
   looks plausible whatever it says, which is how timing the steps from job start
   predicted 250 s for a 15 s job).
-  Run them all with `python -m unittest discover -p 'test_*.py'` (no runner dependency).
+  Run them all with `python -m unittest discover -s tests -t .` (no runner dependency).
 - **`openai_image_bridge.py`** — pure request/response plumbing for the OpenAI
   image shims (`multipart_list`, `parse_size`, `coerce_scalar`, `images_uploads`
   slot mapping, `images_response`); imports only the leaf `jobs`. `main.py`

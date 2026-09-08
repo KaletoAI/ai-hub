@@ -146,7 +146,7 @@ class TestModelSetKey(unittest.TestCase):
 
     def test_the_sample_trellis2_high_and_low_share_a_key(self):
         import json, os
-        d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sample_comfyui_workflows")
+        d = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sample_comfyui_workflows")
         def load(name):
             with open(os.path.join(d, name)) as f:
                 return json.load(f)

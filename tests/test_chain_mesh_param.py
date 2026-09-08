@@ -5,7 +5,7 @@ all) and deliver a stale/WRONG mesh as a "done" job. main._chain_mesh_param_erro
 the guard that turns that into an up-front failure, and it is pure over the successor
 candidate — these tests pin it for both successor kinds.
 
-Run: python -m unittest test_chain_mesh_param -v
+Run: python -m unittest tests.test_chain_mesh_param -v
 """
 import os
 import sys
@@ -15,7 +15,7 @@ import unittest
 # `import main` reads ./config.yaml at import time — give it a minimal one in a temp cwd.
 # The dir is needed ONLY for that import, so it is removed in the same finally that
 # restores the cwd; leaving it to the finalizer raises a ResourceWarning under -W error.
-_here = os.path.dirname(os.path.abspath(__file__))
+_here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # repo root (tests/ is one level down)
 _prev = os.getcwd()
 _tmp = tempfile.TemporaryDirectory()
 with open(os.path.join(_tmp.name, "config.yaml"), "w") as _f:

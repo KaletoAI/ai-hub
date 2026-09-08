@@ -8,7 +8,7 @@ out of rotation for 15 minutes; and a cloud candidate that fails over would re-r
 task the vendor already BILLED — none of it raises, and none of it shows up anywhere
 except as a bill or an idle GPU.
 
-Run: venv/bin/python -m unittest test_run_job_failover -v
+Run: venv/bin/python -m unittest tests.test_run_job_failover -v
 """
 import asyncio
 import json
@@ -20,7 +20,7 @@ import types
 import unittest
 
 # `import main` reads ./config.yaml at import time — give it a minimal one in a temp cwd.
-_here = os.path.dirname(os.path.abspath(__file__))
+_here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # repo root (tests/ is one level down)
 _prev = os.getcwd()
 _tmp = tempfile.TemporaryDirectory()
 with open(os.path.join(_tmp.name, "config.yaml"), "w") as _f:

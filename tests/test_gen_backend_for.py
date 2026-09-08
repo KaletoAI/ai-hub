@@ -5,7 +5,7 @@ job then fails opaquely inside the wrong adapter. These tests pin the two lookup
 decide the kind: main._gen_backend_for (routing/cancel) and admin._same_kind (the editor's
 "which backends may I add" filter).
 
-Run: python -m unittest test_gen_backend_for -v
+Run: python -m unittest tests.test_gen_backend_for -v
 """
 import os
 import sys
@@ -15,7 +15,7 @@ import unittest
 # `import main` reads ./config.yaml at import time — give it a minimal one in a temp cwd.
 # The dir is needed ONLY for that import, so it is removed in the same finally that
 # restores the cwd; leaving it to the finalizer raises a ResourceWarning under -W error.
-_here = os.path.dirname(os.path.abspath(__file__))
+_here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # repo root (tests/ is one level down)
 _prev = os.getcwd()
 _tmp = tempfile.TemporaryDirectory()
 with open(os.path.join(_tmp.name, "config.yaml"), "w") as _f:

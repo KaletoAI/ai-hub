@@ -7,7 +7,7 @@ completion (tens of GPU-minutes for a mesh), and only the /view fetch afterwards
 reports "produced no mesh". Node-id drift between two revisions of the same
 workflow is the everyday cause.
 
-Run: venv/bin/python -m unittest test_chain_export_node -v
+Run: venv/bin/python -m unittest tests.test_chain_export_node -v
 """
 import unittest
 

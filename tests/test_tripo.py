@@ -1,4 +1,4 @@
-"""Unit tests for tripo.py — run: /home/dev/projekte/llm-gateway/venv/bin/python -m unittest test_tripo -v"""
+"""Unit tests for tripo.py — run: venv/bin/python -m unittest tests.test_tripo -v"""
 import unittest
 
 import cloudtask

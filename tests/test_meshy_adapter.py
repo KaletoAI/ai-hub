@@ -1,5 +1,5 @@
 """Adapter I/O tests for MeshyAdapter against a local HTTP stub.
-run: /home/dev/projekte/llm-gateway/venv/bin/python -m unittest test_meshy_adapter -v"""
+run: venv/bin/python -m unittest tests.test_meshy_adapter -v"""
 import asyncio
 import json
 import threading
