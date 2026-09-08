@@ -1,7 +1,10 @@
 # AI-Hub — example config.
 # Copy to config.yaml and edit. config.yaml is gitignored.
 
-# Port (used by the systemd unit; uvicorn is launched separately, see ai-hub.service)
+# Port — INFORMATIONAL ONLY. The listening port is set by the launch command
+# (`uvicorn --port`, hard-coded in ai-hub.service); this value is merely displayed in
+# the /ui Server tab so the console can show what the gateway is supposed to be on.
+# Change the port in ai-hub.service (or your uvicorn command line), then here to match.
 port: 4000
 
 # Master/admin API key. Clients send it as `Authorization: Bearer <key>`; it also
@@ -10,7 +13,9 @@ port: 4000
 # are managed in the /ui Users tab (stored encrypted in store.db), not here.
 api_key: "sk-change-me"
 
-# How often (seconds) each backend's /v1/models is polled for liveness + model discovery.
+# How often (seconds) every enabled backend is polled for liveness + discovery. What is
+# polled depends on the type: /v1/models for LLM backends, /object_info for ComfyUI,
+# the credit balance for a cloud mesh backend (Meshy/Tripo).
 health_check_interval: 30
 
 # Per-request log lines (→ attempt, ← result with backend + status + duration).
@@ -35,10 +40,12 @@ model_prefix: true
 # Call parking (default): when EVERY backend that maps an alias is busy, the call
 # is held in a FIFO queue until one frees, instead of returning 503. No client
 # field is needed — a standard request just waits, then gets a 200 (or a 503 +
-# Retry-After if the wait runs out). All tunable live in the /ui Server tab too.
-# park_timeout_s: 60      # global default seconds a call may wait for a free backend
-# max_parked: 100         # queue cap; a busy call beyond this gets 503
-# Per-alias override (blank/absent = the global default above; 0 = parking off for
+# Retry-After if the wait runs out).
+# NOT config keys — these live in the /ui Server tab only (stored in store.db):
+#   park time         default 60 s   how long a call waits for a free backend (0 = off)
+#   max parked        default 100    queue cap; a busy call beyond this gets 503
+#   affinity max wait default 120 s  see "Scheduling" below
+# Per-alias override (blank/absent = the global default park time; 0 = parking off for
 # that alias). Also editable per chat alias in the /ui Mapping editor (`park_s`).
 # alias_park:
 #   fast: 10              # this alias waits at most 10s
@@ -47,21 +54,20 @@ model_prefix: true
 # Async LLM requests use the official OpenAI Responses background mode (no custom
 # field): POST /v1/responses {background:true} -> queued id -> poll GET
 # /v1/responses/{id} -> cancel POST /v1/responses/{id}/cancel. The background
-# worker parks in the same queue, up to:
-# async_park_timeout_s: 600
+# worker parks in the same queue, for up to 600 s (`async_park_timeout_s`, a default
+# in main.py — neither a config key nor a Server-tab field).
 # A parked generation job whose backends briefly ALL go unhealthy (e.g. a busy
-# ComfyUI dropping its discovery poll mid-render) rides out the flap for this long
-# before it's declared "no healthy backend"; a genuinely-offline alias still fails
-# after it (not the full park deadline).
-# park_health_grace_s: 90
+# ComfyUI dropping its discovery poll mid-render) rides out the flap for 90 s before
+# it's declared "no healthy backend"; a genuinely-offline alias still fails after it
+# (not the full park deadline). Also a main.py default (`park_health_grace_s`), not
+# a setting.
 #
 # Scheduling: every request queues, and the fastest free UNPAID candidate takes it
 # (speed = measured tok/s per LLM backend, seconds per media alias+backend; never
 # measured = probed first). A backend that frees up prefers the oldest waiter of the
 # type it just ran, so the loaded model/workflow stays loaded. This may hold a queued
 # request back at most affinity_max_wait_s seconds; beyond that it is "overdue" and
-# the next free capable backend takes it, strictly oldest-first. Server tab too.
-# affinity_max_wait_s: 120
+# the next free capable backend takes it, strictly oldest-first. Server tab only.
 
 # Optional call-stats sink: SQLite DB; the dashboard is built into the /ui console
 # (Statistic tab) — no separate server/port anymore. When enabled, every call is
@@ -74,6 +80,8 @@ stats:
   enabled: false
   db_path: stats.db
   retention_days: 0   # 0 = keep forever; otherwise prune older rows hourly
+  # blob_dir: calls   # full request/response bodies live here as files, never in the
+  #                   # DB; they are pruned together with their rows
 
 # Backends. The list order is display order only — the scheduler decides who runs
 # what (see affinity_max_wait_s above).
@@ -87,14 +95,31 @@ stats:
 #                     llama.cpp server run with `--parallel 1`, high/unset for a
 #                     cloud API that handles concurrency itself.
 #   local           → ALSO list this backend's models bare (without the
-#                     `<backend>/` prefix), alongside the prefixed id. A bare
-#                     request then routes across every `local` backend
-#                     that serves it — same failover as a virtual alias. Does not
-#                     affect model_prefix; the prefixed id stays listed too.
+#                     `<backend>/` prefix) in /v1/models, alongside the prefixed id.
+#                     Listing only: a bare id is ALWAYS routed across every backend
+#                     that exposes it (same failover as a virtual alias), whether or
+#                     not they are `local` — this flag just makes the id discoverable
+#                     to clients that read the catalog. Does not affect model_prefix;
+#                     the prefixed id stays listed too.
+#   host            → group several backends onto one physical box for the per-host GPU
+#                     policies (Hosts panel); default = the URL's address
+#   priority        → sorts the backend LIST only — it has routed nothing since the
+#                     2026-09-01 scheduler spec (default 100)
 backends:
   - name: local-gpu
     url: http://192.168.1.10:8080      # e.g. llama-swap, llama.cpp server, vLLM, …
     max_concurrent: 1                   # single-slot llama.cpp → 1 request at a time
+    # host: gpu-box                     # this backend shares a GPU box with others
+    # priority: 100                     # display order in the backend list, nothing else
+    # sampling_defaults:                # folded in per backend for the keys the client
+    #   temperature: 0.85               # AND the alias left unset (text endpoints only;
+    #   min_p: 0.05                     # a non-dict value is warned about and ignored)
+    # stream_reasoning_as_content: ["gemma-4*"]   # model globs whose streamed `reasoning`
+    #                                   # deltas are relabelled `content` (LocalAI marks
+    #                                   # every delta as reasoning after a thinking marker)
+    # prompt_cache: true                # keep Claude Code's `cache_control` breakpoints
+    #                                   # when translating /v1/messages for this chat
+    #                                   # backend (OpenRouter → Anthropic/Gemini models)
 
   - name: local-cpu
     url: http://192.168.1.11:8080
@@ -152,7 +177,7 @@ virtual_models:
     local-cpu:   "gemma-3-9b-it"
     # together:  "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo"
 
-# ── Generation (image / video / TTS) — Phase 1 ────────────────────────────────
+# ── Generation backends (image / video / audio / 3D) ──────────────────────────
 # A ComfyUI backend speaks a different protocol than OpenAI, so it declares
 # `type: comfyui`. Discovery uses /object_info (not /v1/models); dispatch submits
 # a parametrized workflow and polls /history. Optional per-backend knobs:
@@ -162,7 +187,18 @@ virtual_models:
 #                       or /view read fails fast → failover, not a max_wait stall
 #   disconnect_grace  → seconds of continuous unreachability tolerated mid-run before
 #                       failing over to the next candidate (default 30)
-# (Backends still take `paid`, `enabled`, `max_concurrent` like any other.)
+#   stuck_after_s     → executor watchdog: the same head prompt pending with an idle
+#                       executor for this long marks the backend DOWN (default 90) —
+#                       ComfyUI answers HTTP even when its prompt worker has died
+#   auto_restart      → opt-in: reboot ComfyUI via ComfyUI-Manager when that fires
+#   restart_cooldown_s → at most one auto-restart attempt per this many seconds (600)
+#   self_retries      → extra attempts on the SAME generation backend before failing
+#                       over (default 0; the in-flight slot is held across them)
+#   comfy_output_dir  → ComfyUI's output dir on that host — needed for a `relay: path`
+#                       chain hand-off (both stages on one backend, shared disk)
+#   comfy_input_dir   → its input dir, for a `relay: upload` hand-off; blank = derived
+#                       from comfy_output_dir's `…/input` sibling
+# (Backends still take `paid`, `enabled`, `max_concurrent`, `host` like any other.)
 #
 #   - name: ct452-comfy
 #     type: comfyui
@@ -170,6 +206,11 @@ virtual_models:
 #     max_concurrent: 1               # one generation at a time on this GPU
 #     poll_interval: 1.0
 #     max_wait: 600
+#     comfy_output_dir: /opt/ComfyUI/output   # enables a `relay: path` chain hand-off
+#     stuck_after_s: 90               # executor watchdog threshold
+#     auto_restart: true              # let the gateway reboot it when the watchdog fires
+#     restart_cooldown_s: 600         # …at most once per 10 minutes
+#     self_retries: 1                 # one retry here before the job fails over
 #
 # Meshy.ai is the second generation backend type: a cloud task API (image → 3D and
 # multi-image → 3D), billed per task in credits, so it is ALWAYS paid — the scheduler
@@ -202,9 +243,10 @@ virtual_models:
 #
 # The third endpoint, `rigging`, takes a MESH instead of an image (5 credits): the
 # client sends it as files.input_mesh_path (a binary .glb of a biped) and gets back
-# Meshy's own skeleton. Its only client params are input_name and input_height_m
-# (default 1.7); rigging knows glb/fbx and nothing else, and `animations: true`
-# delivers Meshy's walking/running clips as extra artifacts.
+# Meshy's own skeleton. Its client params are input_name and input_height_m (default
+# 1.7) — plus input_no_fingers, which is advertised but inert; rigging knows glb/fbx
+# and nothing else, and `animations: true` delivers Meshy's walking/running clips as
+# extra artifacts.
 #   "Meshy-Rig":
 #     - backend: meshy
 #       task: mesh2rig
@@ -306,15 +348,18 @@ virtual_models:
 #         # keep_from_mesh: ["preview.png"]   # stage-1 files to ship along
 
 # Generation aliases: the `model` field of a POST /v1/generations request. Each
-# maps to a list of candidates (the fastest free unpaid one is used;
-# cross-candidate failover + VRAM coordination come in later phases). A candidate
+# maps to a list of candidates — the fastest free unpaid one runs the job, an
+# execution error fails over to the next, and a backend that keeps failing is
+# quarantined for 15 min (see the Backends tab). VRAM on a shared GPU box is freed
+# before a job whose model set differs from the last one (per-host policy). A candidate
 # names the backend, the task, the workflow file (API-format JSON), and optionally
 # a model/checkpoint to inject into the workflow's loader node.
 # `mapping` binds logical params to concrete workflow nodes+fields, e.g.
 # "prompt → node 6, field text". This is convention-FREE: it works with any
 # workflow regardless of how its nodes are named. Omit `mapping` to let the
 # gateway auto-detect via naming heuristics (fine for templated workflows; the
-# explicit form always wins). Later a "register workflow" UI will author these.
+# explicit form always wins). The /ui Mapping tab authors these for you — paste a
+# workflow's API JSON and it pre-fills the bindings from the same heuristics.
 # image_models:
 #   "flux":
 #     - backend:  ct452-comfy
@@ -330,6 +375,35 @@ virtual_models:
 #         cfg:             {node: "3",  field: "cfg"}
 #         seed:            {node: "3",  field: "seed"}
 #         model:           {node: "4",  field: "unet_name"}
+#         # A mapping entry may also carry a `label` — the param's PUBLIC api name.
+#         # Incoming values are accepted under the label OR the param name, and the
+#         # auto-random seed keys on whichever is effective:
+#         # noise:         {node: "3",  field: "noise_seed", label: "seed"}
+#         # An image slot decides what happens when the client leaves it empty
+#         # (`placeholder` = the shared 72-byte dummy, `required` = 400, `disable` =
+#         # prune the whole dead branch behind it), and may name extra nodes the
+#         # prune cannot take but that must not run on nothing either:
+#         # input_image:   {node: "10", field: "image", on_empty: "disable",
+#         #                 on_empty_bypass: ["34"]}
+#       # workflow_json: {...}                 # the workflow INLINE instead of a file
+#       #                                      # path — what the /ui Mapping editor writes
+#       # fixed:                               # PER-BACKEND pinned values; a pin is
+#       #   - {node: "4", field: "unet_name", value: "flux1-dev-Q8_0.gguf"}
+#       #                                      # authoritative — no API param overrides it
+#       # bypass: ["12", "13"]                 # PER-BACKEND node ids removed and rewired
+#       #                                      # (ComfyUI mode 4)
+#       # output_node: "9"                     # which node's files are the delivery
+#       # output_ext: glb                      # prefer the same-stem sibling with this ext
+#       # output_globs: ["*.png"]              # unconditional extra files to ship
+#       # output_cases: [...]                  # conditional deliveries, fetched once each
+#       # texture_format: jpeg                 # transcode a generic texture PNG to JPEG q90
+#       # dummy_check: false                   # opt out of the placeholder-image check (on)
+#       # successor:                           # workflow chain — deliver ONLY stage 2
+#       #   alias: mesh-mia                    # (same fields as the Meshy/Tripo examples
+#       #   mesh_param: input_mesh_path        #  above: alias, export_node, mesh_param,
+#       #   export_node: "31"                  #  relay, keep_from_mesh, rig)
+#       #   relay: path                        # path (one backend, shared disk) | upload
+#       #   rig: mixamo
 #   "sdxl":
 #     - backend:  ct452-comfy                # no `mapping` → auto-detected
 #       task:     text2img
@@ -340,6 +414,7 @@ virtual_models:
 # set. Sync requests also get their result inline; the cached copy stays until TTL.
 # Optional in config — the Server tab in /ui manages these too (stored override).
 # jobs:
+#   enabled: true                # force the job store on without any image_models
 #   db_path: jobs.db
 #   blob_dir: jobs               # artifact files live under jobs/<id>/<n>.<ext>
 #   default_ttl_s: 86400         # how long a result stays retrievable (24h)
@@ -348,8 +423,9 @@ virtual_models:
 
 # Management console: a server-rendered UI mounted at /ui on the main port. Manage
 # backends, chat + generation aliases, workflow mappings, users, and server settings;
-# run a chat/image playground; watch jobs, stats, and the live routing map. Auto-on
-# whenever the store is (image_models set, or jobs.enabled: true, or any user exists).
+# run a chat/image playground; watch jobs, stats, and the live routing map. Always on
+# (the writable store comes up with the gateway); the generation JOB store is what
+# needs image_models or jobs.enabled: true.
 # The store (store.db) is seeded once from this config, then becomes the source of
 # truth — so you can run mostly from config OR mostly from the console.
 #
