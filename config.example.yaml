@@ -55,12 +55,13 @@ model_prefix: true
 # field): POST /v1/responses {background:true} -> queued id -> poll GET
 # /v1/responses/{id} -> cancel POST /v1/responses/{id}/cancel. The background
 # worker parks in the same queue, for up to 600 s (`async_park_timeout_s`, a default
-# in main.py — neither a config key nor a Server-tab field).
+# in main.py — neither a config key nor a Server-tab field; `apply_server_settings`
+# would honour a stored settings row of that name, but no form writes one).
 # A parked generation job whose backends briefly ALL go unhealthy (e.g. a busy
 # ComfyUI dropping its discovery poll mid-render) rides out the flap for 90 s before
 # it's declared "no healthy backend"; a genuinely-offline alias still fails after it
-# (not the full park deadline). Also a main.py default (`park_health_grace_s`), not
-# a setting.
+# (not the full park deadline). Also a main.py default (`park_health_grace_s`),
+# readable from a stored settings row the same way — but with no form to write one.
 #
 # Scheduling: every request queues, and the fastest free UNPAID candidate takes it
 # (speed = measured tok/s per LLM backend, seconds per media alias+backend; never

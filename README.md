@@ -192,8 +192,8 @@ narrows by namespace too.
 - **`quota_cost_month`** — summed USD cost for the month (from the stats log) →
   blocked when exceeded. Needs stats enabled and priced backends; streaming calls
   are costed from the backend's usage chunk (the gateway always requests
-  `stream_options.include_usage`) and count as `0` only on a backend that reports
-  nothing.
+  `stream_options.include_usage`) and fall back to gateway estimates only on a
+  backend that reports nothing.
 
 ---
 
@@ -1110,7 +1110,10 @@ stats:
 - **Source** is the authenticated user, else the `X-Source` header, else client IP
   (IP aliases give those friendly names; reverse-DNS is auto-resolved).
 - **Streaming** calls record real tokens when the backend honors
-  `stream_options.include_usage` (requested automatically), else `0`.
+  `stream_options.include_usage` (requested automatically); a backend that reports
+  nothing — or all-zero usage, as LocalAI does — is replaced by gateway estimates
+  (content-bearing deltas ≈ completion tokens, ~chars/4 for the prompt), never by
+  `0`, so a priced backend still books a cost.
 - The applied **reasoning control** is logged per call (LLM Calls tab column).
 - **Refused calls are logged too** — a request turned away before any backend saw
   it (no healthy backend, park timeout, quota exceeded, unknown alias, bad key)
