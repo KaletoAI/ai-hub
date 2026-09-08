@@ -691,7 +691,7 @@ def reload_config() -> None:
     log_config_summary()
 
 
-async def watch_config(path: str, on_change: Callable[[], None]) -> None:
+async def watch_config(path: "str | Path", on_change: Callable[[], None]) -> None:
     """Call `on_change` once per save of `path`, for the life of the process.
 
     Watches the config's DIRECTORY and filters events down to the one file, because an
@@ -718,8 +718,10 @@ async def watch_config(path: str, on_change: Callable[[], None]) -> None:
     one entry when the path is not a link) and an event matching EITHER identity counts.
     `target` is computed once at start: after the link has been replaced, `resolve()`
     returns the lexical path itself, and the lexical arm of the filter is what keeps
-    later in-place edits of the now-regular file visible (the old target's parent stays
-    watched, which is harmless).
+    later in-place edits of the now-regular file visible. The old target's parent stays
+    watched and an edit of the orphaned target still triggers one (idempotent) reload —
+    a log line, nothing more. The mirror case is NOT covered on purpose: a config that
+    BECOMES a symlink after start keeps only the lexical arm.
     """
     lexical = Path(path).absolute()      # where the operator's editor writes
     target = lexical.resolve()           # where the bytes live (== lexical when not a link)
@@ -730,8 +732,8 @@ async def watch_config(path: str, on_change: Callable[[], None]) -> None:
             return True
         try:
             return q.resolve() == target
-        except OSError:                  # vanished mid-batch — it cannot be our file now
-            return False
+        except (OSError, RuntimeError):  # a symlink LOOP raises RuntimeError; an exception
+            return False                 # out of a watch_filter kills the awatch silently
 
     async for _ in awatch(*{lexical.parent, target.parent}, recursive=False,
                           watch_filter=_is_config):

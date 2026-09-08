@@ -52,7 +52,9 @@ finally:
     del _tmp
 
 SETTLE = 0.5        # watchfiles groups changes over `step` = 50 ms; 0.5 s is ten of those —
-                    # 0.3 s under-groups on a starved box, splitting one save over two ticks
+                    # 0.3 s can let two saves land in ONE batch on a starved box, and two
+                    # saves counted as one reads exactly like the bug (assertGreaterEqual
+                    # tolerates a split, never a merge)
 
 
 def _write(path: str, text: str) -> None:
