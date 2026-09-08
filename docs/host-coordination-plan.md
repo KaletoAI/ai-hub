@@ -122,10 +122,15 @@ nicht entschieden, was als Nächstes kommt, also ist jede Antwort geraten. Beim
 **Claim** ist sie bekannt. Deshalb ist die Hauptregel jetzt
 `comfy_free_before_job` (default an für JEDE ComfyUI-Box, auch dedizierte):
 sobald ein Job ein Backend beansprucht (`main._claim_gen_backend`), wird
-`POST /free` **awaited** ausgeführt, wenn der Type-Key (Media: der Alias, also
-ein Workflow = ein Modellsatz) ein **anderer** ist als der zuletzt dort
-gelaufene. Gleicher Alias → Cache bleibt; genau das ist die Auszahlung der
-Alias-Affinität aus `scheduler.designated_taker`. Verglichen wird dabei nicht
+`POST /free` **awaited** ausgeführt, wenn der **Modellsatz** des Requests ein
+**anderer** ist als der zuletzt dort geladene. Der Modellsatz ist nicht der Alias
+(der war es zuerst — falsch in beide Richtungen: `trellis2_high`/`_low` laden
+dasselbe `TRELLIS.2-4B` und wurden bei jedem Wechsel entladen, ein per Mapping
+gewähltes Modell unter EINEM Alias nie), sondern `scheduler.model_set_key`: die
+Gewichtsnamen der Loader-Nodes nach Pins/Mapping/LoRAs
+(`ComfyUIAdapter.model_set_key`), Alias nur als Fallback. Gleicher Satz → Cache
+bleibt; die Alias-Affinität aus `scheduler.designated_taker` bleibt davon
+unberührt (sie steuert Zuteilung, nicht das Freigeben). Verglichen wird dabei nicht
 der Affinitäts-Key `backend_last_key`, sondern `backend_vram_key` — was die GPU
 nachweislich HÄLT, geschrieben aus dem Ergebnis des Free (`_comfy_free` liefert
 ein Urteil), nie aus dem Versuch: ein fehlgeschlagener oder wegen eines laufenden

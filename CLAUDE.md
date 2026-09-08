@@ -769,7 +769,8 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   all that backend's models); image aliases are included; `?type=chat|image`.
 - **Alias/model-name collisions** (`alias_model_conflicts`): surfaced in `/health`
   + Routing tab, split `covered` vs actionable `shadowed`.
-- **Host coordination** (shared-GPU boxes; `docs/host-coordination-plan.md`):
+- **Host coordination** (every box with a ComfyUI backend — the LLM-vs-media policies
+  matter on SHARED boxes, the VRAM policy on all; `docs/host-coordination-plan.md`):
   backends group by physical box (`backend_host`: explicit `host` field, else URL
   IP → `backend_hosts`/`host_backends`, shown in `/health` and the Backends tab's
   Hosts panel). Per-host policies (store settings `hosts`, cached `hosts_meta`):
@@ -779,12 +780,20 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   **VRAM is freed BEFORE a job, not after it** — ComfyUI never releases its model
   cache by itself, and at job END nobody knows yet what comes next, so the answer
   was always guessed. At CLAIM it is known: `_claim_gen_backend(backend, key)`
-  records the affinity key `backend_last_key` (media: the alias = one workflow = one
-  model set) and, when what the GPU HOLDS (`backend_vram_key`) differs, AWAITS the free
+  records the affinity key `backend_last_key` (media: the alias) and, when what the GPU
+  HOLDS (`backend_vram_key`) differs from what the request will LOAD, AWAITS the free
   before the prompt goes out (`scheduler.free_vram_before_job`, pure +
   `test_scheduler.py`; host flag `comfy_free_before_job`, default on for EVERY ComfyUI
-  box). Same alias → the cache stays, which is the payoff of `designated_taker`'s alias
-  affinity. The two keys are separate on purpose: `backend_vram_key` is written from
+  box). What it loads is the **model-set key** — `scheduler.model_set_key` over the
+  workflow's loader nodes (class /load/ minus image/mask/mesh/path loaders; only their
+  STRING-valued weight inputs — name/model/ckpt/unet/clip/vae/lora/gguf — never node
+  ids, links, dtype/device/`keep_models_loaded`), computed by
+  `ComfyUIAdapter.model_set_key(req)` AFTER pins, the LoRA list/cascade and the mapped
+  params, so the request is built before the claim. The alias was the key at first and
+  is wrong both ways: `img2mesh-trellis2_high`/`_low` both load `microsoft/TRELLIS.2-4B`
+  and were freed+reloaded on every switch, while a mapped model choice or a LoRA under
+  ONE alias never freed. Alias stays the FALLBACK (no loader recognised) and the
+  affinity key. The two records are separate on purpose: `backend_vram_key` is written from
   the free's VERDICT (`_comfy_free` returns one), never from the attempt — a failed or
   skipped free leaves it `None`, and `None` (unknown, or two aliases' sets mixed by a
   job in flight, or a gateway restart — which never empties ComfyUI's VRAM) counts as
@@ -801,7 +810,10 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   `CUDA out of memory. Tried to allocate 20.00 MiB` with 21.4 of 23.5 GiB held by
   the ComfyUI process, and Make-It-Animatable runs in its OWN venv/process, so it can
   never share that cache). The after-job free (`_free_comfy_vram`, flag
-  `comfy_free_after_job`, default on for shared hosts only) survives for its one
+  `comfy_free_after_job`, default on for shared hosts only — all four host flags and
+  their defaults live in ONE table, `scheduler.HOST_FLAGS`, read by `main._host_flag`,
+  the console's host form/panel and `host_save`, and `host_save` derives "shared" from
+  the LIVE backend list, never from a hidden form field) survives for its one
   remaining purpose — a shared box must free even when NO media job follows, or the
   next llama-swap load aborts — and skips when the waiter the scheduler will hand
   this backend next (`_designated_gen_waiter`, so `exclude`/force/LoRA eligibility

@@ -2618,9 +2618,10 @@ async def _wait_backend_up(backend: dict, timeout_s: float = 30.0) -> None:
             pass
 
 
-def _host_flag(host: str, key: str, default: bool) -> bool:
-    v = (hosts_meta.get(host) or {}).get(key)
-    return default if v is None else bool(v)
+def _host_flag(host: str, key: str) -> bool:
+    """A host's GPU-policy flag: stored value, else the default `scheduler.HOST_FLAGS`
+    gives it (the console reads the same table — one answer for an untouched host)."""
+    return scheduler.host_flag(hosts_meta.get(host), key, _shared_host(host))
 
 
 def _shared_host(host: str) -> bool:
@@ -2673,9 +2674,13 @@ async def _comfy_free(backend: dict, why: str, settle_s: float = 0.0,
     url = (backend.get("url") or "").rstrip("/")
     name = backend.get("name")
     body = {"unload_models": True, "free_memory": True}
+    # 5 s: the POST only sets two flags and answers in milliseconds when the box is
+    # alive. This call is AWAITED on the claim path with the slot already held, so a
+    # box whose HTTP layer is gone must cost one short timeout there, not 30 s per
+    # phase before generate() spends its own (review 2026-09-08).
     before = await _comfy_vram_reserved(url) if settle_s > 0 else None
     try:
-        await http_client.post(f"{url}/free", json=body, timeout=30.0)
+        await http_client.post(f"{url}/free", json=body, timeout=5.0)
     except Exception as e:
         logger.warning(f"host: /free on [{name}] failed: {e}")
         return False
@@ -2704,16 +2709,28 @@ async def _comfy_free(backend: dict, why: str, settle_s: float = 0.0,
                 logger.info(f"host: /free on [{name}] not repeated — {why} no longer applies")
                 return False
             try:
-                await http_client.post(f"{url}/free", json=body, timeout=30.0)
+                await http_client.post(f"{url}/free", json=body, timeout=5.0)
                 last_post = now
             except Exception as e:
                 logger.warning(f"host: /free on [{name}] failed: {e}")
                 return False
 
 
-async def _claim_gen_backend(backend: dict, key: str) -> None:
+def _model_set_key(adapter, req) -> Optional[str]:
+    """The request's VRAM key from the adapter that will run it, None for one that
+    has no notion of it (a cloud task API) — see _claim_gen_backend."""
+    fn = getattr(adapter, "model_set_key", None)
+    return fn(req) if callable(fn) else None
+
+
+async def _claim_gen_backend(backend: dict, key: str, vram_key: Optional[str] = None) -> None:
     """Record the type key a generation backend now runs AND, for ComfyUI, free its
-    VRAM first when that key CHANGED (scheduler.free_vram_before_job).
+    VRAM first when the MODEL SET changed (scheduler.free_vram_before_job).
+
+    `vram_key` is what the request will load (`ComfyUIAdapter.model_set_key` →
+    `scheduler.model_set_key`: the loader nodes' weight names after pins/mapping/LoRAs),
+    falling back to the alias `key` when nothing recognisable is loaded. The alias
+    alone was the key at first — wrong both ways, see `scheduler.model_set_key`.
 
     This is the one moment where the question can be answered instead of guessed:
     the job is claimed, so what comes next is decided. Freeing after a job is the
@@ -2743,12 +2760,13 @@ async def _claim_gen_backend(backend: dict, key: str) -> None:
     backend_last_key[bid] = key
     if backend.get("type") != "comfyui":
         return                      # a cloud task API has no VRAM to free / no host siblings
+    key = vram_key or key
     held = backend_vram_key.get(bid)
     host = backend_hosts.get(bid, "")
     if not scheduler.free_vram_before_job(
             held, key,
             others_inflight=max(0, backend_inflight.get(bid, 0) - 1),   # our own slot is held
-            enabled=_host_flag(host, "comfy_free_before_job", True)):
+            enabled=_host_flag(host, "comfy_free_before_job")):
         if held != key:
             backend_vram_key[bid] = None   # our set joins whatever is there → nobody knows
         return
@@ -2777,7 +2795,7 @@ async def _free_comfy_vram(backend: dict, why: str) -> None:
         return                      # a cloud task API has no VRAM to free / no host siblings
     bid = backend_id(backend)
     host = backend_hosts.get(bid, "")
-    if not _host_flag(host, "comfy_free_after_job", _shared_host(host)):
+    if not _host_flag(host, "comfy_free_after_job"):
         return
     if backend_inflight.get(bid, 0) > 0:
         return
@@ -2807,7 +2825,7 @@ async def _unload_host_llms(backend: dict) -> None:
         return                      # a cloud task API has no VRAM to free / no host siblings
     bid = backend_id(backend)
     host = backend_hosts.get(bid, "")
-    if not _host_flag(host, "llm_unload_before_media", False):
+    if not _host_flag(host, "llm_unload_before_media"):
         return
     for obid in host_backends.get(host, ()):
         if not obid.startswith("openai:"):
@@ -2858,12 +2876,13 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req) -> None
             for attempt in range(1, tries + 1):
                 attempts += 1
                 try:
-                    # Type affinity + an empty GPU when the alias changed (see
-                    # _claim_gen_backend). A self-retry re-runs the same key → no free.
-                    await _claim_gen_backend(backend, alias)
-                    await _unload_host_llms(backend)   # opt-in host policy, no-op by default
                     req = build_req(backend, cand)
                     req.slot_held = True               # we hold it — generate() must not double-count
+                    # Type affinity + an empty GPU when the MODEL SET changed (see
+                    # _claim_gen_backend); the request is built first because the key
+                    # is what it loads. A self-retry re-runs the same key → no free.
+                    await _claim_gen_backend(backend, alias, _model_set_key(adapter, req))
+                    await _unload_host_llms(backend)   # opt-in host policy, no-op by default
                     t0 = time.monotonic()
                     out = await adapter.generate(req)
                     _record_gen_attempt(bid, conn_fail=False)
@@ -3250,8 +3269,6 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
             await asyncio.to_thread(jobs.set_stage, job_id, "1/2")   # multi-stage progress → "running 1/2"
             try:
                 _apply_seconds(params, stage1_cand)     # no-op re-derive (endpoint validated it)
-                await _claim_gen_backend(backend, alias)  # type affinity + free VRAM on a key change
-                await _unload_host_llms(backend)        # opt-in host policy, no-op by default
                 # ── Stage 1: mesh (pin the export filename; ignore its own outputs) ──
                 req1 = NormalizedRequest(
                     alias=alias, real_model=stage1_cand.get("model"),
@@ -3265,6 +3282,10 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                     upload_files=dict(upload_files or {}),
                     upload_prefix=_upload_prefix(job_id, "s1"), job_id=job_id,
                     loras=body.get("loras"), slot_held=True)
+                # type affinity + free VRAM when the model set changes (keyed on what
+                # req1 loads, hence after it is built)
+                await _claim_gen_backend(backend, alias, _model_set_key(adapter, req1))
+                await _unload_host_llms(backend)        # opt-in host policy, no-op by default
                 # runbook B: retry a sporadic fault on the SAME backend first — the held
                 # slot (`held`) spans the repeats; the last attempt re-raises into the
                 # existing stage-1 failover (next candidate via `tried`).
@@ -3404,7 +3425,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 # two different workflows, and the second one (a rigger) may not even
                 # run in ComfyUI's process — measured on Meshy→mesh-mia, where stage 2
                 # OOM'd on the 21 GiB stage 1 left behind (job cc604da29e0e).
-                await _claim_gen_backend(backend2, succ_alias)
+                await _claim_gen_backend(backend2, succ_alias, _model_set_key(adapter2, req2))
                 await _unload_host_llms(backend2)
                 gen_attempts += 1
                 t2 = time.monotonic()

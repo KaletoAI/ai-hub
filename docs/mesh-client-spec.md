@@ -184,7 +184,7 @@ bei Bildern mit sauberem Alphakanal auf false setzbar), `input_no_fingers` (bool
 | `Trellis2-Generic-High`, `Trellis2-Humanoid-High` | 20000 | 1024 | höchste Qualität, längste Laufzeit |
 | `Trellis2-Generic-Low`, `Trellis2-Humanoid-Low`, `Trellis2-Object-Low` | 20000 | 1024 | schnellere Pipeline |
 | `Pixal3D-Generic`, `Pixal3D-Humanoid`, `Pixal3D-Object` | 50000 | 2048 | höchste Auflösung |
-| `Hunyuan3D-Generic`, `Hunyuan3D-Humanoid`, `Hunyuan3D-Object` | 40000 | 1024 | ⚠ **`input_face_num` nie über 40000** — größere Werte frieren das Backend ein (kein Fehler, der Job hängt bis zum Timeout). 40000 ist der höchste nachweislich stabile Wert. `-Object` liefert zusätzlich frei wählbare LOD-Stufen, siehe unten. |
+| `Hunyuan3D-Generic`, `Hunyuan3D-Humanoid`, `Hunyuan3D-Object` | 40000 | 1024 | ⚠ **`input_face_num` nie über 40000** — größere Werte frieren das Backend ein (kein Fehler, der Job hängt bis zum Timeout). 40000 ist der höchste nachweislich stabile Wert. |
 | `Meshy-Object`, `Meshy-Multiview` | Meshy-Default (30000 bei Remesh) | 2048 | Cloud (Meshy.ai, bezahlt pro Task, nur als Fallback oder gezielt). `-Multiview` nimmt `input_image_front` (Pflicht) + optional `input_image_back` / `_left` / `_right`. Zusätzlich `input_texture_prompt` (string) und `input_pose` (`a-pose`/`t-pose`). `input_remove_background`/`input_no_fingers` werden angenommen, wirken nicht. Kein `files`-Upload (`400` — Bilder gehören unter `images`). Liefert `model.glb` (Texturen eingebettet) + `preview.png`. |
 | `Meshy-Humanoid`, `Meshy-Humanoid-Multiview` | wie oben | 2048 | Cloud-Mesh (t-pose) → **lokales** Rigging mit Make-It-Animatable, Kette wie `Trellis2-Humanoid-*`: Auslieferung ein `*_rigged.glb`, Job-Feld `rig: "mixamo"`, Speicher-Kontrakt der `-Humanoid`-Zeile in 3.1. `-Multiview` nimmt dieselben vier Bild-Slots wie `Meshy-Multiview`. |
 | `Meshy-Humanoid-Cloud` | wie oben | 2048 | Cloud-Mesh (t-pose) → **Cloud**-Rigging (`Meshy-Rig`, 3.5), das Mesh verlässt Meshy nie. Auslieferung `rigged.glb` (+ optionale Clips), Job-Feld `rig: "meshy"` — nicht normalisiert, nicht validiert (3.1). Ein mitgeschicktes `input_height_m` wird an die Rig-Stufe durchgereicht (Default 1.7 m); zwei Tasks = Mesh-Credits + 5 Credits. |
@@ -213,44 +213,15 @@ Quads, Ausgabeformate und das Vorschaubild sind Alias-Defaults des Betreibers. E
 `failed` Tripo-Task ist endgültig; `/v1/jobs/{id}/cancel` beendet nur den Gateway-Job —
 Tripo kennt in V3 keinen Cancel-Endpunkt und rechnet den Task ab.
 
-#### LOD-Stufen bei `Hunyuan3D-Object`
+#### LOD-Stufen (`input_lod_faces`) — zurückgezogen
 
-Dieser Alias liefert neben dem Hauptergebnis **beliebig viele reduzierte Fassungen**
-desselben Modells. Gesteuert wird das über den Parameter **`input_lod_faces`** —
-eine kommaseparierte Liste von Ziel-Dreieckszahlen, **als String gesendet**:
-
-```json
-"params": {"input_name": "Held", "input_face_num": 20000, "input_lod_faces": "8000,4000,2000"}
-```
-
-Ein einzelner Wert (`"5000"`, der Default) ist ebenso gültig. Die Stufen werden
-**nicht nachträglich verkleinert**, sondern aus denselben generierten Ansichten neu
-aufgebacken — jede ist qualitativ eigenständig und **selbsttragend** (Texturen
-eingebettet, keine Begleitdateien nötig). Der Job liefert **alle** angeforderten
-Stufen aus; was davon behalten wird, entscheidet der Client. Jede zusätzliche Stufe
-kostet nur wenige Sekunden.
-
-Regeln für die Auswertung:
-
-* **Dateiname = angeforderter Wert**, nicht der tatsächliche: `<name>_<zahl>.glb`.
-  Wer die echte Dreieckszahl braucht, liest sie aus dem GLB.
-* **Stufen oberhalb der Ausgangsgröße liefern eine Kopie in Originalgröße.**
-  `input_face_num` ist beim Hauptergebnis nur eine **Obergrenze**; liefert das
-  Modell von sich aus weniger, laufen darüberliegende Stufen ins Leere (gemessen:
-  Hauptergebnis 4.972 Dreiecke → `_8000.glb` enthält ebenfalls 4.972, `_4000.glb`
-  und `_2000.glb` treffen exakt).
-* **Die Reihenfolge in der Antwort ist alphabetisch nach Dateiname**, nicht die der
-  Eingabe: `"8000,4000,2000"` kommt als `_2000`, `_4000`, `_8000` zurück. Ordne über
-  den Dateinamen zu, nie über die Position.
-* **`input_name` pro Job eindeutig wählen.** Die Stufen liegen backendseitig unter
-  dem Namen; ein zweiter Lauf mit demselben Namen und weniger Stufen liefert die
-  älteren Stufen mit aus.
-* Die LOD-Dateien sind wegen der Textur-Einbettung als Data-URI oft **größer** als
-  das Hauptergebnis — sie sind nicht als „kleine Datei" gedacht, sondern als
-  geometrisch leichteres Modell.
-
-Erkennung in der Antwort: das Hauptergebnis endet auf `_00001_.glb`, die LOD-Dateien
-auf `_<zahl>.glb` (also Ziffer direkt vor der Endung).
+Der Parameter `input_lod_faces` (kommaseparierte Ziel-Dreieckszahlen, mehrere
+reduzierte Fassungen pro Job) existierte bis September 2026 nur auf `Hunyuan3D-Object`.
+Der Workflow trägt die LOD-Kette nicht mehr (Stand 2026-09-08); ein mitgeschickter
+Wert wird **stillschweigend ignoriert** — der Job liefert nur das Hauptergebnis, der
+Parameter erscheint nicht unter `applied`. Wer reduzierte Fassungen braucht, hängt
+`mesh-shrink` / `mesh-shrink-quad` (Abschnitt 1 der Workflow-README) als Folgestufe an
+oder dezimiert clientseitig.
 
 V-Flip und JPEG-Umkodierung (Abschnitt 2) greifen nur bei den
 `-Generic`-Aliasen; bei `-Object` und `-Humanoid` kommen die Karten unverändert

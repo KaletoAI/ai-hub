@@ -36,6 +36,8 @@ from typing import Any, Callable, Optional
 from urllib.parse import quote
 
 import httpx
+
+import scheduler
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
@@ -2673,6 +2675,32 @@ class ComfyUIAdapter(BackendAdapter):
         for nid in empty:
             wf[nid].setdefault("inputs", {})["image"] = name
         return empty
+
+    def model_set_key(self, req: NormalizedRequest) -> Optional[str]:
+        """What THIS request will load, as `scheduler.model_set_key` sees it — the
+        workflow after the same injections `generate()` applies to its loaders (pins,
+        the LoRA list/cascade, mapped params, label aliasing), minus the uploads and
+        the bypass resolution, which touch no weight set. Pure: no I/O, and the stored
+        workflow is copied first. None when nothing recognisable is loaded (the caller
+        keys on the alias then)."""
+        try:
+            wf = self._workflow_for(req)
+            fixed = [f for f in (req.fixed or []) if isinstance(f, dict)]
+            _apply_fixed(wf, fixed)
+            protected = {(f.get("node"), f.get("field")) for f in fixed if f.get("node") and f.get("field")}
+            values = _gen_values(req)
+            mapping = req.node_mapping or suggest_mapping(wf)
+            for prm, m in mapping.items():
+                lbl = ((m or {}).get("label") or "").strip()
+                if lbl and lbl != prm and lbl in values and prm not in values:
+                    values[prm] = values.pop(lbl)
+            _apply_lora_list(wf, mapping, req.loras or [], self.ctx.loras_of(self.bid))
+            _apply_lora_cascade(wf, values)
+            _apply_mapping(wf, mapping, values, protected)
+            return scheduler.model_set_key(wf, req.bypass or [])
+        except Exception as e:                      # a key is a hint, never a failure
+            logger.debug(f"model_set_key on [{self.name}] failed: {e}")
+            return None
 
     async def generate(self, req: NormalizedRequest) -> GenOutput:
         b = self.backend

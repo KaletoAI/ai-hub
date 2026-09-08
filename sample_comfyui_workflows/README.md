@@ -1,6 +1,6 @@
 # Mesh-Workflows — Ein- und Ausgaben
 
-Stand 2026-08-03. Die Tabellen sind aus den `*_api.json` erzeugt, nicht von Hand gepflegt.
+Stand 2026-09-08. Die Tabellen sind aus den `*_api.json` erzeugt, nicht von Hand gepflegt.
 
 **Dateiablage:** `<name>_api.json` = API-Format (das, was das Gateway einreicht, git-versioniert).
 `org/<name>.json` = UI-Format zum Bearbeiten in ComfyUI — **`org/` ist gitignored**, Sicherungen
@@ -47,6 +47,23 @@ und kollidiert in der Kette (siehe `main.py`, Kommentar zu `s2_params`).
 | `input_remove_background` | `61` | `value` | `True` | ja |
 | `input_no_fingers` | `66` | `value` | `False` | **nein** — Pass-through an Stage 2 |
 
+#### img2mesh-trellis2_multiview
+
+| Bindepunkt | Node | Feld | Default | wirkt im Graphen |
+|---|---|---|---|---|
+| `input_image_front` | `94` | `image` | — | ja |
+| `input_image_back` | `95` | `image` | — | ja |
+| `input_image_left` | `96` | `image` | — | ja |
+| `input_image_right` | `97` | `image` | — | ja |
+| `input_name` | `89` | `value` | `'kira'` | ja |
+| `input_face_num` | `90` | `value` | `50000` | ja |
+| `input_steps` | `91` | `value` | `35` | ja |
+| `input_remove_background` | `92` | `value` | `True` | ja |
+| `input_no_fingers` | `93` | `value` | `False` | **nein** — Pass-through an Stage 2 |
+
+Vier Bild-Slots; leere Seitenansichten werden über `on_empty: disable` samt ihrem
+Zweig entfernt (siehe CLAUDE.md, `_prune_branch`).
+
 #### img2mesh-Pixal3D
 
 | Bindepunkt | Node | Feld | Default | wirkt im Graphen |
@@ -64,7 +81,7 @@ und kollidiert in der Kette (siehe `main.py`, Kommentar zu `s2_params`).
 |---|---|---|---|---|
 | `input_image` | `58` | `image` | `'source.png'` | ja |
 | `input_name` | `47` | `value` | `''` | ja |
-| `input_num_gaussians` | `62` | `value` | `10000` | ja |
+| `input_num_gaussians` | `62` | `value` | `262144` | ja |
 | `input_texture_resolution` | `102` | `value` | `512` | ja — steuert Mesh-Auflösung **und** Preprocess-Größe |
 | `input_remove_background` | `61` | `value` | `True` | ja (seit 2026-08-03) |
 
@@ -94,6 +111,7 @@ Kein `input_face_num`: `SplatToMesh` kennt kein Face-Ziel, die Dichte kommt übe
 | `input_name` | `4` | `value` | `''` | ja |
 | `input_face_num` | `2` | `value` | `5000` | ja |
 | `input_texture_resolution` | `3` | `value` | `1024` | ja |
+| `input_keep_borders` | `8` | `value` | `'true'` | ja |
 | `input_no_fingers` | `6` | `value` | `False` | **nein** — Pass-through an Stage 2 |
 
 Unterschied: `mesh-shrink` dezimiert (Quadric Edge Collapse), `mesh-shrink-quad` remesht

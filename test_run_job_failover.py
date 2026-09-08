@@ -11,6 +11,7 @@ except as a bill or an idle GPU.
 Run: venv/bin/python -m unittest test_run_job_failover -v
 """
 import asyncio
+import json
 import os
 import sys
 import tempfile
@@ -263,6 +264,28 @@ class ClaimFreesVram(RunJobExecFailover):
         self._run([good], {"comfyui:good": _Adapter()})
         self.assertEqual(self.frees, ["good"])
 
+    def test_the_free_keys_on_the_model_set_not_the_alias(self):
+        """Two aliases loading the same weights (trellis2 high/low) share the cache; one
+        alias loading other weights (a mapped model, a LoRA) frees — the adapter says
+        what a request loads, the alias is only the fallback."""
+        class _Keyed(_Adapter):
+            def __init__(self, key):
+                super().__init__(); self.key = key
+            def model_set_key(self, req):
+                return self.key
+        good = self._comfy("good")
+        main.backend_adapters["comfyui:good"] = _Keyed("ms:trellis")
+        asyncio.run(main._run_job("j1", "trellis-high", [good],
+                                  lambda b, c: types.SimpleNamespace(slot_held=False)))
+        asyncio.run(main._run_job("j2", "trellis-low", [good],
+                                  lambda b, c: types.SimpleNamespace(slot_held=False)))
+        self.assertEqual(self.frees, ["good"])                  # other alias, same weights → kept
+        main.backend_adapters["comfyui:good"] = _Keyed("ms:other")
+        asyncio.run(main._run_job("j3", "trellis-low", [good],
+                                  lambda b, c: types.SimpleNamespace(slot_held=False)))
+        self.assertEqual(self.frees, ["good", "good"])          # same alias, other weights → freed
+        self.assertEqual(main.backend_last_key["comfyui:good"], "trellis-low")   # affinity = alias
+
     def test_a_cloud_backend_records_affinity_but_never_frees(self):
         cloud = ({"name": "meshy", "type": "meshy"},
                  {"backend": "meshy", "meshy": {"endpoint": "image-to-3d"}})
@@ -430,6 +453,47 @@ class ComfyFreeSettles(unittest.TestCase):
         main.http_client = fake = _FakeHttp(20 * self.GIB, drop_after=99)
         self.assertTrue(self._free(settle_s=0.0))
         self.assertEqual(fake.posts, 1)
+
+
+class AdapterModelSetKey(unittest.TestCase):
+    """`ComfyUIAdapter.model_set_key` on the shipped samples: the key must see what the
+    request will LOAD after the same injections generate() applies — a mapped model
+    choice under one alias is a different set, two aliases on one model are the same."""
+
+    def setUp(self):
+        import adapters
+        d = os.path.join(_here, "sample_comfyui_workflows")
+
+        def load(name):
+            with open(os.path.join(d, name)) as f:
+                return json.load(f)
+        self.hi, self.lo = load("img2mesh-trellis2_high_api.json"), load("img2mesh-trellis2_low_api.json")
+        self.ad = object.__new__(adapters.ComfyUIAdapter)      # no ctx/HTTP needed for the key
+        self.ad.backend = {"name": "gpu", "type": "comfyui", "url": "http://gpu:8188"}
+        self.ad.name, self.ad.bid = "gpu", "comfyui:gpu"
+        self.ad.ctx = types.SimpleNamespace(loras_of=lambda bid: set())
+        self.NR = adapters.NormalizedRequest
+
+    def _req(self, wf, mapping=None, params=None, fixed=None):
+        return self.NR(alias="a", real_model=None, task="text2img", inputs={}, params=params or {},
+                       output={}, workflow=None, workflow_json=wf, node_mapping=mapping or {},
+                       fixed=fixed or [])
+
+    def test_high_and_low_share_the_key(self):
+        self.assertEqual(self.ad.model_set_key(self._req(self.hi)), self.ad.model_set_key(self._req(self.lo)))
+
+    def test_a_mapped_model_choice_changes_the_key(self):
+        m = {"model": {"node": "60", "field": "modelname"}}
+        a = self.ad.model_set_key(self._req(self.hi, m, {"model": "microsoft/TRELLIS.2-4B"}))
+        b = self.ad.model_set_key(self._req(self.hi, m, {"model": "TencentARC/Pixal3D-T"}))
+        self.assertNotEqual(a, b)
+
+    def test_a_pin_is_part_of_the_key_and_the_stored_workflow_stays_untouched(self):
+        before = json.dumps(self.hi, sort_keys=True)
+        a = self.ad.model_set_key(self._req(self.hi))
+        b = self.ad.model_set_key(self._req(self.hi, fixed=[{"node": "60", "field": "modelname", "value": "other/model"}]))
+        self.assertNotEqual(a, b)
+        self.assertEqual(before, json.dumps(self.hi, sort_keys=True))
 
 
 if __name__ == "__main__":

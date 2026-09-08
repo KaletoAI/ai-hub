@@ -966,6 +966,24 @@ its **inputs** (prompt, params, reference images) so it stays inspectable in the
 which interrupts the ComfyUI prompt to free the GPU. On a restart, any job left
 `running`/`queued` is reconciled to `failed`.
 
+### Hosts & VRAM policy
+
+Backends group by the physical box they run on (`host` field, else the URL's
+host/IP — shown in `/health` and the Backends tab's **Hosts · GPU policy** panel).
+Per host, four flags decide who may use its GPU and when ComfyUI's VRAM is freed.
+ComfyUI never releases its model cache by itself, so the gateway does:
+
+| Flag | Default | What |
+|---|---|---|
+| `comfy_free_before_job` | **on** (every ComfyUI box) | At claim time, when the job's **model set** differs from what the box holds, `POST /free` is awaited **and watched** (`/system_stats` VRAM, re-posted every 2 s) before the prompt goes out. The model set is what the workflow's loader nodes name after pins/mapping/LoRAs — two aliases on one model keep the cache, a mapped model change under one alias frees. Needed even on a dedicated box: a node that runs in its own process (rigging, Make-It-Animatable) cannot share ComfyUI's cache and OOMs on it. |
+| `comfy_free_after_job` | on **iff shared** (an LLM and a ComfyUI backend on one GPU) | `POST /free` when a job ends, so the next llama-swap load does not abort on VRAM ComfyUI still holds. Skipped while another job runs there, and when the queued job the scheduler will hand this box next wants the model set it just ran. |
+| `avoid_llm_during_media` | on | Chat candidates on a box with a running media job sort **last** (never dropped). |
+| `llm_unload_before_media` | off | `GET /unload` on the box's llama-swap backends before a media job. |
+
+Defaults come from one table (`scheduler.HOST_FLAGS`); only a non-default value is
+stored per host. A gateway restart counts the VRAM as unknown (it never empties
+ComfyUI's cache), so the first job after one frees.
+
 ### Two ways to call it
 
 - **OpenAI Images API** (for OpenAI image clients):
@@ -1036,7 +1054,7 @@ locked). Tabs:
 |---|---|
 | **Dashboard** | live per-backend status + in-flight, parked calls, media-job counts/recent, recent LLM calls |
 | **Server** | runtime + restart-required settings (API key, caps, park time/queue, `affinity_max_wait_s`, stats/jobs, TTL/prune) |
-| **Backends** | add/edit/remove backends (LLM, ComfyUI, Meshy, Tripo), incl. the `paid` cost tier |
+| **Backends** | add/edit/remove backends (LLM, ComfyUI, Meshy, Tripo), incl. the `paid` cost tier; the **Hosts · GPU policy** panel below the list edits the per-box VRAM flags (see [Hosts & VRAM policy](#hosts--vram-policy)) |
 | **Input** | what clients can call — chat aliases, generation models, endpoints |
 | **Routing Overview** | the live alias→backend map + collisions (searchable) |
 | **Mapping** | register a ComfyUI workflow, wire its node mapping, pin values (a cloud alias — Meshy, Tripo — needs no workflow: one schema-driven editor renders its endpoint + option defaults instead); chat-alias editor (per-alias `park_s` + reasoning default) |

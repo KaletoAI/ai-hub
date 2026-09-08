@@ -31,6 +31,7 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Resp
 import adapters
 import cloudtask
 import jobs
+import scheduler
 import reasoning
 import stats
 import store
@@ -1443,8 +1444,7 @@ async def backends_page(request: Request):
     if editing or qp.get("new"):
         detail = _backend_form(editing, hosts)
     elif edit_host:
-        types = {b.get("type", "openai") for b in binfo if b.get("host") == edit_host}
-        detail = _host_form(edit_host, shared=("comfyui" in types and len(types) > 1))
+        detail = _host_form(edit_host, shared=_host_is_shared([b for b in binfo if b.get("host") == edit_host]))
     else:
         detail = ("<h2>Details</h2><p class='hint'>Select a backend's <b>Edit</b>, "
                   "or <b>+ New</b> to add one.</p>")
@@ -1455,10 +1455,10 @@ async def backends_page(request: Request):
 
 
 def _hosts_panel(binfo: list, sel_host: str) -> str:
-    """Physical-box grouping under the backend list: one row per **shared** host with
-    its member backends. Membership is edited on the backend (its `host` field or the
-    URL IP); this panel edits the per-host extras — a label and the shared-GPU policy
-    flags (docs/host-coordination-plan.md).
+    """Physical-box grouping under the backend list: one row per host that has a
+    ComfyUI backend, with its member backends. Membership is edited on the backend
+    (its `host` field or the URL IP); this panel edits the per-host extras — a label
+    and the GPU policy flags (docs/host-coordination-plan.md).
 
     Listed: every box with a ComfyUI backend. The LLM-vs-media policies only concern
     a SHARED box (an LLM and a ComfyUI backend on one GPU), but the free-before-job
@@ -1471,9 +1471,6 @@ def _hosts_panel(binfo: list, sel_host: str) -> str:
             by_host.setdefault(b["host"], []).append(b)
     meta = store.get_hosts() if store.is_active() else {}
 
-    def is_shared(members: list) -> bool:
-        types = {b.get("type", "openai") for b in members}
-        return "comfyui" in types and len(types) > 1
     def has_comfy(members: list) -> bool:
         return any(b.get("type") == "comfyui" for b in members)
     listed = [h for h, members in by_host.items() if has_comfy(members) or meta.get(h)]
@@ -1484,19 +1481,23 @@ def _hosts_panel(binfo: list, sel_host: str) -> str:
         hm = meta.get(h) or {}
         label = hm.get("label", "")
         members = " · ".join(f"{b['name']} ({b['type']})" for b in by_host[h])
-        shared = is_shared(by_host[h])
+        shared = _host_is_shared(by_host[h])
         tag = _badge("shared", "warn", "an LLM and a ComfyUI backend share this box (and its GPU/VRAM)") if shared else ""
-        if hm.get("avoid_llm_during_media", True) is False:
+        # badges mark EXPLICIT non-default values only — the defaults come from the
+        # same table the request path reads (scheduler.HOST_FLAGS)
+        def non_default(key: str) -> bool:
+            return key in hm and bool(hm[key]) != scheduler.host_flag_default(key, shared)
+        if non_default("avoid_llm_during_media"):
             tag += " " + _badge("llm-avoid off", "warn",
                                 "chat routing does NOT step aside while this host generates media")
-        if hm.get("comfy_free_before_job", True) is False:
+        if non_default("comfy_free_before_job"):
             tag += " " + _badge("free-before off", "warn",
-                                "VRAM is NOT freed when this box's next media job runs a "
-                                "different alias — non-default setting")
-        if hm.get("comfy_free_after_job", shared) != shared:      # explicit non-default only
+                                "VRAM is NOT freed when this box's next media job loads a "
+                                "different model set — non-default setting")
+        if non_default("comfy_free_after_job"):
             tag += " " + _badge(f"free-after {'on' if hm['comfy_free_after_job'] else 'off'}", "warn",
                                 "ComfyUI /free after each media job — non-default setting")
-        if hm.get("llm_unload_before_media"):
+        if non_default("llm_unload_before_media"):
             tag += " " + _badge("unload-llm", "warn",
                                 "this host's LLMs are unloaded before each media job")
         acts = _icon_acts(("✎", f"/ui/backends?host={quote(h)}", "secondary", "Edit host"))
@@ -1508,15 +1509,23 @@ def _hosts_panel(binfo: list, sel_host: str) -> str:
             f"same GPU (badge <b>shared</b>).</p>{rows}")
 
 
+def _host_is_shared(members: list) -> bool:
+    """A box where an LLM and a ComfyUI backend contend for one GPU. Derived from the
+    LIVE backend list wherever it is needed (form, panel, save) — never round-tripped
+    through the form: a backend added or removed between render and Save would
+    otherwise flip which value counts as the default (review 2026-09-08)."""
+    types = {b.get("type", "openai") for b in members}
+    return "comfyui" in types and len(types) > 1
+
+
 def _host_form(host: str, shared: bool) -> str:
     meta = (store.get_hosts() if store.is_active() else {}).get(host) or {}
-    avoid = meta.get("avoid_llm_during_media", True)
-    pre = meta.get("comfy_free_before_job", True)       # default: on for every ComfyUI box
-    free = meta.get("comfy_free_after_job", shared)     # default: on only when shared
-    unload = meta.get("llm_unload_before_media", False)
+    avoid = scheduler.host_flag(meta, "avoid_llm_during_media", shared)
+    pre = scheduler.host_flag(meta, "comfy_free_before_job", shared)
+    free = scheduler.host_flag(meta, "comfy_free_after_job", shared)
+    unload = scheduler.host_flag(meta, "llm_unload_before_media", shared)
     return (f'<form action="/ui/backends/host-save" method="post">'
             f'<input type="hidden" name="host" value="{_esc(host)}">'
-            f'<input type="hidden" name="shared" value="{1 if shared else 0}">'
             f'<div class="formbar"><h2>Host {_esc(host)}</h2>'
             f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/backends", "secondary")}</div>'
             + _field("label", _inp("label", meta.get("label", ""), placeholder="e.g. K12 box"))
@@ -1533,12 +1542,13 @@ def _host_form(host: str, shared: bool) -> str:
             + _field("VRAM", '<div style="display:flex;flex-direction:column;gap:6px;'
                              'align-items:flex-start">'
                      + _checkbox("comfy_free_pre", pre,
-                                       "free ComfyUI VRAM before a job that changes the alias",
-                                       "POST /free once a job is claimed and the workflow it needs is "
-                                       "NOT what this box last ran (a gateway restart counts as unknown "
-                                       "— ComfyUI keeps its cache across one). A same-alias job keeps "
-                                       "the models loaded, which is what the queue's alias affinity is "
-                                       "for. Leave on: a node running in its own process (rigging, "
+                                       "free ComfyUI VRAM before a job that changes the model set",
+                                       "POST /free once a job is claimed and the weights its workflow "
+                                       "loads (its loader nodes, after pins/mapping/LoRAs) are NOT what "
+                                       "this box holds — a gateway restart counts as unknown, ComfyUI "
+                                       "keeps its cache across one. A job loading the same weights "
+                                       "(the same alias, or another one on the same model) keeps them. "
+                                       "Leave on: a node running in its own process (rigging, "
                                        "Make-It-Animatable) cannot share ComfyUI's cache and OOMs on it.")
                      + _checkbox("comfy_free", free, "free ComfyUI VRAM after each media job",
                                        "POST /free when a job ends, even if no media job follows — only "
@@ -1562,20 +1572,23 @@ async def host_save(request: Request):
     host = (f.get("host", "") or "").strip()
     if host and store.is_active():
         label = (f.get("label", "") or "").strip()
-        shared = f.get("shared") == "1"
+        # `shared` decides which value is the default (and therefore stored or dropped)
+        # — from the LIVE backend list, never the form (see _host_is_shared)
+        binfo = _gateway_info().get("backends", [])
+        shared = _host_is_shared([b for b in binfo if b.get("host") == host])
         cur = dict(store.get_hosts().get(host) or {})
         if label:
             cur["label"] = label
         else:
             cur.pop("label", None)
-        # flags store only the NON-default value (default: avoid on, free on-if-
-        # shared, unload off) — an untouched host keeps adapting to its defaults.
-        for form_key, store_key, default in (("avoid_llm", "avoid_llm_during_media", True),
-                                             ("comfy_free_pre", "comfy_free_before_job", True),
-                                             ("comfy_free", "comfy_free_after_job", shared),
-                                             ("llm_unload", "llm_unload_before_media", False)):
+        # flags store only the NON-default value (defaults: scheduler.HOST_FLAGS — the
+        # table the request path reads) — an untouched host keeps adapting to them.
+        for form_key, store_key in (("avoid_llm", "avoid_llm_during_media"),
+                                    ("comfy_free_pre", "comfy_free_before_job"),
+                                    ("comfy_free", "comfy_free_after_job"),
+                                    ("llm_unload", "llm_unload_before_media")):
             val = bool(f.get(form_key))
-            if val == default:
+            if val == scheduler.host_flag_default(store_key, shared):
                 cur.pop(store_key, None)
             else:
                 cur[store_key] = val

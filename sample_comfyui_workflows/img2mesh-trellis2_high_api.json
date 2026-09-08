@@ -422,7 +422,7 @@
   },
   "62": {
     "inputs": {
-      "value": 100000
+      "value": 20000
     },
     "class_type": "PrimitiveInt",
     "_meta": {

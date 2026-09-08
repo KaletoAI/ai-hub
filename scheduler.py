@@ -5,6 +5,8 @@ All state comes in as arguments; this module never imports main (hot-reload-safe
 unit-testable). Three rules replace priority/speed routing everywhere:
 unpaid-then-fastest ordering, freed-backend type affinity, and an overdue guard.
 """
+import hashlib
+import re
 from typing import Callable, Iterable, Optional
 
 EMA_ALPHA = 0.3
@@ -47,6 +49,82 @@ def free_vram_before_job(last_key: Optional[str], next_key: str,
     if not enabled or others_inflight > 0:
         return False
     return last_key != next_key
+
+
+_LOADER_CLASS = re.compile(r"load", re.I)
+# Loaders whose "file" is a per-job INPUT (the uploaded image, the chain's mesh), not a
+# weight set: their values change on every job and mean nothing for the VRAM.
+_INPUT_LOADER = re.compile(r"image|mask|mesh|path|video|audio", re.I)
+# The loader inputs that name a weight set. Everything else on a loader (device,
+# attention backend, low_vram, a dtype) is HOW it loads, not WHAT — two aliases that
+# differ only there hold the same weights, and freeing between them is the reload
+# this key exists to avoid.
+_WEIGHT_INPUT = re.compile(r"name|model|ckpt|unet|clip|vae|lora|gguf|weight", re.I)
+_HOW_INPUT = re.compile(r"dtype|precision|device|backend|attn", re.I)   # …but these are "how"
+
+
+def model_set_key(workflow: dict, skip_ids: Iterable = ()) -> Optional[str]:
+    """What a ComfyUI workflow LOADS, as a key: the same key ⇒ the same weights in
+    VRAM, whatever else the two workflows do. The alias used to be this key ("one alias
+    = one workflow = one model set"), which is wrong in both directions: two aliases can
+    load the same weights (trellis2 high and low both load `microsoft/TRELLIS.2-4B` —
+    alternating them freed and reloaded a multi-GB model on every switch), and one
+    alias can load different weights per request (a mapped model choice, a LoRA
+    cascade) under the same name and never free.
+
+    Derived from the loader nodes: class name matching /load/ minus the input
+    loaders (image, mask, mesh, path…), and of their inputs only the ones that name a
+    weight set (see `_WEIGHT_INPUT`) with a STRING value; links and node ids are left out,
+    so node numbering and graph layout do not matter. `skip_ids` are the backend's
+    bypassed nodes — a bypassed loader loads nothing. None when the workflow has no
+    such loader (the caller falls back to the alias), never a key that says "nothing".
+
+    Pure, and deliberately conservative in what it IGNORES: a difference this key
+    misses (a dtype, a bypassed branch) means one skipped free — ComfyUI's own model
+    management still handles that inside its process — while a difference it invents
+    means a reload on every job, which is the silent failure mode here."""
+    skip = {str(i) for i in (skip_ids or ())}
+    parts = []
+    for nid, node in (workflow or {}).items():
+        if str(nid) in skip or not isinstance(node, dict):
+            continue
+        cls = str(node.get("class_type") or "")
+        if not _LOADER_CLASS.search(cls) or _INPUT_LOADER.search(cls):
+            continue
+        for k, v in (node.get("inputs") or {}).items():
+            # a weight set is NAMED (a filename, a hub id) — a bool/number on a loader
+            # (`keep_models_loaded`, `low_vram`, a strength) is always a how
+            if not isinstance(v, str) or not _WEIGHT_INPUT.search(k) or _HOW_INPUT.search(k):
+                continue
+            parts.append((cls, k, v))
+    if not parts:
+        return None
+    parts.sort()
+    return "ms:" + hashlib.sha1("\n".join("\t".join(p) for p in parts).encode()).hexdigest()[:16]
+
+
+# The per-host GPU policy flags (store `hosts` meta) and their defaults — the ONE table
+# the request path (`main._host_flag`), the console's host form, its Hosts panel and
+# `host_save` read, so "what does an untouched host do" has exactly one answer. A
+# default of SHARED means "on iff an LLM and a ComfyUI backend share the box's GPU".
+SHARED = object()
+HOST_FLAGS: dict = {
+    "avoid_llm_during_media": True,     # chat routing steps aside while the box renders
+    "comfy_free_before_job": True,      # POST /free at claim when the model set changes
+    "comfy_free_after_job": SHARED,     # POST /free after a job — a llama-swap load needs it
+    "llm_unload_before_media": False,   # GET /unload on the LLM siblings before a media job
+}
+
+
+def host_flag_default(key: str, shared: bool) -> bool:
+    d = HOST_FLAGS[key]
+    return bool(shared) if d is SHARED else bool(d)
+
+
+def host_flag(meta: Optional[dict], key: str, shared: bool) -> bool:
+    """The effective value of a host flag: what is stored, else its default."""
+    v = (meta or {}).get(key)
+    return host_flag_default(key, shared) if v is None else bool(v)
 
 
 def designated_taker(pool: Iterable, can_serve: Callable, type_key: Callable,

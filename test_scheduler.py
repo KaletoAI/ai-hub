@@ -97,5 +97,76 @@ class TestFreeVramBeforeJob(unittest.TestCase):
         self.assertFalse(scheduler.free_vram_before_job(None, "x", 0, enabled=False))
 
 
+class TestModelSetKey(unittest.TestCase):
+    """The VRAM key: a wrong one fails silently in both directions — a reload on every
+    job (looks like "generation got slower") or a free that never comes (the OOM the
+    free-before-job mechanism exists for)."""
+
+    LOAD = {"class_type": "UNETLoader",
+            "inputs": {"unet_name": "a.safetensors", "weight_dtype": "default"}}
+
+    def test_the_same_weights_under_different_ids_and_layout_share_a_key(self):
+        a = {"1": self.LOAD, "2": {"class_type": "KSampler", "inputs": {"model": ["1", 0], "steps": 20}}}
+        b = {"7": dict(self.LOAD), "9": {"class_type": "KSampler", "inputs": {"model": ["7", 0], "steps": 40}}}
+        self.assertEqual(scheduler.model_set_key(a), scheduler.model_set_key(b))
+
+    def test_a_different_weight_file_is_a_different_key(self):
+        a = {"1": self.LOAD}
+        b = {"1": {"class_type": "UNETLoader", "inputs": {"unet_name": "b.safetensors"}}}
+        self.assertNotEqual(scheduler.model_set_key(a), scheduler.model_set_key(b))
+
+    def test_how_it_loads_does_not_count(self):
+        """trellis2 high vs low: same modelname, different low_vram/keep_models_loaded."""
+        a = {"1": {"class_type": "Trellis2LoadModel",
+                   "inputs": {"modelname": "microsoft/TRELLIS.2-4B", "low_vram": False, "device": "cuda"}}}
+        b = {"1": {"class_type": "Trellis2LoadModel",
+                   "inputs": {"modelname": "microsoft/TRELLIS.2-4B", "low_vram": True, "device": "cuda"}}}
+        self.assertEqual(scheduler.model_set_key(a), scheduler.model_set_key(b))
+
+    def test_input_loaders_and_links_are_ignored(self):
+        a = {"1": self.LOAD, "2": {"class_type": "LoadImage", "inputs": {"image": "gw_job1_x.png"}}}
+        b = {"1": self.LOAD, "2": {"class_type": "LoadImage", "inputs": {"image": "gw_job2_x.png"}}}
+        self.assertEqual(scheduler.model_set_key(a), scheduler.model_set_key(b))
+
+    def test_a_lora_slot_counts(self):
+        a = {"1": self.LOAD, "2": {"class_type": "Lora Loader Stack (rgthree)",
+                                   "inputs": {"lora_01": "None", "strength_01": 1}}}
+        b = {"1": self.LOAD, "2": {"class_type": "Lora Loader Stack (rgthree)",
+                                   "inputs": {"lora_01": "style.safetensors", "strength_01": 1}}}
+        self.assertNotEqual(scheduler.model_set_key(a), scheduler.model_set_key(b))
+
+    def test_a_bypassed_loader_loads_nothing(self):
+        a = {"1": self.LOAD, "2": {"class_type": "LoaderGGUF", "inputs": {"gguf_name": "x.gguf"}}}
+        b = {"1": self.LOAD}
+        self.assertEqual(scheduler.model_set_key(a, skip_ids=["2"]), scheduler.model_set_key(b))
+
+    def test_no_loader_means_no_key(self):
+        self.assertIsNone(scheduler.model_set_key({"1": {"class_type": "KSampler", "inputs": {}}}))
+        self.assertIsNone(scheduler.model_set_key({}))
+
+    def test_the_sample_trellis2_high_and_low_share_a_key(self):
+        import json, os
+        d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sample_comfyui_workflows")
+        def load(name):
+            with open(os.path.join(d, name)) as f:
+                return json.load(f)
+        hi, lo, hy = (load(f"img2mesh-{n}_api.json") for n in ("trellis2_high", "trellis2_low", "hunyuan3d"))
+        self.assertEqual(scheduler.model_set_key(hi), scheduler.model_set_key(lo))
+        self.assertNotEqual(scheduler.model_set_key(hi), scheduler.model_set_key(hy))
+
+
+class TestHostFlags(unittest.TestCase):
+    def test_defaults_in_one_place(self):
+        self.assertTrue(scheduler.host_flag_default("comfy_free_before_job", shared=False))
+        self.assertFalse(scheduler.host_flag_default("comfy_free_after_job", shared=False))
+        self.assertTrue(scheduler.host_flag_default("comfy_free_after_job", shared=True))
+        self.assertFalse(scheduler.host_flag_default("llm_unload_before_media", shared=True))
+
+    def test_a_stored_value_wins_over_the_default(self):
+        self.assertFalse(scheduler.host_flag({"comfy_free_before_job": False}, "comfy_free_before_job", True))
+        self.assertTrue(scheduler.host_flag({}, "comfy_free_before_job", False))
+        self.assertTrue(scheduler.host_flag(None, "avoid_llm_during_media", False))
+
+
 if __name__ == "__main__":
     unittest.main()
