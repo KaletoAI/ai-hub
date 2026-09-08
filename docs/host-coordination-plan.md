@@ -41,7 +41,7 @@ Routing-Rücksicht + aktive VRAM-Freigabe.
 
 ---
 
-## Phase 1 — Datenmodell + UI (rein strukturell, keine Verhaltensänderung)
+## Phase 1 — Datenmodell + UI (umgesetzt: main.backend_host/rebuild_backends, store `hosts`, /health `hosts`, Backends-Tab)
 
 **Store** (`store.py`): Settings-Key `hosts` nach dem Muster von
 `voice_library`/`alias_park`: dict `name → {label, …policy-flags}`
@@ -49,34 +49,43 @@ Routing-Rücksicht + aktive VRAM-Freigabe.
 Backend-Zuordnung: neues Feld `host` im Backend-JSON (Spalte bleibt, wie
 alles Backend-Config, im `json`-Blob).
 
-**Seeding/Migration:** einmalig beim Laden — Backends ohne `host` bekommen
-als Vorschlag den **Hostnamen aus ihrer URL** (`urlparse(url).hostname`,
-z. B. `192.168.8.37`); gleiche IP = gleicher Host. Damit sind k12-gpu
-(openai+comfyui) und die evo-Paare sofort korrekt gruppiert, ohne dass
-jemand klicken muss. Manuell umbenennbar/änderbar im UI.
+**Ableitung (keine Migration):** der Host wird bei jedem `rebuild_backends()`
+frisch berechnet — explizites Feld `host`, sonst `urlparse(url).hostname`
+(z. B. `192.168.8.37`), sonst der Backend-Name als Fallback (`main.backend_host`).
+Gleiche IP = gleicher Host, ohne dass jemand klicken muss; damit sind k12-gpu
+(openai+comfyui) und die evo-Paare sofort korrekt gruppiert. Nichts davon wird
+gespeichert, sodass eine geänderte URL sofort regruppiert. In den Store kommt ein
+`host` nur, wenn er im Backend-Editor eingetragen wird.
 
 **main.py:** in `rebuild_backends()` zwei Maps ableiten:
 `backend_hosts: bid → host` und `host_backends: host → [bids]`. Kein
 Route-Index-Impact (Hosts ändern keine Kandidatenmenge in Phase 1).
 `/health` bekommt die Host-Gruppierung dazu (Sichtbarkeit).
 
-**UI** (`admin.py`, Backends-Tab): Host-Spalte in der Backend-Liste; im
-Backend-Editor ein Host-Dropdown (+ Freitext „neuer Host"); darunter ein
-Hosts-Panel nach den Admin-CRUD-Konventionen (volle Breite, gemeinsame
-Add/Edit-Detailseite). Phase 1 editiert dort nur Name/Label.
+**UI** (`admin.py`, Backends-Tab): der Host steht in der Sub-Zeile jeder
+Backend-Kachel (`· host …`); im Backend-Editor ein Freitextfeld mit
+`<datalist>`-Vorschlägen (leer = aus der URL abgeleitet). Darunter, in derselben
+linken Spalte, das Hosts-Panel `_hosts_panel`: eine Zeile je Box mit
+ComfyUI-Backend (plus jede Box mit gespeicherter Meta, damit eine alte
+Einstellung nie uneditierbar wird), mit Mitglieder-Liste, `shared`-Badge und
+Badges für jeden vom Default abweichenden Flag-Wert. Ein „Add" gibt es nicht —
+Mitgliedschaft wird am Backend gesetzt; `✎` öffnet über `?host=<name>` das
+Host-Formular in der Detailspalte, das Label und alle vier Policy-Flags
+(Phase 2 + 3) trägt.
 
-Aufwand: klein. Risiko: keins (keine Verhaltensänderung).
-
-## Phase 2 — Routing-Rücksicht („media-busy" Kandidaten ans Ende)
+## Phase 2 — Routing-Rücksicht („media-busy" Kandidaten ans Ende) (umgesetzt: main._media_busy_hosts + resolve_routes)
 
 **Flag pro Host:** `avoid_llm_during_media` (default **an** für Hosts mit
 llama-swap+comfy, sonst irrelevant).
 
-**Mechanik:** `resolve_routes()` (main.py) bewertet heute pro Kandidat die
-Live-Flags (healthy/busy/draining). Neu: ein Chat-Kandidat, dessen Host
-gerade einen **laufenden Media-Job** hat (Gateway weiß das selbst:
-`_gen_tasks`/Jobs mit Status `running` + `backend_hosts`-Lookup), wird
-**nicht entfernt, sondern ans Ende der Ready-Liste sortiert**. Ergebnis:
+**Mechanik:** `resolve_routes()` (main.py) bewertet pro Kandidat die Live-Flags
+(healthy/busy/draining). Ein Chat-Kandidat, dessen Host gerade rendert, wird
+**nicht entfernt, sondern ans Ende der Ready-Liste sortiert**. „Rendert" heißt:
+`_media_busy_hosts()` liest den Live-Zähler `backend_inflight` für die
+ComfyUI-Backends (`comfyui:`-Präfix) und schlägt deren Host in `backend_hosts`
+nach — ein laufender Cloud-Task zählt nicht, der belegt keine lokale GPU.
+Sortiert wird nach `scheduler.order_ready`, stabil, sodass die Scheduler-Ordnung
+innerhalb beider Gruppen erhalten bleibt. Ergebnis:
 
 - Gibt es Alternativen, gewinnen die — die Kollision entsteht gar nicht.
 - Gibt es keine, wird der Host trotzdem versucht (best effort); crasht der
@@ -87,10 +96,7 @@ Bewusst NICHT als harter Skip: sortieren statt filtern hält die
 Parking-Semantik unangetastet (media-busy ≠ busy; es wird nicht geparkt,
 nur umsortiert).
 
-Aufwand: klein–mittel (Job→Host-Lookup + Sortierung in `resolve_routes`,
-Flag im Hosts-Editor). Risiko: gering, rein ordnend.
-
-## Phase 3 — Aktive VRAM-Freigabe (der eigentliche „Handler")
+## Phase 3 — Aktive VRAM-Freigabe (umgesetzt: main._free_comfy_vram / _unload_host_llms; siehe Nachtrag 2026-09-05)
 
 Zwei Host-Flags, beide einzeln schaltbar:
 
@@ -103,13 +109,20 @@ Zwei Host-Flags, beide einzeln schaltbar:
    der Adapter bleibt protokoll-dumm. Kompromiss: unmittelbar
    aufeinanderfolgende Media-Jobs laden das Bildmodell neu (~Sekunden);
    akzeptabel, das Flag kann sonst aus bleiben.
+   Auch dieser Free ist inzwischen ein beobachteter: aus Sicht des Job-Pfads
+   fire-and-forget (`asyncio.create_task`), im Call selbst aber derselbe
+   `_comfy_free(settle_s=30)` mit Nachposten alle 2 s wie beim Free vor dem Job —
+   ein einzelner POST landet meist im `gc.collect()`-Fenster des Workers und geht
+   verloren. Ein `abort_when` bricht das Nachposten ab, sobald ein neuer Job das
+   Backend beansprucht hat: ein Re-Post unter einem gerade gestarteten Prompt
+   entlädt genau die Modelle, die er lädt.
 2. **`llm_unload_before_media`** (default aus): vor dem Submit eines
    Comfy-Workflows auf dem Host das LLM aktiv entladen, damit die
-   Generation nicht ihrerseits an VRAM-Mangel scheitert. **Zu
-   verifizieren:** welchen Unload-Endpoint die deployte llama-swap-Version
-   anbietet (`GET/POST /unload`? per-Modell?) — vor Implementierung auf
-   .37 testen. Bis dahin reicht Flag 1: die TTL (120 s) entlädt das LLM
-   ohnehin schnell.
+   Generation nicht ihrerseits an VRAM-Mangel scheitert. **Umgesetzt** in
+   `main._unload_host_llms` (Endpoint auf k12-gpu verifiziert: llama-swap
+   `GET /unload` → 200, andere Server ignorieren ihn): best effort, 8 s Timeout,
+   über alle `openai:`-Geschwister des Hosts, direkt nach dem Claim. Flag bleibt
+   default aus — die llama-swap-TTL (120 s) entlädt ohnehin meist zuerst.
 
 Aufwand: mittel (Comfy-`/free`-Hook klein; llama-swap-Unload je nach
 Endpoint). Risiko: gering — beide Aktionen sind idempotente Aufräum-Calls,
@@ -140,8 +153,11 @@ heißt außerdem beobachtet: ComfyUIs `POST /free` setzt nur zwei Flags und
 antwortet sofort; der Worker liest sie erst nach seinem nächsten `q.get()`, und
 das `notify` geht verloren, während er nach einem Prompt im `gc.collect()`
 steckt — genau dann postet der Gateway-Poll. `_comfy_free(settle_s=…)` pollt
-deshalb `torch_vram_total` aus `/system_stats` und postet alle 2 s nach, bis der
-Pool auf ≤ 20 % gefallen ist (sonst nach 30 s Urteil False). Review 2026-09-08.
+deshalb alle 0,5 s `torch_vram_total` aus `/system_stats` und postet alle 2 s
+nach, bis der Pool unter die Zielmarke `max(20 % des Ausgangswerts, 256 MiB)`
+gefallen ist (sonst nach 30 s Urteil False). Ein Pool, der schon vorher ≤ 256 MiB
+hält, gilt als leer (Urteil True); sind die `/system_stats` nicht lesbar, bleibt
+es beim alten Fire-and-forget. Review 2026-09-08.
 
 Zwei Dinge, die Flag 1 nicht abdecken konnte:
 - **Chain-Stages.** Stage 1 und Stage 2 sind zwei Workflows, oft auf DEMSELBEN
@@ -154,12 +170,21 @@ Zwei Dinge, die Flag 1 nicht abdecken konnte:
 
 Flag 1 bleibt, aber nur noch für seinen einen eigenen Zweck: eine geteilte Box
 soll auch dann freigeben, wenn gar kein Media-Job folgt, sonst scheitert der
-nächste llama-swap-Load. Es überspringt jetzt zusätzlich den Free, wenn bereits
-ein Job mit demselben Alias auf dieses Backend wartet — der wäre der designierte
-Nehmer und müsste sonst genau die Modelle neu laden, auf die er wartet.
+nächste llama-swap-Load. Es überspringt den Free zusätzlich dann, wenn der
+Scheduler diesem Backend als Nächstes einen Job zuteilen würde, der genau den
+Modellsatz will, den die GPU nachweislich hält: gefragt wird
+`_designated_gen_waiter` (die EINE Stelle, an der die Zuteilung berechnet wird —
+overdue > Typ-Affinität > ältester), und verglichen wird gegen
+`backend_vram_key`, nicht gegen den zuletzt gelaufenen Alias. Ein unbekannter
+Stand (`None`) gibt unabhängig von Wartenden frei. Ein Scan der ganzen Queue nach
+Alias wäre falsch und war es: ein Wartender, der dieses Backend gar nicht nehmen
+kann (nach einer fehlgeschlagenen Chain-Stage ausgeschlossen, anderswo
+force-gepinnt), unterdrückte den Free dauerhaft — und damit gab auf einer
+geteilten Box nichts mehr die GPU frei (Review 2026-09-08).
 
 Pure Entscheidung: `scheduler.free_vram_before_job(last_key, next_key,
-others_inflight, enabled)`, getestet in `test_scheduler.py` — beide Fehler-
+others_inflight, enabled)`, getestet in `tests/test_scheduler.py`
+(`TestFreeVramBeforeJob`, `TestModelSetKey`) — beide Fehler-
 richtungen sind still (zu eifrig = unerklärter Reload, gar nicht = OOM im Node).
 
 ## Nicht-Ziele
@@ -173,8 +198,9 @@ richtungen sind still (zu eifrig = unerklärter Reload, gar nicht = OOM im Node)
 
 ## Offene Fragen
 
-1. llama-swap-Unload-Endpoint auf .37/.34 verifizieren (nur für Phase-3-
-   Flag 2 relevant).
+1. ~~llama-swap-Unload-Endpoint verifizieren~~ — auf .37 (k12-gpu) erledigt:
+   `GET /unload` → 200, andere Server ignorieren ihn. Für .34 nicht nachgemessen,
+   das Flag ist dort aus.
 2. Sollen `dx10-01/-02` (falls je eine Comfy-Instanz dazukommt) dieselben
    Defaults bekommen? (Host-Tabelle macht das später zum No-Brainer.)
 3. Dashboard-Gruppierung nach Host (optional, jederzeit nachrüstbar).
