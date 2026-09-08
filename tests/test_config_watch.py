@@ -1,4 +1,4 @@
-"""The config hot reload must survive an editor's rename-save.
+"""The config hot reload must survive an editor's rename-save — and a symlink.
 
 Why this file exists (the mechanism fails SILENTLY): `main.watch_config` is the only
 thing that notices an edited config.yaml, and when it stops noticing, the gateway keeps
@@ -18,7 +18,16 @@ So the three edits below are the three the old form got wrong: rename-replace, a
 in-place append AFTER it, and a second rename-replace. Prod never hit this because its
 config.yaml carries `backends: []` and everything is store-managed.
 
+The fourth case is the SYMLINK one, measured 2026-09-08 with the same setup: this repo's
+stub-instance harness is a directory of symlinks, so config.yaml points at a file
+elsewhere. A directory watch that resolves the link first watches the TARGET's directory
+only — and an editor saving the instance-dir config.yaml replaces the LINK with a regular
+file, an event in the lexical parent that nobody watches: 0 detections, and from then on
+the gateway watches a file nobody edits. Same silence, one indirection further out.
+
 Run: venv/bin/python -m unittest tests.test_config_watch -v
+(needs an inotify-capable TMPDIR — a tmpfs/ext4 /tmp is fine, a network or overlay mount
+that swallows inotify events is not.)
 """
 import asyncio
 import os
@@ -42,7 +51,8 @@ finally:
     _tmp.cleanup()
     del _tmp
 
-SETTLE = 0.3        # watchfiles groups changes over `step` = 50 ms; 0.3 s is six of those
+SETTLE = 0.5        # watchfiles groups changes over `step` = 50 ms; 0.5 s is ten of those —
+                    # 0.3 s under-groups on a starved box, splitting one save over two ticks
 
 
 def _write(path: str, text: str) -> None:
@@ -119,6 +129,56 @@ class TestConfigWatchSurvivesRenameSave(unittest.TestCase):
             seen = asyncio.run(run(cfg, os.path.join(d, "store.db")))
 
         self.assertEqual(seen, 0, f"{seen} reload(s) triggered by an unrelated file")
+
+
+class TestConfigWatchSurvivesASymlinkedConfig(unittest.TestCase):
+    """A config.yaml that IS a symlink (the stub-instance harness ships a directory of
+    them) has two identities, and edits arrive under either one: the operator's editor
+    writes the LINK path, the bytes live at the TARGET path. Watching only the resolved
+    parent misses every save made through the link — including the one that replaces the
+    link with a regular file, after which the watch is aimed at a file nobody edits."""
+
+    def test_edits_through_the_link_and_through_the_target_are_all_seen(self):
+        async def run(link: str, real: str) -> int:
+            hits = []
+            task = asyncio.ensure_future(main.watch_config(link, lambda: hits.append(1)))
+            try:
+                await asyncio.sleep(SETTLE)                       # let the watch arm
+                _write(real, 'api_key: "a"\nbackends: []\n')      # 1) in place, via the TARGET
+                await asyncio.sleep(SETTLE)
+                _rename_replace(link, 'api_key: "b"\nbackends: []\n')  # 2) editor save ON the link
+                await asyncio.sleep(SETTLE)                       #    (the link is a real file now)
+                with open(link, "a") as f:                        # 3) in-place append after that
+                    f.write("# touched\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+                await asyncio.sleep(SETTLE)
+            finally:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            return len(hits)
+
+        with tempfile.TemporaryDirectory() as d:
+            realdir = os.path.join(d, "real")
+            instdir = os.path.join(d, "instance")
+            os.mkdir(realdir)
+            os.mkdir(instdir)
+            real = os.path.join(realdir, "config.yaml")
+            link = os.path.join(instdir, "config.yaml")
+            _write(real, 'api_key: ""\nbackends: []\n')
+            os.symlink(os.path.join("..", "real", "config.yaml"), link)
+            self.assertTrue(os.path.islink(link))
+            seen = asyncio.run(run(link, real))
+
+        self.assertGreaterEqual(
+            seen, 3,
+            f"only {seen} of 3 saves of a SYMLINKED config.yaml were detected — a watch "
+            f"on the resolved parent alone never sees the editor's save on the link "
+            f"path, and once that save turns the link into a regular file the gateway "
+            f"is watching a file nobody edits, silently serving the old config")
 
 
 if __name__ == "__main__":

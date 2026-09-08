@@ -691,7 +691,7 @@ def reload_config() -> None:
     log_config_summary()
 
 
-async def watch_config(path, on_change: Callable[[], None]) -> None:
+async def watch_config(path: str, on_change: Callable[[], None]) -> None:
     """Call `on_change` once per save of `path`, for the life of the process.
 
     Watches the config's DIRECTORY and filters events down to the one file, because an
@@ -707,10 +707,34 @@ async def watch_config(path, on_change: Callable[[], None]) -> None:
     `recursive=False` keeps jobs/ and its artifacts out of the watch entirely; the
     store/stats/jobs DB files that sit beside config.yaml still raise events, and the
     filter drops them before anything reloads.
+
+    A config.yaml may also BE a symlink — the stub-instance harness is a directory of
+    them — and then it has two identities: the LEXICAL path the operator's editor writes
+    and the RESOLVED path the bytes live at. Measured 2026-09-08, same install: resolving
+    first and watching only the target's parent saw 0 of the saves made through the link,
+    because an editor saving the instance-dir config.yaml REPLACES the link with a regular
+    file — an event in the lexical parent, which was not watched — and from then on the
+    watch is aimed at a file nobody edits. So both parents are watched (deduplicated to
+    one entry when the path is not a link) and an event matching EITHER identity counts.
+    `target` is computed once at start: after the link has been replaced, `resolve()`
+    returns the lexical path itself, and the lexical arm of the filter is what keeps
+    later in-place edits of the now-regular file visible (the old target's parent stays
+    watched, which is harmless).
     """
-    target = Path(path).resolve()
-    async for _ in awatch(target.parent, recursive=False,
-                          watch_filter=lambda _change, p: Path(p).resolve() == target):
+    lexical = Path(path).absolute()      # where the operator's editor writes
+    target = lexical.resolve()           # where the bytes live (== lexical when not a link)
+
+    def _is_config(_change, p: str) -> bool:
+        q = Path(p)
+        if q.absolute() == lexical:
+            return True
+        try:
+            return q.resolve() == target
+        except OSError:                  # vanished mid-batch — it cannot be our file now
+            return False
+
+    async for _ in awatch(*{lexical.parent, target.parent}, recursive=False,
+                          watch_filter=_is_config):
         on_change()
 
 

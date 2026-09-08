@@ -577,7 +577,10 @@ they need via injected callables, staying hot-reload-safe.
   over it — measured 2026-09-08 on a fresh Debian 13 install, one of four edits detected,
   then nothing ever again, while the gateway went on serving the config it read first and
   said so nowhere; so the test performs the three saves that got it wrong — rename-replace,
-  an in-place append after it, a second rename-replace — and counts the reloads).
+  an in-place append after it, a second rename-replace — and counts the reloads; plus the
+  same three through a SYMLINKED config.yaml, the shape the stub-instance harness ships,
+  where resolving the link before watching leaves the operator's own save — in the lexical
+  parent — unwatched entirely).
   And one guards the project's own NAME (`test_project_name.py`): a stale mention of the
   pre-rename name left in `deploy.sh` points a deploy at a path that no longer exists, in
   `ai-hub.service` at a `WorkingDirectory` that is gone, in the README at a clone URL that
