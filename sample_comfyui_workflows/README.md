@@ -1,6 +1,9 @@
 # Mesh-Workflows — Ein- und Ausgaben
 
 Stand 2026-09-08. Die Tabellen sind aus den `*_api.json` erzeugt, nicht von Hand gepflegt.
+`—` in der Default-Spalte heißt „kein sinnvoller Default“: im JSON steht dort ein
+Arbeitsdateiname aus dem letzten ComfyUI-Lauf (`ComfyUI_temp_*.png`, `1784443662.png`), der
+bei jeder Anfrage überschrieben wird.
 
 **Dateiablage:** `<name>_api.json` = API-Format (das, was das Gateway einreicht, git-versioniert).
 `org/<name>.json` = UI-Format zum Bearbeiten in ComfyUI — **`org/` ist gitignored**, Sicherungen
@@ -9,11 +12,15 @@ liegen in `org/backups/`.
 **Konventionen:**
 
 * Nodes mit Titel `input_*` sind die Bindepunkte des Gateways.
-* Der Haupt-Export trägt den Titel **`Output`** und bekommt `filename_prefix` aus `input_name`.
+* Der Haupt-Export trägt den Titel **`Output`** und bekommt `filename_prefix` aus `input_name`
+  — außer als Stage 1 einer Kette: dort pinnt das Gateway den Prefix auf `gwchain_<job-id>`
+  (`main.py`, `adapters.chain_export`). Die `Save Image`-Artefakte behalten auch dann ihren
+  `input_name`-Prefix.
 * Dateinamen: `<name>.<ext>` für das Hauptergebnis, `<name>_<artefakt>.<ext>` für alles andere,
   Artefaktnamen klein. `<name>` = Wert von `input_name`.
 * ComfyUI hängt an Export-/Save-Nodes einen laufenden Zähler an: aus `<name>_basecolor` wird auf
-  der Platte `<name>_basecolor_00001_.png`. Globs deshalb immer mit `*` am Ende.
+  der Platte `<name>_basecolor_00001_.png`. Der Zähler steht **vor** der Endung — Globs
+  deshalb immer mit `*` vor der Endung (`*_basecolor*.png`), nie `…_basecolor.png`.
 
 ---
 
@@ -114,8 +121,11 @@ Kein `input_face_num`: `SplatToMesh` kennt kein Face-Ziel, die Dichte kommt übe
 | `input_keep_borders` | `8` | `value` | `'true'` | ja |
 | `input_no_fingers` | `6` | `value` | `False` | **nein** — Pass-through an Stage 2 |
 
-Unterschied: `mesh-shrink` dezimiert (Quadric Edge Collapse), `mesh-shrink-quad` remesht
-(QuadriFlow, Quad-Topologie). Gleiche Bindepunkte, austauschbar.
+Unterschied: `mesh-shrink` dezimiert (Quadric Edge Collapse), `mesh-shrink-quad` dezimiert
+erst fest auf 20000 Faces (#11) und remesht dann (`Hy3D21IMRemesh`, Instant Meshes,
+Quad-Topologie). Gleiche Bindepunkte, aber `input_face_num` ist bei `-quad` eine
+**Vertex**-Zahl (`vertex_count`), bei `mesh-shrink` eine **Face**-Zahl
+(`target_face_count`) — austauschbar nur bei angepasstem Wert.
 
 #### mesh-reg-unirig / mesh-reg-mia / mesh-make-it-animatable
 
@@ -135,12 +145,13 @@ Preview-Node in `/history` landet. `mesh-make-it-animatable` hat außerdem kein 
 |---|---|---|
 | `img2mesh-trellis2_high` | `82` | `<name>.glb` · `_whitemesh.glb` (#33) · `_refined.glb` (#36) · `_basecolor.png` (#70) · `_metallic.png` (#71) |
 | `img2mesh-trellis2_low` | `100` | `<name>.glb` · `_whitemesh.glb` (#68) · `_basecolor.png` (#92) · `_metallic.png` (#93) |
+| `img2mesh-trellis2_multiview` | `103` | `<name>.glb` · `_basecolor.png` (#101) · `_metallic.png` (#102) |
 | `img2mesh-Pixal3D` | `312` | `<name>.glb` · `_whitemesh.glb` (#322) · `_basecolor.png` (#313) · `_metallic.png` (#315) |
 | `img2mesh-triposplat` | `107` | `<name>.glb` — **sonst nichts**, siehe unten |
 | `img2mesh-hunyuan3d` | `50` | `<name>.glb` · `_whitemesh.glb` (#41) · `_basecolor.png` (#45) · `_metallic.png` (#47) · `_multiview.png` (#43) |
 | `mesh-shrink` / `-quad` | `30` | `<name>.glb` · `_basecolor.png` (#33) · `_metallic.png` (#35) |
 | `mesh-reg-unirig` | — (#7) | `<name>.fbx` |
-| `mesh-reg-mia` | — (#2) | `<name>.fbx` |
+| `mesh-reg-mia` | — (#2) | `<name>.fbx` · daneben `<name>.glb` (nicht in `/history` gemeldet → Alias-Option `output_ext: glb`) |
 | `mesh-make-it-animatable` | — (#7) | `<name>.glb` (mixamo-Skin) |
 
 **triposplat liefert keine getrennten Texturen.** `SplatToMesh` gibt den Core-Typ `MESH` aus,
@@ -158,7 +169,8 @@ Konfiguration des Nachfolgers: `{alias, export_node, mesh_param, relay?, keep_fr
 * `keep_from_mesh` — Globs für Stage-1-Dateien, die in die Auslieferung übernommen werden.
   Für `generic`-Rigger **zwingend** `*_basecolor*.png` (Begründung in 2.2).
 * `rig` — `generic` (FBX-Ergebnis) oder `mixamo` (GLB-Ergebnis); steuert Validierung und
-  Textur-Normalisierung.
+  Textur-Normalisierung. Zusätzlich erlaubt: `meshy` / `tripo` für Cloud-Rigger — die werden
+  nur getaggt, nie normalisiert oder validiert (Cloud-Konventionen).
 
 Übergabe: bei geteiltem Dateisystem als absoluter Pfad, sonst per Upload ins `input/` von
 Stage 2. Relative Pfade (`output/3D/…glb`) funktionieren, weil ComfyUI mit
