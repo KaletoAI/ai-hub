@@ -150,7 +150,7 @@ die Generierungsseiten nennen PNG/JPEG/WebP.
 | `texture_alignment` | string | nein | `original_image` | `original_image`, `geometry` | Textur an Bild oder an Geometrie ausrichten |
 | `texture_seed` | integer | nein | random | beliebig | reproduzierbare Textur |
 | `model_seed` | integer | nein | random | beliebig | reproduzierbare Geometrie |
-| `geometry_quality` | string | nein | `standard` | `standard`, `detailed` | nur ab `model >= v3.0`; `detailed` +20 Credits |
+| `geometry_quality` | string | nein | `standard` | `standard`, `detailed` | nur ab `model >= v3.0`; `detailed` +20 Credits. UNKLAR, ob ältere Modelle das Feld ablehnen oder ignorieren — das Gateway sendet es über `tripo._PASSTHROUGH` bei JEDEM Generierungsrequest, auch für `v2.5-20250123` und die P-Serie (anders als bei `generate_parts` erzwingt `options_of` hier keine Modellregel). Ein 400 wäre ein finaler Job-Fehler. |
 | `face_limit` | integer | nein | adaptiv | s. u. | Obergrenze Polygone |
 | `quad` | boolean | nein | `false` | | Quad-Mesh statt Tris (+5 Credits); erzwingt in `convert` FBX |
 | `smart_low_poly` | boolean | nein | `false` | | „handgebaute" saubere Topologie (+10 Credits) |
@@ -172,7 +172,22 @@ sichtbar und wenig verdeckt.
 | `v3.1-20260211` | 1.500.000 | 2.000.000 | 150.000 |
 | `v3.0-20250812` | 1.000.000 | 2.000.000 | 150.000 |
 | `v2.5-20250123` | 500.000 | — | 150.000 |
+| `P1-20260311` | UNKLAR (Gateway nimmt 50.000 an) | — | UNKLAR |
 | `P2-20260801` | 48–50.000 | — | 48–25.000 |
+
+**Im Gateway** (`tripo.FACE_MAX` / `FACE_MAX_QUAD` / `_FACE_MIN`): 1,5 M / 1 M / 500 k je
+H-Modell, 50.000 für **beide** P-Modelle, 2 M für ein unbekanntes Modell — und mit
+`quad: true` **pauschal 150.000 für jedes Modell**, also auch für die P-Serie, deren
+Quad-Grenze diese Tabelle bei 25.000 sieht. Die Untergrenze ist 100, nicht 48. Ein
+Client-`input_face_num` wird in [100, cap] geklemmt (`face_limit_for`), ein
+Admin-`face_limit` wird NICHT geklemmt, sondern außerhalb des Bereichs verworfen
+(`opt_face_limit` → Tripos adaptiver Default).
+
+Die Spalte *Tris (ultra/detailed)* ist im Gateway nicht umgesetzt: `tripo._face_cap`
+klemmt immer gegen die Standard-Obergrenze des Modells und kennt `geometry_quality`
+nicht — ein `v3.1`-Alias landet also auch mit `geometry_quality: detailed` bei
+1.500.000. Die 2.000.000 verwendet der Code nur als Fallback für ein Modell, das seine
+Modelltabelle nicht kennt.
 
 Empfehlungen der Doku: Game-ready 50.000–100.000; Web/Mobile 10.000–50.000;
 mit `smart_low_poly` typisch 500–10.000 Quads.
@@ -358,6 +373,13 @@ belegt**. Praktisch: `output` einmal komplett loggen und dann fest verdrahten.
   Signed-URL-Natur und der V2-Doku abgeleitet — UNKLAR, aber sehr wahrscheinlich.)
 - **Konsequenz für eine Gateway-Implementierung:** direkt nach `success`
   herunterladen, nicht die URL an den Client durchreichen.
+  ACHTUNG, im heutigen Gateway nur bei Ein-Task-Jobs erfüllt:
+  `CloudTaskAdapter.generate` lädt `state.downloads` erst, wenn `_run` fertig ist —
+  bei einem Tripo-Job mit Convert-/Clip-Tasks liegen zwischen dem `success` des
+  Haupttasks und seinem Download also alle Folge-Tasks. Falls die
+  5-Minuten-Gültigkeit stimmt, muss vor dem Download ein frisches
+  `GET /v3/tasks/{task_id}` geholt werden (oder jeder Task sofort nach seinem
+  eigenen `success`).
 
 ### Polling & weitere Task-Endpoints
 - Empfohlenes Poll-Intervall: **2 Sekunden**.
@@ -383,7 +405,11 @@ belegt**. Praktisch: `output` einmal komplett loggen und dann fest verdrahten.
 |---|---|---|---|
 | `input` | string | ja | `task_id` \| `file_token` \| public URL — genau EINE Form |
 
-Format: **nur GLB**, max. **150 MB**.
+Format: **nur GLB**, max. **150 MB** — im Widerspruch zur Feldtabelle des Auto-Rigs in
+7.2, die für `input` zusätzlich GLTF/FBX/OBJ/STL nennt. Da die Doku den Rig-Check vor
+jedem Rig verlangt, ist GLB der gemeinsame Nenner. Das Gateway (`tripo.mesh_ext`)
+akzeptiert für `input_mesh_path` deshalb ausschließlich binäres glTF und weist alles
+andere ab, bevor Bytes hochgeladen oder 25 Credits ausgegeben werden.
 
 ```bash
 curl --request POST \
@@ -419,7 +445,7 @@ curl --request POST \
 
 | Feld | Typ | Pflicht | Default | Erlaubte Werte |
 |---|---|---|---|---|
-| `input` | string | **ja** | — | `task_id` \| `file_token` \| public URL (GLB, GLTF, FBX, OBJ, STL; max. 150 MB) |
+| `input` | string | **ja** | — | `task_id` \| `file_token` \| public URL (laut Feldtabelle GLB, GLTF, FBX, OBJ, STL; max. 150 MB — der Rig-Check in 7.1 nennt dagegen **nur GLB**, siehe dort) |
 | `model` | string | nein | `v1.0-20240301` | `v1.0-20240301`, `v2.5-20260210` |
 | `rig_type` | string | nein | `biped` | `biped`, `quadruped`, `hexapod`, `octopod`, `avian`, `serpentine`, `aquatic` |
 | `spec` | string | nein | `tripo` | **`tripo`, `mixamo`** |
@@ -527,7 +553,7 @@ Modell mit sauberem Prompt neu zu generieren (komplexe Posen vermeiden).
 | Feld | Typ | Pflicht | Default | Werte / Bemerkung |
 |---|---|---|---|---|
 | `input` | string | **ja** | — | `task_id` \| `file_token` \| public URL (GLB, GLTF, FBX, OBJ, STL; max. 150 MB) |
-| `format` | string | **ja** | — | `GLTF`, `FBX`, `USDZ`, `OBJ`, `STL`, `3MF` (Großschreibung!) |
+| `format` | string | **ja** | — | `GLTF`, `FBX`, `USDZ`, `OBJ`, `STL`, `3MF` (Großschreibung!); `GLB` ist in der Feldtabelle **nicht** gelistet — UNKLAR, ob der Endpoint es annimmt |
 | `quad` | boolean | nein | `false` | Vierecke statt Dreiecke; **erzwingt FBX** |
 | `force_symmetry` | boolean | nein | `false` | nur wirksam bei `quad: true` |
 | `face_limit` | integer | nein | — (Original bleibt) | V2-Default war `10000` |
@@ -545,6 +571,13 @@ Modell mit sauberem Prompt neu zu generieren (komplexe Posen vermeiden).
 | `part_names` | string[] | nein | — | Namen der zu exportierenden Meshes/Segmente |
 | `export_orientation` | string | nein | `+x` | `+x`, `-x`, `+y`, `-y` |
 | `fbx_preset` | string | nein | `blender` | `blender`, `3dsmax`, `mixamo`, `bake_scale` |
+
+**Gateway-Hinweis:** `adapters.TripoAdapter._run` schickt jedes Zielformat, das der
+Haupttask nicht selbst liefert, als eigenen Convert-Task (`tripo.build_convert`,
+`format` in Großbuchstaben). Beim **Rig**-Endpoint ist das native Format das ERSTE
+gehakte Lieferformat, ein Rig-Alias mit `deliver formats = fbx, glb` löst deshalb einen
+Convert nach `GLB` aus. Solange oben nicht geklärt ist, ob `GLB` zulässig ist: bei
+Rig-Aliassen `glb` zuerst haken.
 
 **Beispiel:**
 ```json
