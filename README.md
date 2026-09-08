@@ -290,6 +290,26 @@ window among them — the client cannot pick the backend. Unknown stays absent,
 never `0`. The **Input & Routing → LLM models** tab shows the value on each
 backend chip (`ctx 32k`), so "why does my client think 128k?" is answerable there.
 
+### Scan network (find backends on the LAN)
+
+Backends tab → **Scan network** sweeps this host's own subnet(s) for servers the
+gateway can register — llama-swap / llama.cpp / vLLM / Ollama (`openai`) and
+ComfyUI (`comfyui`) — and lists each find with an **Add** link that opens the
+backend form pre-filled (name from reverse DNS, type, url; `local` ticked). A find
+already registered says *registered as `name`* instead. Nothing is ever added by
+itself, and nothing is scanned unless someone clicks.
+
+| Setting (Server tab) | Meaning |
+|---|---|
+| `scan_cidrs` | comma-separated ranges; blank = the /24 of every IPv4 address of this host. Capped at **1024** hosts per scan. |
+| `scan_ports` | ports tried on every host; blank = `8080, 8000, 11434, 8188, 1234, 5000`. |
+
+Detection per open port, first hit wins: `GET /v1/models` (a `data` list → openai,
+flavor from `owned_by`; 401/403 → openai that *needs api key*), `GET /system_stats`
+(`comfyui_version` → comfyui), `GET /api/tags` (Ollama's native API). TCP connect
+0.5 s, 256 in parallel, so a /24 with six ports takes a few seconds. Progress and
+the result table update live.
+
 ### Sampling defaults (`sampling_defaults`)
 
 Some backends sample with bare server defaults when a request carries no sampling

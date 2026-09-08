@@ -31,7 +31,7 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
   restart for backend/alias changes. Read **only at startup**:
   `stats.enabled` and the stats/jobs DB paths.
 - **No linter or build step, and no blanket test suite** — only targeted stdlib
-  `unittest` files for the mechanisms that fail SILENTLY (see the twenty-three listed under
+  `unittest` files for the mechanisms that fail SILENTLY (see the twenty-four listed under
   `anthropic_bridge.py`): `venv/bin/python -m unittest discover -s tests -t .`.
   Everything else is verified by running the server and hitting endpoints with
   `curl` (README "Try it"), `curl localhost:4000/health` for a routing snapshot, or
@@ -44,11 +44,11 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
 
 ## Architecture
 
-Fifteen self-contained Python files hold everything (`ls *.py` is the count of
+Sixteen self-contained Python files hold everything (`ls *.py` is the count of
 record; the tests live in `tests/`). `main.py` owns app state; the others
 (`adapters`, `meshy`, `tripo`, `cloudtask`, `jobs`, `store`, `stats`, `admin`,
 `reasoning`, `scheduler`, `responses_bridge`, `anthropic_bridge`,
-`openai_image_bridge`, `previewanim`) never import `main` — they receive what
+`openai_image_bridge`, `previewanim`, `netscan`) never import `main` — they receive what
 they need via injected callables, staying hot-reload-safe.
 
 - **`main.py`** — config loading, health/discovery loop, routing, all HTTP
@@ -535,7 +535,7 @@ they need via injected callables, staying hot-reload-safe.
   silently answer about content the model never saw (documents/PDFs). Covered by
   `test_anthropic_bridge.py` (stdlib `unittest` — a streaming tool-call bridge fails
   silently rather than crashing). `ls tests/test_*.py` is the count of record —
-  **twenty-three** files today — and each exists for that same reason: the mechanism it
+  **twenty-four** files today — and each exists for that same reason: the mechanism it
   guards fails SILENTLY, so it is named next to that mechanism above.
   `test_anthropic_bridge.py`, `test_prune_branch.py` (a
   dead-branch prune that cascades one node too far or too few surfaces as an aborted
@@ -589,6 +589,12 @@ they need via injected callables, staying hot-reload-safe.
   the llama-swap enrichment asking `/upstream/<model>/v1/models` for LOADED models only —
   asking an unloaded one would load it — the merge that keeps what this poll did not see,
   and the MINIMUM a bare id or alias publishes over its backends).
+  `test_netscan.py` (the LAN scan: a wrong range silently scans nothing or a whole
+  site, a misclassified server pre-fills a backend the gateway cannot discover, a
+  "known" match that misses re-offers every backend already there, and a scan that
+  loads an unloaded model or writes the store would be a side effect nobody asked
+  for — so it pins address derivation, the cap, every fingerprint branch, the
+  registered match, one real-socket sweep, the status snapshot and both renderers).
   And one guards the project's own NAME (`test_project_name.py`): a stale mention of the
   pre-rename name left in `deploy.sh` points a deploy at a path that no longer exists, in
   `ai-hub.service` at a `WorkingDirectory` that is gone, in the README at a clone URL that
@@ -620,6 +626,17 @@ they need via injected callables, staying hot-reload-safe.
   the `/ui` inspection view ONLY (`add_idle(glb) → glb`), so bad skin weights show as
   spikes/rings once it deforms. Pure struct/json on the glTF binary, append-only; the
   result route applies it on `?anim=idle`, never to the delivered file.
+- **`netscan.py`** — the LAN scan behind Backends → *Scan network* (spec
+  `docs/superpowers/specs/2026-09-08-lan-scan-design.md`): pure (no `main`/`adapters`
+  imports, no module state, `fetch`/`resolve`/runner injected). `parse_ip_addr` derives
+  the /24 of every own IPv4 address (a shorter prefix is NARROWED, a /30 kept),
+  `expand_targets` caps at `HOST_CAP` 1024, `scan` TCP-connects (0.5 s, 256 parallel)
+  then `fingerprint`s every open port — `/v1/models` (openai; 401/403 = needs key) →
+  `/system_stats` (comfyui) → `/api/tags` (Ollama) — and `known_backend_for` matches
+  host+port against the configured list so a registered backend is named, not
+  re-offered. `main.start_scan`/`scan_status` own the ONE task and the settings
+  `scan_cidrs`/`scan_ports`; `admin._scan_panel` renders it live (`data-sk="scan"`),
+  *Add* opens `_backend_form(prefill=…)`. Manual only, never writes the store.
 
 ### Request flow
 
