@@ -75,3 +75,76 @@ def expand_targets(cidrs: list[str], cap: int = HOST_CAP) -> tuple[list[str], bo
             seen.add(s)
             out.append(s)
     return out, False
+
+
+@dataclass
+class Finding:
+    """One server the scan can offer as a backend."""
+    host: str
+    port: int
+    url: str                     # what the backend form's `url` will be
+    type: str                    # "openai" | "comfyui" — the gateway's backend type
+    flavor: str                  # human label: llama-swap / llama.cpp / vLLM / ollama / ComfyUI 0.3
+    models: Optional[int]        # count from the listing; None when it could not be read
+    needs_key: bool = False      # /v1/models answered 401/403
+    known_as: Optional[str] = None   # name of the backend already registered at this url
+    hostname: Optional[str] = None   # reverse DNS, when the injected resolver knew one
+
+
+_FLAVORS = {"llama-swap": "llama-swap", "llamacpp": "llama.cpp", "vllm": "vLLM", "library": "ollama"}
+
+
+async def _get(fetch, url):
+    try:
+        return await fetch(url)
+    except Exception:
+        return 0, None
+
+
+async def fingerprint(fetch, base: str) -> Optional[Finding]:
+    """What runs at `base` (scheme://host:port), first hit wins:
+    /v1/models with a `data` list (or a bare list) → openai, flavor from owned_by;
+    401/403 there → openai that needs a key; /system_stats with comfyui_version →
+    comfyui; /api/tags with `models` → Ollama (which serves /v1 too). None when the
+    port speaks none of these — an open port is not a backend."""
+    hp = host_port(base)
+    if hp is None:
+        return None
+    host, port = hp
+    st, body = await _get(fetch, f"{base}/v1/models")
+    if st in (401, 403):
+        return Finding(host, port, base, "openai", "openai-compatible", None, needs_key=True)
+    data = body.get("data") if isinstance(body, dict) else body
+    if st == 200 and isinstance(data, list) and all(isinstance(m, dict) for m in data):
+        owners = {str(m.get("owned_by", "")).lower() for m in data}
+        flavor = next((_FLAVORS[o] for o in _FLAVORS if o in owners), "openai-compatible")
+        return Finding(host, port, base, "openai", flavor, len(data))
+    st, body = await _get(fetch, f"{base}/system_stats")
+    ver = (body.get("system") or {}).get("comfyui_version") if isinstance(body, dict) else None
+    if st == 200 and ver:
+        return Finding(host, port, base, "comfyui", f"ComfyUI {ver}", None)
+    st, body = await _get(fetch, f"{base}/api/tags")
+    if st == 200 and isinstance(body, dict) and isinstance(body.get("models"), list):
+        return Finding(host, port, base, "openai", "ollama", len(body["models"]))
+    return None
+
+
+def host_port(url: str) -> Optional[tuple[str, int]]:
+    """(host, port) of a backend url; the scheme's default port when none is given."""
+    m = re.match(r"^(https?)://([^/:]+)(?::(\d+))?/?", str(url or "").strip(), re.I)
+    if not m:
+        return None
+    scheme, host, port = m.group(1).lower(), m.group(2).lower(), m.group(3)
+    return host, int(port) if port else (443 if scheme == "https" else 80)
+
+
+def known_backend_for(url: str, backends: list[dict]) -> Optional[str]:
+    """Name of a configured backend at the same host+port (scheme and trailing slash
+    ignored) — so the panel says 'registered as …' instead of offering it again."""
+    want = host_port(url)
+    if want is None:
+        return None
+    for b in backends or []:
+        if host_port(b.get("url", "")) == want:
+            return b.get("name")
+    return None

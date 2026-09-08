@@ -71,5 +71,76 @@ class Addresses(unittest.TestCase):
         self.assertEqual(hosts, ["10.20.0.1", "10.20.0.2", "127.0.0.1"])
 
 
+def _fetcher(routes: dict):
+    """fetch(url) → (status, json) from a {path: (status, obj)} table; unknown → (404, None)."""
+    async def fetch(url):
+        rest = url.split("//", 1)[1]
+        path = "/" + rest.split("/", 1)[1] if "/" in rest else "/"
+        return routes.get(path, (404, None))
+    return fetch
+
+
+def _fp(routes):
+    return asyncio.run(netscan.fingerprint(_fetcher(routes), "http://10.0.0.5:8080"))
+
+
+class Fingerprint(unittest.TestCase):
+    def test_llama_swap(self):
+        f = _fp({"/v1/models": (200, {"data": [{"id": "a", "owned_by": "llama-swap"},
+                                               {"id": "b", "owned_by": "llama-swap"}]})})
+        self.assertEqual((f.type, f.flavor, f.models, f.needs_key), ("openai", "llama-swap", 2, False))
+        self.assertEqual(f.url, "http://10.0.0.5:8080")
+
+    def test_llama_cpp_vllm_ollama_flavors(self):
+        for owned, flavor in (("llamacpp", "llama.cpp"), ("vllm", "vLLM"), ("library", "ollama"),
+                              ("acme", "openai-compatible")):
+            f = _fp({"/v1/models": (200, {"data": [{"id": "m", "owned_by": owned}]})})
+            self.assertEqual(f.flavor, flavor, owned)
+
+    def test_bare_list_payload_counts(self):
+        f = _fp({"/v1/models": (200, [{"id": "m"}, {"id": "n"}])})
+        self.assertEqual((f.type, f.models), ("openai", 2))
+
+    def test_needs_key(self):
+        for st in (401, 403):
+            f = _fp({"/v1/models": (st, {"error": "no"})})
+            self.assertEqual((f.type, f.needs_key, f.models), ("openai", True, None))
+
+    def test_comfyui_via_system_stats(self):
+        f = _fp({"/system_stats": (200, {"system": {"comfyui_version": "0.3.40"}})})
+        self.assertEqual((f.type, f.flavor), ("comfyui", "ComfyUI 0.3.40"))
+
+    def test_ollama_native_api_only(self):
+        f = _fp({"/api/tags": (200, {"models": [{"name": "llama3"}]})})
+        self.assertEqual((f.type, f.flavor, f.models), ("openai", "ollama", 1))
+
+    def test_plain_http_server_is_not_a_finding(self):
+        self.assertIsNone(_fp({"/": (200, {"hello": 1})}))
+        self.assertIsNone(_fp({"/v1/models": (200, {"nope": []})}))
+
+    def test_fetch_exception_is_not_a_finding(self):
+        async def fetch(url):
+            raise ConnectionError("reset")
+        self.assertIsNone(asyncio.run(netscan.fingerprint(fetch, "http://10.0.0.5:8080")))
+
+
+class Known(unittest.TestCase):
+    B = [{"name": "dx10-01", "type": "openai", "url": "http://192.168.8.35:8080"},
+         {"name": "dx10-02", "type": "comfyui", "url": "https://192.168.8.36:8188/"}]
+
+    def test_same_host_and_port_matches_whatever_scheme_or_slash(self):
+        self.assertEqual(netscan.known_backend_for("http://192.168.8.35:8080/", self.B), "dx10-01")
+        self.assertEqual(netscan.known_backend_for("http://192.168.8.36:8188", self.B), "dx10-02")
+
+    def test_other_port_or_host_does_not(self):
+        self.assertIsNone(netscan.known_backend_for("http://192.168.8.35:8000", self.B))
+        self.assertIsNone(netscan.known_backend_for("http://192.168.8.37:8080", self.B))
+
+    def test_default_ports_by_scheme(self):
+        self.assertEqual(netscan.host_port("http://a"), ("a", 80))
+        self.assertEqual(netscan.host_port("https://a/"), ("a", 443))
+        self.assertIsNone(netscan.host_port("nonsense"))
+
+
 if __name__ == "__main__":
     unittest.main()
