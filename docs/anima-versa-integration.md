@@ -34,8 +34,10 @@ Chat-/LLM-Modelle aller Backends (400+) **plus** die Image-Generierungs-Aliase
 (`owned_by: "ai-hub (image)"`). Zwei Hebel, damit anima-versa nur das Relevante sieht:
 
 1. **Eigenen anima-versa-User mit Allow-List** (empfohlen). Im `/ui` → **Users** einen
-   User anlegen, dessen Häkchen **nur** die Image-Aliase (z.B. `Qwen`) — oder ein ganzes
-   **Backend** — umfassen. `GET /v1/models` mit diesem Key ist dann **gefiltert** und
+   User anlegen, dessen Häkchen **die Image-Aliase namentlich** enthalten (z.B. `Qwen`).
+   Ein Grant auf ein ganzes **Backend** wirkt nur für Chat-/LLM-Modelle — Image-Aliase
+   müssen einzeln freigegeben werden, sonst sind sie weder in `GET /v1/models` sichtbar
+   noch nutzbar (`403`). `GET /v1/models` mit diesem Key ist dann **gefiltert** und
    liefert nur die erlaubten Einträge (verifiziert: `allow=[Qwen]` → genau 1 Eintrag).
    Die Allow-List gated zugleich die **Nutzung** (fremdes Modell → `403`).
 2. **`GET /v1/models?type=image`** — liefert ausschließlich die Image-Aliase
@@ -57,8 +59,13 @@ Beides kombinierbar: anima-versa nutzt seinen beschränkten Key, ruft `GET /v1/m
   "model": "Qwen",                 // PFLICHT — gen-alias
   "prompt": "a red apple on a table",   // PFLICHT
   "negative_prompt": "blurry, low quality",  // optional
-  "size": "1024x1024",             // optional — "BxH" oder "auto" (→ 1024x1024). Default 1024x1024
-  "n": 1,                          // optional — Anzahl Bilder. Default 1
+  "size": "1024x1024",             // optional — "BxH" oder "auto"; unparsebare Werte
+                                   // fallen still auf 1024x1024 zurück. Wirkt NUR, wenn
+                                   // der Alias width/height im Mapping bindet — sonst
+                                   // still ignoriert (wie jeder ungemappte Param, §4).
+  "n": 1,                          // wird ANGENOMMEN, aber ignoriert — die Anzahl der
+                                   // Bilder bestimmt der Workflow (Batch-Size im Graph).
+                                   // data[] hat so viele Einträge, wie der Job liefert.
   "response_format": "b64_json",   // optional — "b64_json" | "url". Default "url"
 
   // BONUS (LocalAI-kompatibel): Referenzbilder als Liste.
@@ -84,9 +91,9 @@ kein zweiter, auth-pflichtiger Abruf nötig — siehe §5).
 {
   "created": 1782590443,
   "data": [
-    { "b64_json": "<base64-PNG>" }   // bei response_format "b64_json"
+    { "mime": "image/png", "b64_json": "<base64-PNG>" }   // bei response_format "b64_json"
     // ODER bei "url":
-    // { "url": "http://192.168.8.10:4000/v1/jobs/<id>/result/0" }
+    // { "mime": "image/png", "url": "http://192.168.8.10:4000/v1/jobs/<id>/result/0" }
   ]
 }
 ```
@@ -110,15 +117,19 @@ curl -s -m 240 http://192.168.8.10:4000/v1/images/generations \
 
 | Feld | Typ | Bedeutung |
 |---|---|---|
-| `image` | Datei(en) | **PFLICHT.** 1..16 Bilddateien → **positionsweise** auf die Bild-Slots des Workflows (in **Mapping-Reihenfolge**). Leere Slots bekommen einen 8×8-Platzhalter — **außer** der Slot ist im Mapping als **`required`** markiert (z.B. Inpaint-Bild/Maske): dann bleibt er leer und ComfyUI failt klar, wenn nichts kommt. Mehrfach `image=@...`. |
+| `image` | Datei(en) | **PFLICHT.** 1..16 Bilddateien → **positionsweise** auf die Bild-Slots des Workflows (in **Mapping-Reihenfolge**). Was ein leer gebliebener Slot tut, legt der Admin pro Slot fest: `placeholder` (Default, 8×8-Platzhalter) · `required` (bleibt leer, ComfyUI failt klar) · `disable` (Loader **und** der davon abhängige Zweig werden entfernt — der Job läuft ohne dieses Bild). Mehrfach `image=@...`. |
 | `mask` | Datei | optional (OpenAI-Inpaint). Wird **nach** den `image`-Dateien als nächster positionaler Slot angehängt — der Mask-Slot (`LoadImageMask`) ist normal der letzte in der Mapping-Reihenfolge. |
 | `model` | Text | **PFLICHT.** gen-alias. |
 | `prompt` | Text | optional |
 | `negative_prompt` | Text | optional |
 | `size` | Text | optional, `BxH`/`auto` |
-| `n` | Text | optional, Default 1 |
+| `n` | Text | akzeptiert, aber **wirkungslos** — der Workflow bestimmt die Bildanzahl |
 | `response_format` | Text | `b64_json` \| `url` |
 | *alles andere* | Text | dynamische Scalar-Params (loras, seed, …) — Strings werden auto-gecastet (`"0.8"`→0.8) |
+
+Effektives Limit ist `min(16, Anzahl Bild-Slots des Alias)` — überzählige Dateien
+werden **still verworfen** (kein Fehler). Wie viele Slots ein Alias hat und wie sie
+heißen, liefert `GET /v1/generations/{alias}/schema` (Liste `images`).
 
 Response identisch zu §2 (`{created, data:[…]}`). Task ist intern `img2img`.
 **Reihenfolge:** `image[0]` → erster Bild-Slot, `image[1]`/`mask` → nächster. Welcher
@@ -170,8 +181,16 @@ auf Gateway-Seite, nicht in anima-versa hartzucodieren. Ein anima-versa-UI-Feld
 - **LoRA-bewusstes Routing:** Fragt ein Request eine LoRA an, die nur auf bestimmten
   Backends installiert ist, routet die Gateway **automatisch dorthin** (bzw. parkt
   darauf), statt auf ein Backend ohne die LoRA auszuweichen. Eine LoRA, die es nirgends
-  gibt, wird ignoriert (Priorität entscheidet). Du brauchst also **kein** Backend
-  vorzugeben — die Verfügbarkeit der LoRA steuert die Auswahl.
+  gibt, wird ignoriert (dann entscheidet die normale Scheduler-Reihenfolge: unbezahlte
+  Backends vor bezahlten, danach das schnellste laut gemessener Generierungszeit). Du
+  brauchst also **kein** Backend vorzugeben — die Verfügbarkeit der LoRA steuert die
+  Auswahl.
+- **Zwei Schreibweisen, ein Pfad je Endpoint:** Auf `/v1/images/generations` und
+  `/v1/images/edits` gilt **nur** die flache Form `lora_1`, `lora_2`, … (+ `strength_N`).
+  Die im Alias-Schema beworbene Array-Form `loras: [{name, strength}]` versteht **nur**
+  der native `POST /v1/generations` — auf den Image-Shims wird sie stillschweigend
+  ignoriert. Umgekehrt müssen `lora_N` beim nativen Endpoint **in `params`** stehen
+  (top-level werden dort nur width/height/steps/cfg/seed/sampler/scheduler/seconds gelesen).
 
 ---
 
@@ -187,8 +206,9 @@ auf Gateway-Seite, nicht in anima-versa hartzucodieren. Ein anima-versa-UI-Feld
 Die Result-URLs bleiben bis zum TTL des Jobs abrufbar (Default 24 h).
 
 **Video/Audio-Ausgabe:** Manche Aliase erzeugen kein Bild, sondern **Video/Audio**
-(z.B. img2video). Beim Images-Shim trägt jeder `data[]`-Eintrag dann ein `mime`
-(z.B. `video/mp4`) — die `url` liefert die Datei mit korrektem Content-Type. Für
+(z.B. img2video). Beim Images-Shim trägt **jeder** `data[]`-Eintrag ein `mime` (bei
+solchen Aliasen z.B. `video/mp4`) — die `url` liefert die Datei mit korrektem
+Content-Type. Für
 solche Aliase ist der **native `/v1/generations`** sauberer: `results[]` trägt pro
 Artefakt `kind` (`image`/`video`/`audio`) + `mime` + `url`. Consumer sollten am
 `mime`/`kind` entscheiden, nicht Bild annehmen.
@@ -198,21 +218,30 @@ Artefakt `kind` (`image`/`video`/`audio`) + `mime` + `url`. Consumer sollten am
 ## 6. Fehler- & Lastverhalten
 
 Die Endpoints sind **synchron**: der HTTP-Request blockiert, bis das Bild fertig ist
-(typisch ~30–90 s pro Bild). **Großzügiges Client-Timeout setzen (z.B. 240–300 s).**
+(typisch ~30–90 s pro Bild). Ist das Backend belegt, kommt die **Parkzeit** obendrauf:
+bis `async_park_timeout_s` (Default **600 s**) wartet der Job auf einen freien Slot,
+erst danach failt er (502). Worst case also Parkzeit + Generierungszeit —
+**Client-Timeout ≥ 660 s setzen** (oder den nativen Async-Pfad aus §7 nehmen).
 
 | Code | Bedeutung | anima-versa |
 |---|---|---|
 | 200 | Bild(er) fertig | normal verarbeiten |
 | 400 | `prompt` bzw. `image` fehlt | Request-Fehler, nicht retrien |
 | 401 | API-Key ungültig | Config-Fehler |
-| 402 | Credit-/Quota-Limit des Users erreicht | dem User melden |
+| 402 | Monats-Kostenlimit des Users erreicht | dem User melden |
 | 403 | Modell/Alias für diesen Key nicht erlaubt | Config-Fehler |
+| 429 | Tages-Request-Kontingent des Users erschöpft | mit Backoff / am nächsten Tag |
 | 502 | Generierung fehlgeschlagen / Park-Timeout (Backend zu lange busy) | optional 1× retrien |
 | 503 | **Kein** gesundes Backend für den Alias (down/nicht gemappt) | mit Backoff retrien |
 
+**Fehler-Body:** Das Gateway antwortet auf den Image-Pfaden im FastAPI-Format
+`{"detail": "<Meldung>"}` — **nicht** im OpenAI-Format `{"error":{"message":…}}`.
+Ein wiederverwendeter OpenAI-Provider muss die Meldung aus `detail` lesen, sonst
+bleibt sie leer.
+
 **Busy ≠ Fehler:** Wenn das ComfyUI-Backend gerade ausgelastet ist (Concurrency-Cap),
 **queued das Gateway den Job intern und blockiert den Request, bis ein Slot frei wird**
-(bis `async_park_timeout`, dann 502). anima-versa braucht **keine eigene
+(bis `async_park_timeout_s`, Default 600 s, dann 502). anima-versa braucht **keine eigene
 Concurrency-Drosselung** — nur ein großzügiges Timeout. Mehrere parallele Requests
 reihen sich auf dem Backend sauber ein.
 
@@ -224,7 +253,12 @@ Wenn anima-versa nicht minutenlang synchron blocken will, gibt es den nativen Jo
 
 1. `POST /v1/generations` → `{"model":"Qwen","prompt":"…","mode":"async","params":{"width":1024,"height":1024,"seed":1}}`
    → **202** `{"job_id":"…","status":"queued"}`
-2. `GET /v1/jobs/<job_id>` → `{"status":"queued|running|done|failed", "results":[{"n":0,"url":"…"}], "error":…}`
+2. `GET /v1/jobs/<job_id>` → `{"job_id":"…","status":"queued|running|done|failed",
+   "alias":"…","backend":"…","error":null,
+   "results":[{"n":0,"kind":"image","mime":"image/png","name":"…","sha256":"…","url":"…"}]}`
+   — `results` ist erst bei `status:"done"` gefüllt; laufende Jobs tragen zusätzlich
+   `elapsed_s` und (wenn das Backend seinen Schrittzähler meldet) `progress`,
+   `progress_step` und `eta_s`.
 3. `GET /v1/jobs/<job_id>/result/<n>` → die Bilddatei (mit Bearer-Header).
 
 Das ist optional und **nicht** OpenAI-Standard — nur nehmen, wenn ein nicht-blockierender
@@ -249,7 +283,7 @@ Flow gewünscht ist. Für die Standard-Anbindung reichen §2/§3.
    - Extra-Params als zusätzliche JSON-Keys bzw. Form-Felder anhängen.
 4. **Response parsen:** `data[*].b64_json` → Bytes dekodieren; bei `url` → GET mit
    demselben Bearer-Header.
-5. **Timeout** auf ~300 s; Fehler-Codes aus §6 mappen.
+5. **Timeout** auf ~660 s (oder Async-Pfad §7); Fehler-Codes aus §6 mappen.
 6. **Auth:** Bearer-Header **immer** mitschicken — auch beim Result-URL-Abruf.
 
 ### Nicht-Ziele / Abgrenzung
