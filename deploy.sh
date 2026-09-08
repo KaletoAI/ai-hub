@@ -43,12 +43,17 @@ TAR_EXCLUDES=(
     --exclude='./deploy.sh'
 )
 
-if command -v rsync >/dev/null 2>&1; then
+# rsync is a two-ended protocol: the local binary spawns a REMOTE rsync over ssh, so
+# a local-only check is not enough. Measured 2026-09-08 deploying to a fresh Debian 13
+# container that had no rsync: the run died with "rsync error: error in rsync protocol
+# data stream (code 12)" and the tar fallback — which exists for exactly this case —
+# never ran. One extra ssh round-trip settles it before we pick a transport.
+if command -v rsync >/dev/null 2>&1 && ssh "${HOST}" 'command -v rsync >/dev/null 2>&1'; then
     echo "==> Syncing files to ${HOST}:${DEST} (rsync)"
     rsync -az --delete --human-readable --info=stats1,progress2 \
         "${RSYNC_EXCLUDES[@]}" ./ "${HOST}:${DEST}/"
 else
-    echo "==> rsync not found — falling back to tar-over-ssh (no --delete)"
+    echo "==> rsync missing locally or on ${HOST} — falling back to tar-over-ssh (no --delete)"
     ssh "${HOST}" "mkdir -p '${DEST}'"
     tar czf - "${TAR_EXCLUDES[@]}" -C . . \
         | ssh "${HOST}" "tar xzf - -C '${DEST}'"
