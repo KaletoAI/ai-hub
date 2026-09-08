@@ -339,6 +339,18 @@ class Console(unittest.TestCase):
         html = admin._backend_form(None, [], prefill={"name": "n", "type": "openai", "url": "http://h:8080"})
         self.assertIn('name="local" value="1" checked', html)
 
+    def test_server_tab_declares_the_two_text_settings(self):
+        keys = {k: kind for k, kind, *_ in admin._SRV_RUNTIME}
+        self.assertEqual(keys.get("scan_cidrs"), "text")
+        self.assertEqual(keys.get("scan_ports"), "text")
+
+    def test_server_row_renders_text_inputs_as_text(self):
+        # every runtime row used to be a number input; a CIDR list in one is unsubmittable
+        html = admin._srv_runtime_row("scan_cidrs", "text", "scan cidrs", "note", "192.168.8.0/24")
+        self.assertIn('type="text"', html)
+        self.assertIn('value="192.168.8.0/24"', html)
+        self.assertIn('type="number"', admin._srv_runtime_row("max_parked", "int", "x", "", 5))
+
 
 if __name__ == "__main__":
     unittest.main()

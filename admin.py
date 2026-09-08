@@ -6618,6 +6618,11 @@ _SRV_RUNTIME = [
      "seconds — how often an UNHEALTHY backend is re-checked while calls or jobs wait for "
      "capacity, so one that came back is picked up in seconds instead of a whole health "
      "check interval (blank = 3; 0 = off)"),
+    ("scan_cidrs", "text", "scan cidrs",
+     "Backends tab → Scan network: comma-separated ranges, e.g. 192.168.8.0/24, 10.20.0.0/30 "
+     "(blank = the /24 of every IPv4 address of this host; at most 1024 hosts per scan)"),
+    ("scan_ports", "text", "scan ports",
+     "ports tried on every host (blank = 8080, 8000, 11434, 8188, 1234, 5000)"),
 ]
 _SRV_RESTART = [
     ("__grp", "", "AI-Hub", ""),
@@ -6646,6 +6651,14 @@ def _srv_disp(k, v):
     return v
 
 
+def _srv_runtime_row(k: str, kind: str, lbl: str, note: str, value) -> str:
+    """One Server-tab runtime row. Numeric kinds render a number input; `text` a text
+    input — a CIDR or port LIST in a number input cannot be submitted at all."""
+    typ = "text" if kind == "text" else "number"
+    n = f" <span class='muted'>{_esc(note)}</span>" if note else ""
+    return _field(lbl, _inp(k, "" if value in (None, "") else value, typ=typ) + n)
+
+
 async def server_page(request: Request):
     si = _server_info()
     eff, rt = si.get("effective", {}), si.get("runtime", {})
@@ -6669,8 +6682,7 @@ async def server_page(request: Request):
         _field("API key (client auth)",
                _inp("api_key", "", placeholder=("•••• set — blank keeps it" if eff.get("api_key_set")
                                                 else "unset — clients need no key")))
-        + "".join(_field(lbl, _inp(k, "" if eff.get(k) in (None, "") else eff.get(k), typ="number") + note(n))
-                  for k, kind, lbl, n in _SRV_RUNTIME)
+        + "".join(_srv_runtime_row(k, kind, lbl, n, eff.get(k)) for k, kind, lbl, n in _SRV_RUNTIME)
         + _field("flags",
                  _checkbox("log_per_call", bool(eff.get("log_per_call")), "log_per_call",
                            "one log line per forwarded request")
