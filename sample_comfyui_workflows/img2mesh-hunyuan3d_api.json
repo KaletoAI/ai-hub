@@ -53,15 +53,6 @@
       "value": false
     }
   },
-  "7": {
-    "class_type": "PrimitiveString",
-    "_meta": {
-      "title": "input_lod_faces"
-    },
-    "inputs": {
-      "value": "5000"
-    }
-  },
   "10": {
     "class_type": "Trellis2PreProcessImage",
     "_meta": {
@@ -91,7 +82,7 @@
         "10",
         0
       ],
-      "steps": 30,
+      "steps": 50,
       "guidance_scale": 5.0,
       "seed": 0,
       "attention_mode": "sdpa"
@@ -109,7 +100,7 @@
   "22": {
     "class_type": "Hy3D21VAEDecode",
     "_meta": {
-      "title": "VAE-Decode → Mesh"
+      "title": "VAE-Decode \u2192 Mesh"
     },
     "inputs": {
       "vae": [
@@ -121,7 +112,7 @@
         0
       ],
       "box_v": 1.01,
-      "octree_resolution": 256,
+      "octree_resolution": 384,
       "num_chunks": 8000,
       "mc_level": 0,
       "mc_algo": "mc",
@@ -132,7 +123,7 @@
   "23": {
     "class_type": "Hy3D21PostprocessMesh",
     "_meta": {
-      "title": "Aufräumen + auf input_face_num reduzieren"
+      "title": "Aufr\u00e4umen + auf input_face_num reduzieren"
     },
     "inputs": {
       "trimesh": [
@@ -164,7 +155,7 @@
   "31": {
     "class_type": "Hy3D21CameraConfig",
     "_meta": {
-      "title": "Kamera — 6 Ansichten"
+      "title": "Kamera \u2014 6 Ansichten"
     },
     "inputs": {
       "camera_azimuths": "0, 90, 180, 270, 0, 180",
@@ -174,9 +165,9 @@
     }
   },
   "32": {
-    "class_type": "Hy3D21MultiViewsGeneratorWithMetaData",
+    "class_type": "Hy3DMultiViewsGenerator",
     "_meta": {
-      "title": "Multiview-Diffusion (Albedo + MR) + MetaData"
+      "title": "Multiview-Diffusion (Albedo + MR)"
     },
     "inputs": {
       "trimesh": [
@@ -199,21 +190,21 @@
         0
       ],
       "unwrap_mesh": false,
-      "seed": 0,
-      "output_name": [
-        "5",
-        0
-      ]
+      "seed": 0
     }
   },
   "33": {
-    "class_type": "Hy3DBakeMultiViewsWithMetaData",
+    "class_type": "Hy3DBakeMultiViews",
     "_meta": {
-      "title": "Ansichten auf UV backen + Lücken füllen (schreibt meta_data.json)"
+      "title": "Ansichten auf UV backen"
     },
     "inputs": {
       "pipeline": [
         "32",
+        0
+      ],
+      "camera_config": [
+        "31",
         0
       ],
       "albedo": [
@@ -223,10 +214,38 @@
       "mr": [
         "32",
         2
+      ]
+    }
+  },
+  "34": {
+    "class_type": "Hy3DInPaint",
+    "_meta": {
+      "title": "L\u00fccken f\u00fcllen"
+    },
+    "inputs": {
+      "pipeline": [
+        "33",
+        0
       ],
-      "metadata": [
-        "32",
+      "albedo": [
+        "33",
+        1
+      ],
+      "albedo_mask": [
+        "33",
+        2
+      ],
+      "mr": [
+        "33",
         3
+      ],
+      "mr_mask": [
+        "33",
+        4
+      ],
+      "output_mesh_name": [
+        "5",
+        0
       ]
     }
   },
@@ -313,7 +332,7 @@
     },
     "inputs": {
       "images": [
-        "33",
+        "34",
         0
       ],
       "filename_prefix": [
@@ -343,7 +362,7 @@
     },
     "inputs": {
       "images": [
-        "33",
+        "34",
         1
       ],
       "filename_prefix": [
@@ -359,7 +378,7 @@
     },
     "inputs": {
       "trimesh": [
-        "33",
+        "34",
         2
       ],
       "filename_prefix": [
@@ -379,97 +398,6 @@
       "model_file": [
         "50",
         0
-      ]
-    }
-  },
-  "60": {
-    "class_type": "StringConcatenate",
-    "_meta": {
-      "title": "LOD: <name>.glb"
-    },
-    "inputs": {
-      "string_a": [
-        "5",
-        0
-      ],
-      "string_b": "glb",
-      "delimiter": "."
-    }
-  },
-  "61": {
-    "class_type": "StringReplace",
-    "_meta": {
-      "title": "LOD: Pfad meta_data.json (aus Bake-Ausgabe)"
-    },
-    "inputs": {
-      "string": [
-        "33",
-        3
-      ],
-      "find": [
-        "60",
-        0
-      ],
-      "replace": "meta_data.json"
-    }
-  },
-  "62": {
-    "class_type": "Hy3DHighPolyToLowPolyBakeMultiViewsWithMetaData",
-    "_meta": {
-      "title": "LOD: dezimieren + Ansichten neu backen"
-    },
-    "inputs": {
-      "metadata_file": [
-        "61",
-        0
-      ],
-      "view_size": 768,
-      "texture_size": [
-        "4",
-        0
-      ],
-      "target_face_nums": [
-        "7",
-        0
-      ]
-    }
-  },
-  "63": {
-    "class_type": "StringConcatenate",
-    "_meta": {
-      "title": "LOD: Glob <LowPoly>/*/*.glb"
-    },
-    "inputs": {
-      "string_a": [
-        "62",
-        0
-      ],
-      "string_b": "*/*.glb",
-      "delimiter": "/"
-    }
-  },
-  "64": {
-    "class_type": "GeomPackLoadMeshGlob",
-    "_meta": {
-      "title": "LOD: alle Stufen einsammeln"
-    },
-    "inputs": {
-      "glob_pattern": [
-        "63",
-        0
-      ],
-      "sort_by": "name"
-    }
-  },
-  "67": {
-    "class_type": "Preview3D",
-    "_meta": {
-      "title": "LOD Output"
-    },
-    "inputs": {
-      "model_file": [
-        "64",
-        2
       ]
     }
   }

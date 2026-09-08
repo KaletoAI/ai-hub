@@ -261,7 +261,7 @@
       "lora_04": "None",
       "strength_04": 1,
       "model": [
-        "138",
+        "144",
         0
       ],
       "clip": [
@@ -272,23 +272,6 @@
     "class_type": "Lora Loader Stack (rgthree)",
     "_meta": {
       "title": "input_lora"
-    }
-  },
-  "138": {
-    "inputs": {
-      "boolean": true,
-      "on_true": [
-        "119",
-        0
-      ],
-      "on_false": [
-        "120",
-        0
-      ]
-    },
-    "class_type": "Switch any [Crystools]",
-    "_meta": {
-      "title": "true-diffusion_false-gguf"
     }
   },
   "140": {
@@ -314,6 +297,22 @@
     "class_type": "ComfyMathExpression",
     "_meta": {
       "title": "Math Expression"
+    }
+  },
+  "144": {
+    "inputs": {
+      "any_01": [
+        "119",
+        0
+      ],
+      "any_02": [
+        "120",
+        0
+      ]
+    },
+    "class_type": "Any Switch (rgthree)",
+    "_meta": {
+      "title": "Any Switch (rgthree)"
     }
   }
 }

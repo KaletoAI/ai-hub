@@ -115,6 +115,48 @@ Aufwand: mittel (Comfy-`/free`-Hook klein; llama-swap-Unload je nach
 Endpoint). Risiko: gering — beide Aktionen sind idempotente Aufräum-Calls,
 fire-and-forget mit Log, nie im Request-Pfad blockierend.
 
+### Nachtrag 2026-09-05 — der Free gehört VOR den Job
+
+Flag 1 stellt die Frage zum falschen Zeitpunkt: wenn ein Job endet, ist noch
+nicht entschieden, was als Nächstes kommt, also ist jede Antwort geraten. Beim
+**Claim** ist sie bekannt. Deshalb ist die Hauptregel jetzt
+`comfy_free_before_job` (default an für JEDE ComfyUI-Box, auch dedizierte):
+sobald ein Job ein Backend beansprucht (`main._claim_gen_backend`), wird
+`POST /free` **awaited** ausgeführt, wenn der Type-Key (Media: der Alias, also
+ein Workflow = ein Modellsatz) ein **anderer** ist als der zuletzt dort
+gelaufene. Gleicher Alias → Cache bleibt; genau das ist die Auszahlung der
+Alias-Affinität aus `scheduler.designated_taker`. Verglichen wird dabei nicht
+der Affinitäts-Key `backend_last_key`, sondern `backend_vram_key` — was die GPU
+nachweislich HÄLT, geschrieben aus dem Ergebnis des Free (`_comfy_free` liefert
+ein Urteil), nie aus dem Versuch: ein fehlgeschlagener oder wegen eines laufenden
+Jobs übersprungener Free hinterlässt `None`, und `None` (unbekannt, gemischt,
+Gateway-Neustart — der leert nie ComfyUIs VRAM) zählt als Änderung. „Awaited“
+heißt außerdem beobachtet: ComfyUIs `POST /free` setzt nur zwei Flags und
+antwortet sofort; der Worker liest sie erst nach seinem nächsten `q.get()`, und
+das `notify` geht verloren, während er nach einem Prompt im `gc.collect()`
+steckt — genau dann postet der Gateway-Poll. `_comfy_free(settle_s=…)` pollt
+deshalb `torch_vram_total` aus `/system_stats` und postet alle 2 s nach, bis der
+Pool auf ≤ 20 % gefallen ist (sonst nach 30 s Urteil False). Review 2026-09-08.
+
+Zwei Dinge, die Flag 1 nicht abdecken konnte:
+- **Chain-Stages.** Stage 1 und Stage 2 sind zwei Workflows, oft auf DEMSELBEN
+  Backend, ohne Job-Ende dazwischen — vorher lief dort nie ein Free. Gemessen
+  2026-09-05 (Job `cc604da29e0e`, Meshy → `mesh-mia` auf k12-gpu): Stage 2 starb
+  an `torch.OutOfMemoryError: Tried to allocate 20.00 MiB`, weil der ComfyUI-
+  Prozess 21,4 von 23,5 GiB hielt. Der Rig-Node (Make-It-Animatable) läuft in
+  einem EIGENEN venv/Prozess und kann diesen Cache prinzipiell nicht mitbenutzen.
+- **Free über den Gateway-Neustart hinweg** (siehe oben).
+
+Flag 1 bleibt, aber nur noch für seinen einen eigenen Zweck: eine geteilte Box
+soll auch dann freigeben, wenn gar kein Media-Job folgt, sonst scheitert der
+nächste llama-swap-Load. Es überspringt jetzt zusätzlich den Free, wenn bereits
+ein Job mit demselben Alias auf dieses Backend wartet — der wäre der designierte
+Nehmer und müsste sonst genau die Modelle neu laden, auf die er wartet.
+
+Pure Entscheidung: `scheduler.free_vram_before_job(last_key, next_key,
+others_inflight, enabled)`, getestet in `test_scheduler.py` — beide Fehler-
+richtungen sind still (zu eifrig = unerklärter Reload, gar nicht = OOM im Node).
+
 ## Nicht-Ziele
 
 - Kein VRAM-Messen/-Budgetieren (keine verlässliche Quelle über beide

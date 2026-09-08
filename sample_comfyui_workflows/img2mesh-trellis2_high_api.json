@@ -147,7 +147,7 @@
     "inputs": {
       "seed": 12345,
       "resolution": 1024,
-      "shape_steps": 25,
+      "shape_steps": 30,
       "shape_guidance_strength": 6.5,
       "shape_guidance_rescale": 0.2,
       "shape_rescale_t": 4,
@@ -174,7 +174,7 @@
         0
       ],
       "trimesh": [
-        "42",
+        "85",
         0
       ],
       "image": [
@@ -207,11 +207,11 @@
     "inputs": {
       "seed": 12345,
       "pipeline_type": "1024_cascade",
-      "sparse_structure_steps": 25,
+      "sparse_structure_steps": 30,
       "sparse_structure_guidance_strength": 6.5,
       "sparse_structure_guidance_rescale": 0.2,
       "sparse_structure_rescale_t": 4,
-      "shape_steps": 25,
+      "shape_steps": 30,
       "shape_guidance_strength": 6.5,
       "shape_guidance_rescale": 0.2,
       "shape_rescale_t": 4,
@@ -345,7 +345,7 @@
   "57": {
     "inputs": {
       "seed": 1379186264,
-      "texture_steps": 12,
+      "texture_steps": 30,
       "texture_guidance_strength": 3,
       "texture_guidance_rescale": 0.2,
       "texture_rescale_t": 3,
@@ -377,7 +377,7 @@
         0
       ],
       "trimesh": [
-        "46",
+        "86",
         0
       ]
     },
@@ -422,7 +422,7 @@
   },
   "62": {
     "inputs": {
-      "value": 20000
+      "value": 100000
     },
     "class_type": "PrimitiveInt",
     "_meta": {
@@ -535,6 +535,36 @@
     "class_type": "PrimitiveInt",
     "_meta": {
       "title": "input_texture_resolution"
+    }
+  },
+  "85": {
+    "inputs": {
+      "empty_cache": true,
+      "gc_collect": true,
+      "unload_all_models": true,
+      "any_input": [
+        "42",
+        0
+      ]
+    },
+    "class_type": "VRAM_Debug",
+    "_meta": {
+      "title": "free mem vor MeshRefiner"
+    }
+  },
+  "86": {
+    "inputs": {
+      "empty_cache": true,
+      "gc_collect": true,
+      "unload_all_models": true,
+      "any_input": [
+        "46",
+        0
+      ]
+    },
+    "class_type": "VRAM_Debug",
+    "_meta": {
+      "title": "free mem vor MeshTexturing"
     }
   }
 }

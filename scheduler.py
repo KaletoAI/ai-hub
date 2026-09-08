@@ -23,6 +23,32 @@ def order_ready(cands: list, speed_of: Callable, paid_of: Callable) -> list:
     return sorted(cands, key=lambda bx: (bool(paid_of(bx[0])), -speed_of(bx[0], bx[1])))
 
 
+def free_vram_before_job(last_key: Optional[str], next_key: str,
+                         others_inflight: int, enabled: bool = True) -> bool:
+    """Must a ComfyUI backend's VRAM be freed BEFORE the job that is about to run?
+
+    ComfyUI never releases its model cache by itself, and freeing it AFTER a job is
+    the wrong moment twice over: it throws away a cache the very next job may want,
+    and it cannot know what that job will be. Once a job is CLAIMED the answer is
+    known, so the decision moves here:
+
+      * the backend last ran the SAME type key (media: the alias = one workflow, one
+        model set) → keep the cache. This is the payoff of the freed-backend type
+        affinity in `designated_taker`, which steers a same-alias job here for
+        exactly that reason;
+      * anything else — a different alias, or nothing recorded (a gateway restart
+        does not empty ComfyUI's VRAM: measured 2026-09-05, 21.4 of 23.5 GiB still
+        held) → free, so the run starts against an empty GPU;
+      * another job is in flight on that backend → never (the free would drop the
+        cache under a RUNNING prompt). The caller's own slot is not counted.
+
+    Pure — `enabled` carries the host policy, `others_inflight` the live counter.
+    """
+    if not enabled or others_inflight > 0:
+        return False
+    return last_key != next_key
+
+
 def designated_taker(pool: Iterable, can_serve: Callable, type_key: Callable,
                      last_key: Optional[str], now: float, max_wait_s: float):
     """The waiting entry a freed backend should take, or None.

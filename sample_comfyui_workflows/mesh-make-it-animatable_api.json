@@ -19,7 +19,7 @@
         0
       ],
       "use_normals": false,
-      "weight_postprocess": true,
+      "weight_postprocess": false,
       "animation_file": ""
     },
     "class_type": "MakeItAnimatableRig",

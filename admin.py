@@ -1460,10 +1460,11 @@ def _hosts_panel(binfo: list, sel_host: str) -> str:
     URL IP); this panel edits the per-host extras — a label and the shared-GPU policy
     flags (docs/host-coordination-plan.md).
 
-    Only shared boxes (an LLM *and* a ComfyUI backend on the same GPU) are listed:
-    every policy here is about the two contending for VRAM, so a dedicated box has
-    nothing to decide. A host that still carries stored meta stays listed regardless,
-    so an old setting never becomes uneditable."""
+    Listed: every box with a ComfyUI backend. The LLM-vs-media policies only concern
+    a SHARED box (an LLM and a ComfyUI backend on one GPU), but the free-before-job
+    policy applies to a dedicated one too — its VRAM is contended by the next alias
+    and by nodes that run outside ComfyUI's own process. A host that still carries
+    stored meta stays listed regardless, so an old setting never becomes uneditable."""
     by_host: dict = {}
     for b in binfo:
         if b.get("host"):
@@ -1473,7 +1474,9 @@ def _hosts_panel(binfo: list, sel_host: str) -> str:
     def is_shared(members: list) -> bool:
         types = {b.get("type", "openai") for b in members}
         return "comfyui" in types and len(types) > 1
-    listed = [h for h, members in by_host.items() if is_shared(members) or meta.get(h)]
+    def has_comfy(members: list) -> bool:
+        return any(b.get("type") == "comfyui" for b in members)
+    listed = [h for h, members in by_host.items() if has_comfy(members) or meta.get(h)]
     if not listed:
         return ""
     rows = ""
@@ -1486,8 +1489,12 @@ def _hosts_panel(binfo: list, sel_host: str) -> str:
         if hm.get("avoid_llm_during_media", True) is False:
             tag += " " + _badge("llm-avoid off", "warn",
                                 "chat routing does NOT step aside while this host generates media")
+        if hm.get("comfy_free_before_job", True) is False:
+            tag += " " + _badge("free-before off", "warn",
+                                "VRAM is NOT freed when this box's next media job runs a "
+                                "different alias — non-default setting")
         if hm.get("comfy_free_after_job", shared) != shared:      # explicit non-default only
-            tag += " " + _badge(f"free-vram {'on' if hm['comfy_free_after_job'] else 'off'}", "warn",
+            tag += " " + _badge(f"free-after {'on' if hm['comfy_free_after_job'] else 'off'}", "warn",
                                 "ComfyUI /free after each media job — non-default setting")
         if hm.get("llm_unload_before_media"):
             tag += " " + _badge("unload-llm", "warn",
@@ -1495,15 +1502,16 @@ def _hosts_panel(binfo: list, sel_host: str) -> str:
         acts = _icon_acts(("✎", f"/ui/backends?host={quote(h)}", "secondary", "Edit host"))
         title = f"{_esc(h)}{(' — ' + _esc(label)) if label else ''} {tag}"
         rows += _item(title, members, acts, sel=(h == sel_host))
-    return ('<div class="grouphdr" style="margin-top:18px">Hosts · shared GPU</div>'
-            "<p class='hint' style='margin:2px 0 6px'>Only boxes where an LLM and a ComfyUI backend "
-            "share the GPU — the policies below arbitrate their VRAM. Dedicated boxes need none of "
-            f"it and are not listed.</p>{rows}")
+    return ('<div class="grouphdr" style="margin-top:18px">Hosts · GPU policy</div>'
+            "<p class='hint' style='margin:2px 0 6px'>Every box with a ComfyUI backend: who may use "
+            "its VRAM and when it is freed. The LLM policies matter only where an LLM shares the "
+            f"same GPU (badge <b>shared</b>).</p>{rows}")
 
 
 def _host_form(host: str, shared: bool) -> str:
     meta = (store.get_hosts() if store.is_active() else {}).get(host) or {}
     avoid = meta.get("avoid_llm_during_media", True)
+    pre = meta.get("comfy_free_before_job", True)       # default: on for every ComfyUI box
     free = meta.get("comfy_free_after_job", shared)     # default: on only when shared
     unload = meta.get("llm_unload_before_media", False)
     return (f'<form action="/ui/backends/host-save" method="post">'
@@ -1518,17 +1526,34 @@ def _host_form(host: str, shared: bool) -> str:
                                           "while this host's ComfyUI is generating, its LLM backends are "
                                           "tried LAST (never skipped) — a llama-swap model load would abort "
                                           "on the VRAM the generation holds"))
-            + _field("VRAM", _checkbox("comfy_free", free, "free ComfyUI VRAM after each media job",
-                                       "POST /free when a job ends — ComfyUI never releases its model "
-                                       "cache by itself; without this the next LLM load on this box can "
-                                       "abort. Costs the next media job its model reload.")
-                     + "<br>" + _checkbox("llm_unload", unload, "unload LLMs before media jobs",
+            # The three VRAM policies stack VERTICALLY: `.control` is a flex ROW, so a
+            # <br> between checkboxes is ignored and they line up side by side, where
+            # three long labels read as one sentence. A column wrapper is the fix that
+            # stays local to this form.
+            + _field("VRAM", '<div style="display:flex;flex-direction:column;gap:6px;'
+                             'align-items:flex-start">'
+                     + _checkbox("comfy_free_pre", pre,
+                                       "free ComfyUI VRAM before a job that changes the alias",
+                                       "POST /free once a job is claimed and the workflow it needs is "
+                                       "NOT what this box last ran (a gateway restart counts as unknown "
+                                       "— ComfyUI keeps its cache across one). A same-alias job keeps "
+                                       "the models loaded, which is what the queue's alias affinity is "
+                                       "for. Leave on: a node running in its own process (rigging, "
+                                       "Make-It-Animatable) cannot share ComfyUI's cache and OOMs on it.")
+                     + _checkbox("comfy_free", free, "free ComfyUI VRAM after each media job",
+                                       "POST /free when a job ends, even if no media job follows — only "
+                                       "needed where an LLM shares this GPU, since a llama-swap load "
+                                       "aborts on VRAM ComfyUI still holds. Skipped when the queued job "
+                                       "this box will take next wants the alias it just ran.")
+                     + _checkbox("llm_unload", unload, "unload LLMs before media jobs",
                                           "GET /unload on this host's LLM backends before a generation "
                                           "starts (llama-swap). Rarely needed — the swap TTL usually "
-                                          "clears the model first."))
-            + f"<p class='hint'>Defaults: routing consideration ON · free-after-job "
-              f"{'ON (shared box)' if shared else 'OFF (dedicated box)'} · unload-before OFF. "
-              "All of it only matters when LLM and ComfyUI share this box's GPU.</p>"
+                                          "clears the model first.")
+                     + "</div>")
+            + f"<p class='hint'>Defaults: routing consideration ON · free-before-job ON · "
+              f"free-after-job {'ON (shared box)' if shared else 'OFF (dedicated box)'} · "
+              "unload-before OFF. Free-before-job is the one that applies to a dedicated box too; "
+              "the rest only matters when an LLM shares this GPU.</p>"
             + "</form>")
 
 
@@ -1546,6 +1571,7 @@ async def host_save(request: Request):
         # flags store only the NON-default value (default: avoid on, free on-if-
         # shared, unload off) — an untouched host keeps adapting to its defaults.
         for form_key, store_key, default in (("avoid_llm", "avoid_llm_during_media", True),
+                                             ("comfy_free_pre", "comfy_free_before_job", True),
                                              ("comfy_free", "comfy_free_after_job", shared),
                                              ("llm_unload", "llm_unload_before_media", False)):
             val = bool(f.get(form_key))
@@ -1557,6 +1583,7 @@ async def host_save(request: Request):
         _apply_hosts()                         # refresh main's request-path cache
         logger.info(f"ui: host '{host}' saved (label={'y' if label else 'n'}, "
                     f"avoid_llm={'on' if f.get('avoid_llm') else 'OFF'}, "
+                    f"comfy_free_pre={'on' if f.get('comfy_free_pre') else 'OFF'}, "
                     f"comfy_free={'on' if f.get('comfy_free') else 'off'}, "
                     f"llm_unload={'on' if f.get('llm_unload') else 'off'})")
     return RedirectResponse("/ui/backends", status_code=303)

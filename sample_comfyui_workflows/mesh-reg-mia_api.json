@@ -20,7 +20,7 @@
         0
       ],
       "use_normal": false,
-      "reset_to_rest": false,
+      "reset_to_rest": true,
       "trimesh": [
         "4",
         0

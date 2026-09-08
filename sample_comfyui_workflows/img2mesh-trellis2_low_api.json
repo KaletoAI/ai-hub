@@ -188,7 +188,7 @@
         0
       ],
       "trimesh": [
-        "73",
+        "103",
         0
       ]
     },
@@ -387,6 +387,21 @@
     "class_type": "PrimitiveInt",
     "_meta": {
       "title": "input_texture_resolution"
+    }
+  },
+  "103": {
+    "inputs": {
+      "empty_cache": true,
+      "gc_collect": true,
+      "unload_all_models": true,
+      "any_input": [
+        "73",
+        0
+      ]
+    },
+    "class_type": "VRAM_Debug",
+    "_meta": {
+      "title": "free mem vor MeshTexturing"
     }
   }
 }

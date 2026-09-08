@@ -75,5 +75,27 @@ class TestDesignatedTaker(unittest.TestCase):
         self.assertIsNone(self._pick(pool, last_key="a", unservable={"cant"}))
 
 
+class TestFreeVramBeforeJob(unittest.TestCase):
+    """The decision fails SILENTLY in both directions: freeing too eagerly only
+    costs a model reload nobody attributes to it, and not freeing at all surfaces
+    as a CUDA OOM inside a node — never as a gateway error."""
+
+    def test_same_key_keeps_the_cache(self):
+        self.assertFalse(scheduler.free_vram_before_job("mesh-mia", "mesh-mia", 0))
+
+    def test_changed_key_frees(self):
+        self.assertTrue(scheduler.free_vram_before_job("Trellis2", "mesh-mia", 0))
+
+    def test_unknown_last_key_frees(self):
+        # a gateway restart empties backend_last_key, never ComfyUI's VRAM
+        self.assertTrue(scheduler.free_vram_before_job(None, "mesh-mia", 0))
+
+    def test_never_while_another_job_runs_there(self):
+        self.assertFalse(scheduler.free_vram_before_job(None, "mesh-mia", 1))
+
+    def test_host_policy_off_wins(self):
+        self.assertFalse(scheduler.free_vram_before_job(None, "x", 0, enabled=False))
+
+
 if __name__ == "__main__":
     unittest.main()

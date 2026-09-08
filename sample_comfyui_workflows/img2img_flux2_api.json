@@ -169,7 +169,7 @@
   },
   "134": {
     "inputs": {
-      "cfg": 1,
+      "cfg": 1.5,
       "model": [
         "315",
         0
@@ -394,7 +394,7 @@
     },
     "class_type": "ReferenceLatent",
     "_meta": {
-      "title": "ReferenceLatent"
+      "title": "Set Reference Latent"
     }
   },
   "276:120": {
@@ -426,7 +426,7 @@
     },
     "class_type": "ReferenceLatent",
     "_meta": {
-      "title": "ReferenceLatent"
+      "title": "Set Reference Latent"
     }
   }
 }

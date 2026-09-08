@@ -774,10 +774,41 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   IP → `backend_hosts`/`host_backends`, shown in `/health` and the Backends tab's
   Hosts panel). Per-host policies (store settings `hosts`, cached `hosts_meta`):
   chat candidates on a host with a RUNNING media job sort LAST in `resolve_routes`
-  (never dropped; flag `avoid_llm_during_media`, default on); after a media job
-  ends, ComfyUI gets `POST /free` (`_free_comfy_vram`; default on for shared
-  hosts only — ComfyUI never frees VRAM itself, a llama-swap load would abort);
+  (never dropped; flag `avoid_llm_during_media`, default on);
   opt-in `llm_unload_before_media` GETs llama-swap `/unload` first.
+  **VRAM is freed BEFORE a job, not after it** — ComfyUI never releases its model
+  cache by itself, and at job END nobody knows yet what comes next, so the answer
+  was always guessed. At CLAIM it is known: `_claim_gen_backend(backend, key)`
+  records the affinity key `backend_last_key` (media: the alias = one workflow = one
+  model set) and, when what the GPU HOLDS (`backend_vram_key`) differs, AWAITS the free
+  before the prompt goes out (`scheduler.free_vram_before_job`, pure +
+  `test_scheduler.py`; host flag `comfy_free_before_job`, default on for EVERY ComfyUI
+  box). Same alias → the cache stays, which is the payoff of `designated_taker`'s alias
+  affinity. The two keys are separate on purpose: `backend_vram_key` is written from
+  the free's VERDICT (`_comfy_free` returns one), never from the attempt — a failed or
+  skipped free leaves it `None`, and `None` (unknown, or two aliases' sets mixed by a
+  job in flight, or a gateway restart — which never empties ComfyUI's VRAM) counts as
+  a change. And "awaited" means watched: ComfyUI's `POST /free` only sets two flags
+  and answers 200; its single worker reads them after `q.get()`, and `set_flag`'s
+  `notify` is LOST while the worker sits in its post-prompt `gc.collect()` — exactly
+  when the gateway's /history poll posts the free — so the flag would fire only after
+  the NEXT prompt ran. `_comfy_free(settle_s=…)` therefore polls `/system_stats`'
+  `torch_vram_total` (torch's reserved pool, what other processes cannot use) and
+  re-posts every 2 s until it dropped to ≤ 20 %, else reports False after 30 s
+  (`test_run_job_failover.py::ComfyFreeSettles`). It is also the only hook that sits between two CHAIN stages — two
+  workflows on one backend with no job end in between (measured 2026-09-05, job
+  `cc604da29e0e`, Meshy→`mesh-mia` on k12-gpu: stage 2 died on
+  `CUDA out of memory. Tried to allocate 20.00 MiB` with 21.4 of 23.5 GiB held by
+  the ComfyUI process, and Make-It-Animatable runs in its OWN venv/process, so it can
+  never share that cache). The after-job free (`_free_comfy_vram`, flag
+  `comfy_free_after_job`, default on for shared hosts only) survives for its one
+  remaining purpose — a shared box must free even when NO media job follows, or the
+  next llama-swap load aborts — and skips when the waiter the scheduler will hand
+  this backend next (`_designated_gen_waiter`, so `exclude`/force/LoRA eligibility
+  apply) wants the alias its VRAM holds. Asking the scheduler, not scanning the queue
+  by alias, is what keeps a waiter that can never run here (a chain that excluded the
+  backend after a failed stage 1) from suppressing the free forever
+  (`test_run_job_failover.py::FreeAfterJob`).
 
 ### Auth / multi-user
 

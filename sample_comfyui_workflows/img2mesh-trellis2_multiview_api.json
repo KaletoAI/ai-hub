@@ -1,0 +1,603 @@
+{
+  "4": {
+    "inputs": {
+      "remesh_band": 1,
+      "remesh_project": 0,
+      "dual_contouring_resolution": "1024",
+      "remove_floaters": 0.03,
+      "remove_inner_faces": "1024",
+      "mesh": [
+        "34",
+        0
+      ]
+    },
+    "class_type": "Trellis2RemeshWithQuad",
+    "_meta": {
+      "title": "Trellis2 - Remesh With Quad"
+    }
+  },
+  "5": {
+    "inputs": {
+      "target_face_num": [
+        "90",
+        0
+      ],
+      "method": "Cumesh",
+      "mesh": [
+        "4",
+        0
+      ]
+    },
+    "class_type": "Trellis2SimplifyMesh",
+    "_meta": {
+      "title": "Trellis2 - Simplify Mesh"
+    }
+  },
+  "6": {
+    "inputs": {
+      "mesh": [
+        "5",
+        0
+      ]
+    },
+    "class_type": "Trellis2FillHolesWithMeshlib",
+    "_meta": {
+      "title": "Trellis2 - Fill Holes with Meshlib"
+    }
+  },
+  "7": {
+    "inputs": {
+      "seed": 123456,
+      "texture_steps": [
+        "91",
+        0
+      ],
+      "texture_guidance_strength": 3,
+      "texture_guidance_rescale": 0.2,
+      "texture_rescale_t": 3,
+      "resolution": 1024,
+      "texture_size": 4096,
+      "texture_alpha_mode": "OPAQUE",
+      "double_side_material": false,
+      "texture_guidance_interval_start": 0,
+      "texture_guidance_interval_end": 0.9,
+      "bake_on_vertices": false,
+      "use_custom_normals": false,
+      "mesh_cluster_threshold_cone_half_angle_rad": 60,
+      "front_axis": "z",
+      "blend_temperature": 2,
+      "sampler": "euler",
+      "inpainting": "telea",
+      "verbose": false,
+      "dino_lock": 0,
+      "dino_substeps": 4,
+      "dino_foundation_cap": 1,
+      "pipeline": [
+        "22",
+        0
+      ],
+      "front_image": [
+        "27",
+        0
+      ],
+      "trimesh": [
+        "32",
+        0
+      ],
+      "back_image": [
+        "28",
+        0
+      ],
+      "left_image": [
+        "29",
+        0
+      ],
+      "right_image": [
+        "30",
+        0
+      ]
+    },
+    "class_type": "Trellis2MeshTexturingMultiView",
+    "_meta": {
+      "title": "Trellis2 - Mesh Texturing Multi-View"
+    }
+  },
+  "22": {
+    "inputs": {
+      "modelname": "microsoft/TRELLIS.2-4B",
+      "backend": "sdpa",
+      "device": "cuda",
+      "low_vram": true,
+      "keep_models_loaded": true,
+      "conv_backend": "flex_gemm",
+      "sparse_backend": "flash_attn",
+      "use_reconviagen": false
+    },
+    "class_type": "Trellis2LoadModel",
+    "_meta": {
+      "title": "Trellis2 - LoadModel"
+    }
+  },
+  "27": {
+    "inputs": {
+      "padding": 25,
+      "remove_background": [
+        "92",
+        0
+      ],
+      "max_size": 2048,
+      "image": [
+        "94",
+        2
+      ]
+    },
+    "class_type": "Trellis2PreProcessImage",
+    "_meta": {
+      "title": "Texture Front"
+    }
+  },
+  "28": {
+    "inputs": {
+      "padding": 25,
+      "remove_background": [
+        "92",
+        0
+      ],
+      "max_size": 2048,
+      "image": [
+        "95",
+        2
+      ]
+    },
+    "class_type": "Trellis2PreProcessImage",
+    "_meta": {
+      "title": "Texture Back"
+    }
+  },
+  "29": {
+    "inputs": {
+      "padding": 25,
+      "remove_background": [
+        "92",
+        0
+      ],
+      "max_size": 2048,
+      "image": [
+        "96",
+        2
+      ]
+    },
+    "class_type": "Trellis2PreProcessImage",
+    "_meta": {
+      "title": "Texture Left"
+    }
+  },
+  "30": {
+    "inputs": {
+      "padding": 25,
+      "remove_background": [
+        "92",
+        0
+      ],
+      "max_size": 2048,
+      "image": [
+        "97",
+        2
+      ]
+    },
+    "class_type": "Trellis2PreProcessImage",
+    "_meta": {
+      "title": "Texture Right"
+    }
+  },
+  "32": {
+    "inputs": {
+      "reorient_vertices": "90 degrees",
+      "mesh": [
+        "6",
+        0
+      ]
+    },
+    "class_type": "Trellis2MeshWithVoxelToTrimesh",
+    "_meta": {
+      "title": "Trellis2 - Mesh With Voxel To Trimesh"
+    }
+  },
+  "34": {
+    "inputs": {
+      "seed": 123639,
+      "pipeline_type": "1024_cascade",
+      "sparse_structure_steps": [
+        "91",
+        0
+      ],
+      "sparse_structure_guidance_strength": 6.5,
+      "sparse_structure_guidance_rescale": 0.2,
+      "sparse_structure_rescale_t": 4,
+      "shape_steps": [
+        "91",
+        0
+      ],
+      "shape_guidance_strength": 6.5,
+      "shape_guidance_rescale": 0.2,
+      "shape_rescale_t": 4,
+      "texture_steps": 12,
+      "texture_guidance_strength": 3,
+      "texture_guidance_rescale": 0.2,
+      "texture_rescale_t": 3,
+      "max_num_tokens": 999999,
+      "sparse_structure_resolution": 32,
+      "generate_texture_slat": true,
+      "sparse_structure_guidance_interval_start": 0.1,
+      "sparse_structure_guidance_interval_end": 1,
+      "shape_guidance_interval_start": 0.1,
+      "shape_guidance_interval_end": 1,
+      "texture_guidance_interval_start": 0,
+      "texture_guidance_interval_end": 0.9,
+      "use_tiled_decoder": true,
+      "front_axis": "z",
+      "blend_temperature": 2,
+      "sampler": "euler",
+      "fill_holes": true,
+      "hole_iterations": 1,
+      "verbose": false,
+      "dino_lock": 0,
+      "dino_substeps": 4,
+      "hole_fill_algorithm": "flood_fill",
+      "dino_foundation_cap": 1,
+      "keep_only_shell": true,
+      "pipeline": [
+        "22",
+        0
+      ],
+      "front_image": [
+        "112",
+        0
+      ],
+      "back_image": [
+        "116",
+        0
+      ],
+      "left_image": [
+        "117",
+        0
+      ],
+      "right_image": [
+        "118",
+        0
+      ]
+    },
+    "class_type": "Trellis2MeshWithVoxelMultiViewGenerator",
+    "_meta": {
+      "title": "Trellis2 - Mesh With Voxel Multi-View Generator"
+    }
+  },
+  "36": {
+    "inputs": {
+      "processing_resolution": 2048,
+      "controlnet_strength": 1,
+      "seed": 1234567,
+      "pipeline": [
+        "50",
+        0
+      ],
+      "image": [
+        "28",
+        0
+      ]
+    },
+    "class_type": "StableXProcessImage",
+    "_meta": {
+      "title": "StableX Process Image - Back"
+    }
+  },
+  "39": {
+    "inputs": {
+      "processing_resolution": 2048,
+      "controlnet_strength": 1,
+      "seed": 1234567,
+      "pipeline": [
+        "50",
+        0
+      ],
+      "image": [
+        "27",
+        0
+      ]
+    },
+    "class_type": "StableXProcessImage",
+    "_meta": {
+      "title": "StableX Process Image - Front"
+    }
+  },
+  "44": {
+    "inputs": {
+      "processing_resolution": 2048,
+      "controlnet_strength": 2,
+      "seed": 1234567,
+      "pipeline": [
+        "50",
+        0
+      ],
+      "image": [
+        "29",
+        0
+      ]
+    },
+    "class_type": "StableXProcessImage",
+    "_meta": {
+      "title": "StableX Process Image"
+    }
+  },
+  "49": {
+    "inputs": {
+      "processing_resolution": 2048,
+      "controlnet_strength": 2,
+      "seed": 1234567,
+      "pipeline": [
+        "50",
+        0
+      ],
+      "image": [
+        "30",
+        0
+      ]
+    },
+    "class_type": "StableXProcessImage",
+    "_meta": {
+      "title": "StableX Process Image - Right"
+    }
+  },
+  "50": {
+    "inputs": {
+      "model": "yoso-normal-v1-8-1"
+    },
+    "class_type": "DownloadAndLoadStableXModel",
+    "_meta": {
+      "title": "(Down)load StableX Model"
+    }
+  },
+  "89": {
+    "inputs": {
+      "value": "kira"
+    },
+    "class_type": "PrimitiveString",
+    "_meta": {
+      "title": "input_name"
+    }
+  },
+  "90": {
+    "inputs": {
+      "value": 50000
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "input_face_num"
+    }
+  },
+  "91": {
+    "inputs": {
+      "value": 35
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "input_steps"
+    }
+  },
+  "92": {
+    "inputs": {
+      "value": true
+    },
+    "class_type": "PrimitiveBoolean",
+    "_meta": {
+      "title": "input_remove_background"
+    }
+  },
+  "93": {
+    "inputs": {
+      "value": false
+    },
+    "class_type": "PrimitiveBoolean",
+    "_meta": {
+      "title": "input_no_fingers"
+    }
+  },
+  "94": {
+    "inputs": {
+      "image": "ComfyUI_temp_gpgad_00001_.png"
+    },
+    "class_type": "Trellis2LoadImageWithTransparency",
+    "_meta": {
+      "title": "input_image_front"
+    }
+  },
+  "95": {
+    "inputs": {
+      "image": "ComfyUI_temp_pfaqe_00001_.png"
+    },
+    "class_type": "Trellis2LoadImageWithTransparency",
+    "_meta": {
+      "title": "input_image_back"
+    }
+  },
+  "96": {
+    "inputs": {
+      "image": "ComfyUI_temp_dqvgq_00001_.png"
+    },
+    "class_type": "Trellis2LoadImageWithTransparency",
+    "_meta": {
+      "title": "input_image_left"
+    }
+  },
+  "97": {
+    "inputs": {
+      "image": "ComfyUI_temp_dqvgq_00001_.png"
+    },
+    "class_type": "Trellis2LoadImageWithTransparency",
+    "_meta": {
+      "title": "input_image_right"
+    }
+  },
+  "98": {
+    "inputs": {
+      "model_file": [
+        "103",
+        0
+      ],
+      "image": ""
+    },
+    "class_type": "Preview3D",
+    "_meta": {
+      "title": "Preview 3D & Animation"
+    }
+  },
+  "99": {
+    "inputs": {
+      "string_a": [
+        "89",
+        0
+      ],
+      "string_b": "_basecolor",
+      "delimiter": ""
+    },
+    "class_type": "StringConcatenate",
+    "_meta": {
+      "title": "Concatenate Text"
+    }
+  },
+  "100": {
+    "inputs": {
+      "string_a": [
+        "89",
+        0
+      ],
+      "string_b": "_metallic",
+      "delimiter": ""
+    },
+    "class_type": "StringConcatenate",
+    "_meta": {
+      "title": "Concatenate Text"
+    }
+  },
+  "101": {
+    "inputs": {
+      "filename_prefix": [
+        "99",
+        0
+      ],
+      "images": [
+        "7",
+        1
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  },
+  "102": {
+    "inputs": {
+      "filename_prefix": [
+        "100",
+        0
+      ],
+      "images": [
+        "7",
+        2
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  },
+  "103": {
+    "inputs": {
+      "filename_prefix": [
+        "89",
+        0
+      ],
+      "file_format": "glb",
+      "trimesh": [
+        "7",
+        0
+      ]
+    },
+    "class_type": "Trellis2ExportMesh",
+    "_meta": {
+      "title": "Output"
+    }
+  },
+  "112": {
+    "inputs": {
+      "rem_mode": "RMBG-1.4",
+      "image_output": "Preview",
+      "save_prefix": "ComfyUI",
+      "torchscript_jit": false,
+      "add_background": "none",
+      "refine_foreground": false,
+      "images": [
+        "39",
+        0
+      ]
+    },
+    "class_type": "easy imageRemBg",
+    "_meta": {
+      "title": "Image Remove Bg - Front"
+    }
+  },
+  "116": {
+    "inputs": {
+      "rem_mode": "RMBG-1.4",
+      "image_output": "Preview",
+      "save_prefix": "ComfyUI",
+      "torchscript_jit": false,
+      "add_background": "none",
+      "refine_foreground": false,
+      "images": [
+        "36",
+        0
+      ]
+    },
+    "class_type": "easy imageRemBg",
+    "_meta": {
+      "title": "Image Remove Bg - Back"
+    }
+  },
+  "117": {
+    "inputs": {
+      "rem_mode": "RMBG-1.4",
+      "image_output": "Preview",
+      "save_prefix": "ComfyUI",
+      "torchscript_jit": false,
+      "add_background": "none",
+      "refine_foreground": false,
+      "images": [
+        "44",
+        0
+      ]
+    },
+    "class_type": "easy imageRemBg",
+    "_meta": {
+      "title": "Image Remove Bg - Left"
+    }
+  },
+  "118": {
+    "inputs": {
+      "rem_mode": "RMBG-1.4",
+      "image_output": "Preview",
+      "save_prefix": "ComfyUI",
+      "torchscript_jit": false,
+      "add_background": "none",
+      "refine_foreground": false,
+      "images": [
+        "49",
+        0
+      ]
+    },
+    "class_type": "easy imageRemBg",
+    "_meta": {
+      "title": "Image Remove Bg - Right"
+    }
+  }
+}

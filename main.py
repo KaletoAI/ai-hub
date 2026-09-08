@@ -10,7 +10,7 @@ import time
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -231,6 +231,7 @@ def _note_progress(job_id: str, info: Optional[dict]) -> None:
         return
     gen_progress[job_id] = {**info, "at": time.time()}
 backend_last_key: dict = {}                                    # bid → type key last DISPATCHED (media: alias, LLM: real model)
+backend_vram_key: dict = {}                                    # bid → alias whose model set a ComfyUI GPU HOLDS; None = unknown/mixed (see _claim_gen_backend)
 
 
 def _note_gen_speed(alias: str, bid: str, seconds: float) -> None:
@@ -2628,13 +2629,150 @@ def _shared_host(host: str) -> bool:
     return "comfyui" in kinds and len(kinds) > 1
 
 
+_FREE_SETTLE_S = 30.0            # how long a free may take to SHOW in /system_stats before we stop trusting it
+_FREE_REPOST_S = 2.0             # re-post /free this often while the VRAM has not moved (see below)
+_FREE_FLOOR_BYTES = 256 << 20    # torch's reserved pool at or under this = "nothing loaded"
+
+
+async def _comfy_vram_reserved(url: str) -> Optional[int]:
+    """Bytes torch holds on the backend's devices per /system_stats (`torch_vram_total`
+    is `torch.cuda.memory_reserved()` — the pool OTHER processes cannot use until
+    `empty_cache()` gives it back, which is exactly what an unload must achieve for a
+    rigger in its own process or a llama-swap load). None when unreadable."""
+    try:
+        r = await http_client.get(f"{url}/system_stats", timeout=5.0)
+        devs = r.json().get("devices") or []
+        return sum(int(d.get("torch_vram_total") or 0) for d in devs)
+    except Exception:
+        return None
+
+
+async def _comfy_free(backend: dict, why: str, settle_s: float = 0.0,
+                      abort_when: Optional[Callable[[], bool]] = None) -> bool:
+    """POST /free (unload models + free memory) to a ComfyUI backend and, with
+    `settle_s`, wait until the VRAM is actually gone. The raw call — every policy lives
+    in the two callers below. Never raises: a box that cannot be freed must not fail the
+    job that asked for it. Returns whether the free is KNOWN to have happened — the
+    callers record what the GPU holds from that verdict, never from the attempt.
+
+    Why waiting on the POST is not enough (ComfyUI server.py/main.py, checked
+    2026-09-08): `/free` only sets two flags on the prompt queue and answers 200. The
+    single prompt worker reads the flags AFTER `q.get()` returns — after executing the
+    prompt it just took — and `set_flag` wakes it with a `Condition.notify` that is
+    LOST when nobody is waiting: right after a prompt the worker is in `gc.collect()` +
+    `soft_empty_cache()` (a second or more after a heavy 3D run), which is precisely
+    when the gateway's 1 s /history poll sees the result and posts the free. The flag
+    then sits until the NEXT prompt has run — i.e. stage 2 of a chain executes on stage
+    1's whole cache first and the unload lands after it (the cc604da29e0e OOM by another
+    route). So: post, watch `torch_vram_total`, and re-post every `_FREE_REPOST_S` until
+    it drops — a re-post is idempotent (the flags are booleans) and the second one lands
+    once the worker waits again. `settle_s = 0` keeps the fire-and-forget shape;
+    `abort_when` stops the re-posting (verdict False) once the caller's reason is gone —
+    the after-job free passes "a job claimed this backend", because a re-post under a
+    prompt that just started would unload the models it is loading."""
+    url = (backend.get("url") or "").rstrip("/")
+    name = backend.get("name")
+    body = {"unload_models": True, "free_memory": True}
+    before = await _comfy_vram_reserved(url) if settle_s > 0 else None
+    try:
+        await http_client.post(f"{url}/free", json=body, timeout=30.0)
+    except Exception as e:
+        logger.warning(f"host: /free on [{name}] failed: {e}")
+        return False
+    if settle_s <= 0 or before is None:
+        logger.info(f"host: freed ComfyUI VRAM on [{name}] — {why}")
+        return True                 # nothing to watch (or no stats to watch it by)
+    if before <= _FREE_FLOOR_BYTES:
+        logger.info(f"host: ComfyUI VRAM on [{name}] already empty ({before >> 20} MiB) — {why}")
+        return True
+    target = max(before // 5, _FREE_FLOOR_BYTES)      # "gone" = ≤ 20 % of what it held
+    t0 = last_post = time.monotonic()
+    while True:
+        await asyncio.sleep(0.5)
+        held = await _comfy_vram_reserved(url)
+        now = time.monotonic()
+        if held is not None and held <= target:
+            logger.info(f"host: freed ComfyUI VRAM on [{name}] — {why} "
+                        f"({before >> 20} → {held >> 20} MiB in {now - t0:.1f} s)")
+            return True
+        if now - t0 >= settle_s:
+            logger.warning(f"host: /free on [{name}] did not settle in {settle_s:.0f} s "
+                           f"(still {(held or 0) >> 20} of {before >> 20} MiB) — {why}")
+            return False
+        if now - last_post >= _FREE_REPOST_S:
+            if abort_when is not None and abort_when():
+                logger.info(f"host: /free on [{name}] not repeated — {why} no longer applies")
+                return False
+            try:
+                await http_client.post(f"{url}/free", json=body, timeout=30.0)
+                last_post = now
+            except Exception as e:
+                logger.warning(f"host: /free on [{name}] failed: {e}")
+                return False
+
+
+async def _claim_gen_backend(backend: dict, key: str) -> None:
+    """Record the type key a generation backend now runs AND, for ComfyUI, free its
+    VRAM first when that key CHANGED (scheduler.free_vram_before_job).
+
+    This is the one moment where the question can be answered instead of guessed:
+    the job is claimed, so what comes next is decided. Freeing after a job is the
+    older, weaker half of it — it throws away a cache the next job may want and, on
+    a box nobody hands another media job to, happens far too late to matter. What
+    made it not merely wasteful: ComfyUI holds its cache across a GATEWAY restart
+    too, so a first job after one starts against a full GPU (measured 2026-09-05 on
+    k12-gpu — 21.4 of 23.5 GiB held by the ComfyUI process, and the Make-It-Animatable
+    node, which runs in its OWN venv/process and can therefore never share that cache,
+    died on `CUDA out of memory. Tried to allocate 20.00 MiB`).
+
+    Awaited, unlike the after-job free: the prompt must not be submitted before the
+    VRAM is actually gone — `_comfy_free` waits for that, because the POST alone only
+    queues the unload (see there). Host flag `comfy_free_before_job`, default ON for
+    every ComfyUI host (a same-alias run keeps its models either way, so the flag only
+    buys back reload time for a box whose VRAM is never contended).
+
+    Two records, deliberately: `backend_last_key` is the scheduler's AFFINITY key (what
+    ran here last — set for every backend type, before any early return, because a cloud
+    backend is designated by the same rule) and `backend_vram_key` is what the GPU is
+    KNOWN to hold, written from the free's verdict and never from the attempt. They used
+    to be one field, written up front: a /free that timed out (or was skipped for a job
+    in flight) left the alias on record, so every later same-alias job trusted a cache
+    that was still another alias's — the OOM this mechanism exists to prevent, made
+    permanent (review 2026-09-08). None means unknown OR mixed, and both free next."""
+    bid = backend_id(backend)
+    backend_last_key[bid] = key
+    if backend.get("type") != "comfyui":
+        return                      # a cloud task API has no VRAM to free / no host siblings
+    held = backend_vram_key.get(bid)
+    host = backend_hosts.get(bid, "")
+    if not scheduler.free_vram_before_job(
+            held, key,
+            others_inflight=max(0, backend_inflight.get(bid, 0) - 1),   # our own slot is held
+            enabled=_host_flag(host, "comfy_free_before_job", True)):
+        if held != key:
+            backend_vram_key[bid] = None   # our set joins whatever is there → nobody knows
+        return
+    ok = await _comfy_free(backend, f"claiming '{key}' (was {held or 'unknown'})",
+                           settle_s=_FREE_SETTLE_S)
+    backend_vram_key[bid] = key if ok else None
+
+
 async def _free_comfy_vram(backend: dict, why: str) -> None:
-    """POST /free to a ComfyUI backend after its media job ended (fire-and-forget
-    via create_task). ComfyUI caches models in VRAM indefinitely; on a shared box
-    the next llama-swap load then aborts on that memory (phase 3, host plan).
-    Skipped while ANOTHER generation runs there — the free would drop its cache.
-    Policy: host flag `comfy_free_after_job`; absent = ON for shared hosts only
-    (a dedicated comfy box keeps its cache for speed)."""
+    """POST /free to a ComfyUI backend after its media job ended (fire-and-forget via
+    create_task). The SECOND half of the policy above, and the only one that serves a
+    non-media purpose: on a shared box a llama-swap load aborts on the VRAM ComfyUI
+    still holds hours after its last job (phase 3, host plan), so that host frees
+    eagerly. Skipped while ANOTHER generation runs there (the free would drop its
+    cache) and when the job the scheduler will hand this backend next
+    (`_designated_gen_waiter` — the ONE place that designation is computed) wants the
+    alias its VRAM holds: freeing would make it reload the model set it is queued for.
+    Asking the scheduler is the point: a same-alias waiter that can never run here (it
+    excluded this backend after a failed chain stage, it is force-pinned elsewhere)
+    must not suppress the free — it did, when this scanned the whole queue by alias
+    (review 2026-09-08), and on a shared box nothing else ever freed the GPU again.
+    Policy: host flag `comfy_free_after_job`; absent = ON for shared hosts only (a
+    dedicated comfy box keeps its cache — the before-job free above already guarantees
+    an empty GPU whenever the alias changes)."""
     if backend.get("type") != "comfyui":
         return                      # a cloud task API has no VRAM to free / no host siblings
     bid = backend_id(backend)
@@ -2643,12 +2781,20 @@ async def _free_comfy_vram(backend: dict, why: str) -> None:
         return
     if backend_inflight.get(bid, 0) > 0:
         return
-    try:
-        await http_client.post(f"{backend['url'].rstrip('/')}/free",
-                               json={"unload_models": True, "free_memory": True}, timeout=10.0)
-        logger.info(f"host: freed ComfyUI VRAM on [{backend['name']}] after {why}")
-    except Exception as e:
-        logger.warning(f"host: /free on [{backend['name']}] failed: {e}")
+    held = backend_vram_key.get(bid)         # None = unknown/mixed → free regardless of waiters
+    if held:
+        pool = _gen_waiting_pool()
+        if pool:
+            nxt = await asyncio.to_thread(_designated_gen_waiter, backend, pool)
+            if nxt is not None and nxt.get("alias") == held:
+                return
+            if backend_inflight.get(bid, 0) > 0:
+                return              # claimed while we were in the store — its prompt is next
+    # Settled too: the after-job POST lands in the worker's post-prompt gc window more
+    # often than not (see _comfy_free), where a lone post is simply lost.
+    if await _comfy_free(backend, f"after {why}", settle_s=_FREE_SETTLE_S,
+                         abort_when=lambda: backend_inflight.get(bid, 0) > 0):
+        backend_vram_key[bid] = None
 
 
 async def _unload_host_llms(backend: dict) -> None:
@@ -2702,9 +2848,6 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req) -> None
         except (TypeError, ValueError):
             tries = 1                          # malformed config value → no self-retry
         _inflight_inc(bid)                     # hold ONE slot across all self-retries
-        # Type affinity (spec 2026-09-01): remember what this backend is running, so
-        # once it frees it prefers a queued job on the same alias (no workflow reload).
-        backend_last_key[bid] = alias
         # The job row was stamped with the FIRST candidate at creation; re-point it at
         # the backend actually claiming it. A parked job routinely lands somewhere else
         # (a different backend freed first, or one came back while it waited), and a row
@@ -2715,6 +2858,9 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req) -> None
             for attempt in range(1, tries + 1):
                 attempts += 1
                 try:
+                    # Type affinity + an empty GPU when the alias changed (see
+                    # _claim_gen_backend). A self-retry re-runs the same key → no free.
+                    await _claim_gen_backend(backend, alias)
                     await _unload_host_llms(backend)   # opt-in host policy, no-op by default
                     req = build_req(backend, cand)
                     req.slot_held = True               # we hold it — generate() must not double-count
@@ -3092,7 +3238,6 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 continue
             _inflight_inc(bid)
             entry["claimed"] = True              # holding a slot → out of the waiting pool
-            backend_last_key[bid] = alias        # type affinity: this backend now runs `alias`
             # `held` tracks which slot we owe a decrement, so the per-attempt finally never
             # over/under-counts across the hand-off. `active` = backend to free VRAM on.
             held = bid
@@ -3105,6 +3250,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
             await asyncio.to_thread(jobs.set_stage, job_id, "1/2")   # multi-stage progress → "running 1/2"
             try:
                 _apply_seconds(params, stage1_cand)     # no-op re-derive (endpoint validated it)
+                await _claim_gen_backend(backend, alias)  # type affinity + free VRAM on a key change
                 await _unload_host_llms(backend)        # opt-in host policy, no-op by default
                 # ── Stage 1: mesh (pin the export filename; ignore its own outputs) ──
                 req1 = NormalizedRequest(
@@ -3218,7 +3364,6 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                         return
                     held = bid2
                     active = backend2
-                    backend_last_key[bid2] = succ_alias   # stage 2 is its own type key
                     await asyncio.to_thread(jobs.set_backend, job_id, backend2["name"])
                     mesh_ref = await adapter2.chain_feed_mesh(req2, backend2, mesh_param,
                                                              mesh_name, mesh_bytes, outdir)
@@ -3254,6 +3399,12 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 # `req2.upload_files` (or the request body) — never into `req2.params`.
                 req2.params = s2_params                  # built before the hand-off (see above)
                 await asyncio.to_thread(jobs.set_stage, job_id, "2/2")   # → "running 2/2"
+                # Stage 2 is its own type key, and on the SAME backend it is also the
+                # moment stage 1's model set has to go: the two stages of a chain are
+                # two different workflows, and the second one (a rigger) may not even
+                # run in ComfyUI's process — measured on Meshy→mesh-mia, where stage 2
+                # OOM'd on the 21 GiB stage 1 left behind (job cc604da29e0e).
+                await _claim_gen_backend(backend2, succ_alias)
                 await _unload_host_llms(backend2)
                 gen_attempts += 1
                 t2 = time.monotonic()
