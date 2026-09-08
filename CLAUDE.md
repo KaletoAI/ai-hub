@@ -31,7 +31,7 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
   restart for backend/alias changes. Read **only at startup**:
   `stats.enabled` and the stats/jobs DB paths.
 - **No linter or build step, and no blanket test suite** — only targeted stdlib
-  `unittest` files for the mechanisms that fail SILENTLY (see the six listed under
+  `unittest` files for the mechanisms that fail SILENTLY (see the twenty-one listed under
   `anthropic_bridge.py`): `venv/bin/python -m unittest discover -s tests -t .`.
   Everything else is verified by running the server and hitting endpoints with
   `curl` (README "Try it"), `curl localhost:4000/health` for a routing snapshot, or
@@ -380,7 +380,8 @@ they need via injected callables, staying hot-reload-safe.
   `add_api_route`, *not* `include_router` — broken in this starlette build;
   callbacks injected via `admin.bind(...)`). Session-gated by `_ui_guard` once
   locked. Tabs in `TABS`; a top tab can group child views via `SUBTABS` +
-  `_with_subnav()` (`?sub=` on the parent route, first child = default —
+  `_subnav()` (rendered outside `<main>` via `_page(subnav=…)`; `?sub=` on the
+  parent route, first child = default —
   Playground: Chat | Media | Voice, Jobs & Calls: LLM | Media | Voice,
   Mapping: Chat | Media, Input & Routing: Input | Chat aliases | LLM models |
   Media aliases | Image models | LoRAs); the workflow Mapping editor owns a pasted
@@ -478,7 +479,9 @@ they need via injected callables, staying hot-reload-safe.
   SIBLING of `.jdur` — `_JOB_TICK` overwrites that element's text every second.
 - **`stats.py`** — optional SQLite (WAL) call log + body store. The dashboard is
   **in the `/ui` Statistic/Routing tabs** (no separate port — the old standalone
-  :4001 server was folded into the console). Zero new dependencies — keep it.
+  :4001 server was folded into the console; its `stats_app` + `/`, `/routing`, `/healthz`
+  handlers still sit at the bottom of the file, mounted by nothing). Zero new
+  dependencies — keep it.
   The `calls` row carries the applied `reasoning` control (shown in LLM Calls) and
   the prompt-cache split `cache_read`/`cache_write` — both SUBSETS of
   `input_tokens` (which stays the total the model processed), so
@@ -508,7 +511,7 @@ they need via injected callables, staying hot-reload-safe.
   silently answer about content the model never saw (documents/PDFs). Covered by
   `test_anthropic_bridge.py` (stdlib `unittest` — a streaming tool-call bridge fails
   silently rather than crashing). `ls tests/test_*.py` is the count of record —
-  **twenty** files today — and each exists for that same reason: the mechanism it
+  **twenty-one** files today — and each exists for that same reason: the mechanism it
   guards fails SILENTLY, so it is named next to that mechanism above.
   `test_anthropic_bridge.py`, `test_prune_branch.py` (a
   dead-branch prune that cascades one node too far or too few surfaces as an aborted
@@ -545,6 +548,13 @@ they need via injected callables, staying hot-reload-safe.
   shows a job a stranger's step count — a lying feature, not an absent one — and an ETA
   looks plausible whatever it says, which is how timing the steps from job start
   predicted 250 s for a 15 s job).
+  And one guards the project's own NAME (`test_project_name.py`): a stale mention of the
+  pre-rename name left in `deploy.sh` points a deploy at a path that no longer exists, in
+  `ai-hub.service` at a `WorkingDirectory` that is gone, in the README at a clone URL that
+  redirects — none of it raises, all of it fails at the worst moment. It walks
+  `git ls-files` and allows the old name only in `docs/superpowers/`, `docs/archive/`
+  (history keeps the name of its time) and ONCE each in README.md/CLAUDE.md as the
+  migration note, and it pins `deploy.sh`'s `DEST`/`SERVICE` against the unit file.
   Run them all with `python -m unittest discover -s tests -t .` (no runner dependency).
 - **`openai_image_bridge.py`** — pure request/response plumbing for the OpenAI
   image shims (`multipart_list`, `parse_size`, `coerce_scalar`, `images_uploads`
@@ -781,7 +791,7 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   opt-in `llm_unload_before_media` GETs llama-swap `/unload` first.
   **VRAM is freed BEFORE a job, not after it** — ComfyUI never releases its model
   cache by itself, and at job END nobody knows yet what comes next, so the answer
-  was always guessed. At CLAIM it is known: `_claim_gen_backend(backend, key)`
+  was always guessed. At CLAIM it is known: `_claim_gen_backend(backend, key, vram_key)`
   records the affinity key `backend_last_key` (media: the alias) and, when what the GPU
   HOLDS (`backend_vram_key`) differs from what the request will LOAD, AWAITS the free
   before the prompt goes out (`scheduler.free_vram_before_job`, pure +
