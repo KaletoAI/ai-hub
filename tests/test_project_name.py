@@ -16,6 +16,8 @@ OLD = re.compile(r"llm[-_ ]gateway", re.I)
 # Historical records keep their name; the archive index and the migration note in
 # the README/CLAUDE.md may mention the old name ONCE as "formerly".
 EXCLUDE_DIRS = ("docs/superpowers/", "docs/archive/")
+# Extensionless but very much alive — the NOTICE carries the project's own name.
+ALIVE_BASENAMES = ("NOTICE", "LICENSE")
 ALLOWED_MENTIONS = {
     "README.md": 1,           # "formerly llm-gateway" once, near the title
     "CLAUDE.md": 1,           # the migration note
@@ -28,7 +30,10 @@ class ProjectName(unittest.TestCase):
         files = subprocess.check_output(["git", "ls-files"], cwd=ROOT, text=True).split()
         offenders = {}
         for f in files:
-            if f.startswith(EXCLUDE_DIRS) or not f.endswith((".py", ".md", ".sh", ".service", ".yaml", ".txt", ".json")):
+            if f.startswith(EXCLUDE_DIRS) or not (
+                f.endswith((".py", ".md", ".sh", ".service", ".yaml", ".txt", ".json"))
+                or os.path.basename(f) in ALIVE_BASENAMES
+            ):
                 continue
             try:
                 with open(os.path.join(ROOT, f), encoding="utf-8") as fh:

@@ -2,8 +2,8 @@
 set -euo pipefail
 
 HOST="${DEPLOY_HOST:?Set DEPLOY_HOST=user@host (e.g. root@192.168.1.10)}"
-DEST="/opt/llm-gateway"
-SERVICE="llm-gateway"
+DEST="/opt/ai-hub"
+SERVICE="ai-hub"
 
 cd "$(dirname "$(readlink -f "$0")")"
 

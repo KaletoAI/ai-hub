@@ -699,7 +699,7 @@ async def watch_config_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Starting LLM Gateway")
+    logger.info("Starting AI-Hub")
 
     # Writable store backs all UI-managed state (backends, chat aliases, generation
     # aliases) — always on so the /ui console works regardless of image_models.
@@ -775,7 +775,7 @@ async def lifespan(app: FastAPI):
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="LLM Gateway", lifespan=lifespan)
+app = FastAPI(title="AI-Hub", lifespan=lifespan)
 admin.register(app)                     # generation management UI at /ui
 
 
@@ -1868,7 +1868,7 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
         for alias in virtual_models:
             if alias not in seen and visible({alias}):
                 seen.add(alias)
-                data.append({"id": alias, "object": "model", "created": now, "owned_by": "llm-gateway (virtual)"})
+                data.append({"id": alias, "object": "model", "created": now, "owned_by": "ai-hub (virtual)"})
 
     # IMAGE generation aliases (separate namespace) — listed so image clients (anima-verse)
     # can discover them; granted by alias name. `?type=image` returns only these.
@@ -1878,7 +1878,7 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
         for alias in img_aliases:
             if alias not in seen and visible({alias}):
                 seen.add(alias)
-                data.append({"id": alias, "object": "model", "created": now, "owned_by": "llm-gateway (image)"})
+                data.append({"id": alias, "object": "model", "created": now, "owned_by": "ai-hub (image)"})
 
     return {"object": "list", "data": data}
 
@@ -1888,7 +1888,7 @@ async def get_model(model_id: str, authorization: Optional[str] = Header(None)):
     check_auth(authorization)
     now = int(time.time())
     if model_id in virtual_models:
-        return {"id": model_id, "object": "model", "created": now, "owned_by": "llm-gateway (virtual)"}
+        return {"id": model_id, "object": "model", "created": now, "owned_by": "ai-hub (virtual)"}
     llm = [b for b in enabled_backends() if not _is_gen(b)]
     bname, bare = split_backend_prefix(model_id)
     if bname is not None:

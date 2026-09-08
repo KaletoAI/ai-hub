@@ -388,7 +388,7 @@ async def prune_loop(retention_days: int, interval_s: int = 3600) -> None:
 
 # ── Dashboard ────────────────────────────────────────────────────────────────
 
-stats_app = FastAPI(title="LLM Gateway Stats", docs_url=None, redoc_url=None)
+stats_app = FastAPI(title="AI-Hub Stats", docs_url=None, redoc_url=None)
 
 
 def _q(sql: str, *params) -> list[tuple]:
@@ -547,7 +547,7 @@ def _doc(title: str, active: str, body: str, *, refresh: Optional[int] = None,
     refresh_tag = f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
     return (f'<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
             f'{refresh_tag}\n<title>{title}</title>\n<style>{_CSS}</style>\n</head>\n'
-            f'<body>\n<h1>llm-gateway</h1>\n{_nav(active)}\n{body}\n'
+            f'<body>\n<h1>ai-hub</h1>\n{_nav(active)}\n{body}\n'
             f'{_SEARCH_JS if search else ""}\n</body>\n</html>')
 
 
@@ -616,7 +616,7 @@ def _render(total, h24, by_backend, by_model, by_source, recent) -> str:
 <th>In/Out</th><th>Cost</th></tr></thead>
 <tbody>{rows_recent}</tbody></table>
 </div>"""
-    return _doc("llm-gateway stats", "stats", body, refresh=30)
+    return _doc("ai-hub stats", "stats", body, refresh=30)
 
 
 @stats_app.get("/routing", response_class=HTMLResponse)
@@ -723,4 +723,4 @@ def _render_routing(snap: dict) -> str:
               '<p class="muted">Reflects live health &amp; discovery — reload to refresh.</p>')
 
     body = search + conflict_html + alias_html + model_html
-    return _doc("llm-gateway routing", "routing", body, search=True)
+    return _doc("ai-hub routing", "routing", body, search=True)

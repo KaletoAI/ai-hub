@@ -1,7 +1,7 @@
-# LLM Gateway — example config.
+# AI-Hub — example config.
 # Copy to config.yaml and edit. config.yaml is gitignored.
 
-# Port (used by the systemd unit; uvicorn is launched separately, see llm-gateway.service)
+# Port (used by the systemd unit; uvicorn is launched separately, see ai-hub.service)
 port: 4000
 
 # Master/admin API key. Clients send it as `Authorization: Bearer <key>`; it also

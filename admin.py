@@ -177,7 +177,7 @@ def _nav(active: str) -> str:
                     for k, label in TABS)
     logout = ('<a href="/ui/logout" style="margin-left:auto;color:#8b97a4">Logout</a>'
               if _ui_locked() else "")
-    return f'<header><span class="brand">LLM Gateway</span><nav>{links}{logout}</nav></header>'
+    return f'<header><span class="brand">AI-Hub</span><nav>{links}{logout}</nav></header>'
 
 
 _CSS = """
@@ -558,7 +558,7 @@ def _page(title: str, body: str, active: str = "", refresh: Optional[int] = None
     head = "" if nologin else _nav(active)        # login page renders without the nav
     # subnav (see SUBTABS) renders as a second header row — outside <main>, so it
     # never scrolls and sits flush under the tabs.
-    return (f'<!doctype html><html><head><meta charset="utf-8"><title>{_esc(title)} · Gateway</title>'
+    return (f'<!doctype html><html><head><meta charset="utf-8"><title>{_esc(title)} · AI-Hub</title>'
             f"<style>{_CSS}</style></head><body>{head}{subnav}<main{live}>{body}</main>"
             f"{_SCROLL_JS}{_SORT_JS}{_LIVE_JS}</body></html>")
 
