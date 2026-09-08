@@ -191,7 +191,9 @@ narrows by namespace too.
 - **`quota_req_day`** — requests per day (in-memory counter) → `429` when exceeded.
 - **`quota_cost_month`** — summed USD cost for the month (from the stats log) →
   blocked when exceeded. Needs stats enabled and priced backends; streaming calls
-  count as `0` (no `usage` in stream chunks).
+  are costed from the backend's usage chunk (the gateway always requests
+  `stream_options.include_usage`) and count as `0` only on a backend that reports
+  nothing.
 
 ---
 
@@ -247,7 +249,7 @@ skipped, so the request spills to the next backend instead of overloading a slow
 one. Match it to real parallelism (`1` for `llama.cpp --parallel 1`; unset for a
 cloud API). Missing/`0` = unlimited. The counter is released when the response
 **completes** — including when a streamed response finishes, not when headers are
-sent. Busy state shows in `/health` and the Routing tab.
+sent. Busy state shows in `/health` and the **Input & Routing → Chat aliases** tab.
 
 ### Per-backend model filters
 
@@ -291,18 +293,22 @@ anything starting with `_` — those drive routing, streaming and the reasoning
 hand-off, and are rejected when you save. Values may be scalars, lists (`stop`)
 or objects (`logit_bias`).
 
-Applies to `/v1/chat/completions`, `/v1/completions` and `/v1/responses` only —
-not `/v1/embeddings`, not `/v1/audio/*`, not generation. The backend stage is
+Applies to `/v1/chat/completions`, `/v1/completions` and `/v1/responses` — plus a
+`/v1/messages` request served by a **translated** (`type: openai`) backend, where
+only the backend stage runs (the alias stage is deliberately skipped, see
+[Claude Code](#claude-code--anthropic-messages)). Never `/v1/embeddings`, never
+`/v1/audio/*`, never generation, and never the Anthropic passthrough. The backend stage is
 derived **per backend**, so a failover uses the values of the backend that
 actually serves the call. The forwarded body is what gets logged, so the
 **LLM Calls** tab shows exactly which values went out.
 
 ### Alias / model-name collisions
 
-Naming an alias the same as a real model id *shadows* that model. `/health`'s
-`alias_model_conflicts` and the Routing tab flag every collision, split into
+Naming an alias the same as a real model id *shadows* that model. The
+**Input & Routing → Chat aliases** tab flags every collision, split into
 **covered** (in the mapping → still routable) and **shadowed** (hosts the model
-but isn't mapped → unreachable by that name) — the latter is the actionable case.
+but isn't mapped → unreachable by that name); `/health`'s `alias_model_conflicts`
+carries only the entries that actually shadow a backend — the actionable case.
 
 ---
 
@@ -1057,13 +1063,11 @@ locked). Tabs:
 | **Dashboard** | live per-backend status + in-flight, parked calls, media-job counts/recent, recent LLM calls |
 | **Server** | runtime + restart-required settings (API key, caps, park time/queue, `affinity_max_wait_s`, stats/jobs, TTL/prune) |
 | **Backends** | add/edit/remove backends (LLM, ComfyUI, Meshy, Tripo), incl. the `paid` cost tier; the **Hosts · GPU policy** panel below the list edits the per-box VRAM flags (see [Hosts & VRAM policy](#hosts--vram-policy)) |
-| **Input** | what clients can call — chat aliases, generation models, endpoints |
-| **Routing Overview** | the live alias→backend map + collisions (searchable) |
+| **Input & Routing** | sub-tabs **Input** (what clients can call — chat aliases, generation models, endpoints), **Chat aliases** (the live alias→backend map + alias/model collisions), **LLM models**, **Media aliases**, **Image models**, **LoRAs** — all searchable |
 | **Mapping** | register a ComfyUI workflow, wire its node mapping, pin values (a cloud alias — Meshy, Tripo — needs no workflow: one schema-driven editor renders its endpoint + option defaults instead); chat-alias editor (per-alias `park_s` + reasoning default) |
 | **Reasoning** | the normalized-thinking rule list (model glob × backend set → adapter) + test resolver |
-| **Playground** | one tab, sub-tabs **Media** (generation via `POST /v1/generations` — image/video/audio, upload refs + mesh files, or an earlier job's artifact), **Chat** (chat completion through `/v1/chat/completions`) and **Voice** (TTS via `POST /v1/audio/speech`, inline player + download) — all as **real API clients** (auth, routing, parking, stats all apply) |
-| **Media Jobs** | list + detail of generation jobs (inputs + outputs, within TTL), plus the media requests that were refused before they became a job |
-| **LLM Calls** | per-call history with stored request/response bodies (LLM endpoints only — voice and media have their own sub-tabs) |
+| **Playground** | one tab, sub-tabs **Chat** (default — chat completion through `/v1/chat/completions`), **Media** (generation via `POST /v1/generations` — image/video/audio, upload refs + mesh files, or an earlier job's artifact) and **Voice** (TTS via `POST /v1/audio/speech`, inline player + download) — all as **real API clients** (auth, routing, parking, stats all apply) |
+| **Jobs & Calls** | sub-tabs **LLM Calls** (per-call history with stored request/response bodies — LLM endpoints only), **Media Jobs** (list + detail of generation jobs, inputs + outputs, within TTL, plus the media requests that were refused before they became a job) and **Voice Calls** |
 | **Statistic** | the call-stats dashboard (search, aggregates, drilldown) |
 | **Users** | multi-user keys, allow-lists, quotas, IP aliases |
 
@@ -1088,7 +1092,7 @@ skipped entirely and catch up the moment you switch back.
 
 ## Stats & routing dashboard
 
-Opt-in SQLite call log, surfaced in the **Statistic** and **Routing** tabs of the
+Opt-in SQLite call log, surfaced in the **Statistic** and **Input & Routing** tabs of the
 console (no separate port — the old standalone dashboard was folded into `/ui`).
 Every call records timestamp, duration, backend, source, alias, model, endpoint,
 HTTP status, tokens, and USD cost.
