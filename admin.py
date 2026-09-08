@@ -119,6 +119,11 @@ def _num(s: str):
 _comfy_backends: Callable[[], list] = lambda: []
 _gen_backends: Callable[[], list] = lambda: []      # every generation backend (ComfyUI, Meshy, Tripo)
 _gateway_info: Callable[[], dict] = lambda: {}
+# LAN scan (Backends tab → Scan network): start one, read the snapshot. Bound by main.
+_scan_start: Callable[[], bool] = lambda: False
+_scan_status: Callable[[], dict] = lambda: {"running": False, "findings": [], "cidrs": [],
+                                            "ports": [], "hosts_total": 0, "hosts_done": 0,
+                                            "truncated": False, "error": None, "no_range": False}
 _gen_speed_info: Callable[[], dict] = lambda: {"speed": {}, "quarantine": {}}
 _job_progress: Callable[[str], Optional[dict]] = lambda job_id: None   # live ws progress, None = none
 _cancel_generation = None

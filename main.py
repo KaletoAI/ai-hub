@@ -27,6 +27,8 @@ import anthropic_bridge
 import jobs
 import reasoning
 import scheduler
+import netscan
+import socket
 import stats
 import store
 from adapters import (AdapterContext, ComfyExecutorStuck, NormalizedRequest, image_params,
@@ -441,6 +443,12 @@ _probing: set = set()                  # backend ids with a discovery poll in fl
 # backend that came back outside the gateway is noticed in seconds instead of a whole
 # health_check_interval. 0 disables the fast probe (Server tab).
 fast_probe_interval_s: float = 3.0
+# LAN scan for backends (Backends tab → Scan network; docs/superpowers/specs/
+# 2026-09-08-lan-scan-design.md). Manual only — one scan at a time, nothing is added
+# by itself. `scan_cidrs` empty = the /24 of every IPv4 address of this host.
+scan_cidrs: list[str] = []
+scan_ports: list[int] = list(netscan.DEFAULT_PORTS)
+_scan: dict = {"task": None, "result": None}
 # Media jobs park in their own poll loops rather than in `_parked`, so they announce
 # themselves here instead. A TIMESTAMP, not a counter: a cancelled or crashed job task
 # can never leave a phantom waiter behind, it just stops refreshing.
@@ -4401,6 +4409,64 @@ def _cloud_info(b: dict) -> dict:
     return info
 
 
+async def _scan_fetch(url: str):
+    """netscan's fetch: (status, json|None) with a short timeout — an open port that
+    does not answer HTTP in 2 s is not a backend worth waiting for."""
+    async with httpx.AsyncClient(timeout=2.0) as c:
+        r = await c.get(url)
+        try:
+            return r.status_code, r.json()
+        except ValueError:
+            return r.status_code, None
+
+
+async def _scan_resolve(host: str) -> Optional[str]:
+    try:
+        return (await asyncio.to_thread(socket.gethostbyaddr, host))[0]
+    except Exception:
+        return None
+
+
+def start_scan() -> bool:
+    """Start one LAN scan (Backends tab button). False when one is still running —
+    the console then simply shows that one. Never writes to the store."""
+    t = _scan.get("task")
+    if t is not None and not t.done():
+        return False
+    cidrs = list(scan_cidrs) or netscan.local_cidrs()
+    hosts, truncated = netscan.expand_targets(cidrs, netscan.HOST_CAP)
+    res = netscan.ScanResult(cidrs=cidrs, ports=list(scan_ports), hosts_total=len(hosts),
+                             truncated=truncated)
+    _scan["result"] = res
+    if not hosts:
+        res.finished = time.time()           # nothing to scan: report, do not spawn
+        _scan["task"] = None
+        return True
+    _scan["task"] = asyncio.create_task(netscan.scan(
+        hosts, list(scan_ports), fetch=_scan_fetch, resolve=_scan_resolve,
+        backends=[{"name": b["name"], "url": b.get("url", "")} for b in backends],
+        result=res))
+    return True
+
+
+def scan_status() -> dict:
+    """Snapshot for admin._scan_panel — plain dicts, no dataclasses across the seam."""
+    res = _scan.get("result")
+    if res is None:
+        return {"running": False, "cidrs": [], "ports": list(scan_ports), "hosts_total": 0,
+                "hosts_done": 0, "truncated": False, "error": None, "findings": [], "no_range": False}
+    return {
+        "running": res.running,
+        "cidrs": list(res.cidrs), "ports": list(res.ports),
+        "hosts_total": res.hosts_total, "hosts_done": res.hosts_done,
+        "truncated": res.truncated, "error": res.error,
+        "no_range": res.hosts_total == 0,
+        "findings": [{"host": f.host, "port": f.port, "url": f.url, "type": f.type,
+                      "flavor": f.flavor, "models": f.models, "needs_key": f.needs_key,
+                      "known_as": f.known_as, "hostname": f.hostname} for f in res.findings],
+    }
+
+
 def gateway_info() -> dict:
     """Snapshot the UI's Backends/Input/Server tabs read from."""
     config_ids = {backend_id(b) for b in config_backends}
@@ -4507,6 +4573,16 @@ def apply_chat_aliases() -> None:
 _server_runtime: dict = {}
 
 
+def _apply_scan_settings(s: dict) -> None:
+    """Server-tab text fields → the scan globals. Blank cidrs = derive from this host;
+    blank ports = DEFAULT_PORTS. Pure over `s`, so tests can call it directly."""
+    global scan_cidrs, scan_ports
+    if "scan_cidrs" in s:
+        scan_cidrs = [c.strip() for c in str(s.get("scan_cidrs") or "").split(",") if c.strip()]
+    if "scan_ports" in s:
+        scan_ports = netscan.parse_ports(s.get("scan_ports")) or list(netscan.DEFAULT_PORTS)
+
+
 def apply_server_settings() -> None:
     """Overlay UI-managed server settings (store) onto the live config globals.
 
@@ -4561,6 +4637,7 @@ def apply_server_settings() -> None:
             fast_probe_interval_s = max(0.0, float(s["fast_probe_interval_s"]))
         except (TypeError, ValueError):
             pass
+    _apply_scan_settings(s)
     # restart-only: overlaid onto stats_cfg / jobs_cfg so the next start picks them up
     # (these init once at startup). Lets config.yaml shed the jobs/stats db knobs.
     for skey, ckey in (("stats_enabled", "enabled"),
@@ -4597,6 +4674,8 @@ def server_info() -> dict:
             "fast_probe_interval_s": (int(fast_probe_interval_s)
                                       if fast_probe_interval_s == int(fast_probe_interval_s)
                                       else fast_probe_interval_s),
+            "scan_cidrs": ", ".join(scan_cidrs),
+            "scan_ports": ", ".join(str(p) for p in scan_ports),
             "port": (config or {}).get("port", 4000),
             "stats_enabled": bool(stats_cfg.get("enabled")),
             "stats_db_path": stats_cfg.get("db_path", "stats.db"),
@@ -4640,6 +4719,8 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
            routing_snapshot=routing_snapshot,
            server_info=server_info,
            apply_server_settings=apply_server_settings_hook,
+           scan_start=start_scan,
+           scan_status=scan_status,
            apply_users=apply_users,
            resolve_admin=resolve_admin, ui_locked=ui_locked,
            dashboard_snapshot=dashboard_snapshot, cancel_generation=cancel_generation,

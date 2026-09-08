@@ -18,6 +18,21 @@ _here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _here)
 import netscan  # noqa: E402
 
+# `import main` reads ./config.yaml at import time — give it a minimal one in a temp cwd.
+import tempfile  # noqa: E402
+_prev = os.getcwd()
+_tmp = tempfile.TemporaryDirectory()
+with open(os.path.join(_tmp.name, "config.yaml"), "w") as _f:
+    _f.write('api_key: ""\nbackends: []\n')
+os.chdir(_tmp.name)
+try:
+    import main   # noqa: E402
+    import admin  # noqa: E402
+finally:
+    os.chdir(_prev)
+    _tmp.cleanup()
+    del _tmp
+
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 IP_ADDR = """\
@@ -216,6 +231,50 @@ class Scan(unittest.TestCase):
         self.assertEqual(res.findings, [])
         self.assertIsNone(res.error)           # a closed port and a failing resolver are normal
         self.assertFalse(res.running)
+
+
+class MainState(unittest.TestCase):
+    def test_status_before_any_scan(self):
+        main._scan["task"], main._scan["result"] = None, None
+        st = main.scan_status()
+        self.assertEqual((st["running"], st["findings"], st["hosts_done"], st["hosts_total"]),
+                         (False, [], 0, 0))
+
+    def test_status_reflects_a_result_and_flattens_findings(self):
+        res = netscan.ScanResult(cidrs=["127.0.0.1/32"], ports=[1], hosts_total=1, hosts_done=1,
+                                 finished=1.0)
+        res.findings.append(netscan.Finding("127.0.0.1", 1, "http://127.0.0.1:1", "openai",
+                                            "llama-swap", 3, known_as="me"))
+        main._scan["task"], main._scan["result"] = None, res
+        st = main.scan_status()
+        self.assertFalse(st["running"])
+        self.assertEqual(st["findings"][0]["known_as"], "me")
+        self.assertEqual(st["findings"][0]["flavor"], "llama-swap")
+        self.assertEqual(st["cidrs"], ["127.0.0.1/32"])
+        main._scan["result"] = None
+
+    def test_start_is_a_noop_while_one_runs(self):
+        res = netscan.ScanResult(cidrs=[], ports=[], hosts_total=1)   # running: finished == 0
+
+        class _T:
+            def done(self):
+                return False
+        main._scan["task"], main._scan["result"] = _T(), res
+        self.assertFalse(main.start_scan())
+        main._scan["task"], main._scan["result"] = None, None
+
+    def test_settings_parse(self):
+        saved = (main.scan_cidrs, main.scan_ports)
+        try:
+            main.scan_cidrs, main.scan_ports = [], []
+            main._apply_scan_settings({"scan_cidrs": "192.168.8.0/24, 10.20.0.0/30", "scan_ports": "8080 8188"})
+            self.assertEqual(main.scan_cidrs, ["192.168.8.0/24", "10.20.0.0/30"])
+            self.assertEqual(main.scan_ports, [8080, 8188])
+            main._apply_scan_settings({"scan_cidrs": "", "scan_ports": ""})
+            self.assertEqual(main.scan_cidrs, [])
+            self.assertEqual(main.scan_ports, netscan.DEFAULT_PORTS)
+        finally:
+            main.scan_cidrs, main.scan_ports = saved
 
 
 if __name__ == "__main__":
