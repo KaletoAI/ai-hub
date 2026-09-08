@@ -217,6 +217,44 @@ class TestParseTask(unittest.TestCase):
         self.assertEqual(st.error, "bad image")
         self.assertEqual(st.downloads, [])
 
+    def test_failed_server_error_is_retryable(self):
+        # `task_error.type` is the ONE field saying whether trying again can help. Measured
+        # 2026-09-03 (task 01a0696e…, job 9cf448115b4b): `server_error` at 45 % progress,
+        # 0 credits consumed, message "Please retry" — the vendor's trouble, not the input's.
+        st = meshy.parse_task({"status": "FAILED", "progress": 45, "consumed_credits": 0,
+                               "task_error": {"type": "server_error",
+                                              "message": "An unexpected error occurred."}},
+                              ["glb"])
+        self.assertEqual(st.error, "An unexpected error occurred.")
+        self.assertTrue(st.retryable)
+
+    def test_failed_other_retryable_types(self):
+        for t in ("timeout", "service_unavailable", "SERVER_ERROR"):
+            st = meshy.parse_task({"status": "FAILED",
+                                   "task_error": {"type": t, "message": "x"}}, ["glb"])
+            self.assertTrue(st.retryable, t)
+
+    def test_failed_invalid_input_is_not_retryable(self):
+        # Both permanent failures seen on prod: a plain invalid_input (job ba24ba23) and
+        # moderation_blocked (job 1862e68e). Retrying either only burns time.
+        for code in ("invalid_input", "moderation_blocked"):
+            st = meshy.parse_task({"status": "FAILED",
+                                   "task_error": {"type": "invalid_input", "code": code,
+                                                  "message": "no"}}, ["glb"])
+            self.assertFalse(st.retryable, code)
+
+    def test_failed_without_a_type_is_not_retryable(self):
+        st = meshy.parse_task({"status": "FAILED",
+                               "task_error": {"message": "bad image"}}, ["glb"])
+        self.assertFalse(st.retryable)
+
+    def test_cancelled_is_never_retryable(self):
+        # A cancellation is a decision, not a fault — re-running it defies the caller.
+        st = meshy.parse_task({"status": "CANCELED",
+                               "task_error": {"type": "server_error", "message": "x"}},
+                              ["glb"])
+        self.assertFalse(st.retryable)
+
     def test_pending(self):
         st = meshy.parse_task({"status": "PENDING", "progress": 0, "preceding_tasks": 3}, ["glb"])
         self.assertEqual(st.status, "PENDING")

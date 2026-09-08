@@ -27,6 +27,7 @@ with open(os.path.join(_tmp.name, "config.yaml"), "w") as _f:
 os.chdir(_tmp.name)
 sys.path.insert(0, _here)
 try:
+    import adapters
     import main
 finally:
     os.chdir(_prev)
@@ -54,6 +55,49 @@ class TestErrText(unittest.TestCase):
             self.assertIn(type(e).__name__, msg)
         # …and the no-candidate case (last is None) says so instead of rendering "None"
         self.assertNotIn("None", main._gen_exhausted_msg(None))
+
+    def test_retryable_cloud_fault_is_not_reported_as_unreachable(self):
+        # The task REACHED the vendor and the vendor broke it — saying "unreachable" here
+        # sends the operator diagnosing a network that answered perfectly well.
+        e = adapters.CloudTaskRetryable("Meshy task t1 failed: boom", vendor="Meshy")
+        msg = main._gen_exhausted_msg(e)
+        self.assertNotIn("unreachable", msg)
+        self.assertIn("Meshy", msg)
+        self.assertIn("boom", msg)
+        self.assertIn("no credits", msg)                 # "consumed no credits"
+        self.assertEqual(main._fault_label(e), "Meshy failed the task on its side")
+
+
+class TestGenFailMeta(unittest.TestCase):
+    """What a FAILED generation job carries. A failed cloud run returns no GenOutput, so
+    these keys are the only record of the vendor task — and an empty meta is silent: the
+    job row simply shows nothing and the task id survives only inside the error text."""
+
+    def test_cloud_trace_reaches_the_failed_row(self):
+        trace = {"cloud": "meshy", "cloud_task_id": "t1", "endpoint": "image-to-3d",
+                 "request": {"ai_model": "latest"}}
+        meta = main._gen_fail_meta(1, trace)
+        self.assertEqual(meta["cloud_task_id"], "t1")
+        self.assertEqual(meta["endpoint"], "image-to-3d")
+        self.assertNotIn("attempts", meta)               # a single attempt is not worth noting
+
+    def test_attempts_ride_along_without_a_cloud_run(self):
+        self.assertEqual(main._gen_fail_meta(3, {}), {"attempts": 3})
+
+    def test_nothing_to_say_stays_none(self):
+        self.assertIsNone(main._gen_fail_meta(1, {}))
+
+    def test_the_trace_is_copied_not_aliased(self):
+        # jobs.fail merges the dict into the row; mutating the caller's trace afterwards
+        # must not rewrite what was recorded.
+        trace = {"cloud": "tripo", "cloud_task_id": "t1"}
+        meta = main._gen_fail_meta(2, trace)
+        trace["cloud_task_id"] = "CHANGED"
+        self.assertEqual(meta["cloud_task_id"], "t1")
+
+    def test_trace_of_a_request_without_one_is_empty(self):
+        self.assertEqual(main._cloud_trace_of(None), {})
+        self.assertEqual(main._cloud_trace_of(adapters.NormalizedRequest()), {})
 
 
 if __name__ == "__main__":

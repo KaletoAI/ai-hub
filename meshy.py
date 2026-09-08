@@ -297,6 +297,13 @@ def public_fields(cand: dict) -> tuple[list, list, list]:
 
 TASK_STATUSES = ("PENDING", "IN_PROGRESS", "SUCCEEDED", "FAILED", "CANCELED")
 
+# `task_error.type` on a FAILED task — Meshy's own verdict on whether trying again can
+# help (docs.meshy.ai/en/api/errors). `invalid_input` is permanent ("something is wrong
+# with the input you provided"); these three are the service's own trouble and the docs
+# say "retry the request" for each. Read the TYPE, never the message: the message is
+# prose that changes, the type is the contract.
+RETRYABLE_ERROR_TYPES = ("timeout", "service_unavailable", "server_error")
+
 
 def parse_task(task: dict, formats: list, endpoint: str = "image-to-3d",
                animations: bool = False, options: Optional[dict] = None) -> TaskState:
@@ -330,7 +337,11 @@ def parse_task(task: dict, formats: list, endpoint: str = "image-to-3d",
         st.error = f"unknown task status {status!r}"
         return st
     if status in ("FAILED", "CANCELED"):
-        st.error = ((task.get("task_error") or {}).get("message") or status.lower())
+        err = task.get("task_error") or {}
+        st.error = err.get("message") or status.lower()
+        # CANCELED is a decision, not a fault — re-running it would defy whoever cancelled.
+        st.retryable = (status == "FAILED"
+                        and str(err.get("type") or "").lower() in RETRYABLE_ERROR_TYPES)
         return st
     if status == "SUCCEEDED":
         anim: dict = {}

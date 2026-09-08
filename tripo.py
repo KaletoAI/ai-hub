@@ -396,6 +396,10 @@ def parse_task(task: dict, formats: list, endpoint: str = "image-to-model",
         msg = str(task.get("error_message") or "failed")
         code = task.get("error_code")
         st.error = f"{msg} (code {code})" if code not in (None, "") else msg
+        # `st.retryable` stays False: unlike Meshy's documented `task_error.type`, Tripo's
+        # V3 docs give no field separating its own faults from a rejected input, and
+        # guessing one from `error_code` would risk re-submitting a task the vendor already
+        # judged. Left final on purpose — fill this in when Tripo documents the split.
         return st
     if status == "cancelled":
         st.error = "cancelled"

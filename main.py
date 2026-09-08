@@ -2519,6 +2519,8 @@ def _fault_label(e: BaseException) -> str:
         return "no credits left"
     if isinstance(e, adapters.CloudBusy):
         return f"{e.vendor} queue full"
+    if isinstance(e, adapters.CloudTaskRetryable):
+        return f"{e.vendor} failed the task on its side"
     if isinstance(e, TimeoutError):            # the adapter's own max_wait cap
         return "did not finish in time"
     if isinstance(e, httpx.TimeoutException):  # a single HTTP round trip timed out
@@ -2544,12 +2546,36 @@ def _gen_exhausted_msg(last: Optional[BaseException]) -> str:
         return f"no candidate backend could run it — {last.vendor} account out of credits: {txt}"
     if isinstance(last, adapters.CloudBusy):
         return f"no candidate backend could run it — {last.vendor} queue limit reached: {txt}"
+    if isinstance(last, adapters.CloudTaskRetryable):
+        # Named apart from "unreachable": the task REACHED the vendor and the vendor broke
+        # it. Sending someone to check the network here is the same wrong turn the max_wait
+        # case warns about, and the credits question ("was I billed?") is answered too.
+        return (f"every attempt failed inside {last.vendor} — the vendor called it a "
+                f"retryable fault and consumed no credits: {txt}")
     if isinstance(last, TimeoutError):
         return (f"no candidate backend finished in time — the gateway's per-backend "
                 f"`max_wait` (default 600s; raise it in Backends for slow workflows): {txt}")
     if isinstance(last, httpx.TimeoutException):
         return f"no candidate backend answered in time (transport timeout): {txt}"
     return f"all candidate backends unreachable (connection): {txt}"
+
+
+def _cloud_trace_of(req) -> dict:
+    """A COPY of what a cloud adapter recorded on this request (`NormalizedRequest.
+    cloud_trace`), empty for a ComfyUI request or an attempt that never got that far.
+    Copied because the request is re-built per attempt and the trace outlives it."""
+    return dict(getattr(req, "cloud_trace", None) or {})
+
+
+def _gen_fail_meta(attempts: int, cloud_trace: dict) -> Optional[dict]:
+    """The meta a failed generation job carries: the retry count (kept visible, runbook B)
+    plus whatever a cloud candidate had already created. The cloud keys are the SAME ones
+    the success meta uses, so `admin._cloud_table` and the job view render a failed run
+    with no special case. None when there is nothing to say."""
+    meta = dict(cloud_trace)
+    if attempts > 1:
+        meta["attempts"] = attempts
+    return meta or None
 
 
 # bid → deque[(ts, conn_fail)] of the last generate() attempts. In-memory on
@@ -2856,6 +2882,13 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req) -> None
     # job ends because a fault only counts as the BACKEND's once a later candidate has
     # succeeded — until then it is indistinguishable from a broken request.
     exec_faults: list = []
+    # What a CLOUD candidate had already created when it failed (task id, endpoint, the
+    # request summary). A failed run returns no GenOutput, so these facts reach the job row
+    # only from here — and they are the ones a cloud failure is diagnosed with: without
+    # them the task id survives only inside the error TEXT and everything else not at all
+    # (measured 2026-09-03, job 9cf448115b4b). Last writer wins: the candidate the job
+    # actually died on is the one worth describing.
+    cloud_trace: dict = {}
     for backend, cand in candidates:
         bid = backend_id(backend)
         adapter = backend_adapters.get(bid)
@@ -2875,7 +2908,8 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req) -> None
         try:
             for attempt in range(1, tries + 1):
                 attempts += 1
-                try:
+                req = None                             # so a build_req failure cannot leave
+                try:                                   # the PREVIOUS attempt's trace behind
                     req = build_req(backend, cand)
                     req.slot_held = True               # we hold it — generate() must not double-count
                     # Type affinity + an empty GPU when the MODEL SET changed (see
@@ -2901,6 +2935,7 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req) -> None
                 except _GEN_FAILOVER_ERRORS as e:
                     _record_gen_attempt(bid, conn_fail=True)
                     last = e
+                    cloud_trace = _cloud_trace_of(req) or cloud_trace
                     # both fail over, but they are different faults — name them apart so
                     # the log points at the workflow, not the network (see _gen_exhausted_msg)
                     what = _fault_label(e)
@@ -2925,6 +2960,7 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req) -> None
                     # update broke every Flux-family model load, and four user retries in a
                     # row died on it while two backends that could run the alias sat idle).
                     _record_gen_attempt(bid, conn_fail=False, exec_fail=True)
+                    cloud_trace = _cloud_trace_of(req) or cloud_trace
                     if adapters.cloud_kind(cand):
                         # A cloud task is BILLED. Whatever failed here may have happened
                         # after the paid task was created, and re-running the job on the
@@ -2932,7 +2968,7 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req) -> None
                         # tripo.py/adapters.py go out of their way to preserve. Final.
                         logger.warning(f"✗ job {job_id} [{backend['name']}] failed: {_err_text(e)}")
                         await asyncio.to_thread(jobs.fail, job_id, _err_text(e),
-                                                {"attempts": attempts} if attempts > 1 else None)
+                                                _gen_fail_meta(attempts, cloud_trace))
                         return
                     exec_faults.append((bid, backend["name"], e))
                     last = e
@@ -2953,10 +2989,10 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req) -> None
             msg += (f" — the same on {len(exec_faults)} backends "
                     f"({', '.join(n for _, n, _ in exec_faults)}), so the request is at fault")
         await asyncio.to_thread(jobs.fail, job_id, msg,
-                                {"attempts": attempts} if attempts > 1 else None)
+                                _gen_fail_meta(attempts, cloud_trace))
         return
     await asyncio.to_thread(jobs.fail, job_id, _gen_exhausted_msg(last),
-                            {"attempts": attempts} if attempts > 1 else None)
+                            _gen_fail_meta(attempts, cloud_trace))
 
 
 def _chain_mesh_param_error(s2: dict, mesh_param: str, succ_alias: str) -> Optional[str]:
@@ -3091,19 +3127,27 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
         """Extra meta for a chain `jobs.fail`. A stage-2 failure is exactly when the
         hand-off matters most, so what stage 2 was handed is kept on the failed row too
         (`jobs.fail` merges; `complete`'s _mark_done rewrites, hence the explicit key
-        there). `s2_info` is None until the hand-off, so a stage-1 failure carries only
-        the attempt count, as before. `chain_stage1` rides along whenever stage 1 was a
-        PAID cloud task: a chain that dies after it must still name the cloud task that
-        was billed, which `complete`'s meta would otherwise be the only record of."""
-        m = {**({"attempts": gen_attempts} if gen_attempts > 2 else {}),
+        there). `s2_info` is None until the hand-off. `chain_stage1` rides along whenever
+        stage 1 was a PAID cloud task: a chain that dies after it must still name the cloud
+        task that was billed, which `complete`'s meta would otherwise be the only record of.
+
+        A stage that FAILED produced no GenOutput at all, so `s1_meta` stays None for it and
+        the adapter's own trace (`NormalizedRequest.cloud_trace`) is the only record that a
+        vendor task ever existed. It goes exactly where the success path puts the same
+        facts: stage 1 under `chain_stage1`, a cloud stage 2 at the TOP level."""
+        s1 = s1_meta or _cloud_trace_of(req1)
+        m = {**_cloud_trace_of(req2),
+             **({"attempts": gen_attempts} if gen_attempts > 2 else {}),
              **({"chain_stage2": s2_info} if s2_info else {}),
-             **({"chain_stage1": s1_meta} if s1_meta else {})}
+             **({"chain_stage1": s1} if s1 else {})}
         return m or None
 
     deadline = time.monotonic() + async_park_timeout_s
     tried: set = set()                       # stage-1 backends that failed with a connection error
     skip_reason = None
     gen_attempts = 0                         # generate() calls across candidates + self-retries
+    req1 = req2 = None                       # the live stage requests — `fail_meta` reads their
+                                             # cloud_trace, and it may run before either exists
     # In the media queue for the whole chain (see the docstring): registered before
     # the first pass, dropped again on every exit path.
     entry = {"job_id": job_id, "alias": alias, "enqueued_at": time.monotonic(),
@@ -3264,6 +3308,8 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
             s1_done = False                             # mesh in hand → stage-2 errors are final
             s1_meta = None                              # a paid stage-1 cloud task, for the job view
             s2_info = None                              # what stage 2 was actually handed (job view)
+            req1 = req2 = None                          # per CANDIDATE: a later stage-1 failure must
+                                                        # not report the previous pass's tasks
             await asyncio.to_thread(jobs.set_status, job_id, "running")
             await asyncio.to_thread(jobs.set_backend, job_id, backend["name"])   # cancel targets the LIVE backend
             await asyncio.to_thread(jobs.set_stage, job_id, "1/2")   # multi-stage progress → "running 1/2"

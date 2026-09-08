@@ -373,11 +373,26 @@ class TestTripoAdapter(unittest.TestCase):
         client.post is what a transport fault hits), leaving every other create intact."""
         real = self.ad._create
 
-        async def flaky(client, url, body, endpoint):
+        async def flaky(client, url, body, endpoint, *a, **kw):
             if endpoint.startswith(role_prefix):
                 raise exc
-            return await real(client, url, body, endpoint)
+            return await real(client, url, body, endpoint, *a, **kw)
         self.ad._create = flaky
+
+    def test_side_tasks_do_not_claim_the_primary_slot_in_the_trace(self):
+        """One Tripo job is several tasks. The trace a failed job leaves must still name
+        the PRIMARY one under cloud_task_id/endpoint — the same meaning those keys carry in
+        the success meta — while converts and clips only join the task list. Getting this
+        backwards would point the operator at a convert task for a job that failed there."""
+        self._create_raising(httpx.ConnectError("boom"), "convert")
+        req = self._req(images={"input_image": PNG}, target_formats=["glb", "obj"])
+        with self.assertRaises(RuntimeError):
+            self._run(self.ad.generate(req))
+        tr = req.cloud_trace
+        self.assertEqual(tr["cloud"], "tripo")
+        self.assertEqual(tr["endpoint"], "image-to-model")     # not "convert:obj"
+        self.assertEqual([t["role"] for t in tr["tasks"]], ["image-to-model"])
+        self.assertEqual(tr["cloud_task_id"], tr["tasks"][0]["task_id"])
 
     def test_convert_create_transport_fault_is_final(self):
         """httpx's transport errors are subclasses of NEITHER ConnectionError nor

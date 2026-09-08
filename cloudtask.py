@@ -16,6 +16,12 @@ class TaskState:
     downloads: list = field(default_factory=list)      # [(filename, url)] in delivery order
     thumbnail: Optional[str] = None
     credits: Optional[float] = None
+    # A failed task the VENDOR blames on itself and invites a retry for (Meshy's
+    # `task_error.type` server_error/timeout/service_unavailable). The distinction is the
+    # vendor's own, never a guess from the message text: a rejected input fails the same
+    # way on every candidate, while the service's own hiccup is exactly what the gateway's
+    # self-retry and failover exist for. Default False — a module that cannot tell says so.
+    retryable: bool = False
     # A task that answers a QUESTION instead of delivering a file (Tripo's free rig-check:
     # "can this mesh be rigged, and as what?"). Optional because every other task leaves
     # them None — the adapter reads them only for the endpoint that sets them.
