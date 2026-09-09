@@ -75,7 +75,8 @@ class EmbeddedScriptsParse(unittest.TestCase):
         if not shutil.which("node"):
             self.skipTest("node not installed")
         with tempfile.TemporaryDirectory() as tmp:
-            for name in ("_SCROLL_JS", "_SORT_JS", "_LIVE_JS", "_FILTER_JS", "_JOB_TICK"):
+            for name in ("_SCROLL_JS", "_SORT_JS", "_LIVE_JS", "_FILTER_JS", "_JOB_TICK",
+                         "_TABS_JS"):
                 blob = getattr(admin, name)
                 for i, src in enumerate(re.findall(r"<script>(.*?)</script>", blob, re.S)):
                     path = os.path.join(tmp, f"{name}{i}.js")

@@ -304,6 +304,11 @@ table.recent{font-size:12px}
 table.sortable th{cursor:pointer;user-select:none}
 table.sortable th:hover{color:#dfe6ee}
 table.sortable th .sind{margin-left:4px;color:#5fb8c8;font-size:10px}
+/* Backend form tabs: one form, four panes, only display switched (_TABS_JS). */
+.btabs{display:flex;flex-wrap:wrap;gap:2px;margin:0 0 12px;border-bottom:1px solid #242a33}
+.btab{background:none;border:0;border-bottom:2px solid transparent;border-radius:0;color:#9aa7b4;font:inherit;font-size:13px;height:auto;padding:7px 12px;width:auto;cursor:pointer}
+.btab:hover{color:#dce4ec;background:#1b1f27}
+.btab.on{color:#fff;border-bottom-color:#3b82f6}
 details.optblock{border:1px solid #242a33;border-radius:8px;padding:6px 10px;margin:0 0 12px}
 details.optblock>summary{cursor:pointer;user-select:none;font-size:12px;color:#8b97a4;padding:2px 0}
 details.optblock>summary:hover{color:#cdd6e0}
@@ -420,6 +425,55 @@ _SORT_JS = ("<script>(function(){"
             "window.gwLiveHooks.push(function(){"
             "[].slice.call(document.querySelectorAll('table.sortable')).forEach(function(tbl,i){"
             "wire(tbl,i);applySort(tbl,i);});});"
+            "})();</script>")
+
+
+# The backend form's tabs (General / Models / Behavior / <type>). Client-side only:
+# ONE <form> holds every pane and only `display` is switched, because a pane rendered
+# conditionally would drop its inputs from the POST and `backend_save` reads an absent
+# field as "cleared" — switching tabs would silently wipe what the other tabs hold.
+#
+# Three things this has to survive, all of them silent when they break:
+#   · the live morph. The Backends page can be live (draining, a running scan) and the
+#     morph rewrites every inline `style` from the server's HTML, which always renders
+#     General. So the choice lives in sessionStorage and a gwLiveHooks entry re-applies
+#     it after every tick — the same pattern the sort and filter hooks use.
+#   · the <script> rule: the morph never INSERTS a script, so this must already be on
+#     the page before the form can arrive. It is emitted by `_page()` for every view
+#     (it is inert where there is no #btabs) rather than from the form's own markup.
+#   · a tab that disappears. The <type> tab is hidden for openai, so a type switch can
+#     remove the tab the operator is standing on; `apply()` then falls back to General
+#     instead of leaving the form apparently empty.
+# The click handler is delegated from `document`, so a form the morph brings in later
+# needs no re-binding at all. The choice is ALSO kept in a module variable, not only in
+# sessionStorage: a browser that refuses site data (private mode, a blocked origin) makes
+# every read throw, and a store-only version would then read back "general" on the very
+# next tick — the tabs would look dead while nothing errored.
+_TABS_JS = ("<script>(function(){"
+            "var KEY='gw:btab',mem=null;"
+            "function cur(){if(mem)return mem;"
+            "try{mem=sessionStorage.getItem(KEY)||'general';}catch(e){mem='general';}"
+            "return mem;}"
+            "function set(v){mem=v;try{sessionStorage.setItem(KEY,v);}catch(e){}}"
+            "function apply(){var bar=document.getElementById('btabs');if(!bar)return;"
+            "var btns=bar.querySelectorAll('.btab'),t=cur(),seen={},i,b;"
+            "for(i=0;i<btns.length;i++){b=btns[i];"
+            "if(b.style.display!=='none')seen[b.getAttribute('data-tab')]=1;}"
+            "if(!seen[t]){t='general';set(t);}"
+            "for(i=0;i<btns.length;i++){b=btns[i];"
+            "b.className=b.getAttribute('data-tab')===t?'btab on':'btab';}"
+            "var ps=document.querySelectorAll('.bpane');"
+            "for(i=0;i<ps.length;i++){"
+            "ps[i].style.display=ps[i].getAttribute('data-btab')===t?'':'none';}}"
+            "window.gwBackendTab=apply;"
+            "document.addEventListener('click',function(e){var n=e.target;"
+            "while(n&&n.getAttribute){"
+            "if(n.getAttribute('data-tab')&&/(^|\\s)btab(\\s|$)/.test(n.className||'')){"
+            "set(n.getAttribute('data-tab'));apply();return;}"
+            "n=n.parentNode;}});"
+            "apply();"
+            "window.gwLiveHooks=window.gwLiveHooks||[];"
+            "window.gwLiveHooks.push(apply);"
             "})();</script>")
 
 
@@ -565,7 +619,7 @@ def _page(title: str, body: str, active: str = "", refresh: Optional[int] = None
     # never scrolls and sits flush under the tabs.
     return (f'<!doctype html><html><head><meta charset="utf-8"><title>{_esc(title)} · AI-Hub</title>'
             f"<style>{_CSS}</style></head><body>{head}{subnav}<main{live}>{body}</main>"
-            f"{_SCROLL_JS}{_SORT_JS}{_LIVE_JS}</body></html>")
+            f"{_SCROLL_JS}{_SORT_JS}{_TABS_JS}{_LIVE_JS}</body></html>")
 
 
 def _field(label: str, control: str, short: bool = False, wide: bool = False) -> str:
@@ -1129,11 +1183,54 @@ def _image_fields(wf: dict) -> list:
 
 # ── Tab: Backends ───────────────────────────────────────────────────────────────
 
+def _type_tab_label(t: str) -> str:
+    """The type tab's caption for a backend type — "" for openai, whose settings all
+    live in the shared tabs (there is no openai-only pane, so the tab is hidden)."""
+    if t == "comfyui":
+        return "ComfyUI"
+    if t in adapters.CLOUD_TYPES:
+        return "Cloud task API"
+    if t == "anthropic":
+        return "Anthropic"
+    return ""
+
+
+def _btab_bar(cur_type: str) -> str:
+    """The backend form's tab strip. Plain buttons (type=button — a bare <button> in a
+    form submits it), switched client-side by _TABS_JS; the type tab renames itself and
+    hides for openai, driven by the type select's own handler."""
+    lbl = _type_tab_label(cur_type)
+    out = ""
+    for key, txt in (("general", "General"), ("models", "Models"), ("behavior", "Behavior")):
+        on = " on" if key == "general" else ""
+        out += f'<button type="button" class="btab{on}" data-tab="{key}">{txt}</button>'
+    hide = "" if lbl else ' style="display:none"'
+    out += f'<button type="button" class="btab" data-tab="type" id="btab-type"{hide}>{_esc(lbl)}</button>'
+    return f'<div class="btabs" id="btabs">{out}</div>'
+
+
+def _btype_block(types: str, cur_type: str, inner: str) -> str:
+    """A block that only applies to some backend types, inside a tab that is shown for
+    all of them. `types` is a space-separated list of types; the token `cloud` matches
+    every cloud kind. Rendered ALWAYS (only `display` is toggled, by the type select's
+    handler) — a field that is not submitted would silently clear its stored value."""
+    toks = types.split()
+    on = cur_type in toks or (cur_type in adapters.CLOUD_TYPES and "cloud" in toks)
+    style = "" if on else ' style="display:none"'
+    return f'<div data-btype="{types}"{style}>{inner}</div>'
+
+
 def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None) -> str:
     # A scan finding arrives as `prefill` (name/type/url; `local` ticked for an openai
     # find — a LAN server is local by definition, the operator may untick). It reads
     # like a stored backend for rendering, but the title stays "Add Backend" and no
     # `orig` hidden field is emitted, so Save creates instead of renaming.
+    #
+    # The form is ONE form in four tabs (General / Models / Behavior / <type>), and
+    # every pane stays in the DOM at all times — only `display` is switched, by
+    # _TABS_JS. A pane that were rendered conditionally would drop its fields from the
+    # POST, and backend_save reads "absent" as "cleared": switching tabs would silently
+    # wipe the settings of every tab you did not visit.
     src = b or ({**prefill, "local": prefill.get("type", "openai") == "openai"} if prefill else {})
     g = lambda k, d="": str(src.get(k) if src.get(k) is not None else d)
     gb = lambda k: bool(src.get(k))
@@ -1149,9 +1246,15 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
     host_inp = (f'<input name="host" value="{_esc(g("host"))}" list="hostlist" '
                 f'placeholder="auto: URL host/IP" autocomplete="off">'
                 f'<datalist id="hostlist">{hlist}</datalist>')
+    pane = lambda key: (f'<div class="bpane" data-btab="{key}"'
+                        + ("" if key == "general" else ' style="display:none"') + ">")
     return (f'<form action="/ui/backends/save" method="post">{orig}'
             f'<div class="formbar"><h2>{title}</h2>'
             f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/backends", "secondary")}</div>'
+            + _btab_bar(cur_type)
+
+            # ── General ───────────────────────────────────────────────────────────
+            + pane("general")
             + _field("name", _inp("name", g("name"), placeholder="evo-comfy"))
             + _field("type", _type_select(g("type", "openai")))
             + "<p class='hint' style='margin:-4px 0 10px'><b>openai</b> = every OpenAI-compatible server "
@@ -1179,8 +1282,114 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
               "and reaches for a paid one only when no unpaid backend is free.</p>"
             + _field("max_concurrent", _inp("max_concurrent", g("max_concurrent"), placeholder="optional, e.g. 1", typ="number"))
             + _field("api key", _inp("api_key", g("api_key"), placeholder="optional — cloud backends"))
+            + "</div>"
+
+            # ── Models ────────────────────────────────────────────────────────────
+            # The whitelist/blacklist pair applies to EVERY backend type, so it sits
+            # outside any type-conditional block.
+            + pane("models")
+            + _field("model whitelist", _inp("models_allow", g("models_allow"),
+                     placeholder="gpt-*, claude-*"))
+            + _field("model blacklist", _inp("models_deny", g("models_deny"),
+                     placeholder="*-embed, *:free"))
+            + "<p class='hint'><b>model whitelist / blacklist</b>: comma-separated globs "
+              "(<code>*</code>, <code>?</code>; an exact id works the same) applied to what discovery "
+              "finds, for <b>every</b> backend type — on a ComfyUI backend they shorten the checkpoint "
+              "lists just as well. The whitelist runs first (blank = keep everything), then the "
+              "blacklist removes from what is left, so the blacklist wins. Blank = no filter. A filter "
+              "that matches nothing leaves the backend <b>healthy with no models at all</b> — the "
+              "backend list therefore shows how many models are left.</p>"
+            + f'<div id="llmopts" style="{"" if cur_type == "openai" else "display:none"}">'
+            + '<div class="grouphdr">LLM</div>'
+            + _field("discovery filters",
+                     _checkbox("chat_only", gb("chat_only"), "chat_only",
+                               "keep only models with type==chat (skip image/video/embedding)")
+                     + _checkbox("serverless_only", gb("serverless_only"), "serverless_only",
+                                 "keep only priced models (skip dedicated-only; OpenRouter :free)"))
+            + "<p class='hint'>Filters for cloud LLM catalogs (Together / OpenRouter); "
+              "backends whose models carry no type/pricing are unaffected.</p>"
+            + _field("list models under bare id",
+                     _checkbox("local", gb("local"), "local"))
+            + "<p class='hint'><b>local</b>: also list each of this backend's models under its plain "
+              "id (without the <code>backend/</code> prefix). Several local backends sharing a model id "
+              "then collapse into one entry the scheduler routes across (fastest free unpaid backend "
+              "first) with failover — an implicit "
+              "cross-backend alias.</p>"
+            + _field("context windows",
+                     _textarea("model_context", g("model_context"), rows=3,
+                               placeholder="glm-*=32768\nqwen3.8-flash-next-ple4=131072"))
+            + "<p class='hint'><b>context windows</b>: one <code>model-glob=tokens</code> per line, "
+              "published as <code>context_length</code> in <code>/v1/models</code> — the number a "
+              "client (Oh My Pi, Hermes, OpenCode) sizes its prompts by; without one it assumes "
+              "128k and a 33k prompt to a 32k model 400s. A rule beats what discovery learned "
+              "(OpenRouter/Together <code>context_length</code>, vLLM <code>max_model_len</code>, "
+              "llama-server <code>n_ctx</code> — read through llama-swap for <b>loaded</b> models "
+              "only, and remembered). Write a rule for a llama-swap model that is rarely loaded, or "
+              "when the server's value is not what clients should use.</p>"
+            + "</div>"
+            + _btype_block("anthropic", cur_type,
+                           '<div class="grouphdr">Anthropic</div>'
+                           + _field("models", _inp("models", ", ".join((b or {}).get("models") or [])
+                                                   if isinstance((b or {}).get("models"), list)
+                                                   else g("models"),
+                                                   placeholder="claude-sonnet-5, claude-opus-5"))
+                           + "<p class='hint' style='margin:-4px 0 10px'>Comma-separated fallback model "
+                             "list. Discovery asks <code>GET /v1/models</code> first; a subscription token "
+                             "is not guaranteed to be allowed there, and this list keeps the backend usable "
+                             "when it isn't. Point a chat alias at one of these ids, then run Claude Code "
+                             "with <code>ANTHROPIC_BASE_URL=&lt;gateway&gt;</code>.</p>")
+            + "</div>"
+
+            # ── Behavior ──────────────────────────────────────────────────────────
+            + pane("behavior")
+            + _btype_block("openai", cur_type,
+                           _field("prompt cache passthrough",
+                                  _checkbox("prompt_cache", gb("prompt_cache"), "prompt_cache"))
+                           + "<p class='hint'><b>prompt_cache</b>: keep Claude Code's cache breakpoints "
+                             "when this backend serves <code>/v1/messages</code> (translated). Turn it on "
+                             "for <b>OpenRouter</b>, which forwards them to Anthropic/Gemini models — "
+                             "without them the full context is billed again every turn. Off by default: "
+                             "the breakpoints turn a message into a content-part list, which a strict "
+                             "server may reject. Irrelevant for local models (no token billing) and for "
+                             "OpenAI models (they cache automatically).</p>"
+                           + f'<details class="optblock"{" open" if (b or {}).get("sampling_defaults") else ""}>'
+                           + "<summary>Sampling defaults <span class='muted'>— used when the caller sends "
+                             "none</span></summary>"
+                           + _sampling_inputs((b or {}).get("sampling_defaults"))
+                           + "<p class='hint'><b>sampling defaults</b>: values filled into every chat "
+                             "request to this backend, for keys the caller did <b>not</b> send (an explicit "
+                             "client value — and an alias default — always wins). For backends whose server "
+                             "samples with bare defaults: vLLM without a truncation sampler "
+                             "(<code>top_p=1</code>, <code>min_p=0</code>) degenerates into token salad at "
+                             "temperature ≈ 1. Re-derived per backend, so a failover uses the new backend's "
+                             "values. Applies to chat/completions/responses only.</p>"
+                           + "</details>")
+            + _btype_block("comfyui", cur_type,
+                           _field("self retries", _inp("self_retries", g("self_retries"),
+                                  placeholder="0", typ="number"))
+                           + "<p class='hint' style='margin:-4px 0 10px'><b>self retries</b>: a "
+                             "connection-type fault mid-job retries the <b>same</b> backend this many "
+                             "times (after waiting for <code>/system_stats</code>) before failing over — "
+                             "for hosts with sporadic driver faults. Blank/0 = fail over immediately; "
+                             "content errors are never retried, and an <b>execution</b> fault never "
+                             "repeats on the same backend either (it reproduces).</p>")
+            + _btype_block("cloud", cur_type,
+                           "<p class='hint'>A cloud task API runs the job on the vendor's side: there is "
+                           "no sampling to default and no local fault to retry (a task that failed after "
+                           "creation is already billed). Its timeouts live in the "
+                           "<b>Cloud task API</b> tab.</p>")
+            + _btype_block("anthropic", cur_type,
+                           "<p class='hint'>An Anthropic backend is a <b>verbatim</b> passthrough: "
+                           "sampling defaults, the reasoning toggle and cache rewriting are deliberately "
+                           "not applied to it — the client's own request reaches the API unchanged.</p>")
+            + "</div>"
+
+            # ── <type> ────────────────────────────────────────────────────────────
+            # One pane holding every type-specific block; the tab button carries the
+            # type's own name and hides for openai (which has no block of its own).
+            + pane("type")
             # ComfyUI-only options — hidden for openai (none of these apply to an LLM backend)
-            + f'<div id="comfyopts" style="{"" if g("type", "openai") == "comfyui" else "display:none"}">'
+            + f'<div id="comfyopts" style="{"" if cur_type == "comfyui" else "display:none"}">'
             + '<div class="grouphdr">ComfyUI</div>'
             + _field("comfy output dir", _inp("comfy_output_dir", g("comfy_output_dir"),
                      placeholder="e.g. /home/kai/ComfyUI/output"))
@@ -1200,8 +1409,6 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
                      placeholder="600", typ="number"))
             + _field("stuck after s", _inp("stuck_after_s", g("stuck_after_s"),
                      placeholder="90", typ="number"))
-            + _field("self retries", _inp("self_retries", g("self_retries"),
-                     placeholder="0", typ="number"))
             + _field("max wait s", _inp("max_wait", g("max_wait"),
                      placeholder="600", typ="number"))
             + _field("poll interval s", _inp("poll_interval", g("poll_interval"),
@@ -1216,10 +1423,9 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
               "backend goes <b>down</b> when prompts wait while nothing runs for <b>stuck after s</b> "
               "seconds. <b>auto_restart</b> then reboots the service via the ComfyUI-Manager "
               "extension (requires it installed + a systemd unit with <code>Restart=always</code>), "
-              "at most once per <b>restart cooldown s</b>. <b>self retries</b>: a connection-type "
-              "fault mid-job retries the <b>same</b> backend this many times (after waiting for "
-              "<code>/system_stats</code>) before failing over — for hosts with sporadic driver "
-              "faults. Blank/0 = fail over immediately; content errors are never retried.</p>"
+              "at most once per <b>restart cooldown s</b>. A mid-job connection fault is retried on "
+              "this same backend <b>self retries</b> times first — that field sits in the "
+              "<b>Behavior</b> tab.</p>"
             + "</div>"
             # Cloud-only options (Meshy, Tripo) — a cloud task API: no dirs, no watchdog,
             # no self-retry. The fields are named cloud_* because #comfyopts already
@@ -1237,57 +1443,9 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
                       f'{"" if k == cur_type else ";display:none"}">{m.BACKEND_HINT}</p>'
                       for k, m in adapters.CLOUD_MODULES.items())
             + "</div>"
-            # LLM-only options — hidden for comfyui (none of these apply to ComfyUI)
-            + f'<div id="llmopts" style="{"" if g("type", "openai") == "openai" else "display:none"}">'
-            + '<div class="grouphdr">LLM</div>'
-            + _field("discovery filters",
-                     _checkbox("chat_only", gb("chat_only"), "chat_only",
-                               "keep only models with type==chat (skip image/video/embedding)")
-                     + _checkbox("serverless_only", gb("serverless_only"), "serverless_only",
-                                 "keep only priced models (skip dedicated-only; OpenRouter :free)"))
-            + "<p class='hint'>Filters for cloud LLM catalogs (Together / OpenRouter); "
-              "backends whose models carry no type/pricing are unaffected.</p>"
-            + _field("list models under bare id",
-                     _checkbox("local", gb("local"), "local"))
-            + "<p class='hint'><b>local</b>: also list each of this backend's models under its plain "
-              "id (without the <code>backend/</code> prefix). Several local backends sharing a model id "
-              "then collapse into one entry the scheduler routes across (fastest free unpaid backend "
-              "first) with failover — an implicit "
-              "cross-backend alias.</p>"
-            + _field("prompt cache passthrough",
-                     _checkbox("prompt_cache", gb("prompt_cache"), "prompt_cache"))
-            + "<p class='hint'><b>prompt_cache</b>: keep Claude Code's cache breakpoints when this "
-              "backend serves <code>/v1/messages</code> (translated). Turn it on for <b>OpenRouter</b>, "
-              "which forwards them to Anthropic/Gemini models — without them the full context is billed "
-              "again every turn. Off by default: the breakpoints turn a message into a content-part list, "
-              "which a strict server may reject. Irrelevant for local models (no token billing) and for "
-              "OpenAI models (they cache automatically).</p>"
-            + _field("context windows",
-                     _textarea("model_context", g("model_context"), rows=3,
-                               placeholder="glm-*=32768\nqwen3.8-flash-next-ple4=131072"))
-            + "<p class='hint'><b>context windows</b>: one <code>model-glob=tokens</code> per line, "
-              "published as <code>context_length</code> in <code>/v1/models</code> — the number a "
-              "client (Oh My Pi, Hermes, OpenCode) sizes its prompts by; without one it assumes "
-              "128k and a 33k prompt to a 32k model 400s. A rule beats what discovery learned "
-              "(OpenRouter/Together <code>context_length</code>, vLLM <code>max_model_len</code>, "
-              "llama-server <code>n_ctx</code> — read through llama-swap for <b>loaded</b> models "
-              "only, and remembered). Write a rule for a llama-swap model that is rarely loaded, or "
-              "when the server's value is not what clients should use.</p>"
-            + f'<details class="optblock"{" open" if (b or {}).get("sampling_defaults") else ""}>'
-            + "<summary>Sampling defaults <span class='muted'>— used when the caller sends none"
-              "</span></summary>"
-            + _sampling_inputs((b or {}).get("sampling_defaults"))
-            + "<p class='hint'><b>sampling defaults</b>: values filled into every chat request to "
-              "this backend, for keys the caller did <b>not</b> send (an explicit client value — and an "
-              "alias default — always wins). For backends whose server samples with bare defaults: vLLM "
-              "without a truncation sampler (<code>top_p=1</code>, <code>min_p=0</code>) degenerates into "
-              "token salad at temperature ≈ 1. Re-derived per backend, so a failover uses the new "
-              "backend's values. Applies to chat/completions/responses only.</p>"
-            + "</details>"
-            + "</div>"
             # Anthropic-only options — the licence warning sits AT the credential field,
             # not in a footnote, because that is where the decision is made.
-            + f'<div id="anthopts" style="{"" if g("type", "openai") == "anthropic" else "display:none"}">'
+            + f'<div id="anthopts" style="{"" if cur_type == "anthropic" else "display:none"}">'
             + '<div class="grouphdr">Anthropic</div>'
             + "<p class='bad' style='margin:0 0 10px'><b>Licence boundary.</b> A Claude "
               "<b>subscription</b> token (<code>claude setup-token</code>) is licensed for your own use of "
@@ -1302,17 +1460,10 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
                 ("api_key", "api key — console.anthropic.com")],
                 g("auth_mode", "subscription")))
             + "<p class='hint' style='margin:-4px 0 10px'>Determines how the credential in <b>api key</b> "
-              "above is sent: <b>subscription</b> → <code>Authorization: Bearer</code> plus the OAuth beta "
-              "header; <b>api key</b> → <code>x-api-key</code>.</p>"
-            + _field("models", _inp("models", ", ".join((b or {}).get("models") or [])
-                                    if isinstance((b or {}).get("models"), list)
-                                    else g("models"),
-                                    placeholder="claude-sonnet-5, claude-opus-5"))
-            + "<p class='hint' style='margin:-4px 0 10px'>Comma-separated fallback model list. Discovery "
-              "asks <code>GET /v1/models</code> first; a subscription token is not guaranteed to be allowed "
-              "there, and this list keeps the backend usable when it isn't. Point a chat alias at one of "
-              "these ids, then run Claude Code with "
-              "<code>ANTHROPIC_BASE_URL=&lt;gateway&gt;</code>.</p>"
+              "(General tab) is sent: <b>subscription</b> → <code>Authorization: Bearer</code> plus the "
+              "OAuth beta header; <b>api key</b> → <code>x-api-key</code>. The model list this backend "
+              "falls back to lives in the <b>Models</b> tab.</p>"
+            + "</div>"
             + "</div></form>")
 
 
@@ -1333,6 +1484,14 @@ def _type_select(current: str) -> str:
     at discovery, pointing at the wrong thing. Anything else the operator typed (a
     self-hosted proxy) is never overwritten. `backend_save` applies the same rule.
 
+    Two mechanisms, because a type-specific block may sit in a shared tab: the four
+    historic blocks keep their ids (#llmopts / #comfyopts / #cloudopts / #anthopts), and
+    everything else declares `data-btype="<types>"` (space-separated; the token `cloud`
+    matches every cloud kind) — a block, not a pane, so `display` is all that changes and
+    every field stays submitted. The handler also renames the <type> tab button and hides
+    it for openai; _TABS_JS then re-applies the active tab (and falls back to General when
+    the tab that was open just disappeared).
+
     Every cloud kind comes from adapters.CLOUD_MODULES, so a new one appears here without
     touching this handler. ES5 only (var/function, no arrows): an inline attribute is
     never transpiled, and test_admin_live pins the console's JS to ES5."""
@@ -1351,6 +1510,15 @@ def _type_select(current: str) -> str:
             "if(a)a.style.display=t==='anthropic'?'':'none';"
             "Array.prototype.forEach.call(document.querySelectorAll('[data-cloud-hint]'),"
             "function(h){h.style.display=h.getAttribute('data-cloud-hint')===t?'':'none'});"
+            "Array.prototype.forEach.call(document.querySelectorAll('[data-btype]'),"
+            "function(h){var v=' '+(h.getAttribute('data-btype')||'')+' ';"
+            "h.style.display=(v.indexOf(' '+t+' ')>=0||(cloudUrls[t]&&v.indexOf(' cloud ')>=0))"
+            "?'':'none'});"
+            "var bt=document.getElementById('btab-type');"
+            "if(bt){var lb=t==='comfyui'?'ComfyUI':"
+            "(cloudUrls[t]?'Cloud task API':(t==='anthropic'?'Anthropic':''));"
+            "bt.textContent=lb;bt.style.display=lb?'':'none';"
+            "if(window.gwBackendTab)window.gwBackendTab();}"
             "if(cloudUrls[t]){if(u){var ow=!u.value;"
             "for(var k in cloudUrls){if(k!==t&&u.value===cloudUrls[k])ow=true}"
             "if(ow)u.value=cloudUrls[t]}"
@@ -1358,6 +1526,30 @@ def _type_select(current: str) -> str:
             "p.checked=true;p.disabled=true}}"
             "else if(p){p.disabled=false;if(p.dataset.was!==undefined){"
             "p.checked=p.dataset.was==='1';delete p.dataset.was}}\">" + opts + "</select>")
+
+
+def _filter_badge(mf) -> str:
+    """The `models_allow`/`models_deny` verdict as a badge, from the backend summary's
+    `models_filtered` = {kept, total} (present only where a filter is configured).
+
+    Two states, because they need different reactions: a filter that trimmed the list is
+    working as intended (discreet), while a filter that matched NOTHING leaves the
+    backend healthy, discovered and routing nothing at all — which no other signal in
+    this list shows. Absent/malformed key = nothing rendered: the summary comes from the
+    live gateway, which may not carry it yet."""
+    if not isinstance(mf, dict):
+        return ""
+    try:
+        kept, total = int(mf.get("kept")), int(mf.get("total"))
+    except (TypeError, ValueError):
+        return ""
+    if kept == 0:
+        return _badge("0 models — filter matches nothing", "bad",
+                      f"model whitelist/blacklist active: none of the {total} discovered "
+                      "models match — the backend stays healthy but routes nothing")
+    if kept < total:
+        return _badge(f"filtered {kept}/{total}", "muted", "model whitelist/blacklist active")
+    return ""
 
 
 def _bid(b: dict) -> str:
@@ -1396,6 +1588,10 @@ async def backends_page(request: Request):
             badge = _badge("⚠ executor stuck", "bad",
                            "ComfyUI answers HTTP but its executor is not draining the queue "
                            "— restart the service (⟳) or check the box/GPU")
+        # A model filter is invisible in every other signal: discovery succeeds, the
+        # backend stays healthy, and a filter that matches nothing leaves it routing
+        # NOTHING. The key exists only where a filter is configured (main puts it there).
+        badge += _filter_badge(b.get("models_filtered"))
         acts_list = [("✎", f"/ui/backends?edit={quote(bid)}", "secondary", "Edit")]
         if draining:
             acts_list.append(("↺", f"/ui/backends/undrain?id={quote(bid)}", "secondary",
@@ -1813,6 +2009,15 @@ async def backend_save(request: Request):
         b["model_context"] = mctx               # `glob=tokens` lines; parsed on every read
     else:
         b.pop("model_context", None)
+    # Model whitelist / blacklist: comma-separated globs, applied to the discovered model
+    # set of EVERY backend type (a ComfyUI checkpoint list included) — deliberately read
+    # here and not in the cloud branch below, which strips the ComfyUI-only keys.
+    for mk in ("models_allow", "models_deny"):
+        mv = (f.get(mk, "") or "").strip()
+        if mv:
+            b[mk] = mv
+        else:
+            b.pop(mk, None)                     # blank = no filter (never an empty glob)
     # boolean flags: checkbox present → True, absent → drop the key (= False)
     for flag in ("chat_only", "serverless_only", "local", "auto_restart",
                  "prompt_cache"):

@@ -263,6 +263,23 @@ sent. Busy state shows in `/health` and the **Input & Routing → Chat aliases**
 |---|---|
 | `chat_only` | keep only `type == "chat"` models (drops image/video/embedding). Understands Together's `type` and OpenRouter's `architecture.output_modalities`. Backends without those fields (llama-swap, vLLM) are unaffected — so **don't** set it on a backend whose embedding models you want routable. |
 | `serverless_only` | keep only models with non-zero pricing (Together's dedicated-only models are `0/0`; on OpenRouter this also drops `:free`). |
+| `models_allow` | keep only models matching one of these globs (comma-separated, or a YAML list): `models_allow: "gpt-*, claude-*"`. Empty/unset = no filter. |
+| `models_deny` | drop every model matching one of these globs, **after** `models_allow` — so deny wins, and `gpt-*` allow + `gpt-*-embed` deny is "all the GPTs except the embedders". Empty/unset = no filter. |
+
+`models_allow`/`models_deny` are glob-matched case-sensitively (an exact id is just a
+pattern without wildcards) and, unlike the two flags above, apply to **every** backend
+type — `openai`, `anthropic`, `comfyui`, `meshy`, `tripo` — because they narrow the
+discovered set itself. One source: `/v1/models`, routing, alias candidates and the
+Mapping tab's checkpoint dropdowns all see the filtered set. Edit them in the Backends
+tab under **Models**.
+
+A backend that filters reports `models_filtered: {kept, total}` in `/health`, and the
+Backends tab badges it — `filtered 3/6`, or the red `0 models — filter matches nothing`
+when the globs match none of the discovered ids. Without that badge a whitelist typo
+would leave the backend **healthy, discovered and routing nothing**, with every symptom
+pointing somewhere else. The numbers are what a discovery poll measured: a backend that
+has not polled successfully reports none at all, so an unreachable host is never blamed
+on its filter.
 
 ### Context windows (`context_length` in `/v1/models`)
 
@@ -272,7 +289,7 @@ their prompts by. Without it a client assumes a default (Oh My Pi: 128k) and a
 33k prompt to a 32k model comes back as a `400 exceed_context_size_error`. Two
 sources, in this order:
 
-1. **`model_context`** on the backend (Backends tab → *context windows*, or
+1. **`model_context`** on the backend (Backends tab → *Models* → *context windows*, or
    config): one `model-glob=tokens` per line, first match wins.
    ```yaml
    model_context: |
@@ -1114,7 +1131,7 @@ locked). Tabs:
 |---|---|
 | **Dashboard** | live per-backend status + in-flight, parked calls, media-job counts/recent, recent LLM calls |
 | **Server** | runtime + restart-required settings (API key, caps, park time/queue, `affinity_max_wait_s`, stats/jobs, TTL/prune) |
-| **Backends** | add/edit/remove backends (LLM, ComfyUI, Meshy, Tripo), incl. the `paid` cost tier; the **Hosts · GPU policy** panel below the list edits the per-box VRAM flags (see [Hosts & VRAM policy](#hosts--vram-policy)) |
+| **Backends** | add/edit/remove backends (LLM, ComfyUI, Meshy, Tripo), incl. the `paid` cost tier; the editor is split into **General** (name, type, url, host, cost tier, concurrency, credential), **Models** (whitelist/blacklist, discovery filters, bare-id listing, context windows), **Behavior** (prompt-cache passthrough, sampling defaults, self-retries) and one tab named after the type (**ComfyUI** / **Cloud task API** / **Anthropic**); the **Hosts · GPU policy** panel below the list edits the per-box VRAM flags (see [Hosts & VRAM policy](#hosts--vram-policy)) |
 | **Input & Routing** | sub-tabs **Input** (what clients can call — chat aliases, generation models, endpoints), **Chat aliases** (the live alias→backend map + alias/model collisions), **LLM models**, **Media aliases**, **Image models**, **LoRAs** — all searchable |
 | **Mapping** | register a ComfyUI workflow, wire its node mapping, pin values (a cloud alias — Meshy, Tripo — needs no workflow: one schema-driven editor renders its endpoint + option defaults instead); chat-alias editor (per-alias `park_s` + reasoning default) |
 | **Reasoning** | the normalized-thinking rule list (model glob × backend set → adapter) + test resolver |

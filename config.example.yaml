@@ -133,6 +133,12 @@ backends:
   #   api_key: "tgp_v1_…"               # https://api.together.xyz/settings/api-keys
   #   chat_only: true                   # skip image/video/embedding models
   #   serverless_only: true             # skip dedicated-endpoint-only models
+  #   models_allow: "meta-llama/*, Qwen/*"   # keep only these (globs, comma-separated
+  #                                     # or a YAML list); empty/unset = no filter
+  #   models_deny: "*-Embed*, *-Vision" # dropped AFTER models_allow — deny wins, so
+  #                                     # "all of X except Y" needs no enumeration.
+  #                                     # Works on every backend type (also comfyui/
+  #                                     # meshy/tripo); kept/total show in /health.
 
   # - name: openrouter                  # Cloud fallback (OpenAI-compatible)
   #   url: https://openrouter.ai/api    # NOTE: /api only — the gateway appends /v1/…

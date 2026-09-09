@@ -213,6 +213,36 @@ def model_context_for(backend: dict, model: str, learned: dict) -> Optional[int]
     return int(v) if isinstance(v, (int, float)) and v > 0 else None
 
 
+def parse_model_filter(value) -> list[str]:
+    """The backend's `models_allow` / `models_deny` patterns: a comma-separated string
+    OR an already-parsed list (config.yaml may write either). Entries are trimmed and
+    empty ones dropped, so a trailing comma or a stray space cannot become a pattern
+    that matches nothing (or, worse, everything)."""
+    items = value if isinstance(value, (list, tuple, set)) else str(value or "").split(",")
+    return [s for s in (str(x).strip() for x in items) if s]
+
+
+def filter_models(models: set[str], backend: dict) -> set[str]:
+    """Narrow a discovered model set by the backend's allow/deny globs.
+
+    Allow first: a non-empty `models_allow` keeps only ids matching at least one of
+    its patterns. Deny then removes every match of `models_deny`, so deny WINS over
+    allow — that ordering is what makes "all of `gpt-*` except `gpt-*-embed`"
+    expressible with two lines instead of an enumeration. Both empty/absent = no
+    filter, the set comes back unchanged. Matching is `fnmatch.fnmatchcase` (as in
+    model_context_for), so an exact id is just a pattern without wildcards, and the
+    case of the backend's own ids is respected."""
+    allow = parse_model_filter(backend.get("models_allow"))
+    deny = parse_model_filter(backend.get("models_deny"))
+    if not allow and not deny:
+        return models
+    out = {m for m in models
+           if not allow or any(fnmatch.fnmatchcase(m, p) for p in allow)}
+    if deny:
+        out = {m for m in out if not any(fnmatch.fnmatchcase(m, p) for p in deny)}
+    return out
+
+
 def _is_chat_model(m: dict) -> bool:
     """True unless the model is clearly not chat-completions routable.
 

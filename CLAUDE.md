@@ -31,7 +31,7 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
   restart for backend/alias changes. Read **only at startup**:
   `stats.enabled` and the stats/jobs DB paths.
 - **No linter or build step, and no blanket test suite** — only targeted stdlib
-  `unittest` files for the mechanisms that fail SILENTLY (see the twenty-four listed under
+  `unittest` files for the mechanisms that fail SILENTLY (see the twenty-six listed under
   `anthropic_bridge.py`): `venv/bin/python -m unittest discover -s tests -t .`.
   Everything else is verified by running the server and hitting endpoints with
   `curl` (README "Try it"), `curl localhost:4000/health` for a routing snapshot, or
@@ -467,7 +467,22 @@ they need via injected callables, staying hot-reload-safe.
   `display` style and would ignore an active filter; the sort hook also `wire()`s
   every sortable table, since a table the morph INSERTS mid-session never went through
   the load-time binding and would otherwise ignore header clicks until a
-  real reload. This replaced four `<meta http-equiv="refresh">` pages (Dashboard,
+  real reload. The BACKEND-FORM TAB hook (`_TABS_JS`, `window.gwBackendTab`) is there
+  for the same reason: `_backend_form` is ONE form in four panes — General | Models |
+  Behavior | &lt;type&gt; — of which only `display` is ever switched, because a pane
+  rendered conditionally would drop its inputs from the POST and `backend_save` reads
+  absent as CLEARED (switching tabs would wipe what the other tabs hold). The server
+  always renders General, so the morph would reset the operator's tab every tick; the
+  choice lives in `sessionStorage` plus a module variable (a browser refusing site data
+  makes every read throw and a store-only version would look dead) and the hook
+  re-applies it. `_TABS_JS` is emitted by `_page()` for EVERY view, not from the form's
+  own markup, because the morph never INSERTS a `<script>`. Type-specific blocks keep
+  their four historic ids (`#llmopts`/`#comfyopts`/`#cloudopts`/`#anthopts`, pinned by
+  `test_cloud_editor.py`) and newer ones inside a shared pane declare
+  `data-btype="<types>"` (token `cloud` = every cloud kind); `_type_select`'s handler
+  drives both, renames the &lt;type&gt; tab and hides it for openai, and the hook then
+  falls back to General when the tab that was open just disappeared.
+  `test_backend_form_tabs.py`. This replaced four `<meta http-equiv="refresh">` pages (Dashboard,
   Media Jobs, Job detail, Backends while draining) and both hand-rolled fragment
   pollers: `_PG_POLL_JS` + `/ui/playground/status/{job_id}` (the media playground's
   result column — the dirty-input rule is what keeps the form editable now) and
@@ -535,7 +550,7 @@ they need via injected callables, staying hot-reload-safe.
   silently answer about content the model never saw (documents/PDFs). Covered by
   `test_anthropic_bridge.py` (stdlib `unittest` — a streaming tool-call bridge fails
   silently rather than crashing). `ls tests/test_*.py` is the count of record —
-  **twenty-four** files today — and each exists for that same reason: the mechanism it
+  **twenty-six** files today — and each exists for that same reason: the mechanism it
   guards fails SILENTLY, so it is named next to that mechanism above.
   `test_anthropic_bridge.py`, `test_prune_branch.py` (a
   dead-branch prune that cascades one node too far or too few surfaces as an aborted
@@ -595,6 +610,21 @@ they need via injected callables, staying hot-reload-safe.
   loads an unloaded model or writes the store would be a side effect nobody asked
   for — so it pins address derivation, the cap, every fingerprint branch, the
   registered match, one real-socket sweep, the status snapshot and both renderers).
+  Newest are the two the per-backend model filter brought:
+  `test_model_filter.py` (the allow/deny globs: a whitelist is one typo away from
+  matching nothing, and a backend narrowed to zero models stays UP, answers
+  `/v1/models` with an empty list and reports no error — every symptom then points
+  elsewhere, an alias with no candidates reading as "all backends busy". It pins the
+  pure rule, `refresh_backend` applying it to the set the rest of the gateway reads,
+  and the two reporting rules: a backend that never polled reports NO counts — deriving
+  `(0, 0)` from its empty set blames the filter for an unreachable host — while the
+  summary carries the globs themselves, because the editor pre-fills a config-defined
+  backend from there and a field it omits comes back blank on the next Save);
+  `test_backend_form_tabs.py` (the backend form's four tabs: a field lost or duplicated
+  while re-sorting the panes is invisible in the HTML and silently CLEARS or overwrites
+  its stored value on the next Save, and a pane without a button is unreachable in the
+  browser without anything erroring. It derives the field list from `backend_save` by
+  AST — so a field added there and forgotten in the form fails the test, not production).
   And one guards the project's own NAME (`test_project_name.py`): a stale mention of the
   pre-rename name left in `deploy.sh` points a deploy at a path that no longer exists, in
   `ai-hub.service` at a `WorkingDirectory` that is gone, in the README at a clone URL that
@@ -842,6 +872,21 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   `backend_models`). A bare id or alias publishes the MINIMUM over its backends.
   Unknown = absent, never 0. Clients that find none assume a default (Oh My Pi 128k)
   and their over-long prompts 400 at the backend — `test_context_length.py`.
+- **Per-backend model allow/deny** (`models_allow` / `models_deny`, comma-separated
+  globs): `adapters.filter_models` narrows what discovery found — allow first (empty =
+  keep all), then deny removes from the rest, so DENY WINS and "`gpt-*` except
+  `gpt-*-embed`" is two lines instead of an enumeration. Applied in
+  `main.refresh_backend` on `caps.models`, NOT in `extract_models` (that is the openai
+  path only): so it holds for every backend type — a ComfyUI backend's checkpoint list
+  shortens by the same two knobs — and it runs BEFORE the `changed` compare, the persist
+  and `rebuild_route_index()`, so `/v1/models`, routing, alias candidates and the Mapping
+  dropdowns all read the one filtered set. The filter is otherwise INVISIBLE (a typo'd
+  whitelist leaves the backend healthy and routing nothing, and every symptom points
+  elsewhere), so `backend_model_counts` records what each poll measured and
+  `_model_filter_info` publishes `models_filtered: {kept, total}` to `/health` + the
+  Backends tab, which badges `filtered 3/6` and, at zero, `0 models — filter matches
+  nothing`. A backend that never polled publishes NOTHING — `(0, 0)` derived from an
+  empty set would badge an unreachable host as a filter mistake. `test_model_filter.py`.
 - **Allow-list filtering**: `/v1/models` authenticates the caller and filters by
   their allow-list (entries may be aliases, model ids, or **backend names** =
   all that backend's models); image aliases are included; `?type=chat|image`.

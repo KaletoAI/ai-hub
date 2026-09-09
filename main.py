@@ -206,6 +206,10 @@ backend_healthy: dict[str, bool] = {}                          # name → bool
 backend_error: dict[str, dict] = {}                            # bid → why discovery failed (see _classify_error)
 backend_pricing: dict[str, dict[str, dict[str, float]]] = {}   # name → {model_id → {input, output}}
 backend_loras: dict[str, set[str]] = {}                        # id → {lora filename, ...} (ComfyUI)
+# bid → (kept, total) of the last discovery poll, when the backend carries an
+# allow/deny model filter. A whitelist typo would otherwise leave the backend healthy
+# and serving 0 models with nothing anywhere saying why — so the counts are reported.
+backend_model_counts: dict[str, tuple[int, int]] = {}
 # id → {model_id → context window (tokens)} as LEARNED by discovery (persisted, merged —
 # a llama-swap model says its n_ctx only while loaded). The admin's per-backend
 # `model_context` rules sit above this; adapters.model_context_for() resolves both.
@@ -650,6 +654,14 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
     _probing.add(bid)
     try:
         caps = await adapter.discover(client)
+        # The admin's allow/deny globs narrow the discovered set HERE — type-neutrally
+        # (extract_models is the openai path only) and BEFORE `changed`, the persist and
+        # the route-index rebuild, so /v1/models, routing, alias candidates and the
+        # ComfyUI checkpoint dropdowns all read the one filtered set.
+        total = len(caps.models)
+        caps.models = adapters.filter_models(caps.models, backend)
+        filtered = len(caps.models) != total
+        backend_model_counts[bid] = (len(caps.models), total)
         changed = caps.models != backend_models.get(bid)
         if changed and store.is_active():
             await asyncio.to_thread(store.save_backend_models, bid, caps.models)  # persist on change
@@ -666,6 +678,8 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
         was_healthy = backend_healthy.get(bid, False)
         if not was_healthy:
             logger.info(f"[{label}] UP  — {len(caps.models)} models, {len(caps.pricing)} priced")
+        if filtered and (not was_healthy or changed):   # same cadence as the UP log — never every poll
+            logger.info(f"[{label}] model filter — {len(caps.models)} of {total} models kept")
         backend_healthy[bid] = True
         backend_error.pop(bid, None)
         if not was_healthy or changed:     # a backend came online / gained models →
@@ -744,6 +758,7 @@ def reload_config() -> None:
         backend_models.pop(stale, None)
         backend_pricing.pop(stale, None)
         backend_loras.pop(stale, None)
+        backend_model_counts.pop(stale, None)
         backend_inflight.pop(stale, None)
         logger.info(f"  removed backend [{stale}] — state cleared")
     build_backend_adapters()       # rebind adapters to the new backend dicts
@@ -4390,6 +4405,33 @@ def _comfy_watch_info(b: dict) -> dict:
     return info
 
 
+def _model_filter_info(b: dict) -> dict:
+    """`{"models_filtered": {"kept": k, "total": t}}` for a backend that carries an
+    allow/deny model filter, `{}` for every other one — so the absent key means "no
+    filter configured", not "filtered nothing away".
+
+    Reported because the filter is otherwise INVISIBLE: a typo in `models_allow`
+    leaves the backend healthy, discovered and empty, and every downstream symptom
+    (an alias with no candidates, a model missing from /v1/models) points somewhere
+    else. `kept`/`total` are the numbers a discovery poll actually MEASURED.
+
+    A backend that never polled successfully therefore reports nothing at all —
+    deriving `(0, 0)` from the empty model set puts "filter matches nothing" next to
+    an UNREACHABLE backend and blames the filter for a dead host (measured 2026-09-09
+    on a fresh instance: a down backend carrying a filter showed exactly that badge).
+    One that polled and went down afterwards keeps its last measured numbers, which
+    stay true."""
+    bid = backend_id(b)
+    if not (adapters.parse_model_filter(b.get("models_allow"))
+            or adapters.parse_model_filter(b.get("models_deny"))):
+        return {}
+    counts = backend_model_counts.get(bid)
+    if counts is None:
+        return {}                    # never polled — there is no measurement to report
+    kept, total = counts
+    return {"models_filtered": {"kept": int(kept), "total": int(total)}}
+
+
 def _cloud_info(b: dict) -> dict:
     """Credit balance seen at the last discovery of a cloud backend (Meshy, Tripo), plus
     the same rolling fail-rate the comfy backends carry (merged into /health + the UI
@@ -4481,10 +4523,18 @@ def gateway_info() -> dict:
             "chat_only": bool(b.get("chat_only")), "serverless_only": bool(b.get("serverless_only")),
             "local": bool(b.get("local")), "paid": bool(b.get("paid")),
             "sampling_defaults": b.get("sampling_defaults") or None,
+            # The filter globs themselves, not just the resulting counts: the backend
+            # editor falls back to THIS summary for a config-defined backend (nothing in
+            # the store yet), and a field the summary omits renders blank — the next Save
+            # would then write that blank back and drop the filter without a word.
+            # Joined through the parser, so config.yaml's YAML-list form arrives as the
+            # comma string the editor's text input expects (never "['gpt-*']").
+            "models_allow": ", ".join(adapters.parse_model_filter(b.get("models_allow"))),
+            "models_deny": ", ".join(adapters.parse_model_filter(b.get("models_deny"))),
             "host": backend_hosts.get(backend_id(b), ""),
             "host_explicit": bool((b.get("host") or "").strip()),
             "source": "config" if backend_id(b) in config_ids else "ui",
-            **_comfy_watch_info(b), **_cloud_info(b),
+            **_comfy_watch_info(b), **_cloud_info(b), **_model_filter_info(b),
         } for b in backends],
         "virtual_models": list(virtual_models.keys()),
         "endpoints": ["/v1/chat/completions", "/v1/completions", "/v1/embeddings",
@@ -4758,7 +4808,7 @@ async def health():
                 "tps": round(backend_tps.get(backend_id(b), 0.0), 1),
                 "sampling_defaults": b.get("sampling_defaults") or None,
                 "models": sorted(backend_models.get(backend_id(b), set())) if is_enabled(b) else [],
-                **_comfy_watch_info(b), **_cloud_info(b),
+                **_comfy_watch_info(b), **_cloud_info(b), **_model_filter_info(b),
             }
             for b in backends
         },
