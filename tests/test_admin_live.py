@@ -453,5 +453,46 @@ class VoiceUploadProgressIsConsumed(unittest.TestCase):
         self.assertIn("lib:new", html)
 
 
+class DatalistSuggestions(unittest.TestCase):
+    """What the console OFFERS in a model field, and what it must not.
+
+    Both failures are silent in the browser. A datalist input without
+    `autocomplete="off"` has the browser's own form history appended to the popup,
+    so a model id the gateway never proposed — one no backend serves, or one
+    belonging to a different backend than the selected one — appears as a
+    suggestion and reads as a routing bug. And a backend whose discovered set is
+    EMPTY (its `models_allow` globs match nothing) must still narrow the list to
+    nothing rather than fall back to every model on every backend, which is the
+    same lie from the other direction."""
+
+    def setUp(self):
+        self._llm, self._gi = admin._llm_backends, admin._gateway_info
+        admin._llm_backends = lambda: [
+            {"name": "npu-strix", "type": "openai", "enabled": True, "models": []},
+            {"name": "llamaswap-strix", "type": "openai", "enabled": True,
+             "models": ["qwen3.5-9b-heretic", "qwen3.5-9b-heretic-thinking"]},
+        ]
+        admin._gateway_info = lambda: {"virtual_models": []}
+
+    def tearDown(self):
+        admin._llm_backends, admin._gateway_info = self._llm, self._gi
+
+    def test_model_input_disables_browser_form_history(self):
+        self.assertIn('autocomplete="off"', admin._dl_input("model", "", "cpmodels"))
+
+    def test_picking_a_backend_narrows_the_rendered_datalist(self):
+        html = admin._chatplay_form({"backend": "llamaswap-strix"})
+        dl = html.split('<datalist id="cpmodels"')[1].split("</datalist>")[0]
+        self.assertIn("qwen3.5-9b-heretic-thinking", dl)
+        self.assertNotIn("llamaswap-strix/", dl)     # bare ids only for a pinned backend
+
+    def test_a_backend_filtered_to_zero_models_offers_nothing(self):
+        html = admin._chatplay_form({"backend": "npu-strix"})
+        dl = html.split('<datalist id="cpmodels"')[1].split("</datalist>")[0]
+        self.assertNotIn("<option", dl)
+        # …and the client-side filter agrees, rather than falling back to CP_ALL.
+        self.assertIn('"npu-strix": []', html.replace('"npu-strix":[]', '"npu-strix": []'))
+
+
 if __name__ == "__main__":
     unittest.main()
