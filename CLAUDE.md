@@ -887,6 +887,29 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   Backends tab, which badges `filtered 3/6` and, at zero, `0 models — filter matches
   nothing`. A backend that never polled publishes NOTHING — `(0, 0)` derived from an
   empty set would badge an unreachable host as a filter mistake. `test_model_filter.py`.
+- **Per-backend extra models** (`models_extra`, comma-separated EXACT ids, no globs —
+  there is nothing for a pattern to expand against when discovery never saw the name):
+  `adapters.add_model_extras` is the one knob that ADDS to the discovered set, because a
+  filter can only ever subtract and routing checks `real in backend_models[bid]` in three
+  places — so a model the backend SERVES but does not LIST is unreachable by every name,
+  alias and `backend/model` prefix alike. Measured 2026-09-11 on npu-strix: FastFlowLM
+  answers `/v1/embeddings` (768-dim, and it IGNORES the `model` field — three different
+  names return the identical vector) and `/v1/audio/transcriptions` while `/v1/models`
+  and `/api/tags` return the 36 chat models only, so its Embedding-Gemma and
+  Whisper-V3-Turbo simply did not exist for the gateway; that also makes the whisper
+  model `_whisper_route()` looks for reachable, moving voice-reference transcription off
+  the gateway's CPU faster-whisper. Applied in `main.refresh_backend` right AFTER
+  `filter_models` and AFTER `backend_model_counts` is written: after the filter so a
+  narrow whitelist cannot take the extras straight back out (otherwise the two knobs
+  would have to be kept in sync), after the counts so `kept/total` keeps describing what
+  the filter did to what the poll MEASURED. Only a SUCCESSFUL poll publishes them — an
+  unreachable backend advertising a model is a 503 waiting to happen. The verdict is
+  `models_added: [ids]` in `/health` + the Backends tab (`+2 listed manually`),
+  deliberately NOT named `models_extra`: that key carries the config string for the
+  editor to pre-fill, and one key cannot be both (the form needs the string always, the
+  badge needs the measurement only when there is one). A typo'd id fails the other way
+  round from a filter typo — it routes, looks healthy, and dies at the backend.
+  `test_model_filter.py`.
 - **Allow-list filtering**: `/v1/models` authenticates the caller and filters by
   their allow-list (entries may be aliases, model ids, or **backend names** =
   all that backend's models); image aliases are included; `?type=chat|image`.

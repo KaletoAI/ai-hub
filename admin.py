@@ -1292,6 +1292,8 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
                      placeholder="gpt-*, claude-*"))
             + _field("model blacklist", _inp("models_deny", g("models_deny"),
                      placeholder="*-embed, *:free"))
+            + _field("extra models", _inp("models_extra", g("models_extra"),
+                     placeholder="Whisper-V3-Turbo-NPU2, Embedding-Gemma-300M-NPU2"))
             + "<p class='hint'><b>model whitelist / blacklist</b>: comma-separated globs "
               "(<code>*</code>, <code>?</code>; an exact id works the same) applied to what discovery "
               "finds, for <b>every</b> backend type — on a ComfyUI backend they shorten the checkpoint "
@@ -1299,6 +1301,13 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
               "blacklist removes from what is left, so the blacklist wins. Blank = no filter. A filter "
               "that matches nothing leaves the backend <b>healthy with no models at all</b> — the "
               "backend list therefore shows how many models are left.</p>"
+            + "<p class='hint'><b>extra models</b>: comma-separated <b>exact</b> ids (no globs) that "
+              "this backend serves but does not list. Some servers publish their chat models only "
+              "while still answering <code>/v1/embeddings</code> or "
+              "<code>/v1/audio/transcriptions</code> — an unlisted model is unroutable by any name, "
+              "and the whitelist cannot bring it back, because it only ever subtracts. Added after "
+              "the filter, and only once discovery has succeeded. A typo here is silent: the id "
+              "routes, and the backend rejects it.</p>"
             + f'<div id="llmopts" style="{"" if cur_type == "openai" else "display:none"}">'
             + '<div class="grouphdr">LLM</div>'
             + _field("discovery filters",
@@ -1552,6 +1561,23 @@ def _filter_badge(mf) -> str:
     return ""
 
 
+def _extras_badge(ids) -> str:
+    """The summary's `models_added` as a badge — the ids `models_extra` actually put
+    into the routing table, added by hand because the backend serves them without
+    listing them. (The config string itself travels as `models_extra`, for the form.)
+
+    Rendered because the addition is as invisible as the filter and fails the same
+    silent way from the other side: a typo'd id stays in the routing table forever,
+    healthy-looking, and every call to it dies at the backend with a model error that
+    names the gateway's own configuration nowhere. Seeing the exact strings in the
+    backend list is what makes that a five-second check."""
+    if not isinstance(ids, (list, tuple)) or not ids:
+        return ""
+    names = ", ".join(str(x) for x in ids)
+    return _badge(f"+{len(ids)} listed manually", "muted",
+                  f"models_extra (served but not listed by the backend): {names}")
+
+
 def _bid(b: dict) -> str:
     """Stable backend id = type:name (so LLM + ComfyUI may share a name)."""
     return f'{b.get("type", "openai")}:{b["name"]}'
@@ -1592,6 +1618,7 @@ async def backends_page(request: Request):
         # backend stays healthy, and a filter that matches nothing leaves it routing
         # NOTHING. The key exists only where a filter is configured (main puts it there).
         badge += _filter_badge(b.get("models_filtered"))
+        badge += _extras_badge(b.get("models_added"))
         acts_list = [("✎", f"/ui/backends?edit={quote(bid)}", "secondary", "Edit")]
         if draining:
             acts_list.append(("↺", f"/ui/backends/undrain?id={quote(bid)}", "secondary",
@@ -2009,10 +2036,11 @@ async def backend_save(request: Request):
         b["model_context"] = mctx               # `glob=tokens` lines; parsed on every read
     else:
         b.pop("model_context", None)
-    # Model whitelist / blacklist: comma-separated globs, applied to the discovered model
-    # set of EVERY backend type (a ComfyUI checkpoint list included) — deliberately read
-    # here and not in the cloud branch below, which strips the ComfyUI-only keys.
-    for mk in ("models_allow", "models_deny"):
+    # Model whitelist / blacklist (globs, subtract) and the extra-model list (exact ids,
+    # add), all applied to the discovered model set of EVERY backend type (a ComfyUI
+    # checkpoint list included) — deliberately read here and not in the cloud branch
+    # below, which strips the ComfyUI-only keys.
+    for mk in ("models_allow", "models_deny", "models_extra"):
         mv = (f.get(mk, "") or "").strip()
         if mv:
             b[mk] = mv
