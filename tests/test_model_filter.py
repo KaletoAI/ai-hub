@@ -200,5 +200,101 @@ class RefreshBackendApplies(unittest.TestCase):
         self.assertEqual(main.backend_model_counts[bid], (1, 2))
 
 
+class AddModelExtras(unittest.TestCase):
+    """The pure rule for `models_extra` — the knob that ADDS."""
+
+    def test_no_extras_returns_the_set_unchanged(self):
+        ms = {"a", "b"}
+        self.assertIs(adapters.add_model_extras(ms, {}), ms)
+        self.assertIs(adapters.add_model_extras(ms, {"models_extra": ""}), ms)
+        self.assertIs(adapters.add_model_extras(ms, {"models_extra": " , "}), ms)
+
+    def test_ids_are_added(self):
+        self.assertEqual(adapters.add_model_extras({"a"}, {"models_extra": "b, c"}),
+                         {"a", "b", "c"})
+
+    def test_a_list_from_yaml_is_accepted(self):
+        self.assertEqual(adapters.add_model_extras({"a"}, {"models_extra": ["b"]}), {"a", "b"})
+
+    def test_an_id_discovery_already_found_changes_nothing(self):
+        self.assertEqual(adapters.add_model_extras({"a", "b"}, {"models_extra": "b"}), {"a", "b"})
+
+    def test_the_input_set_is_not_mutated(self):
+        ms = {"a"}
+        adapters.add_model_extras(ms, {"models_extra": "b"})
+        self.assertEqual(ms, {"a"})
+
+
+class RefreshBackendAddsExtras(RefreshBackendApplies):
+    """`models_extra` through refresh_backend — where it has to be ROUTABLE.
+
+    Why this needs pinning: routing checks `real in backend_models[bid]` in three
+    places, so a model the backend serves but does not list is unreachable by every
+    name — and no whitelist can bring it back, because a filter only subtracts. That
+    is the whole point of the knob, and it is also how it breaks: added in the wrong
+    ORDER it is filtered straight back out, and counted into `kept/total` it makes the
+    console's filter badge report a number no poll measured.
+    """
+
+    def test_an_unlisted_model_becomes_routable(self):
+        b = {"name": "npu", "type": "openai", "url": "http://npu", "enabled": True,
+             "models_extra": "whisper-v3-turbo"}
+        bid = self._run(b, {"qwen3:4b"})
+        self.assertEqual(main.backend_models[bid], {"qwen3:4b", "whisper-v3-turbo"})
+        ready, _busy = main.resolve_routes("whisper-v3-turbo")
+        self.assertEqual([(bk["name"], real) for bk, real in ready], [("npu", "whisper-v3-turbo")])
+
+    def test_extras_survive_a_whitelist_that_excludes_them(self):
+        # The order is the contract: filter first, add second. Reversed, the operator
+        # would have to repeat every extra id in models_allow to keep it — two knobs
+        # kept in sync for nothing, and silently losing the model when they drift.
+        b = {"name": "npu", "type": "openai", "url": "http://npu", "enabled": True,
+             "models_allow": "qwen3*", "models_extra": "Whisper-V3-Turbo-NPU2"}
+        bid = self._run(b, {"qwen3:4b", "gemma3:1b"})
+        self.assertEqual(main.backend_models[bid], {"qwen3:4b", "Whisper-V3-Turbo-NPU2"})
+
+    def test_extras_are_not_counted_into_the_filter_verdict(self):
+        # kept/total describes what the FILTER did to what discovery MEASURED. Counting
+        # an addition into it would report a total no poll ever saw, and could even hide
+        # a whitelist matching nothing behind a non-zero `kept`.
+        b = {"name": "npu", "type": "openai", "url": "http://npu", "enabled": True,
+             "models_allow": "qwen3*", "models_extra": "whisper"}
+        bid = self._run(b, {"qwen3:4b", "gemma3:1b"})
+        self.assertEqual(main.backend_model_counts[bid], (1, 2))
+        self.assertEqual(main._model_filter_info(b),
+                         {"models_filtered": {"kept": 1, "total": 2}, "models_added": ["whisper"]})
+
+    def test_extras_alone_report_only_themselves(self):
+        b = {"name": "npu", "type": "openai", "url": "http://npu", "enabled": True,
+             "models_extra": "whisper, embed"}
+        self._run(b, {"qwen3:4b"})
+        self.assertEqual(main._model_filter_info(b), {"models_added": ["whisper", "embed"]})
+
+    def test_a_never_polled_backend_publishes_no_extras(self):
+        # An unreachable backend must not offer a model: refresh_backend adds the ids
+        # only on a successful poll, so the report has to follow the same rule or the
+        # console would list models every call fails on.
+        b = {"name": "npu", "type": "openai", "url": "http://npu", "enabled": True,
+             "models_extra": "whisper"}
+        self.assertEqual(main._model_filter_info(b), {})
+        self.assertEqual(main.backend_models.get(main.backend_id(b)), None)
+
+    def test_summary_carries_the_extras_for_the_editor(self):
+        # Same reason as the globs: the editor pre-fills a config-defined backend from
+        # this summary, and a field it omits comes back blank on the next Save.
+        b = {"name": "npu", "type": "openai", "url": "http://npu", "enabled": True,
+             "models_extra": ["whisper", " embed "]}
+        self._run(b, {"qwen3:4b"})
+        row = next(r for r in main.gateway_info()["backends"] if r["name"] == "npu")
+        self.assertEqual(row["models_extra"], "whisper, embed")      # config string, for the form
+        self.assertEqual(row["models_added"], ["whisper", "embed"])  # verdict, for the badge
+
+    def test_applies_to_non_openai_types_too(self):
+        b = {"name": "gpu", "type": "comfyui", "url": "http://gpu", "enabled": True,
+             "models_extra": "hidden.safetensors"}
+        bid = self._run(b, {"sd15.ckpt"})
+        self.assertEqual(main.backend_models[bid], {"sd15.ckpt", "hidden.safetensors"})
+
+
 if __name__ == "__main__":
     unittest.main()

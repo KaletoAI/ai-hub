@@ -662,6 +662,15 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
         caps.models = adapters.filter_models(caps.models, backend)
         filtered = len(caps.models) != total
         backend_model_counts[bid] = (len(caps.models), total)
+        # `models_extra` goes the other way — ids the backend SERVES but does not LIST
+        # (FastFlowLM answers /v1/embeddings and /v1/audio/transcriptions while listing
+        # chat models only). Added AFTER the filter so a narrow whitelist cannot remove
+        # them again, and after the counts so `kept/total` keeps describing what the
+        # filter did to what discovery MEASURED. Here and not in the adapter: like the
+        # filter it must hold for every backend type, and only a successful poll may
+        # publish them — an unreachable backend offering a model is a 503 waiting to
+        # happen.
+        caps.models = adapters.add_model_extras(caps.models, backend)
         changed = caps.models != backend_models.get(bid)
         if changed and store.is_active():
             await asyncio.to_thread(store.save_backend_models, bid, caps.models)  # persist on change
@@ -4406,9 +4415,16 @@ def _comfy_watch_info(b: dict) -> dict:
 
 
 def _model_filter_info(b: dict) -> dict:
-    """`{"models_filtered": {"kept": k, "total": t}}` for a backend that carries an
-    allow/deny model filter, `{}` for every other one — so the absent key means "no
-    filter configured", not "filtered nothing away".
+    """What the two model-set knobs did: `{"models_filtered": {"kept": k, "total": t}}`
+    for a backend carrying an allow/deny filter, `{"models_added": [ids]}` for one
+    carrying manual additions, `{}` for a backend with neither — so an absent key means
+    "not configured", not "changed nothing".
+
+    Both are VERDICTS, reported only where a poll has happened, and named apart from
+    the config fields they come from (`models_allow`/`models_deny`/`models_extra`,
+    which this same summary carries verbatim for the editor to pre-fill). One key
+    cannot be both: the form needs the comma string always, the badge needs the
+    measurement only when there is one.
 
     Reported because the filter is otherwise INVISIBLE: a typo in `models_allow`
     leaves the backend healthy, discovered and empty, and every downstream symptom
@@ -4422,14 +4438,21 @@ def _model_filter_info(b: dict) -> dict:
     One that polled and went down afterwards keeps its last measured numbers, which
     stay true."""
     bid = backend_id(b)
-    if not (adapters.parse_model_filter(b.get("models_allow"))
-            or adapters.parse_model_filter(b.get("models_deny"))):
-        return {}
     counts = backend_model_counts.get(bid)
     if counts is None:
         return {}                    # never polled — there is no measurement to report
-    kept, total = counts
-    return {"models_filtered": {"kept": int(kept), "total": int(total)}}
+    out: dict = {}
+    if (adapters.parse_model_filter(b.get("models_allow"))
+            or adapters.parse_model_filter(b.get("models_deny"))):
+        kept, total = counts
+        out["models_filtered"] = {"kept": int(kept), "total": int(total)}
+    # `models_extra` is reported under the same never-polled rule, for a reason of its
+    # own: refresh_backend adds these ids only where discovery SUCCEEDED, so announcing
+    # them for a backend that has never answered would list models nothing can serve.
+    extra = adapters.parse_model_filter(b.get("models_extra"))
+    if extra:
+        out["models_added"] = extra
+    return out
 
 
 def _cloud_info(b: dict) -> dict:
@@ -4531,6 +4554,7 @@ def gateway_info() -> dict:
             # comma string the editor's text input expects (never "['gpt-*']").
             "models_allow": ", ".join(adapters.parse_model_filter(b.get("models_allow"))),
             "models_deny": ", ".join(adapters.parse_model_filter(b.get("models_deny"))),
+            "models_extra": ", ".join(adapters.parse_model_filter(b.get("models_extra"))),
             "host": backend_hosts.get(backend_id(b), ""),
             "host_explicit": bool((b.get("host") or "").strip()),
             "source": "config" if backend_id(b) in config_ids else "ui",

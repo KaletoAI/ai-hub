@@ -243,6 +243,30 @@ def filter_models(models: set[str], backend: dict) -> set[str]:
     return out
 
 
+def add_model_extras(models: set[str], backend: dict) -> set[str]:
+    """Add the backend's `models_extra` ids to a discovered set.
+
+    The counterpart of `filter_models`, which can only ever NARROW what discovery
+    found. Some backends serve a model they do not list: FastFlowLM (the NPU box)
+    answers `/v1/embeddings` and `/v1/audio/transcriptions` while `/v1/models` and
+    `/api/tags` return the chat models only — so the embedding and whisper models are
+    reachable but, to the gateway, do not exist. Routing checks `real in
+    backend_models[bid]` in three places, so an unlisted model is unroutable by any
+    name, alias or `backend/model` prefix included; no whitelist can bring it back,
+    because a filter subtracts.
+
+    Entries are EXACT ids, never globs — there is nothing for a pattern to expand
+    against when the point is that discovery never saw the name. They are added AFTER
+    filter_models, so a narrow whitelist cannot take them straight back out (the two
+    knobs would otherwise have to be kept in sync for no reason).
+
+    It is applied only where discovery SUCCEEDED (see `main.refresh_backend`): a
+    backend that is unreachable must not publish models the caller can only fail on.
+    """
+    extra = parse_model_filter(backend.get("models_extra"))
+    return (models | set(extra)) if extra else models
+
+
 def _is_chat_model(m: dict) -> bool:
     """True unless the model is clearly not chat-completions routable.
 

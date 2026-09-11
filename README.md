@@ -265,6 +265,7 @@ sent. Busy state shows in `/health` and the **Input & Routing → Chat aliases**
 | `serverless_only` | keep only models with non-zero pricing (Together's dedicated-only models are `0/0`; on OpenRouter this also drops `:free`). |
 | `models_allow` | keep only models matching one of these globs (comma-separated, or a YAML list): `models_allow: "gpt-*, claude-*"`. Empty/unset = no filter. |
 | `models_deny` | drop every model matching one of these globs, **after** `models_allow` — so deny wins, and `gpt-*` allow + `gpt-*-embed` deny is "all the GPTs except the embedders". Empty/unset = no filter. |
+| `models_extra` | **exact** ids (no globs) this backend serves but does not list, added to the discovered set: `models_extra: "Whisper-V3-Turbo-NPU2"`. Applied last, so a narrow `models_allow` can't take them back out. Empty/unset = nothing added. |
 
 `models_allow`/`models_deny` are glob-matched case-sensitively (an exact id is just a
 pattern without wildcards) and, unlike the two flags above, apply to **every** backend
@@ -280,6 +281,18 @@ would leave the backend **healthy, discovered and routing nothing**, with every 
 pointing somewhere else. The numbers are what a discovery poll measured: a backend that
 has not polled successfully reports none at all, so an unreachable host is never blamed
 on its filter.
+
+`models_extra` is the one knob that goes the other way. Some servers serve more than
+they publish: FastFlowLM (an AMD NPU box) answers `/v1/embeddings` and
+`/v1/audio/transcriptions` while `/v1/models` lists its chat models only — so its
+embedding and whisper models are reachable but, to the gateway, do not exist, and no
+whitelist can bring them back because a filter only ever subtracts. List the exact ids
+here and they join the discovered set: routable by alias, by bare id and by
+`backend/model`, and eligible as the whisper fallback for voice-reference
+transcription. They are added only once discovery has SUCCEEDED, so an unreachable
+backend never advertises a model. `/health` reports them as `models_added: [ids]` and
+the Backends tab badges `+2 listed manually` — a typo'd id is otherwise silent: it
+routes, and the backend rejects the call.
 
 ### Context windows (`context_length` in `/v1/models`)
 
