@@ -2535,8 +2535,19 @@ def _datalist(dlid: str, models: list) -> str:
 
 
 def _dl_input(name: str, value, dlid: str, placeholder: str = "model id") -> str:
+    """A text input whose suggestions come from `dlid` — and ONLY from there.
+
+    `autocomplete="off"` is load-bearing: a browser merges its own form history for a
+    field NAME into the datalist popup, so the carefully narrowed list (the chat
+    playground's per-backend models, the reasoning test's, the mapping pickers) gets a
+    stranger's leftovers appended — a model id no backend serves any more, or one that
+    belongs to a DIFFERENT backend than the one selected, offered as if the gateway had
+    proposed it (measured 2026-09-11: `localai-phoenix/qwen3.5-9b-heretic-thinking`
+    offered under a backend filtered down to zero models, while that string was in
+    neither list the server rendered). Nothing errors, so it reads as a routing bug in
+    the console instead of browser autofill."""
     return (f'<input type="text" name="{_esc(name)}" value="{_esc(value)}" list="{_esc(dlid)}" '
-            f'placeholder="{_esc(placeholder)}">')
+            f'autocomplete="off" placeholder="{_esc(placeholder)}">')
 
 
 def _chat_value_for(alias: str) -> dict:
