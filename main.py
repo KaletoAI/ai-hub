@@ -1222,6 +1222,34 @@ def serves_path(backend: dict, path: str) -> bool:
     return True
 
 
+def anthropic_only_candidates(alias: str) -> bool:
+    """Is every backend that could serve `alias` an Anthropic one?
+
+    Asked ONLY to explain a refusal (see `_dispatch_or_park`), never to route: such a
+    backend answers `/v1/messages` alone (`serves_path`), so off that path it is no
+    candidate and the caller must be told WHICH endpoint to use instead of "no healthy
+    backend". Health and busy state are deliberately not consulted — the answer is
+    about who OWNS the name, not who is up.
+
+    A '<backend>/<model>' pin is resolved the same way `resolve_routes` resolves it,
+    against `_llm_backends` — reading `_route_index` cannot work here: the index holds
+    aliases and BARE model ids only (`rebuild_route_index`), so every pinned name came
+    back with no candidates and fell through to the generic 503.
+    """
+    bname, bare = split_backend_prefix(alias)
+    if bname is not None:
+        b = next((b for b in _llm_backends if b["name"] == bname), None)
+        if b is None:
+            return False
+        real = resolve_for_backend(bare, bname)
+        # A model that backend never listed is not an endpoint mistake — leave it 503.
+        if real is None or real not in backend_models.get(backend_id(b), set()):
+            return False
+        return b.get("type") == "anthropic"
+    cands = _route_index.get(alias) or []
+    return bool(cands) and all(b.get("type") == "anthropic" for b, _ in cands)
+
+
 def resolve_routes(alias: str, path: str = "/v1/chat/completions") -> tuple[list, list]:
     """(ready, busy) (backend, real_model) candidate lists.
 
@@ -1720,9 +1748,7 @@ async def _dispatch_or_park(alias, path, body, request, stats_endpoint=None, dea
         # the messages path — ON it the very same candidate set means the backend is
         # simply down, and a 404 there would tell the caller to use the endpoint they
         # are already on (and Claude Code does not retry a 404, a 503 it does).
-        cands = _route_index.get(alias) or []
-        if (not path.startswith("/v1/messages")
-                and cands and all(b.get("type") == "anthropic" for b, _ in cands)):
+        if not path.startswith("/v1/messages") and anthropic_only_candidates(alias):
             raise HTTPException(404, f"model '{alias}' is served by an Anthropic backend — "
                                      "reachable through POST /v1/messages only")
         raise HTTPException(503, f"No healthy backend for model '{alias}'")

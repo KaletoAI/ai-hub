@@ -31,7 +31,7 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
   restart for backend/alias changes. Read **only at startup**:
   `stats.enabled` and the stats/jobs DB paths.
 - **No linter or build step, and no blanket test suite** — only targeted stdlib
-  `unittest` files for the mechanisms that fail SILENTLY (see the twenty-six listed under
+  `unittest` files for the mechanisms that fail SILENTLY (see the twenty-seven listed under
   `anthropic_bridge.py`): `venv/bin/python -m unittest discover -s tests -t .`.
   Everything else is verified by running the server and hitting endpoints with
   `curl` (README "Try it"), `curl localhost:4000/health` for a routing snapshot, or
@@ -550,7 +550,7 @@ they need via injected callables, staying hot-reload-safe.
   silently answer about content the model never saw (documents/PDFs). Covered by
   `test_anthropic_bridge.py` (stdlib `unittest` — a streaming tool-call bridge fails
   silently rather than crashing). `ls tests/test_*.py` is the count of record —
-  **twenty-six** files today — and each exists for that same reason: the mechanism it
+  **twenty-seven** files today — and each exists for that same reason: the mechanism it
   guards fails SILENTLY, so it is named next to that mechanism above.
   `test_anthropic_bridge.py`, `test_prune_branch.py` (a
   dead-branch prune that cascades one node too far or too few surfaces as an aborted
@@ -625,6 +625,15 @@ they need via injected callables, staying hot-reload-safe.
   its stored value on the next Save, and a pane without a button is unreachable in the
   browser without anything erroring. It derives the field list from `backend_save` by
   AST — so a field added there and forgotten in the form fails the test, not production).
+  `test_anthropic_endpoint_404.py` (what the gateway SAYS when an Anthropic model is
+  asked for on a chat path: the explaining 404 read its candidates from `_route_index`,
+  which holds aliases and BARE ids only, so every `<backend>/<model>` pin fell through to
+  the generic `503 No healthy backend` — a healthy backend reported as absent, the licence
+  rule that caused the refusal never mentioned, and a client that does not retry a 404
+  retrying a 503 forever: measured 2026-09-12 on prod, 3195 of them in three hours from
+  one agent. It pins both spellings, the messages path where the same empty set really
+  does mean DOWN, and — the guard on the fix itself — that the boundary stays CLOSED:
+  only the message changed, `serves_path` still makes that backend no candidate at all).
   And one guards the project's own NAME (`test_project_name.py`): a stale mention of the
   pre-rename name left in `deploy.sh` points a deploy at a path that no longer exists, in
   `ai-hub.service` at a `WorkingDirectory` that is gone, in the README at a clone URL that
