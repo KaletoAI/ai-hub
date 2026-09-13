@@ -312,6 +312,66 @@ class Capabilities:
     pricing: dict[str, dict[str, float]]
     loras: set = field(default_factory=set)         # ComfyUI: installed LoRA filenames
     context: dict = field(default_factory=dict)     # model → context window (tokens), where the listing says
+    # llama-swap `/running` as parse_running() reads it; None = the backend has no such
+    # endpoint (vLLM, OpenRouter, LocalAI), which is what makes `current` unroutable there.
+    running: Optional[list] = None
+
+
+# ── `current`: whatever model a llama-swap backend has loaded right now ────────
+# llama-swap cannot address a call without a model name, and naming one swaps it in.
+# `<backend>/current` (or `current` as an alias's per-backend model) resolves to a model
+# the backend ALREADY runs — never to one it would have to load: nothing suitable loaded
+# means the candidate is skipped, not that something gets loaded.
+CURRENT_MODEL = "current"
+_CURRENT_STATES = ("ready", "starting")       # starting: llama-swap queues the call, no swap
+_EMBED_FLAGS = ("--embedding", "--embeddings")
+_RERANK_FLAGS = ("--rerank", "--reranking")
+
+
+def parse_running(payload) -> Optional[list[dict]]:
+    """llama-swap `GET /running` → `[{model, state, kind}]`, or None when the payload is
+    not that shape (a server whose `/running` is something else must not look like an
+    empty llama-swap).
+
+    `kind` comes from the llama-server flags in `cmd`: `embedding`, `rerank` or `chat`.
+    It is what keeps `current` from handing a chat call to the embedding model llama-swap
+    keeps loaded beside it (measured 2026-09-13: bge-m3 with `ttl 0` on both boxes). An
+    entry without `cmd` counts as `chat` — nothing says otherwise."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("running"), list):
+        return None
+    out = []
+    for ent in payload["running"]:
+        if not isinstance(ent, dict) or not ent.get("model"):
+            continue
+        flags = {t.split("=", 1)[0] for t in str(ent.get("cmd") or "").split()}
+        kind = ("embedding" if flags & set(_EMBED_FLAGS)
+                else "rerank" if flags & set(_RERANK_FLAGS) else "chat")
+        out.append({"model": str(ent["model"]), "state": str(ent.get("state") or ""), "kind": kind})
+    return out
+
+
+def current_kind_for(path: str) -> str:
+    """The model kind a `current` call on `path` needs."""
+    return "embedding" if path.startswith("/v1/embeddings") else "chat"
+
+
+def pick_current(running: Optional[list], path: str, served, last: Optional[str]) -> Optional[str]:
+    """The loaded model a `current` call on `path` goes to, or None (→ skip the backend).
+
+    Eligible: the endpoint's kind (current_kind_for), state ready or starting, and in the
+    backend's served set — so `models_allow`/`models_deny` hold for `current` too. Ready
+    beats starting; among equals the model the gateway last sent there (`last`) wins,
+    else llama-swap's own order."""
+    want = current_kind_for(path)
+    cands = [e for e in (running or [])
+             if e.get("kind") == want and e.get("state") in _CURRENT_STATES
+             and e.get("model") in served]
+    if not cands:
+        return None
+    pool = [e for e in cands if e["state"] == "ready"] or cands
+    if last and any(e["model"] == last for e in pool):
+        return last
+    return pool[0]["model"]
 
 
 @dataclass
@@ -820,29 +880,38 @@ class OpenAIAdapter(BackendAdapter):
         resp.raise_for_status()
         payload = resp.json()
         context = extract_context(payload)
-        context.update(await self._llamaswap_context(client, b))
+        running = await self.fetch_running(client)
+        context.update(await self._llamaswap_context(client, b, running or []))
         return Capabilities(models=extract_models(payload, b),
-                            pricing=extract_pricing(payload), context=context)
+                            pricing=extract_pricing(payload), context=context, running=running)
 
-    async def _llamaswap_context(self, client: httpx.AsyncClient, b: dict) -> dict[str, int]:
-        """llama-swap's own /v1/models carries no n_ctx (only the llama-server behind
-        each model knows it), so ask `/running` which models are loaded and read each
-        one's `/upstream/<model>/v1/models` through the same extract_context(). ONLY
-        loaded (`state == ready`) models are asked: `/upstream/…` on an unloaded model
-        makes llama-swap LOAD it, and a discovery poll must never swap a model in.
-        Every failure is silent — a server without `/running` (vLLM, OpenRouter,
-        LocalAI: 404) is the normal case, and the listing's own values still count."""
-        out: dict[str, int] = {}
+    async def fetch_running(self, client: httpx.AsyncClient,
+                            timeout: float = _DISCOVERY_TIMEOUT) -> Optional[list]:
+        """llama-swap `GET /running` through parse_running(); None when the backend has
+        no such endpoint or did not answer. Silent on purpose — a server without
+        `/running` (vLLM, OpenRouter, LocalAI: 404) is the normal case. Called by
+        discovery and, per request, by main for `current` calls (short timeout)."""
+        b = self.backend
         try:
             r = await client.get(f"{b['url']}/running", headers=self.ctx.auth_headers(b),
-                                 timeout=_DISCOVERY_TIMEOUT)
+                                 timeout=timeout)
             if r.status_code != 200:
-                return out
-            running = r.json().get("running") or []
+                return None
+            return parse_running(r.json())
         except Exception:
-            return out
+            return None
+
+    async def _llamaswap_context(self, client: httpx.AsyncClient, b: dict,
+                                 running: list) -> dict[str, int]:
+        """llama-swap's own /v1/models carries no n_ctx (only the llama-server behind
+        each model knows it), so read each model `/running` reports as loaded through
+        its `/upstream/<model>/v1/models` and the same extract_context(). ONLY loaded
+        (`state == ready`) models are asked: `/upstream/…` on an unloaded model makes
+        llama-swap LOAD it, and a discovery poll must never swap a model in. Every
+        failure is silent, and the listing's own values still count."""
+        out: dict[str, int] = {}
         for ent in running:
-            if not isinstance(ent, dict) or ent.get("state") != "ready" or not ent.get("model"):
+            if ent.get("state") != "ready":
                 continue
             mid = str(ent["model"])
             try:

@@ -1578,6 +1578,33 @@ def _extras_badge(ids) -> str:
                   f"models_extra (served but not listed by the backend): {names}")
 
 
+def _loaded_text(loaded, html: bool = True) -> str:
+    """The summary's `loaded` list (llama-swap `/running`): model names, with the kind
+    when it is not chat and the state when it is not ready — the two things that decide
+    whether a `current` call can use the model. `""` when the key is absent (not a
+    llama-swap backend, or down), 'nothing loaded' for an empty list.
+
+    `html=False` returns plain text for the Backends list, whose sub line `_item`
+    ESCAPES — markup there would show up as literal tags."""
+    if not isinstance(loaded, list):
+        return ""
+    if not loaded:
+        return "<span class='muted'>nothing loaded</span>" if html else "nothing loaded"
+    parts = []
+    for e in loaded:
+        if not isinstance(e, dict):
+            continue
+        tags = [t for t in ((e.get("kind") if e.get("kind") != "chat" else ""),
+                            (e.get("state") if e.get("state") != "ready" else "")) if t]
+        name = str(e.get("model", ""))
+        if not html:
+            parts.append(name + (f" ({', '.join(tags)})" if tags else ""))
+            continue
+        extra = f" <span class='muted'>({_esc(', '.join(tags))})</span>" if tags else ""
+        parts.append(f"<b>{_esc(name)}</b>{extra}")
+    return ", ".join(parts)
+
+
 def _bid(b: dict) -> str:
     """Stable backend id = type:name (so LLM + ComfyUI may share a name)."""
     return f'{b.get("type", "openai")}:{b["name"]}'
@@ -1666,7 +1693,10 @@ async def backends_page(request: Request):
             cr = f" · credits {b['credits']}"
             if b.get("credits_at"):
                 cr += f" ({_age(b['credits_at'])} ago)"
-        sub = f"{b['url']}{host} · {b['models']} models{flags}{smp}{fr}{qn}{cr}{rst}{src}"
+        # llama-swap: what is loaded right now — the model a `<backend>/current` call gets
+        ld = (f" · loaded {_loaded_text(b['loaded'], html=False)}"
+              if isinstance(b.get("loaded"), list) else "")
+        sub = f"{b['url']}{host} · {b['models']} models{ld}{flags}{smp}{fr}{qn}{cr}{rst}{src}"
         return _item(f"{_esc(b['name'])}{_type_badge(b['type'])}{badge}", sub, acts, sel=(bid == edit_id))
 
     # group by kind: LLM (openai-compatible) vs Media (every generation type — ComfyUI,
@@ -2597,6 +2627,8 @@ def _chat_new_form() -> str:
     assigned in the editor afterwards."""
     llm = _llm_backends()
     all_models = sorted({m for b in llm for m in b.get("models", [])})
+    if any(b.get("current") for b in llm):            # llama-swap: "whatever is loaded"
+        all_models.insert(0, adapters.CURRENT_MODEL)
     bopts = [b["name"] for b in llm] or [("", "(no LLM backends)")]
     return ('<form action="/ui/chat/create" method="post">'
             f'<div class="formbar"><h2>New Chat Alias</h2>{_btn("Create", submit=True)}'
@@ -2627,7 +2659,8 @@ def _chat_editor(alias: str) -> str:
               if len(assigned) > 1 else "<span class='muted' title='alias needs ≥1 backend'>—</span>")
         rows += (f"<tr><td>{head}</td><td>{_dl_input('model__' + bn, model, dlid)}</td>"
                  f"<td class='acts'>{rm}</td></tr>")
-        dls += _datalist(dlid, b.get("models", []))
+        dls += _datalist(dlid, ([adapters.CURRENT_MODEL] if b.get("current") else [])
+                         + list(b.get("models", [])))
     rows = rows or "<tr><td colspan=3 class='muted'>no backends — add one below</td></tr>"
     add_opts = [b["name"] for b in llm if b["name"] not in assigned]
     add_sel = ""
@@ -5882,13 +5915,15 @@ def _dash_backends(bes: list, offline: list) -> str:
         # from the other's content, the exact per-tick full-row rewrite keys prevent.
         brows += (f"<tr data-k=\"bk-{_esc(_bid(b))}\"><td>{_esc(b['name'])}</td><td>{_type_badge(b.get('type'))}</td>"
                   f"<td>{bstatus(b)}</td><td>{inf}</td><td>{r1h_cell}</td>"
-                  f"<td>{b.get('models', 0)}</td></tr>")
+                  f"<td>{b.get('models', 0)}</td>"
+                  f"<td>{_loaded_text(b.get('loaded')) or '<span class=muted>—</span>'}</td></tr>")
     off_hint = (f" · {len(offline)} offline hidden (<a href='/ui/backends'>manage</a>)" if offline else "")
     return (f"<h2>Backends <span class='muted' style='font-weight:normal;font-size:12px'>"
             f"· click a header to sort{off_hint}</span></h2>"
             f"<table class='sortable' data-sk='dash-backends'><tr><th>backend</th><th>type</th><th>status</th>"
             f"<th>in flight</th><th title='requests handled in the last hour'>req · 1h</th>"
-            f"<th>models</th></tr>{brows}</table>")
+            f"<th>models</th><th title='llama-swap: the model(s) loaded right now — what "
+            f"&lt;backend&gt;/current routes to'>loaded</th></tr>{brows}</table>")
 
 
 def _dash_jobs(d: dict, now: int) -> str:

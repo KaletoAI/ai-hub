@@ -183,6 +183,7 @@ A user's allow-list can contain any mix of:
 | **image alias** (`Qwen`) | that generation alias |
 | **backend name** (`together`) | **all** of that backend's models |
 | model id (`together/llama-3…` or bare) | that specific model |
+| `<backend>/current` | whatever that llama-swap backend has loaded (a backend-name grant covers it too) |
 
 An **empty** allow-list = everything allowed (the default). A non-empty list both
 **restricts usage** (a disallowed model → `403`) **and filters `/v1/models`** so
@@ -247,6 +248,35 @@ disambiguates. `model_prefix: false` → legacy bare, de-duplicated listing.
 the prefixed id). A bare request then routes across every `local`
 backend that serves it — same failover/busy-spill as a virtual alias; shared ids
 collapse to one entry. Independent of `model_prefix`.
+
+### Whatever is loaded (`<backend>/current`, llama-swap)
+
+llama-swap needs a model name on every call, and naming one swaps it in. For calls
+where the model does not matter, send **`<backend>/current`**: the gateway asks
+llama-swap's `GET /running` right before routing and rewrites `model` to what is
+loaded **now** — it never loads anything.
+
+- **Which loaded model**: the endpoint decides the kind, read from the llama-server
+  flags in `/running`'s `cmd` — `/v1/embeddings` takes a model started with
+  `--embedding`, every other endpoint one started without it (and without
+  `--reranking`). So an embedding model llama-swap keeps loaded beside a chat model
+  never receives a chat call. `ready` beats `starting` (a starting model still counts —
+  llama-swap queues the call, no swap); among several, the one the gateway last sent
+  there wins. `models_allow`/`models_deny` apply.
+- **Nothing suitable loaded** → that backend is not a candidate: a busy backend with
+  the right model loaded **parks** the call, otherwise `503 "no chat model loaded on
+  <backend> — 'current' never loads one"`.
+- **Across backends**: put `current` as the per-backend model of a chat alias
+  (`egal: {llamaswap-strix: current, llamaswap-phoenix: current}`) — the scheduler
+  picks a backend, each resolves to its own loaded model. A bare `current` does not
+  exist (it would be ambiguous); name an alias `current` if you want one.
+- Available only on backends whose `/running` answers (llama-swap); a backend that
+  really lists a model named `current` keeps it. `/v1/models` lists `<backend>/current`
+  without `context_length` (it changes with every swap). Allowed by a whole-backend
+  grant or the exact entry `<backend>/current` — a grant for one model is not enough,
+  since `current` may land on any of them.
+- The **Backends** tab and the Dashboard's Backends panel show the loaded model(s) per
+  llama-swap backend (`loaded` in `/health`), kind and state included.
 
 ### Per-backend concurrency cap (`max_concurrent`)
 

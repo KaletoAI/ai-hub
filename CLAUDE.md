@@ -31,7 +31,7 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
   restart for backend/alias changes. Read **only at startup**:
   `stats.enabled` and the stats/jobs DB paths.
 - **No linter or build step, and no blanket test suite** — only targeted stdlib
-  `unittest` files for the mechanisms that fail SILENTLY (see the twenty-six listed under
+  `unittest` files for the mechanisms that fail SILENTLY (see the twenty-seven listed under
   `anthropic_bridge.py`): `venv/bin/python -m unittest discover -s tests -t .`.
   Everything else is verified by running the server and hitting endpoints with
   `curl` (README "Try it"), `curl localhost:4000/health` for a routing snapshot, or
@@ -550,7 +550,7 @@ they need via injected callables, staying hot-reload-safe.
   silently answer about content the model never saw (documents/PDFs). Covered by
   `test_anthropic_bridge.py` (stdlib `unittest` — a streaming tool-call bridge fails
   silently rather than crashing). `ls tests/test_*.py` is the count of record —
-  **twenty-six** files today — and each exists for that same reason: the mechanism it
+  **twenty-seven** files today — and each exists for that same reason: the mechanism it
   guards fails SILENTLY, so it is named next to that mechanism above.
   `test_anthropic_bridge.py`, `test_prune_branch.py` (a
   dead-branch prune that cascades one node too far or too few surfaces as an aborted
@@ -625,6 +625,12 @@ they need via injected callables, staying hot-reload-safe.
   its stored value on the next Save, and a pane without a button is unreachable in the
   browser without anything erroring. It derives the field list from `backend_save` by
   AST — so a field added there and forgotten in the form fails the test, not production).
+  `test_current_model.py` (llama-swap's `<backend>/current`: every wrong pick is a
+  plausible answer — a chat call handed to the embedding model loaded beside it, a pick
+  against a stale list or a "pick something" fallback that SWAPS a model in, a backend
+  with nothing loaded taken as a candidate so a parkable call 503s. It pins the parser
+  and the pick rule, routing incl. park-instead-of-spill, the live refresh, the
+  allow-list, the catalog and the `loaded` display).
   And one guards the project's own NAME (`test_project_name.py`): a stale mention of the
   pre-rename name left in `deploy.sh` points a deploy at a path that no longer exists, in
   `ai-hub.service` at a `WorkingDirectory` that is gone, in the README at a clone URL that
@@ -806,6 +812,25 @@ maps the alias, and exposes the resolved model. Recurring concepts:
 - **Backend prefixing** (`split_backend_prefix`): `<backend>/<model>` pins that
   backend; a bare id/alias goes through the scheduler. `local: true` *also* lists models
   bare (cross-backend implicit alias). `model_prefix` toggles prefixed listing.
+- **`current`** (`adapters.CURRENT_MODEL`, llama-swap only): `<backend>/current`, or
+  `current` as an alias's per-backend model, resolves to a model the backend has
+  ALREADY loaded — never loads one. `backend_running` holds `/running` as
+  `adapters.parse_running` reads it (`kind` embedding/rerank/chat from the llama-server
+  flags in `cmd`); a key there is what makes `current` routable (`main._is_current`, so
+  `rebuild_route_index` also rebuilds when `/running` appears or vanishes), and a
+  backend that LISTS a model named `current` keeps it. The index stores the placeholder;
+  `resolve_routes` picks per request (`adapters.pick_current`: the endpoint's kind —
+  `/v1/embeddings` embedding, else chat, because llama-swap keeps bge-m3 loaded beside
+  the chat model — ready over starting, the served set so the model filter holds,
+  `backend_last_key` among equals) and DROPS a backend with nothing suitable from ready
+  AND busy: a busy backend with the right model parks the call, an idle one without
+  it must never take it. Freshness: `_dispatch_or_park` and each park-loop wake
+  `await _refresh_loaded(alias)` BEFORE `resolve_routes` (a live `/running`, 2 s; a
+  failed query keeps the last list) — never between resolve and dispatch, where the
+  in-flight claim stays await-free. Nothing loaded anywhere → `_nothing_loaded_error`'s
+  503 naming the backends. Allow-list: a whole-backend grant or the exact
+  `<backend>/current`, never a single model id. `_loaded_info` → `loaded` in `/health`,
+  the Backends tab and the Dashboard panel (`admin._loaded_text`). `test_current_model.py`.
 - **Concurrency/busy** (`backend_inflight`, `backend_busy`): incremented in
   `dispatch()`/`generate()`, decremented on completion incl. the streamed `finally`.
 - **Re-routing onto a returning backend**: waiting work is never pinned to the

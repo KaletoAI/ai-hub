@@ -214,6 +214,12 @@ backend_model_counts: dict[str, tuple[int, int]] = {}
 # a llama-swap model says its n_ctx only while loaded). The admin's per-backend
 # `model_context` rules sit above this; adapters.model_context_for() resolves both.
 backend_context: dict[str, dict[str, int]] = {}
+# bid → what llama-swap's `/running` last said is loaded ([{model, state, kind}],
+# adapters.parse_running). Only backends that HAVE the endpoint carry a key — that key
+# is what makes `<backend>/current` routable. Fed by every discovery poll and, for a
+# `current` call, by a live query right before routing (_refresh_loaded). In memory
+# only: a restart must ask again, the loaded model is not the gateway's to remember.
+backend_running: dict[str, list] = {}
 backend_inflight: dict[str, int] = {}                          # name → current in-flight requests
 backend_hosts: dict[str, str] = {}                             # bid → host (explicit `host` or URL IP)
 backend_tps: dict[str, float] = {}                             # bid → EWMA output tok/s (speed routing; runtime-only, resets on restart)
@@ -682,8 +688,16 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
             backend_context[bid] = learned
             if store.is_active():
                 await asyncio.to_thread(store.save_backend_context, bid, learned)
-        if changed:
-            rebuild_route_index()          # model set changed → refresh routing candidates
+        running = getattr(caps, "running", None)
+        had_running = bid in backend_running
+        if running is None:
+            backend_running.pop(bid, None)
+        else:
+            backend_running[bid] = running
+        if changed or had_running != (running is not None):
+            # model set changed, or `/running` appeared/vanished (which decides whether
+            # an alias's `current` entry is a candidate at all) → refresh the candidates
+            rebuild_route_index()
         was_healthy = backend_healthy.get(bid, False)
         if not was_healthy:
             logger.info(f"[{label}] UP  — {len(caps.models)} models, {len(caps.pricing)} priced")
@@ -1019,6 +1033,11 @@ def _model_allowed(user: dict, model: Optional[str]) -> bool:
     bname, bare = split_backend_prefix(model)    # backend/model
     if bname and bname in allow:                 # whole-backend grant (prefixed request)
         return True
+    if bname and bare == adapters.CURRENT_MODEL and model not in virtual_models:
+        # `<backend>/current` may land on ANY model that backend has loaded, so only a
+        # grant covering all of them (the backend, or this exact entry — both checked
+        # above) allows it; a bare `current` in the list must not open every backend.
+        return False
     if bare in allow:                            # bare model id explicitly granted
         return True
     # Otherwise allow if a GRANTED backend either HOSTS this model (a bare real id) or
@@ -1032,8 +1051,10 @@ def _model_allowed(user: dict, model: Optional[str]) -> bool:
         served = backend_models.get(backend_id(b), set())
         if bare in served:                                       # real model on a granted backend
             return True
-        if is_alias and alias_entry(model, b["name"])[0] in served:   # alias → granted backend's model
-            return True
+        if is_alias:                                             # alias → granted backend's model
+            real = alias_entry(model, b["name"])[0]
+            if real in served or _is_current(b, real):
+                return True
     return False
 
 
@@ -1191,7 +1212,10 @@ def rebuild_route_index() -> None:
     for alias in virtual_models:                       # aliases (they shadow same-named real ids)
         for b in _llm_backends:
             real, _prio = alias_entry(alias, b["name"])
-            if real is not None and real in backend_models.get(backend_id(b), set()):
+            if real is not None and (real in backend_models.get(backend_id(b), set())
+                                     or _is_current(b, real)):
+                # a `current` entry stays the placeholder here — what it resolves to
+                # changes with every swap, so resolve_routes picks it per request
                 index.setdefault(alias, []).append((b, real))
     for b in _llm_backends:                            # bare model ids → pass-through routing
         for mid in backend_models.get(backend_id(b), set()):
@@ -1244,6 +1268,8 @@ def resolve_routes(alias: str, path: str = "/v1/chat/completions") -> tuple[list
         if not serves_path(b, path):
             return [], []
         real = resolve_for_backend(bare, bname)
+        if _is_current(b, real):
+            real = _current_model(b, path)
         if real is None or real not in backend_models.get(backend_id(b), set()):
             return [], []
         return ([], [(b, real)]) if backend_busy(b) else ([(b, real)], [])
@@ -1254,6 +1280,10 @@ def resolve_routes(alias: str, path: str = "/v1/chat/completions") -> tuple[list
             continue
         if not serves_path(b, path):
             continue
+        if _is_current(b, real):
+            real = _current_model(b, path)
+            if real is None:              # nothing suitable loaded → not a candidate (never load one)
+                continue
         (busy if backend_busy(b) else ready).append((b, real))
     if len(ready) > 1:
         # Unified scheduling (spec 2026-09-01): unpaid before paid, then fastest
@@ -1270,6 +1300,74 @@ def resolve_routes(alias: str, path: str = "/v1/chat/completions") -> tuple[list
         if mb:
             ready.sort(key=lambda br: backend_hosts.get(backend_id(br[0]), "") in mb)
     return ready, busy
+
+
+def _is_current(backend: dict, real: Optional[str]) -> bool:
+    """Is `real` the `current` placeholder ON this backend? Only where llama-swap's
+    `/running` answered (backend_running carries the key) — elsewhere `current` is just
+    a model name nobody serves. A backend that really lists a model named `current`
+    keeps it: a listed id is never shadowed by the placeholder."""
+    bid = backend_id(backend)
+    return (real == adapters.CURRENT_MODEL and bid in backend_running
+            and real not in backend_models.get(bid, set()))
+
+
+def _current_model(backend: dict, path: str) -> Optional[str]:
+    """What `current` resolves to on this backend for `path`, from backend_running —
+    None when nothing suitable is loaded (see adapters.pick_current)."""
+    bid = backend_id(backend)
+    return adapters.pick_current(backend_running.get(bid), path,
+                                 backend_models.get(bid, set()), backend_last_key.get(bid))
+
+
+def _current_backends(alias: str) -> list[dict]:
+    """The backends on which `alias` means `current` — the ones a live `/running`
+    query has to ask before routing it. Empty for every other alias, so ordinary calls
+    pay nothing."""
+    bname, bare = split_backend_prefix(alias)
+    if bname is not None:
+        b = next((b for b in _llm_backends if b["name"] == bname), None)
+        return [b] if b is not None and _is_current(b, resolve_for_backend(bare, bname)) else []
+    return [b for b, real in _route_index.get(alias, ()) if _is_current(b, real)]
+
+
+_CURRENT_LIVE_TIMEOUT = 2.0
+
+
+async def _refresh_loaded(alias: str) -> None:
+    """Re-read `/running` on every healthy backend where `alias` means `current`, so the
+    pick is made against what is loaded NOW and not up to a discovery interval ago (a
+    client talking to llama-swap directly swaps without the gateway knowing). Runs
+    BEFORE resolve_routes — never between it and dispatch, where the in-flight claim
+    must stay await-free. A failed query keeps the last known list: if the backend is
+    really gone, dispatch fails over as it would for any other call."""
+    targets = [b for b in _current_backends(alias)
+               if backend_healthy.get(backend_id(b)) and not is_draining(b)]
+    if not targets:
+        return
+
+    async def one(b):
+        ad = backend_adapters.get(backend_id(b))
+        fetch = getattr(ad, "fetch_running", None)
+        if fetch is None:
+            return
+        running = await fetch(http_client, timeout=_CURRENT_LIVE_TIMEOUT)
+        if running is not None and backend_id(b) in backend_running:
+            backend_running[backend_id(b)] = running
+
+    await asyncio.gather(*(one(b) for b in targets), return_exceptions=True)
+
+
+def _nothing_loaded_error(alias: str, path: str) -> Optional[HTTPException]:
+    """The 503 for a `current` call no candidate can take because none has a suitable
+    model loaded — said as such, since 'no healthy backend' would send the caller
+    looking for a fault on a backend that is up and simply idle."""
+    names = [b["name"] for b in _current_backends(alias)
+             if backend_healthy.get(backend_id(b)) and not is_draining(b)]
+    if not names:
+        return None
+    return HTTPException(503, f"model '{alias}': no {adapters.current_kind_for(path)} model "
+                              f"loaded on {', '.join(names)} — 'current' never loads one")
 
 
 def get_routes_for(alias: str) -> list[tuple[dict, str]]:
@@ -1333,7 +1431,7 @@ def routing_snapshot() -> dict:
                 continue                       # alias not mapped to this backend
             bid, enbl = backend_id(b), is_enabled(b)
             healthy = enbl and backend_healthy.get(bid, False)
-            present = real in backend_models.get(bid, set())
+            present = real in backend_models.get(bid, set()) or _is_current(b, real)
             busy = enbl and healthy and backend_busy(b)
             rows.append({
                 "backend": b["name"],
@@ -1706,6 +1804,7 @@ async def _dispatch_or_park(alias, path, body, request, stats_endpoint=None, dea
     request.state.gw_alias = alias
     request.state.gw_body = body
     request.state.gw_endpoint = stats_endpoint or path
+    await _refresh_loaded(alias)                       # `current` only; a no-op for every other alias
     ready, busy = resolve_routes(alias, path)
     # Spec rule 4: always into the queue. A free backend that a parked call is designated
     # for is NOT up for grabs — this request parks instead and competes from inside the
@@ -1725,7 +1824,7 @@ async def _dispatch_or_park(alias, path, body, request, stats_endpoint=None, dea
                 and cands and all(b.get("type") == "anthropic" for b, _ in cands)):
             raise HTTPException(404, f"model '{alias}' is served by an Anthropic backend — "
                                      "reachable through POST /v1/messages only")
-        raise HTTPException(503, f"No healthy backend for model '{alias}'")
+        raise _nothing_loaded_error(alias, path) or HTTPException(503, f"No healthy backend for model '{alias}'")
     if deadline is None:
         ptime = _park_time_for(alias)
         if ptime <= 0:                                 # parking disabled for this alias → 503 now
@@ -1814,11 +1913,19 @@ def _designated_waiter(backend, pool: list, now: Optional[float] = None):
     both go through here so they cannot drift apart.
     """
     bid, bname = backend_id(backend), backend["name"]
+
+    def type_key(e):
+        # A `current` waiter needs no particular model — whatever runs here is its
+        # type, so it counts as the no-reload match it is.
+        if any(backend_id(cb) == bid for cb in _current_backends(e["alias"])):
+            return backend_last_key.get(bid)
+        return alias_entry(e["alias"], bname)[0] or e["alias"]
+
     return scheduler.designated_taker(
         pool,
         can_serve=lambda e: any(backend_id(rb) == bid for rb, _ in
                                 resolve_routes(e["alias"], e["path"])[0]),
-        type_key=lambda e: alias_entry(e["alias"], bname)[0] or e["alias"],
+        type_key=type_key,
         last_key=backend_last_key.get(bid),
         now=time.monotonic() if now is None else now,
         max_wait_s=affinity_max_wait_s)
@@ -1872,6 +1979,7 @@ async def _park_and_dispatch(alias, path, body, request, deadline, source="?", s
     try:
         while True:
             entry["event"].clear()                     # arm before checking → no lost wakeup
+            await _refresh_loaded(alias)               # `current`: the loaded model may have changed while parked
             ready, busy = resolve_routes(alias, path)
             i = _designated_index(entry, ready)
             if i is not None:
@@ -1885,7 +1993,8 @@ async def _park_and_dispatch(alias, path, body, request, deadline, source="?", s
                 cands = [ready[i]] + ready[:i] + ready[i + 1:]
                 return await _dispatch_over(cands, path, alias, body, request, stats_endpoint=stats_endpoint)
             if not ready and not busy:
-                raise HTTPException(503, f"No healthy backend for model '{alias}'")
+                raise _nothing_loaded_error(alias, path) or HTTPException(
+                    503, f"No healthy backend for model '{alias}'")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise HTTPException(503, f"all backends for '{alias}' are busy — parked with no free "
@@ -2006,6 +2115,12 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
                         {"id": mid, "object": "model", "created": now, "owned_by": bname},
                         _context_min((b2, mid) for b2 in offered
                                      if mid in backend_models.get(backend_id(b2), set()))))
+            # `<backend>/current` (llama-swap only) — always prefixed, a bare `current`
+            # would be ambiguous. No context_length: it changes with every swap.
+            cur = f"{bname}/{adapters.CURRENT_MODEL}"
+            if _is_current(backend, adapters.CURRENT_MODEL) and cur not in seen and visible({cur, bname}):
+                seen.add(cur)
+                data.append({"id": cur, "object": "model", "created": now, "owned_by": bname})
         # Virtual chat aliases are cross-backend → always listed bare (no prefix).
         for alias in virtual_models:
             if alias not in seen and visible({alias}):
@@ -2042,6 +2157,8 @@ async def get_model(model_id: str, authorization: Optional[str] = Header(None)):
         if b is not None and bare in backend_models.get(backend_id(b), set()):
             return _with_context({"id": model_id, "object": "model", "created": now, "owned_by": bname},
                                  model_context(b, bare))
+        if b is not None and _is_current(b, bare):
+            return {"id": model_id, "object": "model", "created": now, "owned_by": bname}
     else:
         hosts = [b for b in llm if model_id in backend_models.get(backend_id(b), set())]
         if hosts:      # a bare id routes across every host → the smallest window, as in the listing
@@ -4332,6 +4449,7 @@ def dashboard_snapshot() -> dict:
             "models": len(backend_models.get(bid, set())),
             "reqs_1h": src_1h.get(b["name"], 0),
             "sampling_defaults": b.get("sampling_defaults") or None,
+            **_loaded_info(b),
         })
     is_comfy = _is_gen
     return {
@@ -4455,6 +4573,18 @@ def _model_filter_info(b: dict) -> dict:
     return out
 
 
+def _loaded_info(b: dict) -> dict:
+    """`loaded`: what llama-swap's `/running` last reported ([{model, state, kind}]) for a
+    backend that has the endpoint and is up — the same list `current` resolves against,
+    so the console shows exactly what a `current` call would get. `{}` for every other
+    backend, and for a down one (its last list is no longer a fact); an empty list means
+    'up, nothing loaded'."""
+    bid = backend_id(b)
+    if bid not in backend_running or not (is_enabled(b) and backend_healthy.get(bid, False)):
+        return {}
+    return {"loaded": [dict(e) for e in backend_running[bid]]}
+
+
 def _cloud_info(b: dict) -> dict:
     """Credit balance seen at the last discovery of a cloud backend (Meshy, Tripo), plus
     the same rolling fail-rate the comfy backends carry (merged into /health + the UI
@@ -4558,7 +4688,7 @@ def gateway_info() -> dict:
             "host": backend_hosts.get(backend_id(b), ""),
             "host_explicit": bool((b.get("host") or "").strip()),
             "source": "config" if backend_id(b) in config_ids else "ui",
-            **_comfy_watch_info(b), **_cloud_info(b), **_model_filter_info(b),
+            **_comfy_watch_info(b), **_cloud_info(b), **_model_filter_info(b), **_loaded_info(b),
         } for b in backends],
         "virtual_models": list(virtual_models.keys()),
         "endpoints": ["/v1/chat/completions", "/v1/completions", "/v1/embeddings",
@@ -4774,7 +4904,9 @@ def llm_backends_info() -> list[dict]:
     editor's per-backend model pickers."""
     return [{"name": b["name"], "type": b.get("type", "openai"),
              "enabled": is_enabled(b),
-             "models": sorted(backend_models.get(backend_id(b), set()))}
+             "models": sorted(backend_models.get(backend_id(b), set())),
+             # `/running` answers → the alias editor also offers `current` here
+             "current": _is_current(b, adapters.CURRENT_MODEL)}
             for b in backends if not _is_gen(b)]
 
 
@@ -4832,7 +4964,7 @@ async def health():
                 "tps": round(backend_tps.get(backend_id(b), 0.0), 1),
                 "sampling_defaults": b.get("sampling_defaults") or None,
                 "models": sorted(backend_models.get(backend_id(b), set())) if is_enabled(b) else [],
-                **_comfy_watch_info(b), **_cloud_info(b), **_model_filter_info(b),
+                **_comfy_watch_info(b), **_cloud_info(b), **_model_filter_info(b), **_loaded_info(b),
             }
             for b in backends
         },
