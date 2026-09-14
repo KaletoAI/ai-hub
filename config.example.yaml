@@ -84,6 +84,12 @@ stats:
   # blob_dir: calls   # full request/response bodies live here as files, never in the
   #                   # DB; they are pruned together with their rows
 
+# Backend fault log (Dashboard + Statistic → Backend faults): every DOWN, failed-over
+# call, crashed job attempt and ComfyUI restart per backend. Always on; read at startup.
+# faults:
+#   db_path: faults.db
+#   retention_days: 7
+
 # Backends. The list order is display order only — the scheduler decides who runs
 # what (see affinity_max_wait_s above).
 #   enabled: false  → fully out of rotation (no health-check, no routing)

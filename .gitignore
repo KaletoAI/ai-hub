@@ -18,6 +18,9 @@ store.db-shm
 jobs.db
 jobs.db-wal
 jobs.db-shm
+faults.db
+faults.db-wal
+faults.db-shm
 jobs/
 calls/
 voiceref/

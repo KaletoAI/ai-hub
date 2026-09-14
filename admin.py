@@ -125,6 +125,9 @@ _scan_status: Callable[[], dict] = lambda: {"running": False, "findings": [], "c
                                             "ports": [], "hosts_total": 0, "hosts_done": 0,
                                             "truncated": False, "error": None, "no_range": False}
 _gen_speed_info: Callable[[], dict] = lambda: {"speed": {}, "quarantine": {}}
+# Backend fault log of the last 24h (main.faults_info → faults.py): per-backend summary + bundles.
+_faults_info: Callable[[], dict] = lambda: {"backends": [], "bundles": [], "total": 0,
+                                            "persistent": False, "window_s": 86400}
 _job_progress: Callable[[str], Optional[dict]] = lambda job_id: None   # live ws progress, None = none
 _cancel_generation = None
 _drain_backend = None
@@ -5867,22 +5870,134 @@ async def _autoresolve_ips(by_source: list) -> None:
     store.save_ip_aliases(aliases)
 
 
-def _dash_cards(d: dict, bes: list) -> str:
+def _dash_cards(d: dict, bes: list, f: Optional[dict] = None) -> str:
     """Headline counters (in-flight / parked / active jobs / backends up / 24h)."""
     up = sum(1 for b in bes if b.get("healthy"))
     jc = d.get("jobs_counts", {})
     active_jobs = (jc.get("queued", 0) or 0) + (jc.get("running", 0) or 0)
     card = lambda num, lbl: f"<div class='card'><div class='cnum'>{num}</div><div class='clbl'>{_esc(lbl)}</div></div>"
+    nf = int((f or {}).get("total") or 0)
+    fcard = (f"<div class='card' title='backend failures recorded in the last 24h — see Backend faults below'>"
+             f"<div class='cnum'{_FAULT_RED if nf else ''}>{nf}</div>"
+             f"<div class='clbl'>backend faults · 24h</div></div>")
     return ("<div class='cards'>"
             + card(d.get("llm_inflight", 0), "LLM in flight")
             + card(d.get("parked", 0), "calls parked")
             + card(active_jobs, "media jobs active")
             + card(f"{up}/{len(bes)}", "backends up")
+            + fcard
             + (card(d.get("calls_24h", 0), "calls · 24h") if d.get("stats_active") else "")
             + "</div>")
 
 
-def _dash_backends(bes: list, offline: list) -> str:
+_FAULT_RED = " style='color:#e06c6c'"
+# Fault-log kinds beyond what a discovery poll can report (_DOWN_BADGE covers those).
+_FAULT_KIND = {
+    "execution": "✖ execution failed", "load_failed": "✖ model load failed",
+    "max_wait": "⏱ max_wait expired", "no_credits": "💳 no credits",
+    "vendor_failed": "⚠ vendor failed the task", "restart": "⟳ restarted",
+    "restart_failed": "✖ restart failed", "error": "⚠ error",
+}
+_FAULT_SOURCE = {"health": ("health poll", "the discovery poll failed — the backend went DOWN"),
+                 "call": ("LLM call", "a chat/completions dispatch failed on this backend "
+                                      "(failed over, or a 5xx the client received)"),
+                 "job": ("media job", "a generation attempt failed on this backend "
+                                      "(the job may still have succeeded after a retry or failover)"),
+                 "watchdog": ("watchdog", "a ComfyUI service restart")}
+
+
+def _fault_kind_label(kind: str) -> str:
+    return (_DOWN_BADGE.get(kind) or (_FAULT_KIND.get(kind, kind or "error"),))[0]
+
+
+def _fault_host(s: dict) -> str:
+    """Host cell: the Hosts-tab label first (what the operator calls the box), IP muted."""
+    host, label = s.get("host") or "", s.get("host_label") or ""
+    if label:
+        return f"<td>{_esc(label)} <span class='muted'>{_esc(host)}</span></td>"
+    return f"<td>{_esc(host) or '—'}</td>"
+
+
+def _fault_backend_table(f: dict, sk: str) -> str:
+    """One row per backend that failed in the window (or is down right now): the
+    headline an operator needs — how often, how long down, what it said last."""
+    rows = ""
+    for s in f.get("backends") or []:
+        if not (s.get("faults") or s.get("downtime_s")):
+            continue
+        if not s.get("enabled"):
+            status = _badge("offline / removed", "muted")
+        elif s.get("healthy"):
+            status = _badge("up now", "ok")
+        else:
+            status = _down_badge(s.get("error"))
+        nf = int(s.get("faults") or 0)
+        msg = s.get("last_detail") or ""
+        last = (f"{_badge(_fault_kind_label(s.get('last_kind') or ''), 'bad')} "
+                f"<span title='{_esc(msg)}'>{_esc(msg[:140])}{'…' if len(msg) > 140 else ''}</span>"
+                if s.get("last_kind") else "<span class='muted'>—</span>")
+        down = int(s.get("downtime_s") or 0)
+        rows += (f"<tr data-k=\"flt-{_esc(s.get('bid'))}\">{_fault_host(s)}"
+                 f"<td>{_esc(s.get('backend'))}</td><td>{_type_badge(s.get('type'))}</td>"
+                 f"<td>{status}</td>"
+                 f"<td>{_badge(str(nf), 'bad') if nf else '<span class=muted>0</span>'}</td>"
+                 f"<td>{int(s.get('outages') or 0)}</td>"
+                 f"<td>{_dur(down * 1000) if down else '<span class=muted>—</span>'}</td>"
+                 f"<td>{last}</td>"
+                 f"<td class='muted'>{(_age(s['last_ts']) + ' ago') if s.get('last_ts') else '—'}</td></tr>")
+    if not rows:
+        return ""
+    return (f"<table class='filterable sortable' data-sk='{sk}'><tr><th>host</th><th>backend</th>"
+            f"<th>type</th><th>now</th><th title='failures recorded in the window (every source)'>faults</th>"
+            f"<th title='times the health poll saw it go DOWN'>outages</th>"
+            f"<th title='time spent DOWN inside the window, incl. an outage still open'>downtime</th>"
+            f"<th>last error</th><th>last</th></tr>{rows}</table>")
+
+
+def _dash_faults(f: dict) -> str:
+    """Dashboard panel: which backends failed in the last 24h — shown even once they
+    are healthy again, which is exactly when the live status column stops saying so."""
+    nf = int(f.get("total") or 0)
+    head = (f"<h2>Backend faults <span class='muted' style='font-weight:normal'>· last 24h · "
+            f"<a href='/ui/statistic#faults'>all messages</a></span> "
+            f"{_badge(f'faults {nf}', 'bad') if nf else ''}</h2>")
+    table = _fault_backend_table(f, "dash-faults")
+    return head + (table or "<p class='muted'>no backend failures in the last 24h</p>")
+
+
+def _faults_panel(f: dict) -> str:
+    """Statistic section: the per-backend summary plus EVERY message of the last 24h,
+    bundled — the same failure repeated twenty times is one line with a count."""
+    head = ("<h2 id='faults'>Backend faults · last 24h</h2>"
+            "<p class='hint'>Every failure a backend produced: a health poll that saw it go "
+            "<b>down</b>, an LLM call that <b>failed over</b> or got a 5xx, a media job attempt "
+            "that crashed (also when a retry or another backend then finished the job — which is "
+            "why none of this shows in the call log or the job list), and ComfyUI restarts. "
+            "Messages that differ only in ids and numbers are bundled into one line."
+            + ("" if f.get("persistent") else
+               " <b>Kept in memory only</b> — the fault DB could not be opened, a restart forgets it.")
+            + "</p>")
+    table = _fault_backend_table(f, "stat-faults")
+    if not table:
+        return head + "<p class='muted'>no backend failures in the last 24h</p>"
+    rows = ""
+    for g in f.get("bundles") or []:
+        src, tip = _FAULT_SOURCE.get(g.get("source"), (g.get("source"), ""))
+        rows += (f"<tr>{_fault_host(g)}<td>{_esc(g.get('backend'))}</td>"
+                 f"<td><span class='muted' title='{_esc(tip)}'>{_esc(src)}</span></td>"
+                 f"<td>{_badge(_fault_kind_label(g.get('kind') or ''), 'bad')}"
+                 f"{(' <span class=muted>HTTP ' + str(g['status']) + '</span>') if g.get('status') else ''}</td>"
+                 f"<td style='white-space:normal;max-width:620px'>{_esc(g.get('message'))}</td>"
+                 f"<td><b>{int(g.get('count') or 0)}</b></td>"
+                 f"<td class='muted'>{_ts(g['first'])}</td><td class='muted'>{_ts(g['last'])}</td></tr>")
+    msgs = ("<h3>Messages <span class='muted' style='font-weight:normal'>· bundled, newest first</span></h3>"
+            "<table class='filterable sortable' data-sk='stat-fault-msgs'><tr><th>host</th>"
+            "<th>backend</th><th>source</th><th>kind</th><th>message (latest)</th><th>count</th>"
+            f"<th>first</th><th>last</th></tr>{rows}</table>") if rows else ""
+    return head + table + msgs
+
+
+def _dash_backends(bes: list, offline: list, fmap: Optional[dict] = None) -> str:
     """Per-backend live table, sorted ready → busy → off → disabled."""
     def srank(b):
         if not b.get("enabled"):
@@ -5897,8 +6012,17 @@ def _dash_backends(bes: list, offline: list) -> str:
         if not b.get("enabled"):
             return _badge("⏻ offline", "warn")
         if not b.get("healthy"):
-            return _badge("off", "bad")
+            return _down_badge(b.get("error"))          # names the cause, not just "off"
         return _badge("busy", "warn") if b.get("busy") else _badge("ready", "ok")
+
+    def fcell(b):
+        s = (fmap or {}).get(_bid(b)) or {}
+        nf = int(s.get("faults") or 0)
+        if not nf:
+            return "<td><span class='muted'>0</span></td>"
+        tip = f"{nf} failures in 24h · last: {s.get('last_detail') or ''}"
+        return (f"<td><a href='/ui/statistic#faults' title='{_esc(tip)}'>"
+                f"{_badge(str(nf), 'bad')}</a></td>")
 
     brows = ""
     for b in sorted(bes, key=lambda x: (srank(x), x.get("name", "").lower())):
@@ -5915,13 +6039,14 @@ def _dash_backends(bes: list, offline: list) -> str:
         # from the other's content, the exact per-tick full-row rewrite keys prevent.
         brows += (f"<tr data-k=\"bk-{_esc(_bid(b))}\"><td>{_esc(b['name'])}</td><td>{_type_badge(b.get('type'))}</td>"
                   f"<td>{bstatus(b)}</td><td>{inf}</td><td>{r1h_cell}</td>"
-                  f"<td>{b.get('models', 0)}</td>"
+                  f"{fcell(b)}<td>{b.get('models', 0)}</td>"
                   f"<td>{_loaded_text(b.get('loaded')) or '<span class=muted>—</span>'}</td></tr>")
     off_hint = (f" · {len(offline)} offline hidden (<a href='/ui/backends'>manage</a>)" if offline else "")
     return (f"<h2>Backends <span class='muted' style='font-weight:normal;font-size:12px'>"
             f"· click a header to sort{off_hint}</span></h2>"
             f"<table class='sortable' data-sk='dash-backends'><tr><th>backend</th><th>type</th><th>status</th>"
             f"<th>in flight</th><th title='requests handled in the last hour'>req · 1h</th>"
+            f"<th title='failures recorded in the last 24h (health polls, calls, jobs)'>faults · 24h</th>"
             f"<th>models</th><th title='llama-swap: the model(s) loaded right now — what "
             f"&lt;backend&gt;/current routes to'>loaded</th></tr>{brows}</table>")
 
@@ -6000,9 +6125,11 @@ async def dashboard_page(request: Request):
     offline = [b for b in bes_all if not b.get("enabled")]
     bes = [b for b in bes_all if b.get("enabled")]
     now = int(time.time())
+    f = await asyncio.to_thread(_faults_info)
+    fmap = {s.get("bid"): s for s in f.get("backends") or []}
     body = ("<h2>Dashboard <span class='muted' style='font-weight:normal'>· live · auto-refresh 4s</span></h2>"
-            + _dash_cards(d, bes) + _dash_backends(bes, offline) + _dash_parked(d)
-            + _dash_llm(d, now) + _dash_jobs(d, now) + _JOB_TICK)
+            + _dash_cards(d, bes, f) + _dash_backends(bes, offline, fmap) + _dash_faults(f)
+            + _dash_parked(d) + _dash_llm(d, now) + _dash_jobs(d, now) + _JOB_TICK)
     return HTMLResponse(_page("Dashboard", body, "dashboard", refresh=4))
 
 
@@ -6221,13 +6348,15 @@ def _media_gen_panel() -> str:
 
 
 async def statistic_page(request: Request):
+    # The fault log is its own store (faults.py), not stats.calls — shown either way.
+    fpanel = _faults_panel(await asyncio.to_thread(_faults_info))
     if not stats.is_active():
         # Media aggregates live in the JOB store, not in stats.calls — they are there to
         # show even when call recording is off, and this is the page they belong on.
         media = await asyncio.to_thread(_media_gen_panel)
         return HTMLResponse(_page("Statistic", "<h2>Statistic</h2><p class='hint'>Call recording is off. "
             "Enable <b>stats</b> in the <a href='/ui/server'>Server</a> tab (needs a restart) to collect "
-            "per-call stats here.</p>" + media + (_FILTER_JS if media else ""), "statistic"))
+            "per-call stats here.</p>" + fpanel + media + _FILTER_JS, "statistic"))
     user = (request.query_params.get("user") or "").strip() or None
     s = await asyncio.to_thread(stats.summary, user=user)
     aliases = store.get_ip_aliases()
@@ -6290,7 +6419,7 @@ async def statistic_page(request: Request):
               "moved to the <a href='/ui/llmcalls'>LLM Calls</a> tab.</p>")
     media = await asyncio.to_thread(_media_gen_panel)
     head = f"<h2>Statistic{scope}</h2>{bar}"
-    body = head + cards + by_backend + by_model + by_source + media + recent + _FILTER_JS
+    body = head + cards + fpanel + by_backend + by_model + by_source + media + recent + _FILTER_JS
     return HTMLResponse(_page("Statistic", body, "statistic"))
 
 

@@ -31,7 +31,7 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
   restart for backend/alias changes. Read **only at startup**:
   `stats.enabled` and the stats/jobs DB paths.
 - **No linter or build step, and no blanket test suite** — only targeted stdlib
-  `unittest` files for the mechanisms that fail SILENTLY (see the twenty-eight listed under
+  `unittest` files for the mechanisms that fail SILENTLY (see the twenty-nine listed under
   `anthropic_bridge.py`): `venv/bin/python -m unittest discover -s tests -t .`.
   Everything else is verified by running the server and hitting endpoints with
   `curl` (README "Try it"), `curl localhost:4000/health` for a routing snapshot, or
@@ -44,11 +44,11 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
 
 ## Architecture
 
-Sixteen self-contained Python files hold everything (`ls *.py` is the count of
+Seventeen self-contained Python files hold everything (`ls *.py` is the count of
 record; the tests live in `tests/`). `main.py` owns app state; the others
 (`adapters`, `meshy`, `tripo`, `cloudtask`, `jobs`, `store`, `stats`, `admin`,
 `reasoning`, `scheduler`, `responses_bridge`, `anthropic_bridge`,
-`openai_image_bridge`, `previewanim`, `netscan`) never import `main` — they receive what
+`openai_image_bridge`, `previewanim`, `netscan`, `faults`) never import `main` — they receive what
 they need via injected callables, staying hot-reload-safe.
 
 - **`main.py`** — config loading, health/discovery loop, routing, all HTTP
@@ -385,6 +385,28 @@ they need via injected callables, staying hot-reload-safe.
   reasoning as `meshy.opt_polycount`: a stored value out of range means the candidate
   is broken, and silently rewriting an admin's number is worse than falling back).
   Covered by `test_tripo.py` + `test_tripo_adapter.py` (HTTP stub).
+- **`faults.py`** — the backend fault log (pure, stdlib only): every time a backend
+  FAILED, kept for the console. It exists because every such signal used to vanish by
+  itself — `backend_error` is popped by the next good poll, a failed-over chat call
+  books as a 200, a job that crashed and then succeeded on a retry is a clean `done` —
+  so comfyui-strix (Evo-X2) crashing five times in 20 min on 2026-09-13 showed nowhere
+  but the journal. `main._note_fault(backend, source, kind, detail)` records at the
+  recording points: `health` in `refresh_backend` (ONCE per outage, on the UP→DOWN
+  transition; the next UP writes kind `faults.RECOVERED` with `dur_s` = the outage,
+  which is what downtime sums from), `call` in `_dispatch_over` (failover exceptions,
+  llama-swap's 502, and any 5xx passed to the client, with the body snippet), `job` in
+  `_run_job`/`_run_chain` (EVERY failed attempt, self-retries included — the job row
+  hides those), `watchdog` in `_spawn_comfy_restart`. Always on and independent of
+  `stats.enabled`: a bounded memory ring plus SQLite `faults.db` (`faults.db_path`,
+  `retention_days` default 7, startup-only; an unopenable DB degrades to memory and the
+  Statistic panel says so). `bundles()` groups by backend+source+kind+status+
+  `bundle_key` (hex ids and numbers masked), `per_backend()` clips downtime to the
+  window and counts an outage STILL open (`down_since` from `backend_error`) up to now.
+  `main.faults_info()` resolves Hosts-tab labels and feeds the Dashboard (card, a
+  `faults · 24h` column, panel `_dash_faults`) and Statistic (`_faults_panel`, anchor
+  `#faults`); `/health` carries `faults_24h` per backend. `faults.db*` is in
+  `.gitignore` AND both `deploy.sh` exclude lists — without the latter `rsync --delete`
+  wipes prod's log on every deploy. `test_faults.py`.
 - **`jobs.py`** — generation job store: SQLite metadata + on-disk artifacts under
   `jobs/<id>/<n>.<ext>` (image/video/audio; manifest carries `kind`+`mime`),
   lifecycle `queued→running→done|failed`, TTL pruning. Also persists job **inputs**
@@ -550,7 +572,7 @@ they need via injected callables, staying hot-reload-safe.
   silently answer about content the model never saw (documents/PDFs). Covered by
   `test_anthropic_bridge.py` (stdlib `unittest` — a streaming tool-call bridge fails
   silently rather than crashing). `ls tests/test_*.py` is the count of record —
-  **twenty-eight** files today — and each exists for that same reason: the mechanism it
+  **twenty-nine** files today — and each exists for that same reason: the mechanism it
   guards fails SILENTLY, so it is named next to that mechanism above.
   `test_anthropic_bridge.py`, `test_prune_branch.py` (a
   dead-branch prune that cascades one node too far or too few surfaces as an aborted
@@ -647,6 +669,12 @@ they need via injected callables, staying hot-reload-safe.
   `git ls-files` and allows the old name only in `docs/superpowers/`, `docs/archive/`
   (history keeps the name of its time) and ONCE each in README.md/CLAUDE.md as the
   migration note, and it pins `deploy.sh`'s `DEST`/`SERVICE` against the unit file.
+  `test_faults.py` (the backend fault log: a log that records nothing, records an ongoing
+  outage once per POLL, splits one crash into twenty lines or merges two different ones
+  looks exactly like a healthy fleet — it pins the recording points in `refresh_backend`
+  and `_dispatch_over` incl. a failover that ends in 200, the bundling, the downtime
+  clipping and open outage, persistence across a restart, and what Dashboard/Statistic
+  render).
   Run them all with `python -m unittest discover -s tests -t .` (no runner dependency).
 - **`openai_image_bridge.py`** — pure request/response plumbing for the OpenAI
   image shims (`multipart_list`, `parse_size`, `coerce_scalar`, `images_uploads`

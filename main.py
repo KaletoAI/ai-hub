@@ -24,6 +24,7 @@ from watchfiles import awatch
 import adapters
 import admin
 import anthropic_bridge
+import faults
 import jobs
 import reasoning
 import scheduler
@@ -536,12 +537,14 @@ def _spawn_comfy_restart(backend: dict, adapter, why: str) -> None:
     bid = backend_id(backend)
     _comfy_restarting.add(bid)
     logger.warning(f"[{backend['name']}] restarting ComfyUI service ({why})")
+    _note_fault(backend, "watchdog", "restart", why)
 
     async def _run():
         try:
             await adapter.restart()
         except Exception as e:
-            logger.warning(f"[{backend['name']}] ComfyUI restart failed: {e}")
+            logger.warning(f"[{backend['name']}] ComfyUI restart failed: {_err_text(e)}")
+            _note_fault(backend, "watchdog", "restart_failed", _err_text(e))
         finally:
             _comfy_restarting.discard(bid)
     asyncio.create_task(_run())
@@ -599,6 +602,28 @@ def _classify_error(e: Exception) -> dict:
     else:
         kind = "error"
     return {"kind": kind, "status": status, "detail": detail[:300], "since": int(time.time())}
+
+
+def _note_fault(backend: dict, source: str, kind: str, detail: str = "",
+                status: Optional[int] = None, dur_s: Optional[int] = None) -> None:
+    """Put one backend failure into the fault log (faults.py) — the console's only
+    memory of it once the backend is healthy again. Never raises into the caller."""
+    try:
+        bid = backend_id(backend)
+        faults.record(bid=bid, backend=backend["name"], type=backend.get("type", "openai"),
+                      host=backend_hosts.get(bid) or backend_host(backend), source=source,
+                      kind=kind, detail=detail, status=status, dur_s=dur_s)
+    except Exception as e:
+        logger.warning(f"faults: could not record a fault for [{backend.get('name')}]: {e}")
+
+
+def _resp_snippet(resp) -> str:
+    """The first bytes of an upstream error body, for the fault log (a streamed
+    response carries no body attribute — then just the status)."""
+    body = getattr(resp, "body", None)
+    if isinstance(body, (bytes, bytearray)) and body:
+        return bytes(body[:300]).decode("utf-8", "replace")
+    return f"HTTP {getattr(resp, 'status_code', '?')}"
 
 
 def merge_learned_context(old: Optional[dict], new: Optional[dict]) -> dict[str, int]:
@@ -704,7 +729,11 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
         if filtered and (not was_healthy or changed):   # same cadence as the UP log — never every poll
             logger.info(f"[{label}] model filter — {len(caps.models)} of {total} models kept")
         backend_healthy[bid] = True
-        backend_error.pop(bid, None)
+        prev_err = backend_error.pop(bid, None)
+        if prev_err and not was_healthy:   # closes an outage the fault log opened → its length
+            down_s = max(0, int(time.time()) - int(prev_err.get("since") or time.time()))
+            _note_fault(backend, "health", faults.RECOVERED,
+                        f"back after {down_s} s ({prev_err.get('kind')})", dur_s=down_s)
         if not was_healthy or changed:     # a backend came online / gained models →
             _notify_slot_free()            # let parked calls re-evaluate and grab it
     except Exception as e:
@@ -717,7 +746,10 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
         backend_error[bid] = info
         if backend_healthy.get(bid, True):
             hint = " (credential rejected — check the api key)" if info["kind"] == "auth" else ""
-            logger.warning(f"[{label}] DOWN — {e}{hint}")
+            # `_err_text`: an httpx timeout stringifies to "" — the journal read "DOWN —"
+            # with nothing after it (measured 2026-09-12/13 on prod, a dozen times).
+            logger.warning(f"[{label}] DOWN — {_err_text(e)}{hint}")
+            _note_fault(backend, "health", info["kind"], info["detail"], status=info["status"])
         backend_healthy[bid] = False
         backend_pricing[bid] = {}
         backend_loras[bid] = set()
@@ -886,6 +918,13 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.info(f"gen-speed seed skipped: {e}")
 
+    # Backend fault log (faults.py): always on, like the store — it is what the
+    # Dashboard and Statistic show once a failed backend is healthy again. Opened
+    # BEFORE the first discovery, so a backend already down at boot is recorded.
+    faults_cfg = config.get("faults") or {} if isinstance(config, dict) else {}
+    faults.init(faults_cfg.get("db_path", "faults.db"))
+    faults_prune_task = asyncio.create_task(faults.prune_loop(faults_cfg.get("retention_days", 7)))
+
     log_config_summary()
     await asyncio.gather(*[refresh_backend(b, http_client) for b in enabled_backends()])
     health_task = asyncio.create_task(health_loop())
@@ -916,6 +955,7 @@ async def lifespan(app: FastAPI):
     health_task.cancel()
     probe_task.cancel()
     watch_task.cancel()
+    faults_prune_task.cancel()
     if jobs_prune_task is not None:
         jobs_prune_task.cancel()
     if prune_task is not None:
@@ -1911,11 +1951,20 @@ async def _dispatch_over(candidates, path, alias, body, request, stats_endpoint=
             request.state.gw_dispatched = True
             if _retryable_upstream_error(resp):
                 logger.warning(f"✗ [{backend['name']}] upstream can't start the model (502) — trying next")
+                _note_fault(backend, "call", "load_failed", f"{real_model}: {_resp_snippet(resp)}", 502)
                 last_resp = resp
                 continue
+            # A 5xx the client gets as-is is still the BACKEND failing — the call log
+            # keeps only the status, the fault log keeps what the backend said.
+            if getattr(resp, "status_code", 0) >= 500:
+                _note_fault(backend, "call", "upstream", f"{real_model}: {_resp_snippet(resp)}",
+                            resp.status_code)
             return resp
         except (httpx.ConnectError, httpx.TimeoutException) as e:
-            logger.warning(f"✗ [{backend['name']}] {e} — trying next")
+            logger.warning(f"✗ [{backend['name']}] {_err_text(e)} — trying next")
+            # Failed over — the call may still end as a 200 elsewhere, which is exactly
+            # why this is invisible anywhere but here.
+            _note_fault(backend, "call", _classify_error(e)["kind"], f"{real_model}: {_err_text(e)}")
             last_error = e
     if last_resp is not None:                     # every candidate failed to load → the real 502
         return last_resp
@@ -2820,6 +2869,21 @@ def _fault_label(e: BaseException) -> str:
     return "connection issue"
 
 
+def _gen_fault_kind(e: BaseException) -> str:
+    """`_fault_label` as a short fault-log kind (same distinctions, same order)."""
+    if isinstance(e, adapters.CloudNoCredits):
+        return "no_credits"
+    if isinstance(e, adapters.CloudBusy):
+        return "rate_limit"
+    if isinstance(e, adapters.CloudTaskRetryable):
+        return "vendor_failed"
+    if isinstance(e, TimeoutError):
+        return "max_wait"
+    if isinstance(e, httpx.TimeoutException):
+        return "timeout"
+    return "unreachable"
+
+
 def _gen_exhausted_msg(last: Optional[BaseException]) -> str:
     """The message a generation job dies with once every candidate is used up.
 
@@ -3231,6 +3295,9 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req) -> None
                     # both fail over, but they are different faults — name them apart so
                     # the log points at the workflow, not the network (see _gen_exhausted_msg)
                     what = _fault_label(e)
+                    # Recorded on EVERY attempt: a self-retry that then succeeds leaves a
+                    # clean `done` row, and the crash that forced it is only visible here.
+                    _note_fault(backend, "job", _gen_fault_kind(e), f"{alias}: {what}: {_err_text(e)}")
                     if attempt < tries:
                         logger.warning(f"✗ job {job_id} [{backend['name']}] {what} "
                                        f"({type(e).__name__}: {e}) — retrying same backend "
@@ -3252,6 +3319,7 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req) -> None
                     # update broke every Flux-family model load, and four user retries in a
                     # row died on it while two backends that could run the alias sat idle).
                     _record_gen_attempt(bid, conn_fail=False, exec_fail=True)
+                    _note_fault(backend, "job", "execution", f"{alias}: {_err_text(e)}")
                     cloud_trace = _cloud_trace_of(req) or cloud_trace
                     if adapters.cloud_kind(cand):
                         # A cloud task is BILLED. Whatever failed here may have happened
@@ -3640,6 +3708,8 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                         if s1_attempt >= s1_tries:
                             raise                # outer handler records + fails over
                         _record_gen_attempt(bid, conn_fail=True)
+                        _note_fault(backend, "job", _gen_fault_kind(e),
+                                    f"{alias} (chain stage 1): {_fault_label(e)}: {_err_text(e)}")
                         logger.warning(f"✗ chain job {job_id} stage 1 [{backend['name']}] "
                                        f"{_fault_label(e)} ({type(e).__name__}: {e}) — retrying "
                                        f"same backend (self-retry {s1_attempt}/{s1_tries - 1})")
@@ -3804,7 +3874,9 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 return
             except _GEN_FAILOVER_ERRORS as e:
                 _record_gen_attempt(backend_id(active), conn_fail=True)
-                if s1_done:                              # mesh already relayed — a stage-2 loss is final
+                _note_fault(active, "job", _gen_fault_kind(e),
+                            f"{alias}→{succ_alias}: {_fault_label(e)}: {_err_text(e)}")
+                if s1_done:                            # mesh already relayed — a stage-2 loss is final
                     # `_err_text`: this is the branch an httpx WriteTimeout lands in, and
                     # its str() is empty — the row used to read "chain failed: " (2026-09-02).
                     logger.warning(f"✗ chain job {job_id} [{active['name']}] ({alias}→{succ_alias}) "
@@ -3819,6 +3891,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 asyncio.create_task(_free_comfy_vram(backend, "chain stage-1 failure"))
                 continue
             except Exception as e:
+                _note_fault(active, "job", "execution", f"{alias}→{succ_alias}: {_err_text(e)}")
                 logger.warning(f"✗ chain job {job_id} [{active['name']}] ({alias}→{succ_alias}) "
                                f"failed: {_err_text(e)}")
                 await asyncio.to_thread(jobs.fail, job_id, f"chain failed: {_err_text(e)}", fail_meta())
@@ -4469,6 +4542,7 @@ def dashboard_snapshot() -> dict:
         bes.append({
             "name": b["name"], "type": b.get("type", "openai"),
             "enabled": en, "healthy": en and backend_healthy.get(bid, False),
+            "error": backend_error.get(bid) if en else None,   # why it is down → the status chip
             "busy": en and backend_busy(b), "inflight": backend_inflight.get(bid, 0),
             "draining": is_draining(b),
             "max_concurrent": backend_max_concurrent(b),
@@ -4497,6 +4571,49 @@ def dashboard_snapshot() -> dict:
         "llm_running": sorted(_active_calls.values(), key=lambda c: c.get("started", 0)),
         "llm_recent": stats.recent_since(int(time.time()) - 300) if stats.is_active() else [],
     }
+
+
+def faults_info(window_s: int = faults.WINDOW_S) -> dict:
+    """The last `window_s` of the fault log, derived for the console (Dashboard +
+    Statistic): `backends` = one summary per backend (faults, outages, downtime incl.
+    an outage STILL open, the last error), `bundles` = the faults grouped by message.
+    Host labels come from the Hosts settings — the operator thinks "the Evo-X2 fell
+    over", not "192.168.8.228"."""
+    now = int(time.time())
+    since = now - int(window_s)
+    evs = faults.events_since(since)
+    by_bid = {backend_id(b): b for b in backends}
+    down_since = {bid: int((backend_error.get(bid) or {}).get("since") or now)
+                  for bid, b in by_bid.items()
+                  if is_enabled(b) and bid in backend_error and not backend_healthy.get(bid, False)}
+    per = faults.per_backend(evs, since, now, down_since)
+
+    def label(host: str) -> str:
+        return ((hosts_meta.get(host) or {}).get("label") or "").strip()
+
+    rows = []
+    for bid, s in per.items():
+        b = by_bid.get(bid)
+        if b is not None:
+            s["backend"], s["type"] = b["name"], b.get("type", "openai")
+            s["host"] = backend_hosts.get(bid) or backend_host(b)
+            s["enabled"] = is_enabled(b)
+            s["healthy"] = s["enabled"] and backend_healthy.get(bid, False)
+            s["error"] = backend_error.get(bid) if s["enabled"] else None
+        else:                                    # removed since — history stays readable
+            s.update(enabled=False, healthy=False, error=None)
+        s["host_label"] = label(s["host"])
+        rows.append(s)
+    rows.sort(key=lambda s: (s["healthy"], -(s["faults"]), -(s["last_ts"] or 0), s["backend"].lower()))
+    bundles = faults.bundles(evs)
+    for g in bundles:
+        b = by_bid.get(g["bid"])
+        if b is not None:
+            g["host"] = backend_hosts.get(g["bid"]) or backend_host(b)
+        g["host_label"] = label(g["host"])
+    return {"since": since, "now": now, "window_s": int(window_s),
+            "persistent": faults.is_persistent(), "backends": rows, "bundles": bundles,
+            "total": sum(s["faults"] for s in rows)}
 
 
 def gen_speed_info() -> dict:
@@ -4942,6 +5059,7 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
            gen_backends=lambda: [b for b in backends if _is_gen(b)],
            gateway_info=gateway_info,
            gen_speed_info=gen_speed_info,
+           faults_info=faults_info,
            job_progress=lambda job_id: gen_progress.get(job_id),
            apply_backends=apply_backend_change,
            llm_backends=llm_backends_info,
@@ -4974,6 +5092,7 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
 
 @app.get("/health")
 async def health():
+    fmap = {s["bid"]: s for s in (await asyncio.to_thread(faults_info))["backends"]}
     return {
         "status": "ok",
         "parked": len(_parked),
@@ -4990,6 +5109,10 @@ async def health():
                 "tps": round(backend_tps.get(backend_id(b), 0.0), 1),
                 "sampling_defaults": b.get("sampling_defaults") or None,
                 "models": sorted(backend_models.get(backend_id(b), set())) if is_enabled(b) else [],
+                # What the fault log holds for the last 24h (faults.py) — the current
+                # `error` above is gone the moment the next poll succeeds.
+                "faults_24h": {k: (fmap.get(backend_id(b)) or {}).get(k, 0)
+                               for k in ("faults", "outages", "downtime_s")},
                 **_comfy_watch_info(b), **_cloud_info(b), **_model_filter_info(b), **_loaded_info(b),
             }
             for b in backends
