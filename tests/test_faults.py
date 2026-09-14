@@ -128,13 +128,26 @@ class Storage(unittest.TestCase):
         path = os.path.join(self._dir.name, "faults.db")
         faults.init(path)
         faults.record(bid="comfyui:strix", backend="strix", type="comfyui", host="h",
-                      source="health", kind="unreachable", detail="All connection attempts failed",
-                      ts=1000)
+                      source="health", kind="upstream", detail="HTTP 500", ts=1000)
         faults._MEM.clear()                                       # "restart": memory is gone
         faults.init(path)
         evs = faults.events_since(0)
         self.assertEqual(len(evs), 1)
-        self.assertEqual((evs[0]["backend"], evs[0]["kind"], evs[0]["host"]), ("strix", "unreachable", "h"))
+        self.assertEqual((evs[0]["backend"], evs[0]["kind"], evs[0]["host"]), ("strix", "upstream", "h"))
+
+    def test_unreachable_is_never_recorded_and_old_rows_are_hidden(self):
+        path = os.path.join(self._dir.name, "faults.db")
+        faults.init(path)
+        self.assertIsNone(faults.record(bid="openai:a", backend="a", source="health",
+                                        kind="unreachable", ts=1000))
+        # A row written before the rule existed (prod has some) must not show either.
+        old = dict(ts=1001, bid="openai:a", backend="a", type="openai", host="", source="health",
+                   kind="unreachable", status=None, detail="refused", dur_s=None)
+        faults._insert(old)
+        faults._MEM.append(dict(old))
+        self.assertEqual(faults.events_since(0), [])
+        faults._DB_PATH = None                                    # the memory path filters too
+        self.assertEqual(faults.events_since(0), [])
 
     def test_unopenable_db_falls_back_to_memory(self):
         faults.init(os.path.join(self._dir.name, "no", "such", "dir", "faults.db"))
@@ -189,19 +202,30 @@ EVO = {"name": "comfyui-strix", "type": "comfyui", "url": "http://192.168.8.228:
 
 class HealthTransitions(_MainState):
     def test_down_is_recorded_once_per_outage_not_per_poll(self):
-        bad = _Adapter(fail=httpx.ConnectError("All connection attempts failed"))
+        bad = _Adapter(fail=httpx.ReadTimeout("backend hung"))
         for _ in range(3):
             self._poll(EVO, bad)
         evs = faults.events_since(0)
-        self.assertEqual([(e["source"], e["kind"]) for e in evs], [("health", "unreachable")])
-        self.assertEqual(evs[0]["detail"], "All connection attempts failed")
+        self.assertEqual([(e["source"], e["kind"]) for e in evs], [("health", "timeout")])
+        self.assertEqual(evs[0]["detail"], "backend hung")
+
+    def test_a_switched_off_backend_is_not_a_fault(self):
+        # Kai, 2026-09-14: a backend that is off is a state, not an error — neither its
+        # going down nor its coming back belongs in the fault log.
+        self._poll(EVO, _Adapter(fail=httpx.ConnectError("All connection attempts failed")))
+        bid = main.backend_id(EVO)
+        self.assertEqual(main.backend_error[bid]["kind"], "unreachable")   # live status keeps it
+        main.backend_error[bid]["since"] -= 3600
+        self.assertEqual(main.faults_info()["backends"], [])            # no open-outage downtime
+        self._poll(EVO, _Adapter())
+        self.assertEqual(faults.events_since(0), [])
 
     def test_an_empty_timeout_message_still_says_what_happened(self):
         self._poll(EVO, _Adapter(fail=httpx.ReadTimeout("")))
         self.assertEqual(faults.events_since(0)[0]["detail"], "ReadTimeout")
 
     def test_recovery_closes_the_outage_with_its_length(self):
-        self._poll(EVO, _Adapter(fail=httpx.ConnectError("refused")))
+        self._poll(EVO, _Adapter(fail=httpx.ReadTimeout("hung")))
         bid = main.backend_id(EVO)
         main.backend_error[bid]["since"] -= 90                    # it has been down 90 s
         self._poll(EVO, _Adapter())
@@ -222,17 +246,26 @@ class DispatchFailover(_MainState):
         return asyncio.run(main._dispatch_over([(b, "m") for b, _ in cands], "/v1/chat/completions",
                                                "tool", {"model": "tool"}, request))
 
-    def test_a_failover_that_ends_in_200_is_still_recorded(self):
+    def test_failing_over_from_a_switched_off_backend_is_not_a_fault(self):
         from fastapi.responses import Response
         a = {"name": "llamaswap-strix", "type": "openai", "url": "http://192.168.8.31:8080"}
         b = {"name": "dx10-01", "type": "openai", "url": "http://192.168.8.35:8080"}
         main.backend_adapters = {main.backend_id(a): _Adapter(fail=httpx.ConnectError("refused")),
                                  main.backend_id(b): _Adapter(resp=Response(b"{}", status_code=200))}
+        self.assertEqual(self._dispatch([(a, None), (b, None)]).status_code, 200)
+        self.assertEqual(faults.events_since(0), [])
+
+    def test_a_failover_that_ends_in_200_is_still_recorded(self):
+        from fastapi.responses import Response
+        a = {"name": "llamaswap-strix", "type": "openai", "url": "http://192.168.8.31:8080"}
+        b = {"name": "dx10-01", "type": "openai", "url": "http://192.168.8.35:8080"}
+        main.backend_adapters = {main.backend_id(a): _Adapter(fail=httpx.ReadTimeout("slow")),
+                                 main.backend_id(b): _Adapter(resp=Response(b"{}", status_code=200))}
         resp = self._dispatch([(a, None), (b, None)])
         self.assertEqual(resp.status_code, 200)
         evs = faults.events_since(0)
         self.assertEqual([(e["backend"], e["source"], e["kind"]) for e in evs],
-                         [("llamaswap-strix", "call", "unreachable")])
+                         [("llamaswap-strix", "call", "timeout")])
 
     def test_a_5xx_passed_to_the_client_keeps_the_backend_text(self):
         from fastapi.responses import Response
@@ -245,6 +278,17 @@ class DispatchFailover(_MainState):
         self.assertIn("model crashed", ev["detail"])
 
 
+class GenFaultKind(unittest.TestCase):
+    def test_off_versus_lost_mid_job(self):
+        self.assertEqual(main._gen_fault_kind(httpx.ConnectError("refused")), "unreachable")
+        self.assertEqual(main._gen_fault_kind(httpx.ConnectTimeout("")), "unreachable")
+        self.assertEqual(main._gen_fault_kind(httpx.ReadTimeout("")), "timeout")
+        self.assertEqual(main._gen_fault_kind(ConnectionError(
+            "ComfyUI unreachable for >15s during execution (likely crashed/restarting)")),
+            "connection_lost")
+        self.assertEqual(main._gen_fault_kind(httpx.ReadError("")), "connection_lost")
+
+
 class FaultsInfo(_MainState):
     def test_host_label_open_outage_and_totals(self):
         main.backends = [EVO]
@@ -252,7 +296,7 @@ class FaultsInfo(_MainState):
         main.backend_hosts = {bid: "192.168.8.228"}
         main.hosts_meta = {"192.168.8.228": {"label": "Evo-X2"}}
         main.backend_healthy = {bid: False}
-        main.backend_error = {bid: {"kind": "unreachable", "status": None, "detail": "x",
+        main.backend_error = {bid: {"kind": "timeout", "status": None, "detail": "x",
                                     "since": int(main.time.time()) - 120}}
         faults.record(bid=bid, backend="comfyui-strix", type="comfyui", host="192.168.8.228",
                       source="job", kind="execution", detail="boom")

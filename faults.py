@@ -36,6 +36,12 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 RECOVERED = "recovered"          # kind of the event that CLOSES an outage (not a fault)
+# Kinds that are NOT faults. A backend nobody can connect to is switched OFF — a state,
+# not an error (Kai, 2026-09-14: "wenn ein Backend aus ist, so ist dies kein Fehler").
+# The live status column still says "unreachable"; this log is for REAL errors —
+# timeouts, 5xx, crashes, execution failures. A connection that drops WHILE a job runs
+# is not this kind: main books it as `connection_lost` (the box died mid-work).
+NOT_FAULT_KINDS = frozenset({"unreachable"})
 WINDOW_S = 86400                 # what the console shows: the last 24h
 _MEM_MAX = 5000
 _DETAIL_MAX = 500
@@ -94,8 +100,12 @@ def _insert(ev: dict) -> None:
 
 def record(*, bid: str, backend: str, source: str, kind: str, detail: str = "",
            type: str = "openai", host: str = "", status: Optional[int] = None,
-           dur_s: Optional[int] = None, ts: Optional[int] = None) -> dict:
-    """Record one event. Never raises; on an event loop the DB write runs off-loop."""
+           dur_s: Optional[int] = None, ts: Optional[int] = None) -> Optional[dict]:
+    """Record one event and return it. A kind in NOT_FAULT_KINDS is dropped HERE, so no
+    recording point can book a switched-off backend as a fault (returns None).
+    Never raises; on an event loop the DB write runs off-loop."""
+    if kind in NOT_FAULT_KINDS:
+        return None
     ev = {"ts": int(ts if ts is not None else time.time()), "bid": str(bid),
           "backend": str(backend), "type": str(type or "openai"), "host": str(host or ""),
           "source": str(source), "kind": str(kind or "error"),
@@ -113,17 +123,22 @@ def record(*, bid: str, backend: str, source: str, kind: str, detail: str = "",
 
 
 def events_since(since: int, limit: int = 20000) -> list:
-    """Events with ts > since, oldest first."""
+    """Events with ts > since, oldest first — never a NOT_FAULT_KINDS row (rows written
+    before the rule existed stay in the DB but are not shown)."""
+    skip = sorted(NOT_FAULT_KINDS)
     if _DB_PATH is not None:
         try:
             with sqlite3.connect(_DB_PATH, timeout=10) as c:
                 rows = c.execute(f"SELECT {', '.join(_COLS)} FROM faults WHERE ts > ? "
-                                 f"ORDER BY ts, id LIMIT ?", (int(since), int(limit))).fetchall()
+                                 f"AND kind NOT IN ({', '.join('?' * len(skip))}) "
+                                 f"ORDER BY ts, id LIMIT ?",
+                                 (int(since), *skip, int(limit))).fetchall()
             return [dict(zip(_COLS, r)) for r in rows]
         except Exception as e:
             logger.warning(f"faults: read failed, falling back to memory: {e}")
     with _lock:
-        return [dict(ev) for ev in _MEM if ev["ts"] > since][-limit:]
+        return [dict(ev) for ev in _MEM
+                if ev["ts"] > since and ev["kind"] not in NOT_FAULT_KINDS][-limit:]
 
 
 def prune(retention_s: int) -> int:

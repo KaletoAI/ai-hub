@@ -390,7 +390,14 @@ they need via injected callables, staying hot-reload-safe.
   itself — `backend_error` is popped by the next good poll, a failed-over chat call
   books as a 200, a job that crashed and then succeeded on a retry is a clean `done` —
   so comfyui-strix (Evo-X2) crashing five times in 20 min on 2026-09-13 showed nowhere
-  but the journal. `main._note_fault(backend, source, kind, detail)` records at the
+  but the journal. **`unreachable` is NOT a fault** (`faults.NOT_FAULT_KINDS`; Kai
+  2026-09-14: a backend that is off is a state, not an error): `record()` drops it and
+  `events_since()` hides rows written before the rule, so no recording point can book it,
+  and `faults_info` counts no downtime for such an outage — the live status keeps saying
+  "unreachable". A connection lost WHILE a job runs is `connection_lost`
+  (`_gen_fault_kind`: a builtin `ConnectionError`/`ReadError` after connecting — the
+  box died mid-work), which IS a fault. `main._note_fault(backend, source, kind, detail)`
+  records at the
   recording points: `health` in `refresh_backend` (ONCE per outage, on the UP→DOWN
   transition; the next UP writes kind `faults.RECOVERED` with `dur_s` = the outage,
   which is what downtime sums from), `call` in `_dispatch_over` (failover exceptions,

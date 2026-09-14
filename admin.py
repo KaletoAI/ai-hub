@@ -5893,6 +5893,7 @@ def _dash_cards(d: dict, bes: list, f: Optional[dict] = None) -> str:
 _FAULT_RED = " style='color:#e06c6c'"
 # Fault-log kinds beyond what a discovery poll can report (_DOWN_BADGE covers those).
 _FAULT_KIND = {
+    "connection_lost": "⚡ connection lost mid-job",
     "execution": "✖ execution failed", "load_failed": "✖ model load failed",
     "max_wait": "⏱ max_wait expired", "no_credits": "💳 no credits",
     "vendor_failed": "⚠ vendor failed the task", "restart": "⟳ restarted",
@@ -5973,6 +5974,8 @@ def _faults_panel(f: dict) -> str:
             "<b>down</b>, an LLM call that <b>failed over</b> or got a 5xx, a media job attempt "
             "that crashed (also when a retry or another backend then finished the job — which is "
             "why none of this shows in the call log or the job list), and ComfyUI restarts. "
+            "A backend that is simply <b>switched off</b> (unreachable) is not a fault and "
+            "does not appear here — its live status in the Dashboard says so. "
             "Messages that differ only in ids and numbers are bundled into one line."
             + ("" if f.get("persistent") else
                " <b>Kept in memory only</b> — the fault DB could not be opened, a restart forgets it.")

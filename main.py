@@ -730,7 +730,9 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
             logger.info(f"[{label}] model filter — {len(caps.models)} of {total} models kept")
         backend_healthy[bid] = True
         prev_err = backend_error.pop(bid, None)
-        if prev_err and not was_healthy:   # closes an outage the fault log opened → its length
+        # Closes an outage the fault log opened → its length. A switched-off backend coming
+        # back opened none (being off is not a fault — faults.NOT_FAULT_KINDS).
+        if prev_err and not was_healthy and prev_err.get("kind") not in faults.NOT_FAULT_KINDS:
             down_s = max(0, int(time.time()) - int(prev_err.get("since") or time.time()))
             _note_fault(backend, "health", faults.RECOVERED,
                         f"back after {down_s} s ({prev_err.get('kind')})", dur_s=down_s)
@@ -2879,9 +2881,14 @@ def _gen_fault_kind(e: BaseException) -> str:
         return "vendor_failed"
     if isinstance(e, TimeoutError):
         return "max_wait"
+    if isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout)):
+        return "unreachable"         # never connected: the backend is off — not a fault
     if isinstance(e, httpx.TimeoutException):
         return "timeout"
-    return "unreachable"
+    # Connected, then lost it — ComfyUI gone mid-execution (the adapter's ConnectionError
+    # after disconnect_grace), a dropped read: the box died WHILE working. A real error,
+    # unlike a backend that was simply switched off.
+    return "connection_lost"
 
 
 def _gen_exhausted_msg(last: Optional[BaseException]) -> str:
@@ -4585,7 +4592,8 @@ def faults_info(window_s: int = faults.WINDOW_S) -> dict:
     by_bid = {backend_id(b): b for b in backends}
     down_since = {bid: int((backend_error.get(bid) or {}).get("since") or now)
                   for bid, b in by_bid.items()
-                  if is_enabled(b) and bid in backend_error and not backend_healthy.get(bid, False)}
+                  if is_enabled(b) and bid in backend_error and not backend_healthy.get(bid, False)
+                  and (backend_error.get(bid) or {}).get("kind") not in faults.NOT_FAULT_KINDS}
     per = faults.per_backend(evs, since, now, down_since)
 
     def label(host: str) -> str:

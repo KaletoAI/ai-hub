@@ -1213,10 +1213,16 @@ failures — always on, independent of `stats.enabled`:
 
 | source | recorded when |
 |---|---|
-| `health` | a discovery poll sees the backend go DOWN (once per outage, with the cause: `unreachable`, `timeout`, `auth`, `upstream`, `stuck`, …); coming back UP closes the outage and stores its length |
+| `health` | a discovery poll sees the backend FAIL (once per outage, with the cause: `timeout`, `auth`, `not_found`, `upstream`, `stuck`, …); coming back UP closes the outage and stores its length |
 | `call` | a chat dispatch fails over (connect error/timeout, llama-swap "unable to start process") or returns a 5xx to the client — with the backend's own error text |
-| `job` | a generation attempt fails on the backend (connection lost, `max_wait`, execution error) — also when a self-retry or another backend then completed the job |
+| `job` | a generation attempt fails on the backend (`connection_lost` mid-job, `max_wait`, execution error) — also when a self-retry or another backend then completed the job |
 | `watchdog` | a ComfyUI service restart (auto or manual) and a failed restart |
+
+**A backend that is switched off is not a fault.** `unreachable` — no connection at all:
+host powered off, service stopped — is left out everywhere: no outage, no downtime, no
+failed-over call, no job attempt that never connected. The live status still shows it.
+A connection that drops WHILE a job runs is booked as `connection_lost` — the box died
+mid-work, which is a real error.
 
 The **Dashboard** shows a *backend faults · 24h* card, a per-backend column and a panel
 listing every backend that failed in the last 24h (faults, outages, downtime incl. an
