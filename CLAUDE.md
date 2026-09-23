@@ -420,7 +420,15 @@ they need via injected callables, staying hot-reload-safe.
   (`set_inputs`: prompt/params/reference images, each with `sha256`+`bytes` like a
   result entry — the job view proves WHICH bytes ran; JSON in meta, no migration)
   and `reconcile_orphans()` (startup:
-  mark interrupted `running`/`queued` as failed). Carries `owner`. Reused for
+  mark interrupted `running`/`queued` as failed). Terminal states are FINAL: every status
+  writer (`set_status`, `set_stage`, `fail`, `complete`, `complete_json`) is conditioned
+  on the row still being queued/running, so the first terminal write wins — a worker
+  finishing after a cancel can neither mark the job `done` nor resurrect it to `running`
+  (`set_status` returns False then, and the worker stops), and `complete()` of a row that
+  is no longer live writes no artifact directory. `merge_meta` is the one writer that
+  reaches a terminal row (facts, never status). `prune_once` removes FINISHED jobs only —
+  a short client `ttl_s` used to delete a running job under its worker.
+  `test_jobs_lifecycle.py`. Carries `owner`. Reused for
   **background Responses** jobs (task type `response`, result via `complete_json`).
 - **`store.py`** — writable SQLite store, the console's source of truth: backends,
   chat aliases, generation aliases (+ workflow_json/mapping/fixed), users (api keys
