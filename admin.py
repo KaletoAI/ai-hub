@@ -70,7 +70,7 @@ _LOADER_HINTS = ("loader", "checkpoint", "unet", "clip", "vae", "lora", "gguf", 
 # — only the label reads "Statistics".
 TABS = [
     ("dashboard", "Dashboard"), ("backends", "Backends"),
-    ("routing", "Input & Routing"), ("mapping", "Mapping"),
+    ("routing", "Input & Routing"), ("aliases", "Aliases"),
     ("reasoning", "Reasoning"),
     ("playground", "Playground"),
     ("jobs", "Jobs & Calls"),
@@ -83,10 +83,13 @@ DEFAULT_TAB = "dashboard"
 # register here; the parent page dispatches on `sub` and passes
 # _page(..., subnav=_subnav(parent, sub)) so the bar renders under the header.
 SUBTABS = {"playground": [("chat", "Chat"), ("media", "Media"), ("voice", "Voice")],
-           "mapping": [("chat", "Chat"), ("media", "Media")],
+           # Aliases = what used to be split over two tabs: the editor (Mapping) and the
+           # live alias→route overview (Input & Routing → Chat/Media aliases). The
+           # overview is the right column while no alias is picked.
+           "aliases": [("chat", "Chat"), ("media", "Media")],
            "jobs": [("llm", "LLM Calls"), ("media", "Media Jobs"), ("voice", "Voice Calls")],
-           "routing": [("input", "Input"), ("chat", "Chat aliases"), ("llm", "LLM models"),
-                       ("gen", "Media aliases"), ("image", "Image models"), ("loras", "LoRAs")]}
+           "routing": [("input", "Input"), ("llm", "LLM models"),
+                       ("image", "Image models"), ("loras", "LoRAs")]}
 
 
 def _subnav(parent: str, active_sub: str) -> str:
@@ -2900,16 +2903,33 @@ def _img_status(bm: Optional[dict]) -> str:
     return _badge("healthy", "ok")
 
 
+def _chat_routes_rows(a: dict) -> str:
+    """One chat alias's live routes (backend · model · status) as table rows."""
+    if not a["routes"]:
+        return '<tr><td colspan="3" class="muted">no mapped backends</td></tr>'
+    return "".join(f'<tr><td>{_esc(r["backend"])}</td><td><code>{_esc(r["model"])}</code></td>'
+                   f'<td>{_route_status(r)}</td></tr>' for r in a["routes"])
+
+
+def _chat_alias_routes(snap: dict, alias: str) -> str:
+    """The chat editor's live strip: where THIS alias resolves right now."""
+    a = next((x for x in snap.get("aliases", []) if x.get("alias") == alias), None)
+    if a is None:
+        return ""
+    return ("<h2>Live routes</h2>"
+            '<table data-sk="alias-routes"><tr><th>backend</th><th>model</th><th>status</th></tr>'
+            f"{_chat_routes_rows(a)}</table>")
+
+
 def _routing_chat_body(snap: dict) -> str:
     arows = ""
     for a in snap.get("aliases", []):
-        arows += f'<tr class="grp"><td colspan="3">{_esc(a["alias"])}</td></tr>'
-        if not a["routes"]:
-            arows += '<tr><td colspan="3" class="muted">no mapped backends</td></tr>'
-        for r in a["routes"]:
-            arows += (f'<tr><td>{_esc(r["backend"])}</td><td><code>{_esc(r["model"])}</code></td>'
-                      f'<td>{_route_status(r)}</td></tr>')
-    html = ("<h2>Chat aliases → routes</h2>" + (
+        arows += (f'<tr class="grp"><td colspan="3"><a href="/ui/aliases?cedit={_q(a["alias"])}">'
+                  f'{_esc(a["alias"])}</a></td></tr>')
+        arows += _chat_routes_rows(a)
+    html = ("<h2>Chat aliases → routes</h2>"
+            "<p class='hint'>Live: where each alias resolves right now. An alias name opens "
+            "its editor.</p>" + (
         '<table class="sortable" data-sk="routing-chat"><tr><th>alias / backend</th><th>model</th>'
         f'<th>status</th></tr>{arows}</table>'
         if arows else "<p class='muted'>No chat aliases configured.</p>"))
@@ -2952,9 +2972,12 @@ def _routing_gen_body(bmeta: dict, sel: Optional[str] = None) -> str:
     opts = "<option value=''>all backends</option>" + "".join(
         f"<option value='{_esc(b)}'{' selected' if b == sel else ''}>{_esc(b)} ({len(v)})</option>"
         for b, v in sorted(per_backend.items()))
-    picker = (f"<div style='margin:6px 0 10px'><select class='box' style='width:auto' "
-              f"onchange=\"location.href='/ui/routing?sub=gen'+"
-              f"(this.value?('&amp;backend='+encodeURIComponent(this.value)):'')\">{opts}</select></div>")
+    # A GET form, not a location.href handler: the picker is a VIEW filter, and the
+    # console keeps navigation out of inline handlers (test_ui_post_only).
+    picker = ("<form method='get' action='/ui/aliases' style='margin:6px 0 10px'>"
+              "<input type='hidden' name='sub' value='media'>"
+              f"<select name='backend' class='box' style='width:auto' "
+              f"onchange='this.form.submit()'>{opts}</select></form>")
 
     if sel:
         bm = bmeta.get(sel)
@@ -2972,7 +2995,7 @@ def _routing_gen_body(bmeta: dict, sel: Optional[str] = None) -> str:
                                            (f"{byp} bypassed" if byp else "")) if x) or "—"
             others = ", ".join(sorted(x.get("backend", "") for x in cands
                                       if (x.get("backend") or "").strip() != sel)) or "—"
-            rows += (f'<tr><td><a href="/ui/mapping?edit={_q(alias)}"><code>{_esc(alias)}</code></a></td>'
+            rows += (f'<tr><td><a href="/ui/aliases?edit={_q(alias)}"><code>{_esc(alias)}</code></a></td>'
                      f'<td>{_esc(c.get("task", ""))}</td>'
                      f'<td class="muted">{_esc(mapped)}</td><td>{_esc(local)}</td>'
                      f'<td class="muted">{_esc(others)}</td></tr>')
@@ -2987,7 +3010,8 @@ def _routing_gen_body(bmeta: dict, sel: Optional[str] = None) -> str:
 
     grows = ""
     for alias, cands in sorted(gen_aliases.items()):
-        grows += f'<tr class="grp"><td colspan="3">{_esc(alias)}</td></tr>'
+        grows += (f'<tr class="grp"><td colspan="3"><a href="/ui/aliases?edit={_q(alias)}">'
+                  f'{_esc(alias)}</a></td></tr>')
         for c in cands:
             bn = c.get("backend", "")
             bm = bmeta.get(bn)
@@ -2995,7 +3019,8 @@ def _routing_gen_body(bmeta: dict, sel: Optional[str] = None) -> str:
                       f'<td>{_img_status(bm)}</td></tr>')
     return ("<h2>Media Generation aliases → backends</h2>"
             "<p class='hint'>A job goes to the fastest free unpaid backend of this set, with "
-            "failover (see Mapping). Pick a backend to see everything mapped onto it instead.</p>"
+            "failover. Pick a backend to see everything mapped onto it instead; an alias name "
+            "opens its editor.</p>"
             + picker
             + ('<table class="sortable" data-sk="routing-gen"><tr><th>alias / backend</th><th>task</th>'
                f'<th>status</th></tr>{grows}</table>'
@@ -3034,14 +3059,17 @@ def _routing_loras_body(bmeta: dict) -> str:
 
 async def routing_page(request: Request):
     """Parent tab Input & Routing: what clients can call + how it resolves —
-    sub-tabs Input | Chat aliases | LLM models | Media aliases | Image models |
-    LoRAs (?sub=, first child = default)."""
+    sub-tabs Input | LLM models | Image models | LoRAs (?sub=, first child = default).
+    The alias overviews moved to the Aliases tab; their old URLs redirect there."""
     sub = request.query_params.get("sub") or SUBTABS["routing"][0][0]
+    if sub in ("chat", "gen"):
+        qs = {"sub": "chat" if sub == "chat" else "media"}
+        if request.query_params.get("backend"):
+            qs["backend"] = request.query_params["backend"]
+        return RedirectResponse(f"/ui/aliases?{urlencode(qs)}", status_code=307)
     info = _gateway_info()
     bmeta = {b["name"]: b for b in info.get("backends", []) if b.get("type") in adapters.GEN_TYPES}
-    if sub == "chat":
-        title, body = "Chat aliases", _routing_chat_body(_routing_snapshot())
-    elif sub == "llm":
+    if sub == "llm":
         snap = _routing_snapshot()
         on_llm = [m for m in snap.get("models", [])
                   if any(h.get("type") not in adapters.GEN_TYPES for h in m["hosts"])]
@@ -3053,9 +3081,6 @@ async def routing_page(request: Request):
             "intercepts the bare id.</p>"
             + _models_table([m for m in on_llm if not _is_image_model(m["model"])],
                             sk="routing-llm-models"))
-    elif sub == "gen":
-        title, body = "Media aliases", _routing_gen_body(
-            bmeta, (request.query_params.get("backend") or "").strip() or None)
     elif sub == "image":
         snap = _routing_snapshot()
         img_models = [m for m in snap.get("models", [])
@@ -3141,7 +3166,7 @@ def _chat_new_form(vals: Optional[dict] = None, err: str = "") -> str:
     bopts = [b["name"] for b in llm] or [("", "(no LLM backends)")]
     return ('<form action="/ui/chat/create" method="post" data-guard>'
             f'<div class="formbar"><h2>New Chat Alias</h2>{_btn("Create", submit=True)}'
-            f'{_btn("Cancel", "/ui/mapping", "secondary")}</div>'
+            f'{_btn("Cancel", "/ui/aliases", "secondary")}</div>'
             + _form_err(err)
             + _field("alias name", _inp("alias", v.get("alias", ""), placeholder="fast"), short=True)
             + _field("backend", _select("backend", bopts, v.get("backend")), short=True)
@@ -3237,7 +3262,7 @@ def _chat_editor(alias: str, raw: Optional[dict] = None, err: str = "") -> str:
     return ('<form action="/ui/chat/save" method="post" data-guard>'
             f'<input type="hidden" name="orig" value="{_esc(alias)}">'
             f'<div class="formbar"><h2>Edit Chat Alias</h2>{_btn("Save", submit=True)}'
-            f'{_btn("Cancel", "/ui/mapping", "secondary")}</div>'
+            f'{_btn("Cancel", "/ui/aliases", "secondary")}</div>'
             + _form_err(err)
             + _field("alias name", _inp("alias", r.get("alias", alias) if raw is not None else alias,
                                         placeholder="fast"), short=True)
@@ -3267,7 +3292,7 @@ async def chat_create(request: Request):
     store.upsert_chat_alias(alias, {backend: model})
     _apply_chat_aliases()
     logger.info(f"ui: chat alias '{alias}' created → {backend}/{model or '(no model)'}")
-    return RedirectResponse(f"/ui/mapping?cedit={_q(alias)}", status_code=303)
+    return RedirectResponse(f"/ui/aliases?cedit={_q(alias)}", status_code=303)
 
 
 def _chat_alias_taken(alias: str) -> bool:
@@ -3298,7 +3323,7 @@ async def chat_save(request: Request):
     if not alias:
         return await err("alias name is required")
     if not value:
-        return RedirectResponse(f"/ui/mapping?cedit={_q(orig)}" if orig else "/ui/mapping", status_code=303)
+        return RedirectResponse(f"/ui/aliases?cedit={_q(orig)}" if orig else "/ui/aliases", status_code=303)
     if alias != orig and _chat_alias_taken(alias):
         # the rename used to land ON the other alias: its mapping replaced, and its
         # park/reasoning/voice/sampling overrides silently adopted by this one
@@ -3319,7 +3344,7 @@ async def chat_save(request: Request):
     logger.info(f"ui: chat alias '{alias}' = {value} (park_s={park_s or 'default'}, "
                 f"reasoning={rsn or 'auto'}"
                 + (f", sampling={smp}" if smp else "") + ")")
-    return RedirectResponse("/ui/mapping", status_code=303)
+    return RedirectResponse("/ui/aliases", status_code=303)
 
 
 async def chat_badd(request: Request):
@@ -3331,7 +3356,7 @@ async def chat_badd(request: Request):
         cur[backend] = ""                     # model filled in the editor, then Save
         store.upsert_chat_alias(alias, cur)
         _apply_chat_aliases()
-    return RedirectResponse(f"/ui/mapping?cedit={_q(alias)}", status_code=303)
+    return RedirectResponse(f"/ui/aliases?cedit={_q(alias)}", status_code=303)
 
 
 async def chat_bdel(request: Request):
@@ -3342,7 +3367,7 @@ async def chat_bdel(request: Request):
         del cur[backend]
         store.upsert_chat_alias(alias, cur)
         _apply_chat_aliases()
-    return RedirectResponse(f"/ui/mapping?cedit={_q(alias)}", status_code=303)
+    return RedirectResponse(f"/ui/aliases?cedit={_q(alias)}", status_code=303)
 
 
 async def chat_del(request: Request):
@@ -3355,7 +3380,7 @@ async def chat_del(request: Request):
         store.set_alias_sampling(alias, None)
         _apply_chat_aliases()
         logger.info(f"ui: chat alias '{alias}' deleted")
-    return RedirectResponse("/ui/mapping", status_code=303)
+    return RedirectResponse("/ui/aliases", status_code=303)
 
 
 # ── Tab: Chat Playground ────────────────────────────────────────────────────────
@@ -3564,7 +3589,7 @@ async def chatplay_send(request: Request):
                               subnav=_subnav("playground", "chat")))
 
 
-# ── Tab: Mapping ────────────────────────────────────────────────────────────────
+# ── Tab: Aliases (was Mapping) ────────────────────────────────────────────────────────────────
 
 def _form_err(err: str) -> str:
     """The inline reason a create/save form was refused, right under its form bar."""
@@ -3576,7 +3601,7 @@ def _register_form(vals: Optional[dict] = None, err: str = "") -> str:
     backend_opts = [b["name"] for b in _gen_backends()] or [("", "(no generation backends)")]
     return ('<form action="/ui/mapping/register" method="post" data-guard enctype="multipart/form-data">'
             f'<div class="formbar"><h2>Register Workflow</h2>{_btn("Register", submit=True)}'
-            f'{_btn("Cancel", "/ui/mapping?sub=media", "secondary")}</div>'
+            f'{_btn("Cancel", "/ui/aliases?sub=media", "secondary")}</div>'
             + _form_err(err)
             + (("<p class='hint'>Pick the API JSON file again — a browser never pre-fills a "
                 "file field.</p>") if err else "")
@@ -3613,7 +3638,7 @@ def _mapping_list_chat(cedit: str) -> str:
         src = (_badge("ui", "ok", "Defined/edited in this UI (stored in the gateway; overrides config.yaml)")
                if in_ui else
                _badge("config", "muted", "From config.yaml (read-only base; Edit creates a UI override)"))
-        specs = [("✎", f"/ui/mapping?cedit={_q(name)}", "secondary", "Edit")]
+        specs = [("✎", f"/ui/aliases?cedit={_q(name)}", "secondary", "Edit")]
         if in_ui:
             lbl = "Delete override (revert to config)" if name in cfg else f"Delete {name}?"
             specs.append(("✕", f"/ui/chat/delete?alias={_q(name)}", "danger", "Delete", lbl))
@@ -3621,7 +3646,7 @@ def _mapping_list_chat(cedit: str) -> str:
                             sel=(name == cedit))
     chat_items = chat_items or "<p class='muted'>No chat aliases — + Chat alias.</p>"
     bar = ('<div class="bar"><h2>Chat aliases</h2>'
-           f'<div style="display:flex;gap:8px">{_btn("+ Chat alias", "/ui/mapping?cnew=1")}</div></div>')
+           f'<div style="display:flex;gap:8px">{_btn("+ Chat alias", "/ui/aliases?cnew=1")}</div></div>')
     legend = ("<p class='hint' style='margin:2px 0 6px'>"
               + _badge("config") + " from config.yaml · "
               + _badge("ui", "ok") + " created/edited here (overrides config)</p>")
@@ -3656,7 +3681,7 @@ def _mapping_list_media(iedit: str) -> str:
                       else ", ".join((c.get("mapping") or {}).keys()) or "auto")
             backends = ", ".join(x.get("backend", "") for x in cands)
             acts = _icon_acts(
-                ("✎", f"/ui/mapping?edit={_q(alias)}", "secondary", "Edit"),
+                ("✎", f"/ui/aliases?edit={_q(alias)}", "secondary", "Edit"),
                 ("❐", f"/ui/mapping/copy?alias={_q(alias)}", "secondary", "Copy"),
                 ("✕", f"/ui/mapping/delete?alias={_q(alias)}", "danger", "Delete", f"Delete {alias}?"))
             # the task is the group header now — the row shows what differs within it
@@ -3665,7 +3690,7 @@ def _mapping_list_media(iedit: str) -> str:
     bar = ('<div class="bar"><h2>Media workflows</h2>'
            f'<div style="display:flex;gap:8px">'
            f'{_btn("⬇ Export all", "/ui/mapping/export-all", "secondary", title="Download all cleaned workflows as a zip")}'
-           f'{_btn("+ Workflow", "/ui/mapping?new=1")}</div></div>')
+           f'{_btn("+ Workflow", "/ui/aliases?new=1")}</div></div>')
     return bar + body
 
 
@@ -3673,6 +3698,13 @@ async def mapping_page(request: Request):
     if not store.is_active():
         return _inactive()
     return await _mapping_view(request.query_params)
+
+
+async def mapping_legacy(request: Request):
+    """The tab was called Mapping until it absorbed the alias overviews — old bookmarks
+    and links (`/ui/mapping?edit=…`) land on the same view, query intact."""
+    q = request.url.query
+    return RedirectResponse("/ui/aliases" + (f"?{q}" if q else ""), status_code=307)
 
 
 async def _mapping_view(qp, detail: Optional[str] = None, err: str = "",
@@ -3698,7 +3730,9 @@ async def _mapping_view(qp, detail: Optional[str] = None, err: str = "",
     if detail is not None:
         body = cols(list_html, detail)
     elif cedit and cedit in chat_names:
-        body = cols(list_html, _chat_editor(cedit))          # chat editor (2 cols)
+        # chat editor (2 cols) + where the alias resolves right now, so an edit is
+        # checked against the live routes without switching tabs
+        body = cols(list_html, _chat_editor(cedit) + _chat_alias_routes(_routing_snapshot(), cedit))
     elif qp.get("cnew"):
         body = cols(list_html, _chat_new_form())
     elif iedit and store.get(iedit):
@@ -3714,10 +3748,16 @@ async def _mapping_view(qp, detail: Optional[str] = None, err: str = "",
     elif qp.get("new"):
         body = cols(list_html, _register_form())
     else:
-        what = ("a <b>+ Chat alias</b>" if sub == "chat" else "a <b>+ Workflow</b>")
-        detail = (f"<h2>Details</h2><p class='hint'>Pick an entry to <b>Edit</b>, or add {what}.</p>")
+        # Nothing picked: the right column is the LIVE overview that used to be its own
+        # sub-tab under Input & Routing — the list edits, the overview shows the effect.
+        if sub == "chat":
+            detail = _routing_chat_body(_routing_snapshot())
+        else:
+            bmeta = {b["name"]: b for b in _gateway_info().get("backends", [])
+                     if b.get("type") in adapters.GEN_TYPES}
+            detail = _routing_gen_body(bmeta, (qp.get("backend") or "").strip() or None)
         body = cols(list_html, detail)
-    return HTMLResponse(_page("Mapping", body, "mapping", subnav=_subnav("mapping", sub)),
+    return HTMLResponse(_page("Aliases", body, "aliases", subnav=_subnav("aliases", sub)),
                         status_code=status)
 
 
@@ -3759,7 +3799,7 @@ async def register_post(request: Request):
             cand["task"] = picked_task
         store.upsert(alias, [cand])
         logger.info(f"ui: registered '{alias}' -> {backend} ({bt}, no workflow)")
-        return RedirectResponse(f"/ui/mapping?edit={_q(alias)}", status_code=303)
+        return RedirectResponse(f"/ui/aliases?edit={_q(alias)}", status_code=303)
     try:
         if isinstance(upload, (bytes, bytearray)) and upload.strip():
             wf = json.loads(upload.decode("utf-8"))
@@ -3784,7 +3824,7 @@ async def register_post(request: Request):
         cand["output_node"] = out_node
     store.upsert(alias, [cand])
     logger.info(f"ui: registered '{alias}' → {backend} ({len(wf)} nodes, {len(cand['fixed'])} model slots)")
-    return RedirectResponse(f"/ui/mapping?edit={_q(alias)}", status_code=303)
+    return RedirectResponse(f"/ui/aliases?edit={_q(alias)}", status_code=303)
 
 
 async def update_workflow(request: Request):
@@ -4389,7 +4429,7 @@ def _cloud_editor(kind: str, alias: str, cands: list, saved: bool = False, taken
                 + " are accepted and ignored.") if ignored else ""
     return (f'<form action="/ui/mapping/cloud-update" method="post" data-guard><input type="hidden" name="alias" value="{_esc(alias)}">'
             f'<div class="formbar"><h2 style="margin:0">{_esc(alias)}</h2>'
-            f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/mapping?sub=media", "secondary")}'
+            f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/aliases?sub=media", "secondary")}'
             + _saved_chip(saved, taken, err) + "</div>"
             + _field("alias name", _inp("new_alias", alias), short=True)
             + _field("task", _task_select(cur_task), short=True)
@@ -4487,7 +4527,7 @@ async def _alias_editor(alias: str, saved: bool = False, taken: str = "", err: s
     is_video = "vid" in cur_task.lower() or any(c.get("fps") for c in cands)
     form = (f'<form action="/ui/mapping/update" method="post" data-guard><input type="hidden" name="alias" value="{_esc(alias)}">'
             f'<div class="formbar"><h2 style="margin:0">{_esc(alias)}</h2>'
-            f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/mapping?sub=media", "secondary")}'
+            f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/aliases?sub=media", "secondary")}'
             f'{_btn("⬇ Export", "/ui/mapping/export?alias=" + quote(alias), "secondary", title="Download the gateway-cleaned workflow JSON")}'
             + _saved_chip(saved, taken, err)
             + '</div>'
@@ -4603,7 +4643,7 @@ async def edit_add(request: Request):
             fixed.append({"node": node, "field": fld, "value": cur})
             cand["fixed"] = fixed
             store.upsert(alias, cands)
-    return RedirectResponse(f"/ui/mapping?edit={_q(alias)}", status_code=303)
+    return RedirectResponse(f"/ui/aliases?edit={_q(alias)}", status_code=303)
 
 
 async def edit_del(request: Request):
@@ -4618,7 +4658,7 @@ async def edit_del(request: Request):
             cand["fixed"] = [b for b in (cand.get("fixed") or [])
                              if not (b["node"] == node and b["field"] == fld)]
         store.upsert(alias, cands)
-    return RedirectResponse(f"/ui/mapping?edit={_q(alias)}", status_code=303)
+    return RedirectResponse(f"/ui/aliases?edit={_q(alias)}", status_code=303)
 
 
 async def bypass_add(request: Request):
@@ -4631,7 +4671,7 @@ async def bypass_add(request: Request):
         if node not in bl:
             cands[0]["bypass"] = bl + [node]
             store.upsert(alias, cands)
-    return RedirectResponse(f"/ui/mapping?edit={_q(alias)}", status_code=303)
+    return RedirectResponse(f"/ui/aliases?edit={_q(alias)}", status_code=303)
 
 
 async def bypass_del(request: Request):
@@ -4650,7 +4690,7 @@ async def bypass_del(request: Request):
                     c.pop("bypass", None)
         if changed:
             store.upsert(alias, cands)
-    return RedirectResponse(f"/ui/mapping?edit={_q(alias)}", status_code=303)
+    return RedirectResponse(f"/ui/aliases?edit={_q(alias)}", status_code=303)
 
 
 def _slug_param(s: str) -> str:
@@ -4679,7 +4719,7 @@ async def field_map(request: Request):
             entry["label"] = title
         mp[param] = entry
         store.upsert(alias, cands)
-    return RedirectResponse(f"/ui/mapping?edit={_q(alias)}", status_code=303)
+    return RedirectResponse(f"/ui/aliases?edit={_q(alias)}", status_code=303)
 
 
 async def field_clear(request: Request):
@@ -4708,7 +4748,7 @@ async def field_clear(request: Request):
                 if w and node in w:
                     w[node].setdefault("inputs", {})[field] = blank
             store.upsert(alias, cands)
-    return RedirectResponse(f"/ui/mapping?edit={_q(alias)}", status_code=303)
+    return RedirectResponse(f"/ui/aliases?edit={_q(alias)}", status_code=303)
 
 
 async def cand_add(request: Request):
@@ -4724,7 +4764,7 @@ async def cand_add(request: Request):
         cands.append(new)
         store.upsert(alias, cands)
         logger.info(f"ui: alias '{alias}' + backend '{backend}'")
-    return RedirectResponse(f"/ui/mapping?edit={_q(alias)}", status_code=303)
+    return RedirectResponse(f"/ui/aliases?edit={_q(alias)}", status_code=303)
 
 
 async def cand_del(request: Request):
@@ -4736,7 +4776,7 @@ async def cand_del(request: Request):
         if kept and len(kept) != len(cands):
             store.upsert(alias, kept)
             logger.info(f"ui: alias '{alias}' − backend '{backend}'")
-    return RedirectResponse(f"/ui/mapping?edit={_q(alias)}", status_code=303)
+    return RedirectResponse(f"/ui/aliases?edit={_q(alias)}", status_code=303)
 
 
 async def update(request: Request):
@@ -4770,7 +4810,7 @@ def _rename_gen_alias(alias: str, f: dict) -> tuple:
 
 
 def _saved_url(alias: str, taken: str = "") -> str:
-    return (f"/ui/mapping?edit={_q(alias)}&saved=1"
+    return (f"/ui/aliases?edit={_q(alias)}&saved=1"
             + (f"&taken={_q(taken)}" if taken else ""))
 
 
@@ -5027,21 +5067,21 @@ async def delete(request: Request):
     alias = request.query_params.get("alias", "").strip()
     if alias:
         store.delete(alias)
-    return RedirectResponse("/ui/mapping?sub=media", status_code=303)
+    return RedirectResponse("/ui/aliases?sub=media", status_code=303)
 
 
 async def copy(request: Request):
     alias = _qp(request, "alias")
     cands = store.get(alias)
     if not cands:
-        return RedirectResponse("/ui/mapping?sub=media", status_code=303)
+        return RedirectResponse("/ui/aliases?sub=media", status_code=303)
     new = f"{alias}-copy"
     i = 2
     while store.get(new):
         new, i = f"{alias}-copy{i}", i + 1
     store.upsert(new, json.loads(json.dumps(cands)))     # deep copy of the candidate(s)
     logger.info(f"ui: copied alias '{alias}' → '{new}'")
-    return RedirectResponse(f"/ui/mapping?edit={_q(new)}", status_code=303)
+    return RedirectResponse(f"/ui/aliases?edit={_q(new)}", status_code=303)
 
 
 # ── Tab: Playground ─────────────────────────────────────────────────────────────
@@ -5241,7 +5281,7 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
             else:
                 typ = "number" if isinstance(dv, (int, float)) and not isinstance(dv, bool) else "text"
                 rows += _field(label, _inp(f"p__{p}", v(p), typ=typ))
-    rows = rows or "<p class='hint'>This alias has no request fields — add some in Mapping.</p>"
+    rows = rows or "<p class='hint'>This alias has no request fields — add some in Aliases.</p>"
     bk_list = [c.get("backend") for c in (store.get(vals.get("model")) or [])]
     sel_bk = vals.get("backend", "")
     bk_opts = ('<option value="">(auto · scheduler picks)</option>'
@@ -5340,7 +5380,7 @@ async def playground_page(request: Request):
     if not aliases:
         return HTMLResponse(_page("Media Playground",
             "<h2>Media Playground</h2><p class='hint'>Register an alias in "
-            "the <a href='/ui/mapping'>Mapping</a> tab first.</p>", "playground",
+            "the <a href='/ui/aliases'>Aliases</a> tab first.</p>", "playground",
             subnav=_subnav("playground", "media")))
     model = qp.get("model", "") or aliases[0]   # first load: pick the first alias
     cand = (store.get(model) or [None])[0]
@@ -7900,7 +7940,7 @@ async def users_del(request: Request):
 _SRV_RUNTIME = [
     ("health_check_interval", "int", "health check interval", "seconds"),
     ("max_concurrent", "int", "default max_concurrent", "blank = unlimited"),
-    ("park_timeout_s", "int", "default park time", "seconds a call waits for a free backend when all are busy (blank = 60; per-alias override in Mapping; 0 = off)"),
+    ("park_timeout_s", "int", "default park time", "seconds a call waits for a free backend when all are busy (blank = 60; per-alias override in Aliases; 0 = off)"),
     ("max_parked", "int", "max parked calls", "queue cap — beyond this a busy call gets 503 (blank = 100)"),
     ("max_queued_gen", "int", "max queued media jobs",
      "async generation jobs queued or running at once — beyond this a new async job gets 503 "
@@ -8100,7 +8140,8 @@ async def mapping_export_all(request: Request):
 
 # Where a GET to a POST-only action sends the operator back to, when the parent path
 # is not itself a page.
-_ACTION_BACK = {"/ui/chat": "/ui/mapping?sub=chat", "/ui/ipalias": "/ui/users"}
+_ACTION_BACK = {"/ui/chat": "/ui/aliases?sub=chat", "/ui/ipalias": "/ui/users",
+                "/ui/mapping": "/ui/aliases"}
 
 
 def _action_back(path: str, get_res: list) -> str:
@@ -8171,7 +8212,8 @@ def register(app) -> None:
     app.add_api_route("/ui/chat/delete", chat_del, methods=["POST"])
     app.add_api_route("/ui/chatplay", chatplay_page, methods=["GET"])
     app.add_api_route("/ui/chatplay/send", chatplay_send, methods=["POST"])
-    app.add_api_route("/ui/mapping", mapping_page, methods=["GET"])
+    app.add_api_route("/ui/aliases", mapping_page, methods=["GET"])
+    app.add_api_route("/ui/mapping", mapping_legacy, methods=["GET"])
     app.add_api_route("/ui/mapping/register", register_post, methods=["POST"])
     app.add_api_route("/ui/mapping/update-workflow", update_workflow, methods=["POST"])
     app.add_api_route("/ui/mapping/field-add", edit_add, methods=["POST"])

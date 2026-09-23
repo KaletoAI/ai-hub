@@ -276,11 +276,11 @@ class _Store(unittest.TestCase):
         return self.c.post(url, headers={**SAME, **(headers or {})}, follow_redirects=False, **kw)
 
 
-PAGES = ["/ui/backends", f"/ui/backends?edit=comfyui:{NASTY}", "/ui/mapping?sub=chat",
-         "/ui/mapping?cedit=" + NASTY.replace("%", "%25").replace("&", "%26").replace("+", "%2B")
+PAGES = ["/ui/backends", f"/ui/backends?edit=comfyui:{NASTY}", "/ui/aliases?sub=chat",
+         "/ui/aliases?cedit=" + NASTY.replace("%", "%25").replace("&", "%26").replace("+", "%2B")
          .replace("#", "%23").replace(" ", "%20"),
-         "/ui/mapping?sub=media",
-         "/ui/mapping?edit=" + NASTY.replace("%", "%25").replace("&", "%26").replace("+", "%2B")
+         "/ui/aliases?sub=media",
+         "/ui/aliases?edit=" + NASTY.replace("%", "%25").replace("&", "%26").replace("+", "%2B")
          .replace("#", "%23").replace(" ", "%20"),
          "/ui/reasoning", "/ui/users", "/ui/playground?sub=voice"]
 
@@ -304,7 +304,7 @@ class RenderedPages(_Store):
     def test_pages_do_offer_their_actions_as_post_buttons(self):
         pages = self._crawl()
         want = {"/ui/backends": "/ui/backends/drain", "/ui/users": "/ui/users/delete",
-                "/ui/reasoning": "/ui/reasoning/toggle", "/ui/mapping?sub=media": "/ui/mapping/copy",
+                "/ui/reasoning": "/ui/reasoning/toggle", "/ui/aliases?sub=media": "/ui/mapping/copy",
                 "/ui/playground?sub=voice": "/ui/playground/voice-ship"}
         for url, action in want.items():
             fa = [a.get("formaction", "") for t, a in _tags(pages[url]) if t == "button"]

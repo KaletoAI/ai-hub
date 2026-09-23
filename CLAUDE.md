@@ -31,7 +31,7 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
   restart for backend/alias changes. Read **only at startup**:
   `stats.enabled` and the stats/jobs DB paths.
 - **No linter or build step, and no blanket test suite** — only targeted stdlib
-  `unittest` files for the mechanisms that fail SILENTLY (see the fifty-eight listed under
+  `unittest` files for the mechanisms that fail SILENTLY (see the fifty-nine listed under
   `anthropic_bridge.py`): `venv/bin/python -m unittest discover -s tests -t .`.
   Everything else is verified by running the server and hitting endpoints with
   `curl` (README "Try it"), `curl -H "Authorization: Bearer <admin key>"
@@ -517,8 +517,17 @@ they need via injected callables, staying hot-reload-safe.
   `_subnav()` (rendered outside `<main>` via `_page(subnav=…)`; `?sub=` on the
   parent route, first child = default —
   Playground: Chat | Media | Voice, Jobs & Calls: LLM | Media | Voice,
-  Mapping: Chat | Media, Input & Routing: Input | Chat aliases | LLM models |
-  Media aliases | Image models | LoRAs); the workflow Mapping editor owns a pasted
+  Aliases: Chat | Media, Input & Routing: Input | LLM models | Image models | LoRAs).
+  **Aliases** (`/ui/aliases`, formerly "Mapping") joins what used to be two tabs: the
+  alias list + editors, and the live alias→route overviews that were Input & Routing's
+  Chat/Media-aliases sub-tabs. With nothing picked the right column IS the overview
+  (`_routing_chat_body` / `_routing_gen_body` — its backend filter is a GET form, since
+  inline handlers never navigate), the chat editor carries that alias's live routes
+  (`_chat_alias_routes`), and every overview row's alias name opens its editor. Old URLs
+  redirect with their query intact (`mapping_legacy`: `/ui/mapping?…` → `/ui/aliases?…`;
+  `/ui/routing?sub=chat|gen` → `?sub=chat|media`); the ACTION routes stay under
+  `/ui/mapping/<action>` and redirect back to `/ui/aliases`. `test_aliases_tab.py`.
+  The workflow editor (the media half of Aliases) owns a pasted
   ComfyUI API JSON and offers discovery-fed dropdowns. A CLOUD alias has no workflow at
   all: `_cloud_editor(kind, …)` + `cloud_update` (`POST /ui/mapping/cloud-update`, which
   REPLACED the Meshy-only `/ui/mapping/meshy-update`) render the vendor's option block
@@ -533,7 +542,7 @@ they need via injected callables, staying hot-reload-safe.
   holds ANOTHER cloud kind's fixed URL — switching meshy → tripo would otherwise store a
   Tripo backend pointing at api.meshy.ai, which surfaces only as an auth error at
   discovery; a URL the operator typed themselves is never overwritten.
-  Mapping's sub-tab is derived
+  The Aliases sub-tab is derived
   when `?sub=` is absent (`?edit=`/`?new=` → media, else chat), so the dozens of
   existing action links keep working unchanged and still land in the right tab.
   The Media list groups by `task` in `_TASK_OPTIONS` order (unknown tasks trail
@@ -731,7 +740,7 @@ they need via injected callables, staying hot-reload-safe.
   running the tool. Covered by
   `test_anthropic_bridge.py` (stdlib `unittest` — a streaming tool-call bridge fails
   silently rather than crashing). `ls tests/test_*.py` is the count of record —
-  **fifty-eight** files today — and each exists for that same reason: the mechanism it
+  **fifty-nine** files today — and each exists for that same reason: the mechanism it
   guards fails SILENTLY, so it is named next to that mechanism above.
   `test_anthropic_bridge.py`, `test_prune_branch.py` (a
   dead-branch prune that cascades one node too far or too few surfaces as an aborted
@@ -1043,6 +1052,12 @@ they need via injected callables, staying hot-reload-safe.
   keeps 220 px and its buttons wrap (the API key shrank to 82 px), a hint is indented by
   padding (100 % + margin was cut off), a narrow column stacks label over control, list
   settings take the whole column, and Logout is a button.
+  `test_aliases_tab.py` (the Aliases tab replaced two tabs, so every old URL is somebody's
+  bookmark: a redirect that drops the query opens an EMPTY editor instead of the alias it
+  named, a sub-tab still listed but gone renders a blank page, and an overview that is no
+  longer the idle right column is simply never seen again. Pins the tab set, both legacy
+  redirects with their query, actions redirecting to the new tab, the idle overviews with
+  alias→editor links and the backend filter, and the chat editor's live routes).
   Run them all with `python -m unittest discover -s tests -t .` (no runner dependency).
 - **`openai_image_bridge.py`** — pure request/response plumbing for the OpenAI
   image shims (`multipart_list`, `parse_size`, `coerce_scalar`, `images_uploads`

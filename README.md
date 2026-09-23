@@ -318,7 +318,7 @@ sent. Busy state shows in `/health` and the **Input & Routing → Chat aliases**
 pattern without wildcards) and, unlike the two flags above, apply to **every** backend
 type — `openai`, `anthropic`, `comfyui`, `meshy`, `tripo` — because they narrow the
 discovered set itself. One source: `/v1/models`, routing, alias candidates and the
-Mapping tab's checkpoint dropdowns all see the filtered set. Edit them in the Backends
+Aliases editor's checkpoint dropdowns all see the filtered set. Edit them in the Backends
 tab under **Models**.
 
 A backend that filters reports `models_filtered: {kept, total}` in `/health`, and the
@@ -782,7 +782,7 @@ backends:
     # disconnect_grace: 30      # unreachability tolerated while polling a task
 ```
 
-Register an alias on the Meshy backend in **Mapping › Media** (no workflow JSON) and
+Register an alias on the Meshy backend in **Aliases › Media** (no workflow JSON) and
 pick the endpoint: `image-to-3d` takes `images.input_image`; `multi-image-to-3d` takes
 `images.input_image_front` (required) plus optional `input_image_back`,
 `input_image_left`, `input_image_right` — the slot names of the Trellis2 multiview
@@ -897,7 +897,7 @@ What is different from Meshy (none of it visible to a client):
   refused *before* the rig task is created (so no credits) instead of quietly receiving
   a biped skeleton.
 
-Register a Tripo alias in **Mapping › Media** (no workflow JSON — endpoint plus admin
+Register a Tripo alias in **Aliases › Media** (no workflow JSON — endpoint plus admin
 option defaults) and pick the endpoint: `image-to-model` takes `images.input_image`;
 `multiview-to-model` takes `images.input_image_front` **plus at least one** of
 `input_image_back` / `input_image_left` / `input_image_right` — Tripo refuses a
@@ -956,7 +956,7 @@ while transport errors, `5xx` and `429` are tolerated for `disconnect_grace` sec
 then fail over. Cancelling stops the gateway's job only — Tripo has no cancel endpoint in
 V3, so the task finishes and is billed.
 
-The Tripo alias set this is built for (register them in **Mapping › Media**):
+The Tripo alias set this is built for (register them in **Aliases › Media**):
 
 | Alias | Task | Tripo endpoint | Successor |
 |---|---|---|---|
@@ -988,7 +988,7 @@ image_models:
 
 The mapping is **convention-free** — it works with any workflow regardless of node
 naming. (An auto-detect heuristic pre-fills it for templated workflows; the
-explicit mapping always wins.) In practice you author all this in the **Mapping**
+explicit mapping always wins.) In practice you author all this in the **Aliases**
 tab of the console rather than by hand: paste the ComfyUI API JSON, the gateway
 owns it, auto-suggests the mapping, and gives you discovery-fed dropdowns.
 
@@ -1000,7 +1000,7 @@ Key mapping concepts:
   identical from outside. A request param that targets a pinned node/field is
   **ignored** — a pin is authoritative; the API can't override it.
 - **Image input slots** (a `LoadImage` / `LoadImageMask` node) become file-upload
-  request fields. The Mapping editor picks one of three behaviours per slot for a
+  request fields. The Aliases media editor picks one of three behaviours per slot for a
   request that sends no image:
   - **`8×8 if empty`** (default) — the loader gets a black 8×8 placeholder.
   - **`required`** — the slot is left empty so ComfyUI errors clearly when a needed
@@ -1067,7 +1067,7 @@ stage of a chain keeps its own task id, request, sub-tasks and credits on the jo
 (`meta.chain_stage1` for stage 1, the top-level meta for stage 2), so the Media Jobs
 view shows one table per cloud stage — and the two stages may be different vendors.
 
-The Meshy alias set this is built for (register them in **Mapping › Media**; the
+The Meshy alias set this is built for (register them in **Aliases › Media**; the
 successor column is the chain config above):
 
 | Alias | Task | Meshy endpoint | Successor |
@@ -1148,7 +1148,7 @@ ComfyUI's cache), so the first job after one frees.
   Unlike `params`, `files` is strict: unknown key or unreadable value → `400`,
   over 64 MB → `413`. Naming a backend PATH for such a file field in `params`
   instead is admin-only (`400` for a user key, unless the admin ticked *client may send
-  a backend path* on that field in the Mapping editor — `client_path: true`). A file
+  a backend path* on that field in the Aliases media editor — `client_path: true`). A file
   field is one whose name ends in `path` (`input_mesh_path`) or whose workflow field is
   a file field, and only a value that names a file (`/`, `\`, `~` or an extension) is
   judged — `mesh_format: glb` is a setting, not a path. And a list or object is never accepted as a mapped
@@ -1204,8 +1204,8 @@ session cookie is marked `Secure`. Tabs:
 |---|---|
 | **Dashboard** | live per-backend status (a down backend names its cause) + in-flight, a **backend faults · 24h** card, column and panel (see [Backend fault log](#backend-fault-log)), parked calls, media-job counts/recent, recent LLM calls |
 | **Backends** | add/edit/remove backends (LLM, ComfyUI, Meshy, Tripo), incl. the `paid` cost tier; the editor is split into **General** (name, type, url, host, cost tier, concurrency, credential — never shown again once stored: blank keeps it, *clear* removes it), **Models** (whitelist/blacklist, discovery filters, bare-id listing, context windows), **Behavior** (prompt-cache passthrough, sampling defaults, self-retries) and one tab named after the type (**ComfyUI** / **Cloud task API** / **Anthropic**); the **Hosts · GPU policy** panel below the list edits the per-box VRAM flags (see [Hosts & VRAM policy](#hosts--vram-policy)) |
-| **Input & Routing** | sub-tabs **Input** (what clients can call — chat aliases, generation models, endpoints), **Chat aliases** (the live alias→backend map + alias/model collisions), **LLM models**, **Media aliases**, **Image models**, **LoRAs** — all searchable |
-| **Mapping** | register a ComfyUI workflow, wire its node mapping, pin values (a cloud alias — Meshy, Tripo — needs no workflow: one schema-driven editor renders its endpoint + option defaults instead); chat-alias editor (per-alias `park_s` + reasoning default) |
+| **Input & Routing** | sub-tabs **Input** (what clients can call — chat aliases, generation models, endpoints), **LLM models**, **Image models**, **LoRAs** — all searchable |
+| **Aliases** | sub-tabs **Chat** and **Media** — the alias list on the left; with nothing picked the right column is the LIVE overview (chat: alias → backend · model · status + alias/model collisions; media: alias → backends, or pick a backend to see everything mapped onto it); pick an alias for its editor. Chat editor: per-alias `park_s`, reasoning/voice/sampling defaults, backends — plus that alias's live routes. Media editor: register a ComfyUI workflow, wire its node mapping, pin values (a cloud alias — Meshy, Tripo — needs no workflow: one schema-driven editor renders its endpoint + option defaults instead). Old `/ui/mapping?…` and `/ui/routing?sub=chat|gen` links redirect here. |
 | **Reasoning** | the normalized-thinking rule list (model glob × backend set → adapter) + test resolver |
 | **Playground** | one tab, sub-tabs **Chat** (default — chat completion through `/v1/chat/completions`), **Media** (generation via `POST /v1/generations` — image/video/audio, upload refs + mesh files, or an earlier job's artifact) and **Voice** (TTS via `POST /v1/audio/speech`, inline player + download) — all as **real API clients** (auth, routing, parking, stats all apply) |
 | **Jobs & Calls** | sub-tabs **LLM Calls** (per-call history with stored request/response bodies — LLM endpoints only), **Media Jobs** (list + detail of generation jobs, inputs + outputs, within TTL, plus the media requests that were refused before they became a job) and **Voice Calls** |
@@ -1516,7 +1516,7 @@ new index (`idx_calls_ts_backend`, the old `idx_calls_ts` is dropped) and `fault
 - **Generation requests:** a reference image or `files` URL pointing at a private /
   loopback / link-local address is `400` until its range is listed in
   `ref_url_allow_cidrs`; a backend PATH in a file field's `params` is admin-only unless
-  the field ticks *client may send a backend path* (`client_path`) in the Mapping editor;
+  the field ticks *client may send a backend path* (`client_path`) in the Aliases media editor;
   a list or object in `params`, `prompt` or `negative_prompt` is `400`; an unreadable
   reference image is `400` instead of a silent placeholder.
 - **Limits:** request bodies capped at `max_body_mb` (default 200 → `413`), async
