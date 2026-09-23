@@ -2215,13 +2215,13 @@ async def _dispatch_over(candidates, path, alias, body, request, stats_endpoint=
             # answer twice, so it ends here; a local one only wastes its own compute, and
             # a hung llama-swap load is exactly when another box helps.
             _note_fault(backend, "call", "timeout", f"{real_model}: {_err_text(e)}")
-            if backend.get("paid"):
+            if _bills_while_generating(backend):
                 logger.warning(f"✗ [{backend['name']}] no answer in {_READ_BUDGET_S:g} s — "
-                               "paid backend, not retried elsewhere")
+                               "billed backend, not retried elsewhere")
                 raise HTTPException(504, f"backend '{backend['name']}' did not answer within "
                                          f"{_READ_BUDGET_S:g} s — not retried on another backend, "
-                                         "because a paid backend may still be generating (and "
-                                         "billing) this request")
+                                         "because a paid or subscription backend may still be "
+                                         "generating (and billing) this request")
             logger.warning(f"✗ [{backend['name']}] {_err_text(e)} — trying next")
             last_error = e
         except httpx.TransportError as e:
@@ -2249,6 +2249,16 @@ async def _dispatch_over(candidates, path, alias, body, request, stats_endpoint=
 
 
 _READ_BUDGET_S = adapters._CHAT_TIMEOUT.read
+
+
+def _bills_while_generating(backend: dict) -> bool:
+    """Does a request this backend gave up on still cost something? `paid` backends
+    bill per token, and an `anthropic` one keeps generating against the subscription
+    quota or the API key's bill. It is deliberately NOT marked `paid` for that: the
+    scheduler orders unpaid before paid, and a flat subscription tagged `paid` would
+    sort behind every unpaid candidate of a mixed alias — Claude Code sessions moving
+    to per-token OpenRouter or a local model. Only this no-failover rule needs it."""
+    return bool(backend.get("paid")) or backend.get("type") == "anthropic"
 
 
 def _call_fault_kind(e: BaseException) -> str:

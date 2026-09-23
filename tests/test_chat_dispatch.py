@@ -126,6 +126,19 @@ class Failover(_MainState):
                                          (B, second)]).status_code, 200)
         self.assertEqual(second.calls, 1)
 
+    def test_a_read_timeout_on_an_anthropic_backend_is_not_bought_twice(self):
+        # R6: a subscription/API-key Claude backend keeps generating (and consuming quota
+        # or billing) after the gateway gave up — the same case as a paid one. It is NOT
+        # marked `paid`, which would demote it behind every unpaid chat candidate.
+        claude = {"name": "claude", "type": "anthropic", "url": "https://api.anthropic.com"}
+        second = self._ok()
+        with self.assertRaises(HTTPException) as cm:
+            self._dispatch([(claude, _Adapter(fail=httpx.ReadTimeout(""))), (B, second)],
+                           path="/v1/messages")
+        self.assertEqual(cm.exception.status_code, 504)
+        self.assertEqual(second.calls, 0)
+        self.assertIn("claude", cm.exception.detail)
+
     def test_a_connect_timeout_on_a_paid_backend_fails_over(self):
         # Never connected = nothing was sent, nothing can be billed.
         second = self._ok()

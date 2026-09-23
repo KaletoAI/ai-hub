@@ -1041,9 +1041,12 @@ they need via injected callables, staying hot-reload-safe.
   (`ReadError`/`WriteError`); all of them surface before the client saw a byte — and on
   llama-swap's "unable to start process" 502 (backend-local load failure,
   `_retryable_upstream_error`); other HTTP error statuses return as-is. ONE exception:
-  a `ReadTimeout` on a `paid` backend (connected, sent, no answer within the 300 s read
-  budget — it is most likely still generating) answers 504 instead of failing over,
-  or the failover buys the same answer twice; on an unpaid backend it still fails over.
+  a `ReadTimeout` on a `paid` or `anthropic` backend (`_bills_while_generating`;
+  connected, sent, no answer within the 300 s read budget — it is most likely still
+  generating) answers 504 instead of failing over, or the failover buys the same answer
+  twice; on an unpaid backend it still fails over. An `anthropic` backend is NOT made
+  `paid` for this: the scheduler puts unpaid before paid, so a flat subscription marked
+  paid would sort behind every unpaid candidate of a mixed alias.
   `adapters._CHAT_TIMEOUT` is `httpx.Timeout(300, connect=10, pool=30)` — a scalar 300
   let a SYN-swallowing host hold the failover for five minutes. Anything else an adapter
   raises is a clean 502 naming the backend (fault kind `error`, no failover — a bug
