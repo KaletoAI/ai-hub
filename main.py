@@ -5340,8 +5340,34 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
                                   for b in backends if b.get("type") == "comfyui"})
 
 
+def _health_full_allowed(request: Request, authorization: Optional[str],
+                         x_api_key: Optional[str]) -> bool:
+    """The full /health snapshot is for admins: bootstrap-open (everything is open
+    anyway), an admin credential as Bearer or x-api-key, or a valid /ui session."""
+    if not users and not api_key:
+        return True
+    token = authorization[7:] if authorization and authorization.startswith("Bearer ") else None
+    if resolve_admin(token) or resolve_admin(x_api_key):
+        return True
+    return bool(admin._session_user(request))
+
+
 @app.get("/health")
-async def health():
+async def health_endpoint(request: Request, authorization: Optional[str] = Header(None),
+                          x_api_key: Optional[str] = Header(None)):
+    """Liveness for everyone, the inventory for admins (see _health_full_allowed).
+    Model ids only with `?verbose=1` — every backend listing every model made this the
+    largest unasked-for response the gateway sends."""
+    if not _health_full_allowed(request, authorization, x_api_key):
+        en = [b for b in backends if is_enabled(b)]
+        return {"status": "ok", "backends_total": len(en),
+                "backends_healthy": sum(1 for b in en if backend_healthy.get(backend_id(b), False))}
+    verbose = request.query_params.get("verbose", "") not in ("", "0", "false", "no")
+    return await health(verbose=verbose)
+
+
+async def health(verbose: bool = True) -> dict:
+    """The full health snapshot (admin view of /health; tests read it directly)."""
     fmap = {s["bid"]: s for s in (await asyncio.to_thread(faults_info))["backends"]}
     return {
         "status": "ok",
@@ -5358,7 +5384,9 @@ async def health():
                 "paid": bool(b.get("paid")),
                 "tps": round(backend_tps.get(backend_id(b), 0.0), 1),
                 "sampling_defaults": b.get("sampling_defaults") or None,
-                "models": sorted(backend_models.get(backend_id(b), set())) if is_enabled(b) else [],
+                "models_count": len(backend_models.get(backend_id(b), set())) if is_enabled(b) else 0,
+                **({"models": sorted(backend_models.get(backend_id(b), set())) if is_enabled(b) else []}
+                   if verbose else {}),
                 # What the fault log holds for the last 24h (faults.py) — the current
                 # `error` above is gone the moment the next poll succeeds.
                 "faults_24h": {k: (fmap.get(backend_id(b)) or {}).get(k, 0)

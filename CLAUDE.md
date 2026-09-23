@@ -34,7 +34,10 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
   `unittest` files for the mechanisms that fail SILENTLY (see the thirty-three listed under
   `anthropic_bridge.py`): `venv/bin/python -m unittest discover -s tests -t .`.
   Everything else is verified by running the server and hitting endpoints with
-  `curl` (README "Try it"), `curl localhost:4000/health` for a routing snapshot, or
+  `curl` (README "Try it"), `curl -H "Authorization: Bearer <admin key>"
+  localhost:4000/health` for a routing snapshot (`?verbose=1` lists model ids; without an
+  admin key a locked gateway answers only `status` + counts — `main.health_endpoint`,
+  `test_health_access.py`; `main.health()` stays the full snapshot for code), or
   compile-gating (`venv/bin/python -m py_compile *.py`) before deploy.
 - `requirements.txt` omits `watchfiles`; it ships with `uvicorn[standard]`. Keep it.
 - Deploy with `DEPLOY_HOST=root@host ./deploy.sh` (rsync/tar over SSH, remote venv

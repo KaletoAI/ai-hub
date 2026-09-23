@@ -1374,7 +1374,7 @@ The gateway therefore keeps a **voice reference library** (Playground → Voice)
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/health` | per-backend health/models/`paid`/tok-s + busy/inflight + conflicts |
+| `GET` | `/health` | liveness (`status` + backend counts) for anyone; with an admin key (Bearer or `x-api-key`), a `/ui` session, or in bootstrap-open mode the full snapshot: per-backend health/`models_count`/`paid`/tok-s + busy/inflight + hosts + conflicts; `?verbose=1` adds every backend's model ids |
 | `*` | `/ui/**` | the management console |
 
 Every proxied LLM response carries **`x-gateway-backend`** (which backend served
@@ -1424,8 +1424,9 @@ curl $B/v1/images/generations -H "Authorization: Bearer $KEY" \
 # LoRAs valid for an alias
 curl $B/v1/generations/flux/loras -H "Authorization: Bearer $KEY"
 
-# Backend health snapshot
-curl $B/health
+# Backend health snapshot (full view needs an admin key once the gateway is locked;
+# add ?verbose=1 for every backend's model ids)
+curl $B/health -H "Authorization: Bearer $KEY"
 ```
 
 ---

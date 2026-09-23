@@ -397,7 +397,7 @@ Dateisystem, das Mesh reist als Datei mit (`required: true` im Schema).
 | Symptom | Bedeutung / Reaktion |
 |---|---|
 | `status: "failed"` + `error` | Workflow-/Validierungsfehler (z. B. „no basecolor PNG", „embedded texture is a 2x2 dummy", per-Node-Fehler des Backends). Nicht blind retrien — Fehlertext auswerten. |
-| `503` beim Start | Für den Alias existiert kein gesundes Backend (bzw. keines, das das geforderte `backend`-Pin/LoRA erfüllt) — Alias und `/health` prüfen, kein blinder Retry. |
+| `503` beim Start | Für den Alias existiert kein gesundes Backend (bzw. keines, das das geforderte `backend`-Pin/LoRA erfüllt) — Alias und `/health` prüfen (die Details dort nur mit Admin-Key), kein blinder Retry. |
 | `status: "failed"`, `error` beginnt mit `park timeout:` | Alle Backends waren die ganze Park-Zeit belegt — später neu einreichen. |
 | Job hängt lange in `running` | Mesh-Jobs dauern Minuten; `progress` beachten. Hunyuan3D mit `face_num` > 40000: siehe 3.2 — vermeiden. |
 | `status: "failed"` bei `Meshy-Rig` / `Meshy-Humanoid-Cloud` | Meshys Rigging hat abgelehnt (kein erkennbarer Biped, zu viele Dreiecke, unbrauchbare Pose) — endgültig, Credits werden erstattet. Mesh prüfen (3.5), nicht retrien. Fehlt `files.input_mesh_path` oder ist die Datei kein binäres glTF, scheitert der Job mit `status: "failed"` (Meldung „`files.input_mesh_path` is required" bzw. „Meshy rigging takes a binary glTF (.glb) mesh") — **bevor** ein Task angelegt wird, also ohne Credits. `400` beim Start heißt dagegen: unbekannter `files`-Schlüssel oder unlesbarer Wert; ab 64 MB kommt `413`. |
