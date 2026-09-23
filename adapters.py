@@ -856,12 +856,42 @@ def _error_text(resp) -> str:
         return "upstream error"
 
 
-# Client headers that must NEVER be forwarded to a backend. `authorization` AND
-# `x-api-key` are both gateway credentials (Claude Code authenticates with the
-# latter) — forwarding either would hand the caller's gateway key to OpenRouter,
-# Anthropic or whoever else serves the call. The adapter adds the backend's own
-# credential afterwards.
-_HOP_BY_HOP = ("host", "content-length", "authorization", "x-api-key", "x-park-mode")
+# Client headers that must NEVER be forwarded to a backend. A DENYLIST on purpose,
+# not an allowlist: the verbatim Anthropic passthrough depends on whatever Claude Code
+# sends (`anthropic-*`, `x-stainless-*`, `x-app`, its user-agent — the subscription path
+# checks them), OpenRouter reads `HTTP-Referer`/`X-Title` for attribution, and a list
+# of what backends may see would silently strip the next such header. What is dropped:
+# - gateway credentials: `authorization` AND `x-api-key` (Claude Code authenticates
+#   with the latter) — forwarding either hands the caller's gateway key to OpenRouter,
+#   Anthropic or whoever serves the call; the adapter adds the backend's own afterwards;
+# - what describes THIS hop: `host`, `content-length`, RFC 7230 hop-by-hop
+#   (`connection` + every header it names, `keep-alive`, `te`, `trailer`,
+#   `transfer-encoding`, `upgrade`, `proxy-*`) and `expect`. A client's
+#   `transfer-encoding: chunked` next to httpx's own content-length makes an invalid
+#   request;
+# - `accept-encoding`: httpx negotiates what IT can decode. A browser's `br`/`zstd`
+#   was honoured by the backend and the gateway then passed on — and parsed for usage —
+#   a body it could not decompress;
+# - what identifies the CLIENT to a third party: `cookie` (the /ui session cookie rides
+#   along on a browser's same-origin call), `forwarded`/`x-forwarded-*`/`x-real-ip`/
+#   `via`/`cf-connecting-ip`/`true-client-ip`, the browser's `origin`/`referer`/`sec-*`
+#   metadata, and the gateway's own `x-source` attribution and `x-park-mode`.
+_HOP_BY_HOP = frozenset((
+    "host", "content-length", "authorization", "x-api-key", "x-park-mode", "x-source",
+    "connection", "keep-alive", "te", "trailer", "transfer-encoding", "upgrade", "expect",
+    "accept-encoding", "cookie", "forwarded", "x-real-ip", "via", "cf-connecting-ip",
+    "true-client-ip", "origin", "referer",
+))
+_HOP_BY_HOP_PREFIXES = ("proxy-", "x-forwarded-", "sec-")
+
+
+def _forward_headers(headers) -> dict:
+    """The client's headers a backend may see (see _HOP_BY_HOP), names lowercased."""
+    items = [(str(k).lower(), v) for k, v in (headers or {}).items()]
+    named = {h.strip().lower() for k, v in items if k == "connection"
+             for h in str(v).split(",") if h.strip()}
+    return {k: v for k, v in items
+            if k not in _HOP_BY_HOP and k not in named and not k.startswith(_HOP_BY_HOP_PREFIXES)}
 
 
 class OpenAIAdapter(BackendAdapter):
@@ -1007,10 +1037,7 @@ class OpenAIAdapter(BackendAdapter):
         release it via _finish()."""
         b = self.backend
         ctx = self.ctx
-        headers = {
-            k: v for k, v in req.raw.headers.items()
-            if k.lower() not in _HOP_BY_HOP
-        }
+        headers = _forward_headers(req.raw.headers)
         headers.update(self._backend_auth())
         real_model = req.body.get("model")
         fwd, reasoning_ctl = self._payload(req)

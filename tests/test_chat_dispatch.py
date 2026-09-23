@@ -183,6 +183,69 @@ class UnexpectedErrorShape(unittest.TestCase):
         self.assertIn("bridge exploded", body["error"]["message"])
 
 
+def _ctx(recorded=None):
+    async def record_call(**kw):
+        if recorded is not None:
+            recorded.append(kw)
+    return adapters.AdapterContext(
+        auth_headers=lambda b: {"authorization": "Bearer BACKEND-KEY"} if b.get("api_key") else {},
+        inflight_inc=lambda bid: None, inflight_dec=lambda bid: None,
+        cost_usd=lambda *a: 0.0, source_of=lambda r: "test", record_call=record_call,
+        log_enabled=lambda: False)
+
+
+def _raw(headers):
+    return types.SimpleNamespace(headers=headers, client=None, state=types.SimpleNamespace())
+
+
+BROWSER_HEADERS = {
+    "host": "gw:4000", "content-length": "99", "authorization": "Bearer GATEWAY-KEY",
+    "x-api-key": "GATEWAY-KEY", "connection": "keep-alive, x-hop-custom", "keep-alive": "timeout=5",
+    "x-hop-custom": "1", "te": "trailers", "trailer": "x", "transfer-encoding": "chunked",
+    "upgrade": "h2c", "proxy-authorization": "Basic Zm9v", "expect": "100-continue",
+    "accept-encoding": "gzip, br, zstd", "cookie": "gw_session=SECRET",
+    "x-forwarded-for": "10.0.0.7", "x-forwarded-host": "hub.lan", "forwarded": "for=10.0.0.7",
+    "x-real-ip": "10.0.0.7", "x-source": "kai-laptop", "origin": "http://hub.lan",
+    "referer": "http://hub.lan/ui/playground", "sec-fetch-site": "same-origin",
+    "sec-ch-ua": '"Chromium"', "x-park-mode": "wait",
+    # what backends DO read — must survive
+    "content-type": "application/json", "accept": "text/event-stream",
+    "user-agent": "claude-cli/2.1 (external, cli)", "anthropic-beta": "fine-grained-tool-streaming",
+    "anthropic-version": "2023-06-01", "x-app": "cli", "x-stainless-lang": "js",
+    "http-referer": "https://n8n.example", "x-title": "N8N agent",
+}
+KEPT = {"content-type", "accept", "user-agent", "anthropic-beta", "anthropic-version", "x-app",
+        "x-stainless-lang", "http-referer", "x-title"}
+
+
+class ForwardedHeaders(unittest.TestCase):
+    """K9/S20: what reaches a backend of the client's headers."""
+
+    def test_only_end_to_end_headers_a_backend_can_use_survive(self):
+        self.assertEqual(set(adapters._forward_headers(BROWSER_HEADERS)), KEPT)
+
+    def test_openai_adapter_forwards_the_filtered_set_plus_its_own_credential(self):
+        a = adapters.OpenAIAdapter({"name": "or", "url": "http://x", "api_key": "k"}, _ctx())
+        req = adapters.NormalizedRequest(path="/v1/chat/completions", alias="m", real_model="m",
+                                         body={"model": "m", "messages": []}, raw=_raw(BROWSER_HEADERS))
+        call = a._prepare(req)
+        a._finish(call)
+        self.assertEqual(set(call.headers), KEPT | {"authorization"})
+        self.assertEqual(call.headers["authorization"], "Bearer BACKEND-KEY")
+
+    def test_anthropic_passthrough_keeps_what_claude_code_sends(self):
+        a = adapters.AnthropicAdapter({"name": "claude", "type": "anthropic",
+                                       "url": "https://api.anthropic.com", "api_key": "tok"}, _ctx())
+        req = adapters.NormalizedRequest(path="/v1/messages", alias="m", real_model="m",
+                                         body={"model": "m", "messages": []}, raw=_raw(BROWSER_HEADERS))
+        call = a._prepare(req)
+        a._finish(call)
+        for k in ("anthropic-beta", "anthropic-version", "user-agent", "x-app", "x-stainless-lang"):
+            self.assertIn(k, call.headers)
+        self.assertNotIn("cookie", call.headers)
+        self.assertNotIn("x-api-key", call.headers)        # the gateway key never leaves
+
+
 class Timeouts(unittest.TestCase):
     """P5: 300 s is a READ budget for long completions, never a connect budget."""
 

@@ -110,7 +110,15 @@ they need via injected callables, staying hot-reload-safe.
   Anthropic backend AND an OpenRouter model with normal failover between them.
   `_HOP_BY_HOP` drops `x-api-key` alongside `authorization` — both are GATEWAY
   credentials (Claude Code sends the former), and forwarding either would hand the
-  caller's key to the backend.
+  caller's key to the backend. `_forward_headers` applies it (the one site that copies
+  client headers) and also drops RFC 7230 hop-by-hop headers (plus whatever
+  `connection` names), `expect`, `accept-encoding` (httpx negotiates what it can
+  decode — a browser's `br` came back as a body the gateway could not read), and what
+  identifies the client to a third party: `cookie`, `forwarded`/`x-forwarded-*`/
+  `x-real-ip`/`via`, `origin`/`referer`/`sec-*`, `x-source`. It stays a DENYLIST on
+  purpose: the Anthropic passthrough relies on whatever Claude Code sends
+  (`anthropic-*`, `x-stainless-*`, `x-app`, user-agent) and OpenRouter reads
+  `HTTP-Referer`/`X-Title` — an allowlist would silently strip the next such header.
   Going the other way, every response builder keeps only its OWN headers
   (`call.rheaders` = `x-gateway-backend` + `x-reasoning-control`) — an upstream
   `content-length` would describe a body the gateway re-serializes — with ONE
