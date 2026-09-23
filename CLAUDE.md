@@ -1005,6 +1005,17 @@ they need via injected callables, staying hot-reload-safe.
   and "1.5"/"-1"/"1e3" became an UNLIMITED cap or quota. Each refusal is a 400 with the
   form re-rendered as typed, nothing is written; voice ship targets are checked on Save
   with main's own rules).
+  Extended in the second review round (no new files): `test_gen_inputs.py` also pins the
+  image slots of a `workflow: <path>` alias (read from that file; an unreadable one
+  filters nothing — reading it as `{}` dropped every reference image, and the job came
+  back `done` on the loader's default) and the shims' positional mapping onto it;
+  `test_playground_files.py` that `mesh_format`/`remesh_mode`-style settings are no file
+  fields; `test_ui_look.py` that an EMPTY Media Jobs list is live and already carries the
+  list's scripts; `test_stats_store.py` that the Users page's reverse-DNS names stay in
+  memory until *Save resolved names*; `test_ui_post_only.py` the 405 console page (with
+  `Allow: POST` and a way back) for a GET to any POST-only path; `test_jobs_lifecycle.py`
+  that `set_backend` leaves a terminal row alone; `test_gen_cancel.py` that a discovery
+  poll spanning an adapter rebuild lands on the CURRENT instance (only for the same URL).
   Run them all with `python -m unittest discover -s tests -t .` (no runner dependency).
 - **`openai_image_bridge.py`** — pure request/response plumbing for the OpenAI
   image shims (`multipart_list`, `parse_size`, `coerce_scalar`, `images_uploads`
