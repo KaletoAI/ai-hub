@@ -133,5 +133,26 @@ class SortKeysInMarkup(unittest.TestCase):
         self.assertIn('data-sv="60000"', row)           # dur (ms)
 
 
+class LiveStatusChip(unittest.TestCase):
+    """A live page whose server went away kept showing its last numbers as if they were
+    current (review U12) — the poller only backed off, silently. The chip is the one
+    place that says "these numbers are old"."""
+
+    def test_header_carries_a_hidden_chip_outside_main(self):
+        html = admin._page("T", "<p>x</p>", "dashboard", refresh=4)
+        head = html.split("<body>", 1)[1].split("<main", 1)[0]
+        self.assertRegex(head, r'<span id="gwlive" class="livechip"[^>]*\bhidden\b')
+
+    def test_poller_drives_all_three_states(self):
+        js = admin._LIVE_JS
+        self.assertIn("getElementById('gwlive')", js)
+        for state in ("'live'", "'stale'", "'offline'"):
+            self.assertIn(state, js)
+
+    def test_dashboard_no_longer_hardcodes_its_cadence(self):
+        import inspect
+        self.assertNotIn("auto-refresh 4s", inspect.getsource(admin.dashboard_page))
+
+
 if __name__ == "__main__":
     unittest.main()

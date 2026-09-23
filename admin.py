@@ -581,6 +581,13 @@ _TABS_JS = ("<script>(function(){"
 # every live page owes: it must ALREADY contain every <script> any later state of it
 # can render — hoist them (see job_detail_page, _playground_body) and, where the script
 # has to act on nodes that arrive later, register the action in window.gwLiveHooks.
+# The poller also owns the header's #gwlive chip (rendered hidden by _nav, outside
+# <main> so the morph never touches it): "live · 4s" after every good tick, "stale
+# since hh:mm:ss" when the server answers non-2xx, "offline since …" when the fetch
+# itself fails — the time is that of the last GOOD update, i.e. the age of what the
+# page shows. Before it, a dead server just left the last numbers standing. Hidden
+# again when a response stops the poller: a page that is no longer live has nothing
+# to announce.
 _LIVE_JS = ("<script>(function(){"
             "var main=document.querySelector('main');"
             "if(!main)return;"
@@ -652,6 +659,14 @@ _LIVE_JS = ("<script>(function(){"
             "var cur=o.firstChild;"
             "for(i=0;i<out.length;i++){if(cur===out[i])cur=cur.nextSibling;"
             "else o.insertBefore(out[i],cur);}}"
+            "var chip=document.getElementById('gwlive'),okAt=Date.now();"
+            "function hms(t){var d=new Date(t);return [d.getHours(),d.getMinutes(),d.getSeconds()]"
+            ".map(function(x){return ('0'+x).slice(-2);}).join(':');}"
+            "function show(st,txt,tip){if(!chip)return;chip.hidden=!st;if(!st)return;"
+            "chip.className=st==='live'?'livechip':'livechip '+st;chip.textContent=txt;"
+            "chip.title=tip||'';}"
+            "function fresh(){okAt=Date.now();show('live','live \\u00b7 '+(base/1000)+'s',"
+            "'auto-updating every '+(base/1000)+' s \\u00b7 last update '+hms(okAt));}"
             "var wait=base,timer=null,catchUp=false;"
             "function schedule(ms){if(timer)clearTimeout(timer);timer=setTimeout(tick,ms);}"
             "function stop(){if(timer)clearTimeout(timer);timer=null;}"
@@ -660,7 +675,9 @@ _LIVE_JS = ("<script>(function(){"
             ".then(function(r){"
             "if(r.redirected&&new URL(r.url).pathname!==location.pathname){"
             "stop();location.href=r.url;return null;}"
-            "if(!r.ok){wait=Math.min(wait*2,30000);schedule(wait);return null;}"
+            "if(!r.ok){wait=Math.min(wait*2,30000);schedule(wait);"
+            "show('stale','stale since '+hms(okAt),'the server answered HTTP '+r.status+"
+            "' \\u2014 showing what it sent at '+hms(okAt)+'; retrying');return null;}"
             "return r.text();})"
             ".then(function(html){"
             "if(html===null||html===undefined)return;"
@@ -674,13 +691,15 @@ _LIVE_JS = ("<script>(function(){"
             "for(var i=0;i<window.gwLiveHooks.length;i++){"
             "try{window.gwLiveHooks[i]();}catch(e){}}"
             "var next=parseInt(main.getAttribute('data-live')||'0',10)*1000;"
-            "if(!(next>0)){stop();return;}"
-            "wait=base=next;"
+            "if(!(next>0)){stop();show('');return;}"
+            "wait=base=next;fresh();"
             "schedule(wait);})"
-            ".catch(function(){wait=Math.min(wait*2,30000);schedule(wait);});}"
+            ".catch(function(){wait=Math.min(wait*2,30000);schedule(wait);"
+            "show('offline','offline since '+hms(okAt),'the server cannot be reached \\u2014 "
+            "showing what it sent at '+hms(okAt)+'; retrying');});}"
             "document.addEventListener('visibilitychange',function(){"
             "if(!document.hidden&&catchUp&&timer){catchUp=false;schedule(0);}});"
-            "schedule(wait);"
+            "fresh();schedule(wait);"
             "})();</script>")
 
 
@@ -6295,7 +6314,7 @@ async def dashboard_page(request: Request):
     now = int(time.time())
     f = await asyncio.to_thread(_faults_info)
     fmap = {s.get("bid"): s for s in f.get("backends") or []}
-    body = ("<h2>Dashboard <span class='muted' style='font-weight:normal'>· live · auto-refresh 4s</span></h2>"
+    body = ("<h2>Dashboard</h2>"
             + _dash_cards(d, bes, f) + _dash_backends(bes, offline, fmap) + _dash_faults(f)
             + _dash_parked(d) + _dash_llm(d, now) + _dash_jobs(d, now) + _JOB_TICK)
     return HTMLResponse(_page("Dashboard", body, "dashboard", refresh=4))
