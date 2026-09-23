@@ -98,10 +98,8 @@ class AdapterHelpers(unittest.TestCase):
         self.assertEqual(adapters.cloud_block({"tripo": {"endpoint": "rig"}}), {"endpoint": "rig"})
         self.assertIsNone(adapters.cloud_block({}))
 
-    def test_exception_aliases_and_vendor(self):
+    def test_exception_vendor(self):
         import adapters
-        self.assertIs(adapters.MeshyNoCredits, adapters.CloudNoCredits)
-        self.assertIs(adapters.MeshyBusy, adapters.CloudBusy)
         e = adapters.CloudNoCredits("x", vendor="Tripo")
         self.assertIsInstance(e, ConnectionError)
         self.assertEqual(e.vendor, "Tripo")

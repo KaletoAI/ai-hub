@@ -111,9 +111,6 @@ class CloudTaskRetryable(ConnectionError):
         self.vendor = vendor
 
 
-MeshyNoCredits, MeshyBusy = CloudNoCredits, CloudBusy   # pre-Tripo names (main._fault_label, tests)
-
-
 # ── OpenAI /v1/models discovery helpers (moved verbatim from main.py) ──────────
 
 def _to_float(v) -> float:
@@ -429,9 +426,6 @@ class NormalizedRequest:
     cloud: Optional[dict] = None                    # cloud alias candidate block {endpoint, options} of
                                                     # whatever kind — `cloud_block(cand)`; None on ComfyUI
                                                     # candidates
-    meshy: Optional[dict] = None                    # the pre-Tripo name of `cloud`, kept so existing
-                                                    # callers keep constructing a Meshy request the old
-                                                    # way; folded into `cloud` below, nothing reads it
     slot_held: bool = False                         # caller already holds the in-flight slot (chain) —
                                                     # generate() must not inc/dec it a second time
     job_id: str = ""                                # the job row this request runs for. Only live progress
@@ -445,10 +439,6 @@ class NormalizedRequest:
                                                     # what did we send?") is answerable only from the vendor's
                                                     # dashboard. Per-REQUEST, so concurrent jobs on one
                                                     # adapter cannot overwrite each other's facts.
-
-    def __post_init__(self):
-        if self.cloud is None and self.meshy is not None:
-            self.cloud = self.meshy
 
 
 # ── cloud task kinds (Meshy, Tripo): the one seam main/admin ask "which kind?" ──
@@ -3486,7 +3476,6 @@ class ComfyUIAdapter(BackendAdapter):
 _CLOUD_DISCOVERY_TIMEOUT = 8.0
 _CLOUD_HTTP_TIMEOUT = 30.0
 _CLOUD_DOWNLOAD_TIMEOUT = 120.0
-_MESHY_HTTP_TIMEOUT = _CLOUD_HTTP_TIMEOUT    # pre-Tripo name (test_meshy_adapter reads it)
 
 
 class _TaskVerdict(RuntimeError):
@@ -3740,8 +3729,6 @@ class CloudTaskAdapter(BackendAdapter):
                     raise RuntimeError(f"{self.vendor} task {task_id}: {e}")
                 continue
             client_errs = 0
-            # `options` by KEYWORD: meshy.parse_task takes the legacy `animations` bool in
-            # the 4th positional slot, so a positional options dict would land there.
             state = self.mod.parse_task(task, formats, endpoint, options=opts)
             if state.error:            # failed/cancelled — or a status this gateway does not know
                 detail = f"{self.vendor} task {task_id} {state.status.lower()}: {state.error}"

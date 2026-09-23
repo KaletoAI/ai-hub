@@ -233,10 +233,10 @@ they need via injected callables, staying hot-reload-safe.
   backends are keyed `(name, type)`, so a bare-name match could hand a Meshy alias the
   GPU box), `cloud_module(kind)`, `cloud_block(cand)` (a COPY — the request must not
   write through into the stored candidate) and the derived `CLOUD_TYPES`/
-  `CLOUD_MODULES`. `NormalizedRequest.cloud` carries that block (`.meshy` stays as the
-  pre-Tripo name, folded in by `__post_init__`), and `MeshyNoCredits`/`MeshyBusy` are
-  now `CloudNoCredits`/`CloudBusy` with a `vendor` attribute that `main._fault_label`/
-  `_gen_exhausted_msg` name (the old names stay as aliases).
+  `CLOUD_MODULES`. `NormalizedRequest.cloud` carries that block, and the vendor-neutral
+  `CloudNoCredits`/`CloudBusy` (the pre-Tripo `Meshy*` names and the `.meshy` request
+  field are gone — nothing stored carries them; the candidate's `meshy` KEY is the kind
+  and stays) have a `vendor` attribute that `main._fault_label`/`_gen_exhausted_msg` name.
 - **`meshy.py`** — the PURE half of the Meshy.ai backend (`type: meshy`; the HTTP half
   is `adapters.MeshyAdapter`): the fixed `input_*` label table → Meshy request body
   (`build_request`), the recorded request (`request_summary`, image data → byte size),
@@ -256,7 +256,7 @@ they need via injected callables, staying hot-reload-safe.
   endpoint has none → 400). `glb_data_uri` sniffs the `glTF` magic, so a renamed OBJ
   is refused before 5 credits are spent, and `options_of` narrows `target_formats` to
   `RIG_FORMATS` (glb/fbx) for the endpoint. `parse_task(task, formats, endpoint,
-  animations)`: `rigging` reads the urls off `task["result"]`
+  options)`: `rigging` reads the urls off `task["result"]`
   (`rigged_character_<fmt>_url`, `basic_animations.<clip>_<fmt>_url`) instead of
   `model_urls`, and `TaskState.downloads` is `[(filename, url)]` — the FILENAME is
   decided here (`rigged.glb` vs `model.glb`, `walking`/`running` clips only with the
@@ -277,7 +277,7 @@ they need via injected callables, staying hot-reload-safe.
   finishes and bills it. A Meshy backend is always `paid` (it bills per task);
   discovery = `GET /openapi/v1/balance` (0 → DOWN "no credits", balance + its age and
   the rolling gen fail-rate in `/health` + the Backends tab); 402/429 raise
-  `MeshyNoCredits`/`MeshyBusy` (ConnectionError subclasses → failover, named by
+  `CloudNoCredits`/`CloudBusy` (ConnectionError subclasses → failover, named by
   `_fault_label`). A FAILED task is final UNLESS the vendor blames itself: Meshy's
   `task_error.type` is the machine-readable verdict (`invalid_input` = permanent, while
   `timeout`/`service_unavailable`/`server_error` are answered "retry the request" in the
@@ -311,8 +311,7 @@ they need via injected callables, staying hot-reload-safe.
   `build_request`/`request_summary`/`parse_task`, a `<Kind>Input(RuntimeError)` for
   final content errors, and the three help texts `BACKEND_HINT`/`ENDPOINT_HINT`/
   `CHAIN_HINT`. `parse_task(task, formats, endpoint, options=…)` takes the whole option
-  block so the signature is identical for both (Meshy reads `options["animations"]`,
-  and keeps accepting the legacy 4th positional bool).
+  block so the signature is identical for both (Meshy reads `options["animations"]`).
 - **`cloudtask.py`** — the pure leaf both cloud modules import (no `main`/`adapters`
   imports, no I/O): `TaskState` (status/progress/error/downloads/thumbnail/credits,
   plus `riggable`/`rig_type` for a task that answers a QUESTION instead of delivering a

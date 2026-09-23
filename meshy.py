@@ -306,7 +306,7 @@ RETRYABLE_ERROR_TYPES = ("timeout", "service_unavailable", "server_error")
 
 
 def parse_task(task: dict, formats: list, endpoint: str = "image-to-3d",
-               animations: bool = False, options: Optional[dict] = None) -> TaskState:
+               options: Optional[dict] = None) -> TaskState:
     """Read a task object (GET …/{id}). On SUCCEEDED every requested format must have
     a URL — a missing one raises, never a silently smaller delivery.
 
@@ -321,10 +321,9 @@ def parse_task(task: dict, formats: list, endpoint: str = "image-to-3d",
     full wait to learn nothing.
 
     `options` is the whole admin option block, which is what the shared cloud adapter
-    hands every kind (the signature is the same for Meshy and Tripo). Given, it decides
-    the clips; the older `animations` bool stays for direct callers."""
-    if options is not None:
-        animations = bool(options.get("animations"))
+    hands every kind (the signature is the same for Meshy and Tripo); its `animations`
+    decides the clips."""
+    animations = bool((options or {}).get("animations"))
     status = str(task.get("status") or "").upper()
     try:
         progress = int(task.get("progress") or 0)

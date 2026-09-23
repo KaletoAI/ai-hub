@@ -127,7 +127,7 @@ class MeshyChainStage2(unittest.TestCase):
         return adapters.MeshyAdapter({"name": "meshy", "type": "meshy", "url": "http://127.0.0.1:1"}, _ctx())
 
     def test_feed_embeds_upload(self):
-        req2 = NormalizedRequest(alias="Meshy-Rig", meshy={"endpoint": "rigging", "options": {}})
+        req2 = NormalizedRequest(alias="Meshy-Rig", cloud={"endpoint": "rigging", "options": {}})
         ref = asyncio.run(self._ad().chain_feed_mesh(req2, {"name": "meshy"}, "input_mesh_path",
                                                      "gwchain_j1.glb", b"glTF" + b"\0" * 1_048_576, ""))
         self.assertEqual(req2.upload_files["input_mesh_path"][0], "gwchain_j1.glb")
