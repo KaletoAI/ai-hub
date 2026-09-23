@@ -422,8 +422,13 @@ _SCROLL_JS = ("<script>(function(){"
               "})();</script>")
 
 
-# Click-a-header to sort any `table.sortable` (numeric-aware: a cell that is a plain
-# number sorts numerically, otherwise lexically). The choice persists per table in
+# Click-a-header to sort any `table.sortable` (numeric-aware: a cell's `data-sv` raw
+# value wins; else its text is read as a number, understanding the units the console
+# prints — `102 ms`, `1.2 s`, `3.5 min`, `5m`, `2h`, `$0.0012` — else it sorts
+# lexically; a number sorts before a non-number such as `—`). Before the units, "1.2 s,
+# 10.1 s, 102 ms" was a TEXT sort. Cells whose text is not the quantity itself carry
+# `data-sv`: the time stamp (the year is shown only when it differs), `tok i/o` (in+out)
+# and a running job's `12.0 s / ~40 s`. The choice persists per table in
 # sessionStorage and is re-applied on load — so it survives the dashboard's 4s
 # auto-refresh. A gwLiveHooks entry re-applies it after every live morph too:
 # the server renders rows in insertion order and the morph re-imposes that order
@@ -455,8 +460,12 @@ _SCROLL_JS = ("<script>(function(){"
 # views) sort as BLOCKS, so a group never gets torn apart: the group row supplies the
 # key for column 0 (it is the alias name), later columns key off the first member row.
 _SORT_JS = ("<script>(function(){"
-            "function num(td){var t=(td.textContent||'').trim().replace(/[$,\\s]/g,'');"
-            "return /^-?\\d+(\\.\\d+)?$/.test(t)?parseFloat(t):null;}"
+            "function num(td){var v=td.getAttribute('data-sv');"
+            "if(v!==null&&v!==''&&!isNaN(+v))return +v;"
+            "var t=(td.textContent||'').trim().replace(/[$,\\s]/g,'');"
+            "var m=/^(-?\\d+(?:\\.\\d+)?)(ms|s|min|m|h|d)?$/.exec(t);if(!m)return null;"
+            "var f={ms:1,s:1e3,min:6e4,m:6e4,h:36e5,d:864e5};"
+            "return parseFloat(m[1])*(m[2]?f[m[2]]:1);}"
             "function ind(th,a){var s=th.querySelector('.sind');"
             "if(!s){s=document.createElement('span');s.className='sind';th.appendChild(s);}"
             "s.textContent=a||'';}"
@@ -471,6 +480,7 @@ _SORT_JS = ("<script>(function(){"
             "function sortIt(tbl,idx,dir){var hdr=tbl.rows[0];var bs=blocks(tbl,hdr);"
             "bs.sort(function(a,b){var x=cellOf(a,idx),y=cellOf(b,idx);if(!x||!y)return 0;"
             "var nx=num(x),ny=num(y),r;if(nx!==null&&ny!==null)r=nx-ny;"
+            "else if(nx!==null||ny!==null)r=nx!==null?-1:1;"
             "else r=(x.textContent||'').trim().toLowerCase().localeCompare((y.textContent||'').trim().toLowerCase());"
             "return dir<0?-r:r;});"
             "var tb=tbl.tBodies[0]||tbl;"
@@ -5373,7 +5383,7 @@ def _job_dur_cell(j: dict, now: int) -> str:
     st = j["status"]
     cr, upd = int(j.get("created") or 0), int(j.get("updated") or 0)
     if st in ("done", "failed") and upd >= cr:
-        return f"<td class='muted'>{_dur((upd - cr) * 1000)}</td>"
+        return f"<td class='muted' data-sv=\"{(upd - cr) * 1000}\">{_dur((upd - cr) * 1000)}</td>"
     est = _expected_dur_s(j.get("alias") or "", j.get("backend") or "") \
         if st in ("running", "queued") else None
     exp = f" <span class='muted'>/ ~{_dur(est * 1000)}</span>" if est else ""
@@ -5383,7 +5393,7 @@ def _job_dur_cell(j: dict, now: int) -> str:
         live = _job_progress(j["id"]) or {}
         if live.get("eta_s") is not None:
             exp = (f" <span class='muted'>/ ~{_dur(live['eta_s'] * 1000)} left</span>")
-        return (f"<td class='muted'><span class='jdur' data-since='{cr}'>"
+        return (f"<td class='muted' data-sv=\"{max(0, now - cr) * 1000}\"><span class='jdur' data-since='{cr}'>"
                 f"{_dur((now - cr) * 1000)}</span>{exp}</td>")
     if st == "queued" and est:
         return f"<td class='muted'>—<span class='muted'> / ~{_dur(est * 1000)}</span></td>"
@@ -5398,7 +5408,7 @@ def _job_row(j: dict, now: int, *, task_col: bool = False, count_col: bool = Fal
     st, jid = j["status"], j["id"]
     cells = []
     if time_col:
-        cells.append(f"<td class='muted'>{_ts(j.get('created'))}</td>")
+        cells.append(f"<td class='muted' data-sv=\"{int(j.get('created') or 0)}\">{_ts(j.get('created'))}</td>")
     cells.append(f"<td><a href='/ui/job/{_esc(jid)}'><code>{_esc(jid[:8])}</code></a></td>")
     if task_col:
         cells.append(f"<td>{_esc(j.get('task'))}</td>")
@@ -5406,7 +5416,8 @@ def _job_row(j: dict, now: int, *, task_col: bool = False, count_col: bool = Fal
               f"<td><span class='badge {_JOB_SCLS.get(st, 'muted')}'>{_esc(_job_status_text(j))}</span></td>"]
     if count_col:
         cells.append(f"<td class='muted'>{j.get('result_count') or 0}</td>")
-    cells += [f"<td class='muted'>{_age(j.get('created'))}</td>", _job_dur_cell(j, now),
+    cells += [f"<td class='muted' data-sv=\"{max(0, now - int(j.get('created') or 0))}\">"
+              f"{_age(j.get('created'))}</td>", _job_dur_cell(j, now),
               f"<td class='muted'>{_esc(j.get('owner'))}</td>"]
     if actions:
         acts = ((_btn('✕', f'/ui/job/{jid}/cancel', 'danger', sm=True, icon=True, confirm='Cancel this job?')
@@ -6329,11 +6340,13 @@ def _call_row(r, aliases) -> str:
     # whole table instead of inserting one row. Prefixed to keep the key space apart
     # from the job rows', in case the two ever share a parent node.
     return (f"<tr data-k=\"call-{_esc(cid)}\">"
-            f"<td class='muted'>{_ts(ts)}</td><td>{_esc(_src_name(source, aliases))}</td><td>{_esc(backend)}</td>"
+            f"<td class='muted' data-sv=\"{int(ts or 0)}\">{_ts(ts)}</td><td>{_esc(_src_name(source, aliases))}</td><td>{_esc(backend)}</td>"
             f"<td>{_esc(alias) or ''}{('→' + _esc(model)) if model else ''}</td>"
             f"<td class='muted'>{_esc((endpoint or '').replace('/v1/', ''))}</td>"
             f"<td><span class='badge {scls}'>{_esc(status)}</span></td>"
-            f"<td>{_dur(dur)}</td><td>{intk}/{outk}</td><td>{_cost(cost)}</td>{_reasoning_cell(rsn)}<td>{view}</td></tr>")
+            f"<td data-sv=\"{int(dur or 0)}\">{_dur(dur)}</td>"
+            f"<td data-sv=\"{int(intk or 0) + int(outk or 0)}\">{intk}/{outk}</td>"
+            f"<td data-sv=\"{float(cost or 0)}\">{_cost(cost)}</td>{_reasoning_cell(rsn)}<td>{view}</td></tr>")
 
 
 def _calls_table(rows_html: str, sk: str) -> str:

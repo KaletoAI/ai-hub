@@ -8,8 +8,11 @@ without `for` is a label a screen reader never announces; a live page that lost 
 server shows the last good numbers forever, with nothing saying they are old. So the
 contract is pinned on the markup and on the JS, not eyeballed.
 """
+import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import unittest
 
@@ -73,6 +76,61 @@ class Contrast(unittest.TestCase):
     def test_keyboard_focus_is_visible(self):
         self.assertIn(".btn:focus-visible", admin._CSS)
         self.assertIn("input:focus-visible", admin._CSS)
+
+
+_CALL = (4711, 1_799_999_400, 1234, "local-llama", "10.0.0.5", "chat", "gemma-4",
+         "/v1/chat/completions", 200, 120, 45, 0.0012, "hello", 1, "off:prefill")
+
+
+def _node_num(cells):
+    """Run _SORT_JS's num() in node over fake cells {text, sv} → list of keys."""
+    src = re.search(r"(function num\(td\)\{.*?\})function ind", admin._SORT_JS, re.S)
+    assert src, "num() not found in _SORT_JS"
+    prog = (src.group(1) + ";var cells=" + json.dumps(cells) + ";"
+            "console.log(JSON.stringify(cells.map(function(c){return num({textContent:c.text,"
+            "getAttribute:function(k){return k==='data-sv'&&c.sv!==undefined?c.sv:null;}});})));")
+    p = subprocess.run(["node", "-e", prog], capture_output=True, text=True)
+    assert p.returncode == 0, p.stderr
+    return json.loads(p.stdout)
+
+
+class NumericSort(unittest.TestCase):
+    """A header click sorted "1.2 s, 10.1 s, 102 ms" — the numbers carried units, so
+    num() gave up and compared them as text (review U4, confirmed in the browser)."""
+
+    def setUp(self):
+        if not shutil.which("node"):
+            self.skipTest("node not installed")
+
+    def test_units_are_understood(self):
+        keys = _node_num([{"text": "1.2 s"}, {"text": "102 ms"}, {"text": "3.5 min"},
+                          {"text": "5m"}, {"text": "2h"}, {"text": "$0.0012"}])
+        self.assertEqual(keys, [1200, 102, 210000, 300000, 7200000, 0.0012])
+
+    def test_raw_value_wins_over_the_text(self):
+        self.assertEqual(_node_num([{"text": "09-23 12:00:00", "sv": "1799999400"}]),
+                         [1799999400])
+
+    def test_text_stays_text(self):
+        self.assertEqual(_node_num([{"text": "gemma-4"}, {"text": "—"}]), [None, None])
+
+
+class SortKeysInMarkup(unittest.TestCase):
+    def test_call_row_carries_raw_values(self):
+        row = admin._call_row(_CALL, {})
+        self.assertIn('data-sv="1799999400"', row)      # time
+        self.assertIn('data-sv="1234"', row)            # dur (ms)
+        self.assertIn('data-sv="165"', row)             # tokens in+out
+        self.assertIn('data-sv="0.0012"', row)          # cost
+
+    def test_job_row_carries_raw_values(self):
+        j = {"id": "9f3c1ab27de44b0e", "status": "done", "task": "image", "alias": "a",
+             "backend": "b", "created": 1_799_999_400, "updated": 1_799_999_460, "owner": "k",
+             "result_count": 2}
+        row = admin._job_row(j, 1_800_000_000, time_col=True)
+        self.assertIn('data-sv="1799999400"', row)      # time
+        self.assertIn('data-sv="600"', row)             # age (s)
+        self.assertIn('data-sv="60000"', row)           # dur (ms)
 
 
 if __name__ == "__main__":
