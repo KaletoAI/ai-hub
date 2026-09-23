@@ -2632,7 +2632,7 @@ class ComfyUIAdapter(BackendAdapter):
         if old.backend.get("url") == self.backend.get("url"):
             self._node_types = old._node_types
             self._stuck_head, self._stuck_since = old._stuck_head, old._stuck_since
-            self._stuck_checks, self.exec_stuck = old._stuck_checks, old.exec_stuck
+            self.exec_stuck = old.exec_stuck
 
     async def cancel(self, job_id: str = "") -> None:
         """Stop the prompt job `job_id` submitted here — only that one (_stop_prompt). A job

@@ -147,7 +147,7 @@ class CancelledGenerate(unittest.TestCase):
         real = httpx.AsyncClient
         ad = _adapter()
         req = adapters.NormalizedRequest(
-            alias="a", task="text2img", job_id="job1", upload_prefix="gw_job1",
+            alias="a", job_id="job1", upload_prefix="gw_job1",
             workflow_json={"9": {"class_type": "SaveImage", "inputs": {"images": ["8", 0]}}},
             node_mapping={"prompt": {"node": "9", "field": "filename_prefix"}})
 
