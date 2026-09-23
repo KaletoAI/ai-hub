@@ -31,6 +31,10 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 
+class _InBandError(Exception):
+    """A `data: {"error": …}` chunk inside the chat stream being translated."""
+
+
 class UnsupportedContent(Exception):
     """A content block this backend cannot be given a faithful translation of.
     The endpoint turns it into a 400 — the alternative (dropping it) would answer
@@ -248,6 +252,13 @@ async def messages_stream(chat_resp, model: Optional[str], input_tokens: int = 0
                     continue
                 if not isinstance(obj, dict):
                     continue
+                if obj.get("error"):
+                    # The backend (OpenRouter does this) or the adapter after an upstream
+                    # drop reported the failure IN the stream — the same case as an
+                    # exception, and it must not close as a finished end_turn either.
+                    err = obj["error"]
+                    raise _InBandError(str((err.get("message") if isinstance(err, dict) else err)
+                                           or "backend reported an error"))
                 if obj.get("usage"):
                     usage = obj["usage"]
                 choice = (obj.get("choices") or [{}])[0]
@@ -301,7 +312,8 @@ async def messages_stream(chat_resp, model: Optional[str], input_tokens: int = 0
         logger.warning(f"anthropic SSE translate aborted: {e}")
         yield close_open()
         yield ev("error", {"error": {"type": "api_error",
-                                     "message": f"upstream stream failed: {e}"}})
+                                     "message": (str(e) if isinstance(e, _InBandError)
+                                                 else f"upstream stream failed: {e}")}})
         return
     finally:
         aclose = getattr(source, "aclose", None)

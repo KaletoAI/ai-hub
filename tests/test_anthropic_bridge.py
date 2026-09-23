@@ -498,6 +498,18 @@ class MessagesStream(unittest.TestCase):
         self.assertEqual(events[-1]["error"]["type"], "api_error")
         self.assertNotIn("message_stop", [e["type"] for e in events])
 
+    def test_an_in_band_error_chunk_reports_an_error_event(self):
+        """OpenRouter — and the adapter after an upstream drop — report a failure as a
+        `data: {"error": …}` chunk. Ignored, the stream closed as a finished end_turn."""
+        stream = FakeStream([delta_chunk(content="partial"),
+                             sse({"error": {"message": "upstream stream failed: ReadError: x",
+                                            "type": "upstream_error", "code": 502}})])
+        with self.assertLogs("anthropic_bridge", level="WARNING"):
+            events = collect(ab.messages_stream(stream, "m"))
+        self.assertEqual(events[-1]["type"], "error")
+        self.assertEqual(events[-1]["error"]["message"], "upstream stream failed: ReadError: x")
+        self.assertNotIn("message_stop", [e["type"] for e in events])
+
     def test_a_stream_that_never_produced_content_still_closes_cleanly(self):
         events = collect(ab.messages_stream(FakeStream(["data: [DONE]\n\n"]), "m"))
         self.assertEqual([e["type"] for e in events],

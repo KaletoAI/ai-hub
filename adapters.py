@@ -793,6 +793,26 @@ def _stream_end_status(e: BaseException) -> int:
     return 499 if isinstance(e, (GeneratorExit, asyncio.CancelledError)) else 502
 
 
+def _upstream_drop_msg(e: BaseException) -> str:
+    return f"upstream stream failed: {type(e).__name__}: {str(e) or 'connection lost'}"
+
+
+# A stream the UPSTREAM broke mid-answer (client already has a 200 and part of the
+# text). Re-raising used to abort the connection — the client saw a truncated body with
+# no [DONE] and no reason (and uvicorn logged an ASGI traceback) — which many clients
+# take for a finished answer. Both protocols have an in-band error for this: OpenAI
+# clients raise on a `data: {"error": …}` chunk, Anthropic ones on an `error` event.
+def _sse_openai_error(e: BaseException) -> bytes:
+    return ("data: " + json.dumps({"error": {"message": _upstream_drop_msg(e),
+                                             "type": "upstream_error", "code": 502}})
+            + "\n\n").encode()
+
+
+def _sse_anthropic_error(e: BaseException) -> bytes:
+    return ("event: error\ndata: " + json.dumps({"type": "error", "error": {
+        "type": "api_error", "message": _upstream_drop_msg(e)}}) + "\n\n").encode()
+
+
 @dataclass
 class _Call:
     """Per-dispatch bookkeeping shared by the stream and non-stream paths —
@@ -1224,7 +1244,10 @@ class OpenAIAdapter(BackendAdapter):
                     yield tail
             except BaseException as e:
                 status = _stream_end_status(e)
-                raise
+                if status != 502:                  # the CLIENT left — nobody to tell
+                    raise
+                logger.warning(f"✗ [{self.name}] {_upstream_drop_msg(e)} (mid-stream)")
+                yield _sse_openai_error(e)
             finally:
                 try:
                     await stream_cm.__aexit__(None, None, None)
@@ -1456,7 +1479,13 @@ class AnthropicAdapter(OpenAIAdapter):
                     yield chunk                       # verbatim, always
             except BaseException as e:
                 status = _stream_end_status(e)
-                raise
+                if status != 502:                  # the CLIENT left — nobody to tell
+                    raise
+                # The only bytes the gateway ever adds to this stream: the upstream is
+                # gone, so there is no verbatim left to preserve. A blank line first
+                # closes a half-received event, so ours is parsed on its own.
+                logger.warning(f"✗ [{self.name}] {_upstream_drop_msg(e)} (mid-stream)")
+                yield (b"\n\n" if buf else b"") + _sse_anthropic_error(e)
             finally:
                 try:
                     await stream_cm.__aexit__(None, None, None)

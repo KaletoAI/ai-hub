@@ -288,8 +288,10 @@ class StreamStats(unittest.TestCase):
             resp = await a.dispatch(req)
             it = resp.body_iterator
             got, err = 0, None
+            self.out = []
             try:
-                async for _ in it:
+                async for piece in it:
+                    self.out.append(piece if isinstance(piece, bytes) else piece.encode())
                     got += 1
                     if abort_after is not None and got >= abort_after:
                         await it.aclose()          # what Starlette does when the client leaves
@@ -319,9 +321,29 @@ class StreamStats(unittest.TestCase):
     def test_an_upstream_drop_mid_stream_books_502(self):
         rows, counts, err = self._run(adapters.OpenAIAdapter, A, CHAT_CHUNKS,
                                       explode=httpx.ReadError("connection reset"))
-        self.assertIsInstance(err, httpx.ReadError)          # the client's stream still breaks
+        # The client is TOLD, in the stream, instead of getting a cut connection that
+        # reads like a finished answer (no [DONE], no reason, an ASGI traceback).
+        self.assertIsNone(err)
+        last = self.out[-1].decode()
+        self.assertTrue(last.startswith("data: "), last)
+        self.assertIn("ReadError", json.loads(last[6:])["error"]["message"])
+        self.assertNotIn(b"[DONE]", b"".join(self.out))
         self.assertEqual([r["status"] for r in rows], [502])
         self.assertEqual(rows[0]["output_tokens"], 3)
+        self.assertEqual(counts["inc"], counts["dec"])
+
+    def test_an_upstream_drop_on_the_anthropic_passthrough_sends_an_error_event(self):
+        claude = {"name": "claude", "type": "anthropic", "url": "https://api.anthropic.com"}
+        rows, counts, err = self._run(adapters.AnthropicAdapter, claude, ANTH_CHUNKS[:2],
+                                      explode=httpx.RemoteProtocolError("peer closed"),
+                                      path="/v1/messages")
+        self.assertIsNone(err)
+        tail = self.out[-1].decode()
+        self.assertIn("event: error", tail)
+        body = json.loads(tail.split("data: ", 1)[1])
+        self.assertEqual(body["type"], "error")
+        self.assertIn("RemoteProtocolError", body["error"]["message"])
+        self.assertEqual([r["status"] for r in rows], [502])
         self.assertEqual(counts["inc"], counts["dec"])
 
     def test_the_anthropic_passthrough_books_an_abort_too(self):
