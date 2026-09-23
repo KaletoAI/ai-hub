@@ -146,6 +146,10 @@ _apply_server_settings: Callable[[], None] = lambda: None
 _apply_users: Callable[[], None] = lambda: None
 _resolve_admin: Callable = lambda key: None
 _ui_locked: Callable[[], bool] = lambda: False
+# Whether anyone can sign in (master key or an enabled admin user with a key).
+_admin_credential_exists: Callable[[], bool] = lambda: True
+# users-after-the-change → refusal code (see _USER_REFUSALS) or None.
+_admin_change_refusal: Callable[[list], Optional[str]] = lambda users_after: None
 # (admin name, is_master) → fingerprint of that admin's CURRENT credential, None = no
 # longer an admin. Sessions carry it, so revoking the credential revokes them.
 _admin_session_tag: Callable[[Optional[str], bool], Optional[str]] = lambda name, master: None
@@ -1024,9 +1028,16 @@ async def _ui_guard(request: Request, call_next):
 
 def _login_page(error: str = "", nxt: str = "/ui") -> str:
     err = f"<p class='bad'>{_esc(error)}</p>" if error else ""
+    # Users exist but none can sign in (an old store.db — the editor no longer lets
+    # the console get here): name the one way back in instead of a dead login form.
+    stuck = ("" if _admin_credential_exists() else
+             "<p class='bad'>No admin can sign in: users exist, but none of them is an enabled "
+             "<b>admin</b> with a key, and no master key is set. Set <code>api_key: &lt;a long "
+             "random key&gt;</code> in <code>config.yaml</code> (reloaded on save, no restart) "
+             "and sign in with it.</p>")
     body = (f"<div style='max-width:360px;margin:8vh auto;text-align:left'>"
             f"<h2>AI-Hub login</h2><p class='hint'>Enter an <b>admin API key</b> to access the console.</p>"
-            f"{err}<form action='/ui/login' method='post'>"
+            f"{stuck}{err}<form action='/ui/login' method='post'>"
             f"<input type='hidden' name='next' value='{_esc(nxt)}'>"
             f"{_field('admin key', _inp('key', '', placeholder='Bearer token', typ='password'))}"
             f"<div class='field'><label></label><div class='control'>{_btn('Sign in', submit=True)}</div></div>"
@@ -6992,6 +7003,21 @@ def _user_form(u: Optional[dict]) -> str:
             + "</form>")
 
 
+# Why the users editor refused a change (admin_change_refusal's codes). A fixed table,
+# so the redirect's query string can never inject text into the page.
+_USER_REFUSALS = {
+    "last_admin": "that would remove the last admin who can sign in — the console would "
+                  "open to everyone. Make another user an <b>admin</b> (enabled, with a key) "
+                  "or set a master API key in <a href='/ui/server'>Server</a> first.",
+    "last_admin_open": "that would remove the last admin who can sign in — the console AND the "
+                       "API would open to everyone. Set a master API key in "
+                       "<a href='/ui/server'>Server</a> first if that is really what you want.",
+    "no_admin": "the first user must be an enabled <b>admin</b> with a key (or set a master API "
+                "key in <a href='/ui/server'>Server</a>) — a user locks the console, and without "
+                "an admin nobody could sign in.",
+}
+
+
 async def users_page(request: Request):
     qp = request.query_params
     edit = qp.get("edit", "")
@@ -7012,8 +7038,11 @@ async def users_page(request: Request):
         items += _item(f"{_esc(u['name'])} {role_b}{st} {key_b}", sub, acts, sel=(u["name"] == edit))
     items = items or "<p class='muted'>No users — the gateway is open (bootstrap). Add one to require keys.</p>"
     warn = ("<p class='ok-banner'>Bootstrap mode: no users and no master key → the API and /ui are "
-            "open. Add an <b>admin</b> user (or set a master API key in Server) to lock it down.</p>"
-            if open_auth else "")
+            "open. Add an <b>admin</b> user first (or set a master API key in Server) to lock it "
+            "down.</p>" if open_auth else "")
+    why = _USER_REFUSALS.get(qp.get("refused", ""))
+    if why:
+        warn = f"<p class='bad'>Not saved: {why}</p>" + warn
     list_html = (f'<div class="bar"><h2>Users</h2>{_btn("+ New user", "/ui/users?new=1")}</div>'
                  "<p class='hint'>Each user authenticates with their API key; calls are attributed to "
                  "them (stats, job ownership). Empty model list = all allowed.</p>" + items)
@@ -7089,6 +7118,12 @@ async def users_save(request: Request):
     ak = g("api_key").strip()
     if ak:
         u["api_key"] = ak
+    after = [x for x in store.list_users() if x.get("name") not in (orig, name)] + [u]
+    refused = _admin_change_refusal(after)
+    if refused:
+        back = f"edit={quote(orig)}" if orig and store.get_user(orig) else "new=1"
+        logger.warning(f"ui: user '{name}' not saved — {refused}")
+        return RedirectResponse(f"/ui/users?{back}&refused={refused}", status_code=303)
     if orig and orig != name and store.get_user(orig) is not None:
         store.delete_user(orig)
     store.upsert_user(u)
@@ -7100,6 +7135,10 @@ async def users_save(request: Request):
 async def users_del(request: Request):
     name = (request.query_params.get("name", "") or "").strip()
     if name:
+        refused = _admin_change_refusal([u for u in store.list_users() if u.get("name") != name])
+        if refused:
+            logger.warning(f"ui: user '{name}' not deleted — {refused}")
+            return RedirectResponse(f"/ui/users?refused={refused}", status_code=303)
         store.delete_user(name)
         _apply_users()
         logger.info(f"ui: user '{name}' deleted")

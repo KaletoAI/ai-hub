@@ -1074,7 +1074,15 @@ maps the alias, and exposes the resolved model. Recurring concepts:
 `authenticate()` resolves a Bearer token to a user (`_users_by_key`) or the
 master `_MASTER_ADMIN` (the top-level `api_key`); `gate_request()` enforces the
 allow-list (`_model_allowed`, incl. whole-backend grants) + quotas and attributes
-the call. Bootstrap-open with no users and no master key. The `/ui` console
+the call. Bootstrap-open with no users and no master key. `ui_locked()` is the SAME
+condition the API uses (any user or a master key) — locking only on an ADMIN credential
+left a gateway with only `role: user` accounts API-closed and console-open. The users
+editor keeps "someone can sign in" true via `main.admin_change_refusal` (a first
+non-admin user, and deleting/demoting/disabling the last enabled admin with a key while
+no master key exists, are refused with a `?refused=<code>` banner from the fixed
+`_USER_REFUSALS` table); an old store.db already in the users-but-no-admin state stays
+locked and the login page names `api_key` in config.yaml as the way in
+(`test_ui_lock.py`). The `/ui` console
 session is gated by `_ui_guard` once locked: an encrypted cookie (`strict`) carrying
 `main.admin_session_tag` — the fingerprint of the credential it was opened with,
 re-checked per request, so rotating a key or demoting/deleting an admin ends its

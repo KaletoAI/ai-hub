@@ -162,7 +162,13 @@ Two layers, both optional:
   form is ever shown, as before.
 
 **Bootstrap-open → locked.** With no users *and* no master key, the gateway and
-console are fully open. Add an admin user (or set a master key) to lock it down.
+console are fully open. Add an admin user (or set a master key) to lock it down:
+from the first user or master key on, the API needs a key AND the console a login.
+The Users tab therefore refuses a first user that is not an admin, and refuses
+deleting, demoting or disabling the last admin while no master key is set — either
+would leave nobody able to sign in, or silently open the console again. A gateway
+already in that state (users, but no enabled admin with a key and no master key)
+stays locked; set `api_key:` in `config.yaml` (hot-reloaded) and sign in with it.
 
 **Job ownership.** Generation jobs and background responses are owner-gated:
 `GET`/cancel of a job (and its result/input artifacts) is allowed only for its

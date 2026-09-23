@@ -1197,10 +1197,34 @@ def admin_session_tag(name: Optional[str], master: bool) -> Optional[str]:
 
 
 def ui_locked() -> bool:
-    """True once an admin credential exists (master key or an admin user) → /ui needs
-    login. Bootstrap-open (no admin anywhere) returns False so you can't lock yourself
-    out before setting one up."""
-    return bool(api_key) or any(u.get("role") == "admin" for u in users)
+    """True once ANY credential exists (master key or any user) → /ui needs login —
+    the same condition that closes the API (`authenticate`). Locking only on an ADMIN
+    credential left a gateway with nothing but `role: user` accounts API-closed and
+    console-open to the whole LAN. Bootstrap-open (no users, no key) returns False."""
+    return bool(api_key) or bool(users)
+
+
+def admin_credential_exists(user_list: Optional[list] = None,
+                            key: Optional[str] = None) -> bool:
+    """Whether someone can sign in to /ui: a master key, or an ENABLED admin user that
+    has a key (what `resolve_admin` accepts). Defaults to the live state."""
+    ulist = users if user_list is None else user_list
+    if key if key is not None else api_key:
+        return True
+    return any(u.get("role") == "admin" and u.get("enabled", True) and u.get("api_key")
+               for u in ulist)
+
+
+def admin_change_refusal(users_after: list) -> Optional[str]:
+    """Why a users-editor change must be refused, or None. Two states are never entered
+    from the console: users without any admin credential (the console locks and nobody
+    can sign in), and a locked gateway losing its last admin credential (the console —
+    and with no users left, the API — silently opens again). A master key covers both."""
+    if admin_credential_exists(users_after):
+        return None
+    if admin_credential_exists():
+        return ("last_admin" if users_after else "last_admin_open")
+    return "no_admin" if users_after else None
 
 
 def alias_entry(alias: str, backend_name: str) -> tuple[Optional[str], Optional[int]]:
@@ -5130,6 +5154,8 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
            apply_users=apply_users,
            resolve_admin=resolve_admin, ui_locked=ui_locked,
            admin_session_tag=admin_session_tag,
+           admin_credential_exists=admin_credential_exists,
+           admin_change_refusal=admin_change_refusal,
            dashboard_snapshot=dashboard_snapshot, cancel_generation=cancel_generation,
            drain_backend=begin_drain, cancel_drain=cancel_drain,
            set_backend_enabled=set_backend_enabled,
