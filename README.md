@@ -1449,6 +1449,15 @@ sudo systemctl enable --now ai-hub
 journalctl -u ai-hub -f
 ```
 
+The unit runs as `root` (the voice-reference ship uses root's SSH key) inside a systemd
+sandbox that works for root: `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=full`
+(/usr, /boot, /etc read-only), the kernel/cgroup/clock protections, `RestrictSUIDSGID`,
+`RestrictNamespaces` and a socket-family allow-list. It deliberately leaves `ProtectHome`
+off (`~/.ssh`, the faster-whisper cache in `~/.cache`) and uses `full`, not `strict`
+(the DBs, `jobs/`, `voiceref/` live in `/opt/ai-hub`). Running as a dedicated user is
+possible but needs that user to own `/opt/ai-hub` and to hold its own SSH key on every
+voice host — a decision for the operator, not the unit file.
+
 `deploy.sh` is an rsync-over-SSH helper (`DEPLOY_HOST=root@host ./deploy.sh`):
 syncs code (excluding `config.yaml`, `venv/`), installs requirements in a remote
 venv, syncs the systemd unit, restarts.

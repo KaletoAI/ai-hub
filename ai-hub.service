@@ -4,11 +4,36 @@ After=network.target
 
 [Service]
 Type=simple
+# Still root: the voice-reference ship runs ssh/scp with root's key, and /opt/ai-hub is
+# root-owned. A dedicated user is an operator decision (file ownership + an ssh key of
+# its own); until then the sandbox below limits what a compromised process can touch.
 User=root
 WorkingDirectory=/opt/ai-hub
 ExecStart=/opt/ai-hub/venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000
 Restart=on-failure
 RestartSec=5
+
+# Hardening that works as root. Deliberately NOT set: ProtectHome (the ship needs
+# ~/.ssh, faster-whisper caches models in ~/.cache), ProtectSystem=strict (it would need
+# every writable path listed; /opt/ai-hub holds the DBs, jobs/, voiceref/, calls/),
+# PrivateDevices, MemoryDenyWriteExecute and capability drops (native wheels, files a
+# deploy may leave owned by another uid).
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+# AF_NETLINK: `ip -o -4 addr show` behind Backends → Scan network
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 
 [Install]
 WantedBy=multi-user.target

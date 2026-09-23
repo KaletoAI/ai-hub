@@ -41,7 +41,10 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
   compile-gating (`venv/bin/python -m py_compile *.py`) before deploy.
 - `requirements.txt` omits `watchfiles`; it ships with `uvicorn[standard]`. Keep it.
 - Deploy with `DEPLOY_HOST=root@host ./deploy.sh` (rsync/tar over SSH, remote venv
-  install, systemd sync, restart). rsync IS present on both dev and the prod box
+  install, systemd sync, restart). `ai-hub.service` runs as root inside a root-compatible
+  sandbox (NoNewPrivileges, PrivateTmp, ProtectSystem=full, kernel/cgroup protections,
+  AF_NETLINK kept for Scan network); ProtectHome/ProtectSystem=strict would break the
+  voice ship and the DB writes silently — `test_service_unit.py` pins both halves. rsync IS present on both dev and the prod box
   (re-checked 2026-08-18; an older note claiming otherwise was stale). Always
   compile-gate first — a broken file fails the restart silently.
 
