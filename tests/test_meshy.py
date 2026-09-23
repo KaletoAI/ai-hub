@@ -331,7 +331,7 @@ class TestRigging(unittest.TestCase):
                                                 "walking_fbx_url": "https://a/w.fbx", "running_fbx_url": "https://a/x.fbx"}}}
         st = meshy.parse_task(task, ["glb"], "rigging")
         self.assertEqual(st.downloads, [("rigged.glb", "https://a/r.glb")])
-        st = meshy.parse_task(task, ["glb", "fbx"], "rigging", animations=True)
+        st = meshy.parse_task(task, ["glb", "fbx"], "rigging", options={"animations": True})
         self.assertEqual([n for n, _ in st.downloads],
                          ["rigged.glb", "rigged.fbx", "walking.glb", "running.glb", "walking.fbx", "running.fbx"])
         with self.assertRaises(meshy.MeshyInput):

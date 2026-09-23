@@ -104,10 +104,10 @@ class TestMeshyAdapter(unittest.TestCase):
         if formats:
             cand["meshy"]["options"]["target_formats"] = list(formats)
         cand["meshy"]["options"].update(opts)
-        return adapters.NormalizedRequest(alias="Meshy-Object", real_model="latest", task="img2mesh",
+        return adapters.NormalizedRequest(alias="Meshy-Object", real_model="latest",
                                           params=dict(values or {}), upload_images=dict(images or {}),
                                           upload_files=dict(files or {}),
-                                          meshy=cand["meshy"], upload_prefix="gw_j1")
+                                          cloud=cand["meshy"], upload_prefix="gw_j1")
 
     def _run(self, coro):
         return asyncio.run(coro)
@@ -126,8 +126,24 @@ class TestMeshyAdapter(unittest.TestCase):
 
     def test_discover_zero_credits_is_down(self):
         _Stub.balance = 0
-        with self.assertRaises(adapters.MeshyNoCredits):
+        with self.assertRaises(adapters.CloudNoCredits):
             self._discover()
+
+    def test_task_progress_feeds_the_job_view_and_is_dropped_at_the_end(self):
+        # The vendor reports a percentage on every poll; without it a 3-minute cloud job
+        # is a spinner and nothing else, while the job view can show a bar (the same
+        # `note_progress` feed ComfyUI's step counter uses).
+        seen = []
+        self.ad.ctx.note_progress = lambda job_id, info: seen.append((job_id, info))
+        _Stub.script = [_task("IN_PROGRESS", progress=40),
+                        _task("SUCCEEDED", progress=100, model_urls={"glb": f"{self.url}/asset/glb"})]
+        req = self._req({"input_image": PNG})
+        req.job_id = "j1"
+        self._run(self.ad.generate(req))
+        live = [i for j, i in seen if j == "j1" and i]
+        self.assertTrue(any(i["fraction"] == 0.4 and (i["step"], i["steps"]) == (40, 100)
+                            for i in live), seen)
+        self.assertEqual(seen[-1], ("j1", None))
 
     def test_generate_success(self):
         _Stub.script = [_task("PENDING"), _task("IN_PROGRESS"),
@@ -217,12 +233,12 @@ class TestMeshyAdapter(unittest.TestCase):
 
     def test_402_fails_over(self):
         _Stub.post_status = 402
-        with self.assertRaises(adapters.MeshyNoCredits):
+        with self.assertRaises(adapters.CloudNoCredits):
             self._run(self.ad.generate(self._req({"input_image": PNG})))
 
     def test_429_fails_over(self):
         _Stub.post_status = 429
-        with self.assertRaises(adapters.MeshyBusy):
+        with self.assertRaises(adapters.CloudBusy):
             self._run(self.ad.generate(self._req({"input_image": PNG})))
 
     def test_timeout_names_task(self):
@@ -328,11 +344,11 @@ class TestMeshyAdapter(unittest.TestCase):
         self.assertIsInstance(t, httpx.Timeout)              # a per-request override, not None
         self.assertGreaterEqual(t.read, 20.0)
         self.assertGreaterEqual(t.write, 20.0)
-        self.assertGreater(t.write, adapters._MESHY_HTTP_TIMEOUT)   # genuinely more than the default
+        self.assertGreater(t.write, adapters._CLOUD_HTTP_TIMEOUT)   # genuinely more than the default
         # …and the polls still run on the short client default: disconnect_grace only
         # reacts as fast as a poll gives up.
-        self.assertEqual(seen["client_default"].read, adapters._MESHY_HTTP_TIMEOUT)
-        self.assertEqual(seen["client_default"].write, adapters._MESHY_HTTP_TIMEOUT)
+        self.assertEqual(seen["client_default"].read, adapters._CLOUD_HTTP_TIMEOUT)
+        self.assertEqual(seen["client_default"].write, adapters._CLOUD_HTTP_TIMEOUT)
 
     def test_rigging_missing_mesh_is_input_error(self):
         with self.assertRaises(meshy.MeshyInput):

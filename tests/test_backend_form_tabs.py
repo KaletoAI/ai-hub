@@ -43,7 +43,6 @@ sys.path.insert(0, _here)
 try:
     import main            # noqa: F401  (admin needs it importable, not bound)
     import admin
-    import adapters
     import store
 finally:
     os.chdir(_prev)

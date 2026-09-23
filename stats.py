@@ -1,31 +1,34 @@
-"""Call stats: SQLite-backed per-request log + minimal HTML dashboard.
+"""Call stats: SQLite-backed per-request log (+ on-disk request/response bodies).
 
-Zero new dependencies — sqlite3 is stdlib, FastAPI/uvicorn are already
-required by the gateway. The dashboard is plain HTML rendered from
-f-strings; no template engine, no JS, no chart libs. Auto-refresh via
-<meta http-equiv="refresh">.
+Data only — every view of it is rendered by the /ui console (admin.py: Statistic,
+Jobs & Calls, Dashboard). Zero dependencies beyond the stdlib; keep it that way.
 """
 
 from __future__ import annotations
 
 import asyncio
+import calendar
+import gzip
 import json
 import logging
 import os
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
-
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, PlainTextResponse
 
 logger = logging.getLogger(__name__)
 
 _DB_PATH: Optional[Path] = None
 _BLOB_DIR: str = "calls"
+# A stored body keeps at most this many characters per side (request / response): a
+# Claude Code turn re-sends its whole context, so uncapped blobs cost ~1 MB per CALL.
+# Beyond the cap the head and the tail are kept — where the system prompt and the
+# newest turn sit. `stats.body_max_kb` in config.
+_BODY_MAX_CHARS: int = 256 * 1024
+BODY_RETENTION_DAYS_DEFAULT = 14     # bodies are pruned after this many days; the ROW stays
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS calls (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -48,7 +51,9 @@ CREATE TABLE IF NOT EXISTS calls (
     cache_read    INTEGER DEFAULT 0,
     cache_write   INTEGER DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_calls_ts      ON calls(ts);
+-- (ts, backend) serves every time-window read AND the Dashboard's per-backend count
+-- as a covering index; it replaced a plain idx_calls_ts (a prefix of it, dropped in init).
+CREATE INDEX IF NOT EXISTS idx_calls_ts_backend ON calls(ts, backend);
 CREATE INDEX IF NOT EXISTS idx_calls_backend ON calls(backend);
 CREATE INDEX IF NOT EXISTS idx_calls_source  ON calls(source, ts);  -- month_cost quota scan
 """
@@ -66,23 +71,78 @@ def is_active() -> bool:
     return _DB_PATH is not None
 
 
-def recent(limit: int = 15) -> list:
-    """Just the latest calls (one indexed query) — for the live dashboard."""
-    if _DB_PATH is None:
-        return []
-    return _q("SELECT ts, duration_ms, backend, source, alias, model, endpoint, status, "
-              "input_tokens, output_tokens, cost_usd FROM calls ORDER BY id DESC LIMIT ?", limit)
+# ── the call log's three partitions ───────────────────────────────────────────
+# The console shows the ONE log in three lists (LLM Calls, Voice Calls, the refused
+# requests under Media Jobs) and every row must land in exactly one. The rule lives
+# HERE, as endpoint prefixes, so the SQL that fills each list and admin._call_kind
+# that files a single row cannot disagree. Everything that is neither voice nor
+# media is llm (incl. a NULL endpoint).
+KIND_PREFIXES = {"voice": ("/v1/audio",),
+                 "media": ("/v1/images", "/v1/generations", "/v1/jobs")}
+
+
+def call_kind(endpoint) -> str:
+    p = str(endpoint or "")
+    for kind, prefixes in KIND_PREFIXES.items():
+        if p.startswith(prefixes):
+            return kind
+    return "llm"
+
+
+def _kind_where(kind: str) -> tuple:
+    """(sql, params) selecting one partition. substr() = a case-sensitive startswith,
+    the same test call_kind makes (LIKE would be case-insensitive and treat `_` as a
+    wildcard)."""
+    def any_of(prefixes):
+        return ("(" + " OR ".join("substr(endpoint, 1, ?) = ?" for _ in prefixes) + ")",
+                [x for p in prefixes for x in (len(p), p)])
+    if kind in KIND_PREFIXES:
+        return any_of(KIND_PREFIXES[kind])
+    sql, params = any_of([p for ps in KIND_PREFIXES.values() for p in ps])
+    return f"(endpoint IS NULL OR NOT {sql})", params
+
+
+# Aggregates behind the Statistic tab and the user pickers are full scans; they are
+# memoised for this long, so a page reload or the tab's own re-render does not pay
+# for them again. The per-call LISTS are never memoised (they must show the call that
+# just happened).
+_MEMO_TTL_S = 30.0
+_memo: dict = {}
+
+
+def _memoised(key: tuple, fn):
+    key = (str(_DB_PATH),) + key
+    now = time.monotonic()
+    hit = _memo.get(key)
+    if hit is not None and now - hit[0] < _MEMO_TTL_S:
+        return hit[1]
+    val = fn()
+    _memo[key] = (now, val)
+    return val
+
+
+# The column shape of every per-call list (the console's _call_row template).
+_CALL_COLS = ("id, ts, duration_ms, backend, source, alias, model, endpoint, status, "
+              "input_tokens, output_tokens, cost_usd, req_preview, has_body, reasoning")
+
+# Both Dashboard-tick queries order/group so that SQLite reads the ts WINDOW through
+# idx_calls_ts_backend. `ORDER BY id DESC` walked the whole table backwards, and a bare
+# `GROUP BY backend` made the planner prefer idx_calls_backend (ordered for the grouping)
+# over the ts range — a full index scan per tick (274 ms at 300k rows, measured). The
+# unary `+` takes the column out of index consideration for the grouping only.
+# test_stats_store.py pins both plans.
+_SQL_RECENT_SINCE = (f"SELECT {_CALL_COLS} FROM calls WHERE ts > ? "
+                     f"ORDER BY ts DESC, id DESC LIMIT ?")
+_SQL_COUNT_BY_BACKEND_SINCE = "SELECT backend, COUNT(*) FROM calls WHERE ts > ? GROUP BY +backend"
 
 
 def recent_since(ts: int, limit: int = 100) -> list:
     """Calls completed since `ts` (unix secs), newest first — the dashboard's
-    'last N minutes' window. Same column shape as summary()['recent'] so it
+    'last N minutes' window. Same column shape (_CALL_COLS) as recent_calls() so it
     renders with the identical row template."""
     if _DB_PATH is None:
         return []
-    return _q("SELECT id, ts, duration_ms, backend, source, alias, model, endpoint, status, "
-              "input_tokens, output_tokens, cost_usd, req_preview, has_body, reasoning "
-              "FROM calls WHERE ts > ? ORDER BY id DESC LIMIT ?", ts, limit)
+    return _q(_SQL_RECENT_SINCE, ts, limit)
 
 
 def count_since(ts: int) -> int:
@@ -97,11 +157,62 @@ def count_by_backend_since(ts: int) -> dict:
     if _DB_PATH is None:
         return {}
     return {r[0]: r[1] for r in
-            _q("SELECT backend, COUNT(*) FROM calls WHERE ts > ? GROUP BY backend", ts)}
+            _q(_SQL_COUNT_BY_BACKEND_SINCE, ts)}
 
 
-def summary(recent_limit: int = 50, model_limit: int = 30, source_limit: int = 20,
-            user: Optional[str] = None) -> dict:
+def _recent_calls_sql(kind: Optional[str], limit: int, user: Optional[str],
+                      refused_only: bool = False) -> tuple:
+    where, params = [], []
+    if kind:
+        sql, p = _kind_where(kind)
+        where.append(sql)
+        params += p
+    if user:
+        where.append("source = ?")
+        params.append(user)
+    if refused_only:
+        # A refusal on a media endpoint is the only thing the call log holds there
+        # (a job owns every outcome after it exists), and the backend marker lets the
+        # list read idx_calls_backend instead of scanning the table.
+        where.append("backend = ?")
+        params.append(REFUSED_BACKEND)
+    sql = f"SELECT {_CALL_COLS} FROM calls"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    return sql + " ORDER BY id DESC LIMIT ?", (*params, int(limit))
+
+
+def recent_calls(kind: Optional[str] = None, limit: int = 300, user: Optional[str] = None,
+                 refused_only: bool = False) -> list:
+    """The newest `limit` calls of ONE partition (call_kind), filtered IN SQL — the
+    lists used to take the newest 300 of the whole log and filter afterwards, so a
+    busy LLM day left Voice Calls empty although voice calls existed."""
+    if _DB_PATH is None:
+        return []
+    sql, params = _recent_calls_sql(kind, limit, user, refused_only)
+    return _q(sql, *params)
+
+
+def sources(limit: int = 500) -> list:
+    """(source, calls) for every source, busiest first — the user pickers. Reads
+    idx_calls_source only (no cost column: that would cost a table scan). Memoised
+    (_MEMO_TTL_S)."""
+    if _DB_PATH is None:
+        return []
+    return _memoised(("sources", limit), lambda: _q(
+        "SELECT COALESCE(source,'unknown'), COUNT(*) "
+        "FROM calls GROUP BY source ORDER BY COUNT(*) DESC LIMIT ?", limit))
+
+
+def summary(model_limit: int = 30, source_limit: int = 20, user: Optional[str] = None) -> dict:
+    """Memoised (_MEMO_TTL_S) — see _summary."""
+    if _DB_PATH is None:
+        return {"active": False}
+    return _memoised(("summary", model_limit, source_limit, user),
+                     lambda: _summary(model_limit, source_limit, user))
+
+
+def _summary(model_limit: int, source_limit: int, user: Optional[str]) -> dict:
     """Aggregated call stats for the in-UI dashboard (data only, no HTML). If
     `user` is given, every figure is scoped to that source (per-user drilldown);
     `by_source` stays unscoped so it can drive the user picker.
@@ -121,8 +232,8 @@ def summary(recent_limit: int = 50, model_limit: int = 30, source_limit: int = 2
     h24 = _q(f"SELECT COUNT(*), COALESCE(SUM(cost_usd),0) FROM calls{h24flt}", now - 86400, *ua)[0]
     # Params bind by position across the WHOLE statement, so the SELECT's ts window
     # comes before the WHERE's backend/source.
-    ref = _q(f"SELECT COUNT(*), COALESCE(SUM(CASE WHEN ts > ? THEN 1 ELSE 0 END),0) "
-             f"FROM calls WHERE backend = ?" + (" AND source = ?" if user else ""),
+    ref = _q("SELECT COUNT(*), COALESCE(SUM(CASE WHEN ts > ? THEN 1 ELSE 0 END),0) "
+             "FROM calls WHERE backend = ?" + (" AND source = ?" if user else ""),
              now - 86400, REFUSED_BACKEND, *ua)[0]
     return {
         "active": True, "user": user,
@@ -143,10 +254,6 @@ def summary(recent_limit: int = 50, model_limit: int = 30, source_limit: int = 2
         "by_source": _q(
             "SELECT COALESCE(source,'unknown'), COUNT(*), COALESCE(SUM(cost_usd),0) "
             "FROM calls GROUP BY source ORDER BY COUNT(*) DESC LIMIT ?", source_limit),
-        "recent": _q(
-            f"SELECT id, ts, duration_ms, backend, source, alias, model, endpoint, status, "
-            f"input_tokens, output_tokens, cost_usd, req_preview, has_body, reasoning "
-            f"FROM calls{flt} ORDER BY id DESC LIMIT ?", *ua, recent_limit),
     }
 
 
@@ -180,27 +287,73 @@ def cache_trend(hours: int = 24, buckets: int = 24, user: Optional[str] = None) 
     return {b: s for b, s in out.items() if any(r or w for _, r, w in s)}
 
 
+# Month-to-date cost per source, kept in memory: gate_request asks for it on EVERY
+# request of a user with a cost quota, and a range SUM over the month's rows cost
+# 10-46 ms each time. Seeded from the rows at init() for the current UTC month, then
+# advanced by every recorded call (_record_sync) — for that month and any later one,
+# which start at 0 and see all their rows go through this process. Keyed by
+# (source, month start); months before the seeded one fall back to the rows.
+_month_lock = threading.Lock()
+_month_sums: dict = {}
+_month_seeded: Optional[int] = None
+
+
+def _month_start(ts: int) -> int:
+    t = time.gmtime(ts)
+    return calendar.timegm((t.tm_year, t.tm_mon, 1, 0, 0, 0, 0, 0, 0))
+
+
+def _seed_month(c) -> None:
+    global _month_seeded, _month_sums
+    ms = _month_start(int(time.time()))
+    rows = c.execute("SELECT source, COALESCE(SUM(cost_usd),0) FROM calls WHERE ts >= ? "
+                     "GROUP BY source", (ms,)).fetchall()
+    with _month_lock:
+        _month_sums = {(src, ms): float(cost or 0) for src, cost in rows}
+        _month_seeded = ms
+
+
+def _month_add(source, ts: int, cost) -> None:
+    if not cost:
+        return
+    key = (source, _month_start(ts))
+    with _month_lock:
+        _month_sums[key] = _month_sums.get(key, 0.0) + float(cost)
+
+
 def month_cost(user: str, month_start_ts: int) -> float:
-    """Total cost_usd for a user since a UTC timestamp — drives the monthly
-    cost quota (E1). 0 when stats are off (quota simply can't bind then)."""
+    """Total cost_usd for a user since a UTC month start — drives the monthly
+    cost quota (E1). 0 when stats are off (quota simply can't bind then).
+    Answered from memory for the seeded month and later ones (see _month_sums)."""
     if _DB_PATH is None:
         return 0.0
+    with _month_lock:
+        if _month_seeded is not None and month_start_ts >= _month_seeded:
+            return float(_month_sums.get((user, int(month_start_ts)), 0.0))
     r = _q("SELECT COALESCE(SUM(cost_usd),0) FROM calls WHERE source = ? AND ts >= ?",
            user, month_start_ts)
     return float(r[0][0]) if r else 0.0
 
 
-def init(db_path: str, blob_dir: str = "calls") -> None:
+def init(db_path: str, blob_dir: str = "calls", body_max_kb: Optional[int] = None) -> None:
     """Open / create the stats DB, set WAL, ensure schema. Full call bodies
     (request + response) live on disk under `blob_dir` (never in the DB), keyed
-    by call id, and are pruned together with their row."""
-    global _DB_PATH, _BLOB_DIR
+    by call id, gzip-compressed and capped at `body_max_kb` per side; they are
+    pruned with their row, or earlier by `body_retention_days` (see prune_once)."""
+    global _DB_PATH, _BLOB_DIR, _BODY_MAX_CHARS
     _DB_PATH = Path(db_path)
     _BLOB_DIR = blob_dir
+    _memo.clear()
+    if body_max_kb:
+        try:
+            _BODY_MAX_CHARS = max(1024, int(body_max_kb) * 1024)
+        except (TypeError, ValueError):
+            logger.warning(f"stats: ignoring invalid body_max_kb {body_max_kb!r}")
     os.makedirs(_BLOB_DIR, exist_ok=True)
     with _conn() as c:
         c.execute("PRAGMA journal_mode=WAL")
         c.executescript(_SCHEMA)
+        c.execute("DROP INDEX IF EXISTS idx_calls_ts")    # a prefix of idx_calls_ts_backend
         # Migrate older DBs that predate later columns.
         cols = {r[1] for r in c.execute("PRAGMA table_info(calls)").fetchall()}
         for col, ddl in (("req_preview", "TEXT"),
@@ -210,12 +363,17 @@ def init(db_path: str, blob_dir: str = "calls") -> None:
                          ("cache_write", "INTEGER DEFAULT 0")):
             if col not in cols:
                 c.execute(f"ALTER TABLE calls ADD COLUMN {col} {ddl}")
+        _seed_month(c)
     logger.info(f"stats: SQLite at {_DB_PATH} (WAL), call bodies in {_BLOB_DIR}/")
 
 
 @contextmanager
 def _conn():
     conn = sqlite3.connect(_DB_PATH, isolation_level=None, timeout=10.0)
+    # Per connection (not persisted). In WAL mode NORMAL only gives up durability of
+    # the LAST commits on a power cut — never consistency — and saves an fsync per
+    # recorded call; a call-log row is worth less than that fsync on the request path.
+    conn.execute("PRAGMA synchronous=NORMAL")
     try:
         yield conn
     finally:
@@ -223,7 +381,13 @@ def _conn():
 
 
 def _body_path(call_id: int) -> str:
-    return os.path.join(_BLOB_DIR, f"{call_id}.json")
+    """Where a call's body is WRITTEN (gzip). Reads also accept the legacy plain
+    `<id>.json` of blobs stored before compression (_body_paths)."""
+    return os.path.join(_BLOB_DIR, f"{call_id}.json.gz")
+
+
+def _body_paths(call_id: int) -> tuple:
+    return (_body_path(call_id), os.path.join(_BLOB_DIR, f"{call_id}.json"))
 
 
 def _audio_path(call_id: int) -> str:
@@ -240,10 +404,30 @@ def _as_obj(text):
         return text
 
 
+def _capped(text):
+    """A body side for storage: parsed JSON when it fits the cap, else head + tail
+    of the raw text with a marker saying how much was dropped."""
+    if text is None or len(text) <= _BODY_MAX_CHARS:
+        return _as_obj(text)
+    keep = _BODY_MAX_CHARS // 2
+    return {"_truncated": f"{len(text)} chars — only the first and last {keep} are stored "
+                          f"(stats.body_max_kb)",
+            "head": text[:keep], "tail": text[-keep:]}
+
+
 def get_body(call_id: int) -> Optional[dict]:
-    """Full {request, response} for a call from its on-disk blob (or None)."""
+    """Full {request, response} for a call from its on-disk blob (or None). Reads the
+    gzip blob, or the plain JSON one written before bodies were compressed."""
+    gz, plain = _body_paths(int(call_id))
     try:
-        with open(_body_path(int(call_id)), "r", encoding="utf-8") as f:
+        with gzip.open(gz, "rt", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, EOFError):
+        return None
+    try:
+        with open(plain, "r", encoding="utf-8") as f:
             return json.load(f)
     except (OSError, ValueError):
         return None
@@ -251,14 +435,13 @@ def get_body(call_id: int) -> Optional[dict]:
 
 def call_neighbors(call_id: int, voice: bool) -> tuple:
     """(newer_id, older_id) around a call within its list partition — Voice Calls
-    (endpoint /v1/audio/*) vs LLM Calls (the rest) — for the detail page's
-    prev/next navigation. None at the list ends."""
+    or LLM Calls (call_kind) — for the detail page's prev/next navigation. None at
+    the list ends."""
     if _DB_PATH is None:
         return None, None
-    flt = ("endpoint LIKE '/v1/audio/%'" if voice
-           else "(endpoint IS NULL OR endpoint NOT LIKE '/v1/audio/%')")
-    newer = _q(f"SELECT id FROM calls WHERE id > ? AND {flt} ORDER BY id ASC LIMIT 1", int(call_id))
-    older = _q(f"SELECT id FROM calls WHERE id < ? AND {flt} ORDER BY id DESC LIMIT 1", int(call_id))
+    flt, p = _kind_where("voice" if voice else "llm")
+    newer = _q(f"SELECT id FROM calls WHERE id > ? AND {flt} ORDER BY id ASC LIMIT 1", int(call_id), *p)
+    older = _q(f"SELECT id FROM calls WHERE id < ? AND {flt} ORDER BY id DESC LIMIT 1", int(call_id), *p)
     return (newer[0][0] if newer else None, older[0][0] if older else None)
 
 
@@ -274,28 +457,43 @@ def get_audio(call_id: int) -> Optional[tuple]:
     return p, (mime or "audio/wav")
 
 
-def _record_sync(row: tuple, request_text=None, response_text=None, response_audio=None) -> None:
+_REQUEST_NOT_STORED = "(not stored — the call was refused before any backend saw it)"
+
+
+def _write_body(call_id: int, request_text, response_text, response_audio,
+                store_request: bool) -> None:
+    payload = {"request": _capped(request_text) if store_request else _REQUEST_NOT_STORED,
+               "response": _capped(response_text)}
+    if response_audio:                          # binary body (TTS WAV): own file + JSON marker
+        data, mime = response_audio
+        with open(_audio_path(call_id), "wb") as af:
+            af.write(data)
+        payload["response"] = {"_audio": mime or "audio/wav", "bytes": len(data)}
+    with gzip.open(_body_path(call_id), "wt", encoding="utf-8", compresslevel=5) as f:
+        json.dump(payload, f, ensure_ascii=False)
+
+
+def _record_sync(row: tuple, request_text=None, response_text=None, response_audio=None,
+                 store_request: bool = True) -> None:
+    want_body = request_text is not None or response_text is not None or response_audio is not None
     with _conn() as c:
+        # ONE autocommitted statement: has_body goes in with the row instead of a second
+        # UPDATE (and commit) after the blob write. The rare failed blob write takes it
+        # back; a reader racing the write for a few ms at worst sees "no stored body".
         cur = c.execute(
             "INSERT INTO calls (ts, duration_ms, backend, source, alias, model, "
             "endpoint, status, input_tokens, output_tokens, cost_usd, req_preview, reasoning, "
-            "cache_read, cache_write) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            row,
+            "cache_read, cache_write, has_body) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (*row, 1 if want_body else 0),
         )
-        if request_text is not None or response_text is not None or response_audio is not None:
+        _month_add(row[3], row[0], row[10])         # source, ts, cost_usd
+        if want_body:
             try:
-                payload = {"request": _as_obj(request_text), "response": _as_obj(response_text)}
-                if response_audio:                  # binary body (TTS WAV): own file + JSON marker
-                    data, mime = response_audio
-                    with open(_audio_path(cur.lastrowid), "wb") as af:
-                        af.write(data)
-                    payload["response"] = {"_audio": mime or "audio/wav", "bytes": len(data)}
-                with open(_body_path(cur.lastrowid), "w", encoding="utf-8") as f:
-                    json.dump(payload, f, ensure_ascii=False)
-                c.execute("UPDATE calls SET has_body=1 WHERE id=?", (cur.lastrowid,))
+                _write_body(cur.lastrowid, request_text, response_text, response_audio, store_request)
             except Exception as e:                  # row stays valid, body view just absent
                 logger.warning(f"stats: body blob write failed for call {cur.lastrowid}: {e}")
+                c.execute("UPDATE calls SET has_body=0 WHERE id=?", (cur.lastrowid,))
 
 
 def _preview(text: Optional[str], head: int = 50, tail: int = 50) -> Optional[str]:
@@ -331,10 +529,14 @@ async def record_call(
     reasoning: Optional[str] = None,
     cache_read: int = 0,
     cache_write: int = 0,
+    store_request: bool = True,
 ) -> None:
     """Async-safe insert. Never raises into the request path. Full request/response
     bodies (when given) are written to an on-disk blob, not the DB row;
     `response_audio` = (bytes, mime) for binary TTS replies (own blob + player).
+    `store_request=False` keeps the request out of the blob (the preview column still
+    describes it) — for refused calls, whose body would be the one nobody reads,
+    repeated as often as a misconfigured client retries.
 
     `cache_read`/`cache_write` break `input_tokens` down: how much of it the
     backend served from its prompt cache and how much it wrote into the cache.
@@ -360,372 +562,75 @@ async def record_call(
         max(0, int(cache_write or 0)),
     )
     try:
-        await asyncio.to_thread(_record_sync, row, request_text, response_text, response_audio)
+        await asyncio.to_thread(_record_sync, row, request_text, response_text, response_audio,
+                                store_request)
     except Exception as e:
         logger.warning(f"stats: insert failed: {e}")
 
 
-async def prune_loop(retention_days: int, interval_s: int = 3600) -> None:
-    """Periodically delete rows older than retention_days. 0 = disabled."""
-    if retention_days <= 0:
+def _drop_blobs(call_id: int) -> None:
+    for p in (*_body_paths(call_id), _audio_path(call_id)):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def prune_once(retention_days: float = 0, body_retention_days: float = BODY_RETENTION_DAYS_DEFAULT) -> tuple:
+    """Delete rows older than `retention_days` (0 = keep forever) with their blobs, and
+    the BODY blobs of rows older than `body_retention_days` (0 = keep forever) — the row
+    itself stays for the aggregates and the monthly cost quota. (rows, bodies) removed."""
+    now = int(time.time())
+    rows = bodies = 0
+    with _conn() as c:
+        if body_retention_days and float(body_retention_days) > 0:
+            cutoff = now - int(float(body_retention_days) * 86400)
+            ids = [r[0] for r in c.execute(
+                "SELECT id FROM calls WHERE ts < ? AND has_body = 1", (cutoff,)).fetchall()]
+            for cid in ids:
+                _drop_blobs(cid)
+            c.execute("UPDATE calls SET has_body = 0 WHERE ts < ? AND has_body = 1", (cutoff,))
+            bodies = len(ids)
+        if retention_days and float(retention_days) > 0:
+            cutoff = now - int(float(retention_days) * 86400)
+            ids = [r[0] for r in c.execute("SELECT id FROM calls WHERE ts < ?", (cutoff,)).fetchall()]
+            for cid in ids:
+                _drop_blobs(cid)
+            c.execute("DELETE FROM calls WHERE ts < ?", (cutoff,))
+            rows = len(ids)
+    return rows, bodies
+
+
+async def prune_loop(retention_days: float, body_retention_days: float = BODY_RETENTION_DAYS_DEFAULT,
+                     interval_s: int = 3600) -> None:
+    """Hourly prune_once(). Returns at once when both retentions are 0 (keep forever).
+    A blank/None value means the default (rows: forever, bodies: 14 days) — the Server
+    tab stores an emptied field as ""."""
+    def days(v, default):
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return float(default)
+        return float(v)
+    try:
+        retention_days = days(retention_days, 0)
+        body_retention_days = days(body_retention_days, BODY_RETENTION_DAYS_DEFAULT)
+    except (TypeError, ValueError):
+        logger.warning("stats: invalid retention setting — pruning disabled")
+        return
+    if retention_days <= 0 and body_retention_days <= 0:
         return
     while True:
         try:
-            cutoff = int(time.time()) - retention_days * 86400
-            def _prune():
-                with _conn() as c:
-                    ids = [r[0] for r in c.execute("SELECT id FROM calls WHERE ts < ?", (cutoff,)).fetchall()]
-                    for cid in ids:
-                        for p in (_body_path(cid), _audio_path(cid)):
-                            try:
-                                os.remove(p)
-                            except OSError:
-                                pass
-                    c.execute("DELETE FROM calls WHERE ts < ?", (cutoff,))
-                    return len(ids)
-            n = await asyncio.to_thread(_prune)
-            if n:
-                logger.info(f"stats: pruned {n} rows older than {retention_days} days")
+            rows, bodies = await asyncio.to_thread(prune_once, retention_days, body_retention_days)
+            if rows or bodies:
+                logger.info(f"stats: pruned {rows} rows older than {retention_days:g} days, "
+                            f"{bodies} bodies older than {body_retention_days:g} days")
         except Exception as e:
             logger.warning(f"stats: prune failed: {e}")
         await asyncio.sleep(interval_s)
 
 
-# ── Dashboard ────────────────────────────────────────────────────────────────
-
-stats_app = FastAPI(title="AI-Hub Stats", docs_url=None, redoc_url=None)
-
+# ── Query helper ─────────────────────────────────────────────────────────────
 
 def _q(sql: str, *params) -> list[tuple]:
     with _conn() as c:
         return c.execute(sql, params).fetchall()
-
-
-@stats_app.get("/healthz", response_class=PlainTextResponse)
-def healthz() -> str:
-    return "ok"
-
-
-@stats_app.get("/", response_class=HTMLResponse)
-def dashboard() -> str:
-    if _DB_PATH is None:
-        return "<h1>Stats not enabled</h1>"
-
-    total_count, total_cost = _q(
-        "SELECT COUNT(*), COALESCE(SUM(cost_usd),0) FROM calls"
-    )[0]
-    h24 = int(time.time()) - 86400
-    h24_count, h24_cost = _q(
-        "SELECT COUNT(*), COALESCE(SUM(cost_usd),0) FROM calls WHERE ts > ?", h24
-    )[0]
-    by_backend = _q(
-        "SELECT backend, COUNT(*), COALESCE(SUM(input_tokens),0), "
-        "COALESCE(SUM(output_tokens),0), COALESCE(SUM(cost_usd),0), "
-        "COALESCE(AVG(duration_ms),0) "
-        "FROM calls GROUP BY backend ORDER BY COUNT(*) DESC"
-    )
-    by_model = _q(
-        "SELECT COALESCE(alias,''), COALESCE(model,''), COUNT(*), "
-        "COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), "
-        "COALESCE(SUM(cost_usd),0) "
-        "FROM calls GROUP BY alias, model ORDER BY COUNT(*) DESC LIMIT 30"
-    )
-    by_source = _q(
-        "SELECT COALESCE(source,'unknown'), COUNT(*), COALESCE(SUM(cost_usd),0) "
-        "FROM calls GROUP BY source ORDER BY COUNT(*) DESC LIMIT 20"
-    )
-    recent = _q(
-        "SELECT ts, duration_ms, backend, source, alias, model, endpoint, "
-        "status, input_tokens, output_tokens, cost_usd, req_preview "
-        "FROM calls ORDER BY id DESC LIMIT 50"
-    )
-    return _render(
-        (total_count, total_cost),
-        (h24_count, h24_cost),
-        by_backend, by_model, by_source, recent,
-    )
-
-
-def _fmt_ts(ts: int) -> str:
-    return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _fmt_time(ts: int) -> str:
-    return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone().strftime("%H:%M:%S")
-
-
-def _esc(s) -> str:
-    if s is None:
-        return ""
-    return (str(s)
-            .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            .replace('"', "&quot;").replace("'", "&#39;"))
-
-
-# Shared chrome: CSS + nav tabs + optional search JS, wrapped by _doc(). Kept as
-# plain (non-f) strings so braces don't need escaping.
-_CSS = """
-* { box-sizing: border-box; }
-body { font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
-       margin: 1.5rem; color: #1c1c1c; background: #f4f5f7; }
-h1 { margin: 0 0 .5rem; }
-h2 { margin: 0 0 .75rem; font-size: 1.05rem; color: #555; }
-.muted { color: #888; font-size: .85rem; }
-.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-         gap: 1rem; margin: 1rem 0 2rem; }
-.card { background: #fff; border-radius: 8px; padding: 1rem 1.25rem;
-        box-shadow: 0 1px 3px rgba(0,0,0,.06); }
-.metric { font-size: 1.6rem; font-weight: 600; margin-top: .25rem; }
-.panel { background: #fff; border-radius: 8px; padding: 1rem 1.25rem;
-         margin: 1rem 0; box-shadow: 0 1px 3px rgba(0,0,0,.06); }
-table { width: 100%; border-collapse: collapse; }
-th, td { padding: .4rem .5rem; text-align: left;
-         border-bottom: 1px solid #eee; vertical-align: top; }
-th { background: #fafafa; font-weight: 600; color: #555; }
-tr:hover td { background: #fcfcfc; }
-td.ok { color: #1a7f37; font-weight: 600; }
-td.err { color: #cf222e; font-weight: 600; }
-code { background: #f1f1f1; padding: 1px 4px; border-radius: 3px; }
-.tabs { display: flex; gap: .25rem; margin: .25rem 0 0; border-bottom: 2px solid #e0e2e8; }
-.tabs a { padding: .45rem 1rem; border-radius: 6px 6px 0 0; text-decoration: none;
-          color: #555; background: #e7e9ee; font-weight: 600; }
-.tabs a.active { background: #fff; color: #1c1c1c; box-shadow: 0 -1px 3px rgba(0,0,0,.06); }
-.search { margin: 1rem 0 0; }
-.search input { width: 100%; max-width: 460px; padding: .55rem .75rem; font-size: 1rem;
-                border: 1px solid #ccc; border-radius: 6px; }
-.count { color: #888; font-size: .8rem; margin-left: .5rem; }
-.badge { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: .75rem;
-         font-weight: 600; }
-.badge.ok   { background: #e6f4ea; color: #1a7f37; }
-.badge.warn { background: #fff4e5; color: #b35900; }
-.badge.err  { background: #fde8e8; color: #cf222e; }
-.badge.info { background: #e8eefc; color: #1a56c4; }
-.badge.off  { background: #eceef1; color: #888; }
-.badge.busy { background: #f3e8fd; color: #8250df; }
-tr.off td { color: #aaa; }
-.dim { color: #aaa; }
-.host { white-space: nowrap; }
-.hidden { display: none; }
-"""
-
-# Vanilla filter for the routing tab. Matches each row's text plus its
-# data-search attribute (carries the alias name onto continuation rows), keeps
-# the query in the URL hash so it survives a reload.
-_SEARCH_JS = """
-<script>
-(function () {
-  var box = document.getElementById('q');
-  if (!box) return;
-  var rows = Array.prototype.slice.call(document.querySelectorAll('tr.f'));
-  var counter = document.getElementById('count');
-  function apply(q) {
-    q = q.trim().toLowerCase();
-    var shown = 0;
-    rows.forEach(function (r) {
-      var hay = (r.textContent + ' ' + (r.dataset.search || '')).toLowerCase();
-      var match = !q || hay.indexOf(q) !== -1;
-      r.classList.toggle('hidden', !match);
-      if (match) shown++;
-    });
-    if (counter) counter.textContent = q ? (shown + ' match' + (shown === 1 ? '' : 'es')) : '';
-    history.replaceState(null, '', q ? '#' + encodeURIComponent(q) : location.pathname);
-  }
-  box.addEventListener('input', function () { apply(box.value); });
-  var initial = decodeURIComponent(location.hash.slice(1));
-  if (initial) box.value = initial;
-  apply(box.value);
-  box.focus();
-})();
-</script>
-"""
-
-
-def _nav(active: str) -> str:
-    def cls(name: str) -> str:
-        return ' class="active"' if name == active else ""
-    return (f'<div class="tabs"><a href="/"{cls("stats")}>Stats</a>'
-            f'<a href="/routing"{cls("routing")}>Routing</a></div>')
-
-
-def _doc(title: str, active: str, body: str, *, refresh: Optional[int] = None,
-         search: bool = False) -> str:
-    refresh_tag = f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
-    return (f'<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
-            f'{refresh_tag}\n<title>{title}</title>\n<style>{_CSS}</style>\n</head>\n'
-            f'<body>\n<h1>ai-hub</h1>\n{_nav(active)}\n{body}\n'
-            f'{_SEARCH_JS if search else ""}\n</body>\n</html>')
-
-
-def _render(total, h24, by_backend, by_model, by_source, recent) -> str:
-    rows_backend = "".join(
-        f"<tr><td>{_esc(b)}</td><td>{c:,}</td><td>{int(it):,}</td>"
-        f"<td>{int(ot):,}</td><td>${cu:.4f}</td><td>{int(dm):,} ms</td></tr>"
-        for (b, c, it, ot, cu, dm) in by_backend
-    ) or '<tr><td colspan="6" class="muted">no data yet</td></tr>'
-
-    rows_model = "".join(
-        f"<tr><td>{_esc(a)}</td><td>{_esc(m)}</td><td>{c:,}</td>"
-        f"<td>{int(it):,}</td><td>{int(ot):,}</td><td>${cu:.4f}</td></tr>"
-        for (a, m, c, it, ot, cu) in by_model
-    ) or '<tr><td colspan="6" class="muted">no data yet</td></tr>'
-
-    rows_source = "".join(
-        f"<tr><td>{_esc(s)}</td><td>{c:,}</td><td>${cu:.4f}</td></tr>"
-        for (s, c, cu) in by_source
-    ) or '<tr><td colspan="3" class="muted">no data yet</td></tr>'
-
-    rows_recent = "".join(
-        f"<tr><td>{_fmt_ts(ts - round((dm or 0) / 1000))}</td><td>{_fmt_time(ts)}</td>"
-        f"<td><code>{_esc(rp)}</code></td><td>{_esc(b)}</td><td>{_esc(src)}</td>"
-        f"<td>{_esc(a)}</td><td>{_esc(m)}</td><td>{_esc(ep)}</td>"
-        f"<td class='{ 'ok' if 200 <= (st or 0) < 400 else 'err' }'>{st}</td>"
-        f"<td>{int(dm):,} ms</td><td>{int(it or 0)}/{int(ot or 0)}</td>"
-        f"<td>${(cu or 0):.5f}</td></tr>"
-        for (ts, dm, b, src, a, m, ep, st, it, ot, cu, rp) in recent
-    ) or '<tr><td colspan="12" class="muted">no calls recorded yet</td></tr>'
-
-    body = f"""<p class="muted">Auto-refreshes every 30 s. Source override: send header
-<code>X-Source: my-workflow</code> from clients to tag calls.</p>
-
-<div class="cards">
-  <div class="card"><div class="muted">Total calls</div><div class="metric">{total[0]:,}</div></div>
-  <div class="card"><div class="muted">Total cost</div><div class="metric">${total[1]:.4f}</div></div>
-  <div class="card"><div class="muted">Last 24h calls</div><div class="metric">{h24[0]:,}</div></div>
-  <div class="card"><div class="muted">Last 24h cost</div><div class="metric">${h24[1]:.4f}</div></div>
-</div>
-
-<div class="panel">
-<h2>By backend</h2>
-<table><thead><tr><th>Backend</th><th>Calls</th><th>Input tokens</th>
-<th>Output tokens</th><th>Cost</th><th>Avg duration</th></tr></thead>
-<tbody>{rows_backend}</tbody></table>
-</div>
-
-<div class="panel">
-<h2>By model (top 30)</h2>
-<table><thead><tr><th>Alias</th><th>Real model</th><th>Calls</th>
-<th>Input</th><th>Output</th><th>Cost</th></tr></thead>
-<tbody>{rows_model}</tbody></table>
-</div>
-
-<div class="panel">
-<h2>By source (top 20)</h2>
-<table><thead><tr><th>Source</th><th>Calls</th><th>Cost</th></tr></thead>
-<tbody>{rows_source}</tbody></table>
-</div>
-
-<div class="panel">
-<h2>Recent calls (last 50)</h2>
-<table><thead><tr><th>Start</th><th>End</th><th>Request</th><th>Backend</th><th>Source</th><th>Alias</th>
-<th>Model</th><th>Endpoint</th><th>Status</th><th>Duration</th>
-<th>In/Out</th><th>Cost</th></tr></thead>
-<tbody>{rows_recent}</tbody></table>
-</div>"""
-    return _doc("ai-hub stats", "stats", body, refresh=30)
-
-
-@stats_app.get("/routing", response_class=HTMLResponse)
-def routing() -> str:
-    import main  # lazy import: main imports stats at load, so defer to call time
-    return _render_routing(main.routing_snapshot())
-
-
-def _render_routing(snap: dict) -> str:
-    aliases = snap["aliases"]
-    models = snap["models"]
-    conflicts = snap["conflicts"]
-
-    # Collisions panel — only shown when an alias name equals a real model id.
-    conflict_html = ""
-    if conflicts:
-        crows = []
-        for c in conflicts:
-            shadow = ", ".join(_esc(b) for b in c["shadowed"])
-            covered = ", ".join(_esc(b) for b in c["covered"]) or "—"
-            if c["shadowed"]:
-                kind = '<span class="badge err">shadows real model</span>'
-                shadow_cell = f'<td class="err">{shadow}</td>'
-            else:
-                kind = '<span class="badge info">covered</span>'
-                shadow_cell = '<td class="dim">—</td>'
-            crows.append(
-                f'<tr class="f"><td><code>{_esc(c["name"])}</code></td>'
-                f"<td>{kind}</td><td>{covered}</td>{shadow_cell}</tr>"
-            )
-        has_actionable = any(c["shadowed"] for c in conflicts)
-        note = ('<p class="muted">⚠ <b>Shadowed</b> hosts serve a real model whose id '
-                "equals the alias but aren't in its mapping — that model is unreachable "
-                "by its bare name (the alias overrides the pass-through). Add them to the "
-                "alias mapping, or rename the alias.</p>") if has_actionable else (
-                '<p class="muted">These aliases intentionally shadow a real model id and '
-                "cover every host that serves it — no backend is left unreachable.</p>")
-        conflict_html = (
-            '<div class="panel"><h2>Alias / model-name collisions</h2>' + note +
-            "<table><thead><tr><th>Alias</th><th>Kind</th><th>Covered hosts</th>"
-            "<th>Shadowed hosts</th></tr></thead><tbody>" + "".join(crows) +
-            "</tbody></table></div>"
-        )
-
-    # Aliases — one row per route, in the backend list order.
-    arows = []
-    for a in aliases:
-        name = a["alias"]
-        routes = a["routes"]
-        if not routes:
-            arows.append(f'<tr class="f"><td><code>{_esc(name)}</code></td>'
-                         '<td colspan="3" class="muted">no enabled backend maps this alias</td></tr>')
-            continue
-        for i, r in enumerate(routes):
-            label = f'<code>{_esc(name)}</code>' if i == 0 else '<span class="dim">↳</span>'
-            if not r.get("enabled", True):
-                status = '<span class="badge off">disabled</span>'
-            elif not r["healthy"]:
-                status = '<span class="badge warn">backend down</span>'
-            elif not r["present"]:
-                status = '<span class="badge err">model missing</span>'
-            elif r.get("busy"):
-                status = '<span class="badge busy">busy</span>'
-            else:
-                status = '<span class="badge ok">routable</span>'
-            row_cls = "f off" if not r.get("enabled", True) else "f"
-            arows.append(
-                f'<tr class="{row_cls}" data-search="{_esc(name)}"><td>{label}</td>'
-                f'<td class="host">{_esc(r["backend"])}</td>'
-                f'<td><code>{_esc(r["model"])}</code></td>'
-                f"<td>{status}</td></tr>"
-            )
-    alias_html = (
-        '<div class="panel"><h2>Aliases <span class="muted">'
-        "(a call takes the fastest free unpaid host)</span></h2>"
-        "<table><thead><tr><th>Alias</th><th>Host</th><th>Real model</th>"
-        "<th>Status</th></tr></thead><tbody>" +
-        ("".join(arows) or '<tr><td colspan="4" class="muted">no virtual_models configured</td></tr>') +
-        "</tbody></table></div>"
-    )
-
-    # Discovered models — which backends a bare/direct model id can route to.
-    mrows = []
-    for m in models:
-        parts = []
-        for h in m["hosts"]:
-            down = "" if h["healthy"] else ' <span class="badge warn">down</span>'
-            busy = ' <span class="badge busy">busy</span>' if h.get("busy") else ""
-            parts.append(f'<span class="host">{_esc(h["backend"])}{down}{busy}</span>')
-        shadow = ' <span class="badge info">alias exists</span>' if m["shadowed_by_alias"] else ""
-        mrows.append(f'<tr class="f"><td><code>{_esc(m["model"])}</code>{shadow}</td>'
-                     f'<td>{" &nbsp; ".join(parts)}</td></tr>')
-    model_html = (
-        '<div class="panel"><h2>Discovered models <span class="muted">'
-        "(where a bare / direct model id can route)</span></h2>"
-        "<table><thead><tr><th>Model id</th><th>Hosts</th></tr></thead><tbody>" +
-        ("".join(mrows) or '<tr><td colspan="2" class="muted">nothing discovered yet</td></tr>') +
-        "</tbody></table></div>"
-    )
-
-    search = ('<div class="search"><input id="q" type="search" autocomplete="off" '
-              'placeholder="filter aliases, models, hosts…">'
-              '<span id="count" class="count"></span></div>'
-              '<p class="muted">Reflects live health &amp; discovery — reload to refresh.</p>')
-
-    body = search + conflict_html + alias_html + model_html
-    return _doc("ai-hub routing", "routing", body, search=True)

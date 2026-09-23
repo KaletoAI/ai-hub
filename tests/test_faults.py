@@ -149,6 +149,34 @@ class Storage(unittest.TestCase):
         faults._DB_PATH = None                                    # the memory path filters too
         self.assertEqual(faults.events_since(0), [])
 
+    def test_the_bundle_key_is_computed_once_at_insert(self):
+        path = os.path.join(self._dir.name, "faults.db")
+        faults.init(path)
+        faults.record(bid="openai:a", backend="a", source="call", kind="timeout",
+                      detail="slow after 15s (job abcdef012345)", ts=1000)
+        evs = faults.events_since(0)
+        self.assertEqual(evs[0]["bkey"], faults.bundle_key("slow after 15s (job abcdef012345)"))
+        saved = faults.bundle_key
+        faults.bundle_key = lambda d: self.fail("bundle_key re-derived on read")
+        try:
+            self.assertEqual(len(faults.bundles(evs)), 1)
+        finally:
+            faults.bundle_key = saved
+
+    def test_an_old_db_gets_the_column_and_its_rows_a_key(self):
+        path = os.path.join(self._dir.name, "faults.db")
+        import sqlite3
+        with sqlite3.connect(path) as c:                          # the pre-bkey schema
+            c.executescript("CREATE TABLE faults (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER "
+                            "NOT NULL, bid TEXT NOT NULL, backend TEXT NOT NULL, type TEXT, host TEXT, "
+                            "source TEXT NOT NULL, kind TEXT NOT NULL, status INTEGER, detail TEXT, "
+                            "dur_s INTEGER);")
+            c.execute("INSERT INTO faults (ts, bid, backend, source, kind, detail) "
+                      "VALUES (5, 'openai:a', 'a', 'call', 'timeout', 'port 8080 hung')")
+        faults.init(path)
+        self.assertTrue(faults.is_persistent())
+        self.assertEqual(faults.events_since(0)[0]["bkey"], faults.bundle_key("port 8080 hung"))
+
     def test_unopenable_db_falls_back_to_memory(self):
         faults.init(os.path.join(self._dir.name, "no", "such", "dir", "faults.db"))
         self.assertFalse(faults.is_persistent())
@@ -180,6 +208,7 @@ class _MainState(unittest.TestCase):
 
     def setUp(self):
         _reset_log()
+        main.faults_info_memo_clear()
         self._saved = {k: getattr(main, k) for k in self.KEYS}
         for k in self.KEYS:
             setattr(main, k, [] if k == "backends" else {})
@@ -227,7 +256,7 @@ class HealthTransitions(_MainState):
     def test_recovery_closes_the_outage_with_its_length(self):
         self._poll(EVO, _Adapter(fail=httpx.ReadTimeout("hung")))
         bid = main.backend_id(EVO)
-        main.backend_error[bid]["since"] -= 90                    # it has been down 90 s
+        main.backend_error[bid]["fault_since"] -= 90              # it has been down 90 s
         self._poll(EVO, _Adapter())
         evs = faults.events_since(0)
         self.assertEqual(evs[-1]["kind"], faults.RECOVERED)
@@ -237,6 +266,83 @@ class HealthTransitions(_MainState):
     def test_a_healthy_boot_records_nothing(self):
         self._poll(EVO, _Adapter())
         self.assertEqual(faults.events_since(0), [])
+
+    # An outage whose kind CHANGES while it lasts (a hung box that then drops off the
+    # network, a timeout that turns into 5xx while it restarts) is still ONE outage:
+    # opened once, closed once, and its downtime runs from the moment it became a fault.
+
+    def test_a_fault_that_turns_into_unreachable_is_still_closed(self):
+        bid = main.backend_id(EVO)
+        self._poll(EVO, _Adapter(fail=httpx.ReadTimeout("hung")))
+        main.backend_error[bid]["fault_since"] -= 90
+        self._poll(EVO, _Adapter(fail=httpx.ConnectError("refused")))
+        self._poll(EVO, _Adapter())
+        evs = faults.events_since(0)
+        self.assertEqual([e["kind"] for e in evs], ["timeout", faults.RECOVERED])
+        self.assertGreaterEqual(evs[-1]["dur_s"], 90)
+
+    def test_a_kind_change_does_not_restart_the_outage_clock(self):
+        bid = main.backend_id(EVO)
+        self._poll(EVO, _Adapter(fail=httpx.ReadTimeout("hung")))
+        main.backend_error[bid]["fault_since"] -= 90
+        err500 = httpx.HTTPStatusError("boom", request=httpx.Request("GET", "http://x"),
+                                       response=httpx.Response(500))
+        self._poll(EVO, _Adapter(fail=err500))
+        self._poll(EVO, _Adapter())
+        evs = faults.events_since(0)
+        self.assertEqual([e["kind"] for e in evs], ["timeout", faults.RECOVERED])
+        self.assertGreaterEqual(evs[-1]["dur_s"], 90)
+
+    def test_a_switched_off_backend_that_starts_failing_opens_its_fault_then(self):
+        bid = main.backend_id(EVO)
+        self._poll(EVO, _Adapter(fail=httpx.ConnectError("refused")))    # off: no fault
+        main.backend_error[bid]["since"] -= 3600
+        self._poll(EVO, _Adapter(fail=httpx.ReadTimeout("hung")))        # now it IS one
+        self._poll(EVO, _Adapter(fail=httpx.ReadTimeout("hung")))        # once, not per poll
+        self._poll(EVO, _Adapter())
+        evs = faults.events_since(0)
+        self.assertEqual([e["kind"] for e in evs], ["timeout", faults.RECOVERED])
+        self.assertLess(evs[-1]["dur_s"], 60)          # the hour it was merely OFF is no downtime
+
+    def test_an_open_outage_keeps_counting_after_its_kind_changed(self):
+        bid = main.backend_id(EVO)
+        self._poll(EVO, _Adapter(fail=httpx.ReadTimeout("hung")))
+        main.backend_error[bid]["fault_since"] -= 300
+        self._poll(EVO, _Adapter(fail=httpx.ConnectError("refused")))
+        main.faults_info_memo_clear()
+        s = main.faults_info()["backends"][0]
+        self.assertGreaterEqual(s["downtime_s"], 300)
+        self.assertEqual(s["outages"], 1)
+
+
+class DiscoveryPersistFailure(_MainState):
+    """Persisting what a poll learned is bookkeeping: a locked store.db must not turn a
+    backend that just ANSWERED into a DOWN one (and a fault-log outage)."""
+
+    def test_a_store_error_does_not_mark_a_healthy_backend_down(self):
+        import sqlite3
+        import store
+
+        def locked(*a, **k):
+            raise sqlite3.OperationalError("database is locked")
+        saved = (store.is_active, store.save_backend_models, store.save_backend_context)
+        store.is_active = lambda: True
+        store.save_backend_models = store.save_backend_context = locked
+
+        class _Ctx(_Adapter):
+            async def discover(self, client):
+                return adapters.Capabilities(models={"m"}, pricing={}, context={"m": 4096})
+        try:
+            with self.assertLogs("main", level="WARNING") as log:
+                self._poll(EVO, _Ctx())
+        finally:
+            store.is_active, store.save_backend_models, store.save_backend_context = saved
+        bid = main.backend_id(EVO)
+        self.assertTrue(main.backend_healthy[bid])
+        self.assertEqual(main.backend_models[bid], {"m"})
+        self.assertNotIn(bid, main.backend_error)
+        self.assertEqual(faults.events_since(0), [])
+        self.assertTrue(any("database is locked" in m for m in log.output), log.output)
 
 
 class DispatchFailover(_MainState):
@@ -289,6 +395,28 @@ class GenFaultKind(unittest.TestCase):
         self.assertEqual(main._gen_fault_kind(httpx.ReadError("")), "connection_lost")
 
 
+class FaultsInfoMemo(_MainState):
+    """faults_info runs on every Dashboard tick and every /health — up to 20k events
+    and two regexes each. Memoised briefly; a NEW fault shows at once."""
+
+    def test_repeated_calls_do_not_re_read_the_log_until_a_fault_is_recorded(self):
+        main.backends = [EVO]
+        reads = []
+        saved = faults.events_since
+        faults.events_since = lambda since, **kw: (reads.append(since), saved(since, **kw))[1]
+        try:
+            main.faults_info()
+            main.faults_info()
+            self.assertEqual(len(reads), 1)
+            faults.record(bid=main.backend_id(EVO), backend="comfyui-strix", source="job",
+                          kind="execution", detail="boom")
+            info = main.faults_info()
+        finally:
+            faults.events_since = saved
+        self.assertEqual(len(reads), 2)
+        self.assertEqual(info["total"], 1)
+
+
 class FaultsInfo(_MainState):
     def test_host_label_open_outage_and_totals(self):
         main.backends = [EVO]
@@ -297,7 +425,8 @@ class FaultsInfo(_MainState):
         main.hosts_meta = {"192.168.8.228": {"label": "Evo-X2"}}
         main.backend_healthy = {bid: False}
         main.backend_error = {bid: {"kind": "timeout", "status": None, "detail": "x",
-                                    "since": int(main.time.time()) - 120}}
+                                    "since": int(main.time.time()) - 120,
+                                    "fault_since": int(main.time.time()) - 120}}
         faults.record(bid=bid, backend="comfyui-strix", type="comfyui", host="192.168.8.228",
                       source="job", kind="execution", detail="boom")
         info = main.faults_info()

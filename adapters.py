@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import copy
 import fnmatch
 import json
@@ -118,9 +119,6 @@ class CloudTaskRetryable(ConnectionError):
     def __init__(self, msg: str = "", vendor: str = "cloud"):
         super().__init__(msg)
         self.vendor = vendor
-
-
-MeshyNoCredits, MeshyBusy = CloudNoCredits, CloudBusy   # pre-Tripo names (main._fault_label, tests)
 
 
 # ── OpenAI /v1/models discovery helpers (moved verbatim from main.py) ──────────
@@ -404,10 +402,8 @@ class NormalizedRequest:
     # forwarding, so they never reach a backend.
     reasoning: Optional[str] = None                 # normalized reasoning control: "off" | "on" | None(auto)
     # ── generation extension ──
-    task: str = "chat"                              # text2img | img2video | tts | …
     inputs: dict = field(default_factory=dict)      # prompt, negative_prompt, …
     params: dict = field(default_factory=dict)      # width, height, steps, cfg, seed, …
-    output: dict = field(default_factory=dict)      # n, format, mode, ttl_s
     workflow: Optional[str] = None                  # workflow file path (share/legacy)
     workflow_json: Optional[dict] = None            # gateway-owned API workflow (preferred)
     node_mapping: dict = field(default_factory=dict)  # {param: {node, field}} request-time
@@ -440,9 +436,6 @@ class NormalizedRequest:
     cloud: Optional[dict] = None                    # cloud alias candidate block {endpoint, options} of
                                                     # whatever kind — `cloud_block(cand)`; None on ComfyUI
                                                     # candidates
-    meshy: Optional[dict] = None                    # the pre-Tripo name of `cloud`, kept so existing
-                                                    # callers keep constructing a Meshy request the old
-                                                    # way; folded into `cloud` below, nothing reads it
     slot_held: bool = False                         # caller already holds the in-flight slot (chain) —
                                                     # generate() must not inc/dec it a second time
     job_id: str = ""                                # the job row this request runs for. Only live progress
@@ -456,10 +449,6 @@ class NormalizedRequest:
                                                     # what did we send?") is answerable only from the vendor's
                                                     # dashboard. Per-REQUEST, so concurrent jobs on one
                                                     # adapter cannot overwrite each other's facts.
-
-    def __post_init__(self):
-        if self.cloud is None and self.meshy is not None:
-            self.cloud = self.meshy
 
 
 # ── cloud task kinds (Meshy, Tripo): the one seam main/admin ask "which kind?" ──
@@ -2443,9 +2432,9 @@ def suggest_mapping(wf: dict) -> dict:
         m["seed"] = {"node": rn, "field": "noise_seed"}
 
     if (ks := _node_by_class(wf, "KSampler")) is not None:
-        for param, field in (("steps", "steps"), ("cfg", "cfg"),
+        for param, fname in (("steps", "steps"), ("cfg", "cfg"),
                              ("sampler", "sampler_name"), ("scheduler", "scheduler")):
-            m[param] = {"node": ks, "field": field}
+            m[param] = {"node": ks, "field": fname}
 
     # Every REMAINING node titled `input_<name>` is a declared bind point (the mesh
     # workflows follow this strictly — see sample_comfyui_workflows/README.md): the
@@ -2569,6 +2558,13 @@ def input_path_ref(backend: dict, stored: str) -> str:
     return f"{indir}/{stored}" if indir else stored
 
 
+def _parse_object_info(raw: bytes) -> tuple:
+    """(node_types, models, loras) from a raw /object_info body — the CPU part of a
+    ComfyUI discovery, run via asyncio.to_thread."""
+    oi = json.loads(raw)
+    return _comfy_node_types(oi), _comfy_models(oi), _comfy_loras(oi)
+
+
 class ComfyUIAdapter(BackendAdapter):
     """ComfyUI image/video/audio backend. discover() via /object_info; generate()
     submits a parametrized workflow and polls /history, then fetches /view."""
@@ -2582,7 +2578,6 @@ class ComfyUIAdapter(BackendAdapter):
         # executor watchdog (discover-driven): pending head seen while nothing ran
         self._stuck_head: Optional[str] = None
         self._stuck_since: float = 0.0
-        self._stuck_checks: int = 0
         self.exec_stuck: bool = False
         self.last_restart: float = 0.0        # ts of the last restart() call (cooldown)
         self.last_restart_result: str = ""    # "" | running | ok | timeout | no-manager
@@ -2592,9 +2587,11 @@ class ComfyUIAdapter(BackendAdapter):
         url = self.backend["url"].rstrip("/")
         resp = await client.get(f"{url}/object_info", timeout=_COMFY_DISCOVERY_TIMEOUT)
         resp.raise_for_status()
-        oi = resp.json()
-        self._node_types = _comfy_node_types(oi)      # cache slot types for bypass (free — same fetch)
-        caps = Capabilities(models=_comfy_models(oi), loras=_comfy_loras(oi), pricing={})
+        # Several MB of JSON per poll (every 30 s, every 3 s while DOWN and calls wait):
+        # parsed and walked in a worker thread, never on the event loop.
+        node_types, models, loras = await asyncio.to_thread(_parse_object_info, resp.content)
+        self._node_types = node_types                 # cache slot types for bypass (free — same fetch)
+        caps = Capabilities(models=models, loras=loras, pricing={})
         qr = await client.get(f"{url}/queue", timeout=_COMFY_DISCOVERY_TIMEOUT)
         qr.raise_for_status()
         self._check_executor(qr.json())               # raises ComfyExecutorStuck → DOWN path
@@ -2613,10 +2610,9 @@ class ComfyUIAdapter(BackendAdapter):
         if head is None or head != self._stuck_head:
             self._stuck_head = head               # None (healthy) or new tracking baseline
             self._stuck_since = time.time()
-            self._stuck_checks = 0
             self.exec_stuck = False
             return
-        self._stuck_checks += 1                   # same head again, still nothing running
+        # same head again, still nothing running
         after = float(self.backend.get("stuck_after_s") or _COMFY_STUCK_AFTER_S)
         if time.time() - self._stuck_since >= after:
             self.exec_stuck = True
@@ -2699,7 +2695,7 @@ class ComfyUIAdapter(BackendAdapter):
                 async with _pooled_client(self.ctx) as client:
                     r = await client.get(f"{url}/object_info", timeout=_COMFY_DISCOVERY_TIMEOUT)
                 if r.status_code == 200:
-                    self._stuck_head, self._stuck_checks = None, 0
+                    self._stuck_head = None
                     self.exec_stuck = False
                     self.last_restart_result = "ok"
                     logger.info(f"[{self.name}] ComfyUI back up after restart")
@@ -3639,7 +3635,6 @@ class ComfyUIAdapter(BackendAdapter):
 _CLOUD_DISCOVERY_TIMEOUT = 8.0
 _CLOUD_HTTP_TIMEOUT = 30.0
 _CLOUD_DOWNLOAD_TIMEOUT = 120.0
-_MESHY_HTTP_TIMEOUT = _CLOUD_HTTP_TIMEOUT    # pre-Tripo name (test_meshy_adapter reads it)
 
 
 class _TaskVerdict(RuntimeError):
@@ -3657,6 +3652,12 @@ class RunResult:
     body: dict
     state: "cloudtask.TaskState"
     extra_meta: dict = field(default_factory=dict)
+
+
+# The job a cloud poll reports progress for — set by CloudTaskAdapter.generate for ONE
+# request. A ContextVar, so concurrent jobs on one adapter stay apart without threading
+# the id through every vendor's _run and every _poll call.
+_CLOUD_JOB: contextvars.ContextVar = contextvars.ContextVar("cloud_job", default="")
 
 
 class CloudTaskAdapter(BackendAdapter):
@@ -3739,6 +3740,7 @@ class CloudTaskAdapter(BackendAdapter):
             self.ctx.inflight_inc(self.bid)
         started = time.monotonic()
         log_on = self.ctx.log_enabled()
+        job_token = _CLOUD_JOB.set(req.job_id or "")
         try:
             # The client default stays SHORT (30 s): every poll runs on it, and the
             # disconnect_grace logic in _poll only reacts as fast as a poll gives up.
@@ -3774,6 +3776,9 @@ class CloudTaskAdapter(BackendAdapter):
         finally:
             if not req.slot_held:
                 self.ctx.inflight_dec(self.bid)
+            _CLOUD_JOB.reset(job_token)
+            if req.job_id:
+                self.ctx.note_progress(req.job_id, None)   # the job row owns it from here
         elapsed_ms = int((time.monotonic() - started) * 1000)
         if log_on:
             logger.info(f"← [{self.name}] {len(blobs)} artifact(s) in {elapsed_ms} ms, "
@@ -3916,9 +3921,8 @@ class CloudTaskAdapter(BackendAdapter):
                     raise RuntimeError(f"{self.vendor} task {task_id}: {e}")
                 continue
             client_errs = 0
-            # `options` by KEYWORD: meshy.parse_task takes the legacy `animations` bool in
-            # the 4th positional slot, so a positional options dict would land there.
             state = self.mod.parse_task(task, formats, endpoint, options=opts)
+            self._note_cloud_progress(state)
             if state.error:            # failed/cancelled — or a status this gateway does not know
                 detail = f"{self.vendor} task {task_id} {state.status.lower()}: {state.error}"
                 # A failure the vendor blames on itself is the one kind worth attempting
@@ -3932,6 +3936,16 @@ class CloudTaskAdapter(BackendAdapter):
         raise TimeoutError(f"{self.vendor} task {task_id} not finished within max_wait={max_wait:.0f}s "
                            f"(still running at {self.vendor} — fetch it by id from the "
                            f"{self.vendor} dashboard)")
+
+    def _note_cloud_progress(self, state) -> None:
+        """The vendor's own percentage → the job view's live progress (the feed ComfyUI's
+        step counter uses, as step N/100). Per polled TASK: a Tripo convert or clip
+        counts from 0 again, which is what is running."""
+        job_id = _CLOUD_JOB.get()
+        if job_id and not state.error and isinstance(state.progress, int):
+            pct = min(max(state.progress, 0), 100)
+            self.ctx.note_progress(job_id, {"basis": "live", "backend": self.name, "step": pct,
+                                            "steps": 100, "fraction": round(pct / 100, 3)})
 
     @staticmethod
     async def _download(client, url: str) -> bytes:

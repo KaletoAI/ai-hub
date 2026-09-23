@@ -18,7 +18,7 @@ import struct
 # joint (Mixamo bone suffix), local rotation axis, amplitude (deg), phase (rad). Legs run
 # opposite phase to the arms → a walk-like scissor that separates the thighs (reveals the
 # crotch ring) and swings every limb (reveals spikes). Diagnostic, not anatomically exact.
-_X, _Y, _Z = (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)
+_X = (1.0, 0.0, 0.0)
 _PI = math.pi
 _IDLE = [
     ("Spine1", _X, 7, 0.0), ("Spine2", _X, 6, 0.0), ("Neck", _X, 6, _PI),

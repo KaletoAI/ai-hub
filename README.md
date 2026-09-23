@@ -1251,6 +1251,8 @@ stats:
   enabled: false        # read at startup only — toggling needs a restart
   db_path: stats.db
   retention_days: 0     # 0 = keep forever; else prune older rows hourly
+  body_retention_days: 14   # request/response bodies go after 14 days, rows stay (0 = keep)
+  body_max_kb: 256      # per side; larger bodies keep their first and last 128 KB
 ```
 
 - **Cost** comes from each backend's pricing (cached at discovery, normalised to
@@ -1282,8 +1284,13 @@ stats:
   OpenAI-shaped backends report reads via `prompt_tokens_details.cached_tokens`.
   A backend that reports nothing shows `—` rather than zeros — "no cache
   reporting" is not the same statement as "the cache missed everything".
-- Recent calls store the full request/response body (large/binary bodies on disk),
-  viewable per-call, pruned with the same retention.
+- Recent calls store the request/response body on disk (gzip, `calls/<id>.json.gz`),
+  viewable per-call. A body side larger than `body_max_kb` keeps its head and tail
+  only — a Claude Code turn re-sends the whole context, ~1 MB per call — and bodies
+  are deleted after `body_retention_days` (default 14) while the row, and with it every
+  aggregate and the monthly cost quota, stays. A **refused** call stores its reason but
+  not its request (the list's preview column still shows what was asked). All stats
+  settings are read at startup only.
 
 ---
 

@@ -522,15 +522,6 @@ def set_alias_park(alias: str, park_s) -> None:
     set_settings({"alias_park": m})
 
 
-def rename_alias_park(old: str, new: str) -> None:
-    if old == new:
-        return
-    m = get_alias_park()
-    if old in m:
-        m[new] = m.pop(old)
-        set_settings({"alias_park": m})
-
-
 # ── Per-alias reasoning default (normalized thinking toggle) ─────────────────────
 # One settings dict {alias: "off"|"on"}; absent = auto. Lets two aliases point at the
 # same backend+model with different thinking behavior (e.g. `tool` off /

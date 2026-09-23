@@ -13,11 +13,10 @@ import time
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 from urllib.parse import urlparse
 
 import httpx
-import uvicorn
 import yaml
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.exception_handlers import http_exception_handler
@@ -687,6 +686,19 @@ def _with_context(entry: dict, ctx: Optional[int]) -> dict:
     return entry
 
 
+async def _persist_discovery(label: str, save, *args) -> None:
+    """Store what a poll learned (models, context windows) — bookkeeping that must never
+    fail the POLL: inside refresh_backend's try, a locked store.db marked a backend that
+    had just answered as DOWN and opened a fault-log outage for it. Logged instead; the
+    in-memory state is updated anyway and the next change persists again."""
+    if not store.is_active():
+        return
+    try:
+        await asyncio.to_thread(save, *args)
+    except Exception as e:
+        logger.warning(f"[{label}] discovery result not persisted ({save.__name__}): {_err_text(e)}")
+
+
 async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
     """Poll a backend's capabilities via its adapter and update discovery state.
 
@@ -721,16 +733,15 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
         # happen.
         caps.models = adapters.add_model_extras(caps.models, backend)
         changed = caps.models != backend_models.get(bid)
-        if changed and store.is_active():
-            await asyncio.to_thread(store.save_backend_models, bid, caps.models)  # persist on change
+        if changed:
+            await _persist_discovery(label, store.save_backend_models, bid, caps.models)
         backend_models[bid] = caps.models
         backend_pricing[bid] = caps.pricing
         backend_loras[bid] = getattr(caps, "loras", set()) or set()
         learned = merge_learned_context(backend_context.get(bid), getattr(caps, "context", None))
         if learned != backend_context.get(bid, {}):
             backend_context[bid] = learned
-            if store.is_active():
-                await asyncio.to_thread(store.save_backend_context, bid, learned)
+            await _persist_discovery(label, store.save_backend_context, bid, learned)
         running = getattr(caps, "running", None)
         had_running = bid in backend_running
         if running is None:
@@ -748,10 +759,11 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
             logger.info(f"[{label}] model filter — {len(caps.models)} of {total} models kept")
         backend_healthy[bid] = True
         prev_err = backend_error.pop(bid, None)
-        # Closes an outage the fault log opened → its length. A switched-off backend coming
-        # back opened none (being off is not a fault — faults.NOT_FAULT_KINDS).
-        if prev_err and not was_healthy and prev_err.get("kind") not in faults.NOT_FAULT_KINDS:
-            down_s = max(0, int(time.time()) - int(prev_err.get("since") or time.time()))
+        # Closes the outage the fault log opened → its length, from the moment it became a
+        # fault (`fault_since`), whatever kind it showed last. A switched-off backend that
+        # never turned into a fault opened none (faults.NOT_FAULT_KINDS) — none to close.
+        if prev_err and prev_err.get("fault_since") is not None:
+            down_s = max(0, int(time.time()) - int(prev_err["fault_since"]))
             _note_fault(backend, "health", faults.RECOVERED,
                         f"back after {down_s} s ({prev_err.get('kind')})", dur_s=down_s)
         if not was_healthy or changed:     # a backend came online / gained models →
@@ -763,13 +775,23 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
         prev = backend_error.get(bid)
         if prev and prev.get("kind") == info["kind"] and prev.get("status") == info["status"]:
             info["since"] = prev["since"]
-        backend_error[bid] = info
+        # The fault log sees ONE outage per DOWN, whatever kinds it runs through: it is
+        # opened the first time it is a fault (the DOWN poll, or later — a switched-off box
+        # that starts timing out), never again, and `fault_since` rides along every poll
+        # until the recovery closes it. Keyed on the kind it had WHEN it opened, a
+        # timeout→unreachable outage was never closed (no downtime) and an
+        # unreachable→timeout one closed without ever opening.
+        fault_since = prev.get("fault_since") if prev and not backend_healthy.get(bid, True) else None
         if backend_healthy.get(bid, True):
             hint = " (credential rejected — check the api key)" if info["kind"] == "auth" else ""
             # `_err_text`: an httpx timeout stringifies to "" — the journal read "DOWN —"
             # with nothing after it (measured 2026-09-12/13 on prod, a dozen times).
             logger.warning(f"[{label}] DOWN — {_err_text(e)}{hint}")
+        if fault_since is None and info["kind"] not in faults.NOT_FAULT_KINDS:
+            fault_since = int(time.time())
             _note_fault(backend, "health", info["kind"], info["detail"], status=info["status"])
+        info["fault_since"] = fault_since
+        backend_error[bid] = info
         backend_healthy[bid] = False
         backend_pricing[bid] = {}
         backend_loras[bid] = set()
@@ -955,8 +977,11 @@ async def lifespan(app: FastAPI):
     # /ui → Statistic now (so no extra port/bind).
     prune_task: Optional[asyncio.Task] = None
     if stats_cfg.get("enabled"):
-        stats.init(stats_cfg.get("db_path", "stats.db"), stats_cfg.get("blob_dir", "calls"))
-        prune_task = asyncio.create_task(stats.prune_loop(stats_cfg.get("retention_days", 0)))
+        stats.init(stats_cfg.get("db_path", "stats.db"), stats_cfg.get("blob_dir", "calls"),
+                   body_max_kb=stats_cfg.get("body_max_kb"))
+        prune_task = asyncio.create_task(stats.prune_loop(
+            stats_cfg.get("retention_days", 0),
+            stats_cfg.get("body_retention_days")))          # None/"" = stats' default
         logger.info("stats: recording on; dashboard at /ui → Statistic")
     # snapshot the restart-only server state actually in effect, so the UI can flag
     # when an edited setting needs a restart to apply.
@@ -964,6 +989,7 @@ async def lifespan(app: FastAPI):
         stats_enabled=bool(stats_cfg.get("enabled")),
         stats_db_path=stats_cfg.get("db_path", "stats.db"),
         stats_retention_days=stats_cfg.get("retention_days", 0),
+        stats_body_retention_days=stats_cfg.get("body_retention_days", stats.BODY_RETENTION_DAYS_DEFAULT),
         jobs_enabled=jobs_prune_task is not None,        # actually running
         jobs_db_path=jobs_cfg.get("db_path", "jobs.db"),
         jobs_blob_dir=jobs_cfg.get("blob_dir", "jobs"),
@@ -1042,6 +1068,9 @@ def _record_rejected(request: Request, exc: HTTPException) -> None:
             status=exc.status_code, input_tokens=0, output_tokens=0, cost_usd=0.0,
             request_text=(json.dumps(body, ensure_ascii=False) if isinstance(body, dict) else None),
             response_text=json.dumps({"error": {"message": str(exc.detail)}}, ensure_ascii=False),
+            # The reason is the body worth keeping; the request only feeds the preview —
+            # an agent retrying a refused 1 MB request stored it once per retry.
+            store_request=False,
         ))
     except Exception as e:                       # never let logging break the answer
         logger.warning(f"stats: could not record a rejected call: {e}")
@@ -1492,12 +1521,6 @@ def _nothing_loaded_error(alias: str, path: str) -> Optional[HTTPException]:
                               f"loaded on {', '.join(names)} — 'current' never loads one")
 
 
-def get_routes_for(alias: str) -> list[tuple[dict, str]]:
-    """(backend, real_model) pairs to try, in dispatch order (see resolve_routes) —
-    ready (non-busy) backends only. Thin wrapper over resolve_routes()."""
-    return resolve_routes(alias)[0]
-
-
 def alias_model_conflicts() -> list[dict]:
     """Aliases whose name also exists as a real model id on some backend.
 
@@ -1536,7 +1559,7 @@ def alias_model_conflicts() -> list[dict]:
 def routing_snapshot() -> dict:
     """Diagnostic view of how every alias and discovered model resolves.
 
-    Unlike get_routes_for(), this keeps unhealthy backends and not-yet-discovered
+    Unlike resolve_routes(), this keeps unhealthy backends and not-yet-discovered
     models in the result (flagged), so the dashboard shows the full configured
     picture rather than only what's routable right now.
     """
@@ -2670,7 +2693,7 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
 @app.post("/v1/embeddings")
 async def embeddings(request: Request, authorization: Optional[str] = Header(None)):
     # Same routing as chat: body["model"] is the alias/model, picked up
-    # by get_routes_for(). Embedding responses carry usage.prompt_tokens only
+    # by resolve_routes(). Embedding responses carry usage.prompt_tokens only
     # (no completion_tokens) → cost falls out of the input-price path for free.
     # Backends that filter out embedding models (chat_only) simply won't be
     # candidates here, so the request routes to a backend that actually serves it.
@@ -2759,11 +2782,11 @@ def _gen_routes(alias: str) -> tuple[list, list]:
     return ready, allc
 
 
-def get_gen_routes(alias: str, include_busy: bool = False) -> list[tuple[dict, dict]]:
-    """Single-list view of _gen_routes() — kept for callers that need only one side
-    (image slots, LoRA listing, admin)."""
-    ready, allc = _gen_routes(alias)
-    return allc if include_busy else ready
+def get_gen_routes(alias: str) -> list[tuple[dict, dict]]:
+    """Every allowed + healthy candidate of _gen_routes(), busy ones included — for
+    callers that ask what an alias CAN run on (image slots, LoRA listing, the chain's
+    successor check), not what is free right now."""
+    return _gen_routes(alias)[1]
 
 
 def _force_filter(routes: list, force: str) -> list:
@@ -3857,7 +3880,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
             # alias's best candidate — preferring stage 1's backend if it is itself one
             # (keeps the fast in-process path).
             if relay == "upload":
-                cands2 = await asyncio.to_thread(get_gen_routes, succ_alias, True)   # successor's allowed+healthy backends
+                cands2 = await asyncio.to_thread(get_gen_routes, succ_alias)   # successor's allowed+healthy backends
                 if not cands2:
                     # No candidate configured at all is a config error — fail fast. A
                     # configured successor whose backend is merely in a transient health
@@ -3950,7 +3973,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 # ── Stage 1: mesh (pin the export filename; ignore its own outputs) ──
                 req1 = NormalizedRequest(
                     alias=alias, real_model=stage1_cand.get("model"),
-                    task=stage1_cand.get("task", "text2img"), inputs=inputs, params=params, output={},
+                    inputs=inputs, params=params,
                     workflow=stage1_cand.get("workflow"), workflow_json=s1_wf,
                     node_mapping=stage1_cand.get("mapping") or {},
                     fixed=list(stage1_cand.get("fixed") or []) + list(export.extra_fixed),
@@ -4030,7 +4053,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 # path. `params` is filled in after the feed, once the mesh_ref is known.
                 req2 = NormalizedRequest(
                     alias=succ_alias, real_model=s2.get("model"),
-                    task=s2.get("task", "text2img"), inputs={}, params={}, output={},
+                    inputs={}, params={},
                     workflow=s2.get("workflow"), workflow_json=s2.get("workflow_json"),
                     node_mapping=s2.get("mapping") or {}, fixed=s2.get("fixed") or [], upload_images={},
                     upload_files={},
@@ -4456,8 +4479,7 @@ async def run_generation(body: dict, request: Request,
         # row exists) — every input upload is namespaced by it.
         return NormalizedRequest(
             alias=alias, real_model=cand.get("model"),
-            task=cand.get("task", body.get("task", "text2img")),
-            inputs=inputs, params=params, output=output,
+            inputs=inputs, params=params,
             workflow=cand.get("workflow"), workflow_json=cand.get("workflow_json"),
             node_mapping=cand.get("mapping") or {}, fixed=cand.get("fixed") or [],
             upload_images=dict(upload_images or {}), raw=request,
@@ -4535,7 +4557,7 @@ def _gen_alias_mapping(alias: str) -> tuple[dict, dict]:
     """A generation alias's (workflow, mapping) — from its first candidate, since both
     are backend-independent. Includes busy backends: resolving a request field must not
     depend on which backend happens to be free."""
-    routes = get_gen_routes(alias, include_busy=True)
+    routes = get_gen_routes(alias)
     if not routes:
         return {}, {}
     _, cand = routes[0]
@@ -4663,7 +4685,7 @@ async def gen_alias_loras(alias: str, request: Request, authorization: Optional[
     if not (known or image_models.get(alias)):
         raise HTTPException(404, f"generation alias '{alias}' not found")
     loras: set = set()
-    for b, _ in await asyncio.to_thread(get_gen_routes, alias, include_busy=True):
+    for b, _ in await asyncio.to_thread(get_gen_routes, alias):
         loras |= backend_loras.get(backend_id(b), set())
     return {"object": "list", "alias": alias, "loras": sorted(loras)}
 
@@ -4773,7 +4795,7 @@ def _gen_image_slots(alias: str) -> list:
     loaders per the mapping) — reference images map onto these positionally. Includes
     busy backends: slots are a workflow property, not gated on backend availability
     (else a busy backend would silently drop the uploaded reference images)."""
-    routes = get_gen_routes(alias, include_busy=True)
+    routes = get_gen_routes(alias)
     if not routes:
         return []
     _, cand = routes[0]
@@ -4941,7 +4963,32 @@ def dashboard_snapshot() -> dict:
     }
 
 
+# faults_info runs on every Dashboard tick (per viewer) and every /health: up to 20k
+# events read and bundled each time. Memoised briefly — keyed on the fault log's
+# generation, so a NEW fault shows at once; only an open outage's running downtime
+# may lag by the TTL.
+_FAULTS_INFO_TTL_S = 5.0
+_faults_info_memo: dict = {}
+
+
+def faults_info_memo_clear() -> None:
+    _faults_info_memo.clear()
+
+
 def faults_info(window_s: int = faults.WINDOW_S) -> dict:
+    """Memoised _faults_info (see _FAULTS_INFO_TTL_S). Callers must not mutate it."""
+    key = (int(window_s), faults.generation())
+    hit = _faults_info_memo.get(key)
+    mono = time.monotonic()
+    if hit is not None and mono - hit[0] < _FAULTS_INFO_TTL_S:
+        return hit[1]
+    val = _faults_info(window_s)
+    _faults_info_memo.clear()
+    _faults_info_memo[key] = (mono, val)
+    return val
+
+
+def _faults_info(window_s: int = faults.WINDOW_S) -> dict:
     """The last `window_s` of the fault log, derived for the console (Dashboard +
     Statistic): `backends` = one summary per backend (faults, outages, downtime incl.
     an outage STILL open, the last error), `bundles` = the faults grouped by message.
@@ -4951,10 +4998,12 @@ def faults_info(window_s: int = faults.WINDOW_S) -> dict:
     since = now - int(window_s)
     evs = faults.events_since(since)
     by_bid = {backend_id(b): b for b in backends}
-    down_since = {bid: int((backend_error.get(bid) or {}).get("since") or now)
+    # Open outages = the ones the log OPENED (fault_since, see refresh_backend) — the same
+    # clock the recovery closes them with, whatever kind they show now.
+    down_since = {bid: int(backend_error[bid]["fault_since"])
                   for bid, b in by_bid.items()
-                  if is_enabled(b) and bid in backend_error and not backend_healthy.get(bid, False)
-                  and (backend_error.get(bid) or {}).get("kind") not in faults.NOT_FAULT_KINDS}
+                  if is_enabled(b) and not backend_healthy.get(bid, False)
+                  and (backend_error.get(bid) or {}).get("fault_since") is not None}
     per = faults.per_backend(evs, since, now, down_since)
 
     def label(host: str) -> str:
@@ -5358,7 +5407,8 @@ def apply_server_settings() -> None:
     # restart-only: overlaid onto stats_cfg / jobs_cfg so the next start picks them up
     # (these init once at startup). Lets config.yaml shed the jobs/stats db knobs.
     for skey, ckey in (("stats_enabled", "enabled"),
-                       ("stats_db_path", "db_path"), ("stats_retention_days", "retention_days")):
+                       ("stats_db_path", "db_path"), ("stats_retention_days", "retention_days"),
+                       ("stats_body_retention_days", "body_retention_days")):
         if skey in s:
             stats_cfg[ckey] = s[skey]
     for skey, ckey in (("jobs_enabled", "enabled"), ("jobs_db_path", "db_path"),
@@ -5397,6 +5447,8 @@ def server_info() -> dict:
             "stats_enabled": bool(stats_cfg.get("enabled")),
             "stats_db_path": stats_cfg.get("db_path", "stats.db"),
             "stats_retention_days": stats_cfg.get("retention_days", 0),
+            "stats_body_retention_days": stats_cfg.get("body_retention_days",
+                                                       stats.BODY_RETENTION_DAYS_DEFAULT),
             "jobs_enabled": bool(jobs_cfg.get("enabled")),
             "jobs_db_path": jobs_cfg.get("db_path", "jobs.db"),
             "jobs_blob_dir": jobs_cfg.get("blob_dir", "jobs"),

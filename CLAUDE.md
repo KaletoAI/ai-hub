@@ -76,7 +76,9 @@ they need via injected callables, staying hot-reload-safe.
   pre-closed `<|channel>thought` tail, although the model can only emit plain
   answer text then) and
   `ComfyUIAdapter` (`type: comfyui`; `discover()` via `/object_info` →
-  models + **installed LoRAs**, plus an **executor watchdog** via `/queue`:
+  models + **installed LoRAs** (the MB-sized body parsed in a worker thread,
+  `_parse_object_info` — never on the loop; `test_comfy_discover.py`), plus an
+  **executor watchdog** via `/queue`:
   same head prompt pending with an idle executor across ≥2 checks and
   ≥`stuck_after_s` (default 90) → `ComfyExecutorStuck` → the normal DOWN path
   in `refresh_backend` (ComfyUI answers HTTP even when its prompt worker died —
@@ -253,7 +255,10 @@ they need via injected callables, staying hot-reload-safe.
   the 30 s client timeout with an EMPTY `str(e)`), `_poll` (a 4xx, or a 200 whose BODY
   refuses the task, is a verdict about the TASK: three IN A ROW → final; transport
   errors, 5xx and 429 are about the SERVICE and get `disconnect_grace` — a poll-rate
-  429 must not end a task that is running and already paid for), `_download` (NO auth
+  429 must not end a task that is running and already paid for; every parsed poll feeds
+  the vendor's percentage to `ctx.note_progress` as step N/100 — `_note_cloud_progress`,
+  keyed by the `_CLOUD_JOB` ContextVar `generate()` sets per request and clears with
+  `None` at the end), `_download` (NO auth
   header: signed CDN urls, the bearer must not leak there) and the three chain hooks.
   A subclass supplies only `discover`, `_run` (build → create → poll, plus whatever
   follow-up tasks the vendor needs, returning `RunResult`), `_task_request`,
@@ -264,10 +269,10 @@ they need via injected callables, staying hot-reload-safe.
   backends are keyed `(name, type)`, so a bare-name match could hand a Meshy alias the
   GPU box), `cloud_module(kind)`, `cloud_block(cand)` (a COPY — the request must not
   write through into the stored candidate) and the derived `CLOUD_TYPES`/
-  `CLOUD_MODULES`. `NormalizedRequest.cloud` carries that block (`.meshy` stays as the
-  pre-Tripo name, folded in by `__post_init__`), and `MeshyNoCredits`/`MeshyBusy` are
-  now `CloudNoCredits`/`CloudBusy` with a `vendor` attribute that `main._fault_label`/
-  `_gen_exhausted_msg` name (the old names stay as aliases).
+  `CLOUD_MODULES`. `NormalizedRequest.cloud` carries that block, and the vendor-neutral
+  `CloudNoCredits`/`CloudBusy` (the pre-Tripo `Meshy*` names and the `.meshy` request
+  field are gone — nothing stored carries them; the candidate's `meshy` KEY is the kind
+  and stays) have a `vendor` attribute that `main._fault_label`/`_gen_exhausted_msg` name.
 - **`meshy.py`** — the PURE half of the Meshy.ai backend (`type: meshy`; the HTTP half
   is `adapters.MeshyAdapter`): the fixed `input_*` label table → Meshy request body
   (`build_request`), the recorded request (`request_summary`, image data → byte size),
@@ -287,7 +292,7 @@ they need via injected callables, staying hot-reload-safe.
   endpoint has none → 400). `glb_data_uri` sniffs the `glTF` magic, so a renamed OBJ
   is refused before 5 credits are spent, and `options_of` narrows `target_formats` to
   `RIG_FORMATS` (glb/fbx) for the endpoint. `parse_task(task, formats, endpoint,
-  animations)`: `rigging` reads the urls off `task["result"]`
+  options)`: `rigging` reads the urls off `task["result"]`
   (`rigged_character_<fmt>_url`, `basic_animations.<clip>_<fmt>_url`) instead of
   `model_urls`, and `TaskState.downloads` is `[(filename, url)]` — the FILENAME is
   decided here (`rigged.glb` vs `model.glb`, `walking`/`running` clips only with the
@@ -308,7 +313,7 @@ they need via injected callables, staying hot-reload-safe.
   finishes and bills it. A Meshy backend is always `paid` (it bills per task);
   discovery = `GET /openapi/v1/balance` (0 → DOWN "no credits", balance + its age and
   the rolling gen fail-rate in `/health` + the Backends tab); 402/429 raise
-  `MeshyNoCredits`/`MeshyBusy` (ConnectionError subclasses → failover, named by
+  `CloudNoCredits`/`CloudBusy` (ConnectionError subclasses → failover, named by
   `_fault_label`). A FAILED task is final UNLESS the vendor blames itself: Meshy's
   `task_error.type` is the machine-readable verdict (`invalid_input` = permanent, while
   `timeout`/`service_unavailable`/`server_error` are answered "retry the request" in the
@@ -342,11 +347,10 @@ they need via injected callables, staying hot-reload-safe.
   `build_request`/`request_summary`/`parse_task`, a `<Kind>Input(RuntimeError)` for
   final content errors, and the three help texts `BACKEND_HINT`/`ENDPOINT_HINT`/
   `CHAIN_HINT`. `parse_task(task, formats, endpoint, options=…)` takes the whole option
-  block so the signature is identical for both (Meshy reads `options["animations"]`,
-  and keeps accepting the legacy 4th positional bool).
+  block so the signature is identical for both (Meshy reads `options["animations"]`).
 - **`cloudtask.py`** — the pure leaf both cloud modules import (no `main`/`adapters`
   imports, no I/O): `TaskState` (status/progress/error/downloads/thumbnail/credits,
-  plus `riggable`/`rig_type` for a task that answers a QUESTION instead of delivering a
+  `progress` feeds the job view's live bar, plus `riggable`/`rig_type` for a task that answers a QUESTION instead of delivering a
   file — Tripo's rig-check), and `parse_options(fields, form, defaults)` +
   `field_value_str`, the reader and writer of the `opt__<key>` form the ONE console
   editor renders from a module's `OPTION_FIELDS`. `parse_options` never raises on a
@@ -431,18 +435,24 @@ they need via injected callables, staying hot-reload-safe.
   (`_gen_fault_kind`: a builtin `ConnectionError`/`ReadError` after connecting — the
   box died mid-work), which IS a fault. `main._note_fault(backend, source, kind, detail)`
   records at the
-  recording points: `health` in `refresh_backend` (ONCE per outage, on the UP→DOWN
-  transition; the next UP writes kind `faults.RECOVERED` with `dur_s` = the outage,
-  which is what downtime sums from), `call` in `_dispatch_over` (failover exceptions,
+  recording points: `health` in `refresh_backend` (ONCE per outage — the first poll at
+  which the outage is a FAULT, usually the UP→DOWN one; `backend_error[bid]
+  ["fault_since"]` carries that moment across every later poll whatever kind it shows,
+  and the next UP writes kind `faults.RECOVERED` with `dur_s` = now − `fault_since`,
+  which is what downtime sums from; the open-outage downtime in `faults_info` reads the
+  same key. Keyed on the CURRENT kind instead, a timeout→unreachable outage was never
+  closed and an unreachable→timeout one closed without opening), `call` in `_dispatch_over` (failover exceptions,
   llama-swap's 502, and any 5xx passed to the client, with the body snippet), `job` in
   `_run_job`/`_run_chain` (EVERY failed attempt, self-retries included — the job row
   hides those), `watchdog` in `_spawn_comfy_restart`. Always on and independent of
   `stats.enabled`: a bounded memory ring plus SQLite `faults.db` (`faults.db_path`,
   `retention_days` default 7, startup-only; an unopenable DB degrades to memory and the
   Statistic panel says so). `bundles()` groups by backend+source+kind+status+
-  `bundle_key` (hex ids and numbers masked), `per_backend()` clips downtime to the
-  window and counts an outage STILL open (`down_since` from `backend_error`) up to now.
-  `main.faults_info()` resolves Hosts-tab labels and feeds the Dashboard (card, a
+  `bundle_key` (hex ids and numbers masked — computed ONCE at `record()` into column
+  `bkey`; `init()` adds and backfills it on an older DB), `per_backend()` clips downtime
+  to the window and counts an outage STILL open (`down_since` from `backend_error`) up
+  to now. `main.faults_info()` is memoised 5 s keyed on `faults.generation()` (a new
+  event shows at once; it runs per Dashboard tick and per /health), resolves Hosts-tab labels and feeds the Dashboard (card, a
   `faults · 24h` column, panel `_dash_faults`) and Statistic (`_faults_panel`, anchor
   `#faults`); `/health` carries `faults_24h` per backend. `faults.db*` is in
   `.gitignore` AND both `deploy.sh` exclude lists — without the latter `rsync --delete`
@@ -591,9 +601,20 @@ they need via injected callables, staying hot-reload-safe.
   SIBLING of `.jdur` — `_JOB_TICK` overwrites that element's text every second.
 - **`stats.py`** — optional SQLite (WAL) call log + body store. The dashboard is
   **in the `/ui` Statistic and Input & Routing tabs** (no separate port — the old standalone
-  :4001 server was folded into the console; its `stats_app` + `/`, `/routing`, `/healthz`
-  handlers still sit at the bottom of the file, mounted by nothing). Zero new
-  dependencies — keep it.
+  :4001 server was folded into the console and its code removed; `stats.py` is data only,
+  admin renders). Zero new dependencies — keep it.
+  Bodies are files, never DB columns: `calls/<id>.json.gz` (gzip; `get_body` still reads
+  the plain `<id>.json` of older blobs), each side capped at `body_max_kb` (default 256 —
+  beyond it head + tail are kept, marked `_truncated`), deleted after
+  `body_retention_days` (default 14) by `prune_once` while the ROW stays — row retention
+  (`retention_days`, default 0 = forever) is separate because the aggregates and the
+  monthly cost quota read the rows. A refused call keeps its reason, not its request
+  (`store_request=False`): one agent retrying a refused 1 MB request stored it per retry.
+  The row goes in with `has_body` in ONE autocommitted INSERT on a
+  `synchronous=NORMAL` connection (WAL: no fsync per call, never inconsistent).
+  `month_cost` (the monthly cost quota, asked on EVERY request of a capped user) is
+  answered from memory: `_month_sums` is seeded from the rows at `init()` for the
+  current UTC month and advanced by `_record_sync`; only an earlier month reads rows.
   The `calls` row carries the applied `reasoning` control (shown in LLM Calls) and
   the prompt-cache split `cache_read`/`cache_write` — both SUBSETS of
   `input_tokens` (which stays the total the model processed), so
@@ -935,7 +956,7 @@ they need via injected callables, staying hot-reload-safe.
   slot AND frees its ComfyUI VRAM once the mesh is in hand, then claims the
   stage-2 slot.
 
-### Routing rules (`get_routes_for`/`get_gen_routes` + `alias_entry`)
+### Routing rules (`resolve_routes`/`get_gen_routes` + `alias_entry`)
 
 A backend is a candidate only if enabled, healthy, **not busy** (in-flight cap),
 maps the alias, and exposes the resolved model. Recurring concepts:
@@ -1203,7 +1224,13 @@ job ran, so without it a **failed media job** was logged a second time as
 outcome; only refusals BEFORE it (no eligible backend, quota, malformed request)
 belong in the call log. `admin._call_kind()` partitions that log into
 `voice`/`media`/`llm` so each row has exactly one home — media refusals show under
-Media Jobs, not LLM Calls. The same handler renders `/v1/messages` errors in
+Media Jobs, not LLM Calls. The rule is `stats.KIND_PREFIXES` (endpoint prefixes), and
+each list is filled by `stats.recent_calls(kind, …)` filtering IN SQL — the lists used
+to take the newest 300 of the whole log and filter afterwards, which left Voice Calls
+empty on any busy LLM day, and the Media Jobs tick ran all six `summary()` scans just
+for that (≈0.6 s at 300k rows; now one indexed read of `(refused)` rows). The user
+pickers read `stats.sources()` (every source, index-only), and `summary()`/`sources()`
+are memoised 30 s (`_MEMO_TTL_S`) — the per-call lists never are. The same handler renders `/v1/messages` errors in
 Anthropic shape, so that form lives in ONE place. Cost from pricing
 cached at discovery (`normalize_pricing`: Together per-million, OpenRouter
 per-token). Streaming records the backend's usage chunk (the adapter always
