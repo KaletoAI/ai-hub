@@ -1147,7 +1147,10 @@ job ran, so without it a **failed media job** was logged a second time as
 outcome; only refusals BEFORE it (no eligible backend, quota, malformed request)
 belong in the call log. `admin._call_kind()` partitions that log into
 `voice`/`media`/`llm` so each row has exactly one home — media refusals show under
-Media Jobs, not LLM Calls. The same handler renders `/v1/messages` errors in
+Media Jobs, not LLM Calls. A refused row holds what the CALLER chose (model, x-source,
+path — before or without auth), so `_clip` cuts each to `_LOG_FIELD_MAX` (200; `_source_of`
+cuts x-source for every row) and 401 rows are capped at `_UNAUTH_LOG_PER_MIN` (60) per
+minute, the overflow summarised in one log line (`test_rejected_log.py`). The same handler renders `/v1/messages` errors in
 Anthropic shape, so that form lives in ONE place. Cost from pricing
 cached at discovery (`normalize_pricing`: Together per-million, OpenRouter
 per-token). Streaming records the backend's usage chunk (the adapter always

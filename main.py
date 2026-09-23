@@ -1049,10 +1049,42 @@ async def _rejected_call(request: Request, exc: HTTPException):
     return await http_exception_handler(request, exc)
 
 
+# Refusals are logged before (or without) authentication, so the row holds what the
+# CALLER chose: the model field, x-source, the path. Cut to a fixed length — an
+# anonymous client could otherwise store a 50 MB "model name" per request — and 401
+# rows, the refusal any stranger can produce at will, are capped per minute so a key
+# scanner cannot push every real call out of the LLM Calls view.
+_LOG_FIELD_MAX = 200
+_UNAUTH_LOG_PER_MIN = 60
+_unauth_log: dict = {}            # {"minute": int, "n": recorded, "dropped": int}
+
+
+def _clip(v) -> Optional[str]:
+    if v is None:
+        return None
+    return (v if isinstance(v, str) else json.dumps(v, ensure_ascii=False, default=str))[:_LOG_FIELD_MAX]
+
+
+def _unauth_row_allowed() -> bool:
+    minute = int(time.time() // 60)
+    if _unauth_log.get("minute") != minute:
+        if _unauth_log.get("dropped"):
+            logger.warning(f"stats: {_unauth_log['dropped']} further 401 refusal(s) not logged "
+                           f"(cap {_UNAUTH_LOG_PER_MIN}/min)")
+        _unauth_log.update(minute=minute, n=0, dropped=0)
+    if _unauth_log["n"] >= _UNAUTH_LOG_PER_MIN:
+        _unauth_log["dropped"] += 1
+        return False
+    _unauth_log["n"] += 1
+    return True
+
+
 def _record_rejected(request: Request, exc: HTTPException) -> None:
     """Fire-and-forget stats row for a refused call. Never raises into the response
     path: a logging failure must not turn a clean 503 into a 500."""
     if not stats.is_active():
+        return
+    if exc.status_code == 401 and not _unauth_row_allowed():
         return
     try:
         body = getattr(request.state, "gw_body", None)
@@ -1060,12 +1092,12 @@ def _record_rejected(request: Request, exc: HTTPException) -> None:
         if alias is None and isinstance(body, dict):
             alias = body.get("model")
         asyncio.create_task(stats.record_call(
-            duration_ms=0, backend=_REJECTED_BACKEND, source=_source_of(request),
+            duration_ms=0, backend=_REJECTED_BACKEND, source=_clip(_source_of(request)),
             # `model` stays empty: it holds the REAL model a backend served, and no
             # backend ever resolved one here — filling it with the alias would render
             # as "x→x" in the call list and claim a resolution that never happened.
-            alias=alias, model=None,
-            endpoint=getattr(request.state, "gw_endpoint", None) or request.url.path,
+            alias=_clip(alias), model=None,
+            endpoint=_clip(getattr(request.state, "gw_endpoint", None) or request.url.path),
             status=exc.status_code, input_tokens=0, output_tokens=0, cost_usd=0.0,
             request_text=(json.dumps(body, ensure_ascii=False) if isinstance(body, dict) else None),
             response_text=json.dumps({"error": {"message": str(exc.detail)}}, ensure_ascii=False),
@@ -1647,7 +1679,9 @@ def _source_of(request: Request) -> str:
     u = getattr(request.state, "gw_user", None)        # authenticated user wins
     if u:
         return u
-    return request.headers.get("x-source") or (request.client.host if request.client else "unknown")
+    # x-source is the caller's to choose and lands in every stats row → bounded.
+    return ((request.headers.get("x-source") or "")[:_LOG_FIELD_MAX]
+            or (request.client.host if request.client else "unknown"))
 
 
 def _normalize_reasoning(body: dict) -> Optional[str]:
