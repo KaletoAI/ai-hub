@@ -60,9 +60,10 @@ _MUTATING_CALLBACKS = {"_cancel_generation", "_drain_backend", "_cancel_drain", 
                        "_set_backend_enabled", "_voice_lib_save", "_voice_lib_delete",
                        "_voice_lib_ship", "_scan_start", "_apply_backends", "_apply_chat_aliases",
                        "_apply_server_settings", "_apply_users", "_apply_reasoning", "_apply_hosts"}
-# Views that persist a DERIVED value as a cache: the reverse-DNS name of a caller IP
-# (idempotent, not user-driven). Everything else a view touches must be read-only.
-_ALLOWED_VIEW_WRITES = {"_autoresolve_ips"}
+# Views that may write despite being a GET: none. (The Users page's reverse-DNS names
+# used to be persisted from the render; they now stay in memory until the operator
+# presses "Save resolved names", a POST.)
+_ALLOWED_VIEW_WRITES: set = set()
 
 
 def _admin_tree():
@@ -157,6 +158,22 @@ class PostOnlyOverHttp(unittest.TestCase):
             url = p.replace("{job_id}", "abc") + "?name=x&alias=x&id=openai:x&idx=0"
             r = self.c.get(url, headers=SAME, follow_redirects=False)
             self.assertEqual(r.status_code, 405, url)
+
+    def test_a_typed_action_url_gets_a_console_page_not_bare_json(self):
+        # A bookmark or an old script link to a (formerly GET) action answered with
+        # Starlette's bare `{"detail":"Method Not Allowed"}` — no console, no way back.
+        for p in sorted(admin._POST_ACTIONS) + ["/ui/backends/save", "/ui/users/save"]:
+            url = p.replace("{job_id}", "abc")
+            r = self.c.get(url + "?name=x", headers=SAME, follow_redirects=False)
+            self.assertEqual(r.status_code, 405, url)
+            self.assertIn("text/html", r.headers.get("content-type", ""), url)
+            self.assertEqual(r.headers.get("allow"), "POST", url)
+            self.assertIn("only runs from its button", r.text, url)
+            self.assertIn("<nav", r.text, url)                       # the console chrome
+        r = self.c.get("/ui/backends/delete", headers=SAME)
+        self.assertIn("href='/ui/backends'", r.text)
+        r = self.c.get("/ui/job/abc/cancel", headers=SAME)
+        self.assertIn("href='/ui/job/abc'", r.text)
 
 
 # ── what the pages render ───────────────────────────────────────────────────────

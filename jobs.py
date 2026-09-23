@@ -350,9 +350,10 @@ def set_stage(job_id: str, stage: Optional[str]) -> None:
 
 def set_backend(job_id: str, backend: str) -> None:
     """Re-point a live job's `backend` to where it currently runs — a chain hand-off
-    moves a job to another backend mid-run, and cancel/UI target this column."""
+    moves a job to another backend mid-run, and cancel/UI target this column. A no-op
+    on a terminal row (_LIVE): a cancelled job keeps naming the backend it was on."""
     with _conn() as c:
-        c.execute("UPDATE jobs SET backend=?, updated=? WHERE id=?",
+        c.execute(f"UPDATE jobs SET backend=?, updated=? WHERE id=? AND {_LIVE}",
                   (backend, int(time.time()), job_id))
 
 

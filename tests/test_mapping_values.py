@@ -11,8 +11,9 @@ ordinary rig of an ordinary mesh.
 
 So: a list or object is never a mapped value (400 up front; the injector itself also
 skips it, so no other path can smuggle one in), and a file field takes a client string
-only from an admin (the documented "a backend path in params is for server admins"),
-from the console, in bootstrap-open mode, or when the mapping entry says `client_path:
+only from an admin key (the documented "a backend path in params is for server admins";
+the console playground's self-call carries the logged-in admin's key), in bootstrap-open
+mode, or when the mapping entry says `client_path:
 true`. Everyone else sends the file under `files`, which the gateway uploads itself.
 The gateway's own chain hand-off (the stage-2 mesh path) is not a client value and is
 untouched.
@@ -89,6 +90,18 @@ class ClientRefusal(unittest.TestCase):
         self.assertIn("files", main._client_param_refusal({"value": "gw_abc_input.glb"},
                                                           self.pairs, False))
 
+    def test_a_setting_is_not_a_path(self):
+        # a file-NAMED param judged by its VALUE: an enum word or a model tag is no path
+        for v in ("quad", "glb", "v1.0-20240301"):
+            self.assertIsNone(main._client_param_refusal({"input_mesh_path": v}, self.pairs, False), v)
+        for v in ("../x.glb", "C:\\x\\y.glb", "~/m.obj", "other.glb"):
+            self.assertIsNotNone(main._client_param_refusal({"input_mesh_path": v}, self.pairs, False), v)
+
+    def test_refusal_names_the_way_out(self):
+        msg = main._client_param_refusal({"input_mesh_path": "/srv/x.glb"}, self.pairs, False)
+        self.assertIn("files.input_mesh_path", msg)
+        self.assertIn("client may send a backend path", msg)
+
     def test_mapping_can_allow_client_paths(self):
         m = {**MAP, "value": {**MAP["value"], "client_path": True}}
         self.assertIsNone(main._client_param_refusal({"input_mesh_path": "/x.glb"}, [(WF, m)], False))
@@ -103,11 +116,61 @@ class ClientRefusal(unittest.TestCase):
             self.assertFalse(main._params_trusted(req("/v1/generations")))
             self.assertFalse(main._params_trusted(req("/v1/generations", False)))
             self.assertTrue(main._params_trusted(req("/v1/generations", True)))
-            self.assertTrue(main._params_trusted(req("/ui/playground/media")))
+            # a /ui path is no credential: the playground reaches /v1/generations as a
+            # self-call carrying the console user's own key, which is what counts
+            self.assertFalse(main._params_trusted(req("/ui/playground/media")))
             main.api_key = ""
             self.assertTrue(main._params_trusted(req("/v1/generations")))     # bootstrap-open
         finally:
             main.api_key, main.users = saved
+
+
+class PromptValues(unittest.TestCase):
+    """prompt / negative_prompt ride as `inputs`, not `params` — same rule, same 400.
+    A list there was skipped with a WARNING by the injector and the job ran `done` on
+    the workflow's DEFAULT prompt: a confident picture of something nobody asked for."""
+
+    def test_list_or_object_prompt_is_refused(self):
+        from fastapi import HTTPException
+        for body in ({"prompt": ["a cat", "a dog"]}, {"negative_prompt": {"text": "blur"}}):
+            with self.assertRaises(HTTPException) as cm:
+                main._gen_inputs_params(body)
+            self.assertEqual(cm.exception.status_code, 400)
+            self.assertIn(next(iter(body)), cm.exception.detail)
+
+    def test_plain_prompts_pass(self):
+        inputs, _ = main._gen_inputs_params({"prompt": "a cat", "negative_prompt": ""})
+        self.assertEqual(inputs, {"prompt": "a cat", "negative_prompt": ""})
+
+
+class EditorCheckbox(unittest.TestCase):
+    """`client_path` is set in the Mapping editor, and survives a Save both ways."""
+
+    def setUp(self):
+        import admin
+        self.admin = admin
+
+    def test_file_row_offers_the_checkbox(self):
+        rows = self.admin._req_fields_rows("a", WF, MAP, {})
+        self.assertIn('name="clientpath__value"', rows)
+        self.assertNotIn('name="clientpath__steps"', rows)
+        self.assertNotIn("checked", rows.split('name="clientpath__value"')[1].split(">")[0])
+        m = {**MAP, "value": {**MAP["value"], "client_path": True}}
+        rows = self.admin._req_fields_rows("a", WF, m, {})
+        self.assertIn("checked", rows.split('name="clientpath__value"')[1].split(">")[0])
+
+    def _save(self, form, stored_cp):
+        cand = {"backend": "b", "workflow_json": WF,
+                "mapping": {"value": {**MAP["value"], **({"client_path": True} if stored_cp else {})}}}
+        base = {"node__value": "1", "field__value": "value", "label__value": "input_mesh_path"}
+        from unittest import mock
+        with mock.patch.object(self.admin.store, "get", lambda alias: None):
+            self.admin._apply_update_form([cand], {**base, **form})
+        return cand["mapping"]["value"]
+
+    def test_save_reads_the_checkbox(self):
+        self.assertTrue(self._save({"clientpath__value": "on"}, False).get("client_path"))
+        self.assertNotIn("client_path", self._save({}, True))     # unticked = cleared
 
 
 if __name__ == "__main__":

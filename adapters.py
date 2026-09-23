@@ -611,6 +611,13 @@ class BackendAdapter(ABC):
         backend's settings changed (main.build_backend_adapters). Default: nothing."""
         return None
 
+    def adopt_discovery(self, old: "BackendAdapter") -> None:
+        """Take over what a discovery poll wrote onto `old` after this instance replaced
+        it (a backend save landed while the poll was in flight — main.refresh_backend).
+        Only what still describes THIS backend; the rest of the poll is discarded.
+        Default: nothing."""
+        return None
+
     # ── workflow chains (main._run_chain) — the three places a stage is backend-specific ──
     def chain_export(self, cand: dict, succ: dict, params: dict, prefix: str) -> ChainExport:
         """Stage 1: how this backend will name/export the mesh. Default: not a stage 1."""
@@ -2030,6 +2037,40 @@ def is_image_field(wf: dict, node: str) -> bool:
     return is_img_loader_class((wf or {}).get(node, {}).get("class_type"))
 
 
+_WF_FILE_CACHE: dict = {}                    # path -> ((mtime_ns, size), workflow)
+
+
+def cand_workflow(cand: Optional[dict]) -> Optional[dict]:
+    """The workflow a ComfyUI candidate RUNS, read the way ComfyUIAdapter._workflow_for
+    reads it: the stored `workflow_json` when there is one, else the `workflow` FILE
+    (a config alias names its workflow by path and has no JSON at all). None when
+    neither is determinable — callers must then not judge by an empty workflow: reading
+    `{}` as "this alias has no image slots" dropped every reference image of a
+    path-workflow alias while the adapter would have matched them. READ-ONLY result
+    (cached per path + mtime)."""
+    cand = cand or {}
+    wj = cand.get("workflow_json")
+    if wj is not None:
+        return wj
+    path = str(cand.get("workflow") or "").strip()
+    if not path:
+        return None
+    try:
+        st = os.stat(path)
+        sig = (st.st_mtime_ns, st.st_size)
+        hit = _WF_FILE_CACHE.get(path)
+        if hit and hit[0] == sig:
+            return hit[1]
+        with open(path) as f:
+            wf = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(wf, dict):
+        return None
+    _WF_FILE_CACHE[path] = (sig, wf)
+    return wf
+
+
 def image_params(wf: dict, mapping: dict) -> list:
     """Request params whose target node is an image loader → rendered as uploads and
     filled per-field (uploaded file, else an 8×8 placeholder)."""
@@ -2043,14 +2084,32 @@ _FILE_FIELDS = ("file_path", "mesh_path", "path", "filename", "file")
 
 
 def is_file_param(param: str, m: Optional[dict]) -> bool:
-    """A mapped NON-image param that takes a client file (a mesh): its public name or the
-    workflow field says so. Heuristic on purpose — the mapping has no kind flag, and every
-    rig/shrink alias in the wild names it `input_mesh_path`. Never true for image loaders
+    """A mapped NON-image param that takes a client file (a mesh): its public name ends in
+    `path` or IS a file field name, or the workflow field is one (_FILE_FIELDS). Heuristic
+    on purpose — the mapping has no kind flag, and every rig/shrink alias in the wild names
+    it `input_mesh_path`. Deliberately NOT "mesh anywhere in the name": `mesh_format: glb`,
+    `remesh_mode: quad` and `mesh_cluster_smooth_strength` are settings, which that rule
+    rendered as file uploads and refused as backend paths. Never true for image loaders
     (the caller checks is_image_field first)."""
     names = {(param or "").lower(), ((m or {}).get("label") or "").lower()}
-    if any(("path" in n or "mesh" in n or n.endswith("_file")) for n in names if n):
+    if any((n.endswith("path") or n in _FILE_FIELDS) for n in names if n):
         return True
     return ((m or {}).get("field") or "").lower() in _FILE_FIELDS
+
+
+_PATHISH_EXT = re.compile(r"\.[A-Za-z][A-Za-z0-9]{0,5}$")
+
+
+def looks_like_path(v) -> bool:
+    """A client string that NAMES a file: a separator, a home-relative start, or a file
+    extension (a bare `other.glb` resolves in ComfyUI's input dir, where every job's
+    uploads live). Not a path: `quad`, `glb`, `v1.0-20240301` — enum words and tags a
+    file-NAMED param may still legitimately carry."""
+    if not isinstance(v, str):
+        return False
+    v = v.strip()
+    return bool(v) and ("/" in v or "\\" in v or v.startswith("~")
+                        or bool(_PATHISH_EXT.search(v)))
 
 
 def file_params(wf: dict, mapping: dict) -> list:
@@ -2087,7 +2146,7 @@ def public_fields(cand: dict) -> tuple[list, list, list]:
     k = cloud_kind(cand)
     if k:
         return cloud_module(k).public_fields(cand)
-    wf = cand.get("workflow_json") or {}
+    wf = cand_workflow(cand) or {}
     mapping = cand.get("mapping") or {}
     files = [{"name": ((mapping.get(p) or {}).get("label") or "").strip() or p, "required": False}
              for p in file_params(wf, mapping)]
@@ -2779,7 +2838,12 @@ class ComfyUIAdapter(BackendAdapter):
             return
         self._prompts = old._prompts
         self.last_restart, self.last_restart_result = old.last_restart, old.last_restart_result
-        if old.backend.get("url") == self.backend.get("url"):
+        self.adopt_discovery(old)
+
+    def adopt_discovery(self, old: BackendAdapter) -> None:
+        """The slot-type cache and the watchdog — while the URL is unchanged (a poll of
+        the old host says nothing about the new one)."""
+        if isinstance(old, ComfyUIAdapter) and old.backend.get("url") == self.backend.get("url"):
             self._node_types = old._node_types
             self._stuck_head, self._stuck_since = old._stuck_head, old._stuck_since
             self.exec_stuck = old.exec_stuck
@@ -3036,7 +3100,7 @@ class ComfyUIAdapter(BackendAdapter):
         name it writes. A node that cannot be pinned is refused HERE — `_apply_fixed`
         drops such a binding silently, so stage 1 would run to completion (tens of
         GPU-minutes) under its own name and only the /view fetch would notice."""
-        wf = cand.get("workflow_json") or {}
+        wf = cand_workflow(cand) or {}
         node = str(succ.get("export_node") or "").strip()
         why = self.export_node_error(wf, node)
         if why:
@@ -3821,6 +3885,9 @@ class CloudTaskAdapter(BackendAdapter):
                 and old.backend.get("url") == self.backend.get("url")
                 and old.backend.get("api_key") == self.backend.get("api_key")):
             self.credits, self.credits_at = old.credits, old.credits_at
+
+    def adopt_discovery(self, old: BackendAdapter) -> None:
+        self.adopt_state(old)            # the balance is all a cloud poll writes
 
     # ── vendor hooks ──────────────────────────────────────────────────────────
     async def discover(self, client: httpx.AsyncClient) -> Capabilities:

@@ -177,7 +177,8 @@ every address the host resolves to is checked, the connection goes to the checke
 address, redirects are not followed and the body is capped at 64 MB. A host that
 resolves to loopback/private/link-local/multicast is refused with `400` — list the
 ranges you trust (a LAN NAS) in `ref_url_allow_cidrs`. `images` keys that are not an
-image slot of the alias are ignored without being fetched, and the OpenAI shims'
+image slot of the alias (read from its stored workflow, or its `workflow:` file; a file
+the gateway cannot read filters nothing) are ignored without being fetched, and the OpenAI shims'
 `ref_images` beyond the alias's slot count are never downloaded.
 
 **Job ownership.** Generation jobs and background responses are owner-gated:
@@ -1146,9 +1147,13 @@ ComfyUI's cache), so the first job after one frees.
   and sends the token), so no path exists. The bytes are not kept as a job input.
   Unlike `params`, `files` is strict: unknown key or unreadable value → `400`,
   over 64 MB → `413`. Naming a backend PATH for such a file field in `params`
-  instead is admin-only (`400` for a user key, unless the mapping entry sets
-  `client_path: true`), and a list or object is never accepted as a mapped
-  `params` value (in ComfyUI's API format a list is a link between nodes).
+  instead is admin-only (`400` for a user key, unless the admin ticked *client may send
+  a backend path* on that field in the Mapping editor — `client_path: true`). A file
+  field is one whose name ends in `path` (`input_mesh_path`) or whose workflow field is
+  a file field, and only a value that names a file (`/`, `\`, `~` or an extension) is
+  judged — `mesh_format: glb` is a setting, not a path. And a list or object is never accepted as a mapped
+  `params` value, nor as `prompt`/`negative_prompt` (`400`; in ComfyUI's API format a
+  list is a link between nodes).
 - **`GET /v1/generations/{alias}/schema`** self-describes an alias in three lists:
   `params`, `images` (loader slots with their empty behaviour) and **`files`** — the
   uploads that are not images. A ComfyUI alias lists its mapped mesh params there
@@ -1290,7 +1295,8 @@ stats:
   USD/million tokens — Together's per-million and OpenRouter's per-token schemas).
   Local backends → 0.
 - **Source** is the authenticated user, else the `X-Source` header, else client IP
-  (IP aliases give those friendly names; reverse-DNS is auto-resolved).
+  (IP aliases give those friendly names; the Users page offers reverse-DNS names and
+  stores them on *Save resolved names*).
 - **Streaming** calls record real tokens when the backend honors
   `stream_options.include_usage` (requested automatically); a backend that reports
   nothing — or all-zero usage, as LocalAI does — is replaced by gateway estimates
@@ -1489,6 +1495,51 @@ DEPLOY_HOST=root@host ./deploy.sh     # rebuilds the venv, installs ai-hub.servi
 sudo systemctl disable llm-gateway.service
 sudo rm /etc/systemd/system/llm-gateway.service
 ```
+
+**Upgrading to the 2026-09-23 review release.** No manual migration: `stats.db` gets a
+new index (`idx_calls_ts_backend`, the old `idx_calls_ts` is dropped) and `faults.db` a
+`bkey` column on first start, both in place. What an operator will notice:
+
+- **Console sign-in.** Every `/ui` session ends once — sign in again. The console now
+  locks as soon as ANY user or a master `api_key` exists (before: only with an admin);
+  the Users tab refuses a first user that is not an admin, and refuses removing,
+  demoting or disabling the last admin while no master key is set.
+- **Console actions are POST-only.** Old bookmarks or scripts that fired an action by
+  GET (`/ui/backends/delete?…`, `/ui/job/<id>/cancel`, …) no longer run it: they get a
+  `405` console page. A link into `/ui` from another site (or another port on the same
+  host) lands on an intermediate page with a *Continue* link first. The Users page no
+  longer stores reverse-DNS names by itself — they are offered as *(resolved)*, and
+  *Save resolved names* stores them.
+- **`/health` without an admin credential** answers `status` + backend counts only; the
+  full snapshot needs the master or an admin key (or a console session), and model ids
+  appear only with `?verbose=1` — adjust monitoring that parsed the old body.
+- **Generation requests:** a reference image or `files` URL pointing at a private /
+  loopback / link-local address is `400` until its range is listed in
+  `ref_url_allow_cidrs`; a backend PATH in a file field's `params` is admin-only unless
+  the field ticks *client may send a backend path* (`client_path`) in the Mapping editor;
+  a list or object in `params`, `prompt` or `negative_prompt` is `400`; an unreadable
+  reference image is `400` instead of a silent placeholder.
+- **Limits:** request bodies capped at `max_body_mb` (default 200 → `413`), async
+  generation jobs at `max_queued_gen` (default 200 queued/running → `503`), a client's
+  `ttl_s` at `jobs.max_ttl_s` (7 days).
+- **Stats:** stored request/response bodies are now gzipped, capped at `body_max_kb`
+  (256 per side, head + tail kept) and deleted after `body_retention_days` (14; the call
+  rows stay) — the first start prunes older bodies. Statistic aggregates may be up to
+  30 s old, the fault summary up to 5 s; at most 60 `401` rows per minute are logged.
+- **Chat dispatch:** a `ReadTimeout` on a `paid` backend answers `504` instead of failing
+  over (it was buying the answer twice); the connect timeout is 10 s (was 300 s), and
+  every transport error (a reset, a closed keep-alive) now fails over. Client headers
+  such as cookies, `x-forwarded-*`, `origin`/`referer`/`sec-*` and `accept-encoding` are
+  no longer forwarded to backends. A stream the upstream breaks mid-answer ends with an
+  in-band error event instead of a cut connection; aborted and dropped streams are
+  booked (499/502) and count toward the cost quota.
+- **Generation jobs:** a cloud task (Meshy/Tripo) is never created a second time once it
+  exists — no failover or self-retry after that point, timeouts and outages end the job;
+  a sync generation keeps running when the client disconnects (it is a job; poll it);
+  a cancel stops only that job's own ComfyUI prompt and may take up to 15 s to return.
+- **Service unit:** `ai-hub.service` gains a systemd sandbox (still `root`, see above);
+  `deploy.sh` installs it — after the restart, check the voice-reference ship, *Scan
+  network* and whisper transcription once.
 
 > **Secrets & data never to commit:** `config.yaml`, `store.db` (+ `secret.key` —
 > they travel together, keys encrypted at rest), `stats.db*`, `jobs.db*`,

@@ -719,7 +719,17 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
         return                             # a poll of this backend is already in flight
     _probing.add(bid)
     try:
-        caps = await adapter.discover(client)
+        try:
+            caps = await adapter.discover(client)
+        finally:
+            # A backend save may have REPLACED the adapter while the poll was in flight
+            # (build_backend_adapters): what discover() wrote (slot types, watchdog,
+            # balance) went onto the old instance. Carry it over where it still applies,
+            # and act on the CURRENT instance from here on (auto-restart cooldown).
+            cur = backend_adapters.get(bid)
+            if cur is not None and cur is not adapter:
+                cur.adopt_discovery(adapter)
+                adapter = cur
         # The admin's allow/deny globs narrow the discovered set HERE — type-neutrally
         # (extract_models is the openai path only) and BEFORE `changed`, the persist and
         # the route-index rebuild, so /v1/models, routing, alias candidates and the
@@ -3093,6 +3103,13 @@ def _gen_inputs_params(body: dict) -> tuple[dict, dict]:
         "prompt": body.get("prompt", ""),
         "negative_prompt": body.get("negative_prompt", ""),
     }
+    # The same rule _client_param_refusal applies to `params`: a list or object is not a
+    # workflow value. The injector skips it with a WARNING, so the job would run `done`
+    # on the workflow's DEFAULT prompt instead of failing.
+    for k, v in inputs.items():
+        if isinstance(v, (list, tuple, dict)):
+            raise HTTPException(400, f"`{k}` must be a single value — a list or object is "
+                                     f"not a workflow value")
     params = dict(body.get("params") or {})
     for k in ("width", "height", "steps", "cfg", "seed", "sampler", "scheduler", "seconds"):
         if k in body and k not in params:        # top-level convenience knobs
@@ -4655,13 +4672,12 @@ def _upload_prefix(job_id: str, stage: str = "") -> str:
 
 def _params_trusted(request) -> bool:
     """Whether this generation request may name BACKEND paths in its params: an admin
-    key (gate_request marks it), the console (its session was checked by _ui_guard),
-    or bootstrap-open mode, where everything is open anyway."""
+    key (gate_request marks it `gw_admin`), or bootstrap-open mode, where everything is
+    open anyway. The console needs no rule of its own: its playground reaches
+    /v1/generations as a self-call carrying the logged-in admin's key (admin._self_api)."""
     if not users and not api_key:
         return True
-    if getattr(getattr(request, "state", None), "gw_admin", False):
-        return True
-    return str(getattr(getattr(request, "url", None), "path", "") or "").startswith("/ui")
+    return bool(getattr(getattr(request, "state", None), "gw_admin", False))
 
 
 def _numberish(v: str) -> bool:
@@ -4696,12 +4712,16 @@ def _client_param_refusal(params: dict, wf_maps: list, trusted: bool) -> Optiona
                 if isinstance(v, (list, tuple, dict)):
                     return (f"`params.{name}` must be a single value — a list or object is "
                             f"not a workflow value")
-                if (not trusted and not m.get("client_path") and isinstance(v, str) and v.strip()
-                        and not _numberish(v)          # is_file_param is a NAME heuristic —
-                        and not is_image_field(wf or {}, m.get("node"))   # "mesh_faces: '5000'" is no path
+                # is_file_param is a NAME heuristic, so the VALUE decides: only a string
+                # that names a file (looks_like_path) is judged — "5000", "quad" are not
+                if (not trusted and not m.get("client_path") and isinstance(v, str)
+                        and not _numberish(v) and adapters.looks_like_path(v)
+                        and not is_image_field(wf or {}, m.get("node"))
                         and adapters.is_file_param(p, m)):
-                    return (f"`params.{name}` names a file on the backend — send the file "
-                            f"itself under `files.{name}` (a backend path is admin-only)")
+                    return (f"`params.{name}` looks like a file path on the backend, which "
+                            f"only an admin key may name — send the file itself under "
+                            f"`files.{name}`, or have an admin tick \"client may send a "
+                            f"backend path\" on this field in the Mapping editor")
     return None
 
 
@@ -4745,13 +4765,13 @@ async def run_generation(body: dict, request: Request,
     inputs, params = _gen_inputs_params(body)
     _apply_seconds(params, routes[0][1])         # seconds → frames (alias fps; 400 if unsupported)
     c0 = routes[0][1]
-    wf_maps = [(c0.get("workflow_json") or {}, c0.get("mapping") or {})]
+    wf_maps = [(adapters.cand_workflow(c0) or {}, c0.get("mapping") or {})]
     succ_alias = ((c0.get("successor") or {}).get("alias") or "").strip()
     if succ_alias:
         sc = (((await asyncio.to_thread(store.get, succ_alias)) if store.is_active() else None)
               or image_models.get(succ_alias) or [])
         if sc:
-            wf_maps.append((sc[0].get("workflow_json") or {}, sc[0].get("mapping") or {}))
+            wf_maps.append((adapters.cand_workflow(sc[0]) or {}, sc[0].get("mapping") or {}))
     refusal = _client_param_refusal(params, wf_maps, _params_trusted(request))
     if refusal:
         raise HTTPException(400, refusal)
@@ -4843,7 +4863,7 @@ def _gen_alias_mapping(alias: str) -> tuple[dict, dict]:
     if not routes:
         return {}, {}
     _, cand = routes[0]
-    return (cand.get("workflow_json") or {}), (cand.get("mapping") or {})
+    return (adapters.cand_workflow(cand) or {}), (cand.get("mapping") or {})
 
 
 def _file_param(wf: dict, mapping: dict, key: str) -> str:
@@ -4948,12 +4968,16 @@ async def generations(request: Request, authorization: Optional[str] = Header(No
         # Only keys that ARE image slots of this alias (param or label) are fetched and
         # kept: anything else was ignored by the adapter anyway, but it was still
         # downloaded and stored as a job input — a free fetch-and-keep for any URL.
+        # A workflow this process cannot read (None) is NOT "no slots": the adapter
+        # loads it itself and matches the images there, so nothing is filtered.
         slots = await asyncio.to_thread(_gen_image_slot_names, body.get("model", ""))
-        for param in imgs:
-            if param not in slots:
-                logger.info(f"generations: ignoring images.{str(param)[:60]} — not an image "
-                            f"slot of '{str(body.get('model', ''))[:80]}'")
-        uploads = await _decode_ref_images({p: v for p, v in imgs.items() if p in slots})
+        if slots is not None:
+            for param in imgs:
+                if param not in slots:
+                    logger.info(f"generations: ignoring images.{str(param)[:60]} — not an "
+                                f"image slot of '{str(body.get('model', ''))[:80]}'")
+        uploads = await _decode_ref_images({p: v for p, v in imgs.items()
+                                            if slots is None or p in slots})
     # Optional client files for NON-image params: {"files": {<param>: <base64|data-URI|URL>}}
     # — e.g. the mesh a shrink/rig alias works on. The gateway uploads it onto whichever
     # backend runs the job, so a client never needs a path on a backend.
@@ -4997,7 +5021,7 @@ async def gen_alias_schema(alias: str, request: Request, authorization: Optional
     # ONE seam for both candidate kinds (ComfyUI: workflow + mapping labels; a cloud
     # backend: the endpoint's fixed label table) — see adapters.public_fields.
     params, images, files = adapters.public_fields(cand)
-    wf = cand.get("workflow_json") or {}
+    wf = adapters.cand_workflow(cand) or {}
     mapping = cand.get("mapping") or {}
     kinds = sorted(k for _, k in lora_groups(wf, mapping) if k)
     out: dict = {"object": "generation.schema", "alias": alias,
@@ -5080,11 +5104,13 @@ async def cancel_job(job_id: str, request: Request, authorization: Optional[str]
 # images response shape) lives in openai_image_bridge.py; main keeps only what
 # needs gateway state: the slot lookup below and the endpoints.
 
-def _gen_image_slots(alias: str) -> list:
+def _gen_image_slots_known(alias: str) -> Optional[list]:
     """Ordered image-input param names of a generation alias (its workflow's image
     loaders per the mapping) — reference images map onto these positionally. Includes
     busy backends: slots are a workflow property, not gated on backend availability
-    (else a busy backend would silently drop the uploaded reference images)."""
+    (else a busy backend would silently drop the uploaded reference images). None when
+    the workflow cannot be read here (adapters.cand_workflow) — "unknown", which must
+    never be read as "no slots"."""
     routes = get_gen_routes(alias)
     if not routes:
         return []
@@ -5093,13 +5119,25 @@ def _gen_image_slots(alias: str) -> list:
         # [1] = the IMAGE slots only: a `files` entry (a rigging mesh) is not something
         # a positional reference image may ever land on.
         return [i["name"] for i in adapters.public_fields(cand)[1]]   # labels ARE the params
-    return image_params(cand.get("workflow_json") or {}, cand.get("mapping") or {})
+    wf = adapters.cand_workflow(cand)      # workflow_json, else the `workflow:` FILE
+    if wf is None:
+        return None
+    return image_params(wf, cand.get("mapping") or {})
 
 
-def _gen_image_slot_names(alias: str) -> set:
+def _gen_image_slots(alias: str) -> list:
+    """_gen_image_slots_known for the positional shims: unknown slots map nothing."""
+    return _gen_image_slots_known(alias) or []
+
+
+def _gen_image_slot_names(alias: str) -> Optional[set]:
     """Every name `images` may use for this alias: each image slot's param AND its
-    public label (the adapter accepts both; a cloud alias's slot names are its labels)."""
-    names = set(_gen_image_slots(alias))
+    public label (the adapter accepts both; a cloud alias's slot names are its labels).
+    None = the workflow is not readable here, so nothing can be judged."""
+    known = _gen_image_slots_known(alias)
+    if known is None:
+        return None
+    names = set(known)
     wf, mapping = _gen_alias_mapping(alias)
     for p in names.copy():
         lbl = ((mapping.get(p) or {}).get("label") or "").strip()

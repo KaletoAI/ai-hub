@@ -849,7 +849,7 @@ _POST_ACTIONS = frozenset((
     "/ui/reasoning/toggle", "/ui/reasoning/delete",
     "/ui/playground/voice-ship", "/ui/playground/voice-del",
     "/ui/job/{job_id}/cancel",
-    "/ui/users/delete", "/ui/ipalias/delete",
+    "/ui/users/delete", "/ui/ipalias/delete", "/ui/ipalias/save-resolved",
 ))
 _POST_ACTION_RES = [re.compile("^" + re.sub(r"\\\{[^}]*\\\}", "[^/]+", re.escape(p)) + "$")
                     for p in _POST_ACTIONS]
@@ -3963,6 +3963,16 @@ def _req_fields_rows(alias: str, wf: dict, mapping: dict, oi: dict) -> str:
             cur_cell = _value_control("default__" + p, node, fld, None, wf, oi)
         else:
             cur_cell = ""                                # stale/incomplete binding — nothing to edit
+        if not is_img and (adapters.is_file_param(p, m) or m.get("client_path")):
+            # main._client_param_refusal: a backend path in this FILE field is admin-only
+            # unless the entry opts in. Rendered for every file row (and any row that
+            # already carries the flag), so the Save below can read "absent" as "off".
+            cur_cell += (' <label style="white-space:nowrap" title="Let every API key name a '
+                         'path on the backend box in this field (params). Off: only an admin '
+                         'key may; everyone else sends the file itself under files.">'
+                         f'<input type="checkbox" name="clientpath__{_esc(p)}"'
+                         + (" checked" if m.get("client_path") else "")
+                         + '> client may send a backend path</label>')
         tag = " <span class='tag'>image</span>" if is_img else ""
         if node and node not in wf:                      # node vanished after a workflow update
             tag += " <span class='badge bad' title='this node no longer exists in the workflow'>stale</span>"
@@ -4782,8 +4792,9 @@ def _apply_update_form(cands: list, f: dict) -> str:
                     if extra:
                         entry["on_empty_bypass"] = extra
                 # `client_path` (a file field that takes a backend path from any client,
-                # main._client_param_refusal) has no form field — keep it across a Save.
-                if (((cands[0] if cands else {}).get("mapping") or {}).get(p) or {}).get("client_path"):
+                # main._client_param_refusal): _req_fields_rows renders the checkbox on every
+                # row where it can matter, so an unticked (= absent) box clears it.
+                if f.get(f"clientpath__{p}"):
                     entry["client_path"] = True
                 mapping[p] = entry
     # Editable workflow defaults (the "=" column): default__<param> writes the
@@ -5980,9 +5991,12 @@ async def _jobs_media_body(request: Request) -> tuple[str, Optional[int]]:
     rows = await asyncio.to_thread(jobs.recent, _MEDIA_JOBS_PAGE, media_only=True, owner=user,
                                    before=before)
     if not rows and not user and not before:
+        # Live too (the idle 15 s tick): the first job an API client starts must appear
+        # without F5. _JOB_TICK rides along because the morph that brings the first
+        # rows strips every <script> it inserts (the live-page invariant).
         return ("<h2>Media Jobs</h2><p class='hint'>No generation jobs yet. Run one in the "
                 "<a href='/ui/playground?sub=media'>Media Playground</a>.</p>"
-                + refused + _FILTER_JS, None)
+                + refused + _JOB_TICK + _FILTER_JS, 15)
     scope, bar = _user_filter_bar("/ui/jobs?sub=media", user,
                                   [(o,) for o in await asyncio.to_thread(jobs.owners)], aliases)
     now = int(time.time())
@@ -6549,17 +6563,22 @@ async def _reverse_dns(ip: str) -> str:
 
 _ip_resolving: set = set()          # IPs a background lookup is working on right now
 _ip_resolve_tasks: set = set()      # strong refs, or the loop may drop a running task
+_ip_dns: dict = {}                  # ip -> reverse-DNS name ('' = looked up, none) — MEMORY only
+_IP_DNS_MAX = 2000
 
 
 def _autoresolve_ips(by_source: list) -> None:
     """Best-effort: for caller IPs seen in stats with no alias yet, reverse-DNS them
-    and persist the hostname (or '' to mark 'attempted', so we don't retry forever).
-    Runs in the BACKGROUND — up to 20 lookups at 1.5 s each held the Users render
-    whenever the resolver was slow or down; the names show on the next render.
-    Takes the caller's already-fetched stats.sources() rows (one query/render)."""
+    into `_ip_dns` (a name, or '' so a dead lookup is not retried every render). Runs
+    in the BACKGROUND — up to 20 lookups at 1.5 s each held the Users render whenever
+    the resolver was slow or down; the names show on the next render. Never writes the
+    store: the Users page is a GET, and a GET changes no state — the names are offered
+    there and persisted only by the operator's "Save resolved names" (POST,
+    _save_resolved_ips). Takes the caller's already-fetched stats.sources() rows."""
     aliases = store.get_ip_aliases()
     todo = [r[0] for r in by_source
-            if _looks_like_ip(r[0]) and r[0] not in aliases and r[0] not in _ip_resolving][:20]
+            if _looks_like_ip(r[0]) and r[0] not in aliases and r[0] not in _ip_dns
+            and r[0] not in _ip_resolving][:20]
     if not todo:
         return
     _ip_resolving.update(todo)
@@ -6567,10 +6586,10 @@ def _autoresolve_ips(by_source: list) -> None:
     async def run():
         try:
             names = await asyncio.gather(*[_reverse_dns(ip) for ip in todo])
-            current = store.get_ip_aliases()      # re-read: an alias may have been set meanwhile
+            if len(_ip_dns) > _IP_DNS_MAX:
+                _ip_dns.clear()
             for ip, name in zip(todo, names):
-                current.setdefault(ip, name)
-            store.save_ip_aliases(current)
+                _ip_dns[ip] = name
         except Exception as e:
             logger.warning(f"ip alias auto-resolve failed: {e}")
         finally:
@@ -6578,6 +6597,17 @@ def _autoresolve_ips(by_source: list) -> None:
     task = asyncio.create_task(run())
     _ip_resolve_tasks.add(task)
     task.add_done_callback(_ip_resolve_tasks.discard)
+
+
+def _save_resolved_ips() -> int:
+    """Persist every resolved name whose IP has no alias yet (an operator's alias is
+    never overwritten). Returns how many were stored."""
+    current = store.get_ip_aliases()
+    new = {ip: name for ip, name in _ip_dns.items() if name and ip not in current}
+    if new:
+        current.update(new)
+        store.save_ip_aliases(current)
+    return len(new)
 
 
 def _dash_cards(d: dict, bes: list, f: Optional[dict] = None) -> str:
@@ -7706,16 +7736,27 @@ async def _users_view(qp, detail: Optional[str] = None, status: int = 200) -> HT
     ipa = store.get_ip_aliases()
     seen_ips = sorted({r[0] for r in by_source if _looks_like_ip(r[0])} | set(ipa.keys()))
     iprows = ""
+    pending = 0
     for ip in seen_ips:
-        iprows += (f"<tr><td><code>{_esc(ip)}</code></td>"
+        dns = _ip_dns.get(ip, "") if ip not in ipa else ""
+        pending += bool(dns)
+        hint = (f" <span class='muted' title='reverse DNS — not saved yet'>{_esc(dns)} "
+                f"(resolved)</span>" if dns else "")
+        iprows += (f"<tr><td><code>{_esc(ip)}</code>{hint}</td>"
                    f"<td><form action='/ui/ipalias/save' method='post' style='display:flex;gap:6px;align-items:center;margin:0'>"
-                   f"<input type='hidden' name='ip' value='{_esc(ip)}'>{_inp('name', ipa.get(ip, ''), placeholder='alias')}"
+                   f"<input type='hidden' name='ip' value='{_esc(ip)}'>"
+                   f"{_inp('name', ipa.get(ip, ''), placeholder=dns or 'alias')}"
                    f"{_btn('Save', submit=True)}</form></td>"
                    f"<td style='text-align:right;white-space:nowrap'>"
                    f"{_icon_acts(('✕', f'/ui/ipalias/delete?ip={quote(ip)}', 'danger', 'Delete', f'Delete IP alias {ip}?'))}</td></tr>")
+    save_all = (" " + _btn(f"Save resolved names ({pending})", "/ui/ipalias/save-resolved",
+                           "secondary", sm=True,
+                           title="Store every reverse-DNS name shown as (resolved) as that "
+                                 "IP's alias — existing aliases are kept") if pending else "")
     ip_section = ("<h2 style='margin-top:26px'>IP aliases</h2>"
                   "<p class='hint'>Friendly names for caller IPs (unauthenticated / <code>x-source</code> calls) as shown in "
-                  "Statistics. Hostnames are auto-resolved via reverse DNS on load — edit or clear as needed.</p>"
+                  "Statistics. Hostnames are looked up via reverse DNS on load and offered as "
+                  "<i>(resolved)</i> — nothing is stored until you save it." + save_all + "</p>"
                   + (f"<table><tr><th>IP</th><th>alias</th><th></th></tr>{iprows}</table>" if iprows
                      else "<p class='muted'>No caller IPs seen yet (calls are currently attributed to authenticated users).</p>"))
     # Design convention (mirrors Mapping): the master-detail .cols is the SOLE full-height
@@ -7733,6 +7774,12 @@ async def ipalias_save(request: Request):
     if ip:
         store.set_ip_alias(ip, name)
         logger.info(f"ui: ip alias '{ip}' → '{name or '(cleared)'}'")
+    return RedirectResponse("/ui/users", status_code=303)
+
+
+async def ipalias_save_resolved(request: Request):
+    n = _save_resolved_ips()
+    logger.info(f"ui: {n} reverse-DNS name(s) saved as IP aliases")
     return RedirectResponse("/ui/users", status_code=303)
 
 
@@ -7998,6 +8045,51 @@ async def mapping_export_all(request: Request):
                     headers={"Content-Disposition": 'attachment; filename="comfyui_workflows.zip"'})
 
 
+# Where a GET to a POST-only action sends the operator back to, when the parent path
+# is not itself a page.
+_ACTION_BACK = {"/ui/chat": "/ui/mapping?sub=chat", "/ui/ipalias": "/ui/users"}
+
+
+def _action_back(path: str, get_res: list) -> str:
+    parent = path.rsplit("/", 1)[0]
+    if parent in _ACTION_BACK:
+        return _ACTION_BACK[parent]
+    if any(r.match(parent) for r in get_res):
+        return parent
+    return "/ui"
+
+
+def _register_post_only_gets(app) -> None:
+    """A GET to a POST-only console action — a typed URL, a bookmark, a script written
+    when the actions were still links — answered with Starlette's bare
+    `{"detail":"Method Not Allowed"}`: no console, no explanation, no way back. Every
+    such path gets a GET twin that renders a 405 CONSOLE page instead (Allow: POST).
+    It runs nothing; the action itself stays POST-only. Registered from here, after
+    every route exists, so the list derives itself — and outside register(), whose
+    literal route table test_ui_post_only reads by AST."""
+    def rx(p):
+        return re.compile("^" + re.sub(r"\\\{[^}]*\\\}", "[^/]+", re.escape(p)) + "$")
+    gets = {r.path for r in app.routes if "GET" in (getattr(r, "methods", None) or ())}
+    get_res = [rx(p) for p in gets if p.startswith("/ui")]
+    post_only = sorted({r.path for r in app.routes
+                        if r.path.startswith("/ui/") and r.path not in gets
+                        and "POST" in (getattr(r, "methods", None) or ())})
+
+    async def post_only_get(request: Request):
+        path = request.url.path
+        back = _action_back(path, get_res)
+        body = ("<h2>This is an action, not a page</h2>"
+                f"<p><code>{_esc(path)}</code> changes the gateway's state, so it only runs "
+                "from its button in the console (a POST) — a typed URL, a bookmark or a "
+                "link cannot trigger it, and nothing was changed.</p>"
+                f"<p><a class='btn' href='{_esc(back)}'>Back to the console</a></p>")
+        return HTMLResponse(_page("Action", body), status_code=405,
+                            headers={"Allow": "POST"})
+
+    for p in post_only:
+        app.add_api_route(p, post_only_get, methods=["GET"], include_in_schema=False)
+
+
 def register(app) -> None:
     # Every state-changing route is POST-only — _POST_ACTIONS is the list, and
     # tests/test_ui_post_only.py checks both directions against the handlers' bodies.
@@ -8073,5 +8165,7 @@ def register(app) -> None:
     app.add_api_route("/ui/users/delete", users_del, methods=["POST"])
     app.add_api_route("/ui/ipalias/save", ipalias_save, methods=["POST"])
     app.add_api_route("/ui/ipalias/delete", ipalias_del, methods=["POST"])
+    app.add_api_route("/ui/ipalias/save-resolved", ipalias_save_resolved, methods=["POST"])
     app.add_api_route("/ui/server", server_page, methods=["GET"])
     app.add_api_route("/ui/server/save", server_save, methods=["POST"])
+    _register_post_only_gets(app)              # LAST: derives its list from the table above

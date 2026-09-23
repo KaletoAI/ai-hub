@@ -31,7 +31,7 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
   restart for backend/alias changes. Read **only at startup**:
   `stats.enabled` and the stats/jobs DB paths.
 - **No linter or build step, and no blanket test suite** — only targeted stdlib
-  `unittest` files for the mechanisms that fail SILENTLY (see the fifty-six listed under
+  `unittest` files for the mechanisms that fail SILENTLY (see the fifty-seven listed under
   `anthropic_bridge.py`): `venv/bin/python -m unittest discover -s tests -t .`.
   Everything else is verified by running the server and hitting endpoints with
   `curl` (README "Try it"), `curl -H "Authorization: Bearer <admin key>"
@@ -69,7 +69,10 @@ they need via injected callables, staying hot-reload-safe.
   to its replacement (`adapter.adopt_state`: ComfyUI's restart cooldown, the running
   jobs' prompt registry, and while the URL holds the slot-type cache and watchdog; a
   cloud adapter's balance while url+key hold). Rebuilding everything on every save reset
-  the auto-restart cooldown and orphaned the prompts of running jobs.
+  the auto-restart cooldown and orphaned the prompts of running jobs. A save that lands
+  while a discovery poll is in flight: `refresh_backend` hands what the poll wrote onto
+  the replaced instance to the current one (`adopt_discovery`, same URL/account rules)
+  and continues on the current one.
 - **`adapters.py`** — the pluggable per-backend protocol seam. `BackendAdapter`
   ABC; `OpenAIAdapter` (`dispatch()` forwards chat/completions/embeddings,
   owns the in-flight counter incl. the streamed-`finally` decrement; streamed
@@ -164,10 +167,15 @@ they need via injected callables, staying hot-reload-safe.
   Workflow injection is **mapping-driven, convention-free** (`_apply_mapping`
   sets `workflow[node].inputs[field]` — never to a list, which ComfyUI reads as a LINK,
   and to an object only where the workflow holds one; `main._client_param_refusal` 400s
-  such values up front, and a client string for a mapped FILE field (`is_file_param`, a
-  path on the backend box — another job's output included) unless `_params_trusted`
-  (admin key via `gate_request`'s `gw_admin`, the /ui console, bootstrap-open) or the
-  entry carries `client_path: true` (no form field; the editor keeps it across Save);
+  such values up front, and a client string for a mapped FILE field (`is_file_param`: a
+  name ending in `path` or a `_FILE_FIELDS` field — NOT "mesh" anywhere, which caught
+  `mesh_format`/`remesh_mode` enums) whose VALUE names a file (`looks_like_path`: a
+  separator, `~`, or an extension — a bare `x.glb` resolves in the shared input dir), i.e.
+  a path on the backend box, another job's output included, unless `_params_trusted`
+  (an admin key via `gate_request`'s `gw_admin`, or bootstrap-open — the console's
+  playground qualifies through its self-call's admin key, not by a /ui rule) or the
+  entry carries `client_path: true` (Mapping editor checkbox *client may send a backend
+  path* on every file row; unticked = cleared);
   judged over the alias's AND its successor's mapping, since params are threaded by
   label — `test_mapping_values.py`); a mapping `label` is the param's public
   API name — incoming values are accepted under label OR param, and the
@@ -619,7 +627,11 @@ they need via injected callables, staying hot-reload-safe.
   and `_SORT_JS`'s `num()` reads the console's units (`102 ms`, `1.2 s`, `5m`, `$`).
   **Every console action is a POST** (`_POST_ACTIONS`; `register()` gives exactly those
   routes `methods=["POST"]`): a GET link fires on anything that makes a browser navigate
-  (link preview, prefetch, a pasted URL). `_btn` renders any href to such a route as a
+  (link preview, prefetch, a pasted URL). A GET to any POST-only /ui path (a bookmark, an
+  old script) gets a 405 CONSOLE page with `Allow: POST` and a link back
+  (`_register_post_only_gets`, called LAST in `register()` so it derives the list from
+  the route table and stays out of the literal table the AST test reads) instead of
+  Starlette's bare JSON; it runs nothing. `_btn` renders any href to such a route as a
   `<button form="gw-act" formaction=…>` — ONE empty form per page, emitted with
   `_CONFIRM_JS` outside `<main>` (the morph never touches it), because the editors' ✕/∅
   buttons sit INSIDE another form and a nested `<form>` is invalid HTML. The "+ Add …"
@@ -627,8 +639,9 @@ they need via injected callables, staying hot-reload-safe.
   never a rewritten form `action`, which a back/forward-cache restore would then Save
   into). Query values go through `_q` (`quote(safe="")`), never `_esc`: the HTML escape
   split `a&b` into `a` plus a stray `amp;b`. `test_ui_post_only.py` walks the handlers
-  by AST (no GET route may reach a store/jobs write or a mutating callback; the one
-  exception is `_autoresolve_ips`' reverse-DNS cache) and crawls the rendered pages (no
+  by AST (no GET route may reach a store/jobs write or a mutating callback — no
+  exceptions: `_autoresolve_ips` keeps its reverse-DNS names in memory, `_ip_dns`, and
+  only the Users page's *Save resolved names* POST stores them) and crawls the rendered pages (no
   link, no `location.href` to an action). Editor forms carry `data-guard`: an edited one
   left by anything but its own submit (an action, a nav tab) gets the browser's
   unsaved-changes prompt; **Update workflow** applies the whole editor form before it
@@ -718,7 +731,7 @@ they need via injected callables, staying hot-reload-safe.
   running the tool. Covered by
   `test_anthropic_bridge.py` (stdlib `unittest` — a streaming tool-call bridge fails
   silently rather than crashing). `ls tests/test_*.py` is the count of record —
-  **fifty-six** files today — and each exists for that same reason: the mechanism it
+  **fifty-seven** files today — and each exists for that same reason: the mechanism it
   guards fails SILENTLY, so it is named next to that mechanism above.
   `test_anthropic_bridge.py`, `test_prune_branch.py` (a
   dead-branch prune that cascades one node too far or too few surfaces as an aborted
@@ -893,7 +906,9 @@ they need via injected callables, staying hot-reload-safe.
   reads any file ComfyUI can read — another job's output included — and delivers it as a
   harmless-looking result. Pins that the injector skips lists and mismatched dicts,
   `_client_param_refusal`'s 400 for stage 1 and successor, backend paths only for an
-  admin, the console, bootstrap-open or `client_path: true`, and numeric strings passing).
+  admin key, bootstrap-open or `client_path: true` (a Mapping checkbox), only VALUES that
+  name a file judged (`quad`, `5000` pass), the same 400 for a list prompt, and that
+  `mesh_format`-style settings are no file fields).
   `test_audio_content_type.py` (the voice playground stash and stored call audio were
   served from the /ui origin under the BACKEND's content type — SVG or HTML from there
   runs script in the admin session. Pins: only `audio/*` plays, anything else is an
@@ -984,8 +999,8 @@ they need via injected callables, staying hot-reload-safe.
   editor's option list are pinned).
   `test_ui_post_only.py` (console actions are POST-only: a GET link fires on any
   navigation — preview, prefetch, a pasted URL — and nothing logs the store change. Walks
-  the handlers by AST (no GET route may reach a store/jobs write or a mutating callback;
-  `_autoresolve_ips`' reverse-DNS cache is the one exception), crawls the rendered pages
+  the handlers by AST (no GET route may reach a store/jobs write or a mutating callback,
+  no exceptions), crawls the rendered pages
   (no link or `location.href` to an action), checks that names with `& + # %` survive
   every action URL — the HTML escape split `a&b` into `a` + `amp;b` and ran the action on
   another alias — and that the Mapping editor keeps typed edits across Update workflow, a
@@ -1008,6 +1023,17 @@ they need via injected callables, staying hot-reload-safe.
   ReadTimeout (no failover, not `paid`) and a `PoolTimeout` as the gateway's own 503
   without failover or fault row; `test_rejected_log.py` that a refusal's preview comes
   from `_ends_only`, never a dump of the whole body.
+  Extended in the second review round (no new files): `test_gen_inputs.py` also pins the
+  image slots of a `workflow: <path>` alias (read from that file; an unreadable one
+  filters nothing — reading it as `{}` dropped every reference image, and the job came
+  back `done` on the loader's default) and the shims' positional mapping onto it;
+  `test_playground_files.py` that `mesh_format`/`remesh_mode`-style settings are no file
+  fields; `test_ui_look.py` that an EMPTY Media Jobs list is live and already carries the
+  list's scripts; `test_stats_store.py` that the Users page's reverse-DNS names stay in
+  memory until *Save resolved names*; `test_ui_post_only.py` the 405 console page (with
+  `Allow: POST` and a way back) for a GET to any POST-only path; `test_jobs_lifecycle.py`
+  that `set_backend` leaves a terminal row alone; `test_gen_cancel.py` that a discovery
+  poll spanning an adapter rebuild lands on the CURRENT instance (only for the same URL).
   Run them all with `python -m unittest discover -s tests -t .` (no runner dependency).
 - **`openai_image_bridge.py`** — pure request/response plumbing for the OpenAI
   image shims (`multipart_list`, `parse_size`, `coerce_scalar`, `images_uploads`
@@ -1109,7 +1135,11 @@ they need via injected callables, staying hot-reload-safe.
   the alias via the **separate** generation store (`image_models`/store), filtered
   to enabled+healthy generation backends of the candidate's own kind
   (`adapters.cand_kind` == `adapters.backend_kind`); LoRA-aware preference +
-  busy→park; a
+  busy→park. Everything the ROUTER reads off a candidate's workflow (image slots for the
+  `images` filter and the shims, the params refusal, the schema, the chain export) goes
+  through `adapters.cand_workflow` — `workflow_json`, else the `workflow:` FILE the adapter
+  loads, else None = unknown, which filters nothing: reading a path alias as `{}` dropped
+  every reference image (`test_gen_inputs.py`); a
   `jobs.py` job runs via `adapter.generate()` — ALWAYS as a tracked task in
   `_gen_tasks` (`_spawn_gen`); a sync request just waits for it (`_run_gen_sync`,
   `asyncio.wait`, so the job row owns the outcome). A queued/running job can be cancelled:

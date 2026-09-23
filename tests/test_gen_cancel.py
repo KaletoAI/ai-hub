@@ -348,6 +348,33 @@ class AdapterRebuildKeepsState(unittest.TestCase):
         self.assertEqual(ad.last_restart, 123.0)
         self.assertIsNone(cl.credits)                          # another account's balance
 
+    def _discover_across_a_rebuild(self, new_comfy):
+        """A discovery poll that is in flight while a backend save rebuilds the adapter:
+        its result lands on the OLD instance unless refresh_backend carries it over."""
+        old = main.backend_adapters["comfyui:gpu"]
+        saved = (dict(main.backend_models), dict(main.backend_healthy))
+
+        async def disc(client):
+            main.backends[:] = [new_comfy, dict(self.cloud)]
+            main.build_backend_adapters()                # the save lands mid-poll
+            old._node_types = {"Fresh": {}}
+            return adapters.Capabilities(models={"ckpt"}, pricing={})
+        old.discover = disc
+        try:
+            asyncio.run(main.refresh_backend(self.comfy, None))
+        finally:
+            main.backend_models.clear(); main.backend_models.update(saved[0])
+            main.backend_healthy.clear(); main.backend_healthy.update(saved[1])
+        return main.backend_adapters["comfyui:gpu"]
+
+    def test_a_poll_across_a_rebuild_reaches_the_new_instance(self):
+        ad = self._discover_across_a_rebuild({**self.comfy, "max_wait": 900})
+        self.assertEqual(ad._node_types, {"Fresh": {}})
+
+    def test_a_poll_of_the_old_url_is_not_carried_to_a_new_one(self):
+        ad = self._discover_across_a_rebuild({**self.comfy, "url": "http://other:8188"})
+        self.assertEqual(ad._node_types, {})
+
 
 class BackgroundTasksAreHeld(unittest.TestCase):
     """K20: `asyncio.create_task` keeps only a WEAK reference — an unreferenced fire-and-
