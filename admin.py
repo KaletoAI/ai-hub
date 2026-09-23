@@ -5396,13 +5396,13 @@ async def _jobs_media_body(request: Request) -> tuple[str, Optional[int]]:
     if not jobs.is_active():
         return ("<h2>Media Jobs</h2><p class='hint'>Job store is off — set <code>image_models</code> "
                 "or <code>jobs.enabled: true</code> in config.</p>" + refused + _FILTER_JS, None)
-    rows = jobs.recent(200, media_only=True, owner=user)
+    rows = await asyncio.to_thread(jobs.recent, 200, media_only=True, owner=user)
     if not rows and not user:
         return ("<h2>Media Jobs</h2><p class='hint'>No generation jobs yet. Run one in the "
                 "<a href='/ui/playground?sub=media'>Media Playground</a>.</p>"
                 + refused + _FILTER_JS, None)
     scope, bar = _user_filter_bar("/ui/jobs?sub=media", user,
-                                  [(o,) for o in jobs.owners()], aliases)
+                                  [(o,) for o in await asyncio.to_thread(jobs.owners)], aliases)
     now = int(time.time())
     tr = "".join(_job_row(j, now, task_col=True, count_col=True, actions=True, time_col=True)
                  for j in rows)
@@ -5676,7 +5676,7 @@ async def job_detail_page(job_id: str, request: Request):
     """Input (prompt/params/reference images) + output artifacts of one job."""
     if not jobs.is_active():
         return _inactive()
-    job = jobs.get(job_id)
+    job = await asyncio.to_thread(jobs.get, job_id)       # live page: a tick every 2 s
     back = _btn("← Back to Media Jobs", "/ui/jobs?sub=media", "secondary")
     if job is None:
         return HTMLResponse(_page("Job", f"<div class='bar'><h2>Job</h2>{back}</div>"
@@ -5692,7 +5692,7 @@ async def job_detail_page(job_id: str, request: Request):
     # listed separately. Bypass comes from the alias config (matches the pinned source).
     cand = {}
     if store.is_active():
-        cs = store.get(job["alias"]) or []
+        cs = await asyncio.to_thread(store.get, job["alias"]) or []
         cand = next((x for x in cs if x.get("backend") == job["backend"]), cs[0] if cs else None) or {}
     mapping = cand.get("mapping") or {}
     pinned = cand.get("fixed") or []
@@ -5805,7 +5805,7 @@ async def job_detail_page(job_id: str, request: Request):
                   title="Copy this job's prompt, params and reference images into the Media Playground")
              if store.is_active() and job.get("task") != "response" else "")
     # prev/next in the Media Jobs list (newest first); hidden at the ends.
-    newer, older = jobs.neighbors(job_id)
+    newer, older = await asyncio.to_thread(jobs.neighbors, job_id)
     nav = ((_btn("‹ Prev", f"/ui/job/{_esc(newer)}", "secondary", title="Newer job") if newer else "")
            + (_btn("Next ›", f"/ui/job/{_esc(older)}", "secondary", title="Older job") if older else ""))
     # Both 3D viewers are hoisted UNCONDITIONALLY, exactly as _playground_body hoists
@@ -6178,10 +6178,9 @@ def _dash_jobs(d: dict, now: int) -> str:
                else "<p class='muted'>nothing running or recently finished</p>"))
 
 
-def _dash_llm(d: dict, now: int) -> str:
+def _dash_llm(d: dict, now: int, aliases: dict) -> str:
     """Recent LLM calls: currently running (live registry) + finished within the last
     5 min (stats, via the shared _call_row template — same columns as LLM Calls)."""
-    aliases = store.get_ip_aliases()
     lr = ""
     for c in d.get("llm_running", []):
         started = int(c.get("started") or 0)
@@ -6234,10 +6233,11 @@ async def dashboard_page(request: Request):
     bes = [b for b in bes_all if b.get("enabled")]
     now = int(time.time())
     f = await asyncio.to_thread(_faults_info)
+    aliases = await asyncio.to_thread(store.get_ip_aliases)
     fmap = {s.get("bid"): s for s in f.get("backends") or []}
     body = ("<h2>Dashboard <span class='muted' style='font-weight:normal'>· live · auto-refresh 4s</span></h2>"
             + _dash_cards(d, bes, f) + _dash_backends(bes, offline, fmap) + _dash_faults(f)
-            + _dash_parked(d) + _dash_llm(d, now) + _dash_jobs(d, now) + _JOB_TICK)
+            + _dash_parked(d) + _dash_llm(d, now, aliases) + _dash_jobs(d, now) + _JOB_TICK)
     return HTMLResponse(_page("Dashboard", body, "dashboard", refresh=4))
 
 
@@ -6535,7 +6535,7 @@ async def statistic_page(request: Request):
 async def call_view(call_id: int, request: Request):
     """Full stored request + response body for one call (E3). Binary audio
     responses (/v1/audio/speech) render as an inline player instead of JSON."""
-    body = stats.get_body(call_id)
+    body = await asyncio.to_thread(stats.get_body, call_id)     # file read + gunzip
     if body is None:
         inner = "<p class='muted'>No stored body for this call (predates the feature, or pruned).</p>"
     else:
@@ -6561,7 +6561,7 @@ async def call_view(call_id: int, request: Request):
     # under their jobs — get the Back button and no stepping.
     nav = ""
     if src != "media":
-        newer, older = stats.call_neighbors(call_id, src == "voice")
+        newer, older = await asyncio.to_thread(stats.call_neighbors, call_id, src == "voice")
         nav = ((_btn("‹ Prev", f"/ui/call/{newer}?src={src}", "secondary", title="Newer call") if newer else "")
                + (_btn("Next ›", f"/ui/call/{older}?src={src}", "secondary", title="Older call") if older else ""))
     page = (f"<div class='bar'><h2>Call #{call_id}</h2>"
@@ -6571,7 +6571,7 @@ async def call_view(call_id: int, request: Request):
 
 async def call_audio(call_id: int):
     """Serve a call's stored binary audio response (within the stats retention)."""
-    hit = stats.get_audio(call_id)
+    hit = await asyncio.to_thread(stats.get_audio, call_id)
     if hit is None:
         raise HTTPException(404, "no audio stored for this call")
     path, mime = hit
