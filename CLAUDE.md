@@ -492,7 +492,9 @@ they need via injected callables, staying hot-reload-safe.
   state of it can render** — hoist them (`job_detail_page`, `_playground_body`) and,
   where the script must act on nodes arriving later, register the action in
   `window.gwLiveHooks` (`gwFbxScan`). `test_admin_live.py` pins this, plus `data-live`
-  on `<main>` and the ES5 validity of every JS constant — all three fail silently.
+  on `<main>` and that every JS constant parses — all three fail silently. "ES5" here
+  is a SYNTAX rule (no arrow functions, let/const, template strings, classes); later
+  DOM APIs (fetch, URL, `closest`, `Array.from`, `replaceChildren`) are used freely.
   Post-morph hooks in `window.gwLiveHooks`: the SORT hook because the server always
   renders insertion order and the morph re-imposes it (a clicked sort would be undone
   every tick), the FILTER hook because rows the morph brings in FRESH carry no

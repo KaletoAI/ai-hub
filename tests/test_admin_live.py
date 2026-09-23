@@ -45,7 +45,13 @@ class PageLiveAttr(unittest.TestCase):
 
 
 class EmbeddedScriptsParse(unittest.TestCase):
-    """Every plain inline <script> the console emits must be valid ES5.
+    """Every plain inline <script> the console emits must parse.
+
+    "ES5" in this console is a SYNTAX rule only — no arrow functions, let/const,
+    template strings or classes (test_ui_look.ConsoleScripts checks those tokens) —
+    while later DOM APIs (fetch, URL, Element.closest, Array.from, replaceChildren)
+    are used freely: the console targets evergreen browsers. `node --check` below
+    catches a script that does not parse at all, which is the silent failure.
 
     `type=`-carrying scripts (model-viewer's module, the three.js importmap) are
     skipped: they are not plain scripts and `node --check` would reject them for

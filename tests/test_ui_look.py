@@ -321,5 +321,41 @@ class Formatters(unittest.TestCase):
         self.assertIn("<td>0 / ∞</td>", html)
 
 
+class ConsoleScripts(unittest.TestCase):
+    """U22. The console's JS is "ES5" only as a SYNTAX rule (no arrow functions,
+    let/const, template strings, classes) — it freely uses later DOM APIs (fetch,
+    URL, Element.closest, Array.from, replaceChildren), so that is the rule to check."""
+
+    CONSTS = ("_SCROLL_JS", "_SORT_JS", "_LIVE_JS", "_FILTER_JS", "_JOB_TICK", "_TABS_JS",
+              "_CONFIRM_JS", "_USER_ACC_JS")
+
+    def test_page_scripts_keep_es5_syntax(self):
+        for name in self.CONSTS:
+            src = "".join(re.findall(r"<script>(.*?)</script>", getattr(admin, name), re.S))
+            for bad in ("=>", "let ", "const ", "`", "class "):
+                self.assertNotIn(bad, src, f"{name}: {bad!r} is not ES5 syntax")
+
+    def test_job_tick_starts_one_timer_however_often_it_is_embedded(self):
+        # The Dashboard and the job lists each append _JOB_TICK; a page carrying it twice
+        # ran two setIntervals rewriting the same cells.
+        if not shutil.which("node"):
+            self.skipTest("node not installed")
+        js = re.findall(r"<script>(.*?)</script>", admin._JOB_TICK, re.S)[0]
+        prog = ("var n=0,window=this;function setInterval(){n++;}"
+                "var document={querySelectorAll:function(){return [];}};"
+                + js + ";" + js + ";console.log(n);")
+        p = subprocess.run(["node", "-e", prog], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout.strip(), "1")
+
+    def test_select_all_box_follows_single_boxes(self):
+        # gwTogAll set every box of a group, but ticking or unticking ONE box never
+        # updated the group's "all" box, which then claimed the opposite of the rows.
+        src = admin._USER_ACC_JS
+        self.assertIn("gwTogAll", src)
+        self.assertIn("addEventListener('change'", src)
+        self.assertIn("data-grp-all", src)
+
+
 if __name__ == "__main__":
     unittest.main()

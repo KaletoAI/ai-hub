@@ -5415,11 +5415,16 @@ async def voice_lib_play(name: str):
 
 # ── Media Jobs tab (G1): inspect a generation's inputs + outputs within its TTL ──
 
-_JOB_TICK = ("<script>function _fd(ms){ms=ms|0;if(ms<1000)return ms+' ms';var s=ms/1000;"
+# Ticks every `.jdur[data-since]` once a second. Guarded by window.gwJobTick: several
+# views append it (a page can carry it twice), and each copy used to start its own
+# setInterval rewriting the same cells. The querySelectorAll runs per tick, so cells
+# the live morph brings in later are covered by the one timer.
+_JOB_TICK = ("<script>(function(){if(window.gwJobTick)return;window.gwJobTick=1;"
+             "function fd(ms){ms=ms|0;if(ms<1000)return ms+' ms';var s=ms/1000;"
              "return s<60?s.toFixed(1)+' s':(s/60).toFixed(1)+' min';}"
-             "function _td(){var n=Date.now()/1000;document.querySelectorAll('.jdur[data-since]')"
-             ".forEach(function(e){e.textContent=_fd((n-parseFloat(e.getAttribute('data-since')))*1000);});}"
-             "setInterval(_td,1000);_td();</script>")
+             "function td(){var n=Date.now()/1000;document.querySelectorAll('.jdur[data-since]')"
+             ".forEach(function(e){e.textContent=fd((n-parseFloat(e.getAttribute('data-since')))*1000);});}"
+             "setInterval(td,1000);td();})();</script>")
 _JOB_SCLS = {"done": "ok", "failed": "bad", "running": "warn", "queued": "warn"}
 
 
@@ -7121,6 +7126,23 @@ def _show_user_keys() -> bool:
     return bool(store.get_setting("show_user_keys", True)) if store.is_active() else True
 
 
+# The Model-access table's "all <kind>" boxes. gwTogAll sets a whole group from its
+# header box; the delegated `change` listener is the other direction — ticking or
+# unticking ONE row used to leave the header claiming the opposite (review U22). The
+# header shows checked when every row is, indeterminate when some are.
+_USER_ACC_JS = ("<script>function gwTogAll(c,g){var s='input[name=model][data-grp=\"'+g+'\"]';"
+                "document.querySelectorAll(s).forEach(function(x){x.checked=c.checked;});"
+                "c.indeterminate=false;}"
+                "(function(){function sync(g){var a=document.querySelector('input[data-grp-all=\"'+g+'\"]');"
+                "if(!a)return;var bs=document.querySelectorAll('input[name=model][data-grp=\"'+g+'\"]'),on=0,i;"
+                "for(i=0;i<bs.length;i++)if(bs[i].checked)on++;"
+                "a.checked=bs.length>0&&on===bs.length;a.indeterminate=on>0&&on<bs.length;}"
+                "document.addEventListener('change',function(e){var x=e.target;"
+                "if(x&&x.name==='model'&&x.getAttribute('data-grp'))sync(x.getAttribute('data-grp'));});"
+                "[].forEach.call(document.querySelectorAll('input[data-grp-all]'),function(a){"
+                "sync(a.getAttribute('data-grp-all'));});})();</script>")
+
+
 def _user_form(u: Optional[dict]) -> str:
     g = lambda k, d="": str((u or {}).get(k) if (u or {}).get(k) is not None else d)
     has_key = bool((u or {}).get("api_key"))
@@ -7148,7 +7170,7 @@ def _user_form(u: Optional[dict]) -> str:
         if not items:
             continue
         all_ck = " checked" if all(a in allowed for a in items) else ""
-        rows += (f'<tr style="background:#13161c"><td><input type="checkbox"{all_ck} '
+        rows += (f'<tr class="grp"><td><input type="checkbox"{all_ck} data-grp-all="{kind}" '
                  f'onclick="gwTogAll(this,\'{kind}\')" title="select all {kind}"></td>'
                  f'<td colspan="2"><b>all {kind}</b> <span class="muted">({len(items)})</span></td></tr>')
         for a in items:
@@ -7157,8 +7179,7 @@ def _user_form(u: Optional[dict]) -> str:
                      f'<td><code>{_esc(a)}</code></td><td class="muted">{kind}</td></tr>')
     acc = ((f'<div class="acctbl"><table><thead><tr><th title="allow this entry">✓</th>'
             f'<th>name</th><th>kind</th></tr></thead><tbody>{rows}</tbody></table></div>'
-            "<script>function gwTogAll(c,g){var s='input[name=model][data-grp=\"'+g+'\"]';"
-            "document.querySelectorAll(s).forEach(function(x){x.checked=c.checked;});}</script>") if rows
+            + _USER_ACC_JS) if rows
            else "<p class='muted'>no aliases or backends yet</p>")
     return (f'<form action="/ui/users/save" method="post">{orig}'
             f'<div class="formbar"><h2>{"Edit User" if u else "Add User"}</h2>'
