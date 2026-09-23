@@ -550,9 +550,8 @@ they need via injected callables, staying hot-reload-safe.
   SIBLING of `.jdur` — `_JOB_TICK` overwrites that element's text every second.
 - **`stats.py`** — optional SQLite (WAL) call log + body store. The dashboard is
   **in the `/ui` Statistic and Input & Routing tabs** (no separate port — the old standalone
-  :4001 server was folded into the console; its `stats_app` + `/`, `/routing`, `/healthz`
-  handlers still sit at the bottom of the file, mounted by nothing). Zero new
-  dependencies — keep it.
+  :4001 server was folded into the console and its code removed; `stats.py` is data only,
+  admin renders). Zero new dependencies — keep it.
   The `calls` row carries the applied `reasoning` control (shown in LLM Calls) and
   the prompt-cache split `cache_read`/`cache_write` — both SUBSETS of
   `input_tokens` (which stays the total the model processed), so
