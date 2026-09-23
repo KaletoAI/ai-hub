@@ -8045,6 +8045,51 @@ async def mapping_export_all(request: Request):
                     headers={"Content-Disposition": 'attachment; filename="comfyui_workflows.zip"'})
 
 
+# Where a GET to a POST-only action sends the operator back to, when the parent path
+# is not itself a page.
+_ACTION_BACK = {"/ui/chat": "/ui/mapping?sub=chat", "/ui/ipalias": "/ui/users"}
+
+
+def _action_back(path: str, get_res: list) -> str:
+    parent = path.rsplit("/", 1)[0]
+    if parent in _ACTION_BACK:
+        return _ACTION_BACK[parent]
+    if any(r.match(parent) for r in get_res):
+        return parent
+    return "/ui"
+
+
+def _register_post_only_gets(app) -> None:
+    """A GET to a POST-only console action — a typed URL, a bookmark, a script written
+    when the actions were still links — answered with Starlette's bare
+    `{"detail":"Method Not Allowed"}`: no console, no explanation, no way back. Every
+    such path gets a GET twin that renders a 405 CONSOLE page instead (Allow: POST).
+    It runs nothing; the action itself stays POST-only. Registered from here, after
+    every route exists, so the list derives itself — and outside register(), whose
+    literal route table test_ui_post_only reads by AST."""
+    def rx(p):
+        return re.compile("^" + re.sub(r"\\\{[^}]*\\\}", "[^/]+", re.escape(p)) + "$")
+    gets = {r.path for r in app.routes if "GET" in (getattr(r, "methods", None) or ())}
+    get_res = [rx(p) for p in gets if p.startswith("/ui")]
+    post_only = sorted({r.path for r in app.routes
+                        if r.path.startswith("/ui/") and r.path not in gets
+                        and "POST" in (getattr(r, "methods", None) or ())})
+
+    async def post_only_get(request: Request):
+        path = request.url.path
+        back = _action_back(path, get_res)
+        body = ("<h2>This is an action, not a page</h2>"
+                f"<p><code>{_esc(path)}</code> changes the gateway's state, so it only runs "
+                "from its button in the console (a POST) — a typed URL, a bookmark or a "
+                "link cannot trigger it, and nothing was changed.</p>"
+                f"<p><a class='btn' href='{_esc(back)}'>Back to the console</a></p>")
+        return HTMLResponse(_page("Action", body), status_code=405,
+                            headers={"Allow": "POST"})
+
+    for p in post_only:
+        app.add_api_route(p, post_only_get, methods=["GET"], include_in_schema=False)
+
+
 def register(app) -> None:
     # Every state-changing route is POST-only — _POST_ACTIONS is the list, and
     # tests/test_ui_post_only.py checks both directions against the handlers' bodies.
@@ -8123,3 +8168,4 @@ def register(app) -> None:
     app.add_api_route("/ui/ipalias/save-resolved", ipalias_save_resolved, methods=["POST"])
     app.add_api_route("/ui/server", server_page, methods=["GET"])
     app.add_api_route("/ui/server/save", server_save, methods=["POST"])
+    _register_post_only_gets(app)              # LAST: derives its list from the table above

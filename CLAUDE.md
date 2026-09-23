@@ -625,7 +625,11 @@ they need via injected callables, staying hot-reload-safe.
   and `_SORT_JS`'s `num()` reads the console's units (`102 ms`, `1.2 s`, `5m`, `$`).
   **Every console action is a POST** (`_POST_ACTIONS`; `register()` gives exactly those
   routes `methods=["POST"]`): a GET link fires on anything that makes a browser navigate
-  (link preview, prefetch, a pasted URL). `_btn` renders any href to such a route as a
+  (link preview, prefetch, a pasted URL). A GET to any POST-only /ui path (a bookmark, an
+  old script) gets a 405 CONSOLE page with `Allow: POST` and a link back
+  (`_register_post_only_gets`, called LAST in `register()` so it derives the list from
+  the route table and stays out of the literal table the AST test reads) instead of
+  Starlette's bare JSON; it runs nothing. `_btn` renders any href to such a route as a
   `<button form="gw-act" formaction=…>` — ONE empty form per page, emitted with
   `_CONFIRM_JS` outside `<main>` (the morph never touches it), because the editors' ✕/∅
   buttons sit INSIDE another form and a nested `<form>` is invalid HTML. The "+ Add …"

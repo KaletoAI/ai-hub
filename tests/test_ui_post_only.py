@@ -159,6 +159,22 @@ class PostOnlyOverHttp(unittest.TestCase):
             r = self.c.get(url, headers=SAME, follow_redirects=False)
             self.assertEqual(r.status_code, 405, url)
 
+    def test_a_typed_action_url_gets_a_console_page_not_bare_json(self):
+        # A bookmark or an old script link to a (formerly GET) action answered with
+        # Starlette's bare `{"detail":"Method Not Allowed"}` — no console, no way back.
+        for p in sorted(admin._POST_ACTIONS) + ["/ui/backends/save", "/ui/users/save"]:
+            url = p.replace("{job_id}", "abc")
+            r = self.c.get(url + "?name=x", headers=SAME, follow_redirects=False)
+            self.assertEqual(r.status_code, 405, url)
+            self.assertIn("text/html", r.headers.get("content-type", ""), url)
+            self.assertEqual(r.headers.get("allow"), "POST", url)
+            self.assertIn("only runs from its button", r.text, url)
+            self.assertIn("<nav", r.text, url)                       # the console chrome
+        r = self.c.get("/ui/backends/delete", headers=SAME)
+        self.assertIn("href='/ui/backends'", r.text)
+        r = self.c.get("/ui/job/abc/cancel", headers=SAME)
+        self.assertIn("href='/ui/job/abc'", r.text)
+
 
 # ── what the pages render ───────────────────────────────────────────────────────
 
