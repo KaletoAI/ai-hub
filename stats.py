@@ -71,6 +71,56 @@ def is_active() -> bool:
     return _DB_PATH is not None
 
 
+# ── the call log's three partitions ───────────────────────────────────────────
+# The console shows the ONE log in three lists (LLM Calls, Voice Calls, the refused
+# requests under Media Jobs) and every row must land in exactly one. The rule lives
+# HERE, as endpoint prefixes, so the SQL that fills each list and admin._call_kind
+# that files a single row cannot disagree. Everything that is neither voice nor
+# media is llm (incl. a NULL endpoint).
+KIND_PREFIXES = {"voice": ("/v1/audio",),
+                 "media": ("/v1/images", "/v1/generations", "/v1/jobs")}
+
+
+def call_kind(endpoint) -> str:
+    p = str(endpoint or "")
+    for kind, prefixes in KIND_PREFIXES.items():
+        if p.startswith(prefixes):
+            return kind
+    return "llm"
+
+
+def _kind_where(kind: str) -> tuple:
+    """(sql, params) selecting one partition. substr() = a case-sensitive startswith,
+    the same test call_kind makes (LIKE would be case-insensitive and treat `_` as a
+    wildcard)."""
+    def any_of(prefixes):
+        return ("(" + " OR ".join("substr(endpoint, 1, ?) = ?" for _ in prefixes) + ")",
+                [x for p in prefixes for x in (len(p), p)])
+    if kind in KIND_PREFIXES:
+        return any_of(KIND_PREFIXES[kind])
+    sql, params = any_of([p for ps in KIND_PREFIXES.values() for p in ps])
+    return f"(endpoint IS NULL OR NOT {sql})", params
+
+
+# Aggregates behind the Statistic tab and the user pickers are full scans; they are
+# memoised for this long, so a page reload or the tab's own re-render does not pay
+# for them again. The per-call LISTS are never memoised (they must show the call that
+# just happened).
+_MEMO_TTL_S = 30.0
+_memo: dict = {}
+
+
+def _memoised(key: tuple, fn):
+    key = (str(_DB_PATH),) + key
+    now = time.monotonic()
+    hit = _memo.get(key)
+    if hit is not None and now - hit[0] < _MEMO_TTL_S:
+        return hit[1]
+    val = fn()
+    _memo[key] = (now, val)
+    return val
+
+
 # The column shape of every per-call list (the console's _call_row template).
 _CALL_COLS = ("id, ts, duration_ms, backend, source, alias, model, endpoint, status, "
               "input_tokens, output_tokens, cost_usd, req_preview, has_body, reasoning")
@@ -88,7 +138,7 @@ _SQL_COUNT_BY_BACKEND_SINCE = "SELECT backend, COUNT(*) FROM calls WHERE ts > ? 
 
 def recent_since(ts: int, limit: int = 100) -> list:
     """Calls completed since `ts` (unix secs), newest first — the dashboard's
-    'last N minutes' window. Same column shape as summary()['recent'] so it
+    'last N minutes' window. Same column shape (_CALL_COLS) as recent_calls() so it
     renders with the identical row template."""
     if _DB_PATH is None:
         return []
@@ -110,8 +160,59 @@ def count_by_backend_since(ts: int) -> dict:
             _q(_SQL_COUNT_BY_BACKEND_SINCE, ts)}
 
 
-def summary(recent_limit: int = 50, model_limit: int = 30, source_limit: int = 20,
-            user: Optional[str] = None) -> dict:
+def _recent_calls_sql(kind: Optional[str], limit: int, user: Optional[str],
+                      refused_only: bool = False) -> tuple:
+    where, params = [], []
+    if kind:
+        sql, p = _kind_where(kind)
+        where.append(sql)
+        params += p
+    if user:
+        where.append("source = ?")
+        params.append(user)
+    if refused_only:
+        # A refusal on a media endpoint is the only thing the call log holds there
+        # (a job owns every outcome after it exists), and the backend marker lets the
+        # list read idx_calls_backend instead of scanning the table.
+        where.append("backend = ?")
+        params.append(REFUSED_BACKEND)
+    sql = f"SELECT {_CALL_COLS} FROM calls"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    return sql + " ORDER BY id DESC LIMIT ?", (*params, int(limit))
+
+
+def recent_calls(kind: Optional[str] = None, limit: int = 300, user: Optional[str] = None,
+                 refused_only: bool = False) -> list:
+    """The newest `limit` calls of ONE partition (call_kind), filtered IN SQL — the
+    lists used to take the newest 300 of the whole log and filter afterwards, so a
+    busy LLM day left Voice Calls empty although voice calls existed."""
+    if _DB_PATH is None:
+        return []
+    sql, params = _recent_calls_sql(kind, limit, user, refused_only)
+    return _q(sql, *params)
+
+
+def sources(limit: int = 500) -> list:
+    """(source, calls) for every source, busiest first — the user pickers. Reads
+    idx_calls_source only (no cost column: that would cost a table scan). Memoised
+    (_MEMO_TTL_S)."""
+    if _DB_PATH is None:
+        return []
+    return _memoised(("sources", limit), lambda: _q(
+        "SELECT COALESCE(source,'unknown'), COUNT(*) "
+        "FROM calls GROUP BY source ORDER BY COUNT(*) DESC LIMIT ?", limit))
+
+
+def summary(model_limit: int = 30, source_limit: int = 20, user: Optional[str] = None) -> dict:
+    """Memoised (_MEMO_TTL_S) — see _summary."""
+    if _DB_PATH is None:
+        return {"active": False}
+    return _memoised(("summary", model_limit, source_limit, user),
+                     lambda: _summary(model_limit, source_limit, user))
+
+
+def _summary(model_limit: int, source_limit: int, user: Optional[str]) -> dict:
     """Aggregated call stats for the in-UI dashboard (data only, no HTML). If
     `user` is given, every figure is scoped to that source (per-user drilldown);
     `by_source` stays unscoped so it can drive the user picker.
@@ -131,8 +232,8 @@ def summary(recent_limit: int = 50, model_limit: int = 30, source_limit: int = 2
     h24 = _q(f"SELECT COUNT(*), COALESCE(SUM(cost_usd),0) FROM calls{h24flt}", now - 86400, *ua)[0]
     # Params bind by position across the WHOLE statement, so the SELECT's ts window
     # comes before the WHERE's backend/source.
-    ref = _q(f"SELECT COUNT(*), COALESCE(SUM(CASE WHEN ts > ? THEN 1 ELSE 0 END),0) "
-             f"FROM calls WHERE backend = ?" + (" AND source = ?" if user else ""),
+    ref = _q("SELECT COUNT(*), COALESCE(SUM(CASE WHEN ts > ? THEN 1 ELSE 0 END),0) "
+             "FROM calls WHERE backend = ?" + (" AND source = ?" if user else ""),
              now - 86400, REFUSED_BACKEND, *ua)[0]
     return {
         "active": True, "user": user,
@@ -153,10 +254,6 @@ def summary(recent_limit: int = 50, model_limit: int = 30, source_limit: int = 2
         "by_source": _q(
             "SELECT COALESCE(source,'unknown'), COUNT(*), COALESCE(SUM(cost_usd),0) "
             "FROM calls GROUP BY source ORDER BY COUNT(*) DESC LIMIT ?", source_limit),
-        "recent": _q(
-            f"SELECT id, ts, duration_ms, backend, source, alias, model, endpoint, status, "
-            f"input_tokens, output_tokens, cost_usd, req_preview, has_body, reasoning "
-            f"FROM calls{flt} ORDER BY id DESC LIMIT ?", *ua, recent_limit),
     }
 
 
@@ -246,6 +343,7 @@ def init(db_path: str, blob_dir: str = "calls", body_max_kb: Optional[int] = Non
     global _DB_PATH, _BLOB_DIR, _BODY_MAX_CHARS
     _DB_PATH = Path(db_path)
     _BLOB_DIR = blob_dir
+    _memo.clear()
     if body_max_kb:
         try:
             _BODY_MAX_CHARS = max(1024, int(body_max_kb) * 1024)
@@ -337,14 +435,13 @@ def get_body(call_id: int) -> Optional[dict]:
 
 def call_neighbors(call_id: int, voice: bool) -> tuple:
     """(newer_id, older_id) around a call within its list partition — Voice Calls
-    (endpoint /v1/audio/*) vs LLM Calls (the rest) — for the detail page's
-    prev/next navigation. None at the list ends."""
+    or LLM Calls (call_kind) — for the detail page's prev/next navigation. None at
+    the list ends."""
     if _DB_PATH is None:
         return None, None
-    flt = ("endpoint LIKE '/v1/audio/%'" if voice
-           else "(endpoint IS NULL OR endpoint NOT LIKE '/v1/audio/%')")
-    newer = _q(f"SELECT id FROM calls WHERE id > ? AND {flt} ORDER BY id ASC LIMIT 1", int(call_id))
-    older = _q(f"SELECT id FROM calls WHERE id < ? AND {flt} ORDER BY id DESC LIMIT 1", int(call_id))
+    flt, p = _kind_where("voice" if voice else "llm")
+    newer = _q(f"SELECT id FROM calls WHERE id > ? AND {flt} ORDER BY id ASC LIMIT 1", int(call_id), *p)
+    older = _q(f"SELECT id FROM calls WHERE id < ? AND {flt} ORDER BY id DESC LIMIT 1", int(call_id), *p)
     return (newer[0][0] if newer else None, older[0][0] if older else None)
 
 

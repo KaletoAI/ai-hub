@@ -5360,13 +5360,9 @@ def _call_kind(endpoint: str) -> str:
 
     The stats table is ONE log, but the console shows it in three places, and every
     row must land in exactly one of them. Media endpoints used to have no partition
-    of their own, so a refused image request surfaced under LLM Calls."""
-    p = str(endpoint or "")
-    if p.startswith("/v1/audio"):
-        return "voice"
-    if p.startswith("/v1/images") or p.startswith("/v1/generations") or p.startswith("/v1/jobs"):
-        return "media"
-    return "llm"
+    of their own, so a refused image request surfaced under LLM Calls. The rule is
+    stats.KIND_PREFIXES — the same one the lists' SQL filters by."""
+    return stats.call_kind(endpoint)
 
 
 async def _refused_media_table(user, aliases) -> str:
@@ -5379,8 +5375,7 @@ async def _refused_media_table(user, aliases) -> str:
     (see run_generation), which is why a failed generation is NOT in this table."""
     if not stats.is_active():
         return ""
-    s = await asyncio.to_thread(stats.summary, recent_limit=300, user=user)
-    rows = [r for r in s["recent"] if _call_kind(r[7]) == "media"]
+    rows = await asyncio.to_thread(stats.recent_calls, "media", 300, user, refused_only=True)
     if not rows:
         return ""
     return (f"<h2 style='margin-top:26px'>Refused media requests "
@@ -5430,10 +5425,12 @@ async def _calls_view_body(request: Request, kind: str) -> str:
         return (f"<h2>{title}</h2><p class='hint'>Call recording is off. Enable <b>stats</b> in the "
                 "<a href='/ui/server'>Server</a> tab (needs a restart) to log per-call history here.</p>")
     user = (request.query_params.get("user") or "").strip() or None
-    s = await asyncio.to_thread(stats.summary, recent_limit=300, user=user)
-    rows = [r for r in s["recent"] if _call_kind(r[7]) == kind]
+    # Filtered by kind IN SQL: taking the newest 300 of the whole log and filtering
+    # afterwards left Voice Calls empty on any busy LLM day.
+    rows = await asyncio.to_thread(stats.recent_calls, kind, 300, user)
+    srcs = await asyncio.to_thread(stats.sources)
     aliases = store.get_ip_aliases()
-    scope, bar = _user_filter_bar(f"/ui/jobs?sub={kind}", user, s["by_source"], aliases)
+    scope, bar = _user_filter_bar(f"/ui/jobs?sub={kind}", user, srcs, aliases)
     head = (f"<h2>{title}{scope} <span class='muted' style='font-weight:normal'>· last {len(rows)}</span></h2>"
             f"{bar}")
     return head + _recent_calls_table(rows, aliases, src=kind) + _FILTER_JS
@@ -5945,19 +5942,37 @@ async def _reverse_dns(ip: str) -> str:
         return ""
 
 
-async def _autoresolve_ips(by_source: list) -> None:
+_ip_resolving: set = set()          # IPs a background lookup is working on right now
+_ip_resolve_tasks: set = set()      # strong refs, or the loop may drop a running task
+
+
+def _autoresolve_ips(by_source: list) -> None:
     """Best-effort: for caller IPs seen in stats with no alias yet, reverse-DNS them
     and persist the hostname (or '' to mark 'attempted', so we don't retry forever).
-    Takes the caller's already-fetched summary()['by_source'] rows (one query/render)."""
+    Runs in the BACKGROUND — up to 20 lookups at 1.5 s each held the Users render
+    whenever the resolver was slow or down; the names show on the next render.
+    Takes the caller's already-fetched stats.sources() rows (one query/render)."""
     aliases = store.get_ip_aliases()
-    seen = [r[0] for r in by_source]
-    todo = [s for s in seen if _looks_like_ip(s) and s not in aliases][:20]
+    todo = [r[0] for r in by_source
+            if _looks_like_ip(r[0]) and r[0] not in aliases and r[0] not in _ip_resolving][:20]
     if not todo:
         return
-    names = await asyncio.gather(*[_reverse_dns(ip) for ip in todo])
-    for ip, name in zip(todo, names):
-        aliases[ip] = name
-    store.save_ip_aliases(aliases)
+    _ip_resolving.update(todo)
+
+    async def run():
+        try:
+            names = await asyncio.gather(*[_reverse_dns(ip) for ip in todo])
+            current = store.get_ip_aliases()      # re-read: an alias may have been set meanwhile
+            for ip, name in zip(todo, names):
+                current.setdefault(ip, name)
+            store.save_ip_aliases(current)
+        except Exception as e:
+            logger.warning(f"ip alias auto-resolve failed: {e}")
+        finally:
+            _ip_resolving.difference_update(todo)
+    task = asyncio.create_task(run())
+    _ip_resolve_tasks.add(task)
+    task.add_done_callback(_ip_resolve_tasks.discard)
 
 
 def _dash_cards(d: dict, bes: list, f: Optional[dict] = None) -> str:
@@ -6453,7 +6468,8 @@ async def statistic_page(request: Request):
     user = (request.query_params.get("user") or "").strip() or None
     s = await asyncio.to_thread(stats.summary, user=user)
     aliases = store.get_ip_aliases()
-    scope, bar = _user_filter_bar("/ui/statistic", user, s["by_source"], aliases)
+    scope, bar = _user_filter_bar("/ui/statistic", user, await asyncio.to_thread(stats.sources),
+                                  aliases)
     # Refused calls are counted in the totals but never in the tables below (they had no
     # backend and no model) — this card is where they stay visible, and it explains the
     # gap between "calls total" and the sum of the By-backend column. Deliberately NOT
@@ -7023,9 +7039,8 @@ async def users_page(request: Request):
         detail = _user_form(None)
     else:
         detail = "<h2>Details</h2><p class='hint'>Select a user's <b>Edit</b>, or <b>+ New user</b>.</p>"
-    by_source = ((await asyncio.to_thread(stats.summary))["by_source"]
-                 if stats.is_active() else [])              # ONE summary per render
-    await _autoresolve_ips(by_source)
+    by_source = (await asyncio.to_thread(stats.sources)) if stats.is_active() else []
+    _autoresolve_ips(by_source)
     ipa = store.get_ip_aliases()
     seen_ips = sorted({r[0] for r in by_source if _looks_like_ip(r[0])} | set(ipa.keys()))
     iprows = ""

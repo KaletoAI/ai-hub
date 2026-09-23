@@ -30,7 +30,9 @@ os.chdir(_tmp.name)
 sys.path.insert(0, _here)
 try:
     import main
+    import admin
     import stats
+    import store
 finally:
     os.chdir(_prev)
     _tmp.cleanup()
@@ -247,6 +249,122 @@ class MonthCost(_StatsDB):
         self._bulk([_row(prev + 5, source="kai", cost=3.0)])
         self._reinit()
         self.assertAlmostEqual(stats.month_cost("kai", prev), 3.0)
+
+
+def _req(**q):
+    return types.SimpleNamespace(query_params=q)
+
+
+class CallLists(_StatsDB):
+    """The three call lists (LLM / Voice / refused Media) and their user picker."""
+
+    def setUp(self):
+        super().setUp()
+        self._saved_aliases = store.get_ip_aliases
+        store.get_ip_aliases = lambda: {}
+
+    def tearDown(self):
+        store.get_ip_aliases = self._saved_aliases
+        super().tearDown()
+
+    def test_voice_calls_show_even_behind_hundreds_of_newer_llm_calls(self):
+        now = int(time.time())
+        self._bulk([_row(now - 1000, endpoint="/v1/audio/speech", backend="tts")]
+                   + [_row(now - 900 + i, endpoint="/v1/chat/completions") for i in range(400)])
+        rows = stats.recent_calls("voice", 300)
+        self.assertEqual([r[7] for r in rows], ["/v1/audio/speech"])
+        html = asyncio.run(admin._calls_view_body(_req(), "voice"))
+        self.assertIn("speech", html)
+        self.assertIn("last 1<", html)
+        llm = stats.recent_calls("llm", 300)
+        self.assertEqual(len(llm), 300)
+        self.assertTrue(all(r[7] == "/v1/chat/completions" for r in llm))
+
+    def test_the_sql_partition_is_the_consoles_partition(self):
+        eps = ["/v1/audio/speech", "/v1/audio/transcriptions", "/v1/images/generations",
+               "/v1/images/edits", "/v1/generations", "/v1/jobs/abc", "/v1/chat/completions",
+               "/v1/messages", "/v1/models", "/v1/embeddings", None, "", "/v1/audiox"]
+        now = int(time.time())
+        self._bulk([_row(now - 100 + i, endpoint=e) for i, e in enumerate(eps)])
+        got = {}
+        for kind in ("llm", "voice", "media"):
+            for r in stats.recent_calls(kind, 100):
+                got[r[7]] = kind
+        self.assertEqual(got, {e: admin._call_kind(e) for e in eps})
+
+    def test_the_user_picker_offers_every_source_not_the_top_twenty(self):
+        now = int(time.time())
+        self._bulk([_row(now - 500 + i, source=f"user{i:02d}") for i in range(30)])
+        html = asyncio.run(admin._calls_view_body(_req(), "llm"))
+        for i in range(30):
+            self.assertIn(f"value='user{i:02d}'", html)
+
+    def test_refused_media_needs_no_summary_and_reads_through_an_index(self):
+        now = int(time.time())
+        self._bulk([_row(now - 5, backend=stats.REFUSED_BACKEND, endpoint="/v1/images/generations")]
+                   + [_row(now - 100 + i) for i in range(50)])
+        saved = stats.summary
+        stats.summary = lambda *a, **k: self.fail("summary() on the Media Jobs tick")
+        try:
+            html = asyncio.run(admin._refused_media_table(None, {}))
+        finally:
+            stats.summary = saved
+        self.assertIn("images/generations", html)
+        sql, params = stats._recent_calls_sql("media", 300, None, refused_only=True)
+        plan = self._plan(sql, *params)
+        self.assertFalse(any(p.startswith("SCAN calls") and "INDEX" not in p for p in plan), plan)
+
+    def test_statistic_aggregates_are_memoised(self):
+        self._bulk([_row(int(time.time()) - 5)])
+        opened = []
+        orig = stats._conn
+
+        @contextmanager
+        def counting():
+            opened.append(1)
+            with orig() as c:
+                yield c
+        stats._conn = counting
+        try:
+            a = stats.summary()
+            n = len(opened)
+            b = stats.summary()
+            stats.sources()
+            stats.sources()
+        finally:
+            stats._conn = orig
+        self.assertEqual(a, b)
+        self.assertEqual(len(opened), n + 1)          # 2nd summary free, sources once
+
+
+class IpAutoResolve(unittest.TestCase):
+    """The Users page reverse-resolves caller IPs it has no alias for — with a dead
+    resolver that held every render for 1.5 s."""
+
+    def test_the_render_does_not_wait_for_reverse_dns(self):
+        saved = (store.get_ip_aliases, store.save_ip_aliases, admin._reverse_dns)
+        mem = {}
+
+        async def slow(ip):
+            await asyncio.sleep(0.5)
+            return f"host-{ip}"
+        store.get_ip_aliases = lambda: dict(mem)
+        store.save_ip_aliases = lambda d: (mem.clear(), mem.update(d))
+        admin._reverse_dns = slow
+
+        async def go():
+            t0 = time.monotonic()
+            admin._autoresolve_ips([("10.0.0.1", 1), ("kai", 5)])
+            admin._autoresolve_ips([("10.0.0.1", 1)])          # no second lookup
+            spent = time.monotonic() - t0
+            await asyncio.gather(*list(admin._ip_resolve_tasks))
+            return spent
+        try:
+            spent = asyncio.run(go())
+        finally:
+            store.get_ip_aliases, store.save_ip_aliases, admin._reverse_dns = saved
+        self.assertLess(spent, 0.2)
+        self.assertEqual(mem, {"10.0.0.1": "host-10.0.0.1"})
 
 
 if __name__ == "__main__":

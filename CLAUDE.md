@@ -1127,7 +1127,13 @@ job ran, so without it a **failed media job** was logged a second time as
 outcome; only refusals BEFORE it (no eligible backend, quota, malformed request)
 belong in the call log. `admin._call_kind()` partitions that log into
 `voice`/`media`/`llm` so each row has exactly one home — media refusals show under
-Media Jobs, not LLM Calls. The same handler renders `/v1/messages` errors in
+Media Jobs, not LLM Calls. The rule is `stats.KIND_PREFIXES` (endpoint prefixes), and
+each list is filled by `stats.recent_calls(kind, …)` filtering IN SQL — the lists used
+to take the newest 300 of the whole log and filter afterwards, which left Voice Calls
+empty on any busy LLM day, and the Media Jobs tick ran all six `summary()` scans just
+for that (≈0.6 s at 300k rows; now one indexed read of `(refused)` rows). The user
+pickers read `stats.sources()` (every source, index-only), and `summary()`/`sources()`
+are memoised 30 s (`_MEMO_TTL_S`) — the per-call lists never are. The same handler renders `/v1/messages` errors in
 Anthropic shape, so that form lives in ONE place. Cost from pricing
 cached at discovery (`normalize_pricing`: Together per-million, OpenRouter
 per-token). Streaming records the backend's usage chunk (the adapter always
