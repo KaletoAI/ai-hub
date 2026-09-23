@@ -1086,7 +1086,11 @@ they need via injected callables, staying hot-reload-safe.
   the alias via the **separate** generation store (`image_models`/store), filtered
   to enabled+healthy generation backends of the candidate's own kind
   (`adapters.cand_kind` == `adapters.backend_kind`); LoRA-aware preference +
-  busy→park; a
+  busy→park. Everything the ROUTER reads off a candidate's workflow (image slots for the
+  `images` filter and the shims, the params refusal, the schema, the chain export) goes
+  through `adapters.cand_workflow` — `workflow_json`, else the `workflow:` FILE the adapter
+  loads, else None = unknown, which filters nothing: reading a path alias as `{}` dropped
+  every reference image (`test_gen_inputs.py`); a
   `jobs.py` job runs via `adapter.generate()` — ALWAYS as a tracked task in
   `_gen_tasks` (`_spawn_gen`); a sync request just waits for it (`_run_gen_sync`,
   `asyncio.wait`, so the job row owns the outcome). A queued/running job can be cancelled:

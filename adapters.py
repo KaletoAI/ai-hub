@@ -1934,6 +1934,40 @@ def is_image_field(wf: dict, node: str) -> bool:
     return is_img_loader_class((wf or {}).get(node, {}).get("class_type"))
 
 
+_WF_FILE_CACHE: dict = {}                    # path -> ((mtime_ns, size), workflow)
+
+
+def cand_workflow(cand: Optional[dict]) -> Optional[dict]:
+    """The workflow a ComfyUI candidate RUNS, read the way ComfyUIAdapter._workflow_for
+    reads it: the stored `workflow_json` when there is one, else the `workflow` FILE
+    (a config alias names its workflow by path and has no JSON at all). None when
+    neither is determinable — callers must then not judge by an empty workflow: reading
+    `{}` as "this alias has no image slots" dropped every reference image of a
+    path-workflow alias while the adapter would have matched them. READ-ONLY result
+    (cached per path + mtime)."""
+    cand = cand or {}
+    wj = cand.get("workflow_json")
+    if wj is not None:
+        return wj
+    path = str(cand.get("workflow") or "").strip()
+    if not path:
+        return None
+    try:
+        st = os.stat(path)
+        sig = (st.st_mtime_ns, st.st_size)
+        hit = _WF_FILE_CACHE.get(path)
+        if hit and hit[0] == sig:
+            return hit[1]
+        with open(path) as f:
+            wf = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(wf, dict):
+        return None
+    _WF_FILE_CACHE[path] = (sig, wf)
+    return wf
+
+
 def image_params(wf: dict, mapping: dict) -> list:
     """Request params whose target node is an image loader → rendered as uploads and
     filled per-field (uploaded file, else an 8×8 placeholder)."""
@@ -1991,7 +2025,7 @@ def public_fields(cand: dict) -> tuple[list, list, list]:
     k = cloud_kind(cand)
     if k:
         return cloud_module(k).public_fields(cand)
-    wf = cand.get("workflow_json") or {}
+    wf = cand_workflow(cand) or {}
     mapping = cand.get("mapping") or {}
     files = [{"name": ((mapping.get(p) or {}).get("label") or "").strip() or p, "required": False}
              for p in file_params(wf, mapping)]
@@ -2940,7 +2974,7 @@ class ComfyUIAdapter(BackendAdapter):
         name it writes. A node that cannot be pinned is refused HERE — `_apply_fixed`
         drops such a binding silently, so stage 1 would run to completion (tens of
         GPU-minutes) under its own name and only the /view fetch would notice."""
-        wf = cand.get("workflow_json") or {}
+        wf = cand_workflow(cand) or {}
         node = str(succ.get("export_node") or "").strip()
         why = self.export_node_error(wf, node)
         if why:

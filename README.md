@@ -177,7 +177,8 @@ every address the host resolves to is checked, the connection goes to the checke
 address, redirects are not followed and the body is capped at 64 MB. A host that
 resolves to loopback/private/link-local/multicast is refused with `400` — list the
 ranges you trust (a LAN NAS) in `ref_url_allow_cidrs`. `images` keys that are not an
-image slot of the alias are ignored without being fetched, and the OpenAI shims'
+image slot of the alias (read from its stored workflow, or its `workflow:` file; a file
+the gateway cannot read filters nothing) are ignored without being fetched, and the OpenAI shims'
 `ref_images` beyond the alias's slot count are never downloaded.
 
 **Job ownership.** Generation jobs and background responses are owner-gated:

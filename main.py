@@ -4675,13 +4675,13 @@ async def run_generation(body: dict, request: Request,
     inputs, params = _gen_inputs_params(body)
     _apply_seconds(params, routes[0][1])         # seconds → frames (alias fps; 400 if unsupported)
     c0 = routes[0][1]
-    wf_maps = [(c0.get("workflow_json") or {}, c0.get("mapping") or {})]
+    wf_maps = [(adapters.cand_workflow(c0) or {}, c0.get("mapping") or {})]
     succ_alias = ((c0.get("successor") or {}).get("alias") or "").strip()
     if succ_alias:
         sc = (((await asyncio.to_thread(store.get, succ_alias)) if store.is_active() else None)
               or image_models.get(succ_alias) or [])
         if sc:
-            wf_maps.append((sc[0].get("workflow_json") or {}, sc[0].get("mapping") or {}))
+            wf_maps.append((adapters.cand_workflow(sc[0]) or {}, sc[0].get("mapping") or {}))
     refusal = _client_param_refusal(params, wf_maps, _params_trusted(request))
     if refusal:
         raise HTTPException(400, refusal)
@@ -4773,7 +4773,7 @@ def _gen_alias_mapping(alias: str) -> tuple[dict, dict]:
     if not routes:
         return {}, {}
     _, cand = routes[0]
-    return (cand.get("workflow_json") or {}), (cand.get("mapping") or {})
+    return (adapters.cand_workflow(cand) or {}), (cand.get("mapping") or {})
 
 
 def _file_param(wf: dict, mapping: dict, key: str) -> str:
@@ -4878,12 +4878,16 @@ async def generations(request: Request, authorization: Optional[str] = Header(No
         # Only keys that ARE image slots of this alias (param or label) are fetched and
         # kept: anything else was ignored by the adapter anyway, but it was still
         # downloaded and stored as a job input — a free fetch-and-keep for any URL.
+        # A workflow this process cannot read (None) is NOT "no slots": the adapter
+        # loads it itself and matches the images there, so nothing is filtered.
         slots = await asyncio.to_thread(_gen_image_slot_names, body.get("model", ""))
-        for param in imgs:
-            if param not in slots:
-                logger.info(f"generations: ignoring images.{str(param)[:60]} — not an image "
-                            f"slot of '{str(body.get('model', ''))[:80]}'")
-        uploads = await _decode_ref_images({p: v for p, v in imgs.items() if p in slots})
+        if slots is not None:
+            for param in imgs:
+                if param not in slots:
+                    logger.info(f"generations: ignoring images.{str(param)[:60]} — not an "
+                                f"image slot of '{str(body.get('model', ''))[:80]}'")
+        uploads = await _decode_ref_images({p: v for p, v in imgs.items()
+                                            if slots is None or p in slots})
     # Optional client files for NON-image params: {"files": {<param>: <base64|data-URI|URL>}}
     # — e.g. the mesh a shrink/rig alias works on. The gateway uploads it onto whichever
     # backend runs the job, so a client never needs a path on a backend.
@@ -4927,7 +4931,7 @@ async def gen_alias_schema(alias: str, request: Request, authorization: Optional
     # ONE seam for both candidate kinds (ComfyUI: workflow + mapping labels; a cloud
     # backend: the endpoint's fixed label table) — see adapters.public_fields.
     params, images, files = adapters.public_fields(cand)
-    wf = cand.get("workflow_json") or {}
+    wf = adapters.cand_workflow(cand) or {}
     mapping = cand.get("mapping") or {}
     kinds = sorted(k for _, k in lora_groups(wf, mapping) if k)
     out: dict = {"object": "generation.schema", "alias": alias,
@@ -5010,11 +5014,13 @@ async def cancel_job(job_id: str, request: Request, authorization: Optional[str]
 # images response shape) lives in openai_image_bridge.py; main keeps only what
 # needs gateway state: the slot lookup below and the endpoints.
 
-def _gen_image_slots(alias: str) -> list:
+def _gen_image_slots_known(alias: str) -> Optional[list]:
     """Ordered image-input param names of a generation alias (its workflow's image
     loaders per the mapping) — reference images map onto these positionally. Includes
     busy backends: slots are a workflow property, not gated on backend availability
-    (else a busy backend would silently drop the uploaded reference images)."""
+    (else a busy backend would silently drop the uploaded reference images). None when
+    the workflow cannot be read here (adapters.cand_workflow) — "unknown", which must
+    never be read as "no slots"."""
     routes = get_gen_routes(alias)
     if not routes:
         return []
@@ -5023,13 +5029,25 @@ def _gen_image_slots(alias: str) -> list:
         # [1] = the IMAGE slots only: a `files` entry (a rigging mesh) is not something
         # a positional reference image may ever land on.
         return [i["name"] for i in adapters.public_fields(cand)[1]]   # labels ARE the params
-    return image_params(cand.get("workflow_json") or {}, cand.get("mapping") or {})
+    wf = adapters.cand_workflow(cand)      # workflow_json, else the `workflow:` FILE
+    if wf is None:
+        return None
+    return image_params(wf, cand.get("mapping") or {})
 
 
-def _gen_image_slot_names(alias: str) -> set:
+def _gen_image_slots(alias: str) -> list:
+    """_gen_image_slots_known for the positional shims: unknown slots map nothing."""
+    return _gen_image_slots_known(alias) or []
+
+
+def _gen_image_slot_names(alias: str) -> Optional[set]:
     """Every name `images` may use for this alias: each image slot's param AND its
-    public label (the adapter accepts both; a cloud alias's slot names are its labels)."""
-    names = set(_gen_image_slots(alias))
+    public label (the adapter accepts both; a cloud alias's slot names are its labels).
+    None = the workflow is not readable here, so nothing can be judged."""
+    known = _gen_image_slots_known(alias)
+    if known is None:
+        return None
+    names = set(known)
     wf, mapping = _gen_alias_mapping(alias)
     for p in names.copy():
         lbl = ((mapping.get(p) or {}).get("label") or "").strip()
