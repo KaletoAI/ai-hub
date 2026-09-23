@@ -3336,7 +3336,8 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req) -> None
     candidate too, but never repeats on the SAME backend — see the `except Exception`
     arm for why that is not the same thing as a connection failover, and why a CLOUD
     candidate is excluded from it. Stops at the first success."""
-    await asyncio.to_thread(jobs.set_status, job_id, "running")
+    if not await asyncio.to_thread(jobs.set_status, job_id, "running"):
+        return                                   # cancelled while it waited — never start it
     last = None
     attempts = 0
     # (bid, name, error) of candidates that ran the prompt and failed. Kept until the
@@ -3421,6 +3422,15 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req) -> None
                     logger.warning(f"✗ job {job_id} [{backend['name']}] {what} "
                                    f"({type(e).__name__}: {e}) — failing over")
                     asyncio.create_task(_free_comfy_vram(backend, "job failover"))
+                except adapters.ComfyPromptInterrupted as e:
+                    # Somebody stopped OUR prompt on the backend (an operator in ComfyUI's
+                    # own UI). A decision, not a fault: no failover — that would run what was
+                    # just stopped — and no execution fault, which could quarantine a
+                    # healthy backend for 15 minutes.
+                    logger.warning(f"✗ job {job_id} [{backend['name']}] {_err_text(e)}")
+                    await asyncio.to_thread(jobs.fail, job_id, _err_text(e),
+                                            _gen_fail_meta(attempts, cloud_trace))
+                    return
                 except Exception as e:
                     # Execution error: the backend accepted the prompt and it blew up.
                     # NEVER retried on the same backend (a re-run reproduces it), but it
@@ -4051,18 +4061,31 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
 _gen_tasks: dict = {}                       # job_id → asyncio.Task (for cancellation)
 
 
-def _spawn_gen(job_id: str, coro) -> None:
+def _spawn_gen(job_id: str, coro) -> asyncio.Task:
     """Run a generation coroutine as a tracked background task so it can be cancelled."""
     t = asyncio.create_task(coro)
     _gen_tasks[job_id] = t
     t.add_done_callback(lambda _: _gen_tasks.pop(job_id, None))
+    return t
+
+
+async def _run_gen_sync(job_id: str, coro) -> None:
+    """Run a SYNC generation as a tracked task and wait for it. Sync jobs used to run
+    inline in the request handler, invisible to `_gen_tasks` — so a cancel marked the row
+    failed while the worker went on to fail over or finish (K3). `asyncio.wait` never
+    raises the task's outcome into the handler: the JOB row owns it (_job_view renders
+    it), and a client that disconnects no longer takes a running job down with it."""
+    await asyncio.wait({_spawn_gen(job_id, coro)})
 
 
 async def cancel_generation(job_id: str) -> bool:
-    """Cancel a queued/running generation job: best-effort interrupt on the backend
-    (adapter.cancel — ComfyUI /interrupt frees the GPU; a cloud task API has nothing
-    to stop, the vendor finishes and bills the task), cancel the worker task, mark the job
-    failed. Returns False if the job is already finished/unknown."""
+    """Cancel a queued/running generation job: mark it failed FIRST (the job store keeps
+    a terminal state final, so nothing the worker does afterwards can mark it done), then
+    cancel the worker task — its adapter stops its OWN ComfyUI prompt on the way out
+    (targeted: a queued job never interrupts somebody else's run; a cloud task API has
+    nothing to stop, the vendor finishes and bills the task, whose id the worker records).
+    Without a worker task in this process, `adapter.cancel(job_id)` is the targeted
+    fallback. Returns False if the job is already finished/unknown."""
     job = await asyncio.to_thread(jobs.get, job_id)
     if not job or job.get("status") not in ("queued", "running"):
         return False
@@ -4078,12 +4101,12 @@ async def cancel_generation(job_id: str) -> bool:
     b = (_gen_backend_for(job.get("backend"), cand, pool) if cand is not None
          else next((x for x in pool if x.get("name") == job.get("backend")), None))
     adapter = backend_adapters.get(backend_id(b)) if b else None
-    if adapter is not None:
-        await adapter.cancel()
+    await asyncio.to_thread(jobs.fail, job_id, "cancelled by user")
     t = _gen_tasks.get(job_id)
     if t and not t.done():
         t.cancel()
-    await asyncio.to_thread(jobs.fail, job_id, "cancelled by user")
+    elif adapter is not None:
+        await adapter.cancel(job_id)
     if b:
         asyncio.create_task(_free_comfy_vram(b, "cancel"))     # no-op for non-ComfyUI (step 3)
     return True
@@ -4297,20 +4320,20 @@ async def run_generation(body: dict, request: Request,
         if mode == "async":
             _spawn_gen(job_id, runner)
             return {"job_id": job_id, "status": "queued"}
-        await runner
+        await _run_gen_sync(job_id, runner)
         return await _job_view(job_id, request)
 
     if parked:
         if mode == "async":                              # queue and hand back a job id
             _spawn_gen(job_id, _run_gen_parked(job_id, alias, force, build_req, eligible))
             return {"job_id": job_id, "status": "queued"}
-        await _run_gen_parked(job_id, alias, force, build_req, eligible)   # sync: block through the park
-        return await _job_view(job_id, request)
+        await _run_gen_sync(job_id, _run_gen_parked(job_id, alias, force, build_req, eligible))
+        return await _job_view(job_id, request)                  # sync: blocked through the park
     if mode == "async":
         _spawn_gen(job_id, _run_job(job_id, alias, routes, build_req))
         return {"job_id": job_id, "status": "queued"}
 
-    await _run_job(job_id, alias, routes, build_req)      # sync: block until done/failed
+    await _run_gen_sync(job_id, _run_job(job_id, alias, routes, build_req))   # until done/failed
     return await _job_view(job_id, request)
 
 

@@ -47,6 +47,7 @@ class _FakeJobs:
 
     def set_status(self, job_id, st):
         self.status = st
+        return True                     # the row was live (jobs.set_status's verdict)
 
     def set_backend(self, job_id, name):
         self.backend = name

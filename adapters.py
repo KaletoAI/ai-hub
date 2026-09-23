@@ -73,6 +73,12 @@ class ComfyExecutorStuck(Exception):
     (queue_pending non-empty, queue_running empty, same head across checks)."""
 
 
+class ComfyPromptInterrupted(RuntimeError):
+    """Our prompt was interrupted ON the backend (ComfyUI's `execution_interrupted`) — a
+    deliberate stop by someone, not a fault of the backend or the request: main ends the
+    job without failing over and books no execution fault for it."""
+
+
 class CloudNoCredits(ConnectionError):
     """A cloud task account has no credits (balance 0 on discovery; Meshy 402 / Tripo
     403+2010 on submit). A ConnectionError on purpose: _GEN_FAILOVER_ERRORS moves the job
@@ -603,9 +609,10 @@ class BackendAdapter(ABC):
         Owns the in-flight counter lifecycle. Default: unsupported."""
         raise NotImplementedError(f"{self.type} adapter has no generate path")
 
-    async def cancel(self) -> None:
-        """Best-effort: stop whatever this backend is running for the gateway (a
-        cancelled job). Default no-op — a cloud task API has nothing to interrupt."""
+    async def cancel(self, job_id: str = "") -> None:
+        """Best-effort: stop what this backend runs for job `job_id` — and nothing else
+        (a cancelled job whose worker task is not in this process). Default no-op — a
+        cloud task API has nothing to interrupt."""
         return None
 
     # ── workflow chains (main._run_chain) — the three places a stage is backend-specific ──
@@ -2152,6 +2159,15 @@ def _format_comfy_error(messages) -> str:
         return str(messages)[:600]
 
 
+def _prompt_queue_state(queue: dict, prompt_id: str) -> Optional[str]:
+    """Where `prompt_id` sits in a ComfyUI /queue response: "running", "pending" or None."""
+    for key, state in (("queue_running", "running"), ("queue_pending", "pending")):
+        for item in (queue.get(key) or []):
+            if isinstance(item, (list, tuple)) and len(item) > 1 and item[1] == prompt_id:
+                return state
+    return None
+
+
 def _prompt_in_queue(queue: dict, prompt_id: str) -> bool:
     """Is `prompt_id` still running or pending in a ComfyUI /queue response? Each entry
     is [number, prompt_id, prompt, extra, …]; the id sits at index 1."""
@@ -2491,6 +2507,7 @@ class ComfyUIAdapter(BackendAdapter):
         self.exec_stuck: bool = False
         self.last_restart: float = 0.0        # ts of the last restart() call (cooldown)
         self.last_restart_result: str = ""    # "" | running | ok | timeout | no-manager
+        self._prompts: dict = {}              # job id → the ComfyUI prompt it runs (cancel target)
 
     async def discover(self, client: httpx.AsyncClient) -> Capabilities:
         url = self.backend["url"].rstrip("/")
@@ -2528,13 +2545,43 @@ class ComfyUIAdapter(BackendAdapter):
                 f"executor stuck: {len(pending)} prompt(s) pending, none running for "
                 f"{int(time.time() - self._stuck_since)}s (head {head})")
 
-    async def cancel(self) -> None:
-        """POST /interrupt — frees the GPU of the running prompt (main.cancel_generation)."""
+    async def cancel(self, job_id: str = "") -> None:
+        """Stop the prompt job `job_id` submitted here — only that one (_stop_prompt). A job
+        with no submitted prompt (still queued in the gateway) touches nothing. The normal
+        cancel path does not come here: main cancels the worker task, whose generate()
+        stops its own prompt on the way out; this is the fallback without such a task."""
+        pid = self._prompts.get(job_id) if job_id else None
+        if not pid:
+            return
         try:
             async with _pooled_client(self.ctx) as client:
-                await client.post(f"{self.backend['url'].rstrip('/')}/interrupt", timeout=5.0)
+                await self._stop_prompt(client, self.backend["url"].rstrip("/"), pid)
         except Exception:
             pass
+
+    async def _stop_prompt(self, client, url: str, prompt_id: str) -> str:
+        """Stop ONE prompt of ours and nothing else; returns where it was.
+
+        ComfyUI's bare `POST /interrupt` stops whatever is EXECUTING. Sent for a job whose
+        prompt was still waiting — a cancel of a queued job, a `max_wait` expiry while the
+        box ran someone else's prompt — it killed another job's run, which then failed
+        over and could even be charged an execution fault (review 2026-09-18, K3). So ask
+        /queue first: running → `/interrupt` naming the prompt (current ComfyUI interrupts
+        only a matching prompt; an older one ignores the body, and ours IS the one running);
+        pending → `/queue {"delete": [id]}`; neither, or /queue unreadable → leave the
+        backend alone (a stop we cannot aim is worse than one we skip)."""
+        try:
+            qr = await client.get(f"{url}/queue", timeout=5.0)
+            where = _prompt_queue_state(qr.json(), prompt_id) if qr.status_code == 200 else None
+            if qr.status_code != 200:
+                return "unknown"
+            if where == "running":
+                await client.post(f"{url}/interrupt", json={"prompt_id": prompt_id}, timeout=5.0)
+            elif where == "pending":
+                await client.post(f"{url}/queue", json={"delete": [prompt_id]}, timeout=5.0)
+            return where or "gone"
+        except Exception:
+            return "unknown"
 
     async def restart(self) -> str:
         """Restart the ComfyUI service via the ComfyUI-Manager reboot endpoint.
@@ -3084,14 +3131,25 @@ class ComfyUIAdapter(BackendAdapter):
                 ws_state = {"prompt_id": prompt_id, "began": time.monotonic()}
                 ws_task = asyncio.create_task(
                     self._ws_progress(url, client_id, req.job_id, ws_state))
+                if req.job_id:
+                    self._prompts[req.job_id] = prompt_id      # what a cancel may stop
                 try:
-                    outputs = await self._poll(client, url, prompt_id, poll_interval, max_wait, started)
+                    outputs = await self._poll(client, url, prompt_id, poll_interval, max_wait)
+                except asyncio.CancelledError:
+                    # The job was cancelled (main.cancel_generation cancels this task): stop
+                    # OUR prompt on the way out — targeted, see _stop_prompt — or it keeps
+                    # the GPU busy for a result nobody will fetch.
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(self._stop_prompt(client, url, prompt_id), 10.0)
+                    raise
                 finally:
                     ws_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError, Exception):
                         await ws_task
                     if req.job_id:
                         self.ctx.note_progress(req.job_id, None)   # the row owns it now
+                        if self._prompts.get(req.job_id) == prompt_id:
+                            self._prompts.pop(req.job_id, None)
                 rig, warnings = None, []
                 if req.output_cases:                 # conditional case delivery (+ rig + validation)
                     blobs, rig = await self._fetch_by_cases(client, url, outputs, req.output_cases)
@@ -3238,7 +3296,7 @@ class ComfyUIAdapter(BackendAdapter):
                 out["eta_s"] = max(0, int(per_step * (mx - val)))
         return out
 
-    async def _poll(self, client, url, prompt_id, poll_interval, max_wait, started) -> dict:
+    async def _poll(self, client, url, prompt_id, poll_interval, max_wait) -> dict:
         # If /history stops responding *after* the run was reachable for a while,
         # ComfyUI most likely crashed ("Reconnecting"). Fail fast with a clear
         # ConnectionError (→ the router can fail over) instead of waiting out the
@@ -3266,7 +3324,12 @@ class ComfyUIAdapter(BackendAdapter):
                     entry = hist[prompt_id]
                     status = entry.get("status", {})
                     if status.get("status_str") == "error":
-                        raise RuntimeError(f"ComfyUI: {_format_comfy_error(status.get('messages'))}")
+                        msgs = status.get("messages") or []
+                        if any(isinstance(m, (list, tuple)) and m and m[0] == "execution_interrupted"
+                               for m in msgs):
+                            raise ComfyPromptInterrupted(
+                                f"ComfyUI: prompt {prompt_id} was interrupted on the backend")
+                        raise RuntimeError(f"ComfyUI: {_format_comfy_error(msgs)}")
                     return entry.get("outputs", {})
                 # Not done yet. Confirm it's still queued/running — if ComfyUI restarted,
                 # the prompt is gone from BOTH history and queue, yet /history keeps
@@ -3302,10 +3365,9 @@ class ComfyUIAdapter(BackendAdapter):
                         f"ComfyUI unreachable for >{grace:.0f}s during execution "
                         f"(likely crashed/restarting): {type(e).__name__}: {e}")
                 continue
-        try:                                    # free the GPU: stop the still-running prompt
-            await client.post(f"{url}/interrupt")
-        except Exception:
-            pass
+        # free the GPU: stop the still-running prompt — ours only (a bare /interrupt would
+        # stop whatever runs, and a prompt still waiting behind another job's is not it)
+        await self._stop_prompt(client, url, prompt_id)
         raise TimeoutError(f"ComfyUI timeout after {max_wait:.0f}s (prompt {prompt_id}); "
                            f"last poll error: {last_exc}")
 

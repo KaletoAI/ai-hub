@@ -85,7 +85,17 @@ they need via injected callables, staying hot-reload-safe.
   Backends tab (⟳ restart action). `generate()` submits a parametrised
   workflow, polls `/history` every `poll_interval` (default 1) until the backend's
   `max_wait` (default 600) — the gateway's cap on ONE generation; ComfyUI itself has
-  none — then `/interrupt`s and raises `TimeoutError`, and fetches `/view`. Both
+  none — then stops its prompt and raises `TimeoutError`, and fetches `/view`. Every
+  stop goes through `_stop_prompt`, which is TARGETED: a bare `/interrupt` stops
+  whatever executes, and a cancel or `max_wait` of a prompt still WAITING killed a
+  stranger's run (which then failed over, or was charged an execution fault). It asks
+  `/queue` first — ours running → `/interrupt {"prompt_id"}` (current ComfyUI checks the
+  id, an older one ignores it, and ours is the running one), pending → `/queue
+  {"delete":[id]}`, gone or `/queue` unreadable → nothing. `generate()` registers
+  `_prompts[job_id]` while it polls and stops its own prompt when the worker task is
+  CANCELLED; a history entry carrying `execution_interrupted` (someone stopped it on the
+  box) raises `ComfyPromptInterrupted`, which `_run_job` ends the job on — no failover,
+  no execution fault. `test_gen_cancel.py`. Both
   fields are edited in the Backends tab: a store backend replaces a same-named config
   entry WHOLESALE (`rebuild_backends`), so config.yaml cannot supply them for a
   UI-managed backend. `TimeoutError` sits in `_GEN_FAILOVER_ERRORS` so it fails over,
@@ -270,7 +280,7 @@ they need via injected callables, staying hot-reload-safe.
   `adapters.public_fields(cand)` is the ONE seam schema/playground/shims read for both
   candidate kinds, and `adapters.GEN_TYPES` (types whose adapter sets
   `serves_generation`) replaces `type == "comfyui"` in `main` wherever "generation
-  backend" is meant; the GPU-host sites (`/free`, `/interrupt` via `adapter.cancel()`,
+  backend" is meant; the GPU-host sites (`/free`, the targeted prompt stop via `adapter.cancel(job_id)`,
   restart, watchdog) stay ComfyUI — a cloud task has nothing to interrupt, Meshy
   finishes and bills it. A Meshy backend is always `paid` (it bills per task);
   discovery = `GET /openapi/v1/balance` (0 → DOWN "no credits", balance + its age and
@@ -807,9 +817,13 @@ they need via injected callables, staying hot-reload-safe.
   to enabled+healthy generation backends of the candidate's own kind
   (`adapters.cand_kind` == `adapters.backend_kind`); LoRA-aware preference +
   busy→park; a
-  `jobs.py` job runs via `adapter.generate()` (sync inline or async job-id). A
-  running job can be cancelled (`cancel_generation` → ComfyUI `/interrupt` + task
-  cancel).
+  `jobs.py` job runs via `adapter.generate()` — ALWAYS as a tracked task in
+  `_gen_tasks` (`_spawn_gen`); a sync request just waits for it (`_run_gen_sync`,
+  `asyncio.wait`, so the job row owns the outcome). A queued/running job can be cancelled:
+  `cancel_generation` marks the row failed FIRST (terminal states are final in `jobs.py`),
+  then cancels the worker task, whose adapter stops its OWN prompt (`_stop_prompt`) and
+  whose CancelledError arm records a created cloud task on the row; `adapter.cancel(job_id)`
+  is the targeted fallback when no worker task exists.
 - **Workflow chains** (`_run_chain`): a gen alias's stage-1 config carries a
   `successor` (`{alias, export_node, mesh_param, relay?, keep_from_mesh?, rig?}`);
   stage 1 exports a mesh under a gateway-pinned filename (`gwchain_<jobid>`) and
