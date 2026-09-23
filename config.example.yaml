@@ -70,6 +70,18 @@ model_prefix: true
 # request back at most affinity_max_wait_s seconds; beyond that it is "overdue" and
 # the next free capable backend takes it, strictly oldest-first. Server tab only.
 
+# Largest request body the gateway reads, in MB (hot-reloaded; 0 = no cap). Bodies are
+# read whole, so without a cap one client could make the gateway hold any amount in
+# memory. 200 is far above the largest legitimate body (a 64 MB mesh under `files` is
+# ~86 MB as base64 JSON); lower it if your clients only chat.
+# max_body_mb: 200
+
+# Reference images / `files` given as an http(s) URL are downloaded BY THE GATEWAY, so
+# it refuses URLs whose host resolves to a loopback, private, link-local or multicast
+# address (else any key holder could read your LAN through it). Open chosen ranges here
+# — e.g. the NAS your clients link images from. Hot-reloaded.
+# ref_url_allow_cidrs: ["192.168.8.20/32"]
+
 # Optional call-stats sink: SQLite DB; the dashboard is built into the /ui console
 # (Statistic tab) — no separate server/port anymore. When enabled, every call is
 # recorded with backend, source (the authenticated user, else X-Source header / client

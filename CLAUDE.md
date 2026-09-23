@@ -1103,6 +1103,21 @@ deliberately ignored, so behind a proxy the limit is shared) — `test_ui_login.
 `data-*` attributes (`data-confirm` + `_CONFIRM_JS`) or `_js_json` — never
 `html.escape` into an inline handler (`test_ui_escaping.py`).
 
+**What clients send is bounded.** `main._BodyLimit` (pure ASGI, added BEFORE
+`admin.register` so it sits inside `_ui_guard` — a BaseHTTPMiddleware's task group would
+turn its 413 into a 500) caps every body at `max_body_mb` (config, default 200, hot):
+Content-Length refused up front, chunked counted in `receive` and raised as
+HTTPException(413) from the endpoint's own read. `admin._form`/`_form_multi` read through
+`_form_raw` with `_FORM_MAX_BYTES` (16 MB). Client URLs (`_decode_ref_blob` →
+`_fetch_ref_url`) are an SSRF-with-readback surface (the bytes come back at
+`/v1/jobs/<id>/input/<n>`): every resolved address must pass `ref_addr_blocked` (not
+global or multicast = blocked; v4-mapped judged as v4; `ref_url_allow_cidrs` opens
+ranges), the request goes to the CHECKED IP with the original Host header and
+`sni_hostname` (no second lookup → no rebinding), no redirects, body counted against
+`_REF_FETCH_MAX_BYTES`. `/v1/generations` fetches only `images` keys in
+`_gen_image_slot_names` (param or label), the image shim only as many `ref_images` as
+the alias has slots (`test_ref_url_fetch.py`, `test_body_limit.py`).
+
 ### Stats recording
 
 Every forward calls `stats.record_call(...)` fire-and-forget via

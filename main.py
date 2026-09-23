@@ -4,6 +4,7 @@ import calendar
 import fnmatch
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import mimetypes
@@ -971,6 +972,61 @@ async def lifespan(app: FastAPI):
 # ── App ───────────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="AI-Hub", lifespan=lifespan)
+
+# Request bodies are read whole (request.json()/body()) — nothing bounded them, so one
+# client could hand the gateway an arbitrarily large body to hold in memory (review S10).
+# `max_body_mb` (config.yaml, hot-reloaded; 0 = off) caps every request: a declared
+# Content-Length over it is refused before a byte is read, a chunked body is counted
+# while it streams. The default stays far above the largest legitimate body — a 64 MB
+# mesh under `files` is ~86 MB as base64 JSON.
+MAX_BODY_MB_DEFAULT = 200
+
+
+def max_body_bytes() -> int:
+    try:
+        mb = float((config or {}).get("max_body_mb", MAX_BODY_MB_DEFAULT))
+    except (TypeError, ValueError, NameError):
+        mb = MAX_BODY_MB_DEFAULT
+    return int(mb * 1024 * 1024) if mb > 0 else 0
+
+
+class _BodyLimit:
+    """Pure ASGI (not BaseHTTPMiddleware): it has to sit in the receive path."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        limit = max_body_bytes() if scope["type"] == "http" else 0
+        if not limit:
+            return await self.app(scope, receive, send)
+        msg = f"request body exceeds {limit / (1024 * 1024):g} MB (max_body_mb)"
+        cl = dict(scope.get("headers") or []).get(b"content-length")
+        try:
+            declared = int(cl) if cl is not None else None
+        except ValueError:
+            declared = None
+        if declared is not None and declared > limit:
+            return await JSONResponse({"detail": msg}, status_code=413)(scope, receive, send)
+        seen = 0
+
+        async def counted():
+            nonlocal seen
+            m = await receive()
+            if m.get("type") == "http.request":
+                seen += len(m.get("body") or b"")
+                if seen > limit:
+                    # Raised inside the endpoint's body read → the app's HTTPException
+                    # handler answers 413 (and logs the refusal like any other).
+                    raise HTTPException(413, msg)
+            return m
+        await self.app(scope, counted, send)
+
+
+# Added BEFORE admin.register: middleware added later wraps the earlier one, so this
+# sits INSIDE the console's BaseHTTPMiddleware guard — whose receive runs in a task
+# group that would turn the 413 into an ExceptionGroup (a 500) on its way out.
+app.add_middleware(_BodyLimit)
 admin.register(app)                     # generation management UI at /ui
 
 
@@ -4349,7 +4405,15 @@ async def generations(request: Request, authorization: Optional[str] = Header(No
     imgs = body.pop("images", None)
     if isinstance(imgs, dict):
         uploads = {}
+        # Only keys that ARE image slots of this alias (param or label) are fetched and
+        # kept: anything else was ignored by the adapter anyway, but it was still
+        # downloaded and stored as a job input — a free fetch-and-keep for any URL.
+        slots = await asyncio.to_thread(_gen_image_slot_names, body.get("model", ""))
         for param, val in imgs.items():
+            if param not in slots:
+                logger.info(f"generations: ignoring images.{str(param)[:60]} — not an image "
+                            f"slot of '{str(body.get('model', ''))[:80]}'")
+                continue
             data = await _decode_ref_image(val)
             if data:
                 uploads[param] = data
@@ -4495,6 +4559,18 @@ def _gen_image_slots(alias: str) -> list:
     return image_params(cand.get("workflow_json") or {}, cand.get("mapping") or {})
 
 
+def _gen_image_slot_names(alias: str) -> set:
+    """Every name `images` may use for this alias: each image slot's param AND its
+    public label (the adapter accepts both; a cloud alias's slot names are its labels)."""
+    names = set(_gen_image_slots(alias))
+    wf, mapping = _gen_alias_mapping(alias)
+    for p in names.copy():
+        lbl = ((mapping.get(p) or {}).get("label") or "").strip()
+        if lbl:
+            names.add(lbl)
+    return names
+
+
 _EXT_BY_MIME = {                            # what a data-URI MIME means as a file extension —
     "model/gltf-binary": "glb",             # the model types mimetypes doesn't know
     "model/gltf+json": "gltf",
@@ -4520,13 +4596,100 @@ async def _decode_ref_blob(ref) -> Optional[tuple[bytes, str]]:
         ref = rest
     if ref.startswith(("http://", "https://")):
         ext = ext or Path(urlparse(ref).path).suffix.lstrip(".")
-        try:
-            r = await http_client.get(ref, timeout=20.0)
-        except Exception:
-            return None
-        return (r.content, _clean_ext(ext)) if r.status_code == 200 else None
+        data = await _fetch_ref_url(ref)
+        return (data, _clean_ext(ext)) if data is not None else None
     try:
         return base64.b64decode(ref), _clean_ext(ext)
+    except Exception:
+        return None
+
+
+# ── Client-supplied URLs (reference images, `files`) ──────────────────────────────
+# The gateway fetches these ON THE CLIENT'S BEHALF and keeps the bytes readable at
+# /v1/jobs/<id>/input/<n> — so an unfiltered fetch lets any key holder read what only
+# the gateway can reach: a backend's admin port, a router UI, 169.254.169.254, the
+# gateway's own /ui on localhost (review S5). Every address the name resolves to must be
+# PUBLIC, the connection goes to exactly the address that was checked (a second lookup
+# could answer differently — DNS rebinding), redirects are never followed (the shared
+# client's default; a 3xx is a failed fetch), and the body is counted while it streams.
+# `ref_url_allow_cidrs` (config.yaml) opens chosen private ranges, e.g. the LAN NAS.
+_REF_FETCH_MAX_BYTES = _UPLOAD_MAX_BYTES
+
+
+def _ref_allow_nets() -> list:
+    nets = []
+    for c in (config.get("ref_url_allow_cidrs") or []) if isinstance(config, dict) else []:
+        try:
+            nets.append(ipaddress.ip_network(str(c).strip(), strict=False))
+        except ValueError:
+            logger.warning(f"ref_url_allow_cidrs: ignoring '{c}' (not a network)")
+    return nets
+
+
+def ref_addr_blocked(addr: str, allow: Optional[list] = None) -> bool:
+    """True for an address a client URL must not reach: anything not globally routable
+    (loopback, RFC 1918, link-local, CGNAT, ULA, unspecified, documentation, …) and
+    multicast — unless an `allow` network contains it. An IPv4-mapped IPv6 address is
+    judged as the IPv4 it carries (`::ffff:127.0.0.1` is loopback)."""
+    try:
+        ip = ipaddress.ip_address(addr.split("%", 1)[0])
+    except ValueError:
+        return True
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    if any(ip in n for n in (allow or [])):
+        return False
+    return (not ip.is_global) or ip.is_multicast
+
+
+async def _resolve_ref_host(host: str, port: int) -> list:
+    """Every address `host` resolves to (a literal IP resolves to itself)."""
+    infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    return list(dict.fromkeys(i[4][0] for i in infos))
+
+
+async def _fetch_ref_url(url: str) -> Optional[bytes]:
+    """GET a client-supplied http(s) URL under the rules above. None = not readable
+    (unresolvable, refused, non-200); 400 = the target is not allowed; 413 = too big."""
+    u = urlparse(url)
+    host = u.hostname
+    if not host:
+        return None
+    try:
+        port = u.port or (443 if u.scheme == "https" else 80)
+    except ValueError:
+        return None
+    try:
+        addrs = await _resolve_ref_host(host, port)
+    except (OSError, UnicodeError):
+        return None
+    allow = _ref_allow_nets()
+    bad = [a for a in addrs if ref_addr_blocked(a, allow)]
+    if not addrs or bad:
+        logger.warning(f"ref url refused: {host} → {', '.join(bad or ['nothing'])}")
+        raise HTTPException(400, f"reference URL host '{host}' resolves to a private, loopback "
+                                 f"or link-local address — the gateway only fetches public "
+                                 f"URLs (send the bytes as base64 instead, or allow the range "
+                                 f"in ref_url_allow_cidrs)")
+    ip = addrs[0].split("%", 1)[0]
+    pinned = u._replace(netloc=(f"[{ip}]" if ":" in ip else ip) + f":{port}").geturl()
+    ext = {"sni_hostname": host} if u.scheme == "https" else {}
+    limit = _REF_FETCH_MAX_BYTES
+    try:
+        async with http_client.stream("GET", pinned, headers={"Host": u.netloc.rsplit("@", 1)[-1]},
+                                      extensions=ext, timeout=20.0) as r:
+            if r.status_code != 200:
+                return None
+            if int(r.headers.get("content-length") or 0) > limit:
+                raise HTTPException(413, f"reference URL body exceeds {limit // (1024 * 1024)} MB")
+            buf = bytearray()
+            async for chunk in r.aiter_bytes():
+                buf += chunk
+                if len(buf) > limit:
+                    raise HTTPException(413, f"reference URL body exceeds {limit // (1024 * 1024)} MB")
+            return bytes(buf)
+    except HTTPException:
+        raise
     except Exception:
         return None
 
@@ -4554,8 +4717,12 @@ async def images_generations(request: Request, authorization: Optional[str] = He
         raise HTTPException(400, "`prompt` is required")
     w, h = parse_size(body.get("size"))
     refs = body.get("ref_images") or []
-    decoded = [await _decode_ref_image(r) for r in refs]
+    if not isinstance(refs, list):
+        raise HTTPException(400, "`ref_images` must be a list")
     slots = await asyncio.to_thread(_gen_image_slots, alias)   # ONE lookup — uploads + log
+    # images_uploads keeps one image per slot; fetching the rest would only download
+    # (and, for URLs, reach out for) bytes that are thrown away.
+    decoded = [await _decode_ref_image(r) for r in refs[:len(slots)]]
     uploads = images_uploads(decoded, slots) if refs else None
     extra = {k: v for k, v in body.items() if k not in OAI_IMG_KEYS}   # dynamic workflow params
     logger.info(f"images/generations '{alias}': ref_images={len(refs)} "   # where client images land

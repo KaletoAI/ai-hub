@@ -170,6 +170,16 @@ would leave nobody able to sign in, or silently open the console again. A gatewa
 already in that state (users, but no enabled admin with a key and no master key)
 stays locked; set `api_key:` in `config.yaml` (hot-reloaded) and sign in with it.
 
+**Limits on what clients send.** Request bodies are capped at `max_body_mb`
+(config.yaml, default 200, hot-reloaded; `0` = off) → `413`. A reference image or
+`files` entry given as a URL is fetched by the gateway only from a PUBLIC address:
+every address the host resolves to is checked, the connection goes to the checked
+address, redirects are not followed and the body is capped at 64 MB. A host that
+resolves to loopback/private/link-local/multicast is refused with `400` — list the
+ranges you trust (a LAN NAS) in `ref_url_allow_cidrs`. `images` keys that are not an
+image slot of the alias are ignored without being fetched, and the OpenAI shims'
+`ref_images` beyond the alias's slot count are never downloaded.
+
 **Job ownership.** Generation jobs and background responses are owner-gated:
 `GET`/cancel of a job (and its result/input artifacts) is allowed only for its
 owner; admin/master see all. Authenticated calls are owned by the user. In

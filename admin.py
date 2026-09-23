@@ -1122,15 +1122,34 @@ async def logout(request: Request):
 
 # ── POST body parsing (no python-multipart) ─────────────────────────────────────
 
+# A url-encoded console form is text typed or pasted by an admin — even a pasted
+# workflow JSON is a few hundred KB. Uploads (meshes, audio, images) go through
+# _multipart, which only the app-wide body cap (main `max_body_mb`) bounds.
+_FORM_MAX_BYTES = 16 * 1024 * 1024
+
+
+async def _form_raw(request: Request) -> str:
+    """The url-encoded body, read with a byte cap WHILE it streams (413 past it) —
+    `request.body()` would hold whatever arrives before anything could check it."""
+    if not hasattr(request, "stream"):                   # a test stub with body() only
+        return (await request.body()).decode("utf-8", "replace")
+    buf = bytearray()
+    async for chunk in request.stream():
+        buf += chunk
+        if len(buf) > _FORM_MAX_BYTES:
+            raise HTTPException(413, f"form body exceeds {_FORM_MAX_BYTES // (1024 * 1024)} MB")
+    return bytes(buf).decode("utf-8", "replace")
+
+
 async def _form(request: Request) -> dict:
-    raw = (await request.body()).decode("utf-8", "replace")
+    raw = await _form_raw(request)
     return {k: v[-1] for k, v in parse_qs(raw, keep_blank_values=True).items()}
 
 
 async def _form_multi(request: Request) -> dict:
     """Like _form(), but keeps EVERY value per key ({k: [v, …]}) — for handlers with
     checkbox lists (reasoning backends, user model grants) that _form would collapse."""
-    raw = (await request.body()).decode("utf-8", "replace")
+    raw = await _form_raw(request)
     return parse_qs(raw, keep_blank_values=True)
 
 
