@@ -88,11 +88,14 @@ def encrypt_secret(plaintext: str) -> str:
     return _ENC_PREFIX + base64.b64encode(nonce + ct + tag).decode()
 
 
-def decrypt_secret(token: str) -> str:
+def decrypt_secret(token: str, strict: bool = False) -> str:
     """Inverse of encrypt_secret. Legacy plaintext (no prefix) passes through, so old
-    rows keep working until re-saved. Returns '' on tamper/wrong-key."""
+    rows keep working until re-saved. Returns '' on tamper/wrong-key.
+
+    `strict` refuses that passthrough ('' instead): for a value that must have been
+    minted by this gateway — the /ui session cookie — plaintext is a forgery."""
     if not token or not token.startswith(_ENC_PREFIX):
-        return token
+        return "" if strict else token
     try:
         raw = base64.b64decode(token[len(_ENC_PREFIX):])
         nonce, ct, tag = raw[:16], raw[16:-32], raw[-32:]

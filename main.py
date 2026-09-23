@@ -2,6 +2,8 @@ import asyncio
 import base64
 import calendar
 import fnmatch
+import hashlib
+import hmac
 import json
 import logging
 import mimetypes
@@ -1046,6 +1048,11 @@ def apply_users() -> None:
     logger.info(f"users changed → {len(users)} user(s)")
 
 
+def _key_eq(given: str, expected: str) -> bool:
+    """Constant-time compare for the master key (`==` leaks the matching prefix length)."""
+    return hmac.compare_digest(given.encode("utf-8"), expected.encode("utf-8"))
+
+
 def authenticate(authorization: Optional[str]) -> Optional[dict]:
     """Resolve the Bearer token to a user. Returns None only in bootstrap-open mode
     (no users + no master key). Raises 401 on a missing/invalid token otherwise."""
@@ -1054,7 +1061,7 @@ def authenticate(authorization: Optional[str]) -> Optional[dict]:
         return None
     if not token:
         raise HTTPException(401, "Missing Authorization header")
-    if api_key and token == api_key:
+    if api_key and _key_eq(token, api_key):
         return _MASTER_ADMIN
     u = _users_by_key.get(token)
     if u:
@@ -1167,10 +1174,25 @@ def resolve_admin(key: Optional[str]) -> Optional[dict]:
     the /ui login. Returns None if the key isn't an admin credential."""
     if not key:
         return None
-    if api_key and key == api_key:
+    if api_key and _key_eq(key, api_key):
         return _MASTER_ADMIN
     u = _users_by_key.get(key)
     return u if (u and u.get("role") == "admin") else None
+
+
+def admin_session_tag(name: Optional[str], master: bool) -> Optional[str]:
+    """Fingerprint of the credential a /ui session belongs to — the master api_key, or
+    the named admin user's key — or None once that is no longer an admin credential
+    (key removed or rotated, user deleted/disabled/demoted). The session cookie stores
+    it at login and admin re-checks it on every request, so revoking the credential
+    revokes its sessions instead of leaving them valid for the cookie's lifetime."""
+    if master:
+        key = api_key
+    else:
+        u = next((u for u in users if u.get("name") == name), None)
+        key = (u.get("api_key") if u and u.get("role") == "admin" and u.get("enabled", True)
+               else None)
+    return hashlib.sha256(f"{'m' if master else 'u'}:{key}".encode()).hexdigest() if key else None
 
 
 def ui_locked() -> bool:
@@ -5081,6 +5103,7 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
            scan_status=scan_status,
            apply_users=apply_users,
            resolve_admin=resolve_admin, ui_locked=ui_locked,
+           admin_session_tag=admin_session_tag,
            dashboard_snapshot=dashboard_snapshot, cancel_generation=cancel_generation,
            drain_backend=begin_drain, cancel_drain=cancel_drain,
            set_backend_enabled=set_backend_enabled,

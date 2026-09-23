@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hmac
 import html
 import ipaddress
 import json
@@ -145,6 +146,9 @@ _apply_server_settings: Callable[[], None] = lambda: None
 _apply_users: Callable[[], None] = lambda: None
 _resolve_admin: Callable = lambda key: None
 _ui_locked: Callable[[], bool] = lambda: False
+# (admin name, is_master) → fingerprint of that admin's CURRENT credential, None = no
+# longer an admin. Sessions carry it, so revoking the credential revokes them.
+_admin_session_tag: Callable[[Optional[str], bool], Optional[str]] = lambda name, master: None
 _dashboard_snapshot: Callable[[], dict] = lambda: {}
 _apply_reasoning: Callable[[], None] = lambda: None
 _llm_backend_names: Callable[[], list] = lambda: []
@@ -909,17 +913,28 @@ _SESSION_COOKIE = "gw_session"
 _SESSION_TTL = 12 * 3600
 
 
-def _make_session(name: str) -> str:
-    return store.encrypt_secret(json.dumps({"u": name, "exp": int(time.time()) + _SESSION_TTL}))
+def _make_session(admin: dict, ttl: int = _SESSION_TTL) -> str:
+    master = bool(admin.get("_master"))
+    return store.encrypt_secret(json.dumps({
+        "u": admin["name"], "m": master, "t": _admin_session_tag(admin["name"], master),
+        "exp": int(time.time()) + ttl}))
 
 
 def _session_user(request: Request) -> Optional[str]:
+    """The admin a session cookie belongs to, or None. Only a cookie this gateway
+    ENCRYPTED counts (strict: the store's legacy-plaintext passthrough would accept a
+    hand-typed one), and its credential tag must still match — see _admin_session_tag."""
     tok = request.cookies.get(_SESSION_COOKIE)
     if not tok:
         return None
     try:
-        d = json.loads(store.decrypt_secret(tok) or "{}")
-        return d["u"] if d.get("exp", 0) > int(time.time()) else None
+        d = json.loads(store.decrypt_secret(tok, strict=True) or "{}")
+        if d.get("exp", 0) <= int(time.time()):
+            return None
+        tag = _admin_session_tag(d.get("u"), bool(d.get("m")))
+        if not tag or not hmac.compare_digest(tag, str(d.get("t") or "")):
+            return None
+        return d["u"]
     except Exception:
         return None
 
@@ -962,7 +977,7 @@ async def login_post(request: Request):
         return HTMLResponse(_page("Login", _login_page("Invalid admin key.", nxt), active="", nologin=True),
                             status_code=401)
     resp = RedirectResponse(nxt if nxt.startswith("/ui") else "/ui", status_code=303)
-    resp.set_cookie(_SESSION_COOKIE, _make_session(admin["name"]),
+    resp.set_cookie(_SESSION_COOKIE, _make_session(admin),
                     max_age=_SESSION_TTL, httponly=True, samesite="lax", path="/")
     logger.info(f"ui: admin '{admin['name']}' logged in")
     return resp

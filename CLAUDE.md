@@ -31,7 +31,7 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
   restart for backend/alias changes. Read **only at startup**:
   `stats.enabled` and the stats/jobs DB paths.
 - **No linter or build step, and no blanket test suite** — only targeted stdlib
-  `unittest` files for the mechanisms that fail SILENTLY (see the twenty-nine listed under
+  `unittest` files for the mechanisms that fail SILENTLY (see the thirty listed under
   `anthropic_bridge.py`): `venv/bin/python -m unittest discover -s tests -t .`.
   Everything else is verified by running the server and hitting endpoints with
   `curl` (README "Try it"), `curl localhost:4000/health` for a routing snapshot, or
@@ -579,7 +579,7 @@ they need via injected callables, staying hot-reload-safe.
   silently answer about content the model never saw (documents/PDFs). Covered by
   `test_anthropic_bridge.py` (stdlib `unittest` — a streaming tool-call bridge fails
   silently rather than crashing). `ls tests/test_*.py` is the count of record —
-  **twenty-nine** files today — and each exists for that same reason: the mechanism it
+  **thirty** files today — and each exists for that same reason: the mechanism it
   guards fails SILENTLY, so it is named next to that mechanism above.
   `test_anthropic_bridge.py`, `test_prune_branch.py` (a
   dead-branch prune that cascades one node too far or too few surfaces as an aborted
@@ -682,6 +682,13 @@ they need via injected callables, staying hot-reload-safe.
   and `_dispatch_over` incl. a failover that ends in 200, the bundling, the downtime
   clipping and open outage, persistence across a restart, and what Dashboard/Statistic
   render).
+  `test_ui_session.py` (the /ui session cookie: a forgeable session looks exactly like a
+  working login. `store.decrypt_secret`'s legacy-plaintext passthrough made a hand-typed
+  `gw_session={"u":"admin",…}` an admin session (review 2026-09-23), so `_session_user`
+  decrypts STRICT; and the cookie carries `main.admin_session_tag` — a fingerprint of the
+  credential it was opened with, re-checked per request — so rotating the master key or
+  deleting/disabling/demoting an admin revokes its sessions instead of leaving them valid
+  for 12 h).
   Run them all with `python -m unittest discover -s tests -t .` (no runner dependency).
 - **`openai_image_bridge.py`** — pure request/response plumbing for the OpenAI
   image shims (`multipart_list`, `parse_size`, `coerce_scalar`, `images_uploads`
