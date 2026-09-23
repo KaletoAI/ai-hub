@@ -161,7 +161,6 @@ _voice_lib_save: Callable = None          # async (name, data, ref_text) → sta
 _voice_lib_delete: Callable = None        # (name) → None
 _voice_lib_ship: Callable = None          # async (name) → (ok, msg)
 _voice_ship_config: Callable[[], tuple] = lambda: ([], "")   # → (hosts, dir)
-_apply_voice_library: Callable[[], None] = lambda: None
 _apply_hosts: Callable[[], None] = lambda: None           # refresh main's hosts_meta cache
 # ComfyUI backend name → sorted installed LoRA filenames (discovery, verbatim).
 _backend_loras: Callable[[], dict] = lambda: {}
@@ -278,7 +277,6 @@ tr.grp td{background:#13161c;font-weight:600}
 .grouphdr:first-child{margin-top:4px}
 .formbar{display:flex;gap:8px;align-items:center;margin:0 0 14px;padding:8px 0 12px;border-bottom:1px solid #242a33;position:sticky;top:0;z-index:10;background:#0f1115}
 .formbar h2{margin:0;border:0;padding:0;flex:1}
-.formwrap{max-width:560px}
 .avail tr td:last-child{text-align:right;white-space:nowrap}
 .avail .node{color:#9aa7b4}.avail .node code{background:#13202f}
 table.pins td:nth-child(2){width:62%}
@@ -1258,18 +1256,6 @@ def _value_control(name: str, node: str, field: str, value, wf: dict, oi: dict) 
     if isinstance(file_val, bool):
         return _select(name, ["true", "false"], str(cur).lower())
     return _inp(name, "" if cur is None else cur)
-
-
-def _boolean_fields(wf: dict) -> list:
-    return [{"node": nid, "field": fn, "value": v, "class": n.get("class_type", "")}
-            for nid, n in wf.items()
-            for fn, v in (n.get("inputs") or {}).items() if isinstance(v, bool)]
-
-
-def _image_fields(wf: dict) -> list:
-    return [{"node": nid, "field": "image", "value": (n.get("inputs") or {}).get("image", ""),
-             "class": n.get("class_type", ""), "title": n.get("_meta", {}).get("title", "")}
-            for nid, n in wf.items() if adapters.is_img_loader_class(n.get("class_type"))]
 
 
 # ── Tab: Backends ───────────────────────────────────────────────────────────────
@@ -4237,7 +4223,6 @@ async def update(request: Request):
     cands = store.get(alias)
     if not alias or not cands:
         raise HTTPException(404, "alias not found")
-    cand = cands[0]
     task = (f.get("task", "") or "").strip()          # task dropdown (blank keeps the stored value)
     if task:
         for c in cands:
@@ -6189,7 +6174,7 @@ def _dash_llm(d: dict, now: int) -> str:
     if not d.get("stats_active") and not nrun:
         return (head + "<p class='hint'>Call recording is off — only currently-running calls show here. "
                 "Enable <b>stats</b> in the <a href='/ui/server'>Server</a> tab for the 5-minute history "
-                "and the full <a href='/ui/llmcalls'>LLM Calls</a> log.</p>")
+                "and the full <a href='/ui/jobs?sub=llm'>LLM Calls</a> log.</p>")
     return head + "<p class='muted'>nothing running or in the last 5 min</p>"
 
 
@@ -6509,7 +6494,7 @@ async def statistic_page(request: Request):
     # Per-call history lives in its own tab now (the LLM Calls list) — keep Statistic
     # to the aggregates. Point there so the link is discoverable.
     recent = ("<p class='hint' style='margin-top:18px'>Per-call history (with request/response bodies) "
-              "moved to the <a href='/ui/llmcalls'>LLM Calls</a> tab.</p>")
+              "moved to the <a href='/ui/jobs?sub=llm'>LLM Calls</a> tab.</p>")
     media = await asyncio.to_thread(_media_gen_panel)
     head = f"<h2>Statistic{scope}</h2>{bar}"
     body = head + cards + fpanel + by_backend + by_model + by_source + media + recent + _FILTER_JS
@@ -6778,7 +6763,7 @@ def _reasoning_list_html(rules: list, edit_i: Optional[int]) -> str:
             "<p class='hint'>Clients send <code>reasoning: \"off\" | \"on\" | \"auto\"</code> (default auto → "
             "unchanged). The first <b>enabled</b> rule whose <b>model glob</b> matches the real model <b>and</b> "
             "whose <b>backend set</b> contains the serving backend is applied; no match → "
-            "<code>unsupported</code> (never fails). Applied control shows in <a href='/ui/llmcalls'>LLM Calls</a> "
+            "<code>unsupported</code> (never fails). Applied control shows in <a href='/ui/jobs?sub=llm'>LLM Calls</a> "
             "+ the <code>x-reasoning-control</code> header.</p>"
             f"<table class='sortable' data-sk='reason'><tr><th>#</th><th>match</th><th>backends</th>"
             f"<th>adapter</th><th>param</th><th>state</th><th></th></tr>{rows}</table>")

@@ -5141,7 +5141,6 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
            probe_reasoning=probe_reasoning,
            voice_lib_save=save_voice_ref, voice_lib_delete=delete_voice_ref,
            voice_lib_ship=ship_voice_ref, voice_ship_config=voice_ship_config,
-           apply_voice_library=apply_voice_library,
            apply_hosts=apply_hosts,
            backend_loras=lambda: {b["name"]: sorted(backend_loras.get(backend_id(b), set()))
                                   for b in backends if b.get("type") == "comfyui"})
