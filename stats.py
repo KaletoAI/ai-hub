@@ -302,6 +302,11 @@ def _preview(text: Optional[str], head: int = 50, tail: int = 50) -> Optional[st
     """First `head` + last `tail` chars of the request, ellipsis in between."""
     if not text:
         return None
+    # Only the two ends are shown — never walk (split/join) a multi-MB body for them.
+    # 8x slack survives the whitespace collapse unless an end is mostly blank.
+    win = 8 * (head + tail)
+    if len(text) > 2 * win:
+        text = f"{text[:win]} {text[-win:]}"
     text = " ".join(text.split())  # collapse whitespace/newlines for a compact preview
     if len(text) <= head + tail:
         return text

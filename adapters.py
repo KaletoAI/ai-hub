@@ -50,7 +50,10 @@ logger = logging.getLogger(__name__)
 
 # Outbound timeouts (seconds): discovery is short (health tick must stay snappy),
 # chat generous (long completions), ComfyUI uploads sized for LAN image posts.
-_CHAT_TIMEOUT = 300.0
+# The chat budget is a READ budget: a scalar 300 also let a host that swallows SYNs
+# hold the failover for five minutes before the next candidate got a chance. Connect
+# (incl. the TLS handshake) and waiting for a pooled connection stay short.
+_CHAT_TIMEOUT = httpx.Timeout(300.0, connect=10.0, pool=30.0)
 _DISCOVERY_TIMEOUT = 5.0
 _COMFY_DISCOVERY_TIMEOUT = 8.0
 _UPLOAD_TIMEOUT = 20.0             # floor; the real budget scales with the file (_upload_timeout_for)
@@ -780,6 +783,15 @@ class _StreamNormalizer:
                                      separators=(",", ":")) + "\n"
 
 
+# Stats status of a stream that did not end normally. Recorded from the stream's
+# `finally`, so an aborted call still books its tokens (the month-cost quota reads
+# them): the client leaving — Starlette closes the body iterator (GeneratorExit) or
+# cancels its task — is 499, nginx's "client closed request"; anything else is the
+# upstream failing mid-answer, 502.
+def _stream_end_status(e: BaseException) -> int:
+    return 499 if isinstance(e, (GeneratorExit, asyncio.CancelledError)) else 502
+
+
 @dataclass
 class _Call:
     """Per-dispatch bookkeeping shared by the stream and non-stream paths —
@@ -791,7 +803,7 @@ class _Call:
     reasoning_ctl: Optional[str]        # x-reasoning-control value ("off:prefill", …) or None
     rheaders: dict                      # gateway response headers (serving backend + reasoning control)
     source: str
-    req_text: str
+    req_text: str                       # the body as SENT — set by _encode(), reused by stats
     started: float
     log_on: bool
     act: Any                            # live-call registry token
@@ -853,12 +865,42 @@ def _error_text(resp) -> str:
         return "upstream error"
 
 
-# Client headers that must NEVER be forwarded to a backend. `authorization` AND
-# `x-api-key` are both gateway credentials (Claude Code authenticates with the
-# latter) — forwarding either would hand the caller's gateway key to OpenRouter,
-# Anthropic or whoever else serves the call. The adapter adds the backend's own
-# credential afterwards.
-_HOP_BY_HOP = ("host", "content-length", "authorization", "x-api-key", "x-park-mode")
+# Client headers that must NEVER be forwarded to a backend. A DENYLIST on purpose,
+# not an allowlist: the verbatim Anthropic passthrough depends on whatever Claude Code
+# sends (`anthropic-*`, `x-stainless-*`, `x-app`, its user-agent — the subscription path
+# checks them), OpenRouter reads `HTTP-Referer`/`X-Title` for attribution, and a list
+# of what backends may see would silently strip the next such header. What is dropped:
+# - gateway credentials: `authorization` AND `x-api-key` (Claude Code authenticates
+#   with the latter) — forwarding either hands the caller's gateway key to OpenRouter,
+#   Anthropic or whoever serves the call; the adapter adds the backend's own afterwards;
+# - what describes THIS hop: `host`, `content-length`, RFC 7230 hop-by-hop
+#   (`connection` + every header it names, `keep-alive`, `te`, `trailer`,
+#   `transfer-encoding`, `upgrade`, `proxy-*`) and `expect`. A client's
+#   `transfer-encoding: chunked` next to httpx's own content-length makes an invalid
+#   request;
+# - `accept-encoding`: httpx negotiates what IT can decode. A browser's `br`/`zstd`
+#   was honoured by the backend and the gateway then passed on — and parsed for usage —
+#   a body it could not decompress;
+# - what identifies the CLIENT to a third party: `cookie` (the /ui session cookie rides
+#   along on a browser's same-origin call), `forwarded`/`x-forwarded-*`/`x-real-ip`/
+#   `via`/`cf-connecting-ip`/`true-client-ip`, the browser's `origin`/`referer`/`sec-*`
+#   metadata, and the gateway's own `x-source` attribution and `x-park-mode`.
+_HOP_BY_HOP = frozenset((
+    "host", "content-length", "authorization", "x-api-key", "x-park-mode", "x-source",
+    "connection", "keep-alive", "te", "trailer", "transfer-encoding", "upgrade", "expect",
+    "accept-encoding", "cookie", "forwarded", "x-real-ip", "via", "cf-connecting-ip",
+    "true-client-ip", "origin", "referer",
+))
+_HOP_BY_HOP_PREFIXES = ("proxy-", "x-forwarded-", "sec-")
+
+
+def _forward_headers(headers) -> dict:
+    """The client's headers a backend may see (see _HOP_BY_HOP), names lowercased."""
+    items = [(str(k).lower(), v) for k, v in (headers or {}).items()]
+    named = {h.strip().lower() for k, v in items if k == "connection"
+             for h in str(v).split(",") if h.strip()}
+    return {k: v for k, v in items
+            if k not in _HOP_BY_HOP and k not in named and not k.startswith(_HOP_BY_HOP_PREFIXES)}
 
 
 class OpenAIAdapter(BackendAdapter):
@@ -1004,10 +1046,8 @@ class OpenAIAdapter(BackendAdapter):
         release it via _finish()."""
         b = self.backend
         ctx = self.ctx
-        headers = {
-            k: v for k, v in req.raw.headers.items()
-            if k.lower() not in _HOP_BY_HOP
-        }
+        headers = _forward_headers(req.raw.headers)
+        headers["content-type"] = "application/json"   # the body is sent as encoded bytes
         headers.update(self._backend_auth())
         real_model = req.body.get("model")
         fwd, reasoning_ctl = self._payload(req)
@@ -1026,9 +1066,19 @@ class OpenAIAdapter(BackendAdapter):
         return _Call(
             url=f"{b['url']}{req.path}", headers=headers, fwd=fwd, real_model=real_model,
             reasoning_ctl=reasoning_ctl, rheaders=rheaders,
-            source=ctx.source_of(req.raw), req_text=json.dumps(fwd, ensure_ascii=False),
+            source=ctx.source_of(req.raw), req_text="",
             started=time.monotonic(), log_on=ctx.log_enabled(), act=act,
         )
+
+    @staticmethod
+    def _encode(call: _Call, body: dict) -> bytes:
+        """Serialize the outgoing body ONCE: the bytes go to the backend (`content=`,
+        not httpx's `json=`, which would serialize it again) and the same text is the
+        stats row's request body. A Claude Code context or a base64 image is several
+        MB, and every pass over it is ~25-30 ms/MB on the event loop. Compact UTF-8,
+        like httpx's own encoder."""
+        call.req_text = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+        return call.req_text.encode("utf-8")
 
     def _backend_auth(self) -> dict:
         """Credential headers for THIS backend. Overridden where the protocol wants
@@ -1095,12 +1145,21 @@ class OpenAIAdapter(BackendAdapter):
             alias=req.alias, model=call.real_model, endpoint=(req.stats_endpoint or req.path),
             status=status, input_tokens=in_tok, output_tokens=out_tok,
             cost_usd=ctx.cost_usd(self.bid, call.real_model, in_tok, out_tok),
-            request_text=call.req_text, response_text=response_text,
+            request_text=call.req_text or None, response_text=response_text,
             response_audio=response_audio,
             reasoning=call.reasoning_ctl,
             cache_read=cache[0], cache_write=cache[1],
         ))
         return elapsed_ms
+
+    def _record_end(self, req: NormalizedRequest, call: _Call, status: int,
+                    in_tok: int, out_tok: int, **kw) -> None:
+        """`_record` for the END of a stream — called from its `finally`, where an
+        exception would replace the GeneratorExit/CancelledError being handled."""
+        try:
+            self._record(req, call, status, in_tok, out_tok, **kw)
+        except Exception as e:
+            logger.warning(f"[{self.name}] stats: could not record a streamed call: {e}")
 
     async def _dispatch_stream(self, req: NormalizedRequest, call: _Call) -> Response:
         ctx = self.ctx
@@ -1126,8 +1185,9 @@ class OpenAIAdapter(BackendAdapter):
         client_cm = _pooled_client(ctx)
         client = None
         try:
+            payload = self._encode(call, body)
             client = await client_cm.__aenter__()
-            stream_cm = client.stream("POST", call.url, json=body,
+            stream_cm = client.stream("POST", call.url, content=payload,
                                       headers=call.headers, timeout=_CHAT_TIMEOUT)
             resp = await stream_cm.__aenter__()
         except BaseException:
@@ -1152,6 +1212,7 @@ class OpenAIAdapter(BackendAdapter):
                             headers={**call.rheaders, **_ratelimit_headers(resp.headers)})
 
         async def generate():
+            status = resp.status_code
             try:
                 async for chunk in resp.aiter_bytes():
                     out = norm.feed(chunk)
@@ -1160,20 +1221,26 @@ class OpenAIAdapter(BackendAdapter):
                 tail = norm.flush()
                 if tail:
                     yield tail
+            except BaseException as e:
+                status = _stream_end_status(e)
+                raise
             finally:
-                await stream_cm.__aexit__(None, None, None)
-                await client_cm.__aexit__(None, None, None)
-                self._finish(call)
-            in_tok, out_tok = norm.tokens()
-            self._record(req, call, resp.status_code, in_tok, out_tok,
-                         cache=(norm.cache_read, norm.cache_write))
+                try:
+                    await stream_cm.__aexit__(None, None, None)
+                    await client_cm.__aexit__(None, None, None)
+                finally:
+                    self._finish(call)
+                    in_tok, out_tok = norm.tokens()
+                    self._record_end(req, call, status, in_tok, out_tok,
+                                     cache=(norm.cache_read, norm.cache_write))
 
         return StreamingResponse(generate(), media_type="text/event-stream", headers=call.rheaders)
 
     async def _dispatch_once(self, req: NormalizedRequest, call: _Call) -> Response:
         try:
+            payload = self._encode(call, call.fwd)
             async with _pooled_client(self.ctx) as client:
-                resp = await client.post(call.url, json=call.fwd,
+                resp = await client.post(call.url, content=payload,
                                          headers=call.headers, timeout=_CHAT_TIMEOUT)
         finally:
             self._finish(call)
@@ -1324,8 +1391,9 @@ class AnthropicAdapter(OpenAIAdapter):
         client_cm = _pooled_client(ctx)
         client = None
         try:
+            payload = self._encode(call, call.fwd)
             client = await client_cm.__aenter__()
-            stream_cm = client.stream("POST", call.url, json=call.fwd,
+            stream_cm = client.stream("POST", call.url, content=payload,
                                       headers=call.headers, timeout=_CHAT_TIMEOUT)
             resp = await stream_cm.__aenter__()
         except BaseException:
@@ -1377,6 +1445,7 @@ class AnthropicAdapter(OpenAIAdapter):
 
         async def generate():
             buf = ""
+            status = resp.status_code
             try:
                 async for chunk in resp.aiter_bytes():
                     buf += chunk.decode("utf-8", "ignore")
@@ -1384,13 +1453,18 @@ class AnthropicAdapter(OpenAIAdapter):
                         line, buf = buf.split("\n", 1)
                         sniff(line)
                     yield chunk                       # verbatim, always
+            except BaseException as e:
+                status = _stream_end_status(e)
+                raise
             finally:
-                await stream_cm.__aexit__(None, None, None)
-                await client_cm.__aexit__(None, None, None)
-                self._finish(call)
-            self._record(req, call, resp.status_code, counted["in"], counted["out"],
-                         response_text="".join(counted["text"]) or None,
-                         cache=(counted["read"], counted["write"]))
+                try:
+                    await stream_cm.__aexit__(None, None, None)
+                    await client_cm.__aexit__(None, None, None)
+                finally:
+                    self._finish(call)
+                    self._record_end(req, call, status, counted["in"], counted["out"],
+                                     response_text="".join(counted["text"]) or None,
+                                     cache=(counted["read"], counted["write"]))
 
         return StreamingResponse(generate(), media_type="text/event-stream", headers=call.rheaders)
 

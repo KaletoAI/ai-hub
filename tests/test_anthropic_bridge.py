@@ -95,6 +95,38 @@ class MessagesToChat(unittest.TestCase):
         self.assertIn("file not found", chat["messages"][0]["content"])
         self.assertIn("rror", chat["messages"][0]["content"])   # flagged as an error
 
+    def test_image_in_a_tool_result_reaches_the_model(self):
+        """Claude Code's Read tool answers an image file with an image block inside the
+        tool_result. The chat `tool` role takes text only, so dropping it answered a
+        question about a screenshot the model never saw. It travels in a user message
+        right after the tool messages, labelled with the call it came from."""
+        img = {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                           "data": "AAAA"}}
+        chat = ab.messages_to_chat({"model": "m", "max_tokens": 100, "messages": [
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1",
+                 "content": [{"type": "text", "text": "shot.png"}, img]},
+                {"type": "tool_result", "tool_use_id": "toolu_2", "content": "plain"},
+                {"type": "text", "text": "what do you see?"}]}]})
+        self.assertEqual([m["role"] for m in chat["messages"]], ["tool", "tool", "user"])
+        self.assertEqual(chat["messages"][0]["content"], "shot.png")
+        parts = chat["messages"][2]["content"]
+        urls = [p["image_url"]["url"] for p in parts if p["type"] == "image_url"]
+        self.assertEqual(urls, ["data:image/png;base64,AAAA"])
+        texts = " ".join(p["text"] for p in parts if p["type"] == "text")
+        self.assertIn("toolu_1", texts)                    # which call it belongs to
+        self.assertIn("what do you see?", texts)
+
+    def test_image_only_tool_result_still_has_tool_content(self):
+        img = {"type": "image", "source": {"type": "url", "url": "http://x/y.png"}}
+        chat = ab.messages_to_chat({"model": "m", "max_tokens": 100, "messages": [
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": [img]}]}]})
+        self.assertEqual([m["role"] for m in chat["messages"]], ["tool", "user"])
+        self.assertTrue(chat["messages"][0]["content"])      # never an empty tool message
+        self.assertEqual(chat["messages"][1]["content"][-1],
+                         {"type": "image_url", "image_url": {"url": "http://x/y.png"}})
+
     def test_tools_are_translated_to_function_schemas(self):
         chat = ab.messages_to_chat({"model": "m", "max_tokens": 100, "messages": [], "tools": [
             {"name": "Read", "description": "read a file",
@@ -232,6 +264,15 @@ class ChatToMessages(unittest.TestCase):
                                              "input": {"file_path": "/tmp/x"}})
         self.assertEqual(msg["stop_reason"], "tool_use")
 
+    def test_tool_calls_with_finish_reason_stop_still_mean_tool_use(self):
+        """Several servers (Ollama, some vLLM/LocalAI builds) report `stop` although the
+        message carries tool calls; `end_turn` makes Claude Code end the turn instead of
+        running the tool."""
+        msg = ab.chat_to_messages(self.chat({"content": None, "tool_calls": [
+            {"id": "c1", "type": "function", "function": {"name": "Read", "arguments": "{}"}}]},
+            "stop"), "m")
+        self.assertEqual(msg["stop_reason"], "tool_use")
+
     def test_unparsable_tool_arguments_yield_an_empty_input(self):
         """A truncated argument stream must not take the whole response down."""
         with self.assertLogs("anthropic_bridge", level="WARNING"):
@@ -358,6 +399,17 @@ class MessagesStream(unittest.TestCase):
                        if e["type"] == "content_block_delta"
                        and e["delta"]["type"] == "input_json_delta"]
         self.assertEqual("".join(json_deltas), '{"file_path": "/x"}')
+        self.assertEqual([e for e in events if e["type"] == "message_delta"][0]
+                         ["delta"]["stop_reason"], "tool_use")
+
+    def test_streamed_tool_call_with_finish_reason_stop_means_tool_use(self):
+        stream = FakeStream([
+            delta_chunk(tool_calls=[{"index": 0, "id": "c1", "type": "function",
+                                     "function": {"name": "Read", "arguments": "{}"}}]),
+            sse({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+            "data: [DONE]\n\n",
+        ])
+        events = collect(ab.messages_stream(stream, "m"))
         self.assertEqual([e for e in events if e["type"] == "message_delta"][0]
                          ["delta"]["stop_reason"], "tool_use")
 

@@ -17,7 +17,9 @@ streaming must survive exactly as Claude Code sent them.
 Translation policy (Claude Code sends more than an OpenAI backend can take):
 drop what is inert (cache_control, thinking blocks from history, server-side
 tools), raise `UnsupportedContent` where dropping would silently produce an
-answer about the wrong thing (documents/PDFs).
+answer about the wrong thing (documents/PDFs), and MOVE what chat can carry
+elsewhere (images inside a tool_result → a user message right after the turn's
+tool messages, since the chat `tool` role takes text only).
 """
 from __future__ import annotations
 
@@ -63,13 +65,41 @@ def _image_part(block: dict) -> dict:
 
 def _tool_result_text(block: dict) -> str:
     """Text a tool_result carries, flagged when the tool reported an error (the
-    chat `tool` role has no is_error field — the model must still see it failed)."""
+    chat `tool` role has no is_error field — the model must still see it failed).
+    A result that is ONLY images gets a pointer to where they went (see
+    `_tool_result_images`) — an empty tool message is refused by strict servers."""
     text = _blocks_text(block.get("content"))
+    if not text and _tool_result_images(block):
+        text = "(image result — attached in the next message)"
     return f"Error: {text}" if block.get("is_error") else text
+
+
+def _tool_result_images(block: dict) -> list[dict]:
+    """Image blocks inside a tool_result, as chat image parts. The chat `tool` role
+    takes text only, so these cannot stay where Anthropic put them; the caller moves
+    them into a user message right after the turn's tool messages. Dropping them — the
+    old behaviour — answered a question about a screenshot the model never saw
+    (Claude Code's Read tool returns image files exactly this way)."""
+    content = block.get("content")
+    if not isinstance(content, list):
+        return []
+    return [_image_part(b) for b in content if isinstance(b, dict) and b.get("type") == "image"]
 
 
 _STOP_REASON = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use",
                 "function_call": "tool_use", "content_filter": "end_turn"}
+
+
+def _stop_reason(finish_reason: Optional[str], has_tool_calls: bool) -> str:
+    """Anthropic stop_reason for a chat finish_reason. A message that carries tool
+    calls is `tool_use` whatever the backend said: several servers (Ollama, some
+    vLLM/LocalAI builds) report `stop` there, and `end_turn` makes Claude Code end the
+    turn instead of running the tool. `max_tokens` stays — a call cut off mid-arguments
+    must not be run."""
+    reason = _STOP_REASON.get(finish_reason or "", "end_turn")
+    if has_tool_calls and reason == "end_turn":
+        return "tool_use"
+    return reason
 
 
 def message_shell(mid: str, model: Optional[str], content: Optional[list] = None,
@@ -119,7 +149,7 @@ def chat_to_messages(chat_resp: dict, model: Optional[str]) -> dict:
     usage_in = chat_resp.get("usage") or {}
     return message_shell(
         _mid(), model, content=content,
-        stop_reason=_STOP_REASON.get(choice.get("finish_reason") or "", "end_turn"),
+        stop_reason=_stop_reason(choice.get("finish_reason"), bool(message.get("tool_calls"))),
         usage={"input_tokens": int(usage_in.get("prompt_tokens") or 0),
                "output_tokens": int(usage_in.get("completion_tokens") or 0)},
     )
@@ -223,7 +253,7 @@ async def messages_stream(chat_resp, model: Optional[str], input_tokens: int = 0
                     usage = obj["usage"]
                 choice = (obj.get("choices") or [{}])[0]
                 if choice.get("finish_reason"):
-                    stop_reason = _STOP_REASON.get(choice["finish_reason"], "end_turn")
+                    stop_reason = choice["finish_reason"]
                 d = choice.get("delta") or {}
 
                 think = d.get("reasoning") or d.get("reasoning_content")
@@ -292,7 +322,7 @@ async def messages_stream(chat_resp, model: Optional[str], input_tokens: int = 0
         yield close_open()
     final_usage = {"input_tokens": int((usage or {}).get("prompt_tokens") or input_tokens),
                    "output_tokens": int((usage or {}).get("completion_tokens") or 0)}
-    yield ev("message_delta", {"delta": {"stop_reason": stop_reason or "end_turn",
+    yield ev("message_delta", {"delta": {"stop_reason": _stop_reason(stop_reason, bool(tools)),
                                          "stop_sequence": None}, "usage": final_usage})
     yield ev("message_stop", {})
 
@@ -383,6 +413,7 @@ def messages_to_chat(body: dict, keep_cache_control: bool = False) -> dict:
             continue
         text_blocks: list[dict] = []
         images: list[dict] = []
+        tool_images: list[dict] = []          # images out of this turn's tool results
         tool_calls: list[dict] = []
         for block in content or []:
             if not isinstance(block, dict):
@@ -404,6 +435,10 @@ def messages_to_chat(body: dict, keep_cache_control: bool = False) -> dict:
                 # user wrote in the same turn — flush it right here to keep the order.
                 messages.append({"role": "tool", "tool_call_id": block.get("tool_use_id", ""),
                                  "content": _tool_result_text(block)})
+                if imgs := _tool_result_images(block):
+                    tool_images.append({"type": "text", "text": "Image(s) returned by tool call "
+                                        f"{block.get('tool_use_id', '')}:"})
+                    tool_images.extend(imgs)
             elif btype in ("thinking", "redacted_thinking"):
                 continue                      # Anthropic-only, inert for an OpenAI backend
             elif btype in ("document", "search_result"):
@@ -413,8 +448,10 @@ def messages_to_chat(body: dict, keep_cache_control: bool = False) -> dict:
             else:
                 logger.warning(f"anthropic bridge: dropping unknown content block '{btype}'")
         text_content = _text_parts(text_blocks, keep_cache_control)
-        if images:
-            parts: list[dict] = []
+        if images or tool_images:
+            # Tool-result images lead: they answer the calls, the user's own text and
+            # images follow as in the original turn.
+            parts: list[dict] = list(tool_images)
             if isinstance(text_content, list):
                 parts.extend(text_content)
             elif text_content:

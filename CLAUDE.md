@@ -110,14 +110,28 @@ they need via injected callables, staying hot-reload-safe.
   Anthropic backend AND an OpenRouter model with normal failover between them.
   `_HOP_BY_HOP` drops `x-api-key` alongside `authorization` — both are GATEWAY
   credentials (Claude Code sends the former), and forwarding either would hand the
-  caller's key to the backend.
+  caller's key to the backend. `_forward_headers` applies it (the one site that copies
+  client headers) and also drops RFC 7230 hop-by-hop headers (plus whatever
+  `connection` names), `expect`, `accept-encoding` (httpx negotiates what it can
+  decode — a browser's `br` came back as a body the gateway could not read), and what
+  identifies the client to a third party: `cookie`, `forwarded`/`x-forwarded-*`/
+  `x-real-ip`/`via`, `origin`/`referer`/`sec-*`, `x-source`. It stays a DENYLIST on
+  purpose: the Anthropic passthrough relies on whatever Claude Code sends
+  (`anthropic-*`, `x-stainless-*`, `x-app`, user-agent) and OpenRouter reads
+  `HTTP-Referer`/`X-Title` — an allowlist would silently strip the next such header.
+  The outgoing body is serialized ONCE (`OpenAIAdapter._encode`, compact UTF-8 like
+  httpx's own encoder): sent as `content=` bytes, not `json=` (which serialized it a
+  second time), and the same text is the stats row's request body — a multi-MB Claude
+  Code context cost ~25-30 ms/MB of event loop per pass. `stats._preview` likewise
+  collapses only the two ends it shows, never the whole body.
   Going the other way, every response builder keeps only its OWN headers
   (`call.rheaders` = `x-gateway-backend` + `x-reasoning-control`) — an upstream
   `content-length` would describe a body the gateway re-serializes — with ONE
   exception: `_ratelimit_headers()` carries the upstream's `retry-after` through,
   because that header is not diagnostics but an instruction to the caller. It is
-  merged in at all four places that rebuild a response from an upstream one
-  (`_dispatch_once`, both stream error paths, `_anthropic_error`), covered by
+  merged in at every place that rebuilds a response from an upstream one
+  (`_dispatch_once`, both stream error paths, `_anthropic_error`, and the two
+  HTTPException re-raises in `main.responses` — plain and streamed), covered by
   `test_ratelimit_headers.py`. Dropping it fails silently — the client still gets
   its 429 and just retries blind: measured 2026-09-01 on prod, one Claude Code
   request became ~10 upstream calls in 20 s against `api.anthropic.com`, which had
@@ -571,7 +585,15 @@ they need via injected callables, staying hot-reload-safe.
   skeleton every state (completed / stream events / background queued-failed)
   builds on. `main.py` keeps the endpoints, dispatch/parking, and background
   mode; the adapter attaches `resp.parsed_json` so the bridge never re-parses
-  the raw body.
+  the raw body. Streamed `delta.tool_calls` are collected per slot (the Messages
+  bridge's index/id rule) and emitted as complete `function_call` items after the
+  message/reasoning items (`output_item.added` → `function_call_arguments.delta`/
+  `.done` → `output_item.done`); a stream that dies — an upstream exception, an
+  in-band `error` payload, or an end with neither `finish_reason` nor `[DONE]` — ends
+  in `response.failed`, never `completed` around a truncated text. In the request
+  direction, consecutive `function_call` items (and the assistant text of that turn)
+  become ONE assistant message — one message per call is a 400 on strict servers.
+  `test_responses_bridge.py`.
 - **`anthropic_bridge.py`** — pure Messages↔Chat translation (no gateway state,
   no `main`/`adapters` imports): `messages_to_chat` / `chat_to_messages` /
   `messages_stream` (chat SSE → Anthropic SSE) / `estimate_input_tokens` and
@@ -579,7 +601,13 @@ they need via injected callables, staying hot-reload-safe.
   an `anthropic` backend forwards verbatim (see `AnthropicAdapter`). Translation
   policy: drop what is inert (`cache_control`, history `thinking` blocks,
   server-side tools), raise `UnsupportedContent` → 400 where dropping would
-  silently answer about content the model never saw (documents/PDFs). Covered by
+  silently answer about content the model never saw (documents/PDFs), and MOVE what
+  chat can carry elsewhere: images inside a `tool_result` (Claude Code's Read on an
+  image file) go into a user message right after the turn's tool messages, because
+  the chat `tool` role is text-only. A message carrying tool calls maps to
+  `stop_reason: tool_use` even when the backend said `stop` (Ollama and some
+  vLLM/LocalAI builds do) — `end_turn` there ends Claude Code's turn instead of
+  running the tool. Covered by
   `test_anthropic_bridge.py` (stdlib `unittest` — a streaming tool-call bridge fails
   silently rather than crashing). `ls tests/test_*.py` is the count of record —
   **thirty-three** files today — and each exists for that same reason: the mechanism it
@@ -757,9 +785,20 @@ they need via injected callables, staying hot-reload-safe.
   skips body parsing/stats blobs for non-text responses — via `route()`): all
   funnel through **`_dispatch_or_park()`** — `resolve_routes()` →
   ready vs busy split → `backend_adapters[bid].dispatch(NormalizedRequest)` to the
-  first ready, failing over on connection/timeout errors and on llama-swap's
-  "unable to start process" 502 (backend-local load failure, `_retryable_upstream_error`);
-  other HTTP error statuses return as-is. The adapter opens the upstream stream
+  first ready, failing over on every `httpx.TransportError` — connect errors, a pooled
+  keep-alive connection the backend had closed (`RemoteProtocolError`), a reset
+  (`ReadError`/`WriteError`); all of them surface before the client saw a byte — and on
+  llama-swap's "unable to start process" 502 (backend-local load failure,
+  `_retryable_upstream_error`); other HTTP error statuses return as-is. ONE exception:
+  a `ReadTimeout` on a `paid` backend (connected, sent, no answer within the 300 s read
+  budget — it is most likely still generating) answers 504 instead of failing over,
+  or the failover buys the same answer twice; on an unpaid backend it still fails over.
+  `adapters._CHAT_TIMEOUT` is `httpx.Timeout(300, connect=10, pool=30)` — a scalar 300
+  let a SYN-swallowing host hold the failover for five minutes. Anything else an adapter
+  raises is a clean 502 naming the backend (fault kind `error`, no failover — a bug
+  reproduces), and `main._unexpected_error` turns any exception left over on `/v1/*`
+  into a 502 through the HTTPException handler, so it is logged and `/v1/messages`
+  answers in Anthropic shape instead of a raw 500 Claude Code shows blank. The adapter opens the upstream stream
   BEFORE answering, so streamed upstream errors carry their real status too. All busy → **park by default** (FIFO queue, per-alias `park_s`)
   until a backend frees, else 503; no client field. Before dispatch,
   **sampling defaults** are folded in two stages whose ORDER is the precedence
@@ -1122,7 +1161,13 @@ cached at discovery (`normalize_pricing`: Together per-million, OpenRouter
 per-token). Streaming records the backend's usage chunk (the adapter always
 requests `include_usage` upstream); a backend that reports zeros/nothing
 (LocalAI streams all-zero usage — measured) gets gateway estimates instead
-(content-delta count ≈ completion tokens, ~chars/4 for the prompt).
+(content-delta count ≈ completion tokens, ~chars/4 for the prompt). A stream that
+does NOT end normally is recorded too, from the generator's `finally`
+(`_record_end`, both the normalized and the Anthropic passthrough stream): status
+499 when the client left (Esc in Claude Code — Starlette closes or cancels the body
+iterator), 502 when the upstream dropped mid-answer, with the tokens counted so far.
+Before, `_record` sat after the `finally` and such calls never reached the log — nor
+the month-cost quota, which sums `cost_usd` over every row.
 
 ## Conventions
 
