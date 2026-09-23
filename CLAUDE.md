@@ -930,6 +930,15 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   the Backends tab and the Dashboard panel (`admin._loaded_text`). `test_current_model.py`.
 - **Concurrency/busy** (`backend_inflight`, `backend_busy`): incremented in
   `dispatch()`/`generate()`, decremented on completion incl. the streamed `finally`.
+  A generation job claims in `_run_job` with the busy check right before
+  `_inflight_inc` (no await between) and the `try` that releases the slot right after
+  it — the candidate list is computed several awaits earlier and a failover target was
+  never checked, so both overran `max_concurrent`, and a cancel landing in an await
+  between claim and `try` leaked the slot for good. A candidate busy at claim time is
+  skipped; if that leaves the job unfinished, `_run_job` returns False and the job parks
+  again (`_run_gen_now` → `_run_gen_parked`) with its `state` — tried backends, attempts,
+  execution faults — carried over. The chain claims the same way (busy check → inc →
+  `try` → row updates).
 - **Re-routing onto a returning backend**: waiting work is never pinned to the
   backend it queued for. `refresh_backend` calls `_notify_slot_free()` on DOWN→UP
   and on a model-set change (parked calls re-evaluate); `apply_backend_change` and

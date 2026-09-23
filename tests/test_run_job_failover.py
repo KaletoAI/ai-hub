@@ -407,6 +407,50 @@ class ChainStage1BilledIsFinal(unittest.TestCase):
         self.assertEqual(main.backend_inflight.get("meshy:a", 0), 0)
 
 
+    def _stage1(self, boom=None):
+        import adapters as ad_mod
+
+        class _S1(_BillingAdapter):
+            def chain_export(self, cand, succ, params, prefix):
+                return ad_mod.ChainExport(f"{prefix}.glb")
+        return _S1(boom)
+
+    def test_a_cancel_during_the_chain_claim_does_not_leak_the_slot(self):
+        import threading
+        gate, entered = threading.Event(), threading.Event()
+
+        def slow_set_status(job_id, st):
+            entered.set()
+            gate.wait(5)
+            return True
+        self.jobs.set_status = slow_set_status
+        main.backend_adapters.update({"meshy:a": self._stage1(), "meshy:b": self._stage1(),
+                                      "meshy:r": _Adapter()})
+
+        async def go():
+            t = asyncio.create_task(main._run_chain("job1", "s1", self.succ, {}, None,
+                                                    {}, {}, {}, {}))
+            while not entered.is_set():
+                await asyncio.sleep(0.005)
+            t.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await t
+            gate.set()
+        asyncio.run(go())
+        self.assertEqual(main.backend_inflight.get("meshy:a", 0), 0)
+
+    def test_a_malformed_self_retries_value_does_not_crash_the_chain(self):
+        """K15: `_run_job` guards int(self_retries); the chain raised ValueError, which its
+        except-Exception arm turned into a failed job that never reached any backend."""
+        self.a["self_retries"] = "two"
+        s1 = self._stage1(ConnectionError("gone"))
+        main.backend_adapters.update({"meshy:a": s1, "meshy:b": self._stage1(ConnectionError("x")),
+                                      "meshy:r": _Adapter()})
+        s1.create = False                     # fails before any task → normal failover
+        main.backend_adapters["meshy:b"].create = False
+        asyncio.run(main._run_chain("job1", "s1", self.succ, {}, None, {}, {}, {}, {}))
+        self.assertEqual(s1.calls, 1)
+
 class CreateAnswerLost(unittest.TestCase):
     """The adapter half of K1: a create POST that went out whole but whose answer was lost
     (read timeout, dropped connection) may have created the task — the trace must say so,
@@ -441,6 +485,90 @@ class CreateAnswerLost(unittest.TestCase):
     def test_a_refused_connect_is_not_marked(self):
         import httpx
         self.assertNotIn("create_unconfirmed", self._create(httpx.ConnectError("refused")))
+
+
+class ClaimIsAtomic(unittest.TestCase):
+    """K4/K5: the job slot. A claim past `max_concurrent` (the busy check ran several awaits
+    before the claim, and a failover target was never checked at all) runs two prompts on a
+    backend that takes one — they simply queue inside ComfyUI, and the second job's time
+    budget burns while it waits. A cancel that lands between the claim and the `try` that
+    releases it leaks the slot for good: the backend then reads busy forever. Both look
+    like an ordinary slow or busy backend."""
+
+    setUp, tearDown = RunJobExecFailover.setUp, RunJobExecFailover.tearDown
+    _comfy = staticmethod(RunJobExecFailover._comfy)
+
+    @staticmethod
+    def _capped(name, cap=1):
+        return ({"name": name, "type": "comfyui", "max_concurrent": cap},
+                {"backend": name, "workflow_json": {}})
+
+    def _run(self, cands, state=None):
+        return asyncio.run(main._run_job("job1", "alias1", cands,
+                                         lambda b, c: types.SimpleNamespace(slot_held=False),
+                                         state))
+
+    def test_a_backend_at_its_cap_is_not_claimed(self):
+        ad = _Adapter()
+        main.backend_adapters["comfyui:gpu"] = ad
+        main.backend_inflight["comfyui:gpu"] = 1          # someone claimed it after our pick
+        self.assertFalse(self._run([self._capped("gpu")]))   # → park again
+        self.assertEqual(ad.calls, 0)
+        self.assertEqual(main.backend_inflight["comfyui:gpu"], 1)
+        self.assertIsNone(self.jobs.failed)                  # not reported as exhausted
+
+    def test_a_busy_failover_target_parks_and_the_state_carries_over(self):
+        a, b = _Adapter(ConnectionError("gone")), _Adapter()
+        main.backend_adapters.update({"comfyui:a": a, "comfyui:b": b})
+        main.backend_inflight["comfyui:b"] = 1
+        st = {}
+        cands = [self._capped("a"), self._capped("b")]
+        self.assertFalse(self._run(cands, st))
+        self.assertEqual((a.calls, b.calls), (1, 0))
+        main.backend_inflight["comfyui:b"] = 0               # b frees up
+        self.assertTrue(self._run(cands, st))                # a is not re-run …
+        self.assertEqual((a.calls, b.calls), (1, 1))
+        self.assertEqual(self.jobs.completed["meta"]["attempts"], 2)   # … and the count holds
+
+    def test_a_cancel_during_the_claim_does_not_leak_the_slot(self):
+        import threading
+        gate = threading.Event()
+        entered = threading.Event()
+
+        def slow_set_backend(job_id, name):
+            entered.set()
+            gate.wait(5)
+        self.jobs.set_backend = slow_set_backend
+        main.backend_adapters["comfyui:gpu"] = _Adapter()
+
+        async def go():
+            t = asyncio.create_task(main._run_job(
+                "job1", "alias1", [self._capped("gpu")],
+                lambda b, c: types.SimpleNamespace(slot_held=False)))
+            while not entered.is_set():
+                await asyncio.sleep(0.005)
+            t.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await t
+            gate.set()
+        asyncio.run(go())
+        self.assertEqual(main.backend_inflight.get("comfyui:gpu", 0), 0)
+
+    def test_a_lost_claim_at_request_time_queues_the_job(self):
+        parked = []
+
+        async def _park(job_id, alias, force, build_req, eligible=None, run_state=None):
+            parked.append(run_state)
+        orig = main._run_gen_parked
+        main._run_gen_parked = _park
+        try:
+            main.backend_adapters["comfyui:gpu"] = _Adapter()
+            main.backend_inflight["comfyui:gpu"] = 1
+            asyncio.run(main._run_gen_now("job1", "alias1", "", [self._capped("gpu")],
+                                          lambda b, c: types.SimpleNamespace(slot_held=False)))
+        finally:
+            main._run_gen_parked = orig
+        self.assertEqual(len(parked), 1)
 
 class _FlakyAdapter:
     """generate() raises each entry of `booms` in turn, then delivers."""
