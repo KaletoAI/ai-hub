@@ -42,7 +42,9 @@ CREATE TABLE IF NOT EXISTS calls (
     cache_read    INTEGER DEFAULT 0,
     cache_write   INTEGER DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS idx_calls_ts      ON calls(ts);
+-- (ts, backend) serves every time-window read AND the Dashboard's per-backend count
+-- as a covering index; it replaced a plain idx_calls_ts (a prefix of it, dropped in init).
+CREATE INDEX IF NOT EXISTS idx_calls_ts_backend ON calls(ts, backend);
 CREATE INDEX IF NOT EXISTS idx_calls_backend ON calls(backend);
 CREATE INDEX IF NOT EXISTS idx_calls_source  ON calls(source, ts);  -- month_cost quota scan
 """
@@ -60,15 +62,28 @@ def is_active() -> bool:
     return _DB_PATH is not None
 
 
+# The column shape of every per-call list (the console's _call_row template).
+_CALL_COLS = ("id, ts, duration_ms, backend, source, alias, model, endpoint, status, "
+              "input_tokens, output_tokens, cost_usd, req_preview, has_body, reasoning")
+
+# Both Dashboard-tick queries order/group so that SQLite reads the ts WINDOW through
+# idx_calls_ts_backend. `ORDER BY id DESC` walked the whole table backwards, and a bare
+# `GROUP BY backend` made the planner prefer idx_calls_backend (ordered for the grouping)
+# over the ts range — a full index scan per tick (274 ms at 300k rows, measured). The
+# unary `+` takes the column out of index consideration for the grouping only.
+# test_stats_store.py pins both plans.
+_SQL_RECENT_SINCE = (f"SELECT {_CALL_COLS} FROM calls WHERE ts > ? "
+                     f"ORDER BY ts DESC, id DESC LIMIT ?")
+_SQL_COUNT_BY_BACKEND_SINCE = "SELECT backend, COUNT(*) FROM calls WHERE ts > ? GROUP BY +backend"
+
+
 def recent_since(ts: int, limit: int = 100) -> list:
     """Calls completed since `ts` (unix secs), newest first — the dashboard's
     'last N minutes' window. Same column shape as summary()['recent'] so it
     renders with the identical row template."""
     if _DB_PATH is None:
         return []
-    return _q("SELECT id, ts, duration_ms, backend, source, alias, model, endpoint, status, "
-              "input_tokens, output_tokens, cost_usd, req_preview, has_body, reasoning "
-              "FROM calls WHERE ts > ? ORDER BY id DESC LIMIT ?", ts, limit)
+    return _q(_SQL_RECENT_SINCE, ts, limit)
 
 
 def count_since(ts: int) -> int:
@@ -83,7 +98,7 @@ def count_by_backend_since(ts: int) -> dict:
     if _DB_PATH is None:
         return {}
     return {r[0]: r[1] for r in
-            _q("SELECT backend, COUNT(*) FROM calls WHERE ts > ? GROUP BY backend", ts)}
+            _q(_SQL_COUNT_BY_BACKEND_SINCE, ts)}
 
 
 def summary(recent_limit: int = 50, model_limit: int = 30, source_limit: int = 20,
@@ -187,6 +202,7 @@ def init(db_path: str, blob_dir: str = "calls") -> None:
     with _conn() as c:
         c.execute("PRAGMA journal_mode=WAL")
         c.executescript(_SCHEMA)
+        c.execute("DROP INDEX IF EXISTS idx_calls_ts")    # a prefix of idx_calls_ts_backend
         # Migrate older DBs that predate later columns.
         cols = {r[1] for r in c.execute("PRAGMA table_info(calls)").fetchall()}
         for col, ddl in (("req_preview", "TEXT"),
