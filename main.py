@@ -533,14 +533,29 @@ def _notify_slot_free() -> None:
             ev.set()
 
 
+_bg_refs: set = set()                    # fire-and-forget tasks, held until they finish
+
+
+def _bg(coro) -> asyncio.Task:
+    """`asyncio.create_task` for fire-and-forget work, with the reference HELD until the
+    task is done. The event loop keeps only a weak reference to a task, so an unreferenced
+    one can be garbage-collected mid-flight — the after-job VRAM free silently never
+    happening, or a restart whose `finally` never clears `_comfy_restarting`, after which
+    that backend can never be restarted again (K20)."""
+    t = asyncio.create_task(coro)
+    _bg_refs.add(t)
+    t.add_done_callback(_bg_refs.discard)
+    return t
+
+
 _comfy_restarting: set[str] = set()      # backend ids with a restart() in flight
 
 
 def _spawn_comfy_restart(backend: dict, adapter, why: str) -> None:
     bid = backend_id(backend)
-    _comfy_restarting.add(bid)
     logger.warning(f"[{backend['name']}] restarting ComfyUI service ({why})")
     _note_fault(backend, "watchdog", "restart", why)
+    _comfy_restarting.add(bid)               # only once nothing before the task can raise
 
     async def _run():
         try:
@@ -550,7 +565,7 @@ def _spawn_comfy_restart(backend: dict, adapter, why: str) -> None:
             _note_fault(backend, "watchdog", "restart_failed", _err_text(e))
         finally:
             _comfy_restarting.discard(bid)
-    asyncio.create_task(_run())
+    _bg(_run())
 
 
 def _maybe_auto_restart(backend: dict, adapter) -> None:
@@ -3432,7 +3447,7 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req,
                         logger.info(f"✓ job {job_id} done on [{backend['name']}] — "
                                     f"{len(out.blobs)} artifact(s)"
                                     + (f" after {attempts} attempts" if attempts > 1 else ""))
-                    asyncio.create_task(_free_comfy_vram(backend, "job done"))
+                    _bg(_free_comfy_vram(backend, "job done"))
                     return True
                 except _GEN_FAILOVER_ERRORS as e:
                     _record_gen_attempt(bid, conn_fail=True)
@@ -3461,7 +3476,7 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req,
                         continue
                     logger.warning(f"✗ job {job_id} [{backend['name']}] {what} "
                                    f"({type(e).__name__}: {e}) — failing over")
-                    asyncio.create_task(_free_comfy_vram(backend, "job failover"))
+                    _bg(_free_comfy_vram(backend, "job failover"))
                 except adapters.ComfyPromptInterrupted as e:
                     # Somebody stopped OUR prompt on the backend (an operator in ComfyUI's
                     # own UI). A decision, not a fault: no failover — that would run what was
@@ -3498,7 +3513,7 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req,
                     last = e
                     logger.warning(f"✗ job {job_id} [{backend['name']}] execution failed: "
                                    f"{_err_text(e)} — trying the next backend")
-                    asyncio.create_task(_free_comfy_vram(backend, "job failure"))
+                    _bg(_free_comfy_vram(backend, "job failure"))
                     break                      # next candidate; never the same backend
                 except asyncio.CancelledError:
                     # Cancelled by the user (cancel_generation marks the row itself). The
@@ -3963,7 +3978,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                     # then claim stage 2's and upload the mesh into its input dir (released
                     # first, so no A-holds-waits-B cycle).
                     _inflight_dec(held); held = None
-                    asyncio.create_task(_free_comfy_vram(backend, "chain stage 1 done"))
+                    _bg(_free_comfy_vram(backend, "chain stage 1 done"))
                     # Stage 1 ran for minutes — the successor backend picked up front may be
                     # in a transient health dip right now. The mesh bytes are in hand and no
                     # slot is held, so waiting is free: park until it is healthy again (or
@@ -4063,7 +4078,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                     route = (f"{backend['name']}→{backend2['name']}" if cross else backend["name"])
                     logger.info(f"✓ chain job {job_id} on [{route}] ({alias}→{succ_alias}) "
                                 f"— {len(blobs)} artifact(s)")
-                asyncio.create_task(_free_comfy_vram(active, "chain done"))
+                _bg(_free_comfy_vram(active, "chain done"))
                 return
             except _GEN_FAILOVER_ERRORS as e:
                 _record_gen_attempt(backend_id(active), conn_fail=True)
@@ -4076,7 +4091,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                                    f"{_fault_label(e)}: {_err_text(e)}")
                     await asyncio.to_thread(jobs.fail, job_id, f"chain failed: {_err_text(e)}",
                                             fail_meta())
-                    asyncio.create_task(_free_comfy_vram(active, "chain failure"))
+                    _bg(_free_comfy_vram(active, "chain failure"))
                     return
                 billed = _billed_cloud_task(stage1_cand, _cloud_trace_of(req1), e, s1_prior_task)
                 if billed:
@@ -4090,14 +4105,14 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 logger.warning(f"✗ chain job {job_id} stage 1 [{backend['name']}] {_fault_label(e)} "
                                f"({type(e).__name__}: {e}) — failing over")
                 tried.add(backend["name"])
-                asyncio.create_task(_free_comfy_vram(backend, "chain stage-1 failure"))
+                _bg(_free_comfy_vram(backend, "chain stage-1 failure"))
                 continue
             except Exception as e:
                 _note_fault(active, "job", "execution", f"{alias}→{succ_alias}: {_err_text(e)}")
                 logger.warning(f"✗ chain job {job_id} [{active['name']}] ({alias}→{succ_alias}) "
                                f"failed: {_err_text(e)}")
                 await asyncio.to_thread(jobs.fail, job_id, f"chain failed: {_err_text(e)}", fail_meta())
-                asyncio.create_task(_free_comfy_vram(active, "chain failure"))
+                _bg(_free_comfy_vram(active, "chain failure"))
                 return
             except asyncio.CancelledError:
                 # cancelled by the user: keep a created (billed) cloud task findable (F1)
@@ -4181,7 +4196,7 @@ async def cancel_generation(job_id: str) -> bool:
     elif adapter is not None:
         await adapter.cancel(job_id)
     if b:
-        asyncio.create_task(_free_comfy_vram(b, "cancel"))     # no-op for non-ComfyUI (step 3)
+        _bg(_free_comfy_vram(b, "cancel"))     # no-op for non-ComfyUI (step 3)
     return True
 
 
@@ -5129,7 +5144,8 @@ def apply_backend_change() -> None:
     async def _discover():
         await asyncio.gather(*[refresh_backend(b, http_client) for b in enabled_backends()])
     try:
-        asyncio.get_running_loop().create_task(_discover())
+        asyncio.get_running_loop()           # outside a loop (import-time callers) → skip
+        _bg(_discover())
     except RuntimeError:
         pass
 

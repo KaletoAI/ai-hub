@@ -345,5 +345,40 @@ class AdapterRebuildKeepsState(unittest.TestCase):
         self.assertEqual(ad.last_restart, 123.0)
         self.assertIsNone(cl.credits)                          # another account's balance
 
+
+class BackgroundTasksAreHeld(unittest.TestCase):
+    """K20: `asyncio.create_task` keeps only a WEAK reference — an unreferenced fire-and-
+    forget task (the after-job VRAM free, a ComfyUI restart) can be collected mid-flight.
+    A lost restart never runs its `finally`, and that backend stays in
+    `_comfy_restarting` — never restartable again, manually or automatically."""
+
+    def test_a_background_task_is_referenced_until_it_finishes(self):
+        async def go():
+            gate = asyncio.Event()
+
+            async def work():
+                await gate.wait()
+            t = main._bg(work())
+            self.assertIn(t, main._bg_refs)
+            gate.set()
+            await t
+            await asyncio.sleep(0)
+            self.assertNotIn(t, main._bg_refs)
+        asyncio.run(go())
+
+    def test_a_restart_that_cannot_start_does_not_block_the_backend_forever(self):
+        b = {"name": "gpu", "type": "comfyui", "url": "http://gpu"}
+        orig = main._note_fault
+
+        def boom(*a, **k):
+            raise RuntimeError("fault log unavailable")
+        main._note_fault = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                main._spawn_comfy_restart(b, types.SimpleNamespace(), "test")
+        finally:
+            main._note_fault = orig
+        self.assertNotIn("comfyui:gpu", main._comfy_restarting)
+
 if __name__ == "__main__":
     unittest.main()
