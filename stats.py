@@ -7,11 +7,13 @@ Jobs & Calls, Dashboard). Zero dependencies beyond the stdlib; keep it that way.
 from __future__ import annotations
 
 import asyncio
+import calendar
 import gzip
 import json
 import logging
 import os
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -188,11 +190,49 @@ def cache_trend(hours: int = 24, buckets: int = 24, user: Optional[str] = None) 
     return {b: s for b, s in out.items() if any(r or w for _, r, w in s)}
 
 
+# Month-to-date cost per source, kept in memory: gate_request asks for it on EVERY
+# request of a user with a cost quota, and a range SUM over the month's rows cost
+# 10-46 ms each time. Seeded from the rows at init() for the current UTC month, then
+# advanced by every recorded call (_record_sync) — for that month and any later one,
+# which start at 0 and see all their rows go through this process. Keyed by
+# (source, month start); months before the seeded one fall back to the rows.
+_month_lock = threading.Lock()
+_month_sums: dict = {}
+_month_seeded: Optional[int] = None
+
+
+def _month_start(ts: int) -> int:
+    t = time.gmtime(ts)
+    return calendar.timegm((t.tm_year, t.tm_mon, 1, 0, 0, 0, 0, 0, 0))
+
+
+def _seed_month(c) -> None:
+    global _month_seeded, _month_sums
+    ms = _month_start(int(time.time()))
+    rows = c.execute("SELECT source, COALESCE(SUM(cost_usd),0) FROM calls WHERE ts >= ? "
+                     "GROUP BY source", (ms,)).fetchall()
+    with _month_lock:
+        _month_sums = {(src, ms): float(cost or 0) for src, cost in rows}
+        _month_seeded = ms
+
+
+def _month_add(source, ts: int, cost) -> None:
+    if not cost:
+        return
+    key = (source, _month_start(ts))
+    with _month_lock:
+        _month_sums[key] = _month_sums.get(key, 0.0) + float(cost)
+
+
 def month_cost(user: str, month_start_ts: int) -> float:
-    """Total cost_usd for a user since a UTC timestamp — drives the monthly
-    cost quota (E1). 0 when stats are off (quota simply can't bind then)."""
+    """Total cost_usd for a user since a UTC month start — drives the monthly
+    cost quota (E1). 0 when stats are off (quota simply can't bind then).
+    Answered from memory for the seeded month and later ones (see _month_sums)."""
     if _DB_PATH is None:
         return 0.0
+    with _month_lock:
+        if _month_seeded is not None and month_start_ts >= _month_seeded:
+            return float(_month_sums.get((user, int(month_start_ts)), 0.0))
     r = _q("SELECT COALESCE(SUM(cost_usd),0) FROM calls WHERE source = ? AND ts >= ?",
            user, month_start_ts)
     return float(r[0][0]) if r else 0.0
@@ -225,6 +265,7 @@ def init(db_path: str, blob_dir: str = "calls", body_max_kb: Optional[int] = Non
                          ("cache_write", "INTEGER DEFAULT 0")):
             if col not in cols:
                 c.execute(f"ALTER TABLE calls ADD COLUMN {col} {ddl}")
+        _seed_month(c)
     logger.info(f"stats: SQLite at {_DB_PATH} (WAL), call bodies in {_BLOB_DIR}/")
 
 
@@ -349,6 +390,7 @@ def _record_sync(row: tuple, request_text=None, response_text=None, response_aud
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (*row, 1 if want_body else 0),
         )
+        _month_add(row[3], row[0], row[10])         # source, ts, cost_usd
         if want_body:
             try:
                 _write_body(cur.lastrowid, request_text, response_text, response_audio, store_request)

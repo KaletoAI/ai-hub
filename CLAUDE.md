@@ -561,6 +561,9 @@ they need via injected callables, staying hot-reload-safe.
   (`store_request=False`): one agent retrying a refused 1 MB request stored it per retry.
   The row goes in with `has_body` in ONE autocommitted INSERT on a
   `synchronous=NORMAL` connection (WAL: no fsync per call, never inconsistent).
+  `month_cost` (the monthly cost quota, asked on EVERY request of a capped user) is
+  answered from memory: `_month_sums` is seeded from the rows at `init()` for the
+  current UTC month and advanced by `_record_sync`; only an earlier month reads rows.
   The `calls` row carries the applied `reasoning` control (shown in LLM Calls) and
   the prompt-cache split `cache_read`/`cache_write` — both SUBSETS of
   `input_tokens` (which stays the total the model processed), so

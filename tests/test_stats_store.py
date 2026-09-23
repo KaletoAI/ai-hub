@@ -201,5 +201,53 @@ class WritePath(_StatsDB):
         self.assertEqual(stats._q("SELECT has_body FROM calls WHERE id=?", cid)[0][0], 1)
 
 
+def _month_start(ts):
+    import calendar
+    t = time.gmtime(ts)
+    return calendar.timegm((t.tm_year, t.tm_mon, 1, 0, 0, 0, 0, 0, 0))
+
+
+class MonthCost(_StatsDB):
+    """gate_request asks for the caller's month-to-date cost on EVERY request of a user
+    with a cost quota — a range SUM over the month's rows each time (10-46 ms measured)."""
+
+    def _reinit(self):
+        stats.init(str(stats._DB_PATH), stats._BLOB_DIR)
+
+    def test_seeded_at_init_and_kept_current_without_touching_the_db(self):
+        now = int(time.time())
+        ms = _month_start(now)
+        self._bulk([_row(ms + 10, source="kai", cost=1.5), _row(ms + 20, source="kai", cost=0.25),
+                    _row(ms - 10, source="kai", cost=100.0),              # last month
+                    _row(ms + 30, source="bob", cost=7.0)])
+        self._reinit()                                                    # "restart"
+        opened = []
+        orig = stats._conn
+
+        @contextmanager
+        def counting():
+            opened.append(1)
+            with orig() as c:
+                yield c
+        stats._conn = counting
+        try:
+            self.assertAlmostEqual(stats.month_cost("kai", ms), 1.75)
+            self.assertAlmostEqual(stats.month_cost("bob", ms), 7.0)
+            self.assertEqual(stats.month_cost("nobody", ms), 0.0)
+            self.assertEqual(opened, [])                                  # answered from memory
+        finally:
+            stats._conn = orig
+        _record(source="kai", cost_usd=0.5)
+        self.assertAlmostEqual(stats.month_cost("kai", ms), 2.25)
+
+    def test_an_earlier_month_is_still_answered_from_the_rows(self):
+        now = int(time.time())
+        ms = _month_start(now)
+        prev = _month_start(ms - 86400)
+        self._bulk([_row(prev + 5, source="kai", cost=3.0)])
+        self._reinit()
+        self.assertAlmostEqual(stats.month_cost("kai", prev), 3.0)
+
+
 if __name__ == "__main__":
     unittest.main()
