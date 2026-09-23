@@ -23,6 +23,7 @@ import copy
 import fnmatch
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -157,6 +158,27 @@ def normalize_pricing(m: dict) -> Optional[dict[str, float]]:
                 out[key] = _to_float(p.get(src)) * 1_000_000
         return out
     return None
+
+
+def reported_cost(usage) -> Optional[float]:
+    """USD the BACKEND says a call cost (OpenRouter: `usage.cost`, on every answer and
+    in the stream's usage chunk), or None when it names none. Wins over any price
+    list: it already carries discounts, provider routing and price changes the
+    listing cached at discovery cannot know. Under BYOK `cost` is only OpenRouter's
+    fee — the provider bills the key separately (`cost_details.
+    upstream_inference_cost`), so both are added. A 0 is a figure (a free model);
+    anything not a finite, non-negative number is no figure at all."""
+    def num(v):
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return None
+        return float(v) if math.isfinite(v) and v >= 0 else None
+    if not isinstance(usage, dict):
+        return None
+    cost = num(usage.get("cost"))
+    if cost is not None and usage.get("is_byok") is True:
+        upstream = num((usage.get("cost_details") or {}).get("upstream_inference_cost"))
+        cost += upstream or 0.0
+    return cost
 
 
 def _is_priced(m: dict) -> bool:
@@ -700,6 +722,7 @@ class _StreamNormalizer:
         self.buf = b""
         self.in_tok = self.out_tok = 0      # best backend-reported usage so far
         self.cache_read = self.cache_write = 0   # prompt-cache share of in_tok (stats only)
+        self.cost: Optional[float] = None   # what the backend says it charged (stats only)
         self.pieces = 0                     # content-bearing deltas ≈ completion tokens
         self.meta: dict = {}                # id/model/created of the last chunk seen
         self.usage_sent = False
@@ -766,6 +789,9 @@ class _StreamNormalizer:
             self.cache_write = max(self.cache_write,
                                    int(det.get("cache_write_tokens")
                                        or u.get("cache_creation_input_tokens") or 0))
+            c = reported_cost(u)
+            if c is not None:
+                self.cost = c
         if not obj.get("choices"):                            # terminal usage chunk
             if u is None:
                 return line + "\n"                            # odd keepalive — leave it
@@ -1259,9 +1285,10 @@ class OpenAIAdapter(BackendAdapter):
     def _record(self, req: NormalizedRequest, call: _Call, status: int,
                 in_tok: int, out_tok: int, response_text: Optional[str] = None,
                 response_audio: Optional[tuple] = None,
-                cache: tuple[int, int] = (0, 0)) -> int:
+                cache: tuple[int, int] = (0, 0), cost: Optional[float] = None) -> int:
         """Fire-and-forget stats row for this dispatch; returns the elapsed ms.
-        `cache` is (read, write) — the prompt-cache share of `in_tok`."""
+        `cache` is (read, write) — the prompt-cache share of `in_tok`; `cost` is what
+        the backend reported (`reported_cost`), else it is priced from the listing."""
         ctx = self.ctx
         elapsed_ms = int((time.monotonic() - call.started) * 1000)
         ctx.note_speed(self.bid, out_tok, elapsed_ms, status)   # speed-routing EWMA (guarded in main)
@@ -1269,7 +1296,8 @@ class OpenAIAdapter(BackendAdapter):
             duration_ms=elapsed_ms, backend=self.name, source=call.source,
             alias=req.alias, model=call.real_model, endpoint=(req.stats_endpoint or req.path),
             status=status, input_tokens=in_tok, output_tokens=out_tok,
-            cost_usd=ctx.cost_usd(self.bid, call.real_model, in_tok, out_tok, cache[0], cache[1]),
+            cost_usd=(cost if cost is not None else
+                      ctx.cost_usd(self.bid, call.real_model, in_tok, out_tok, cache[0], cache[1])),
             request_text=call.req_text or None, response_text=response_text,
             response_audio=response_audio,
             reasoning=call.reasoning_ctl,
@@ -1342,7 +1370,7 @@ class OpenAIAdapter(BackendAdapter):
                 status = 502
             in_tok, out_tok = norm.tokens()
             self._record_end(req, call, status, in_tok, out_tok,
-                             cache=(norm.cache_read, norm.cache_write))
+                             cache=(norm.cache_read, norm.cache_write), cost=norm.cost)
         end = _StreamEnd(stream_cm, client_cm, release)
 
         async def generate():
@@ -1397,7 +1425,9 @@ class OpenAIAdapter(BackendAdapter):
         elapsed_ms = self._record(req, call, resp.status_code, in_tok, out_tok,
                                   response_text=(resp.text if is_texty else None),
                                   response_audio=resp_audio,
-                                  cache=self._cache_of(resp_json if isinstance(resp_json, dict) else {}))
+                                  cache=self._cache_of(resp_json if isinstance(resp_json, dict) else {}),
+                                  cost=reported_cost((resp_json or {}).get("usage")
+                                                     if isinstance(resp_json, dict) else None))
         if call.log_on:
             logger.info(f"← [{self.name}] {req.path} HTTP {resp.status_code} ({elapsed_ms} ms)")
         out = Response(resp.content, status_code=resp.status_code,

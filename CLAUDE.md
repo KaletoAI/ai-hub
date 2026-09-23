@@ -1065,7 +1065,11 @@ they need via injected callables, staying hot-reload-safe.
   `normalize_pricing` reads OpenRouter's `input_cache_read`/`input_cache_write` (absent,
   never 0), that `_cost_usd` prices each share at its own rate with the input price as
   fallback and never below zero, that `_record` hands it the split, and OpenRouter's
-  `prompt_tokens_details.cache_write_tokens`).
+  `prompt_tokens_details.cache_write_tokens`; and that a backend's OWN figure —
+  `adapters.reported_cost`, OpenRouter's `usage.cost`, plus `upstream_inference_cost`
+  under BYOK where `cost` is only the fee — is what gets booked on the plain path, the
+  stream and the Messages bridge, never reaches a strict client's usage chunk, and falls
+  back to the price list when absent or not a finite non-negative number).
   Run them all with `python -m unittest discover -s tests -t .` (no runner dependency).
 - **`openai_image_bridge.py`** — pure request/response plumbing for the OpenAI
   image shims (`multipart_list`, `parse_size`, `coerce_scalar`, `images_uploads`
@@ -1564,7 +1568,9 @@ cuts x-source for every row) and 401 rows are capped at `_UNAUTH_LOG_PER_MIN` (6
 minute, the overflow summarised in one log line (`test_rejected_log.py`). The same handler renders `/v1/messages` errors in
 Anthropic shape, so that form lives in ONE place. Cost from pricing
 cached at discovery (`normalize_pricing`: Together per-million, OpenRouter
-per-token, plus OpenRouter's cache prices), computed ONCE in `_record` via
+per-token, plus OpenRouter's cache prices), computed ONCE in `_record`: the backend's own figure
+first (`adapters.reported_cost` — OpenRouter's `usage.cost`, exact to the cent against
+its dashboard, incl. discounts and routing the cached listing cannot know), else
 `main._cost_usd`, which prices `cache_read`/`cache_write` at their own rate (input
 price where none is listed) — a cache read is often 1/50 of fresh input. Streaming records the backend's usage chunk (the adapter always
 requests `include_usage` upstream); a backend that reports zeros/nothing

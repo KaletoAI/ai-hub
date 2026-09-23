@@ -10,8 +10,18 @@ against 0.14 $/M fresh). Nothing errors; a user's cost quota just runs out early
 So the three links are pinned: discovery reads the cache prices, `_cost_usd`
 prices each share at its own rate (falling back to the input price where the
 backend names none), and the adapter hands the cache split to it.
+
+Where the backend SAYS what the call cost (OpenRouter's `usage.cost`, on every
+answer and in the stream's usage chunk), that figure wins over any price list: it
+already contains discounts, provider routing and price changes the listing cached
+at discovery cannot know. Pinned on the plain path, the stream and the Messages
+bridge, BYOK (where `cost` is only OpenRouter's fee), and the fallback when a
+backend reports nothing or garbage.
 """
 import asyncio
+import json
+
+import httpx
 import os
 import sys
 import tempfile
@@ -152,6 +162,135 @@ class CacheWriteCounter(unittest.TestCase):
         usage = {"prompt_tokens": 100, "completion_tokens": 5,
                  "prompt_tokens_details": {"cached_tokens": 60, "cache_write_tokens": 30}}
         self.assertEqual(a._cache_of({"usage": usage}), (60, 30))
+
+
+# ── the backend's own figure ──────────────────────────────────────────────────
+
+# OpenRouter usage, verbatim shape (measured 2026-09-23 through the gateway)
+OR_USAGE = {"prompt_tokens": 13907, "completion_tokens": 5, "total_tokens": 13912,
+            "cost": 4.29464e-05, "is_byok": False,
+            "prompt_tokens_details": {"cached_tokens": 13888, "cache_write_tokens": 0},
+            "cost_details": {"upstream_inference_cost": 4.29464e-05}}
+
+
+class ReportedCostParse(unittest.TestCase):
+    def test_openrouter_cost(self):
+        self.assertEqual(adapters.reported_cost(OR_USAGE), 4.29464e-05)
+
+    def test_zero_is_a_figure(self):
+        # a free model's 0 is what it cost — not "unknown"
+        self.assertEqual(adapters.reported_cost({"cost": 0}), 0.0)
+
+    def test_byok_adds_the_upstream_bill(self):
+        # BYOK: `cost` is OpenRouter's fee, the provider bills the key separately
+        u = {"cost": 0.0001, "is_byok": True,
+             "cost_details": {"upstream_inference_cost": 0.002}}
+        self.assertAlmostEqual(adapters.reported_cost(u), 0.0021)
+
+    def test_absent_or_garbage_is_none(self):
+        for u in (None, {}, {"prompt_tokens": 5}, {"cost": None}, {"cost": "0.1"},
+                  {"cost": True}, {"cost": -1.0}, {"cost": float("nan")}, "x"):
+            self.assertIsNone(adapters.reported_cost(u), u)
+
+
+def _adapter(handler, rows, computed=0.777):
+    async def record_call(**kw):
+        rows.append(kw)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    ctx = adapters.AdapterContext(
+        auth_headers=lambda b: {}, inflight_inc=lambda b: None, inflight_dec=lambda b: None,
+        cost_usd=lambda *a: computed, source_of=lambda r: "t", record_call=record_call,
+        log_enabled=lambda: False)
+    ctx.http_client = lambda: client
+    return adapters.OpenAIAdapter({"name": "or", "url": "https://openrouter.ai/api"}, ctx), client
+
+
+def _req(path, body, stream):
+    return adapters.NormalizedRequest(
+        path=path, alias="m", real_model="m", body=body, stream=stream,
+        raw=types.SimpleNamespace(headers={}, client=None, state=types.SimpleNamespace()))
+
+
+def _chat_json(usage):
+    return {"id": "c1", "object": "chat.completion", "model": "m",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                         "finish_reason": "stop"}], "usage": usage}
+
+
+def _sse(usage):
+    lines = [{"id": "c1", "object": "chat.completion.chunk", "model": "m",
+              "choices": [{"index": 0, "delta": {"role": "assistant", "content": "ok"}}]},
+             {"id": "c1", "object": "chat.completion.chunk", "model": "m",
+              "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+             {"id": "c1", "object": "chat.completion.chunk", "model": "m", "choices": [],
+              "usage": usage}]
+    return "".join(f"data: {json.dumps(x)}\n\n" for x in lines).encode() + b"data: [DONE]\n\n"
+
+
+class ReportedCostBooked(unittest.TestCase):
+    def _run(self, path, body, stream, handler, computed=0.777):
+        rows = []
+        a, client = _adapter(handler, rows, computed)
+
+        async def go():
+            resp = await a.dispatch(_req(path, body, stream))
+            if hasattr(resp, "body_iterator"):
+                async for _ in resp.body_iterator:
+                    pass
+            for _ in range(5):
+                await asyncio.sleep(0)
+            await client.aclose()
+        asyncio.run(go())
+        self.assertEqual(len(rows), 1)
+        return rows[0]
+
+    def _plain(self, usage):
+        return lambda r: httpx.Response(200, json=_chat_json(usage))
+
+    def _stream(self, usage):
+        return lambda r: httpx.Response(200, headers={"content-type": "text/event-stream"},
+                                         content=_sse(usage))
+
+    CHAT = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+
+    def test_plain_books_the_reported_cost(self):
+        row = self._run("/v1/chat/completions", self.CHAT, False, self._plain(OR_USAGE))
+        self.assertEqual(row["cost_usd"], 4.29464e-05)
+
+    def test_stream_books_the_reported_cost(self):
+        row = self._run("/v1/chat/completions", {**self.CHAT, "stream": True}, True,
+                        self._stream(OR_USAGE))
+        self.assertEqual(row["cost_usd"], 4.29464e-05)
+        self.assertEqual(row["cache_read"], 13888)
+
+    def test_messages_bridge_books_the_reported_cost(self):
+        body = {"model": "m", "max_tokens": 50, "stream": True,
+                "messages": [{"role": "user", "content": "hi"}]}
+        row = self._run("/v1/messages", body, True, self._stream(OR_USAGE))
+        self.assertEqual(row["cost_usd"], 4.29464e-05)
+
+    def test_no_reported_cost_falls_back_to_the_price_list(self):
+        usage = {k: v for k, v in OR_USAGE.items() if k not in ("cost", "cost_details")}
+        row = self._run("/v1/chat/completions", self.CHAT, False, self._plain(usage))
+        self.assertEqual(row["cost_usd"], 0.777)
+        row = self._run("/v1/chat/completions", {**self.CHAT, "stream": True}, True,
+                        self._stream(usage))
+        self.assertEqual(row["cost_usd"], 0.777)
+
+    def test_reported_cost_never_reaches_a_strict_client(self):
+        # the client's usage chunk keeps the strict OpenAI shape
+        rows, out = [], []
+        a, client = _adapter(self._stream(OR_USAGE), rows)
+
+        async def go():
+            resp = await a.dispatch(_req("/v1/chat/completions",
+                                         {**self.CHAT, "stream": True,
+                                          "stream_options": {"include_usage": True}}, True))
+            async for c in resp.body_iterator:
+                out.append(c if isinstance(c, bytes) else c.encode())
+            await client.aclose()
+        asyncio.run(go())
+        self.assertNotIn(b'"cost"', b"".join(out))
 
 
 if __name__ == "__main__":
