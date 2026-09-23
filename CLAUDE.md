@@ -71,7 +71,9 @@ they need via injected callables, staying hot-reload-safe.
   pre-closed `<|channel>thought` tail, although the model can only emit plain
   answer text then) and
   `ComfyUIAdapter` (`type: comfyui`; `discover()` via `/object_info` →
-  models + **installed LoRAs**, plus an **executor watchdog** via `/queue`:
+  models + **installed LoRAs** (the MB-sized body parsed in a worker thread,
+  `_parse_object_info` — never on the loop; `test_comfy_discover.py`), plus an
+  **executor watchdog** via `/queue`:
   same head prompt pending with an idle executor across ≥2 checks and
   ≥`stuck_after_s` (default 90) → `ComfyExecutorStuck` → the normal DOWN path
   in `refresh_backend` (ComfyUI answers HTTP even when its prompt worker died —

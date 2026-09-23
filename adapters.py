@@ -2474,6 +2474,13 @@ def input_path_ref(backend: dict, stored: str) -> str:
     return f"{indir}/{stored}" if indir else stored
 
 
+def _parse_object_info(raw: bytes) -> tuple:
+    """(node_types, models, loras) from a raw /object_info body — the CPU part of a
+    ComfyUI discovery, run via asyncio.to_thread."""
+    oi = json.loads(raw)
+    return _comfy_node_types(oi), _comfy_models(oi), _comfy_loras(oi)
+
+
 class ComfyUIAdapter(BackendAdapter):
     """ComfyUI image/video/audio backend. discover() via /object_info; generate()
     submits a parametrized workflow and polls /history, then fetches /view."""
@@ -2496,9 +2503,11 @@ class ComfyUIAdapter(BackendAdapter):
         url = self.backend["url"].rstrip("/")
         resp = await client.get(f"{url}/object_info", timeout=_COMFY_DISCOVERY_TIMEOUT)
         resp.raise_for_status()
-        oi = resp.json()
-        self._node_types = _comfy_node_types(oi)      # cache slot types for bypass (free — same fetch)
-        caps = Capabilities(models=_comfy_models(oi), loras=_comfy_loras(oi), pricing={})
+        # Several MB of JSON per poll (every 30 s, every 3 s while DOWN and calls wait):
+        # parsed and walked in a worker thread, never on the event loop.
+        node_types, models, loras = await asyncio.to_thread(_parse_object_info, resp.content)
+        self._node_types = node_types                 # cache slot types for bypass (free — same fetch)
+        caps = Capabilities(models=models, loras=loras, pricing={})
         qr = await client.get(f"{url}/queue", timeout=_COMFY_DISCOVERY_TIMEOUT)
         qr.raise_for_status()
         self._check_executor(qr.json())               # raises ComfyExecutorStuck → DOWN path
