@@ -3180,8 +3180,11 @@ class ComfyUIAdapter(BackendAdapter):
                         have = {b.name for b in blobs}
                         blobs += [b for b in await self._fetch_by_globs(client, url, outputs, req.output_globs)
                                   if b.name not in have]
-                    normalize_delivery(blobs, rig, req.texture_format)   # V-flip (+ optional jpeg) textures
-                    warnings = validate_delivery(blobs, rig)
+                    # PIL work on multi-MB textures: off the event loop, which every other
+                    # request and every other job's poll shares (P9)
+                    await asyncio.to_thread(normalize_delivery, blobs, rig,
+                                            req.texture_format)   # V-flip (+ optional jpeg) textures
+                    warnings = await asyncio.to_thread(validate_delivery, blobs, rig)
                 else:
                     blobs = await self._fetch_outputs(client, url, wf, outputs, req.output_node,
                                                       req.output_ext, req.output_globs)
@@ -3193,8 +3196,8 @@ class ComfyUIAdapter(BackendAdapter):
                         raise RuntimeError(f"configured output node {req.output_node} produced "
                                            f"no fetchable artifact{extra} (no matching file in its outputs)")
                     if req.dummy_check:          # 2x2-dummy safety net (case mode does it in validate);
-                        _check_glb_not_dummy(blobs)  # opt-out for legit 1x1/2x2 constant-colour exports
-                    warnings = validate_delivery(blobs, None)   # rig-less: the >30 MB size guideline
+                        await asyncio.to_thread(_check_glb_not_dummy, blobs)   # opt-out: legit 1x1/2x2 exports
+                    warnings = await asyncio.to_thread(validate_delivery, blobs, None)   # rig-less: >30 MB guideline
         finally:
             if not req.slot_held:
                 self.ctx.inflight_dec(self.bid)
@@ -3749,8 +3752,11 @@ class CloudTaskAdapter(BackendAdapter):
         # client timeout, and httpx's WriteTimeout has an EMPTY str() — the job died as
         # "chain failed: " with nothing after the colon. So the create gets its OWN
         # size-scaled budget (~4 s per MiB ≈ a 256 KiB/s floor) without slowing the polls.
-        raw = json.dumps(body)                  # serialised ONCE, sent as content=
-        mb = len(raw) / (1024 * 1024)           # ASCII JSON: chars == bytes
+        # Serialised ONCE, straight to the bytes httpx sends, and in a worker thread: a
+        # rigging body is ~93 MB of base64, and dumping it on the loop stalled every other
+        # request for a third of a second (P10).
+        raw = await asyncio.to_thread(lambda: json.dumps(body).encode())
+        mb = len(raw) / (1024 * 1024)
         try:
             pr = await client.post(
                 url, content=raw,
@@ -3933,8 +3939,9 @@ class MeshyAdapter(CloudTaskAdapter):
         """One task, one delivery: Meshy answers every requested format off the same
         task, so there is nothing to chase after the poll."""
         endpoint = meshy.endpoint_of(cand)
-        body = meshy.build_request(cand, _gen_values(req), req.upload_images or {},
-                                   req.upload_files or {})            # MeshyInput → final
+        # In a thread: a rigging body base64-encodes the whole mesh (P10). MeshyInput → final.
+        body = await asyncio.to_thread(meshy.build_request, cand, _gen_values(req),
+                                       req.upload_images or {}, req.upload_files or {})
         task_id = await self._create(client, self._api(f"/{endpoint}"), body, endpoint, req)
         req.cloud_trace["meshy_task_id"] = task_id      # the name existing rows/views read
         state = await self._poll(client, endpoint, task_id, opts["target_formats"], opts,

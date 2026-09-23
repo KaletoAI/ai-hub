@@ -4069,8 +4069,10 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                     # are rigs the cloud built to its own conventions: tag them, never re-flip
                     # them or fail them against ComfyUI-shaped rules.
                     if chain_rig in ("generic", "mixamo"):
-                        normalize_delivery(blobs, chain_rig, stage1_cand.get("texture_format"))
-                        warnings = validate_delivery(blobs, chain_rig)   # raises → job fails clearly
+                        # PIL on textures — off the event loop (P9)
+                        await asyncio.to_thread(normalize_delivery, blobs, chain_rig,
+                                                stage1_cand.get("texture_format"))
+                        warnings = await asyncio.to_thread(validate_delivery, blobs, chain_rig)   # raises → job fails clearly
                         if warnings:
                             meta["warnings"] = warnings
                 await asyncio.to_thread(jobs.complete, job_id, blobs, meta)

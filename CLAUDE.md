@@ -199,7 +199,9 @@ they need via injected callables, staying hot-reload-safe.
   an empty node still errors, never an extras-only delivery; globs WITHOUT a
   node are the whole delivery). A relative `/view` path keeps its dirs as the
   subfolder (`_view_params`).
-  `normalize_delivery` (case mode + chain level, normalize-once flagged) V-flips
+  `normalize_delivery` (case mode + chain level, normalize-once flagged; it,
+  `validate_delivery` and `_check_glb_not_dummy` are PIL work and run via
+  `asyncio.to_thread`, never on the loop) V-flips
   generic texture PNGs and — alias Output option `texture_format: jpeg` —
   transcodes them to JPEG q90 (real alpha keeps PNG; ComfyUI has no JPEG export).
   **Input isolation** (`upload_prefix` on `NormalizedRequest`, `upload_prefix_for`
@@ -231,7 +233,9 @@ they need via injected callables, staying hot-reload-safe.
   ~60 sites Meshy used to be wired into. It owns the in-flight slot (incl. the `finally`
   decrement and `slot_held` for chain stages), `generate()` (run → download every
   `state.downloads` in order → thumbnail outside the rig endpoint → the job meta),
-  `_create` (serialise ONCE, size-scaled timeout ≈ 4 s/MiB — a 93 MB body once died on
+  `_create` (serialise ONCE — to bytes, in a worker thread, like Meshy's body build: a
+  rigging body is ~93 MB of base64 and dumping it on the loop stalled every request —
+  size-scaled timeout ≈ 4 s/MiB — a 93 MB body once died on
   the 30 s client timeout with an EMPTY `str(e)`), `_poll` (a 4xx, or a 200 whose BODY
   refuses the task, is a verdict about the TASK: three IN A ROW → final; transport
   errors, 5xx and 429 are about the SERVICE and get `disconnect_grace` — a poll-rate
