@@ -398,18 +398,24 @@ they need via injected callables, staying hot-reload-safe.
   (`_gen_fault_kind`: a builtin `ConnectionError`/`ReadError` after connecting — the
   box died mid-work), which IS a fault. `main._note_fault(backend, source, kind, detail)`
   records at the
-  recording points: `health` in `refresh_backend` (ONCE per outage, on the UP→DOWN
-  transition; the next UP writes kind `faults.RECOVERED` with `dur_s` = the outage,
-  which is what downtime sums from), `call` in `_dispatch_over` (failover exceptions,
+  recording points: `health` in `refresh_backend` (ONCE per outage — the first poll at
+  which the outage is a FAULT, usually the UP→DOWN one; `backend_error[bid]
+  ["fault_since"]` carries that moment across every later poll whatever kind it shows,
+  and the next UP writes kind `faults.RECOVERED` with `dur_s` = now − `fault_since`,
+  which is what downtime sums from; the open-outage downtime in `faults_info` reads the
+  same key. Keyed on the CURRENT kind instead, a timeout→unreachable outage was never
+  closed and an unreachable→timeout one closed without opening), `call` in `_dispatch_over` (failover exceptions,
   llama-swap's 502, and any 5xx passed to the client, with the body snippet), `job` in
   `_run_job`/`_run_chain` (EVERY failed attempt, self-retries included — the job row
   hides those), `watchdog` in `_spawn_comfy_restart`. Always on and independent of
   `stats.enabled`: a bounded memory ring plus SQLite `faults.db` (`faults.db_path`,
   `retention_days` default 7, startup-only; an unopenable DB degrades to memory and the
   Statistic panel says so). `bundles()` groups by backend+source+kind+status+
-  `bundle_key` (hex ids and numbers masked), `per_backend()` clips downtime to the
-  window and counts an outage STILL open (`down_since` from `backend_error`) up to now.
-  `main.faults_info()` resolves Hosts-tab labels and feeds the Dashboard (card, a
+  `bundle_key` (hex ids and numbers masked — computed ONCE at `record()` into column
+  `bkey`; `init()` adds and backfills it on an older DB), `per_backend()` clips downtime
+  to the window and counts an outage STILL open (`down_since` from `backend_error`) up
+  to now. `main.faults_info()` is memoised 5 s keyed on `faults.generation()` (a new
+  event shows at once; it runs per Dashboard tick and per /health), resolves Hosts-tab labels and feeds the Dashboard (card, a
   `faults · 24h` column, panel `_dash_faults`) and Statistic (`_faults_panel`, anchor
   `#faults`); `/health` carries `faults_24h` per backend. `faults.db*` is in
   `.gitignore` AND both `deploy.sh` exclude lists — without the latter `rsync --delete`

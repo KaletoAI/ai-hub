@@ -733,10 +733,11 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
             logger.info(f"[{label}] model filter — {len(caps.models)} of {total} models kept")
         backend_healthy[bid] = True
         prev_err = backend_error.pop(bid, None)
-        # Closes an outage the fault log opened → its length. A switched-off backend coming
-        # back opened none (being off is not a fault — faults.NOT_FAULT_KINDS).
-        if prev_err and not was_healthy and prev_err.get("kind") not in faults.NOT_FAULT_KINDS:
-            down_s = max(0, int(time.time()) - int(prev_err.get("since") or time.time()))
+        # Closes the outage the fault log opened → its length, from the moment it became a
+        # fault (`fault_since`), whatever kind it showed last. A switched-off backend that
+        # never turned into a fault opened none (faults.NOT_FAULT_KINDS) — none to close.
+        if prev_err and prev_err.get("fault_since") is not None:
+            down_s = max(0, int(time.time()) - int(prev_err["fault_since"]))
             _note_fault(backend, "health", faults.RECOVERED,
                         f"back after {down_s} s ({prev_err.get('kind')})", dur_s=down_s)
         if not was_healthy or changed:     # a backend came online / gained models →
@@ -748,13 +749,23 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
         prev = backend_error.get(bid)
         if prev and prev.get("kind") == info["kind"] and prev.get("status") == info["status"]:
             info["since"] = prev["since"]
-        backend_error[bid] = info
+        # The fault log sees ONE outage per DOWN, whatever kinds it runs through: it is
+        # opened the first time it is a fault (the DOWN poll, or later — a switched-off box
+        # that starts timing out), never again, and `fault_since` rides along every poll
+        # until the recovery closes it. Keyed on the kind it had WHEN it opened, a
+        # timeout→unreachable outage was never closed (no downtime) and an
+        # unreachable→timeout one closed without ever opening.
+        fault_since = prev.get("fault_since") if prev and not backend_healthy.get(bid, True) else None
         if backend_healthy.get(bid, True):
             hint = " (credential rejected — check the api key)" if info["kind"] == "auth" else ""
             # `_err_text`: an httpx timeout stringifies to "" — the journal read "DOWN —"
             # with nothing after it (measured 2026-09-12/13 on prod, a dozen times).
             logger.warning(f"[{label}] DOWN — {_err_text(e)}{hint}")
+        if fault_since is None and info["kind"] not in faults.NOT_FAULT_KINDS:
+            fault_since = int(time.time())
             _note_fault(backend, "health", info["kind"], info["detail"], status=info["status"])
+        info["fault_since"] = fault_since
+        backend_error[bid] = info
         backend_healthy[bid] = False
         backend_pricing[bid] = {}
         backend_loras[bid] = set()
@@ -4635,7 +4646,32 @@ def dashboard_snapshot() -> dict:
     }
 
 
+# faults_info runs on every Dashboard tick (per viewer) and every /health: up to 20k
+# events read and bundled each time. Memoised briefly — keyed on the fault log's
+# generation, so a NEW fault shows at once; only an open outage's running downtime
+# may lag by the TTL.
+_FAULTS_INFO_TTL_S = 5.0
+_faults_info_memo: dict = {}
+
+
+def faults_info_memo_clear() -> None:
+    _faults_info_memo.clear()
+
+
 def faults_info(window_s: int = faults.WINDOW_S) -> dict:
+    """Memoised _faults_info (see _FAULTS_INFO_TTL_S). Callers must not mutate it."""
+    key = (int(window_s), faults.generation())
+    hit = _faults_info_memo.get(key)
+    mono = time.monotonic()
+    if hit is not None and mono - hit[0] < _FAULTS_INFO_TTL_S:
+        return hit[1]
+    val = _faults_info(window_s)
+    _faults_info_memo.clear()
+    _faults_info_memo[key] = (mono, val)
+    return val
+
+
+def _faults_info(window_s: int = faults.WINDOW_S) -> dict:
     """The last `window_s` of the fault log, derived for the console (Dashboard +
     Statistic): `backends` = one summary per backend (faults, outages, downtime incl.
     an outage STILL open, the last error), `bundles` = the faults grouped by message.
@@ -4645,10 +4681,12 @@ def faults_info(window_s: int = faults.WINDOW_S) -> dict:
     since = now - int(window_s)
     evs = faults.events_since(since)
     by_bid = {backend_id(b): b for b in backends}
-    down_since = {bid: int((backend_error.get(bid) or {}).get("since") or now)
+    # Open outages = the ones the log OPENED (fault_since, see refresh_backend) — the same
+    # clock the recovery closes them with, whatever kind they show now.
+    down_since = {bid: int(backend_error[bid]["fault_since"])
                   for bid, b in by_bid.items()
-                  if is_enabled(b) and bid in backend_error and not backend_healthy.get(bid, False)
-                  and (backend_error.get(bid) or {}).get("kind") not in faults.NOT_FAULT_KINDS}
+                  if is_enabled(b) and not backend_healthy.get(bid, False)
+                  and (backend_error.get(bid) or {}).get("fault_since") is not None}
     per = faults.per_backend(evs, since, now, down_since)
 
     def label(host: str) -> str:

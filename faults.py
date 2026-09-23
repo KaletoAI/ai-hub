@@ -50,7 +50,9 @@ _DB_PATH: Optional[str] = None
 _MEM: deque = deque(maxlen=_MEM_MAX)
 _lock = threading.Lock()
 
-_COLS = ("ts", "bid", "backend", "type", "host", "source", "kind", "status", "detail", "dur_s")
+_COLS = ("ts", "bid", "backend", "type", "host", "source", "kind", "status", "detail", "dur_s",
+         "bkey")
+_generation = 0                  # +1 per recorded event — lets main's faults_info memo notice one
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS faults (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -63,7 +65,8 @@ CREATE TABLE IF NOT EXISTS faults (
     kind    TEXT    NOT NULL,
     status  INTEGER,
     detail  TEXT,
-    dur_s   INTEGER
+    dur_s   INTEGER,
+    bkey    TEXT            -- bundle_key(detail), computed once at insert
 );
 CREATE INDEX IF NOT EXISTS idx_faults_ts ON faults(ts);
 """
@@ -77,6 +80,12 @@ def init(db_path: str) -> None:
         with sqlite3.connect(db_path, timeout=10) as c:
             c.execute("PRAGMA journal_mode=WAL")
             c.executescript(_SCHEMA)
+            cols = {r[1] for r in c.execute("PRAGMA table_info(faults)").fetchall()}
+            if "bkey" not in cols:                   # a DB from before the stored key
+                c.execute("ALTER TABLE faults ADD COLUMN bkey TEXT")
+            todo = c.execute("SELECT id, detail FROM faults WHERE bkey IS NULL").fetchall()
+            c.executemany("UPDATE faults SET bkey = ? WHERE id = ?",
+                          [(bundle_key(d or ""), i) for i, d in todo])
         _DB_PATH = db_path
     except Exception as e:
         _DB_PATH = None
@@ -93,7 +102,7 @@ def _insert(ev: dict) -> None:
     try:
         with sqlite3.connect(_DB_PATH, timeout=10) as c:
             c.execute(f"INSERT INTO faults ({', '.join(_COLS)}) VALUES ({', '.join('?' * len(_COLS))})",
-                      tuple(ev[k] for k in _COLS))
+                      tuple(ev.get(k) for k in _COLS))
     except Exception as e:
         logger.warning(f"faults: insert failed: {e}")
 
@@ -104,6 +113,7 @@ def record(*, bid: str, backend: str, source: str, kind: str, detail: str = "",
     """Record one event and return it. A kind in NOT_FAULT_KINDS is dropped HERE, so no
     recording point can book a switched-off backend as a fault (returns None).
     Never raises; on an event loop the DB write runs off-loop."""
+    global _generation
     if kind in NOT_FAULT_KINDS:
         return None
     ev = {"ts": int(ts if ts is not None else time.time()), "bid": str(bid),
@@ -112,14 +122,21 @@ def record(*, bid: str, backend: str, source: str, kind: str, detail: str = "",
           "status": int(status) if isinstance(status, int) else None,
           "detail": " ".join(str(detail or "").split())[:_DETAIL_MAX],
           "dur_s": int(dur_s) if dur_s is not None else None}
+    ev["bkey"] = bundle_key(ev["detail"])
     with _lock:
         _MEM.append(ev)
+        _generation += 1
     if _DB_PATH is not None:
         try:
             asyncio.get_running_loop().run_in_executor(None, _insert, ev)
         except RuntimeError:                  # no running loop (tests, sync callers)
             _insert(ev)
     return ev
+
+
+def generation() -> int:
+    """Changes whenever an event is recorded (a cheap "anything new?" for memos)."""
+    return _generation
 
 
 def events_since(since: int, limit: int = 20000) -> list:
@@ -180,7 +197,10 @@ def bundles(events: list) -> list:
     for ev in events:
         if ev["kind"] == RECOVERED:
             continue
-        key = (ev["bid"], ev["source"], ev["kind"], ev.get("status"), bundle_key(ev.get("detail") or ""))
+        bkey = ev.get("bkey")
+        if bkey is None:                          # an event from before the stored key
+            bkey = bundle_key(ev.get("detail") or "")
+        key = (ev["bid"], ev["source"], ev["kind"], ev.get("status"), bkey)
         g = groups.get(key)
         if g is None:
             g = groups[key] = {"bid": ev["bid"], "backend": ev["backend"], "type": ev.get("type"),
