@@ -7,6 +7,7 @@ Jobs & Calls, Dashboard). Zero dependencies beyond the stdlib; keep it that way.
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import logging
 import os
@@ -20,6 +21,12 @@ logger = logging.getLogger(__name__)
 
 _DB_PATH: Optional[Path] = None
 _BLOB_DIR: str = "calls"
+# A stored body keeps at most this many characters per side (request / response): a
+# Claude Code turn re-sends its whole context, so uncapped blobs cost ~1 MB per CALL.
+# Beyond the cap the head and the tail are kept — where the system prompt and the
+# newest turn sit. `stats.body_max_kb` in config.
+_BODY_MAX_CHARS: int = 256 * 1024
+BODY_RETENTION_DAYS_DEFAULT = 14     # bodies are pruned after this many days; the ROW stays
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS calls (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -191,13 +198,19 @@ def month_cost(user: str, month_start_ts: int) -> float:
     return float(r[0][0]) if r else 0.0
 
 
-def init(db_path: str, blob_dir: str = "calls") -> None:
+def init(db_path: str, blob_dir: str = "calls", body_max_kb: Optional[int] = None) -> None:
     """Open / create the stats DB, set WAL, ensure schema. Full call bodies
     (request + response) live on disk under `blob_dir` (never in the DB), keyed
-    by call id, and are pruned together with their row."""
-    global _DB_PATH, _BLOB_DIR
+    by call id, gzip-compressed and capped at `body_max_kb` per side; they are
+    pruned with their row, or earlier by `body_retention_days` (see prune_once)."""
+    global _DB_PATH, _BLOB_DIR, _BODY_MAX_CHARS
     _DB_PATH = Path(db_path)
     _BLOB_DIR = blob_dir
+    if body_max_kb:
+        try:
+            _BODY_MAX_CHARS = max(1024, int(body_max_kb) * 1024)
+        except (TypeError, ValueError):
+            logger.warning(f"stats: ignoring invalid body_max_kb {body_max_kb!r}")
     os.makedirs(_BLOB_DIR, exist_ok=True)
     with _conn() as c:
         c.execute("PRAGMA journal_mode=WAL")
@@ -218,6 +231,10 @@ def init(db_path: str, blob_dir: str = "calls") -> None:
 @contextmanager
 def _conn():
     conn = sqlite3.connect(_DB_PATH, isolation_level=None, timeout=10.0)
+    # Per connection (not persisted). In WAL mode NORMAL only gives up durability of
+    # the LAST commits on a power cut — never consistency — and saves an fsync per
+    # recorded call; a call-log row is worth less than that fsync on the request path.
+    conn.execute("PRAGMA synchronous=NORMAL")
     try:
         yield conn
     finally:
@@ -225,7 +242,13 @@ def _conn():
 
 
 def _body_path(call_id: int) -> str:
-    return os.path.join(_BLOB_DIR, f"{call_id}.json")
+    """Where a call's body is WRITTEN (gzip). Reads also accept the legacy plain
+    `<id>.json` of blobs stored before compression (_body_paths)."""
+    return os.path.join(_BLOB_DIR, f"{call_id}.json.gz")
+
+
+def _body_paths(call_id: int) -> tuple:
+    return (_body_path(call_id), os.path.join(_BLOB_DIR, f"{call_id}.json"))
 
 
 def _audio_path(call_id: int) -> str:
@@ -242,10 +265,30 @@ def _as_obj(text):
         return text
 
 
+def _capped(text):
+    """A body side for storage: parsed JSON when it fits the cap, else head + tail
+    of the raw text with a marker saying how much was dropped."""
+    if text is None or len(text) <= _BODY_MAX_CHARS:
+        return _as_obj(text)
+    keep = _BODY_MAX_CHARS // 2
+    return {"_truncated": f"{len(text)} chars — only the first and last {keep} are stored "
+                          f"(stats.body_max_kb)",
+            "head": text[:keep], "tail": text[-keep:]}
+
+
 def get_body(call_id: int) -> Optional[dict]:
-    """Full {request, response} for a call from its on-disk blob (or None)."""
+    """Full {request, response} for a call from its on-disk blob (or None). Reads the
+    gzip blob, or the plain JSON one written before bodies were compressed."""
+    gz, plain = _body_paths(int(call_id))
     try:
-        with open(_body_path(int(call_id)), "r", encoding="utf-8") as f:
+        with gzip.open(gz, "rt", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, EOFError):
+        return None
+    try:
+        with open(plain, "r", encoding="utf-8") as f:
             return json.load(f)
     except (OSError, ValueError):
         return None
@@ -276,28 +319,42 @@ def get_audio(call_id: int) -> Optional[tuple]:
     return p, (mime or "audio/wav")
 
 
-def _record_sync(row: tuple, request_text=None, response_text=None, response_audio=None) -> None:
+_REQUEST_NOT_STORED = "(not stored — the call was refused before any backend saw it)"
+
+
+def _write_body(call_id: int, request_text, response_text, response_audio,
+                store_request: bool) -> None:
+    payload = {"request": _capped(request_text) if store_request else _REQUEST_NOT_STORED,
+               "response": _capped(response_text)}
+    if response_audio:                          # binary body (TTS WAV): own file + JSON marker
+        data, mime = response_audio
+        with open(_audio_path(call_id), "wb") as af:
+            af.write(data)
+        payload["response"] = {"_audio": mime or "audio/wav", "bytes": len(data)}
+    with gzip.open(_body_path(call_id), "wt", encoding="utf-8", compresslevel=5) as f:
+        json.dump(payload, f, ensure_ascii=False)
+
+
+def _record_sync(row: tuple, request_text=None, response_text=None, response_audio=None,
+                 store_request: bool = True) -> None:
+    want_body = request_text is not None or response_text is not None or response_audio is not None
     with _conn() as c:
+        # ONE autocommitted statement: has_body goes in with the row instead of a second
+        # UPDATE (and commit) after the blob write. The rare failed blob write takes it
+        # back; a reader racing the write for a few ms at worst sees "no stored body".
         cur = c.execute(
             "INSERT INTO calls (ts, duration_ms, backend, source, alias, model, "
             "endpoint, status, input_tokens, output_tokens, cost_usd, req_preview, reasoning, "
-            "cache_read, cache_write) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            row,
+            "cache_read, cache_write, has_body) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (*row, 1 if want_body else 0),
         )
-        if request_text is not None or response_text is not None or response_audio is not None:
+        if want_body:
             try:
-                payload = {"request": _as_obj(request_text), "response": _as_obj(response_text)}
-                if response_audio:                  # binary body (TTS WAV): own file + JSON marker
-                    data, mime = response_audio
-                    with open(_audio_path(cur.lastrowid), "wb") as af:
-                        af.write(data)
-                    payload["response"] = {"_audio": mime or "audio/wav", "bytes": len(data)}
-                with open(_body_path(cur.lastrowid), "w", encoding="utf-8") as f:
-                    json.dump(payload, f, ensure_ascii=False)
-                c.execute("UPDATE calls SET has_body=1 WHERE id=?", (cur.lastrowid,))
+                _write_body(cur.lastrowid, request_text, response_text, response_audio, store_request)
             except Exception as e:                  # row stays valid, body view just absent
                 logger.warning(f"stats: body blob write failed for call {cur.lastrowid}: {e}")
+                c.execute("UPDATE calls SET has_body=0 WHERE id=?", (cur.lastrowid,))
 
 
 def _preview(text: Optional[str], head: int = 50, tail: int = 50) -> Optional[str]:
@@ -328,10 +385,14 @@ async def record_call(
     reasoning: Optional[str] = None,
     cache_read: int = 0,
     cache_write: int = 0,
+    store_request: bool = True,
 ) -> None:
     """Async-safe insert. Never raises into the request path. Full request/response
     bodies (when given) are written to an on-disk blob, not the DB row;
     `response_audio` = (bytes, mime) for binary TTS replies (own blob + player).
+    `store_request=False` keeps the request out of the blob (the preview column still
+    describes it) — for refused calls, whose body would be the one nobody reads,
+    repeated as often as a misconfigured client retries.
 
     `cache_read`/`cache_write` break `input_tokens` down: how much of it the
     backend served from its prompt cache and how much it wrote into the cache.
@@ -357,32 +418,68 @@ async def record_call(
         max(0, int(cache_write or 0)),
     )
     try:
-        await asyncio.to_thread(_record_sync, row, request_text, response_text, response_audio)
+        await asyncio.to_thread(_record_sync, row, request_text, response_text, response_audio,
+                                store_request)
     except Exception as e:
         logger.warning(f"stats: insert failed: {e}")
 
 
-async def prune_loop(retention_days: int, interval_s: int = 3600) -> None:
-    """Periodically delete rows older than retention_days. 0 = disabled."""
-    if retention_days <= 0:
+def _drop_blobs(call_id: int) -> None:
+    for p in (*_body_paths(call_id), _audio_path(call_id)):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def prune_once(retention_days: float = 0, body_retention_days: float = BODY_RETENTION_DAYS_DEFAULT) -> tuple:
+    """Delete rows older than `retention_days` (0 = keep forever) with their blobs, and
+    the BODY blobs of rows older than `body_retention_days` (0 = keep forever) — the row
+    itself stays for the aggregates and the monthly cost quota. (rows, bodies) removed."""
+    now = int(time.time())
+    rows = bodies = 0
+    with _conn() as c:
+        if body_retention_days and float(body_retention_days) > 0:
+            cutoff = now - int(float(body_retention_days) * 86400)
+            ids = [r[0] for r in c.execute(
+                "SELECT id FROM calls WHERE ts < ? AND has_body = 1", (cutoff,)).fetchall()]
+            for cid in ids:
+                _drop_blobs(cid)
+            c.execute("UPDATE calls SET has_body = 0 WHERE ts < ? AND has_body = 1", (cutoff,))
+            bodies = len(ids)
+        if retention_days and float(retention_days) > 0:
+            cutoff = now - int(float(retention_days) * 86400)
+            ids = [r[0] for r in c.execute("SELECT id FROM calls WHERE ts < ?", (cutoff,)).fetchall()]
+            for cid in ids:
+                _drop_blobs(cid)
+            c.execute("DELETE FROM calls WHERE ts < ?", (cutoff,))
+            rows = len(ids)
+    return rows, bodies
+
+
+async def prune_loop(retention_days: float, body_retention_days: float = BODY_RETENTION_DAYS_DEFAULT,
+                     interval_s: int = 3600) -> None:
+    """Hourly prune_once(). Returns at once when both retentions are 0 (keep forever).
+    A blank/None value means the default (rows: forever, bodies: 14 days) — the Server
+    tab stores an emptied field as ""."""
+    def days(v, default):
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return float(default)
+        return float(v)
+    try:
+        retention_days = days(retention_days, 0)
+        body_retention_days = days(body_retention_days, BODY_RETENTION_DAYS_DEFAULT)
+    except (TypeError, ValueError):
+        logger.warning("stats: invalid retention setting — pruning disabled")
+        return
+    if retention_days <= 0 and body_retention_days <= 0:
         return
     while True:
         try:
-            cutoff = int(time.time()) - retention_days * 86400
-            def _prune():
-                with _conn() as c:
-                    ids = [r[0] for r in c.execute("SELECT id FROM calls WHERE ts < ?", (cutoff,)).fetchall()]
-                    for cid in ids:
-                        for p in (_body_path(cid), _audio_path(cid)):
-                            try:
-                                os.remove(p)
-                            except OSError:
-                                pass
-                    c.execute("DELETE FROM calls WHERE ts < ?", (cutoff,))
-                    return len(ids)
-            n = await asyncio.to_thread(_prune)
-            if n:
-                logger.info(f"stats: pruned {n} rows older than {retention_days} days")
+            rows, bodies = await asyncio.to_thread(prune_once, retention_days, body_retention_days)
+            if rows or bodies:
+                logger.info(f"stats: pruned {rows} rows older than {retention_days:g} days, "
+                            f"{bodies} bodies older than {body_retention_days:g} days")
         except Exception as e:
             logger.warning(f"stats: prune failed: {e}")
         await asyncio.sleep(interval_s)

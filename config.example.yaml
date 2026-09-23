@@ -81,8 +81,10 @@ stats:
   enabled: false
   db_path: stats.db
   retention_days: 0   # 0 = keep forever; otherwise prune older rows hourly
-  # blob_dir: calls   # full request/response bodies live here as files, never in the
-  #                   # DB; they are pruned together with their rows
+  # blob_dir: calls   # full request/response bodies live here as gzip files, never in
+  #                   # the DB; they go with their row, or earlier:
+  # body_retention_days: 14   # bodies older than this are deleted, the row stays (0 = keep)
+  # body_max_kb: 256          # per side; a bigger request/response keeps head + tail only
 
 # Backend fault log (Dashboard + Statistic → Backend faults): every DOWN, failed-over
 # call, crashed job attempt and ComfyUI restart per backend. Always on; read at startup.

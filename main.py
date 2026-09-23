@@ -940,8 +940,11 @@ async def lifespan(app: FastAPI):
     # /ui → Statistic now (so no extra port/bind).
     prune_task: Optional[asyncio.Task] = None
     if stats_cfg.get("enabled"):
-        stats.init(stats_cfg.get("db_path", "stats.db"), stats_cfg.get("blob_dir", "calls"))
-        prune_task = asyncio.create_task(stats.prune_loop(stats_cfg.get("retention_days", 0)))
+        stats.init(stats_cfg.get("db_path", "stats.db"), stats_cfg.get("blob_dir", "calls"),
+                   body_max_kb=stats_cfg.get("body_max_kb"))
+        prune_task = asyncio.create_task(stats.prune_loop(
+            stats_cfg.get("retention_days", 0),
+            stats_cfg.get("body_retention_days")))          # None/"" = stats' default
         logger.info("stats: recording on; dashboard at /ui → Statistic")
     # snapshot the restart-only server state actually in effect, so the UI can flag
     # when an edited setting needs a restart to apply.
@@ -949,6 +952,7 @@ async def lifespan(app: FastAPI):
         stats_enabled=bool(stats_cfg.get("enabled")),
         stats_db_path=stats_cfg.get("db_path", "stats.db"),
         stats_retention_days=stats_cfg.get("retention_days", 0),
+        stats_body_retention_days=stats_cfg.get("body_retention_days", stats.BODY_RETENTION_DAYS_DEFAULT),
         jobs_enabled=jobs_prune_task is not None,        # actually running
         jobs_db_path=jobs_cfg.get("db_path", "jobs.db"),
         jobs_blob_dir=jobs_cfg.get("blob_dir", "jobs"),
@@ -1013,6 +1017,9 @@ def _record_rejected(request: Request, exc: HTTPException) -> None:
             status=exc.status_code, input_tokens=0, output_tokens=0, cost_usd=0.0,
             request_text=(json.dumps(body, ensure_ascii=False) if isinstance(body, dict) else None),
             response_text=json.dumps({"error": {"message": str(exc.detail)}}, ensure_ascii=False),
+            # The reason is the body worth keeping; the request only feeds the preview —
+            # an agent retrying a refused 1 MB request stored it once per retry.
+            store_request=False,
         ))
     except Exception as e:                       # never let logging break the answer
         logger.warning(f"stats: could not record a rejected call: {e}")
@@ -5044,7 +5051,8 @@ def apply_server_settings() -> None:
     # restart-only: overlaid onto stats_cfg / jobs_cfg so the next start picks them up
     # (these init once at startup). Lets config.yaml shed the jobs/stats db knobs.
     for skey, ckey in (("stats_enabled", "enabled"),
-                       ("stats_db_path", "db_path"), ("stats_retention_days", "retention_days")):
+                       ("stats_db_path", "db_path"), ("stats_retention_days", "retention_days"),
+                       ("stats_body_retention_days", "body_retention_days")):
         if skey in s:
             stats_cfg[ckey] = s[skey]
     for skey, ckey in (("jobs_enabled", "enabled"), ("jobs_db_path", "db_path"),
@@ -5083,6 +5091,8 @@ def server_info() -> dict:
             "stats_enabled": bool(stats_cfg.get("enabled")),
             "stats_db_path": stats_cfg.get("db_path", "stats.db"),
             "stats_retention_days": stats_cfg.get("retention_days", 0),
+            "stats_body_retention_days": stats_cfg.get("body_retention_days",
+                                                       stats.BODY_RETENTION_DAYS_DEFAULT),
             "jobs_enabled": bool(jobs_cfg.get("enabled")),
             "jobs_db_path": jobs_cfg.get("db_path", "jobs.db"),
             "jobs_blob_dir": jobs_cfg.get("blob_dir", "jobs"),

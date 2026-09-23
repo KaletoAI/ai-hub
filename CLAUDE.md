@@ -552,6 +552,15 @@ they need via injected callables, staying hot-reload-safe.
   **in the `/ui` Statistic and Input & Routing tabs** (no separate port — the old standalone
   :4001 server was folded into the console and its code removed; `stats.py` is data only,
   admin renders). Zero new dependencies — keep it.
+  Bodies are files, never DB columns: `calls/<id>.json.gz` (gzip; `get_body` still reads
+  the plain `<id>.json` of older blobs), each side capped at `body_max_kb` (default 256 —
+  beyond it head + tail are kept, marked `_truncated`), deleted after
+  `body_retention_days` (default 14) by `prune_once` while the ROW stays — row retention
+  (`retention_days`, default 0 = forever) is separate because the aggregates and the
+  monthly cost quota read the rows. A refused call keeps its reason, not its request
+  (`store_request=False`): one agent retrying a refused 1 MB request stored it per retry.
+  The row goes in with `has_body` in ONE autocommitted INSERT on a
+  `synchronous=NORMAL` connection (WAL: no fsync per call, never inconsistent).
   The `calls` row carries the applied `reasoning` control (shown in LLM Calls) and
   the prompt-cache split `cache_read`/`cache_write` — both SUBSETS of
   `input_tokens` (which stays the total the model processed), so

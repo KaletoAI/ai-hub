@@ -7132,6 +7132,9 @@ _SRV_RESTART = [
     ("stats_enabled", "bool", "enabled", "record calls (dashboard in Statistic tab)"),
     ("stats_db_path", "text", "db path", ""),
     ("stats_retention_days", "int", "retention days", "0 = keep forever"),
+    ("stats_body_retention_days", "int", "body retention days",
+     "request/response bodies are deleted after this many days, the call row stays "
+     "(blank = 14; 0 = keep with the row)"),
     ("__grp", "", "Jobs (image/video generation)", ""),
     ("jobs_enabled", "bool", "enabled", "auto-on when image models exist"),
     ("jobs_db_path", "text", "db path", ""),
