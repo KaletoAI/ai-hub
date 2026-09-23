@@ -441,7 +441,11 @@ they need via injected callables, staying hot-reload-safe.
   config, then authoritative. `decrypt_secret` lets LEGACY plaintext pass through (old
   rows keep working until re-saved); anything that must have been minted by the gateway
   itself — the /ui session cookie — decrypts with `strict=True`, or a hand-typed value
-  is accepted as genuine.
+  is accepted as genuine. A BACKEND's api key is the opposite of a user key: never
+  rendered back (`_backend_form` shows a blank password field + an `api_key_clear` box;
+  blank keeps the stored key, and for a config backend being copied into the store
+  `backend_save` takes it from the live backend via `_backend_api_key` — the summary only
+  carries `api_key_set`; `test_backend_key_field.py`).
 - **`admin.py`** — the `/ui` console (mounted via `admin.register(app)` +
   `add_api_route`, *not* `include_router` — broken in this starlette build;
   callbacks injected via `admin.bind(...)`). Session-gated by `_ui_guard` once

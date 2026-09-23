@@ -5191,6 +5191,7 @@ def gateway_info() -> dict:
             "max_concurrent": b.get("max_concurrent"),
             "chat_only": bool(b.get("chat_only")), "serverless_only": bool(b.get("serverless_only")),
             "local": bool(b.get("local")), "paid": bool(b.get("paid")),
+            "api_key_set": bool(b.get("api_key")),      # the key itself never leaves main
             "sampling_defaults": b.get("sampling_defaults") or None,
             # The filter globs themselves, not just the resulting counts: the backend
             # editor falls back to THIS summary for a config-defined backend (nothing in
@@ -5455,6 +5456,9 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
            admin_session_tag=admin_session_tag,
            admin_credential_exists=admin_credential_exists,
            admin_change_refusal=admin_change_refusal,
+           backend_api_key=lambda name, typ: next(
+               (b.get("api_key") for b in backends
+                if b["name"] == name and b.get("type", "openai") == typ), None),
            dashboard_snapshot=dashboard_snapshot, cancel_generation=cancel_generation,
            drain_backend=begin_drain, cancel_drain=cancel_drain,
            set_backend_enabled=set_backend_enabled,

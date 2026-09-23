@@ -150,6 +150,8 @@ _ui_locked: Callable[[], bool] = lambda: False
 _admin_credential_exists: Callable[[], bool] = lambda: True
 # users-after-the-change → refusal code (see _USER_REFUSALS) or None.
 _admin_change_refusal: Callable[[list], Optional[str]] = lambda users_after: None
+# (name, type) → the live backend's api_key (config or store), never rendered.
+_backend_api_key: Callable[[str, str], Optional[str]] = lambda name, typ: None
 # (admin name, is_master) → fingerprint of that admin's CURRENT credential, None = no
 # longer an admin. Sessions carry it, so revoking the credential revokes them.
 _admin_session_tag: Callable[[Optional[str], bool], Optional[str]] = lambda name, master: None
@@ -1449,7 +1451,13 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
               "(a cloud API). The scheduler sends a request to the fastest free <b>unpaid</b> backend "
               "and reaches for a paid one only when no unpaid backend is free.</p>"
             + _field("max_concurrent", _inp("max_concurrent", g("max_concurrent"), placeholder="optional, e.g. 1", typ="number"))
-            + _field("api key", _inp("api_key", g("api_key"), placeholder="optional — cloud backends"))
+            # Never rendered back (it is a cloud secret): blank keeps the stored key —
+            # or a config backend's, see backend_save — and "clear" removes it.
+            + _field("api key", _inp("api_key", "", typ="password",
+                                     placeholder=("•••• set — blank keeps it"
+                                                  if (src.get("api_key") or src.get("api_key_set"))
+                                                  else "optional — cloud backends"))
+                     + _checkbox("api_key_clear", False, "clear", "remove the stored key on Save"))
             + "</div>"
 
             # ── Models ────────────────────────────────────────────────────────────
@@ -2227,8 +2235,17 @@ async def backend_save(request: Request):
         b["comfy_input_dir"] = cid
     else:
         b.pop("comfy_input_dir", None)         # blank = derive from the output dir
-    if (f.get("api_key", "") or "").strip():
-        b["api_key"] = f["api_key"].strip()
+    ak = (f.get("api_key", "") or "").strip()
+    if ak:
+        b["api_key"] = ak
+    elif f.get("api_key_clear"):
+        b.pop("api_key", None)
+    elif not b.get("api_key"):
+        # A config backend's first Save copies it into the store — its key is not in the
+        # (masked) form, so it comes from the live backend, or the copy loses auth.
+        live = _backend_api_key(oname, otype)
+        if live:
+            b["api_key"] = live
     mctx = (f.get("model_context", "") or "").strip()
     if mctx:
         b["model_context"] = mctx               # `glob=tokens` lines; parsed on every read
