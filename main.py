@@ -3742,7 +3742,10 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
 
             backend, stage1_cand, s2, outdir = picked
             bid = backend_id(backend)
-            adapter = backend_adapters[bid]
+            adapter = backend_adapters.get(bid)
+            if adapter is None:                  # backend removed/re-saved since usable() looked
+                await asyncio.sleep(0.5)         # (K10) — the next pass re-judges it
+                continue
             # Resolve the stage-2 (successor) backend + candidate. Path relay pinned it to
             # stage 1's backend above (shared disk). Upload relay picks the successor
             # alias's best candidate — preferring stage 1's backend if it is itself one
@@ -4095,10 +4098,28 @@ _gen_tasks: dict = {}                       # job_id → asyncio.Task (for cance
 
 
 def _spawn_gen(job_id: str, coro) -> asyncio.Task:
-    """Run a generation coroutine as a tracked background task so it can be cancelled."""
+    """Run a generation coroutine as a tracked background task so it can be cancelled.
+    The done callback is the job's last line of defence: a worker that dies of an
+    exception nobody anticipated left its row `queued`/`running` until the next process
+    restart (reconcile_orphans) — a job that looks alive, forever (K10). It is marked
+    failed with the error instead; a row that already has its outcome is untouched
+    (jobs keeps terminal states final), and a cancelled task was marked by the cancel."""
     t = asyncio.create_task(coro)
     _gen_tasks[job_id] = t
-    t.add_done_callback(lambda _: _gen_tasks.pop(job_id, None))
+
+    def _done(task: asyncio.Task) -> None:
+        if _gen_tasks.get(job_id) is task:
+            _gen_tasks.pop(job_id, None)
+        if task.cancelled() or task.exception() is None:
+            return
+        e = task.exception()
+        logger.error(f"job {job_id}: generation worker crashed: {type(e).__name__}: {_err_text(e)}",
+                     exc_info=e)
+        try:
+            jobs.fail(job_id, f"internal error: {type(e).__name__}: {_err_text(e)}")
+        except Exception as e2:                  # the store itself is what failed — nothing left to do
+            logger.error(f"job {job_id}: could not mark the crashed job failed: {e2}")
+    t.add_done_callback(_done)
     return t
 
 

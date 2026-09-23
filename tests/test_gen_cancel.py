@@ -262,5 +262,36 @@ class InterruptedIsNoFault(unittest.TestCase):
         self.assertEqual(main.gen_exec_faults, {})
 
 
+
+class WorkerCrash(unittest.TestCase):
+    """K10: a generation worker that dies of an unanticipated exception (a KeyError on a
+    backend deleted mid-job, a bug) left its row `queued`/`running` until the next process
+    restart — a job that looks alive forever, and a sync caller that got a bare 500."""
+
+    def setUp(self):
+        self._orig = main.jobs
+        main.jobs = self.jobs = _Jobs()
+
+    def tearDown(self):
+        main.jobs = self._orig
+
+    def test_a_crashed_worker_fails_its_job(self):
+        async def boom():
+            raise KeyError("comfyui:gone")
+
+        async def go():
+            await main._run_gen_sync("jobK", boom())     # never raises into the handler
+            await asyncio.sleep(0)                       # let the done callback run
+        asyncio.run(go())
+        self.assertIn("internal error", self.jobs.failed)
+        self.assertIn("KeyError", self.jobs.failed)
+        self.assertNotIn("jobK", main._gen_tasks)
+
+    def test_a_clean_worker_is_left_alone(self):
+        async def fine():
+            return True
+        asyncio.run(main._run_gen_sync("jobF", fine()))
+        self.assertIsNone(self.jobs.failed)
+
 if __name__ == "__main__":
     unittest.main()
