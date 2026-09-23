@@ -17,6 +17,7 @@ import html
 import ipaddress
 import json
 import logging
+import math
 import os
 import re
 import socket
@@ -161,6 +162,10 @@ _voice_lib_save: Callable = None          # async (name, data, ref_text) → sta
 _voice_lib_delete: Callable = None        # (name) → None
 _voice_lib_ship: Callable = None          # async (name) → (ok, msg)
 _voice_ship_config: Callable[[], tuple] = lambda: ([], "")   # → (hosts, dir)
+# main's ship-target rules (the ONE gate before ssh/scp) — checked on Save as well, so a
+# bad target is refused where it is typed instead of at the next ship.
+_parse_voice_target: Callable[[str], Optional[tuple]] = lambda t: (t, "")
+_voice_dir_ok: Callable[[str], bool] = lambda d: True
 _apply_hosts: Callable[[], None] = lambda: None           # refresh main's hosts_meta cache
 # ComfyUI backend name → sorted installed LoRA filenames (discovery, verbatim).
 _backend_loras: Callable[[], dict] = lambda: {}
@@ -618,6 +623,40 @@ _CONFIRM_JS = ("<script>document.addEventListener('click',function(e){"
                "if(a&&!window.confirm(a.getAttribute('data-confirm'))){"
                "e.preventDefault();e.stopPropagation();}},true);</script>")
 
+# Every state-changing console action is a POST (see _POST_ACTIONS). Its button needs a
+# form, and a button may sit INSIDE another form (the editors' ✕/∅ buttons) where a
+# nested <form> is invalid HTML — so there is ONE empty form per page, outside <main>
+# (the live morph never touches it), and every action button names it via `form=` and
+# carries its URL in `formaction` (_btn does this for any href in _POST_ACTIONS). It
+# rides on _CONFIRM_JS, the block every page already emits. The confirm handler above
+# covers these submit buttons too (Enter in a form clicks its default button as well).
+# - gwPost(url, formId): POST the named form (default: the empty action form) to `url`
+#   through a throw-away submit button — for the "+ Add …" selects. Never by rewriting
+#   the form's own action: a page restored from the back/forward cache would then Save
+#   into that action URL.
+# - the unsaved-changes guard: a form marked `data-guard` that was edited and is left by
+#   anything but its own submit (an action button, a link, a tab) asks first. Controls
+#   that ARE actions (`data-post` selects) do not count as edits.
+_ACT_FORM_ID = "gw-act"
+_ACTION_JS = ("window.gwPost=function(u,fid){"
+              f"var f=document.getElementById(fid||'{_ACT_FORM_ID}');if(!f)return;"
+              "var b=document.createElement('button');b.type='submit';b.hidden=true;"
+              "b.setAttribute('formaction',u);b.setAttribute('formmethod','post');"
+              "b.setAttribute('formnovalidate','');f.appendChild(b);b.click();f.removeChild(b);};"
+              "(function(){var dirty=null;"
+              "function mark(e){var t=e.target;if(!t||!t.form||t.hasAttribute('data-post'))return;"
+              "if(t.form.hasAttribute('data-guard'))dirty=t.form;}"
+              "document.addEventListener('input',mark,true);"
+              "document.addEventListener('change',mark,true);"
+              "document.addEventListener('submit',function(e){if(e.target===dirty)dirty=null;},true);"
+              "window.gwClean=function(f){if(f===dirty)dirty=null;};"
+              "window.addEventListener('beforeunload',function(e){"
+              "if(dirty&&document.body.contains(dirty)){e.preventDefault();e.returnValue='';return '';}});"
+              "})();")
+# Joined INTO the confirm script (one block) and followed by the empty action form.
+_CONFIRM_JS = (_CONFIRM_JS[:-len("</script>")] + _ACTION_JS + "</script>"
+               + f'<form id="{_ACT_FORM_ID}" method="post" hidden></form>')
+
 
 def _page(title: str, body: str, active: str = "", refresh: Optional[int] = None,
           nologin: bool = False, subnav: str = "") -> str:
@@ -641,8 +680,45 @@ def _field(label: str, control: str, short: bool = False, wide: bool = False) ->
     return f'<div class="field"><label>{_esc(label)}</label><div class="{cls}">{control}</div></div>'
 
 
+# Console routes that change state: POST only (register() derives their methods from
+# here, and _btn renders a POST button for any href to one of them — so a link to an
+# action cannot be written by accident). A GET link was fireable by anything that could
+# make the browser navigate (a mail preview, a prefetch, an <img>), and one that a crawler
+# or a pasted URL followed deleted things. `{…}` marks a path parameter.
+_POST_ACTIONS = frozenset((
+    "/ui/backends/delete", "/ui/backends/drain", "/ui/backends/undrain",
+    "/ui/backends/restart", "/ui/backends/enable",
+    "/ui/chat/badd", "/ui/chat/bdel", "/ui/chat/delete",
+    "/ui/mapping/field-add", "/ui/mapping/field-map", "/ui/mapping/field-clear",
+    "/ui/mapping/field-del", "/ui/mapping/cand-add", "/ui/mapping/cand-del",
+    "/ui/mapping/bypass-add", "/ui/mapping/bypass-del", "/ui/mapping/copy",
+    "/ui/mapping/delete",
+    "/ui/reasoning/toggle", "/ui/reasoning/delete",
+    "/ui/playground/voice-ship", "/ui/playground/voice-del",
+    "/ui/job/{job_id}/cancel",
+    "/ui/users/delete", "/ui/ipalias/delete",
+))
+_POST_ACTION_RES = [re.compile("^" + re.sub(r"\\\{[^}]*\\\}", "[^/]+", re.escape(p)) + "$")
+                    for p in _POST_ACTIONS]
+
+
+def _is_post_action(href: str) -> bool:
+    path = (href or "").split("?", 1)[0].split("#", 1)[0]
+    return any(r.match(path) for r in _POST_ACTION_RES)
+
+
+def _q(v) -> str:
+    """A value for a console URL's query string or path segment. `_esc` is the HTML
+    escape and the wrong one here: `a&b` became `a&amp;b` and arrived as `a` plus a
+    stray `amp;b` parameter, and `+`, `#` or `%` in a name broke the link the same way."""
+    return quote(str(v if v is not None else ""), safe="")
+
+
 def _btn(label: str, href: str = "", kind: str = "", sm: bool = False, submit: bool = False,
-         confirm: str = "", title: str = "", icon: bool = False) -> str:
+         confirm: str = "", title: str = "", icon: bool = False, form: str = "") -> str:
+    """A button. `href` to a view renders a link; `href` to an action (_POST_ACTIONS)
+    renders a POST button that submits the page's empty action form — or `form`, the id
+    of another form whose fields should travel along. `submit` = this form's own submit."""
     cls = "btn" + (f" {kind}" if kind else "") + (" sm" if sm else "") + (" icon" if icon else "")
     t = f' title="{_esc(title)}"' if title else ""
     # The text is DATA read by _CONFIRM_JS, never spliced into an onclick: the browser
@@ -650,8 +726,23 @@ def _btn(label: str, href: str = "", kind: str = "", sm: bool = False, submit: b
     # the JS (the link then navigated without asking) or, chosen by an attacker, ran it.
     dc = f' data-confirm="{_esc(confirm)}"' if confirm else ""
     if submit:
-        return f'<button type="submit" class="{cls}"{t}>{_esc(label)}</button>'
+        fa = f' form="{_esc(form)}"' if form else ""
+        return f'<button type="submit" class="{cls}"{fa}{dc}{t}>{_esc(label)}</button>'
+    if _is_post_action(href):
+        return (f'<button type="submit" class="{cls}" form="{_esc(form or _ACT_FORM_ID)}" '
+                f'formaction="{_esc(href)}" formmethod="post" formnovalidate{dc}{t}>'
+                f'{_esc(label)}</button>')
     return f'<a class="{cls}" href="{_esc(href)}"{dc}{t}>{_esc(label)}</a>'
+
+
+def _add_select(action_prefix: str, options_html: str) -> str:
+    """An "+ Add …" dropdown: picking an option POSTs `action_prefix + <value>` through
+    the page's action form (gwPost in _CONFIRM_JS). The URL is DATA in `data-post`, never
+    spliced into the handler — see the note on `data-confirm` in _btn."""
+    return (f'<select class="addsel" data-post="{_esc(action_prefix)}" '
+            "onchange=\"if(this.value)gwPost(this.getAttribute('data-post')"
+            "+encodeURIComponent(this.value))\">"
+            f"{options_html}</select>")
 
 
 def _js_json(obj) -> str:
@@ -984,6 +1075,11 @@ def _cross_site(request: Request) -> bool:
 
 
 def _cross_site_page(target: str) -> str:
+    if _is_post_action(target):         # POST-only: no link can start it, none is offered
+        return (f"<h2>Opened from another site</h2>"
+                f"<p>This console link was opened from a different site and names an "
+                f"action, which only runs from the console itself:</p>"
+                f"<p><code>{_esc(target)}</code></p><p>{_btn('Dashboard', href='/ui')}</p>")
     return (f"<h2>Opened from another site</h2>"
             f"<p>This console link was opened from a different site. Actions here change "
             f"the gateway, so it only runs when you open it yourself:</p>"
@@ -1298,7 +1394,8 @@ def _btype_block(types: str, cur_type: str, inner: str) -> str:
     return f'<div data-btype="{types}"{style}>{inner}</div>'
 
 
-def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None) -> str:
+def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None,
+                  orig_id: Optional[str] = None, err: str = "", raw: Optional[dict] = None) -> str:
     # A scan finding arrives as `prefill` (name/type/url; `local` ticked for an openai
     # find — a LAN server is local by definition, the operator may untick). It reads
     # like a stored backend for rendering, but the title stays "Add Backend" and no
@@ -1312,8 +1409,11 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
     src = b or ({**prefill, "local": prefill.get("type", "openai") == "openai"} if prefill else {})
     g = lambda k, d="": str(src.get(k) if src.get(k) is not None else d)
     gb = lambda k: bool(src.get(k))
-    title = "Edit Backend" if b else "Add Backend"
-    orig = f'<input type="hidden" name="orig" value="{_esc(_bid(b))}">' if b else ""
+    # orig_id/err/raw: a refused Save shown again — `b` then holds what was typed,
+    # `orig_id` the identity it was editing ("" = a new backend), `raw` the posted form.
+    oid = (_bid(b) if b else "") if orig_id is None else orig_id
+    title = "Edit Backend" if oid else "Add Backend"
+    orig = f'<input type="hidden" name="orig" value="{_esc(oid)}">' if oid else ""
     hlist = "".join(f'<option value="{_esc(h)}">' for h in hosts)
     # The cloud option block is rendered for EVERY cloud kind at once (one hint each,
     # only the current type's visible) — the type select toggles them client-side, so
@@ -1326,9 +1426,10 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
                 f'<datalist id="hostlist">{hlist}</datalist>')
     pane = lambda key: (f'<div class="bpane" data-btab="{key}"'
                         + ("" if key == "general" else ' style="display:none"') + ">")
-    return (f'<form action="/ui/backends/save" method="post">{orig}'
+    return (f'<form action="/ui/backends/save" method="post" data-guard>{orig}'
             f'<div class="formbar"><h2>{title}</h2>'
             f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/backends", "secondary")}</div>'
+            + _form_err(err)
             + _btab_bar(cur_type)
 
             # ── General ───────────────────────────────────────────────────────────
@@ -1442,7 +1543,7 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
                            + f'<details class="optblock"{" open" if (b or {}).get("sampling_defaults") else ""}>'
                            + "<summary>Sampling defaults <span class='muted'>— used when the caller sends "
                              "none</span></summary>"
-                           + _sampling_inputs((b or {}).get("sampling_defaults"))
+                           + _sampling_inputs((b or {}).get("sampling_defaults"), raw=raw)
                            + "<p class='hint'><b>sampling defaults</b>: values filled into every chat "
                              "request to this backend, for keys the caller did <b>not</b> send (an explicit "
                              "client value — and an alias default — always wins). For backends whose server "
@@ -1695,7 +1796,12 @@ def _parse_bid(s: str) -> tuple:
 
 
 async def backends_page(request: Request):
-    qp = request.query_params
+    return await _backends_view(request.query_params)
+
+
+async def _backends_view(qp, detail: Optional[str] = None, status: int = 200) -> HTMLResponse:
+    """The Backends tab; `detail` replaces the right column (a refused Save, re-rendered
+    — then never live: the page's URL is the POST action, which a GET poll cannot fetch)."""
     edit_id = qp.get("edit", "")
     binfo = _gateway_info().get("backends", [])
     # editable from either source: store (full dict incl. api_key) or the live summary (config)
@@ -1797,7 +1903,9 @@ async def backends_page(request: Request):
                  + _scan_panel(scan_st))
     hosts = sorted({b["host"] for b in binfo if b.get("host")})
     edit_host = qp.get("host", "")
-    if editing or qp.get("new"):
+    if detail is not None:
+        pass
+    elif editing or qp.get("new"):
         prefill = ({"name": qp.get("name", ""), "type": qp.get("type", "openai"), "url": qp.get("url", "")}
                    if (not editing and qp.get("url")) else None)
         detail = _backend_form(editing, hosts, prefill=prefill)
@@ -1809,8 +1917,9 @@ async def backends_page(request: Request):
     body = (f'<div class="cols"><div class="col">{list_html}</div>'
             f'<div class="col">{detail}</div></div>')
     draining_now = any(b.get("draining") for b in binfo)      # watch the count drain → offline
-    return HTMLResponse(_page("Backends", body, "backends",
-                              refresh=4 if draining_now else (2 if scan_st.get("running") else None)))
+    live = 4 if draining_now else (2 if scan_st.get("running") else None)
+    return HTMLResponse(_page("Backends", body, "backends", refresh=live if detail is None else None),
+                        status_code=status)
 
 
 def _scan_add_link(f: dict) -> str:
@@ -1942,7 +2051,7 @@ def _host_form(host: str, shared: bool) -> str:
     pre = scheduler.host_flag(meta, "comfy_free_before_job", shared)
     free = scheduler.host_flag(meta, "comfy_free_after_job", shared)
     unload = scheduler.host_flag(meta, "llm_unload_before_media", shared)
-    return (f'<form action="/ui/backends/host-save" method="post">'
+    return (f'<form action="/ui/backends/host-save" method="post" data-guard>'
             f'<input type="hidden" name="host" value="{_esc(host)}">'
             f'<div class="formbar"><h2>Host {_esc(host)}</h2>'
             f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/backends", "secondary")}</div>'
@@ -2084,21 +2193,52 @@ def _parse_sampling_form(f: dict, prefix: str = "smp_") -> tuple:
     return out, ""
 
 
-def _sampling_inputs(cur, prefix: str = "smp_") -> str:
+def _sampling_inputs(cur, prefix: str = "smp_", raw: Optional[dict] = None) -> str:
     """Render the sampler inputs, pre-filled from a stored dict. Unknown keys
-    (anything without its own field) land in the 'more' JSON box."""
+    (anything without its own field) land in the 'more' JSON box. `raw` (a refused
+    form) wins: its strings are shown exactly as typed, the bad one included."""
     d = cur if isinstance(cur, dict) else {}
     known = dict(_SAMPLING_FIELDS)
     rows = "".join(
         _field(key.replace("_", " "),
-               _inp(prefix + key, d.get(key, ""), placeholder=ph, typ="number", step="any"),
+               _inp(prefix + key, raw.get(prefix + key, "") if raw is not None else d.get(key, ""),
+                    placeholder=ph, typ="number", step="any"),
                short=True)
         for key, ph in _SAMPLING_FIELDS)
     rest = {k: v for k, v in d.items() if k not in known}
+    more = (raw.get(prefix + "more", "") if raw is not None
+            else (json.dumps(rest, ensure_ascii=False) if rest else ""))
     return rows + _field("more (JSON)",
-                         _textarea(prefix + "more",
-                                   json.dumps(rest, ensure_ascii=False) if rest else "", 2,
+                         _textarea(prefix + "more", more, 2,
                                    '{"typical_p": 0.95, "stop": ["###"]}'))
+
+
+def _int_field(raw, label: str, blank: str, minimum: int = 0) -> tuple:
+    """A whole-number form field → (value, error). Blank → (None, "") = `blank`, the
+    ONE way to say "unset". Anything else that is not a plain integer ≥ minimum is an
+    error — "1.5", "-1", "1e3" and "5,00" used to fall through to "unset" (for a
+    concurrency cap or a quota: unlimited) without a word."""
+    s = str(raw or "").strip()
+    if not s:
+        return None, ""
+    if re.fullmatch(r"[0-9]+", s) and int(s) >= minimum:
+        return int(s), ""
+    return None, f"{label}: '{s}' is not a whole number ≥ {minimum} (blank = {blank})"
+
+
+def _float_field(raw, label: str, blank: str, minimum: float = 0.0) -> tuple:
+    """Like _int_field for a decimal: a German decimal comma is accepted ("5,00" = 5),
+    anything non-finite or below `minimum` is an error."""
+    s = str(raw or "").strip()
+    if not s:
+        return None, ""
+    try:
+        v = float(s.replace(",", "."))
+    except ValueError:
+        v = None
+    if v is None or not math.isfinite(v) or v < minimum:
+        return None, f"{label}: '{s}' is not a number ≥ {minimum:g} (blank = {blank})"
+    return v, ""
 
 
 async def backend_save(request: Request):
@@ -2107,19 +2247,29 @@ async def backend_save(request: Request):
     url = (f.get("url", "") or "").strip().rstrip("/")
     new_type = (f.get("type", "openai") or "openai").strip()
     url = _cloud_url_for(new_type, url)      # pure rule, tested in test_cloud_editor.py
-    if not name or not url:
-        return HTMLResponse(_page("Backends", '<p class="bad">name and url are required</p>'
-            f'<div class="actions">{_btn("← Back", "/ui/backends", "secondary")}</div>', "backends"))
+    # Every refusal is collected and answered BEFORE the store is touched, with the form
+    # shown again as typed (400) — see _refuse_backend below.
+    problems = [] if (name and url) else ["name and url are required"]
     orig = (f.get("orig", "") or "").strip()
     oname, otype = _parse_bid(orig) if orig else (name, new_type)
+    if name and (not orig or (name, new_type) != (oname, otype)) and (
+            store.get_backend(name, new_type)
+            or any(_bid(x) == f"{new_type}:{name}" for x in _gateway_info().get("backends", []))):
+        # A new backend (or a rename) onto an existing identity used to MERGE into that
+        # backend's stored row and overwrite it; onto a config backend it silently
+        # created an override of it.
+        problems.append(f"a {new_type} backend named '{name}' already exists — pick another "
+                        "name, or edit that one")
     # start from the existing store backend (by old identity) so fields we don't render
     # (e.g. enabled) survive an edit; merge the form values over it.
     b = dict(store.get_backend(oname, otype) or store.get_backend(name, new_type) or {})
     b.update({"name": name, "type": new_type, "url": url,
               "paid": bool(f.get("paid"))})       # unchecked box = absent from the form = False
-    mc = (f.get("max_concurrent", "") or "").strip()
-    if mc.isdigit():
-        b["max_concurrent"] = int(mc)
+    mc, mc_err = _int_field(f.get("max_concurrent"), "max_concurrent", "unlimited")
+    if mc_err:
+        problems.append(mc_err)
+    if mc is not None:
+        b["max_concurrent"] = mc
     else:
         b.pop("max_concurrent", None)
     host = (f.get("host", "") or "").strip()
@@ -2161,18 +2311,22 @@ async def backend_save(request: Request):
             b[flag] = True
         else:
             b.pop(flag, None)
+    # ComfyUI-only fields: validated for a ComfyUI backend only — for any other type they
+    # sit in a hidden pane the operator cannot see, and are dropped below anyway.
+    comfy = new_type == "comfyui"
     for nkey in ("restart_cooldown_s", "stuck_after_s", "self_retries", "max_wait"):
-        v = (f.get(nkey, "") or "").strip()
-        if v.isdigit() and int(v) > 0:
-            b[nkey] = int(v)
+        v, v_err = _int_field(f.get(nkey), nkey.replace("_", " "), "the default")
+        if v_err and comfy:
+            problems.append(v_err)
+        if v:
+            b[nkey] = v
         else:
-            b.pop(nkey, None)                  # blank = defaults (600 / 90 / no self-retry / 600)
-    pi = (f.get("poll_interval", "") or "").strip()   # float — sub-second polling is legitimate
-    try:
-        pi_val = float(pi)
-    except ValueError:
-        pi_val = 0.0
-    if pi_val > 0:
+            b.pop(nkey, None)                  # blank/0 = defaults (600 / 90 / no self-retry / 600)
+    # float — sub-second polling is legitimate
+    pi_val, pi_err = _float_field(f.get("poll_interval"), "poll interval s", "1 s")
+    if pi_err and comfy:
+        problems.append(pi_err)
+    if pi_val:
         b["poll_interval"] = pi_val
     else:
         b.pop("poll_interval", None)           # blank/0/garbage = the 1.0 s default
@@ -2184,11 +2338,11 @@ async def backend_save(request: Request):
         b["paid"] = True                       # bills per task — never an unpaid candidate
         for src, dst, cast in (("cloud_max_wait", "max_wait", int),
                                ("cloud_poll_interval", "poll_interval", float)):
-            v = (f.get(src, "") or "").strip()
-            try:
-                val = cast(float(v))
-            except ValueError:
-                val = 0
+            fv, fv_err = _float_field(f.get(src), src[len("cloud_"):].replace("_", " "),
+                                      "the vendor default")
+            if fv_err:
+                problems.append(fv_err)
+            val = cast(fv or 0)
             if val > 0:
                 b[dst] = val
             else:
@@ -2210,8 +2364,9 @@ async def backend_save(request: Request):
         b.pop("models", None)
     sd, sd_err = _parse_sampling_form(f)
     if sd_err:
-        return HTMLResponse(_page("Backends", f'<p class="bad">{_esc(sd_err)}</p>'
-            f'<div class="actions">{_btn("← Back", "/ui/backends", "secondary")}</div>', "backends"))
+        problems.append(sd_err)
+    if problems:
+        return await _refuse_backend(problems[0], b, f, orig)
     if sd:
         b["sampling_defaults"] = sd
     else:
@@ -2228,6 +2383,23 @@ async def backend_save(request: Request):
     logger.info(f"ui: saved backend '{name}' ({b['type']} {url})"
                 + (f" — re-pointed {renamed} alias(es) from '{oname}'" if renamed else ""))
     return RedirectResponse("/ui/backends", status_code=303)
+
+
+async def _refuse_backend(msg: str, b: dict, f: dict, orig: str) -> HTMLResponse:
+    """A refused backend Save: the Backends tab with the form as TYPED and the reason,
+    status 400. It used to be a bare error page whose "← Back" opened an empty form."""
+    shown = dict(b)
+    cloud = b.get("type") in adapters.CLOUD_TYPES
+    for key, src in (("max_concurrent", "max_concurrent"), ("restart_cooldown_s", "restart_cooldown_s"),
+                     ("stuck_after_s", "stuck_after_s"), ("self_retries", "self_retries"),
+                     ("max_wait", "cloud_max_wait" if cloud else "max_wait"),
+                     ("poll_interval", "cloud_poll_interval" if cloud else "poll_interval")):
+        typed = (f.get(src, "") or "").strip()
+        if typed:
+            shown[key] = typed                  # the bad value too — the reason names it
+    hosts = sorted({x["host"] for x in _gateway_info().get("backends", []) if x.get("host")})
+    form = _backend_form(shown, hosts, orig_id=orig, err=msg, raw=f)
+    return await _backends_view({"edit": orig} if orig else {"new": "1"}, detail=form, status=400)
 
 
 # What a delete clears, and what it deliberately does not — the wording the confirm
@@ -2542,7 +2714,7 @@ def _routing_gen_body(bmeta: dict, sel: Optional[str] = None) -> str:
                                            (f"{byp} bypassed" if byp else "")) if x) or "—"
             others = ", ".join(sorted(x.get("backend", "") for x in cands
                                       if (x.get("backend") or "").strip() != sel)) or "—"
-            rows += (f'<tr><td><a href="/ui/mapping?edit={quote(alias)}"><code>{_esc(alias)}</code></a></td>'
+            rows += (f'<tr><td><a href="/ui/mapping?edit={_q(alias)}"><code>{_esc(alias)}</code></a></td>'
                      f'<td>{_esc(c.get("task", ""))}</td>'
                      f'<td class="muted">{_esc(mapped)}</td><td>{_esc(local)}</td>'
                      f'<td class="muted">{_esc(others)}</td></tr>')
@@ -2700,39 +2872,48 @@ def _chat_value_for(alias: str) -> dict:
     return {}
 
 
-def _chat_new_form() -> str:
+def _chat_new_form(vals: Optional[dict] = None, err: str = "") -> str:
     """Minimal create form — like registering a generation alias. More backends are
-    assigned in the editor afterwards."""
+    assigned in the editor afterwards. `vals`/`err`: a refused create, shown again."""
+    v = vals or {}
     llm = _llm_backends()
     all_models = sorted({m for b in llm for m in b.get("models", [])})
     if any(b.get("current") for b in llm):            # llama-swap: "whatever is loaded"
         all_models.insert(0, adapters.CURRENT_MODEL)
     bopts = [b["name"] for b in llm] or [("", "(no LLM backends)")]
-    return ('<form action="/ui/chat/create" method="post">'
+    return ('<form action="/ui/chat/create" method="post" data-guard>'
             f'<div class="formbar"><h2>New Chat Alias</h2>{_btn("Create", submit=True)}'
             f'{_btn("Cancel", "/ui/mapping", "secondary")}</div>'
-            + _field("alias name", _inp("alias", placeholder="fast"), short=True)
-            + _field("backend", _select("backend", bopts), short=True)
-            + _field("model", _dl_input("model", "", "cm_all"), short=True)
+            + _form_err(err)
+            + _field("alias name", _inp("alias", v.get("alias", ""), placeholder="fast"), short=True)
+            + _field("backend", _select("backend", bopts, v.get("backend")), short=True)
+            + _field("model", _dl_input("model", v.get("model", ""), "cm_all"), short=True)
             + "<p class='hint'>Pick a first backend + model. Assign more backends after "
               "creating.</p>"
             + "</form>" + _datalist("cm_all", all_models))
 
 
-def _chat_editor(alias: str) -> str:
+def _chat_editor(alias: str, raw: Optional[dict] = None, err: str = "") -> str:
     """Editor for an existing alias — same logic as the Mapping editor: a list of
     assigned backends, each with the model to use there; add via dropdown, remove via
-    ✕. Models save on Save; add/remove are immediate."""
+    ✕. Models save on Save; add/remove are immediate.
+    `raw` = a refused Save's submitted form: every field shows what was TYPED (the
+    reason in `err`), never the stored value the user was trying to change."""
     llm = _llm_backends()
     meta = {b["name"]: b for b in llm}
-    assigned = _chat_value_for(alias)
+    r = raw or {}
+    if raw is not None:
+        assigned = {k[len("model__"):]: (v or "").strip() for k, v in raw.items()
+                    if k.startswith("model__")}
+    else:
+        assigned = _chat_value_for(alias)
     rows, dls = "", ""
     for i, (bn, entry) in enumerate(assigned.items()):
         model = entry.get("model", "") if isinstance(entry, dict) else entry
         b, dlid = meta.get(bn, {}), f"cm_{i}"
         off = "" if b.get("enabled", True) else " <span class='muted'>(disabled)</span>"
         head = f"{_esc(bn)}{off}"
-        rm = (_btn("✕", f"/ui/chat/bdel?alias={_esc(alias)}&backend={_esc(bn)}", "danger",
+        rm = (_btn("✕", f"/ui/chat/bdel?alias={_q(alias)}&backend={_q(bn)}", "danger",
                    sm=True, icon=True, title="Remove this backend")
               if len(assigned) > 1 else "<span class='muted' title='alias needs ≥1 backend'>—</span>")
         rows += (f"<tr><td>{head}</td><td>{_dl_input('model__' + bn, model, dlid)}</td>"
@@ -2744,17 +2925,16 @@ def _chat_editor(alias: str) -> str:
     add_sel = ""
     if add_opts:
         opts = "".join(f"<option>{_esc(o)}</option>" for o in add_opts)
-        add_sel = ('<select class="addsel" onchange="if(this.value)location.href=\'/ui/chat/badd?alias='
-                   f"{_esc(alias)}&amp;backend='+encodeURIComponent(this.value)\">"
-                   f'<option value="">+ Add backend…</option>{opts}</select>')
-    cur_park = store.get_alias_park().get(alias)
+        add_sel = _add_select(f"/ui/chat/badd?alias={_q(alias)}&backend=",
+                              f'<option value="">+ Add backend…</option>{opts}')
+    cur_park = r.get("park_s", "") if raw is not None else store.get_alias_park().get(alias)
     park_field = (_field("park seconds",
                          _inp("park_s", "" if cur_park is None else cur_park,
                               placeholder="blank = global default · 0 = off", typ="number"), short=True)
                   + "<p class='hint' style='margin:-4px 0 10px'>When all backends are busy, a call waits in "
                     "the queue up to this long for a free slot, then gets a 503. Blank = the global default "
                     "(Server tab); <b>0</b> disables parking for this alias.</p>")
-    cur_rsn = store.get_alias_reasoning().get(alias) or "auto"
+    cur_rsn = (r.get("reasoning") if raw is not None else store.get_alias_reasoning().get(alias)) or "auto"
     rsn_opts = "".join(f'<option value="{v}"{" selected" if cur_rsn == v else ""}>{v}</option>'
                        for v in ("auto", "on", "off"))
     rsn_field = (_field("reasoning", f'<select name="reasoning">{rsn_opts}</select>', short=True)
@@ -2767,7 +2947,8 @@ def _chat_editor(alias: str) -> str:
     # so they collapse out of the way — folded open only when this alias has them set.
     # (They live here, not with the media aliases: /v1/audio/speech routes through a
     # CHAT alias on an openai-type backend, not through the generation store.)
-    cur_voice = store.get_alias_voice().get(alias) or {}
+    cur_voice = ({"voice": r.get("voice_ref", ""), "ref_text": r.get("voice_ref_text", "")}
+                 if raw is not None else store.get_alias_voice().get(alias) or {})
     voice_field = (
         f'<details class="optblock"{" open" if (cur_voice.get("voice") or cur_voice.get("ref_text")) else ""}>'
         "<summary>Voice defaults <span class='muted'>— TTS aliases only</span></summary>"
@@ -2782,22 +2963,26 @@ def _chat_editor(alias: str) -> str:
         + "</details>")
     # Sampling defaults are set on few aliases, so they collapse like the voice block —
     # folded open only when this alias carries them.
-    cur_smp = store.get_alias_sampling().get(alias)
+    cur_smp = store.get_alias_sampling().get(alias) if raw is None else None
+    smp_open = cur_smp or (raw is not None and any(
+        (v or "").strip() for k, v in raw.items() if k.startswith("smp_")))
     smp_field = (
-        f'<details class="optblock"{" open" if cur_smp else ""}>'
+        f'<details class="optblock"{" open" if smp_open else ""}>'
         "<summary>Sampling defaults <span class='muted'>— client &gt; alias &gt; backend</span></summary>"
-        + _sampling_inputs(cur_smp)
+        + _sampling_inputs(cur_smp, raw=raw)
         + "<p class='hint' style='margin:-4px 0 10px'>Filled into requests on this alias, "
           "for keys the client did <b>not</b> send. Precedence: client &gt; alias &gt; the serving "
           "backend's own <a href='/ui/backends'>sampling defaults</a> (an alias value overrides the "
           "backend's for that key; the backend's other keys still apply). "
           "Chat/completions/responses only.</p>"
         + "</details>")
-    return ('<form action="/ui/chat/save" method="post">'
+    return ('<form action="/ui/chat/save" method="post" data-guard>'
             f'<input type="hidden" name="orig" value="{_esc(alias)}">'
             f'<div class="formbar"><h2>Edit Chat Alias</h2>{_btn("Save", submit=True)}'
             f'{_btn("Cancel", "/ui/mapping", "secondary")}</div>'
-            + _field("alias name", _inp("alias", alias, placeholder="fast"), short=True)
+            + _form_err(err)
+            + _field("alias name", _inp("alias", r.get("alias", alias) if raw is not None else alias,
+                                        placeholder="fast"), short=True)
             + park_field + rsn_field + voice_field + smp_field
             + "<h2>Backends</h2>"
             + "<p class='hint'>Assign backends to this alias and pick the model on each. A call "
@@ -2812,12 +2997,25 @@ async def chat_create(request: Request):
     alias = (f.get("alias", "") or "").strip()
     backend = (f.get("backend", "") or "").strip()
     model = (f.get("model", "") or "").strip()
+
+    async def err(msg):
+        return await _mapping_view({"sub": "chat", "cnew": "1"}, status=400, detail=_chat_new_form(
+            {"alias": alias, "backend": backend, "model": model}, msg))
     if not alias or not backend:
-        return RedirectResponse("/ui/mapping?cnew=1", status_code=303)
+        return await err("alias name and backend are required")
+    if _chat_alias_taken(alias):
+        # upsert used to REPLACE the existing alias's backend mapping with this one entry
+        return await err(f"chat alias '{alias}' already exists — edit it instead")
     store.upsert_chat_alias(alias, {backend: model})
     _apply_chat_aliases()
     logger.info(f"ui: chat alias '{alias}' created → {backend}/{model or '(no model)'}")
-    return RedirectResponse(f"/ui/mapping?cedit={alias}", status_code=303)
+    return RedirectResponse(f"/ui/mapping?cedit={_q(alias)}", status_code=303)
+
+
+def _chat_alias_taken(alias: str) -> bool:
+    """A chat alias of that name exists — UI-made or from config.yaml (a store entry
+    of the same name would silently OVERRIDE the config one)."""
+    return store.get_chat_alias(alias) is not None or alias in _config_chat_aliases()
 
 
 async def chat_save(request: Request):
@@ -2833,11 +3031,20 @@ async def chat_save(request: Request):
     park_s = (f.get("park_s", "") or "").strip()
     rsn = (f.get("reasoning", "") or "").strip()
     smp, smp_err = _parse_sampling_form(f)
+
+    async def err(msg):
+        return await _mapping_view({"sub": "chat", "cedit": orig}, status=400,
+                                   detail=_chat_editor(orig or alias, raw=f, err=msg))
     if smp_err:
-        return HTMLResponse(_page("Chat aliases", f'<p class="bad">{_esc(smp_err)}</p>'
-            f'<div class="actions">{_btn("← Back", "/ui/mapping", "secondary")}</div>', "routing"))
-    if not alias or not value:
-        return RedirectResponse(f"/ui/mapping?cedit={orig}" if orig else "/ui/mapping", status_code=303)
+        return await err(smp_err)
+    if not alias:
+        return await err("alias name is required")
+    if not value:
+        return RedirectResponse(f"/ui/mapping?cedit={_q(orig)}" if orig else "/ui/mapping", status_code=303)
+    if alias != orig and _chat_alias_taken(alias):
+        # the rename used to land ON the other alias: its mapping replaced, and its
+        # park/reasoning/voice/sampling overrides silently adopted by this one
+        return await err(f"chat alias '{alias}' already exists — pick another name")
     if orig and orig != alias and store.get_chat_alias(orig) is not None:
         store.delete_chat_alias(orig)         # renamed a store entry → move it
         store.set_alias_park(orig, None)      # drop the old name's overrides
@@ -2866,7 +3073,7 @@ async def chat_badd(request: Request):
         cur[backend] = ""                     # model filled in the editor, then Save
         store.upsert_chat_alias(alias, cur)
         _apply_chat_aliases()
-    return RedirectResponse(f"/ui/mapping?cedit={alias}", status_code=303)
+    return RedirectResponse(f"/ui/mapping?cedit={_q(alias)}", status_code=303)
 
 
 async def chat_bdel(request: Request):
@@ -2877,7 +3084,7 @@ async def chat_bdel(request: Request):
         del cur[backend]
         store.upsert_chat_alias(alias, cur)
         _apply_chat_aliases()
-    return RedirectResponse(f"/ui/mapping?cedit={alias}", status_code=303)
+    return RedirectResponse(f"/ui/mapping?cedit={_q(alias)}", status_code=303)
 
 
 async def chat_del(request: Request):
@@ -3101,20 +3308,30 @@ async def chatplay_send(request: Request):
 
 # ── Tab: Mapping ────────────────────────────────────────────────────────────────
 
-def _register_form() -> str:
+def _form_err(err: str) -> str:
+    """The inline reason a create/save form was refused, right under its form bar."""
+    return f"<p class='bad' role='alert'>{_esc(err)}</p>" if err else ""
+
+
+def _register_form(vals: Optional[dict] = None, err: str = "") -> str:
+    v = vals or {}
     backend_opts = [b["name"] for b in _gen_backends()] or [("", "(no generation backends)")]
-    return ('<form action="/ui/mapping/register" method="post" enctype="multipart/form-data">'
+    return ('<form action="/ui/mapping/register" method="post" data-guard enctype="multipart/form-data">'
             f'<div class="formbar"><h2>Register Workflow</h2>{_btn("Register", submit=True)}'
             f'{_btn("Cancel", "/ui/mapping?sub=media", "secondary")}</div>'
-            "<p class='hint'>The gateway <b>owns</b> the API JSON once registered — independent of "
+            + _form_err(err)
+            + (("<p class='hint'>Pick the API JSON file again — a browser never pre-fills a "
+                "file field.</p>") if err else "")
+            + "<p class='hint'>The gateway <b>owns</b> the API JSON once registered — independent of "
             "later ComfyUI-GUI edits. You'll map fields after registering. For a <b>cloud</b> backend "
             "(meshy, tripo) no JSON is needed — the alias is created with that vendor's defaults and "
             "edited next.</p>"
-            + _field("alias", _inp("alias", placeholder="flux"))
-            + _field("backend", _select("backend", backend_opts))
-            + _field("task", _task_select())
+            + _field("alias", _inp("alias", v.get("alias", ""), placeholder="flux"))
+            + _field("backend", _select("backend", backend_opts, v.get("backend")))
+            + _field("task", _task_select(v.get("task") or "text2img"))
             + _field("API JSON file", '<input type="file" name="workflow_file" accept=".json,application/json">')
-            + _field("…or share path", _inp("workflow_path", placeholder="/mnt/share/flux_api.json"))
+            + _field("…or share path", _inp("workflow_path", v.get("workflow_path", ""),
+                                            placeholder="/mnt/share/flux_api.json"))
             + "</form>")
 
 
@@ -3138,10 +3355,10 @@ def _mapping_list_chat(cedit: str) -> str:
         src = (_badge("ui", "ok", "Defined/edited in this UI (stored in the gateway; overrides config.yaml)")
                if in_ui else
                _badge("config", "muted", "From config.yaml (read-only base; Edit creates a UI override)"))
-        specs = [("✎", f"/ui/mapping?cedit={_esc(name)}", "secondary", "Edit")]
+        specs = [("✎", f"/ui/mapping?cedit={_q(name)}", "secondary", "Edit")]
         if in_ui:
             lbl = "Delete override (revert to config)" if name in cfg else f"Delete {name}?"
-            specs.append(("✕", f"/ui/chat/delete?alias={_esc(name)}", "danger", "Delete", lbl))
+            specs.append(("✕", f"/ui/chat/delete?alias={_q(name)}", "danger", "Delete", lbl))
         chat_items += _item(f"{_esc(name)} {src}", _chat_summary(val), _icon_acts(*specs),
                             sel=(name == cedit))
     chat_items = chat_items or "<p class='muted'>No chat aliases — + Chat alias.</p>"
@@ -3181,9 +3398,9 @@ def _mapping_list_media(iedit: str) -> str:
                       else ", ".join((c.get("mapping") or {}).keys()) or "auto")
             backends = ", ".join(x.get("backend", "") for x in cands)
             acts = _icon_acts(
-                ("✎", f"/ui/mapping?edit={_esc(alias)}", "secondary", "Edit"),
-                ("⧉", f"/ui/mapping/copy?alias={_esc(alias)}", "secondary", "Copy"),
-                ("✕", f"/ui/mapping/delete?alias={_esc(alias)}", "danger", "Delete", f"Delete {alias}?"))
+                ("✎", f"/ui/mapping?edit={_q(alias)}", "secondary", "Edit"),
+                ("⧉", f"/ui/mapping/copy?alias={_q(alias)}", "secondary", "Copy"),
+                ("✕", f"/ui/mapping/delete?alias={_q(alias)}", "danger", "Delete", f"Delete {alias}?"))
             # the task is the group header now — the row shows what differs within it
             body += _item(_esc(alias), f"{backends} · {mapped}", acts, sel=(alias == iedit))
     body = body or "<p class='muted'>No workflows — + Workflow.</p>"
@@ -3197,7 +3414,15 @@ def _mapping_list_media(iedit: str) -> str:
 async def mapping_page(request: Request):
     if not store.is_active():
         return _inactive()
-    qp = request.query_params
+    return await _mapping_view(request.query_params)
+
+
+async def _mapping_view(qp, detail: Optional[str] = None, err: str = "",
+                        status: int = 200) -> HTMLResponse:
+    """The Mapping tab for `qp`. A handler whose input was refused re-renders through
+    here: `detail` replaces the right column (a create form with the typed values and
+    the reason), `err` rides in the media editor's form bar — answered 400, never the
+    old bare error page whose "← Back" link opened an EMPTY form."""
     cedit, iedit = qp.get("cedit", ""), qp.get("edit", "")
     # Which sub-tab: an explicit ?sub= wins, otherwise the edit target decides. That
     # keeps every existing action link working — they redirect to ?edit=/?cedit= and
@@ -3212,14 +3437,17 @@ async def mapping_page(request: Request):
                 + "".join(f'<div class="col">{p}</div>' for p in panels) + "</div>")
 
     chat_names = set(_config_chat_aliases()) | set(store.list_chat_aliases())
-    if cedit and cedit in chat_names:
+    if detail is not None:
+        body = cols(list_html, detail)
+    elif cedit and cedit in chat_names:
         body = cols(list_html, _chat_editor(cedit))          # chat editor (2 cols)
     elif qp.get("cnew"):
         body = cols(list_html, _chat_new_form())
     elif iedit and store.get(iedit):
         # image editor (3 cols); the post-Save confirmation rides in the form bar so
         # Save leaves the editor's scroll position untouched
-        editor, available = await _alias_editor(iedit, saved=bool(qp.get("saved")))
+        editor, available = await _alias_editor(iedit, saved=bool(qp.get("saved")),
+                                                taken=qp.get("taken", ""), err=err)
         # wider editor (col 2), narrower Available fields (col 3) — see .cols.map3 CSS
         body = ('<div class="cols map3">'
                 f'<div class="col">{list_html}</div>'
@@ -3231,7 +3459,8 @@ async def mapping_page(request: Request):
         what = ("a <b>+ Chat alias</b>" if sub == "chat" else "a <b>+ Workflow</b>")
         detail = (f"<h2>Details</h2><p class='hint'>Pick an entry to <b>Edit</b>, or add {what}.</p>")
         body = cols(list_html, detail)
-    return HTMLResponse(_page("Mapping", body, "mapping", subnav=_subnav("mapping", sub)))
+    return HTMLResponse(_page("Mapping", body, "mapping", subnav=_subnav("mapping", sub)),
+                        status_code=status)
 
 
 async def register_post(request: Request):
@@ -3243,11 +3472,17 @@ async def register_post(request: Request):
     upload = f.get("workflow_file")
     path = str(f.get("workflow_path", "")).strip()
 
-    def err(msg):
-        return HTMLResponse(_page("Register", f'<p class="bad">{_esc(msg)}</p>'
-                            f'<div class="actions" style="padding-left:0">{_btn("← Back", "/ui/mapping?sub=media", "secondary")}</div>', "mapping"))
+    async def err(msg):
+        vals = {"alias": alias, "backend": backend, "task": picked_task, "workflow_path": path}
+        return await _mapping_view({"sub": "media", "new": "1"}, status=400,
+                                   detail=_register_form(vals, msg))
     if not alias or not backend:
-        return err("alias and backend are required")
+        return await err("alias and backend are required")
+    if store.get(alias):
+        # Registering used to REPLACE an existing alias wholesale — its mapping, pins,
+        # extra backends and chain gone, without a word.
+        return await err(f"alias '{alias}' already exists — pick another name, or edit "
+                         "it and use Update workflow to replace its JSON")
     # A cloud alias (Meshy, Tripo) has no workflow at all: its request fields are the
     # fixed label table in the kind's module, its per-backend half is a set of admin
     # options. Registering creates the default candidate; everything else is edited in
@@ -3266,7 +3501,7 @@ async def register_post(request: Request):
             cand["task"] = picked_task
         store.upsert(alias, [cand])
         logger.info(f"ui: registered '{alias}' -> {backend} ({bt}, no workflow)")
-        return RedirectResponse(f"/ui/mapping?edit={quote(alias)}", status_code=303)
+        return RedirectResponse(f"/ui/mapping?edit={_q(alias)}", status_code=303)
     try:
         if isinstance(upload, (bytes, bytearray)) and upload.strip():
             wf = json.loads(upload.decode("utf-8"))
@@ -3274,11 +3509,11 @@ async def register_post(request: Request):
             with open(path) as fh:
                 wf = json.load(fh)
         else:
-            return err("upload an API JSON file or give a share path")
+            return await err("upload an API JSON file or give a share path")
     except Exception as e:
-        return err(f"invalid workflow JSON: {e}")
+        return await err(f"invalid workflow JSON: {e}")
     if not isinstance(wf, dict):
-        return err("workflow JSON must be an object of nodes (API format)")
+        return await err("workflow JSON must be an object of nodes (API format)")
     oi = await _object_info(backend, wf)
     cand = {"backend": backend, "task": task, "workflow_json": wf,
             "mapping": adapters.suggest_mapping(wf), "fixed": _detect_model_bindings(wf, oi)}
@@ -3291,7 +3526,7 @@ async def register_post(request: Request):
         cand["output_node"] = out_node
     store.upsert(alias, [cand])
     logger.info(f"ui: registered '{alias}' → {backend} ({len(wf)} nodes, {len(cand['fixed'])} model slots)")
-    return RedirectResponse(f"/ui/mapping?edit={alias}", status_code=303)
+    return RedirectResponse(f"/ui/mapping?edit={_q(alias)}", status_code=303)
 
 
 async def update_workflow(request: Request):
@@ -3301,13 +3536,21 @@ async def update_workflow(request: Request):
     f = await _multipart(request)
     alias = str(f.get("alias", "")).strip()
     cands = store.get(alias)
-
-    def err(msg):
-        return HTMLResponse(_page("Update workflow", f'<p class="bad">{_esc(msg)}</p>'
-                            f'<div class="actions" style="padding-left:0">'
-                            f'{_btn("← Back", f"/ui/mapping?edit={quote(alias)}", "secondary")}</div>', "mapping"))
     if not cands:
-        return err(f"alias '{alias}' not found")
+        return await _mapping_view({"sub": "media"}, status=404, detail=(
+            f"<h2>Update workflow</h2><p class='bad'>alias '{_esc(alias)}' not found</p>"))
+    # The button sits in the alias editor and submits the WHOLE editor form: its edits
+    # (labels, pins, bypass, …) are applied first, exactly as Save would, so replacing
+    # the workflow never throws away what was typed above it — and a refused file keeps
+    # them too: they are saved, and the editor comes back with the reason.
+    taken = ""
+    if "new_alias" in f:
+        _apply_update_form(cands, f)
+        alias, taken = _rename_gen_alias(alias, f)
+
+    async def err(msg):
+        store.upsert(alias, cands)
+        return await _mapping_view({"edit": alias, "taken": taken}, err=msg, status=400)
     upload = f.get("workflow_file")
     path = str(f.get("workflow_path", "")).strip()
     try:
@@ -3317,11 +3560,11 @@ async def update_workflow(request: Request):
             with open(path) as fh:
                 wf = json.load(fh)
         else:
-            return err("upload an API JSON file or give a share path")
+            return await err("upload an API JSON file or give a share path")
     except Exception as e:
-        return err(f"invalid workflow JSON: {e}")
+        return await err(f"invalid workflow JSON: {e}")
     if not isinstance(wf, dict):
-        return err("workflow JSON must be an object of nodes (API format)")
+        return await err("workflow JSON must be an object of nodes (API format)")
     base_mapping = cands[0].get("mapping") or {}
     for c in cands:
         c["workflow_json"] = wf                          # workflow + mapping are backend-independent →
@@ -3340,14 +3583,15 @@ async def update_workflow(request: Request):
     stale_byp = sorted({str(n) for c in cands for n in (c.get("bypass") or []) if str(n) not in wf})
     logger.info(f"ui: workflow updated for '{alias}' ({len(wf)} nodes); {len(stale)} stale binding(s): {stale}"
                 + (f"; {len(stale_byp)} stale bypass node(s): {stale_byp}" if stale_byp else ""))
-    return RedirectResponse(f"/ui/mapping?edit={quote(alias)}&saved=1", status_code=303)
+    return RedirectResponse(_saved_url(alias, taken), status_code=303)
 
 
-def _reorder_js(alias: str) -> str:
+def _reorder_js() -> str:
     """Vanilla drag-to-reorder for the request-fields rows. On drop, if the order
-    changed, persist it via /ui/mapping/field-order (one ?order= per param) and the
-    redirect reloads the editor — the same order then drives the Playground."""
-    a = _js_json(alias)         # safe JS string literal, also inside <script>
+    changed, the editor form is SAVED: `update` builds the mapping in the order the
+    rows' fields arrive, so the DOM order is the stored order — and the same order then
+    drives the Playground. It used to navigate to a GET action instead, which threw
+    away every unsaved edit in the form."""
     return ("<script>(function(){"
             "var tb=document.getElementById('reqfields');if(!tb)return;"
             "function ord(){return [].map.call(tb.querySelectorAll('tr[data-p]'),"
@@ -3361,8 +3605,8 @@ def _reorder_js(alias: str) -> str:
             "tb.insertBefore(drag,(e.clientY-b.top)/b.height>0.5?tr.nextSibling:tr);});"
             "tr.addEventListener('drop',function(e){e.preventDefault();"
             "if(ord().join('\\u0001')===start)return;"
-            "location.href='/ui/mapping/field-order?alias='+encodeURIComponent(" + a + ")+"
-            "'&'+ord().map(function(p){return 'order='+encodeURIComponent(p);}).join('&');});"
+            "var f=tb.closest('form');if(f.requestSubmit)f.requestSubmit();"
+            "else{if(window.gwClean)gwClean(f);f.submit();}});"
             "});})();</script>")
 
 
@@ -3384,7 +3628,7 @@ def _backends_section(alias: str, cands: list) -> str:
     used = [c.get("backend") for c in cands]
     rows = ""
     for bn in used:
-        rm = (_btn("✕", f"/ui/mapping/cand-del?alias={_esc(alias)}&backend={_esc(bn)}",
+        rm = (_btn("✕", f"/ui/mapping/cand-del?alias={_q(alias)}&backend={_q(bn)}",
                    "danger", sm=True, icon=True, title="Remove this backend")
               if len(used) > 1 else "<span class='muted' title='an alias needs ≥1 backend'>—</span>")
         rows += f"<tr><td>{_esc(bn)}</td><td class='acts'>{rm}</td></tr>"
@@ -3393,9 +3637,8 @@ def _backends_section(alias: str, cands: list) -> str:
     add_sel = ""
     if add_opts:
         opts = "".join(f"<option>{_esc(o)}</option>" for o in add_opts)
-        add_sel = ('<select class="addsel" onchange="if(this.value)location.href=\'/ui/mapping/cand-add?alias='
-                   f"{_esc(alias)}&amp;backend='+encodeURIComponent(this.value)\">"
-                   f'<option value="">+ Add backend…</option>{opts}</select>')
+        add_sel = _add_select(f"/ui/mapping/cand-add?alias={_q(alias)}&backend=",
+                              f'<option value="">+ Add backend…</option>{opts}')
     return (f"<table class='pins'><tr><th>allowed backend</th><th></th></tr>{rows}</table>{add_sel}")
 
 
@@ -3417,7 +3660,7 @@ _PIN_CSS_JS = ("<style>.ptabs{display:flex;gap:4px;margin:10px 0 0;flex-wrap:wra
 
 
 def _map_del_btn(alias: str, qs: str) -> str:
-    return _btn("✕", f"/ui/mapping/field-del?alias={_esc(alias)}&{qs}", "danger", sm=True,
+    return _btn("✕", f"/ui/mapping/field-del?alias={_q(alias)}&{qs}", "danger", sm=True,
                 icon=True, title="Remove")
 
 
@@ -3466,10 +3709,10 @@ def _req_fields_rows(alias: str, wf: dict, mapping: dict, oi: dict) -> str:
         tag = " <span class='tag'>image</span>" if is_img else ""
         if node and node not in wf:                      # node vanished after a workflow update
             tag += " <span class='badge bad' title='this node no longer exists in the workflow'>stale</span>"
-        actions = ((_btn("∅", f"/ui/mapping/field-clear?alias={_esc(alias)}&param={_esc(p)}",
+        actions = ((_btn("∅", f"/ui/mapping/field-clear?alias={_q(alias)}&param={_q(p)}",
                          "secondary", sm=True, icon=True, title="Clear the workflow default")
                     if not is_img else "")
-                   + _map_del_btn(alias, "param=" + _esc(p)))
+                   + _map_del_btn(alias, "param=" + _q(p)))
         rows += (f'<tr draggable="true" data-p="{_esc(p)}">'
                  f"<td><span class='grip' title='Drag to reorder'>⠿</span> {_esc(p)}{tag}</td>"
                  f"<td>{_inp('label__' + p, m.get('label', ''), placeholder=p)}</td>"
@@ -3493,7 +3736,7 @@ def _pin_tab_rows(alias: str, c: dict, is_primary: bool, fixed: list, wf: dict, 
         if is_primary:
             cur, name, inherited = b.get("value"), f"fixed__{nid}__{fld}", False
             acts = (f"<span class='ovact'>"
-                    f"{_map_del_btn(alias, 'node=' + _esc(nid) + '&field=' + _esc(fld))}</span>")
+                    f"{_map_del_btn(alias, 'node=' + _q(nid) + '&field=' + _q(fld))}</span>")
         else:
             cv = next((x.get("value") for x in (c.get("fixed") or [])
                        if str(x.get("node")) == nid and str(x.get("field")) == fld), None)
@@ -3739,7 +3982,7 @@ def _bypass_block(alias: str, cands: list, wf: dict) -> str:
             f"name='byp__{_esc(str(c.get('backend')))}__{_esc(nid)}'"
             f"{' checked' if nid in {str(x) for x in (c.get('bypass') or [])} else ''}></td>"
             for c in cands)
-        rm = _btn("⊘", f"/ui/mapping/bypass-del?alias={_esc(alias)}&node={_esc(nid)}",
+        rm = _btn("⊘", f"/ui/mapping/bypass-del?alias={_q(alias)}&node={_q(nid)}",
                   "danger", sm=True, icon=True, title="Remove from bypass")
         rows += f"<tr><td>{label}</td>{cells}<td class='acts'>{rm}</td></tr>"
     body = (f"<table class='pins'><tr><th>node</th>{hdr}<th></th></tr>{rows}</table>"
@@ -3751,9 +3994,8 @@ def _bypass_block(alias: str, cands: list, wf: dict) -> str:
             t = ((wf[nid] or {}).get("_meta") or {}).get("title", "")
             return (f"<option value='{_esc(nid)}'>{_esc(nid)} — {_esc((wf[nid] or {}).get('class_type', ''))}"
                     + (f" · {_esc(t)}" if t else "") + "</option>")
-        add_sel = ('<select class="addsel" onchange="if(this.value)location.href=\'/ui/mapping/bypass-add?alias='
-                   f"{_esc(alias)}&amp;node='+encodeURIComponent(this.value)\">"
-                   f'<option value="">+ Bypass a node…</option>{"".join(_opt(n) for n in avail)}</select>')
+        add_sel = _add_select(f"/ui/mapping/bypass-add?alias={_q(alias)}&node=",
+                              f'<option value="">+ Bypass a node…</option>{"".join(_opt(n) for n in avail)}')
     return (f"<input type='hidden' name='bypass_nodes' value='{_esc(','.join(managed))}'>"
             "<h2 style='margin-top:18px'>Bypass "
             "<span class='muted' style='font-weight:normal'>— skip a node per backend</span></h2>"
@@ -3813,7 +4055,8 @@ def _option_rows(mod, opts: dict, ep: str) -> str:
     return "".join(rows)
 
 
-def _cloud_editor(kind: str, alias: str, cands: list, saved: bool = False) -> str:
+def _cloud_editor(kind: str, alias: str, cands: list, saved: bool = False, taken: str = "",
+                  err: str = "") -> str:
     """Editor for a cloud alias (Meshy, Tripo): endpoint, ai model and the admin option
     defaults — no workflow, no mapping, no pins (the public fields are a fixed table, see
     the vendor module). Everything vendor-specific is READ from that module (OPTION_FIELDS,
@@ -3856,10 +4099,10 @@ def _cloud_editor(kind: str, alias: str, cands: list, saved: bool = False) -> st
     ignored = getattr(mod, "IGNORED_PARAMS", ())
     ign_hint = (" " + " / ".join(f"<code>{_esc(n)}</code>" for n in ignored)
                 + " are accepted and ignored.") if ignored else ""
-    return (f'<form action="/ui/mapping/cloud-update" method="post"><input type="hidden" name="alias" value="{_esc(alias)}">'
+    return (f'<form action="/ui/mapping/cloud-update" method="post" data-guard><input type="hidden" name="alias" value="{_esc(alias)}">'
             f'<div class="formbar"><h2 style="margin:0">{_esc(alias)}</h2>'
             f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/mapping?sub=media", "secondary")}'
-            + ("<span class='ok-chip fade'>✓ Saved</span>" if saved else "") + "</div>"
+            + _saved_chip(saved, taken, err) + "</div>"
             + _field("alias name", _inp("new_alias", alias), short=True)
             + _field("task", _task_select(cur_task), short=True)
             + f'<h2 style="margin-top:18px">{_esc(vendor)}</h2>'
@@ -3911,7 +4154,14 @@ def _cloud_side(kind: str) -> str:
             "set on the left.</p>")
 
 
-async def _alias_editor(alias: str, saved: bool = False) -> str:
+def _saved_chip(saved: bool, taken: str = "", err: str = "") -> str:
+    return (("<span class='ok-chip fade'>✓ Saved</span>" if saved else "")
+            + (f"<span class='bad' style='margin-left:8px'>not renamed — "
+               f"“{_esc(taken)}” already exists</span>" if taken else "")
+            + (f"<span class='bad' style='margin-left:8px'>{_esc(err)}</span>" if err else ""))
+
+
+async def _alias_editor(alias: str, saved: bool = False, taken: str = "", err: str = "") -> str:
     """The alias editor as a single-column fragment for the master-detail right
     side (request fields + pinned values in one form, available fields below).
     `saved` renders the post-Save confirmation inside the sticky form bar (see
@@ -3922,7 +4172,7 @@ async def _alias_editor(alias: str, saved: bool = False) -> str:
     cand = cands[0]
     kind = adapters.cloud_kind(cand)             # no workflow, no mapping, no /object_info
     if kind:
-        return _cloud_editor(kind, alias, cands, saved), _cloud_side(kind)
+        return _cloud_editor(kind, alias, cands, saved, taken, err), _cloud_side(kind)
     wf = cand.get("workflow_json")
     if wf is None and cand.get("workflow"):
         try:
@@ -3947,11 +4197,11 @@ async def _alias_editor(alias: str, saved: bool = False) -> str:
     # default ('text2img') yet have fps configured — configured fps must never
     # render its own editor fields invisible.
     is_video = "vid" in cur_task.lower() or any(c.get("fps") for c in cands)
-    form = (f'<form action="/ui/mapping/update" method="post"><input type="hidden" name="alias" value="{_esc(alias)}">'
+    form = (f'<form action="/ui/mapping/update" method="post" data-guard><input type="hidden" name="alias" value="{_esc(alias)}">'
             f'<div class="formbar"><h2 style="margin:0">{_esc(alias)}</h2>'
             f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/mapping?sub=media", "secondary")}'
             f'{_btn("⬇ Export", "/ui/mapping/export?alias=" + quote(alias), "secondary", title="Download the gateway-cleaned workflow JSON")}'
-            + ("<span class='ok-chip fade'>✓ Saved</span>" if saved else "")
+            + _saved_chip(saved, taken, err)
             + '</div>'
             + _field("alias name", _inp("new_alias", alias), short=True)
             + _field("task", _task_select(cur_task, _TASK_VIDEO_JS), short=True)
@@ -3993,7 +4243,7 @@ async def _alias_editor(alias: str, saved: bool = False) -> str:
             + pinned_block
             + _bypass_block(alias, cands, wf)
             + _output_section(wf, cands)
-            + '</form>' + pin_extra + _reorder_js(alias))
+            + '</form>' + pin_extra + _reorder_js())
     return form, _available_fields(alias, wf, mapped, oi)
 
 
@@ -4028,10 +4278,10 @@ def _available_fields(alias: str, wf: dict, mapped: set, oi: dict) -> str:
         for f2, v2 in (n.get("inputs") or {}).items():
             if isinstance(v2, list) or (nid, f2) in mapped:    # links / already-mapped → skip
                 continue
-            add = _btn("+", f"/ui/mapping/field-add?alias={_esc(alias)}&node={_esc(nid)}&field={_esc(f2)}",
+            add = _btn("+", f"/ui/mapping/field-add?alias={_q(alias)}&node={_q(nid)}&field={_q(f2)}",
                        "secondary", sm=True, icon=True, title="Add as pinned value")
-            req_btn = _btn("→", f"/ui/mapping/field-map?alias={_esc(alias)}&node={_esc(nid)}"
-                           f"&field={_esc(f2)}", "secondary", sm=True, icon=True,
+            req_btn = _btn("→", f"/ui/mapping/field-map?alias={_q(alias)}&node={_q(nid)}"
+                           f"&field={_q(f2)}", "secondary", sm=True, icon=True,
                            title="Add as request field")
             fopts = oi.get(n.get("class_type", ""), {}).get(f2)   # discovery hint: dropdown? bool?
             if isinstance(fopts, list) and _is_model_field(fopts, v2):
@@ -4065,7 +4315,7 @@ async def edit_add(request: Request):
             fixed.append({"node": node, "field": fld, "value": cur})
             cand["fixed"] = fixed
             store.upsert(alias, cands)
-    return RedirectResponse(f"/ui/mapping?edit={alias}", status_code=303)
+    return RedirectResponse(f"/ui/mapping?edit={_q(alias)}", status_code=303)
 
 
 async def edit_del(request: Request):
@@ -4080,7 +4330,7 @@ async def edit_del(request: Request):
             cand["fixed"] = [b for b in (cand.get("fixed") or [])
                              if not (b["node"] == node and b["field"] == fld)]
         store.upsert(alias, cands)
-    return RedirectResponse(f"/ui/mapping?edit={alias}", status_code=303)
+    return RedirectResponse(f"/ui/mapping?edit={_q(alias)}", status_code=303)
 
 
 async def bypass_add(request: Request):
@@ -4093,7 +4343,7 @@ async def bypass_add(request: Request):
         if node not in bl:
             cands[0]["bypass"] = bl + [node]
             store.upsert(alias, cands)
-    return RedirectResponse(f"/ui/mapping?edit={alias}", status_code=303)
+    return RedirectResponse(f"/ui/mapping?edit={_q(alias)}", status_code=303)
 
 
 async def bypass_del(request: Request):
@@ -4112,7 +4362,7 @@ async def bypass_del(request: Request):
                     c.pop("bypass", None)
         if changed:
             store.upsert(alias, cands)
-    return RedirectResponse(f"/ui/mapping?edit={alias}", status_code=303)
+    return RedirectResponse(f"/ui/mapping?edit={_q(alias)}", status_code=303)
 
 
 def _slug_param(s: str) -> str:
@@ -4141,7 +4391,7 @@ async def field_map(request: Request):
             entry["label"] = title
         mp[param] = entry
         store.upsert(alias, cands)
-    return RedirectResponse(f"/ui/mapping?edit={alias}", status_code=303)
+    return RedirectResponse(f"/ui/mapping?edit={_q(alias)}", status_code=303)
 
 
 async def field_clear(request: Request):
@@ -4170,7 +4420,7 @@ async def field_clear(request: Request):
                 if w and node in w:
                     w[node].setdefault("inputs", {})[field] = blank
             store.upsert(alias, cands)
-    return RedirectResponse(f"/ui/mapping?edit={alias}", status_code=303)
+    return RedirectResponse(f"/ui/mapping?edit={_q(alias)}", status_code=303)
 
 
 async def cand_add(request: Request):
@@ -4186,7 +4436,7 @@ async def cand_add(request: Request):
         cands.append(new)
         store.upsert(alias, cands)
         logger.info(f"ui: alias '{alias}' + backend '{backend}'")
-    return RedirectResponse(f"/ui/mapping?edit={alias}", status_code=303)
+    return RedirectResponse(f"/ui/mapping?edit={_q(alias)}", status_code=303)
 
 
 async def cand_del(request: Request):
@@ -4198,24 +4448,7 @@ async def cand_del(request: Request):
         if kept and len(kept) != len(cands):
             store.upsert(alias, kept)
             logger.info(f"ui: alias '{alias}' − backend '{backend}'")
-    return RedirectResponse(f"/ui/mapping?edit={alias}", status_code=303)
-
-
-async def field_order(request: Request):
-    """Reorder the request fields (drag & drop). Rebuilds the mapping dict in the
-    given param order; that order is what the editor and Playground render."""
-    alias = _qp(request, "alias")
-    order = request.query_params.getlist("order")
-    cands = store.get(alias)
-    if cands and order:
-        cand = cands[0]
-        m = cand.get("mapping") or {}
-        new = {p: m[p] for p in order if p in m}
-        for p in m:                       # keep any param not in the posted order
-            new.setdefault(p, m[p])
-        cand["mapping"] = new
-        store.upsert(alias, cands)
-    return RedirectResponse(f"/ui/mapping?edit={alias}", status_code=303)
+    return RedirectResponse(f"/ui/mapping?edit={_q(alias)}", status_code=303)
 
 
 async def update(request: Request):
@@ -4224,6 +4457,40 @@ async def update(request: Request):
     cands = store.get(alias)
     if not alias or not cands:
         raise HTTPException(404, "alias not found")
+    summary = _apply_update_form(cands, f)
+    alias, taken = _rename_gen_alias(alias, f)
+    store.upsert(alias, cands)         # every candidate — keeps the other allowed backends
+    logger.info(f"ui: updated '{alias}' ({summary})")
+    # Save keeps the editor open (mapping work is iterative); a transient banner
+    # confirms the write instead of the editor closing.
+    return RedirectResponse(_saved_url(alias, taken), status_code=303)
+
+
+def _rename_gen_alias(alias: str, f: dict) -> tuple:
+    """The editor's `new_alias` field → (name to store under, refused name). A name that
+    is already taken is REFUSED and reported, never merged into or overwritten — the
+    rename used to be skipped without a word, so the editor saved and showed the old
+    name as if nothing had been asked."""
+    new_alias = (f.get("new_alias", "") or "").strip()
+    if not new_alias or new_alias == alias:
+        return alias, ""
+    if store.get(new_alias):
+        logger.info(f"ui: rename '{alias}' → '{new_alias}' refused (name taken)")
+        return alias, new_alias
+    store.delete(alias)                # rename: move under the new name
+    return new_alias, ""
+
+
+def _saved_url(alias: str, taken: str = "") -> str:
+    return (f"/ui/mapping?edit={_q(alias)}&saved=1"
+            + (f"&taken={_q(taken)}" if taken else ""))
+
+
+def _apply_update_form(cands: list, f: dict) -> str:
+    """Apply the ComfyUI alias editor's fields to every candidate (not persisted);
+    returns a summary for the log line. Shared by Save and by Update workflow, which
+    submits the same form and used to read only its file/path fields — every other
+    edit in the editor was dropped without a word."""
     task = (f.get("task", "") or "").strip()          # task dropdown (blank keeps the stored value)
     if task:
         for c in cands:
@@ -4400,15 +4667,7 @@ async def update(request: Request):
             c["successor"] = succ
         else:
             c.pop("successor", None)
-    new_alias = (f.get("new_alias", "") or "").strip()
-    if new_alias and new_alias != alias and not store.get(new_alias):
-        store.delete(alias)            # rename: move under the new name
-        alias = new_alias
-    store.upsert(alias, cands)         # cand is cands[0] — keeps the other allowed backends
-    logger.info(f"ui: updated '{alias}' ({len(mapping)} params, {len(fixed)} pinned, retries={retries or 'all'})")
-    # Save keeps the editor open (mapping work is iterative); a transient banner
-    # confirms the write instead of the editor closing.
-    return RedirectResponse(f"/ui/mapping?edit={quote(alias)}&saved=1", status_code=303)
+    return f"{len(mapping)} params, {len(fixed)} pinned, retries={retries or 'all'}"
 
 
 def _cloud_update_apply(kind: str, cands: list, f: dict) -> None:
@@ -4464,14 +4723,11 @@ async def cloud_update(request: Request):
     if not kind:
         raise HTTPException(404, "cloud alias not found")
     _cloud_update_apply(kind, cands, f)
-    new_alias = (f.get("new_alias", "") or "").strip()
-    if new_alias and new_alias != alias and not store.get(new_alias):
-        store.delete(alias)            # rename: move under the new name
-        alias = new_alias
+    alias, taken = _rename_gen_alias(alias, f)
     store.upsert(alias, cands)
     logger.info(f"ui: updated {kind} alias '{alias}' "
                 f"({cands[0][kind]['endpoint']}, {cands[0]['model']})")
-    return RedirectResponse(f"/ui/mapping?edit={quote(alias)}&saved=1", status_code=303)
+    return RedirectResponse(_saved_url(alias, taken), status_code=303)
 
 
 async def delete(request: Request):
@@ -4492,7 +4748,7 @@ async def copy(request: Request):
         new, i = f"{alias}-copy{i}", i + 1
     store.upsert(new, json.loads(json.dumps(cands)))     # deep copy of the candidate(s)
     logger.info(f"ui: copied alias '{alias}' → '{new}'")
-    return RedirectResponse(f"/ui/mapping?edit={new}", status_code=303)
+    return RedirectResponse(f"/ui/mapping?edit={_q(new)}", status_code=303)
 
 
 # ── Tab: Playground ─────────────────────────────────────────────────────────────
@@ -5013,8 +5269,9 @@ def _voiceplay_form(vals: dict) -> str:
             + "</form>" + _datalist("vpmodels", _chat_models()) + _VOICEPLAY_JS)
 
 
-def _voice_lib_panel(status_html: str = "") -> str:
-    """Library management under the Voice form: scp target, upload, entries table."""
+def _voice_lib_panel(status_html: str = "", target: Optional[dict] = None) -> str:
+    """Library management under the Voice form: scp target, upload, entries table.
+    `target` = a refused settings Save ({hosts, dir, whisper_model, err}), shown as typed."""
     lib = store.get_voice_library() if store.is_active() else {}
     rows = ""
     for n, e in sorted(lib.items()):
@@ -5035,6 +5292,10 @@ def _voice_lib_panel(status_html: str = "") -> str:
     rows = rows or "<tr><td colspan=4 class='muted'>no voices yet — upload one below</td></tr>"
     hosts, rdir = _voice_ship_config()
     wm = str((store.get_settings() or {}).get("whisper_model") or "small") if store.is_active() else "small"
+    t_err = ""
+    if target is not None:
+        hosts, rdir = [target.get("hosts", "")], target.get("dir", "")
+        wm, t_err = target.get("whisper_model") or wm, target.get("err", "")
     wm_opts = ["tiny", "base", "small", "medium", "large-v3", "large-v3-turbo"]
     if wm not in wm_opts:
         wm_opts = [wm] + wm_opts
@@ -5054,7 +5315,8 @@ def _voice_lib_panel(status_html: str = "") -> str:
         + _field("ref text", _textarea("ref_text", "", 2, "leave empty → auto-transcribe (whisper)"))
         + f'<div class="field"><label></label><div class="control">{_btn("⬆ Upload voice", submit=True)}</div></div>'
         + "</form>"
-        + '<form action="/ui/playground/voice-target" method="post" style="margin-top:6px">'
+        + '<form action="/ui/playground/voice-target" method="post" data-guard style="margin-top:6px">'
+        + _form_err(t_err)
         + _field("scp targets", _inp("hosts", ", ".join(hosts),
                                      placeholder="user@tts-host:/abs/host/dir, … (comma-separated)"))
         + _field("voice dir (model view)", _inp("dir", rdir,
@@ -5080,8 +5342,9 @@ def _voice_lib_panel(status_html: str = "") -> str:
           "return true;}</script></div>")
 
 
-def _voiceplay_body(vals: dict, result_html: str, lib_status: str = "") -> str:
-    return (f'<div class="cols"><div class="col">{_voiceplay_form(vals)}{_voice_lib_panel(lib_status)}</div>'
+def _voiceplay_body(vals: dict, result_html: str, lib_status: str = "",
+                    target: Optional[dict] = None) -> str:
+    return (f'<div class="cols"><div class="col">{_voiceplay_form(vals)}{_voice_lib_panel(lib_status, target)}</div>'
             f'<div class="col" id="vpresult">{result_html}</div></div>')
 
 
@@ -5199,11 +5462,38 @@ async def voice_upload(request: Request):
     return RedirectResponse("/ui/playground?sub=voice", status_code=303)
 
 
+def _voice_target_error(hosts: str, vdir: str) -> str:
+    """Why these ship settings cannot work ("" = fine). The same rules the ship applies
+    (main.parse_voice_target / _voice_dir_ok, bound in) — before, a bad target was
+    stored without a word and only the next ship, possibly much later, said so."""
+    targets = [h.strip() for h in hosts.split(",") if h.strip()]
+    bad = [t for t in targets if _parse_voice_target(t) is None]
+    if bad:
+        return ("scp targets are 'user@host:/abs/host/dir' (comma-separated; host and dir "
+                "only letters, digits, . _ - /) — refused: " + ", ".join(bad))
+    d = vdir.rstrip("/")
+    if vdir and not _voice_dir_ok(d):
+        return ("voice dir must be an absolute path of letters, digits, . _ - / "
+                f"without '..' — refused: {vdir}")
+    if targets and not d:
+        return "voice dir is required with scp targets — the path the MODEL sees, e.g. /models/voices"
+    return ""
+
+
 async def voice_target(request: Request):
     f = await _form(request)
-    store.set_settings({"voice_ref_hosts": (f.get("hosts", "") or "").strip(),
-                        "voice_ref_dir": (f.get("dir", "") or "").strip(),
-                        "whisper_model": (f.get("whisper_model", "") or "").strip() or "small"})
+    hosts = (f.get("hosts", "") or "").strip()
+    vdir = (f.get("dir", "") or "").strip()
+    wm = (f.get("whisper_model", "") or "").strip() or "small"
+    problem = _voice_target_error(hosts, vdir)
+    if problem:
+        vals = {k: "" for k in _VOICEPLAY_KEYS}
+        result = "<h2>Result</h2><p class='hint'>Synthesize to hear the result here.</p>"
+        body = _voiceplay_body(vals, result, target={"hosts": hosts, "dir": vdir,
+                                                     "whisper_model": wm, "err": problem})
+        return HTMLResponse(_page("Voice", body, "playground", subnav=_subnav("playground", "voice")),
+                            status_code=400)
+    store.set_settings({"voice_ref_hosts": hosts, "voice_ref_dir": vdir, "whisper_model": wm})
     return RedirectResponse("/ui/playground?sub=voice", status_code=303)
 
 
@@ -5331,7 +5621,7 @@ def _job_row(j: dict, now: int, *, task_col: bool = False, count_col: bool = Fal
     cells += [f"<td class='muted'>{_age(j.get('created'))}</td>", _job_dur_cell(j, now),
               f"<td class='muted'>{_esc(j.get('owner'))}</td>"]
     if actions:
-        acts = ((_btn('✕', f'/ui/job/{jid}/cancel', 'danger', sm=True, icon=True, confirm='Cancel this job?')
+        acts = ((_btn('✕', f'/ui/job/{_q(jid)}/cancel', 'danger', sm=True, icon=True, confirm='Cancel this job?')
                  if st in ('queued', 'running') else '')
                 + _btn('view', f'/ui/job/{jid}', 'secondary', sm=True))
         cells.append(f"<td style='text-align:right;white-space:nowrap'>{acts}</td>")
@@ -5787,16 +6077,16 @@ async def job_detail_page(job_id: str, request: Request):
     exp = " · <span class='bad'>expired</span>" if job.get("expired") else ""
     info = (f"<p class='muted'>task {_esc(job['task'])} · alias {_esc(job['alias'])} · backend "
             f"{_esc(job['backend'])} · owner {_esc(job['owner'])} · {_age(job['created'])}{exp}</p>")
-    cancel_btn = (_btn("✕ Cancel", f"/ui/job/{_esc(job_id)}/cancel", "danger", confirm="Cancel this job?")
+    cancel_btn = (_btn("✕ Cancel", f"/ui/job/{_q(job_id)}/cancel", "danger", confirm="Cancel this job?")
                   if st in ("queued", "running") else "")
     # Load this job's inputs (prompt/params + reference images) into the Media Playground.
-    to_pg = (_btn("→ Send to Playground", f"/ui/job/{_esc(job_id)}/to-playground",
+    to_pg = (_btn("→ Send to Playground", f"/ui/job/{_q(job_id)}/to-playground",
                   title="Copy this job's prompt, params and reference images into the Media Playground")
              if store.is_active() and job.get("task") != "response" else "")
     # prev/next in the Media Jobs list (newest first); hidden at the ends.
     newer, older = jobs.neighbors(job_id)
-    nav = ((_btn("‹ Prev", f"/ui/job/{_esc(newer)}", "secondary", title="Newer job") if newer else "")
-           + (_btn("Next ›", f"/ui/job/{_esc(older)}", "secondary", title="Older job") if older else ""))
+    nav = ((_btn("‹ Prev", f"/ui/job/{_q(newer)}", "secondary", title="Newer job") if newer else "")
+           + (_btn("Next ›", f"/ui/job/{_q(older)}", "secondary", title="Older job") if older else ""))
     # Both 3D viewers are hoisted UNCONDITIONALLY, exactly as _playground_body hoists
     # model-viewer: this page is live while the job runs, and _LIVE_JS strips every
     # <script> out of the subtree it morphs in. A GLB or FBX that only appears when the
@@ -6695,7 +6985,7 @@ def _reasoning_form(rule: Optional[dict], idx, test: Optional[dict] = None,
           'formnovalidate onclick="return rTest(this.form)">▶ Run test</button>'
         + f"<div id='rtresult'>{_reason_test_result(test) if test else ''}</div>"
         + "</div>" + _datalist("rtmodels", rt_bk.get(tb_pre) or rt_all))
-    return ('<form action="/ui/reasoning/save" method="post">' + hidden +
+    return ('<form action="/ui/reasoning/save" method="post" data-guard>' + hidden +
             f'<div class="formbar"><h2>{"Edit rule" if rule else "New rule"}</h2>'
             f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/reasoning", "secondary")}</div>'
             + _field("enabled", _checkbox("enabled", r.get("enabled", True), "rule is active"))
@@ -6896,7 +7186,9 @@ def _show_user_keys() -> bool:
     return bool(store.get_setting("show_user_keys", True)) if store.is_active() else True
 
 
-def _user_form(u: Optional[dict]) -> str:
+def _user_form(u: Optional[dict], orig: Optional[str] = None, err: str = "") -> str:
+    """`orig`/`err`: a refused Save shown again — `u` then holds what was typed and
+    `orig` the stored name it was editing ("" = a new user)."""
     g = lambda k, d="": str((u or {}).get(k) if (u or {}).get(k) is not None else d)
     has_key = bool((u or {}).get("api_key"))
     # A stored key is only prefilled for an EXISTING user (a new one has none) and
@@ -6904,7 +7196,8 @@ def _user_form(u: Optional[dict]) -> str:
     # it, exactly as it does for a freshly generated key.
     show_key = has_key and _show_user_keys()
     key_val = (u or {}).get("api_key", "") if show_key else ""
-    orig = f'<input type="hidden" name="orig" value="{_esc((u or {}).get("name", ""))}">' if u else ""
+    oname = (u or {}).get("name", "") if orig is None else orig
+    orig = f'<input type="hidden" name="orig" value="{_esc(oname)}">' if oname else ""
     # model allow-list as a table — ALIASES only (chat + image generation aliases),
     # since access is granted at the alias level; raw model ids would be noise.
     # Empty selection = all allowed.
@@ -6935,9 +7228,10 @@ def _user_form(u: Optional[dict]) -> str:
             "<script>function gwTogAll(c,g){var s='input[name=model][data-grp=\"'+g+'\"]';"
             "document.querySelectorAll(s).forEach(function(x){x.checked=c.checked;});}</script>") if rows
            else "<p class='muted'>no aliases or backends yet</p>")
-    return (f'<form action="/ui/users/save" method="post">{orig}'
-            f'<div class="formbar"><h2>{"Edit User" if u else "Add User"}</h2>'
+    return (f'<form action="/ui/users/save" method="post" data-guard>{orig}'
+            f'<div class="formbar"><h2>{"Edit User" if oname else "Add User"}</h2>'
             f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/users", "secondary")}</div>'
+            + _form_err(err)
             + _field("name", _inp("name", g("name"), placeholder="alice"))
             + _field("API key",
                      _inp("api_key", key_val, typ=("password" if show_key else "text"),
@@ -6979,7 +7273,11 @@ def _user_form(u: Optional[dict]) -> str:
 
 
 async def users_page(request: Request):
-    qp = request.query_params
+    return await _users_view(request.query_params)
+
+
+async def _users_view(qp, detail: Optional[str] = None, status: int = 200) -> HTMLResponse:
+    """The Users tab; `detail` replaces the right column (a refused Save, re-rendered)."""
     edit = qp.get("edit", "")
     open_auth = (not store.list_users()) and not _server_info().get("effective", {}).get("api_key_set")
     items = ""
@@ -6987,8 +7285,8 @@ async def users_page(request: Request):
         role_b = _badge(u.get("role", "user"), "ok" if u.get("role") == "admin" else "muted")
         st = "" if u.get("enabled", True) else _badge("disabled")
         key_b = _badge("key set", "ok") if u.get("api_key") else _badge("no key", "warn")
-        acts = _icon_acts(("✎", f"/ui/users?edit={_esc(u['name'])}", "secondary", "Edit"),
-                          ("✕", f"/ui/users/delete?name={_esc(u['name'])}", "danger", "Delete",
+        acts = _icon_acts(("✎", f"/ui/users?edit={_q(u['name'])}", "secondary", "Edit"),
+                          ("✕", f"/ui/users/delete?name={_q(u['name'])}", "danger", "Delete",
                            f"Delete user {u['name']}?"))
         allow = u.get("models") or []
         cq = u.get('quota_cost_month')
@@ -7003,7 +7301,9 @@ async def users_page(request: Request):
     list_html = (f'<div class="bar"><h2>Users</h2>{_btn("+ New user", "/ui/users?new=1")}</div>'
                  "<p class='hint'>Each user authenticates with their API key; calls are attributed to "
                  "them (stats, job ownership). Empty model list = all allowed.</p>" + items)
-    if edit and store.get_user(edit):
+    if detail is not None:
+        pass
+    elif edit and store.get_user(edit):
         detail = _user_form(store.get_user(edit))
     elif qp.get("new"):
         detail = _user_form(None)
@@ -7032,7 +7332,7 @@ async def users_page(request: Request):
     # the detail form's sticky Save/Cancel bar stays visible while scrolling.
     body = (warn + f'<div class="cols"><div class="col">{list_html}{ip_section}</div>'
             f'<div class="col">{detail}</div></div>')
-    return HTMLResponse(_page("Users", body, "users"))
+    return HTMLResponse(_page("Users", body, "users"), status_code=status)
 
 
 async def ipalias_save(request: Request):
@@ -7057,20 +7357,26 @@ async def users_save(request: Request):
     qs = await _form_multi(request)                     # model allow-list is a checkbox list
     g = lambda k, d="": (qs.get(k) or [d])[-1]
     name = g("name").strip()
-    if not name:
-        return RedirectResponse("/ui/users?new=1", status_code=303)
     orig = g("orig").strip()
+    q, q_err = _int_field(g("quota_req_day"), "quota req/day", "unlimited")
+    qc, qc_err = _float_field(g("quota_cost_month"), "quota cost/month", "unlimited")
+    taken = name != orig and store.get_user(name) is not None
+    problem = ("name is required" if not name else
+               (f"user '{name}' already exists — pick another name" if taken else q_err or qc_err))
+    if problem:
+        # Shown again as typed. Before, a duplicate name MERGED into (new user) or
+        # REPLACED (rename) the existing user, and a bad quota saved as unlimited.
+        typed = {"name": name, "role": g("role", "user"), "enabled": bool(qs.get("enabled")),
+                 "quota_req_day": g("quota_req_day"), "quota_cost_month": g("quota_cost_month"),
+                 "models": [m for m in qs.get("model", []) if m], "api_key": g("api_key").strip()}
+        qp = {"edit": orig} if orig else {"new": "1"}
+        return await _users_view(qp, detail=_user_form(typed, orig=orig, err=problem), status=400)
     u = dict(store.get_user(orig) or store.get_user(name) or {})
     u["name"] = name
     u["role"] = (g("role", "user") or "user").strip()
     u["enabled"] = bool(qs.get("enabled"))
-    q = g("quota_req_day").strip()
-    u["quota_req_day"] = int(q) if q.isdigit() else None
-    qc = g("quota_cost_month").strip()
-    try:
-        u["quota_cost_month"] = float(qc) if qc else None
-    except ValueError:
-        u["quota_cost_month"] = None
+    u["quota_req_day"] = q
+    u["quota_cost_month"] = qc
     u["models"] = [m for m in qs.get("model", []) if m]
     ak = g("api_key").strip()
     if ak:
@@ -7179,7 +7485,7 @@ async def server_page(request: Request):
                              "let an existing user's API key be copied again in the user "
                              "editor (off: only a key generated right there is shown)")))
     runtime_form = (
-        '<form action="/ui/server/save" method="post"><input type="hidden" name="_form" value="runtime">'
+        '<form action="/ui/server/save" method="post" data-guard><input type="hidden" name="_form" value="runtime">'
         f'<div class="formbar"><h2>Runtime settings</h2>{_btn("Save", submit=True)}</div>'
         "<p class='hint'>Applied immediately on Save (no restart).</p>" + runtime_rows + "</form>")
 
@@ -7194,7 +7500,7 @@ async def server_page(request: Request):
             restart_rows += _field(lbl, _inp(k, _srv_disp(k, eff.get(k, "")), typ=("number" if kind == "int" else "text"))
                                    + mark(d) + note(n))
     restart_form = (
-        '<form action="/ui/server/save" method="post"><input type="hidden" name="_form" value="restart">'
+        '<form action="/ui/server/save" method="post" data-guard><input type="hidden" name="_form" value="restart">'
         f'<div class="formbar"><h2>Restart-required{mark(any_restart)}</h2>{_btn("Save", submit=True)}</div>'
         f"<p class='hint'>AI-Hub is listening on port <b>{_esc(running_port or '?')}</b>. "
         "These take effect on the next restart.</p>" + restart_rows + "</form>")
@@ -7288,6 +7594,8 @@ async def mapping_export_all(request: Request):
 
 
 def register(app) -> None:
+    # Every state-changing route is POST-only — _POST_ACTIONS is the list, and
+    # tests/test_ui_post_only.py checks both directions against the handlers' bodies.
     app.middleware("http")(_ui_guard)          # admin-login guard for /ui
     app.add_api_route("/", root_redirect, methods=["GET"], include_in_schema=False)
     app.add_api_route("/ui", ui_root, methods=["GET"], include_in_schema=False)
@@ -7299,50 +7607,49 @@ def register(app) -> None:
     app.add_api_route("/ui/backends/save", backend_save, methods=["POST"])
     app.add_api_route("/ui/backends/scan", backend_scan, methods=["POST"])
     app.add_api_route("/ui/backends/host-save", host_save, methods=["POST"])
-    app.add_api_route("/ui/backends/delete", backend_del, methods=["GET"])
-    app.add_api_route("/ui/backends/drain", backend_drain, methods=["GET"])
-    app.add_api_route("/ui/backends/undrain", backend_undrain, methods=["GET"])
-    app.add_api_route("/ui/backends/restart", backend_restart, methods=["GET"])
-    app.add_api_route("/ui/backends/enable", backend_enable, methods=["GET"])
+    app.add_api_route("/ui/backends/delete", backend_del, methods=["POST"])
+    app.add_api_route("/ui/backends/drain", backend_drain, methods=["POST"])
+    app.add_api_route("/ui/backends/undrain", backend_undrain, methods=["POST"])
+    app.add_api_route("/ui/backends/restart", backend_restart, methods=["POST"])
+    app.add_api_route("/ui/backends/enable", backend_enable, methods=["POST"])
     app.add_api_route("/ui/input", input_page, methods=["GET"])
     app.add_api_route("/ui/routing", routing_page, methods=["GET"])
     app.add_api_route("/ui/chat/create", chat_create, methods=["POST"])
     app.add_api_route("/ui/chat/save", chat_save, methods=["POST"])
-    app.add_api_route("/ui/chat/badd", chat_badd, methods=["GET"])
-    app.add_api_route("/ui/chat/bdel", chat_bdel, methods=["GET"])
-    app.add_api_route("/ui/chat/delete", chat_del, methods=["GET"])
+    app.add_api_route("/ui/chat/badd", chat_badd, methods=["POST"])
+    app.add_api_route("/ui/chat/bdel", chat_bdel, methods=["POST"])
+    app.add_api_route("/ui/chat/delete", chat_del, methods=["POST"])
     app.add_api_route("/ui/chatplay", chatplay_page, methods=["GET"])
     app.add_api_route("/ui/chatplay/send", chatplay_send, methods=["POST"])
     app.add_api_route("/ui/mapping", mapping_page, methods=["GET"])
     app.add_api_route("/ui/mapping/register", register_post, methods=["POST"])
     app.add_api_route("/ui/mapping/update-workflow", update_workflow, methods=["POST"])
-    app.add_api_route("/ui/mapping/field-add", edit_add, methods=["GET"])
-    app.add_api_route("/ui/mapping/field-map", field_map, methods=["GET"])
-    app.add_api_route("/ui/mapping/field-clear", field_clear, methods=["GET"])
-    app.add_api_route("/ui/mapping/field-del", edit_del, methods=["GET"])
-    app.add_api_route("/ui/mapping/cand-add", cand_add, methods=["GET"])
-    app.add_api_route("/ui/mapping/cand-del", cand_del, methods=["GET"])
-    app.add_api_route("/ui/mapping/bypass-add", bypass_add, methods=["GET"])
-    app.add_api_route("/ui/mapping/bypass-del", bypass_del, methods=["GET"])
-    app.add_api_route("/ui/mapping/field-order", field_order, methods=["GET"])
+    app.add_api_route("/ui/mapping/field-add", edit_add, methods=["POST"])
+    app.add_api_route("/ui/mapping/field-map", field_map, methods=["POST"])
+    app.add_api_route("/ui/mapping/field-clear", field_clear, methods=["POST"])
+    app.add_api_route("/ui/mapping/field-del", edit_del, methods=["POST"])
+    app.add_api_route("/ui/mapping/cand-add", cand_add, methods=["POST"])
+    app.add_api_route("/ui/mapping/cand-del", cand_del, methods=["POST"])
+    app.add_api_route("/ui/mapping/bypass-add", bypass_add, methods=["POST"])
+    app.add_api_route("/ui/mapping/bypass-del", bypass_del, methods=["POST"])
     app.add_api_route("/ui/mapping/update", update, methods=["POST"])
     app.add_api_route("/ui/mapping/cloud-update", cloud_update, methods=["POST"])
     app.add_api_route("/ui/mapping/export", mapping_export, methods=["GET"])
     app.add_api_route("/ui/mapping/export-all", mapping_export_all, methods=["GET"])
-    app.add_api_route("/ui/mapping/copy", copy, methods=["GET"])
-    app.add_api_route("/ui/mapping/delete", delete, methods=["GET"])
+    app.add_api_route("/ui/mapping/copy", copy, methods=["POST"])
+    app.add_api_route("/ui/mapping/delete", delete, methods=["POST"])
     app.add_api_route("/ui/reasoning", reasoning_page, methods=["GET"])
     app.add_api_route("/ui/reasoning/save", reasoning_save, methods=["POST"])
     app.add_api_route("/ui/reasoning/test", reasoning_test, methods=["POST"])
-    app.add_api_route("/ui/reasoning/toggle", reasoning_toggle, methods=["GET"])
-    app.add_api_route("/ui/reasoning/delete", reasoning_del, methods=["GET"])
+    app.add_api_route("/ui/reasoning/toggle", reasoning_toggle, methods=["POST"])
+    app.add_api_route("/ui/reasoning/delete", reasoning_del, methods=["POST"])
     app.add_api_route("/ui/playground", playground_page, methods=["GET"])
     app.add_api_route("/ui/playground/voice", voiceplay_send, methods=["POST"])
     app.add_api_route("/ui/playground/voice-audio", voice_audio, methods=["GET"])
     app.add_api_route("/ui/playground/voice-upload", voice_upload, methods=["POST"])
     app.add_api_route("/ui/playground/voice-target", voice_target, methods=["POST"])
-    app.add_api_route("/ui/playground/voice-ship", voice_ship, methods=["GET"])
-    app.add_api_route("/ui/playground/voice-del", voice_del, methods=["GET"])
+    app.add_api_route("/ui/playground/voice-ship", voice_ship, methods=["POST"])
+    app.add_api_route("/ui/playground/voice-del", voice_del, methods=["POST"])
     app.add_api_route("/ui/playground/voice-lib/{name}", voice_lib_play, methods=["GET"])
     app.add_api_route("/ui/playground/generate", generate, methods=["POST"])
     app.add_api_route("/ui/playground/result/{job_id}/{n}", result, methods=["GET"])
@@ -7350,7 +7657,7 @@ def register(app) -> None:
     app.add_api_route("/ui/job/{job_id}", job_detail_page, methods=["GET"])
     app.add_api_route("/ui/job/{job_id}/input/{n}", job_input, methods=["GET"])
     app.add_api_route("/ui/job/{job_id}/to-playground", job_to_playground, methods=["GET"])
-    app.add_api_route("/ui/job/{job_id}/cancel", job_cancel, methods=["GET"])
+    app.add_api_route("/ui/job/{job_id}/cancel", job_cancel, methods=["POST"])
     app.add_api_route("/ui/dashboard", dashboard_page, methods=["GET"])
     app.add_api_route("/ui/llmcalls", llmcalls_page, methods=["GET"])
     app.add_api_route("/ui/statistic", statistic_page, methods=["GET"])
@@ -7358,8 +7665,8 @@ def register(app) -> None:
     app.add_api_route("/ui/call/{call_id}/audio", call_audio, methods=["GET"])
     app.add_api_route("/ui/users", users_page, methods=["GET"])
     app.add_api_route("/ui/users/save", users_save, methods=["POST"])
-    app.add_api_route("/ui/users/delete", users_del, methods=["GET"])
+    app.add_api_route("/ui/users/delete", users_del, methods=["POST"])
     app.add_api_route("/ui/ipalias/save", ipalias_save, methods=["POST"])
-    app.add_api_route("/ui/ipalias/delete", ipalias_del, methods=["GET"])
+    app.add_api_route("/ui/ipalias/delete", ipalias_del, methods=["POST"])
     app.add_api_route("/ui/server", server_page, methods=["GET"])
     app.add_api_route("/ui/server/save", server_save, methods=["POST"])
