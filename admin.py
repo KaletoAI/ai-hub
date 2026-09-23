@@ -5219,13 +5219,26 @@ async def voiceplay_send(request: Request):
                               subnav=_subnav("playground", "voice")))
 
 
+def _audio_headers(mime: Optional[str]) -> tuple:
+    """(media_type, headers) for serving bytes a TTS backend CLAIMS are audio. Its
+    Content-Type is the backend's to choose, and served as-is from /ui an `image/svg+xml`
+    or `text/html` body would run script in the console's origin — so only `audio/*`
+    plays; anything else is a download, and nosniff forbids guessing either way."""
+    base = (mime or "").split(";", 1)[0].strip().lower()
+    if base.startswith("audio/"):
+        return mime, {"X-Content-Type-Options": "nosniff"}
+    return "application/octet-stream", {"X-Content-Type-Options": "nosniff",
+                                        "Content-Disposition": 'attachment; filename="audio.bin"'}
+
+
 async def voice_audio(request: Request):
     """Serve the current user's last synthesis result (stash — no persistence)."""
     stash = _voice_out.get(_session_user(request) or "default")
     if not stash:
         raise HTTPException(404, "no synthesis result")
     data, mime = stash
-    return Response(data, media_type=mime)
+    media_type, headers = _audio_headers(mime)
+    return Response(data, media_type=media_type, headers=headers)
 
 
 def _voice_status(kind: str, msg: str) -> str:
@@ -6640,7 +6653,8 @@ async def call_audio(call_id: int):
     if hit is None:
         raise HTTPException(404, "no audio stored for this call")
     path, mime = hit
-    return FileResponse(path, media_type=mime)
+    media_type, headers = _audio_headers(mime)       # the stored type is the backend's claim
+    return FileResponse(path, media_type=media_type, headers=headers)
 
 
 # ── Reasoning tab: normalized thinking toggle (per-model × per-backend rules) ────

@@ -1201,4 +1201,8 @@ requests `include_usage` upstream); a backend that reports zeros/nothing
   `voice`; `voice:"lib:<name>"` resolves to the shipped path + ref_text in
   `route()`. An empty ref_text is auto-transcribed: local faster-whisper first
   (lazy CPU import; the one heavyweight entry in `requirements.txt`), a backend
-  whisper model as fallback.
+  whisper model as fallback. The playground's synthesis stash (`voice_audio`) and the
+  call log's stored audio (`call_audio`) are served under the BACKEND's Content-Type from
+  the /ui origin, so `admin._audio_headers` plays only `audio/*` and turns anything else
+  (svg, html …) into an `application/octet-stream` attachment, nosniff always
+  (`test_audio_content_type.py`).
