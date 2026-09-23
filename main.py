@@ -4502,6 +4502,24 @@ async def _decode_upload_files(alias: str, files: dict) -> dict:
     return out
 
 
+async def _decode_ref_images(imgs: dict) -> dict:
+    """`images: {slot: base64|data-URI|URL}` → {slot: bytes}. An EMPTY value is a slot the
+    client leaves empty (the slot's own on_empty rule applies); a value that cannot be read
+    — a 404 URL, broken base64 — is a 400 naming the slot. It used to be dropped silently,
+    so the job ran on the slot's placeholder (or its baked-in image) and came back `done`
+    with a confidently wrong result (K12)."""
+    out = {}
+    for param, val in imgs.items():
+        if val in (None, ""):
+            continue
+        data = await _decode_ref_image(val)
+        if not data:
+            raise HTTPException(400, f"`images.{param}` could not be read — expected base64, "
+                                     f"a data-URI or an http(s) URL that answers 200")
+        out[param] = data
+    return out
+
+
 @app.post("/v1/generations")
 async def generations(request: Request, authorization: Optional[str] = Header(None)):
     body = await request.json()
@@ -4512,11 +4530,7 @@ async def generations(request: Request, authorization: Optional[str] = Header(No
     uploads = None
     imgs = body.pop("images", None)
     if isinstance(imgs, dict):
-        uploads = {}
-        for param, val in imgs.items():
-            data = await _decode_ref_image(val)
-            if data:
-                uploads[param] = data
+        uploads = await _decode_ref_images(imgs)
     # Optional client files for NON-image params: {"files": {<param>: <base64|data-URI|URL>}}
     # — e.g. the mesh a shrink/rig alias works on. The gateway uploads it onto whichever
     # backend runs the job, so a client never needs a path on a backend.
