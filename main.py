@@ -2978,6 +2978,43 @@ def _cloud_trace_of(req) -> dict:
     return dict(getattr(req, "cloud_trace", None) or {})
 
 
+def _billed_cloud_task(cand: dict, trace: dict, e: BaseException,
+                       prior_task: Optional[str] = None) -> Optional[str]:
+    """The vendor task a failed CLOUD attempt leaves behind — named for the job row — or
+    None when repeating the attempt (self-retry, next candidate) cannot buy anything twice.
+
+    The failover arm exists for faults that happen BEFORE work starts (a refused connect,
+    a full vendor queue, no credits). A cloud candidate also raises failover-class errors
+    AFTER its paid task was created: `_poll` gives up on a vendor unreachable past
+    `disconnect_grace` (ConnectionError) or on `max_wait` (TimeoutError, whose own text
+    says the task is "still running"), and a create POST whose ANSWER was lost (read
+    timeout, dropped connection) may well have created the task. Every one of those used to
+    re-create the task on the next attempt and pay for it again (review 2026-09-18, K1).
+
+    `prior_task` is the task id the request carried before this attempt (the chain reuses
+    one request across self-retries): a task from an EARLIER attempt that the vendor failed
+    unbilled must not make a later, never-created attempt look billed.
+    `CloudTaskRetryable` stays retryable — `_poll` raises it only for a vendor-side fault
+    that consumed no credits, which is the one case a re-run is meant for."""
+    if not adapters.cloud_kind(cand) or isinstance(e, adapters.CloudTaskRetryable):
+        return None
+    vendor = adapters.cloud_module(adapters.cloud_kind(cand)).VENDOR
+    tid = trace.get("cloud_task_id")
+    if tid and tid != prior_task:
+        return f"{vendor} task {tid}"
+    if trace.get("create_unconfirmed"):
+        return (f"a {vendor} {trace.get('endpoint') or ''} task (the create request was sent "
+                f"but its answer was lost)").replace("  ", " ")
+    return None
+
+
+def _billed_final_msg(e: BaseException, billed: str) -> str:
+    """The job-row error for a cloud failure that must not be repeated (_billed_cloud_task)."""
+    return (f"{_fault_label(e)}: {_err_text(e)} — {billed} may still be running (and "
+            f"billing) at the vendor; not re-created on another attempt, which would pay "
+            f"for it twice")
+
+
 def _gen_fail_meta(attempts: int, cloud_trace: dict) -> Optional[dict]:
     """The meta a failed generation job carries: the retry count (kept visible, runbook B)
     plus whatever a cloud candidate had already created. The cloud keys are the SAME ones
@@ -2987,6 +3024,19 @@ def _gen_fail_meta(attempts: int, cloud_trace: dict) -> Optional[dict]:
     if attempts > 1:
         meta["attempts"] = attempts
     return meta or None
+
+
+def _note_cancelled_trace(job_id: str, attempts: int, trace: dict) -> None:
+    """Put a cancelled job's cloud trace on its row (F1): the vendor finishes and bills a
+    created task whatever the gateway does, and a cancelled row without the task id leaves
+    no way to find it. Nothing to write → nothing written; merged, never a status change
+    (cancel_generation owns that). Synchronous — called from a CancelledError handler."""
+    if not trace:
+        return
+    try:
+        jobs.merge_meta(job_id, _gen_fail_meta(attempts, trace) or {})
+    except Exception as e:                      # a cancel must never turn into a crash
+        logger.warning(f"job {job_id}: could not record the cancelled cloud task: {e}")
 
 
 # bid → deque[(ts, conn_fail)] of the last generate() attempts. In-memory on
@@ -3353,6 +3403,15 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req) -> None
                     # Recorded on EVERY attempt: a self-retry that then succeeds leaves a
                     # clean `done` row, and the crash that forced it is only visible here.
                     _note_fault(backend, "job", _gen_fault_kind(e), f"{alias}: {what}: {_err_text(e)}")
+                    billed = _billed_cloud_task(cand, _cloud_trace_of(req), e)
+                    if billed:
+                        # A paid task exists (or may): neither a self-retry nor the next
+                        # candidate may create another one — see _billed_cloud_task.
+                        logger.warning(f"✗ job {job_id} [{backend['name']}] {what} after "
+                                       f"{billed} was created — final, not re-run")
+                        await asyncio.to_thread(jobs.fail, job_id, _billed_final_msg(e, billed),
+                                                _gen_fail_meta(attempts, cloud_trace))
+                        return
                     if attempt < tries:
                         logger.warning(f"✗ job {job_id} [{backend['name']}] {what} "
                                        f"({type(e).__name__}: {e}) — retrying same backend "
@@ -3391,6 +3450,14 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req) -> None
                                    f"{_err_text(e)} — trying the next backend")
                     asyncio.create_task(_free_comfy_vram(backend, "job failure"))
                     break                      # next candidate; never the same backend
+                except asyncio.CancelledError:
+                    # Cancelled by the user (cancel_generation marks the row itself). The
+                    # except arms above never see a cancel — it is a BaseException — so a
+                    # cloud task that was already created and billed would leave the row
+                    # with no task id at all. Written synchronously on purpose: no await
+                    # while being cancelled.
+                    _note_cancelled_trace(job_id, attempts, _cloud_trace_of(req) or cloud_trace)
+                    raise
         finally:
             _inflight_dec(bid)
     # Every candidate is used up. If any of them EXECUTED and failed, that error is the
@@ -3723,6 +3790,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
             s1_done = False                             # mesh in hand → stage-2 errors are final
             s1_meta = None                              # a paid stage-1 cloud task, for the job view
             s2_info = None                              # what stage 2 was actually handed (job view)
+            s1_prior_task = None                        # see the stage-1 retry loop
             req1 = req2 = None                          # per CANDIDATE: a later stage-1 failure must
                                                         # not report the previous pass's tasks
             await asyncio.to_thread(jobs.set_status, job_id, "running")
@@ -3753,6 +3821,9 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 s1_tries = 1 + max(0, int(backend.get("self_retries") or 0))
                 for s1_attempt in range(1, s1_tries + 1):
                     gen_attempts += 1
+                    # req1 is reused across self-retries, so its trace may already name an
+                    # earlier attempt's (unbilled, retryable) task — only a NEW one counts.
+                    s1_prior_task = req1.cloud_trace.get("cloud_task_id")
                     try:
                         t0 = time.monotonic()
                         out1 = await adapter.generate(req1)
@@ -3760,8 +3831,10 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                         _note_gen_speed(alias, bid, time.monotonic() - t0)
                         break
                     except _GEN_FAILOVER_ERRORS as e:
-                        if s1_attempt >= s1_tries:
-                            raise                # outer handler records + fails over
+                        if s1_attempt >= s1_tries or _billed_cloud_task(
+                                stage1_cand, _cloud_trace_of(req1), e, s1_prior_task):
+                            raise                # outer handler records + fails over (or, for a
+                                                 # billed cloud task, ends the chain)
                         _record_gen_attempt(bid, conn_fail=True)
                         _note_fault(backend, "job", _gen_fault_kind(e),
                                     f"{alias} (chain stage 1): {_fault_label(e)}: {_err_text(e)}")
@@ -3940,6 +4013,15 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                                             fail_meta())
                     asyncio.create_task(_free_comfy_vram(active, "chain failure"))
                     return
+                billed = _billed_cloud_task(stage1_cand, _cloud_trace_of(req1), e, s1_prior_task)
+                if billed:
+                    # a paid stage-1 task exists — failing over would buy it again
+                    logger.warning(f"✗ chain job {job_id} stage 1 [{backend['name']}] "
+                                   f"{_fault_label(e)} after {billed} was created — final")
+                    await asyncio.to_thread(jobs.fail, job_id,
+                                            f"chain stage 1: {_billed_final_msg(e, billed)}",
+                                            fail_meta())
+                    return
                 logger.warning(f"✗ chain job {job_id} stage 1 [{backend['name']}] {_fault_label(e)} "
                                f"({type(e).__name__}: {e}) — failing over")
                 tried.add(backend["name"])
@@ -3952,6 +4034,10 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 await asyncio.to_thread(jobs.fail, job_id, f"chain failed: {_err_text(e)}", fail_meta())
                 asyncio.create_task(_free_comfy_vram(active, "chain failure"))
                 return
+            except asyncio.CancelledError:
+                # cancelled by the user: keep a created (billed) cloud task findable (F1)
+                _note_cancelled_trace(job_id, 0, fail_meta() or {})   # carries its own attempts
+                raise
             finally:
                 if held is not None:
                     _inflight_dec(held)

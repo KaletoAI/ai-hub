@@ -962,7 +962,15 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   `quarantined` in `/health` + the Backends tab, which it must be: unlike the fail rates
   this one really does change routing. **A CLOUD candidate is excluded from the failover**
   — a billed task may have failed AFTER creation, and re-running the job would buy the
-  same mesh twice (the invariant `tripo.py` protects). Covered by
+  same mesh twice (the invariant `tripo.py` protects). The same holds for the
+  FAILOVER-class errors a cloud task raises after it exists (`_poll`'s ConnectionError
+  past `disconnect_grace`, its `max_wait` TimeoutError, a create POST whose answer was
+  lost — `_create` marks that `create_unconfirmed` on the trace): `main._billed_cloud_task`
+  makes them FINAL in `_run_job` AND in the chain's stage 1 — no self-retry, no next
+  candidate, the row names the task id and that it may still run at the vendor. Only
+  `CloudTaskRetryable` (vendor-side, zero credits) still retries. A cancelled job's
+  CancelledError arm writes the trace too (`jobs.merge_meta`), so a cancelled cloud row
+  still names the task the vendor bills. Covered by
   `test_gen_quarantine.py` + `test_run_job_failover.py`.
 - **Context windows**: every `/v1/models` entry carries `context_length` when known
   (`main.model_context` → `adapters.model_context_for`: the backend's `model_context`

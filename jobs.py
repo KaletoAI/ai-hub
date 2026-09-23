@@ -348,6 +348,17 @@ def fail(job_id: str, error: str, meta: Optional[dict] = None) -> None:
         c.execute(f"UPDATE jobs SET {sets} WHERE id=?", (*args, job_id))
 
 
+def merge_meta(job_id: str, meta: dict) -> None:
+    """Merge keys into a job's meta WITHOUT touching its status — for facts that must
+    reach the row whatever state it is in (a cancelled job's already-billed cloud task:
+    cancel_generation has marked the row failed by the time the worker learns of it)."""
+    if not meta:
+        return
+    with _conn() as c:
+        c.execute("UPDATE jobs SET meta_json=? WHERE id=?",
+                  (json.dumps({**_read_meta(c, job_id), **meta}), job_id))
+
+
 def complete(job_id: str, blobs, meta: Optional[dict] = None) -> list[dict]:
     """Write artifact bytes to disk and mark the job done. Returns the result
     manifest (one entry per blob: n, mime, kind, filename).

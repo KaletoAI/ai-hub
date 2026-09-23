@@ -198,6 +198,249 @@ class RunJobExecFailover(unittest.TestCase):
         self.assertIsNone(self.jobs.completed)
 
 
+
+class _BillingAdapter:
+    """A cloud adapter stand-in: each generate() creates a vendor task (records it on the
+    request's cloud_trace, exactly where CloudTaskAdapter._create does) and then fails with
+    `boom` — the task exists and is billed whatever happens next. `create=False` fails
+    BEFORE any task exists (a refused connect, a full queue)."""
+
+    def __init__(self, boom=None, create=True, trace=None):
+        self.boom, self.create, self.trace = boom, create, trace
+        self.calls = 0
+
+    async def generate(self, req):
+        self.calls += 1
+        if self.create:
+            req.cloud_trace.update(self.trace or {"backend": "m", "cloud": "meshy",
+                                                  "cloud_task_id": f"task-{self.calls}",
+                                                  "endpoint": "image-to-3d"})
+        if self.boom is not None:
+            raise self.boom
+        return types.SimpleNamespace(blobs=[b"art"], meta={})
+
+
+class CloudBilledTaskIsFinal(unittest.TestCase):
+    """K1 (review 2026-09-18): the FAILOVER arm re-ran a cloud task that already existed.
+    `_poll` raises failover-class errors after the paid task was created — ConnectionError
+    once the vendor is unreachable past disconnect_grace, TimeoutError at max_wait (whose
+    own text says "still running") — and self_retries/the next candidate then created and
+    paid for a SECOND task. Silent: the job even ends `done`, the double bill shows only at
+    the vendor."""
+
+    setUp, tearDown = RunJobExecFailover.setUp, RunJobExecFailover.tearDown   # the harness only,
+    _comfy = staticmethod(RunJobExecFailover._comfy)                          # not its tests
+
+    @staticmethod
+    def _cloud(name, retries=0):
+        return ({"name": name, "type": "meshy", "self_retries": retries},
+                {"backend": name, "meshy": {"endpoint": "image-to-3d"}})
+
+    def _run(self, cands, adapters_by_bid):
+        main.backend_adapters.update(adapters_by_bid)
+        asyncio.run(main._run_job("job1", "alias1", cands,
+                                  lambda b, c: types.SimpleNamespace(slot_held=False,
+                                                                     cloud_trace={})))
+
+    def _assert_final_on_first(self, boom):
+        a, b = _BillingAdapter(boom), _BillingAdapter()
+        self._run([self._cloud("a", retries=2), self._cloud("b")],
+                  {"meshy:a": a, "meshy:b": b})
+        self.assertEqual(a.calls, 1)                 # no self-retry …
+        self.assertEqual(b.calls, 0)                 # … and no second candidate
+        self.assertIsNone(self.jobs.completed)
+        self.assertIn("task-1", self.jobs.failed["msg"])
+        self.assertIn("still be running", self.jobs.failed["msg"])
+        self.assertEqual(self.jobs.failed["meta"]["cloud_task_id"], "task-1")
+
+    def test_a_poll_timeout_never_creates_a_second_task(self):
+        self._assert_final_on_first(TimeoutError("Meshy task task-1 not finished within max_wait"))
+
+    def test_a_vendor_lost_while_polling_never_creates_a_second_task(self):
+        self._assert_final_on_first(ConnectionError("Meshy unreachable for >30s while polling"))
+
+    def test_a_create_whose_answer_was_lost_is_final_too(self):
+        """A read timeout on the create POST: the body went out whole, the task may exist."""
+        import httpx
+        a = _BillingAdapter(httpx.ReadTimeout(""), trace={
+            "backend": "a", "cloud": "meshy", "endpoint": "image-to-3d",
+            "create_unconfirmed": True})
+        b = _BillingAdapter()
+        self._run([self._cloud("a", retries=1), self._cloud("b")], {"meshy:a": a, "meshy:b": b})
+        self.assertEqual((a.calls, b.calls), (1, 0))
+        self.assertIn("answer was lost", self.jobs.failed["msg"])
+
+    def test_a_failure_before_any_task_still_fails_over(self):
+        """No task, no bill: a full queue or a refused connect must keep the failover."""
+        import adapters
+        a = _BillingAdapter(adapters.CloudBusy("queue full", vendor="Meshy"), create=False)
+        b = _BillingAdapter()
+        self._run([self._cloud("a"), self._cloud("b")], {"meshy:a": a, "meshy:b": b})
+        self.assertEqual((a.calls, b.calls), (1, 1))
+        self.assertIsNotNone(self.jobs.completed)
+
+    def test_an_unbilled_vendor_fault_is_still_retried(self):
+        """CloudTaskRetryable is raised ONLY for a vendor-side failure that consumed no
+        credits — the one case a re-run is meant for; the guard must not swallow it."""
+        import adapters
+        a = _FlakyAdapter(adapters.CloudTaskRetryable("server_error", vendor="Meshy"))
+        self._run([self._cloud("a", retries=1)], {"meshy:a": a})
+        self.assertEqual(a.calls, 2)
+        self.assertIsNotNone(self.jobs.completed)
+
+    def test_a_comfy_timeout_still_fails_over(self):
+        """The guard is about BILLED tasks — a ComfyUI max_wait keeps its failover."""
+        bad, good = self._comfy("bad"), self._comfy("good")
+        good_ad = _Adapter()
+        self._run([bad, good], {"comfyui:bad": _Adapter(TimeoutError("ComfyUI timeout")),
+                                "comfyui:good": good_ad})
+        self.assertEqual(good_ad.calls, 1)
+        self.assertIsNotNone(self.jobs.completed)
+
+
+class CancelKeepsTheBilledTask(unittest.TestCase):
+    """F1: a cancel reaches `_run_job` as CancelledError — a BaseException none of the
+    except arms see — so the row of a cancelled cloud job carried no task id, while the
+    vendor went on to finish and bill the task."""
+
+    setUp, tearDown = RunJobExecFailover.setUp, RunJobExecFailover.tearDown   # the harness only,
+    _comfy = staticmethod(RunJobExecFailover._comfy)                          # not its tests
+
+    def test_a_cancelled_cloud_job_keeps_its_task_id(self):
+        merged = []
+        self.jobs.merge_meta = lambda job_id, meta: merged.append(meta)
+        started = asyncio.Event()
+
+        class _Hang:
+            async def generate(self, req):
+                req.cloud_trace.update({"cloud": "meshy", "cloud_task_id": "task-9",
+                                        "endpoint": "image-to-3d"})
+                started.set()
+                await asyncio.sleep(3600)
+
+        main.backend_adapters["meshy:m"] = _Hang()
+        cand = ({"name": "m", "type": "meshy"}, {"backend": "m", "meshy": {"endpoint": "image-to-3d"}})
+
+        async def go():
+            t = asyncio.create_task(main._run_job(
+                "job1", "alias1", [cand],
+                lambda b, c: types.SimpleNamespace(slot_held=False, cloud_trace={})))
+            await started.wait()
+            t.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await t
+        asyncio.run(go())
+        self.assertEqual(merged[-1]["cloud_task_id"], "task-9")
+        self.assertEqual(main.backend_inflight.get("meshy:m", 0), 0)    # slot released
+
+
+class _ChainJobs(_FakeJobs):
+    """The extra job-store calls _run_chain makes."""
+
+    def __init__(self):
+        super().__init__()
+        self.merged = []
+
+    def get(self, job_id):
+        return {"status": self.failed and "failed" or "running"}
+
+    def set_stage(self, job_id, st):
+        pass
+
+    def merge_meta(self, job_id, meta):
+        self.merged.append(meta)
+
+
+class ChainStage1BilledIsFinal(unittest.TestCase):
+    """K1 for the chain: a stage-1 cloud task lost to a poll timeout / vendor outage was
+    re-created by the stage-1 self-retry and then by the next stage-1 candidate."""
+
+    def setUp(self):
+        RunJobExecFailover.setUp(self)
+        import meshy
+        main.jobs = self.jobs = _ChainJobs()
+        self._saved = (main._gen_backends[:], dict(main.image_models), dict(main.backend_healthy),
+                       main.store._active, main._gen_waiting[:])
+        main.store._active = False
+        self.a = {"name": "a", "type": "meshy", "self_retries": 2, "enabled": True}
+        self.b = {"name": "b", "type": "meshy", "enabled": True}
+        self.r = {"name": "r", "type": "meshy", "enabled": True}
+        main._gen_backends[:] = [self.a, self.b, self.r]
+        s1 = meshy.default_candidate("x")["meshy"]
+        s1["options"]["target_formats"] = ["glb"]
+        succ = {"alias": "rig", "mesh_param": "input_mesh_path"}
+        rig = meshy.default_candidate("r")
+        rig["meshy"]["endpoint"] = "rigging"
+        main.image_models.clear()
+        main.image_models.update({
+            "s1": [{"backend": "a", "meshy": dict(s1), "successor": succ},
+                   {"backend": "b", "meshy": dict(s1), "successor": succ}],
+            "rig": [rig]})
+        self.succ = succ
+        main.backend_healthy.clear()
+        main.backend_healthy.update({"meshy:a": True, "meshy:b": True, "meshy:r": True})
+        main._gen_waiting.clear()
+
+    def tearDown(self):
+        gb, im, bh, sa, gw = self._saved
+        main._gen_backends[:] = gb
+        main.image_models.clear(); main.image_models.update(im)
+        main.backend_healthy.clear(); main.backend_healthy.update(bh)
+        main.store._active = sa
+        main._gen_waiting[:] = gw
+        RunJobExecFailover.tearDown(self)
+
+    def test_a_stage1_task_lost_to_the_vendor_is_not_bought_again(self):
+        import adapters as ad_mod
+
+        class _S1(_BillingAdapter):
+            def chain_export(self, cand, succ, params, prefix):
+                return ad_mod.ChainExport(f"{prefix}.glb")
+
+        a, b = _S1(ConnectionError("Meshy unreachable while polling")), _S1()
+        main.backend_adapters.update({"meshy:a": a, "meshy:b": b, "meshy:r": _Adapter()})
+        asyncio.run(main._run_chain("job1", "s1", self.succ, {}, None, {}, {}, {}, {}))
+        self.assertEqual((a.calls, b.calls), (1, 0))
+        self.assertIn("task-1", self.jobs.failed["msg"])
+        self.assertEqual(self.jobs.failed["meta"]["chain_stage1"]["cloud_task_id"], "task-1")
+        self.assertEqual(main.backend_inflight.get("meshy:a", 0), 0)
+
+
+class CreateAnswerLost(unittest.TestCase):
+    """The adapter half of K1: a create POST that went out whole but whose answer was lost
+    (read timeout, dropped connection) may have created the task — the trace must say so,
+    while the error class stays what main names and fault-logs by. A connect failure never
+    reached the vendor and must NOT be marked."""
+
+    def _create(self, exc):
+        import httpx
+        import adapters
+
+        class _Client:
+            async def post(self, *a, **k):
+                raise exc
+
+        ctx = adapters.AdapterContext(auth_headers=lambda b: {}, inflight_inc=lambda b: None,
+                                      inflight_dec=lambda b: None, cost_usd=lambda *a: 0.0,
+                                      source_of=lambda r: "t", record_call=lambda *a, **k: None,
+                                      log_enabled=lambda: False)
+        ad = adapters.MeshyAdapter({"name": "m", "type": "meshy", "url": "http://x"}, ctx)
+        req = adapters.NormalizedRequest(alias="a")
+        with self.assertRaises(type(exc)):
+            asyncio.run(ad._create(_Client(), "http://x/openapi/v1/image-to-3d", {"a": 1},
+                                   "image-to-3d", req))
+        return req.cloud_trace
+
+    def test_a_read_timeout_marks_the_create_unconfirmed(self):
+        import httpx
+        tr = self._create(httpx.ReadTimeout(""))
+        self.assertTrue(tr.get("create_unconfirmed"))
+        self.assertEqual(tr.get("endpoint"), "image-to-3d")
+
+    def test_a_refused_connect_is_not_marked(self):
+        import httpx
+        self.assertNotIn("create_unconfirmed", self._create(httpx.ConnectError("refused")))
+
 class _FlakyAdapter:
     """generate() raises each entry of `booms` in turn, then delivers."""
 

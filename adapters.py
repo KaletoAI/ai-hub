@@ -3663,11 +3663,24 @@ class CloudTaskAdapter(BackendAdapter):
         # size-scaled budget (~4 s per MiB ≈ a 256 KiB/s floor) without slowing the polls.
         raw = json.dumps(body)                  # serialised ONCE, sent as content=
         mb = len(raw) / (1024 * 1024)           # ASCII JSON: chars == bytes
-        pr = await client.post(
-            url, content=raw,
-            headers={**self._headers(), "Content-Type": "application/json"},
-            timeout=httpx.Timeout(connect=30.0, read=max(120.0, mb * 4),
-                                  write=max(60.0, mb * 4), pool=30.0))
+        try:
+            pr = await client.post(
+                url, content=raw,
+                headers={**self._headers(), "Content-Type": "application/json"},
+                timeout=httpx.Timeout(connect=30.0, read=max(120.0, mb * 4),
+                                      write=max(60.0, mb * 4), pool=30.0))
+        except (httpx.ReadTimeout, httpx.ReadError, httpx.RemoteProtocolError):
+            # The request went out WHOLE and only the answer was lost: the vendor may well
+            # have created (and will bill) the task. The error class stays as it is —
+            # main names and fault-logs by it — but the trace says so, and main then
+            # refuses to create the task a second time (main._billed_cloud_task). A
+            # connect/write failure never reached the vendor and stays freely retryable.
+            if req is not None and role is None:
+                tr = req.cloud_trace
+                tr.setdefault("backend", self.name)
+                tr.setdefault("cloud", self.mod.KIND)
+                tr.update({"endpoint": endpoint, "create_unconfirmed": True})
+            raise
         verdict = self._classify_create(pr)
         if verdict == "nocredits":
             raise CloudNoCredits(f"{self.vendor}: {self._msg(pr)}", vendor=self.vendor)
