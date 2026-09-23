@@ -43,6 +43,14 @@ class FileParamDetection(unittest.TestCase):
     def test_prompt_is_not_a_file(self):
         self.assertFalse(adapters.is_file_param("prompt", {"label": "prompt"}))
 
+    def test_mesh_settings_are_not_files(self):
+        # "mesh" in a name is no file: a string enum (glb / quad) or a number rendered
+        # as a file upload in the playground and refused as a "backend path" in the API
+        for name in ("mesh_format", "remesh_mode", "mesh_cluster_smooth_strength",
+                     "model_file", "remesh_band"):
+            self.assertFalse(adapters.is_file_param(name, {"field": name}), name)
+        self.assertTrue(adapters.is_file_param("glb_path", {"field": "value"}))
+
 
 WF = {
     "1": {"class_type": "LoadImage", "inputs": {"image": "ref.png"}},

@@ -3963,6 +3963,16 @@ def _req_fields_rows(alias: str, wf: dict, mapping: dict, oi: dict) -> str:
             cur_cell = _value_control("default__" + p, node, fld, None, wf, oi)
         else:
             cur_cell = ""                                # stale/incomplete binding — nothing to edit
+        if not is_img and (adapters.is_file_param(p, m) or m.get("client_path")):
+            # main._client_param_refusal: a backend path in this FILE field is admin-only
+            # unless the entry opts in. Rendered for every file row (and any row that
+            # already carries the flag), so the Save below can read "absent" as "off".
+            cur_cell += (' <label style="white-space:nowrap" title="Let every API key name a '
+                         'path on the backend box in this field (params). Off: only an admin '
+                         'key may; everyone else sends the file itself under files.">'
+                         f'<input type="checkbox" name="clientpath__{_esc(p)}"'
+                         + (" checked" if m.get("client_path") else "")
+                         + '> client may send a backend path</label>')
         tag = " <span class='tag'>image</span>" if is_img else ""
         if node and node not in wf:                      # node vanished after a workflow update
             tag += " <span class='badge bad' title='this node no longer exists in the workflow'>stale</span>"
@@ -4782,8 +4792,9 @@ def _apply_update_form(cands: list, f: dict) -> str:
                     if extra:
                         entry["on_empty_bypass"] = extra
                 # `client_path` (a file field that takes a backend path from any client,
-                # main._client_param_refusal) has no form field — keep it across a Save.
-                if (((cands[0] if cands else {}).get("mapping") or {}).get(p) or {}).get("client_path"):
+                # main._client_param_refusal): _req_fields_rows renders the checkbox on every
+                # row where it can matter, so an unticked (= absent) box clears it.
+                if f.get(f"clientpath__{p}"):
                     entry["client_path"] = True
                 mapping[p] = entry
     # Editable workflow defaults (the "=" column): default__<param> writes the

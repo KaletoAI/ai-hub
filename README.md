@@ -1147,8 +1147,11 @@ ComfyUI's cache), so the first job after one frees.
   and sends the token), so no path exists. The bytes are not kept as a job input.
   Unlike `params`, `files` is strict: unknown key or unreadable value → `400`,
   over 64 MB → `413`. Naming a backend PATH for such a file field in `params`
-  instead is admin-only (`400` for a user key, unless the mapping entry sets
-  `client_path: true`), and a list or object is never accepted as a mapped
+  instead is admin-only (`400` for a user key, unless the admin ticked *client may send
+  a backend path* on that field in the Mapping editor — `client_path: true`). A file
+  field is one whose name ends in `path` (`input_mesh_path`) or whose workflow field is
+  a file field, and only a value that names a file (`/`, `\`, `~` or an extension) is
+  judged — `mesh_format: glb` is a setting, not a path. And a list or object is never accepted as a mapped
   `params` value (in ComfyUI's API format a list is a link between nodes).
 - **`GET /v1/generations/{alias}/schema`** self-describes an alias in three lists:
   `params`, `images` (loader slots with their empty behaviour) and **`files`** — the

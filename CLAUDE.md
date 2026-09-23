@@ -162,10 +162,13 @@ they need via injected callables, staying hot-reload-safe.
   Workflow injection is **mapping-driven, convention-free** (`_apply_mapping`
   sets `workflow[node].inputs[field]` — never to a list, which ComfyUI reads as a LINK,
   and to an object only where the workflow holds one; `main._client_param_refusal` 400s
-  such values up front, and a client string for a mapped FILE field (`is_file_param`, a
-  path on the backend box — another job's output included) unless `_params_trusted`
-  (admin key via `gate_request`'s `gw_admin`, the /ui console, bootstrap-open) or the
-  entry carries `client_path: true` (no form field; the editor keeps it across Save);
+  such values up front, and a client string for a mapped FILE field (`is_file_param`: a
+  name ending in `path` or a `_FILE_FIELDS` field — NOT "mesh" anywhere, which caught
+  `mesh_format`/`remesh_mode` enums) whose VALUE names a file (`looks_like_path`: a
+  separator, `~`, or an extension — a bare `x.glb` resolves in the shared input dir), i.e.
+  a path on the backend box, another job's output included, unless `_params_trusted`
+  or the entry carries `client_path: true` (Mapping editor checkbox *client may send a
+  backend path* on every file row; unticked = cleared);
   judged over the alias's AND its successor's mapping, since params are threaded by
   label — `test_mapping_values.py`); a mapping `label` is the param's public
   API name — incoming values are accepted under label OR param, and the

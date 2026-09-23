@@ -1981,14 +1981,32 @@ _FILE_FIELDS = ("file_path", "mesh_path", "path", "filename", "file")
 
 
 def is_file_param(param: str, m: Optional[dict]) -> bool:
-    """A mapped NON-image param that takes a client file (a mesh): its public name or the
-    workflow field says so. Heuristic on purpose — the mapping has no kind flag, and every
-    rig/shrink alias in the wild names it `input_mesh_path`. Never true for image loaders
+    """A mapped NON-image param that takes a client file (a mesh): its public name ends in
+    `path` or IS a file field name, or the workflow field is one (_FILE_FIELDS). Heuristic
+    on purpose — the mapping has no kind flag, and every rig/shrink alias in the wild names
+    it `input_mesh_path`. Deliberately NOT "mesh anywhere in the name": `mesh_format: glb`,
+    `remesh_mode: quad` and `mesh_cluster_smooth_strength` are settings, which that rule
+    rendered as file uploads and refused as backend paths. Never true for image loaders
     (the caller checks is_image_field first)."""
     names = {(param or "").lower(), ((m or {}).get("label") or "").lower()}
-    if any(("path" in n or "mesh" in n or n.endswith("_file")) for n in names if n):
+    if any((n.endswith("path") or n in _FILE_FIELDS) for n in names if n):
         return True
     return ((m or {}).get("field") or "").lower() in _FILE_FIELDS
+
+
+_PATHISH_EXT = re.compile(r"\.[A-Za-z][A-Za-z0-9]{0,5}$")
+
+
+def looks_like_path(v) -> bool:
+    """A client string that NAMES a file: a separator, a home-relative start, or a file
+    extension (a bare `other.glb` resolves in ComfyUI's input dir, where every job's
+    uploads live). Not a path: `quad`, `glb`, `v1.0-20240301` — enum words and tags a
+    file-NAMED param may still legitimately carry."""
+    if not isinstance(v, str):
+        return False
+    v = v.strip()
+    return bool(v) and ("/" in v or "\\" in v or v.startswith("~")
+                        or bool(_PATHISH_EXT.search(v)))
 
 
 def file_params(wf: dict, mapping: dict) -> list:

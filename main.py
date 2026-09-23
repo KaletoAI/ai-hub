@@ -4626,12 +4626,16 @@ def _client_param_refusal(params: dict, wf_maps: list, trusted: bool) -> Optiona
                 if isinstance(v, (list, tuple, dict)):
                     return (f"`params.{name}` must be a single value — a list or object is "
                             f"not a workflow value")
-                if (not trusted and not m.get("client_path") and isinstance(v, str) and v.strip()
-                        and not _numberish(v)          # is_file_param is a NAME heuristic —
-                        and not is_image_field(wf or {}, m.get("node"))   # "mesh_faces: '5000'" is no path
+                # is_file_param is a NAME heuristic, so the VALUE decides: only a string
+                # that names a file (looks_like_path) is judged — "5000", "quad" are not
+                if (not trusted and not m.get("client_path") and isinstance(v, str)
+                        and not _numberish(v) and adapters.looks_like_path(v)
+                        and not is_image_field(wf or {}, m.get("node"))
                         and adapters.is_file_param(p, m)):
-                    return (f"`params.{name}` names a file on the backend — send the file "
-                            f"itself under `files.{name}` (a backend path is admin-only)")
+                    return (f"`params.{name}` looks like a file path on the backend, which "
+                            f"only an admin key may name — send the file itself under "
+                            f"`files.{name}`, or have an admin tick \"client may send a "
+                            f"backend path\" on this field in the Mapping editor")
     return None
 
 

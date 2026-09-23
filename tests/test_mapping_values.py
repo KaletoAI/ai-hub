@@ -89,6 +89,18 @@ class ClientRefusal(unittest.TestCase):
         self.assertIn("files", main._client_param_refusal({"value": "gw_abc_input.glb"},
                                                           self.pairs, False))
 
+    def test_a_setting_is_not_a_path(self):
+        # a file-NAMED param judged by its VALUE: an enum word or a model tag is no path
+        for v in ("quad", "glb", "v1.0-20240301"):
+            self.assertIsNone(main._client_param_refusal({"input_mesh_path": v}, self.pairs, False), v)
+        for v in ("../x.glb", "C:\\x\\y.glb", "~/m.obj", "other.glb"):
+            self.assertIsNotNone(main._client_param_refusal({"input_mesh_path": v}, self.pairs, False), v)
+
+    def test_refusal_names_the_way_out(self):
+        msg = main._client_param_refusal({"input_mesh_path": "/srv/x.glb"}, self.pairs, False)
+        self.assertIn("files.input_mesh_path", msg)
+        self.assertIn("client may send a backend path", msg)
+
     def test_mapping_can_allow_client_paths(self):
         m = {**MAP, "value": {**MAP["value"], "client_path": True}}
         self.assertIsNone(main._client_param_refusal({"input_mesh_path": "/x.glb"}, [(WF, m)], False))
@@ -108,6 +120,36 @@ class ClientRefusal(unittest.TestCase):
             self.assertTrue(main._params_trusted(req("/v1/generations")))     # bootstrap-open
         finally:
             main.api_key, main.users = saved
+
+
+class EditorCheckbox(unittest.TestCase):
+    """`client_path` is set in the Mapping editor, and survives a Save both ways."""
+
+    def setUp(self):
+        import admin
+        self.admin = admin
+
+    def test_file_row_offers_the_checkbox(self):
+        rows = self.admin._req_fields_rows("a", WF, MAP, {})
+        self.assertIn('name="clientpath__value"', rows)
+        self.assertNotIn('name="clientpath__steps"', rows)
+        self.assertNotIn("checked", rows.split('name="clientpath__value"')[1].split(">")[0])
+        m = {**MAP, "value": {**MAP["value"], "client_path": True}}
+        rows = self.admin._req_fields_rows("a", WF, m, {})
+        self.assertIn("checked", rows.split('name="clientpath__value"')[1].split(">")[0])
+
+    def _save(self, form, stored_cp):
+        cand = {"backend": "b", "workflow_json": WF,
+                "mapping": {"value": {**MAP["value"], **({"client_path": True} if stored_cp else {})}}}
+        base = {"node__value": "1", "field__value": "value", "label__value": "input_mesh_path"}
+        from unittest import mock
+        with mock.patch.object(self.admin.store, "get", lambda alias: None):
+            self.admin._apply_update_form([cand], {**base, **form})
+        return cand["mapping"]["value"]
+
+    def test_save_reads_the_checkbox(self):
+        self.assertTrue(self._save({"clientpath__value": "on"}, False).get("client_path"))
+        self.assertNotIn("client_path", self._save({}, True))     # unticked = cleared
 
 
 if __name__ == "__main__":
