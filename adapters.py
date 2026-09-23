@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import copy
 import fnmatch
 import json
@@ -3495,6 +3496,12 @@ class RunResult:
     extra_meta: dict = field(default_factory=dict)
 
 
+# The job a cloud poll reports progress for — set by CloudTaskAdapter.generate for ONE
+# request. A ContextVar, so concurrent jobs on one adapter stay apart without threading
+# the id through every vendor's _run and every _poll call.
+_CLOUD_JOB: contextvars.ContextVar = contextvars.ContextVar("cloud_job", default="")
+
+
 class CloudTaskAdapter(BackendAdapter):
     """Everything a cloud task API shares: the in-flight slot, the create/poll/download
     loop with its grace rules, the job meta and the chain roles. A vendor subclass
@@ -3568,6 +3575,7 @@ class CloudTaskAdapter(BackendAdapter):
             self.ctx.inflight_inc(self.bid)
         started = time.monotonic()
         log_on = self.ctx.log_enabled()
+        job_token = _CLOUD_JOB.set(req.job_id or "")
         try:
             # The client default stays SHORT (30 s): every poll runs on it, and the
             # disconnect_grace logic in _poll only reacts as fast as a poll gives up.
@@ -3603,6 +3611,9 @@ class CloudTaskAdapter(BackendAdapter):
         finally:
             if not req.slot_held:
                 self.ctx.inflight_dec(self.bid)
+            _CLOUD_JOB.reset(job_token)
+            if req.job_id:
+                self.ctx.note_progress(req.job_id, None)   # the job row owns it from here
         elapsed_ms = int((time.monotonic() - started) * 1000)
         if log_on:
             logger.info(f"← [{self.name}] {len(blobs)} artifact(s) in {elapsed_ms} ms, "
@@ -3730,6 +3741,7 @@ class CloudTaskAdapter(BackendAdapter):
                 continue
             client_errs = 0
             state = self.mod.parse_task(task, formats, endpoint, options=opts)
+            self._note_cloud_progress(state)
             if state.error:            # failed/cancelled — or a status this gateway does not know
                 detail = f"{self.vendor} task {task_id} {state.status.lower()}: {state.error}"
                 # A failure the vendor blames on itself is the one kind worth attempting
@@ -3743,6 +3755,16 @@ class CloudTaskAdapter(BackendAdapter):
         raise TimeoutError(f"{self.vendor} task {task_id} not finished within max_wait={max_wait:.0f}s "
                            f"(still running at {self.vendor} — fetch it by id from the "
                            f"{self.vendor} dashboard)")
+
+    def _note_cloud_progress(self, state) -> None:
+        """The vendor's own percentage → the job view's live progress (the feed ComfyUI's
+        step counter uses, as step N/100). Per polled TASK: a Tripo convert or clip
+        counts from 0 again, which is what is running."""
+        job_id = _CLOUD_JOB.get()
+        if job_id and not state.error and isinstance(state.progress, int):
+            pct = min(max(state.progress, 0), 100)
+            self.ctx.note_progress(job_id, {"basis": "live", "backend": self.name, "step": pct,
+                                            "steps": 100, "fraction": round(pct / 100, 3)})
 
     @staticmethod
     async def _download(client, url: str) -> bytes:

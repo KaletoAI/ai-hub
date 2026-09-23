@@ -222,7 +222,10 @@ they need via injected callables, staying hot-reload-safe.
   the 30 s client timeout with an EMPTY `str(e)`), `_poll` (a 4xx, or a 200 whose BODY
   refuses the task, is a verdict about the TASK: three IN A ROW → final; transport
   errors, 5xx and 429 are about the SERVICE and get `disconnect_grace` — a poll-rate
-  429 must not end a task that is running and already paid for), `_download` (NO auth
+  429 must not end a task that is running and already paid for; every parsed poll feeds
+  the vendor's percentage to `ctx.note_progress` as step N/100 — `_note_cloud_progress`,
+  keyed by the `_CLOUD_JOB` ContextVar `generate()` sets per request and clears with
+  `None` at the end), `_download` (NO auth
   header: signed CDN urls, the bearer must not leak there) and the three chain hooks.
   A subclass supplies only `discover`, `_run` (build → create → poll, plus whatever
   follow-up tasks the vendor needs, returning `RunResult`), `_task_request`,
@@ -314,7 +317,7 @@ they need via injected callables, staying hot-reload-safe.
   block so the signature is identical for both (Meshy reads `options["animations"]`).
 - **`cloudtask.py`** — the pure leaf both cloud modules import (no `main`/`adapters`
   imports, no I/O): `TaskState` (status/progress/error/downloads/thumbnail/credits,
-  plus `riggable`/`rig_type` for a task that answers a QUESTION instead of delivering a
+  `progress` feeds the job view's live bar, plus `riggable`/`rig_type` for a task that answers a QUESTION instead of delivering a
   file — Tripo's rig-check), and `parse_options(fields, form, defaults)` +
   `field_value_str`, the reader and writer of the `opt__<key>` form the ONE console
   editor renders from a module's `OPTION_FIELDS`. `parse_options` never raises on a

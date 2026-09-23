@@ -129,6 +129,22 @@ class TestMeshyAdapter(unittest.TestCase):
         with self.assertRaises(adapters.CloudNoCredits):
             self._discover()
 
+    def test_task_progress_feeds_the_job_view_and_is_dropped_at_the_end(self):
+        # The vendor reports a percentage on every poll; without it a 3-minute cloud job
+        # is a spinner and nothing else, while the job view can show a bar (the same
+        # `note_progress` feed ComfyUI's step counter uses).
+        seen = []
+        self.ad.ctx.note_progress = lambda job_id, info: seen.append((job_id, info))
+        _Stub.script = [_task("IN_PROGRESS", progress=40),
+                        _task("SUCCEEDED", progress=100, model_urls={"glb": f"{self.url}/asset/glb"})]
+        req = self._req({"input_image": PNG})
+        req.job_id = "j1"
+        self._run(self.ad.generate(req))
+        live = [i for j, i in seen if j == "j1" and i]
+        self.assertTrue(any(i["fraction"] == 0.4 and (i["step"], i["steps"]) == (40, 100)
+                            for i in live), seen)
+        self.assertEqual(seen[-1], ("j1", None))
+
     def test_generate_success(self):
         _Stub.script = [_task("PENDING"), _task("IN_PROGRESS"),
                         _task("SUCCEEDED", progress=100, consumed_credits=30,
