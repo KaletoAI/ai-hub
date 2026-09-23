@@ -535,7 +535,11 @@ they need via injected callables, staying hot-reload-safe.
   (`keyOf`), falling back to position+tag. An UPDATE never reloads, so scroll, sort
   order, a focused filter, an open form, playing media and the model-viewer camera
   survive it; a response without `data-live` stops the poller (what the meta tag's
-  absence used to mean). The one deliberate real navigation is the escape hatch:
+  absence used to mean). The poller also owns the header's `#gwlive` chip (outside
+  `<main>`, so the morph never touches it): `live · 4s`, `stale since hh:mm:ss` on a
+  non-2xx answer, `offline since …` when the fetch fails — timed from the last GOOD
+  update; hidden on a static page. Media Jobs is always live (15 s idle), sortable, and
+  pages with a `?before=<job id>` keyset (`jobs.recent(before=)`). The one deliberate real navigation is the escape hatch:
   a re-fetch that REDIRECTS to a different path does `location.href = r.url`, which
   is how an expired session lands on `/ui/login` instead of having a login form
   morphed into `<main>` — do not "simplify" it away. The three live row templates
@@ -560,7 +564,9 @@ they need via injected callables, staying hot-reload-safe.
   state of it can render** — hoist them (`job_detail_page`, `_playground_body`) and,
   where the script must act on nodes arriving later, register the action in
   `window.gwLiveHooks` (`gwFbxScan`). `test_admin_live.py` pins this, plus `data-live`
-  on `<main>` and the ES5 validity of every JS constant — all three fail silently.
+  on `<main>` and that every JS constant parses — all three fail silently. "ES5" here
+  is a SYNTAX rule (no arrow functions, let/const, template strings, classes); later
+  DOM APIs (fetch, URL, `closest`, `Array.from`, `replaceChildren`) are used freely.
   Post-morph hooks in `window.gwLiveHooks`: the SORT hook because the server always
   renders insertion order and the morph re-imposes it (a clicked sort would be undone
   every tick), the FILTER hook because rows the morph brings in FRESH carry no
@@ -598,10 +604,17 @@ they need via injected callables, staying hot-reload-safe.
   `blur`+`beforeunload` listeners that saved them are gone; `_SCROLL_JS`'s `<main>`
   restore STAYS, because
   `<main>` is the page's scroll container (`body{overflow:hidden}` +
-  `main{overflow-y:auto}`) and that restore serves REAL navigation (F5, a nav link
+  `main{overflow-y:auto}` — on desktop; below 800 px `_CSS`'s media query lets the
+  whole page scroll, stacks the columns, and `_SCROLL_JS` also tracks the document) and
+  that restore serves REAL navigation (F5, a nav link
   back to a long list, a POST's 303), which the morph does not cover — it is merely
   inert from the first tick onward. POST bodies parsed by
-  hand (`parse_qs`) to stay `python-multipart`-free.
+  hand (`parse_qs`) to stay `python-multipart`-free. Markup conventions: `_field(label,
+  control, hint=)` ties its `<label for>` to the control (its id, else `fld-<name>` is
+  added) and renders `hint` as its own row — never append a hint inside the control;
+  colours come from the `:root` palette in `_CSS` (`var(--muted)` …), boxed pickers use
+  `.box`; a sortable cell whose text is not the quantity carries `data-sv` (raw value),
+  and `_SORT_JS`'s `num()` reads the console's units (`102 ms`, `1.2 s`, `5m`, `$`).
 - **Media has no call log — it has the job store.** A ComfyUI/cloud generation is a
   JOB, not a forwarded call, so it never reaches `stats.calls` and every table in the
   Statistic tab was blind to it (it looked unmeasured; it never was). `jobs.gen_stats_rows()`

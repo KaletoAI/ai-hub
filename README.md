@@ -1198,14 +1198,14 @@ session cookie is marked `Secure`. Tabs:
 | Tab | What |
 |---|---|
 | **Dashboard** | live per-backend status (a down backend names its cause) + in-flight, a **backend faults · 24h** card, column and panel (see [Backend fault log](#backend-fault-log)), parked calls, media-job counts/recent, recent LLM calls |
-| **Server** | runtime + restart-required settings (API key, caps, park time/queue, `affinity_max_wait_s`, stats/jobs, TTL/prune) |
 | **Backends** | add/edit/remove backends (LLM, ComfyUI, Meshy, Tripo), incl. the `paid` cost tier; the editor is split into **General** (name, type, url, host, cost tier, concurrency, credential — never shown again once stored: blank keeps it, *clear* removes it), **Models** (whitelist/blacklist, discovery filters, bare-id listing, context windows), **Behavior** (prompt-cache passthrough, sampling defaults, self-retries) and one tab named after the type (**ComfyUI** / **Cloud task API** / **Anthropic**); the **Hosts · GPU policy** panel below the list edits the per-box VRAM flags (see [Hosts & VRAM policy](#hosts--vram-policy)) |
 | **Input & Routing** | sub-tabs **Input** (what clients can call — chat aliases, generation models, endpoints), **Chat aliases** (the live alias→backend map + alias/model collisions), **LLM models**, **Media aliases**, **Image models**, **LoRAs** — all searchable |
 | **Mapping** | register a ComfyUI workflow, wire its node mapping, pin values (a cloud alias — Meshy, Tripo — needs no workflow: one schema-driven editor renders its endpoint + option defaults instead); chat-alias editor (per-alias `park_s` + reasoning default) |
 | **Reasoning** | the normalized-thinking rule list (model glob × backend set → adapter) + test resolver |
 | **Playground** | one tab, sub-tabs **Chat** (default — chat completion through `/v1/chat/completions`), **Media** (generation via `POST /v1/generations` — image/video/audio, upload refs + mesh files, or an earlier job's artifact) and **Voice** (TTS via `POST /v1/audio/speech`, inline player + download) — all as **real API clients** (auth, routing, parking, stats all apply) |
 | **Jobs & Calls** | sub-tabs **LLM Calls** (per-call history with stored request/response bodies — LLM endpoints only), **Media Jobs** (list + detail of generation jobs, inputs + outputs, within TTL, plus the media requests that were refused before they became a job) and **Voice Calls** |
-| **Statistic** | **Backend faults · last 24h** (per backend + every message, bundled — shown even with stats off), then the call-stats dashboard (search, aggregates, drilldown) — empty until `stats.enabled: true` (the example config ships it `false`; set it in `config.yaml` or the Server tab, then restart — the flag is read at startup only). The same switch feeds the LLM Calls list under Jobs & Calls. |
+| **Statistics** | **Backend faults · last 24h** (per backend + every message, bundled — shown even with stats off), then the call-stats dashboard (search, aggregates, drilldown) — empty until `stats.enabled: true` (the example config ships it `false`; set it in `config.yaml` or the Server tab, then restart — the flag is read at startup only). The same switch feeds the LLM Calls list under Jobs & Calls. |
+| **Server** | runtime + restart-required settings (API key, caps, park time/queue, `affinity_max_wait_s`, stats/jobs, TTL/prune) |
 | **Users** | multi-user keys, allow-lists, quotas, IP aliases |
 
 **Live views update in place — an update never reloads the page.** Anything that
@@ -1223,7 +1223,13 @@ into the view you were on. Updating stops on its own once there is nothing live
 left to watch (the job finished, the drain completed) — no timer keeps running in
 the background, except that a server answering non-200 is retried with a doubling
 backoff up to every 30 s rather than given up on. Tabs in the background are
-skipped entirely and catch up the moment you switch back.
+skipped entirely and catch up the moment you switch back. A chip at the right of
+the tab bar says what the page shows: **live · 4s**, or **stale since 14:35:07**
+(the server answered with an error) / **offline since 14:35:07** (it could not be
+reached) — the time of the last good update, i.e. how old the numbers are. The
+Media Jobs list is always live (every 15 s when idle, so a job started from another
+client shows up without F5), sortable like the other lists, and pages back through
+older jobs 100 at a time (`older →`).
 
 ---
 
@@ -1251,7 +1257,7 @@ mid-work, which is a real error.
 
 The **Dashboard** shows a *backend faults · 24h* card, a per-backend column and a panel
 listing every backend that failed in the last 24h (faults, outages, downtime incl. an
-outage still open, the last error). **Statistic → Backend faults** adds every message of
+outage still open, the last error). **Statistics → Backend faults** adds every message of
 the window, bundled: messages that differ only in ids and numbers are one line with a
 count, first and last time. Hosts appear under their label from the Hosts panel.
 `/health` carries `faults_24h: {faults, outages, downtime_s}` per backend.
@@ -1266,7 +1272,7 @@ faults:                 # optional — these are the defaults; read at startup o
 
 ## Stats & routing dashboard
 
-Opt-in SQLite call log, surfaced in the **Statistic** and **Input & Routing** tabs of the
+Opt-in SQLite call log, surfaced in the **Statistics** and **Input & Routing** tabs of the
 console (no separate port — the old standalone dashboard was folded into `/ui`).
 Every call records timestamp, duration, backend, source, alias, model, endpoint,
 HTTP status, tokens, and USD cost.

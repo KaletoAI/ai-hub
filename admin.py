@@ -65,13 +65,15 @@ def _cloud_url_for(new_type: str, url: str) -> str:
 _MODEL_EXTS = (".safetensors", ".gguf", ".ckpt", ".pt", ".pth", ".bin", ".sft", ".onnx")
 _LOADER_HINTS = ("loader", "checkpoint", "unet", "clip", "vae", "lora", "gguf", "controlnet")
 
+# Daily views first, administration (Server, Users) last. The route stays /ui/statistic
+# — only the label reads "Statistics".
 TABS = [
-    ("dashboard", "Dashboard"), ("server", "Server"), ("backends", "Backends"),
+    ("dashboard", "Dashboard"), ("backends", "Backends"),
     ("routing", "Input & Routing"), ("mapping", "Mapping"),
     ("reasoning", "Reasoning"),
     ("playground", "Playground"),
     ("jobs", "Jobs & Calls"),
-    ("statistic", "Statistic"), ("users", "Users"),
+    ("statistic", "Statistics"), ("server", "Server"), ("users", "Users"),
 ]
 DEFAULT_TAB = "dashboard"
 
@@ -88,7 +90,8 @@ SUBTABS = {"playground": [("chat", "Chat"), ("media", "Media"), ("voice", "Voice
 
 def _subnav(parent: str, active_sub: str) -> str:
     subs = SUBTABS.get(parent) or []
-    links = "".join(f'<a class="{"on" if k == active_sub else ""}" '
+    cur = ' class="on" aria-current="page"'
+    links = "".join(f'<a{cur if k == active_sub else ""} '
                     f'href="/ui/{parent}?sub={k}">{_esc(lbl)}</a>' for k, lbl in subs)
     return f'<nav class="subnav">{links}</nav>'
 
@@ -191,102 +194,126 @@ def _esc(s) -> str:
 
 
 def _nav(active: str) -> str:
-    links = "".join(f'<a class="{"on" if k == active else ""}" href="/ui/{k}">{_esc(label)}</a>'
+    cur = ' class="on" aria-current="page"'
+    links = "".join(f'<a{cur if k == active else ""} href="/ui/{k}">{_esc(label)}</a>'
                     for k, label in TABS)
-    logout = ('<a href="/ui/logout" style="margin-left:auto;color:#8b97a4">Logout</a>'
+    logout = ('<a href="/ui/logout" style="color:#8b97a4;padding:14px 0 14px 14px">Logout</a>'
               if _ui_locked() else "")
-    return f'<header><span class="brand">AI-Hub</span><nav>{links}{logout}</nav></header>'
+    # The live-status chip sits in the header, OUTSIDE <main>: the morph never touches
+    # it, and _LIVE_JS is the only writer (it stays hidden on a page that is not live).
+    return (f'<header><span class="brand">AI-Hub</span><nav>{links}</nav>'
+            f'<span id="gwlive" class="livechip" role="status" hidden></span>{logout}</header>')
 
 
 _CSS = """
-*{box-sizing:border-box}
+/* The palette, in ONE place. Inline styles elsewhere still carry literal colours
+   (moving all ~135 would collide with every other branch); new code uses these. */
+:root{--bg:#0f1115;--bg-2:#12151b;--panel:#171a21;--row:#13161c;--input:#0c0e12;--hover:#1b1f27;--sel:#19222e;
+--line:#242a33;--line-2:#313a46;--line-3:#272b33;--line-4:#2a313c;
+--text:#d7dbe0;--text-hi:#dce4ec;--text-2:#cdd6e0;--dim:#9aa7b4;--dim-2:#8b97a4;
+--muted:#7e8b99;--link:#6cb0ef;--accent:#3b82f6;--btn:#2563eb;--btn-hover:#1d4ed8;--focus:#60a5fa;
+--ok:#5cb87f;--bad:#e06c6c;--warn:#d8b35a}
+*{box-sizing:border-box;scrollbar-width:thin;scrollbar-color:#39414e transparent}
 html,body{height:100%}
-body{font:14px/1.6 system-ui,-apple-system,sans-serif;margin:0;background:#0f1115;color:#d7dbe0;overflow:hidden;display:flex;flex-direction:column}
-a{color:#6cb0ef}
-*{scrollbar-width:thin;scrollbar-color:#39414e transparent}
+body{font:14px/1.6 system-ui,-apple-system,sans-serif;margin:0;background:var(--bg);color:var(--text);overflow:hidden;display:flex;flex-direction:column}
+a{color:var(--link)}
 ::-webkit-scrollbar{width:11px;height:11px}
 ::-webkit-scrollbar-track{background:transparent}
-::-webkit-scrollbar-thumb{background:#2d3440;border-radius:7px;border:2px solid #0f1115}
+::-webkit-scrollbar-thumb{background:#2d3440;border-radius:7px;border:2px solid var(--bg)}
 ::-webkit-scrollbar-thumb:hover{background:#3d4654}
 ::-webkit-scrollbar-corner{background:transparent}
-header{display:flex;align-items:center;background:#171a21;border-bottom:1px solid #272b33;padding:0 20px;flex:none}
+header{display:flex;align-items:center;background:var(--panel);border-bottom:1px solid var(--line-3);padding:0 20px;flex:none}
 .brand{font-weight:700;padding:14px 16px 14px 0;color:#e7ebf0}
 nav{display:flex;flex-wrap:wrap}
-nav a{color:#9aa7b4;padding:14px 14px;text-decoration:none;border-bottom:2px solid transparent;font-size:13px}
-nav a:hover{color:#dce4ec;background:#1b1f27}
-.subnav{display:flex;flex-wrap:wrap;gap:2px;padding:0 20px;background:#12151b;border-bottom:1px solid #272b33;flex:none}
-.subnav a{color:#9aa7b4;padding:8px 12px;text-decoration:none;border-bottom:2px solid transparent;font-size:13px}
-.subnav a:hover{color:#dce4ec;background:#1b1f27}
-.subnav a.on{color:#fff;border-bottom-color:#3b82f6}
-nav a.on{color:#fff;border-bottom-color:#3b82f6}
+nav a{color:var(--dim);padding:14px 14px;text-decoration:none;border-bottom:2px solid transparent;font-size:13px}
+nav a:hover{color:var(--text-hi);background:var(--hover)}
+.subnav{display:flex;flex-wrap:wrap;gap:2px;padding:0 20px;background:var(--bg-2);border-bottom:1px solid var(--line-3);flex:none}
+.subnav a{color:var(--dim);padding:8px 12px;text-decoration:none;border-bottom:2px solid transparent;font-size:13px}
+.subnav a:hover{color:var(--text-hi);background:var(--hover)}
+.subnav a.on{color:#fff;border-bottom-color:var(--accent)}
+nav a.on{color:#fff;border-bottom-color:var(--accent)}
+/* Live-update status (_LIVE_JS drives it): hidden on a static page. */
+.livechip{margin-left:auto;font-size:11px;padding:2px 9px;border-radius:10px;white-space:nowrap;background:#16361f;color:var(--ok)}
+.livechip.stale{background:#3a2f12;color:var(--warn)}
+.livechip.offline{background:#3a1b1b;color:var(--bad)}
 main{flex:1;min-height:0;overflow-y:auto;padding:18px 26px}
-h2{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#7e8b99;margin:28px 0 12px;padding-bottom:7px;border-bottom:1px solid #242a33}
+h2{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:28px 0 12px;padding-bottom:7px;border-bottom:1px solid var(--line)}
 h2:first-child{margin-top:4px}
-p.hint{color:#9aa7b4;margin:0 0 14px;max-width:62ch;line-height:1.5}
+p.hint{color:var(--dim);margin:0 0 14px;max-width:62ch;line-height:1.5}
 .field{display:flex;align-items:center;gap:14px;margin:10px 0}
-.field>label{flex:0 0 140px;text-align:left;color:#9aa7b4;font-size:13px}
+.field>label{flex:0 0 140px;text-align:left;color:var(--dim);font-size:13px}
 .field>.control{flex:1;min-width:0;max-width:480px;display:flex;gap:8px;align-items:center}
 .field>.control.wide{max-width:none}
+/* _field(hint=…): the hint gets its OWN row under the control, never a flex item
+   beside the input (it used to squeeze the input to a sliver). */
+.field.hashint{flex-wrap:wrap;row-gap:2px}
+.field>.fhint{flex:1 0 100%;margin:0 0 0 154px;color:var(--muted);font-size:12px;line-height:1.5;max-width:62ch}
 .control.short input,.control.short select{max-width:150px}
-input,select,textarea{width:100%;background:#0c0e12;color:#dce4ec;border:1px solid #313a46;border-radius:7px;padding:0 10px;height:36px;font:inherit;outline:none}
-input:focus,select:focus,textarea:focus{border-color:#3b82f6}
-textarea{height:auto;min-height:150px;padding:8px 10px;font-family:ui-monospace,monospace;font-size:12px}
+input,select,textarea{width:100%;background:var(--input);color:var(--text-hi);border:1px solid var(--line-2);border-radius:7px;padding:0 10px;height:36px;font:inherit;outline:none}
+input:focus,select:focus,textarea:focus{border-color:var(--accent)}
+textarea{height:auto;min-height:60px;padding:8px 10px;font-family:ui-monospace,monospace;font-size:12px;line-height:1.5}
 input[type=file]{padding:7px 10px;height:auto}
-input[type=checkbox]{width:auto;height:auto;margin:0 6px 0 0;vertical-align:middle;accent-color:#2563eb}
+input[type=checkbox]{width:auto;height:auto;margin:0 6px 0 0;vertical-align:middle;accent-color:var(--btn)}
+/* Keyboard focus must be visible — the inputs above set outline:none for the mouse. */
+a:focus-visible,.btn:focus-visible,.btab:focus-visible,button:focus-visible,summary:focus-visible,
+table.sortable th:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+input:focus-visible,select:focus-visible,textarea:focus-visible{border-color:var(--focus);box-shadow:0 0 0 2px rgba(96,165,250,.45)}
+input[type=checkbox]:focus-visible{outline:2px solid var(--focus);outline-offset:1px}
 .ckbox{display:inline-flex;align-items:center;margin-right:18px;color:#cdd5de;font-size:13px;cursor:pointer;white-space:nowrap}
 .ckbox code{margin:0}
-.btn{height:36px;padding:0 18px;background:#2563eb;color:#fff;border:0;border-radius:7px;font:inherit;font-weight:500;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;text-decoration:none;white-space:nowrap}
-.btn:hover{background:#1d4ed8}
-.btn.secondary{background:#2a313c}.btn.secondary:hover{background:#343c49}
+.btn{height:36px;padding:0 18px;background:var(--btn);color:#fff;border:0;border-radius:7px;font:inherit;font-weight:500;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;text-decoration:none;white-space:nowrap}
+.btn:hover{background:var(--btn-hover)}
+.btn.secondary{background:var(--line-4)}.btn.secondary:hover{background:#343c49}
 .btn.danger{background:#b4433f}.btn.danger:hover{background:#9e3a36}
 .btn.sm{height:28px;padding:0 11px;font-size:12px;border-radius:6px}
 .btn.icon{padding:0;width:32px;min-width:32px;font-size:15px}
 .btn.sm.icon{width:28px;min-width:28px;font-size:14px}
 .actions{display:flex;gap:10px;margin-top:18px;padding-left:0}
 table{border-collapse:collapse;width:100%;margin:6px 0;font-size:13px}
-th,td{border-bottom:1px solid #242a33;padding:8px 10px;text-align:left;vertical-align:middle;overflow-wrap:anywhere}
-th{color:#7e8b99;font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.04em;border-bottom-color:#313a46}
+th,td{border-bottom:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:middle;overflow-wrap:anywhere}
+th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.04em;border-bottom-color:var(--line-2)}
 td .btn{margin-right:4px}
 td input,td select{height:30px}
-.muted{color:#6b7682}.ok{color:#5cb87f}.bad{color:#e06c6c}
-code{background:#1b1f27;padding:2px 6px;border-radius:4px;font-size:12px}
-.stub{color:#7e8b99;border:1px dashed #313a46;border-radius:8px;padding:22px;margin-top:8px;line-height:1.8}
-img.result,video.result{max-width:512px;border:1px solid #313a46;border-radius:8px;margin:8px 0}
+.muted{color:var(--muted)}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}
+code{background:var(--hover);padding:2px 6px;border-radius:4px;font-size:12px}
+.stub{color:var(--muted);border:1px dashed var(--line-2);border-radius:8px;padding:22px;margin-top:8px;line-height:1.8}
+/* The boxed look of a picker/filter/download card (was the _BOX_STYLE inline string). */
+.box{padding:7px 10px;background:var(--input);border:1px solid var(--line);border-radius:8px;color:var(--text-2)}
+img.result,video.result{max-width:512px;border:1px solid var(--line-2);border-radius:8px;margin:8px 0}
 audio.result{width:512px;max-width:100%;margin:8px 0}
 pre.err{white-space:pre-wrap;word-break:break-word;background:#1a1113;border:1px solid #5a2a2a;color:#f0b6b6;border-radius:8px;padding:12px 14px;margin:8px 0;max-height:340px;overflow:auto;font:12px/1.5 ui-monospace,monospace;user-select:text}
-.cols{display:flex;gap:24px;align-items:flex-start}
+.cols{display:flex;gap:0;align-items:stretch;height:100%}
 .col{flex:1;min-width:0}
-.cols{gap:0;align-items:stretch;height:100%}
 .cols>.col{flex:1 1 0;min-width:0;height:100%;overflow-y:auto;padding:0 16px 18px 0}
-.cols>.col+.col{border-left:1px solid #2a313c;margin-left:22px;padding-left:22px}
+.cols>.col+.col{border-left:1px solid var(--line-4);margin-left:22px;padding-left:22px}
 /* Mapping image editor: give the editor (col 2) more room for the request-fields
    table, taken from the Available fields column (col 3). */
 .cols.map3>.col:nth-child(2){flex:1.9 1 0}
 .cols.map3>.col:nth-child(3){flex:0.84 1 0}
-.bar{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:0 0 8px;padding:8px 0 8px;position:sticky;top:0;z-index:10;background:#0f1115}
+.bar{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:0 0 8px;padding:8px 0 8px;position:sticky;top:0;z-index:10;background:var(--bg)}
 .bar h2{margin:0;border:0;padding:0}
 td.acts{white-space:nowrap;text-align:right;width:1%}
 td.acts .btn{margin:0 0 0 6px}
-tr.sel td{background:#19222e}
-.item{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 4px;border-bottom:1px solid #242a33}
-.item.sel{background:#19222e}
+tr.sel td{background:var(--sel)}
+.item{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 4px;border-bottom:1px solid var(--line)}
+.item.sel{background:var(--sel)}
 .item-main{min-width:0}
 .item-title{font-weight:600;font-size:13px}
-.item-sub{color:#6b7682;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.item-sub{color:var(--muted);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .item-acts{white-space:nowrap;flex:none}
 .item-acts .btn{margin:0 0 0 6px}
 .badge{font-size:11px;font-weight:500;padding:1px 7px;border-radius:10px;margin-left:7px;white-space:nowrap}
-.badge.ok{background:#16361f;color:#5cb87f}.badge.bad{background:#3a1b1b;color:#e06c6c}.badge.muted{background:#23262d;color:#7e8b99}
-.badge.warn{background:#3a2f12;color:#d8b35a}
+.badge.ok{background:#16361f;color:var(--ok)}.badge.bad{background:#3a1b1b;color:var(--bad)}.badge.muted{background:#23262d;color:var(--dim-2)}
+.badge.warn{background:#3a2f12;color:var(--warn)}
 .badge.llm{background:#13303a;color:#5fb8c8}.badge.img{background:#2a1d3a;color:#bb8ce6}
-tr.grp td{background:#13161c;font-weight:600}
-.grouphdr{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:#8b97a4;font-weight:600;margin:16px 0 6px;padding-bottom:4px;border-bottom:1px solid #242a33}
+tr.grp td{background:var(--row);font-weight:600}
+.grouphdr{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--dim-2);font-weight:600;margin:16px 0 6px;padding-bottom:4px;border-bottom:1px solid var(--line)}
 .grouphdr:first-child{margin-top:4px}
-.formbar{display:flex;gap:8px;align-items:center;margin:0 0 14px;padding:8px 0 12px;border-bottom:1px solid #242a33;position:sticky;top:0;z-index:10;background:#0f1115}
+.formbar{display:flex;gap:8px;align-items:center;margin:0 0 14px;padding:8px 0 12px;border-bottom:1px solid var(--line);position:sticky;top:0;z-index:10;background:var(--bg)}
 .formbar h2{margin:0;border:0;padding:0;flex:1}
 .formwrap{max-width:560px}
 .avail tr td:last-child{text-align:right;white-space:nowrap}
-.avail .node{color:#9aa7b4}.avail .node code{background:#13202f}
+.avail .node{color:var(--dim)}.avail .node code{background:#13202f}
 table.pins td:nth-child(2){width:62%}
 table.pins td:last-child{width:1%;white-space:nowrap;text-align:right}
 table.reqf tr[draggable]{cursor:grab}
@@ -294,38 +321,69 @@ table.reqf tr.dragging{opacity:.45}
 table.reqf tr[draggable]:hover{background:#13202f}
 table.reqf th:nth-child(3),table.reqf td:nth-child(3){width:72px}   /* node — just an id */
 table.reqf th:nth-child(4),table.reqf td:nth-child(4){width:120px}  /* field */
-.grip{color:#5a6675;cursor:grab;user-select:none;margin-right:4px}
+.grip{color:var(--muted);cursor:grab;user-select:none;margin-right:4px}
+/* Keyboard alternative to dragging a request-field row (_reorder_js). */
+button.mv{background:none;border:1px solid var(--line-2);border-radius:4px;color:var(--dim);width:20px;height:20px;padding:0;margin:0 2px 0 0;font-size:11px;line-height:1;cursor:pointer;vertical-align:middle}
+button.mv:hover{color:var(--text-hi);border-color:var(--accent)}
 .tag{font-size:10px;background:#1d3a52;color:#9fd0ff;border-radius:3px;padding:1px 5px;margin-left:4px;vertical-align:middle}
-textarea{height:auto;min-height:60px;padding:8px 10px;line-height:1.5}
-.chatout{white-space:pre-wrap;word-break:break-word;background:#0c0e12;border:1px solid #242a33;border-radius:8px;padding:12px 14px;user-select:text;font-size:13px}
-.ok-banner{background:#16361f;color:#5cb87f;border:1px solid #1f5232;border-radius:8px;padding:8px 12px;margin:8px 0}
+.chatout{white-space:pre-wrap;word-break:break-word;background:var(--input);border:1px solid var(--line);border-radius:8px;padding:12px 14px;user-select:text;font-size:13px}
+.ok-banner{background:#16361f;color:var(--ok);border:1px solid #1f5232;border-radius:8px;padding:8px 12px;margin:8px 0}
 .ok-banner.fade{animation:okfade 2.2s ease forwards}
 @keyframes okfade{0%,65%{opacity:1}100%{opacity:0;visibility:hidden}}
 /* Save confirmation that lives INSIDE the sticky form bar: a banner stacked above the
    form would push the whole editor down by its height, so the restored scroll position
    lands on shifted content — the very jump the scroll restore exists to prevent. */
-.ok-chip{color:#5cb87f;font-size:12px;white-space:nowrap}
-.acctbl{max-height:360px;overflow-y:auto;border:1px solid #242a33;border-radius:8px}
+.ok-chip{color:var(--ok);font-size:12px;white-space:nowrap}
+.acctbl{max-height:360px;overflow-y:auto;border:1px solid var(--line);border-radius:8px}
 .acctbl table{margin:0}
 .acctbl td:first-child,.acctbl th:first-child{width:1%;text-align:center}
-.acctbl thead th{position:sticky;top:0;background:#13161c;z-index:1}
+.acctbl thead th{position:sticky;top:0;background:var(--row);z-index:1}
 .cards{display:flex;gap:14px;flex-wrap:wrap;margin:10px 0 6px}
-.card{background:#13161c;border:1px solid #242a33;border-radius:10px;padding:12px 18px;min-width:130px}
+.card{background:var(--row);border:1px solid var(--line);border-radius:10px;padding:12px 18px;min-width:130px}
 .card .cnum{font-size:22px;font-weight:600;color:#e8edf2}
-.card .clbl{font-size:12px;color:#8b97a4;margin-top:2px}
+.card .cnum.bad{color:var(--bad)}
+.card .clbl{font-size:12px;color:var(--dim-2);margin-top:2px}
 table.recent{font-size:12px}
 table.sortable th{cursor:pointer;user-select:none}
 table.sortable th:hover{color:#dfe6ee}
 table.sortable th .sind{margin-left:4px;color:#5fb8c8;font-size:10px}
+.pager{display:flex;gap:10px;align-items:center;margin:10px 0}
 /* Backend form tabs: one form, four panes, only display switched (_TABS_JS). */
-.btabs{display:flex;flex-wrap:wrap;gap:2px;margin:0 0 12px;border-bottom:1px solid #242a33}
-.btab{background:none;border:0;border-bottom:2px solid transparent;border-radius:0;color:#9aa7b4;font:inherit;font-size:13px;height:auto;padding:7px 12px;width:auto;cursor:pointer}
-.btab:hover{color:#dce4ec;background:#1b1f27}
-.btab.on{color:#fff;border-bottom-color:#3b82f6}
-details.optblock{border:1px solid #242a33;border-radius:8px;padding:6px 10px;margin:0 0 12px}
-details.optblock>summary{cursor:pointer;user-select:none;font-size:12px;color:#8b97a4;padding:2px 0}
-details.optblock>summary:hover{color:#cdd6e0}
+.btabs{display:flex;flex-wrap:wrap;gap:2px;margin:0 0 12px;border-bottom:1px solid var(--line)}
+.btab{background:none;border:0;border-bottom:2px solid transparent;border-radius:0;color:var(--dim);font:inherit;font-size:13px;height:auto;padding:7px 12px;width:auto;cursor:pointer}
+.btab:hover{color:var(--text-hi);background:var(--hover)}
+.btab.on{color:#fff;border-bottom-color:var(--accent)}
+details.optblock{border:1px solid var(--line);border-radius:8px;padding:6px 10px;margin:0 0 12px}
+details.optblock>summary{cursor:pointer;user-select:none;font-size:12px;color:var(--dim-2);padding:2px 0}
+details.optblock>summary:hover{color:var(--text-2)}
 details.optblock[open]>summary{margin-bottom:8px;border-bottom:1px solid #1c2129;padding-bottom:6px}
+/* Phone / narrow window. Desktop keeps <main> as the scroll container (the fixed
+   header + subnav never scroll, see _SCROLL_JS); below 800 px the whole PAGE scrolls
+   instead, the master-detail columns stack, a field's label sits above its control,
+   and a wide table scrolls sideways inside itself instead of widening the page. */
+@media (max-width:800px){
+html,body{height:auto}
+body{overflow:visible;display:block}
+header{flex-wrap:wrap;padding:0 12px}
+.brand{padding:10px 12px 10px 0}
+nav a{padding:10px 9px}
+.subnav{padding:0 12px}
+.subnav a{padding:8px 9px}
+main{overflow:visible;padding:12px 16px}
+.cols{display:block;height:auto}
+.cols>.col{height:auto;overflow:visible;padding:0}
+.cols>.col+.col{border-left:0;margin-left:0;padding-left:0;border-top:1px solid var(--line-4);margin-top:16px;padding-top:12px}
+.field{flex-wrap:wrap;gap:4px 14px}
+.field>label{flex:1 1 100%}
+.field>.control{max-width:none;flex-wrap:wrap}
+.field>.fhint{margin-left:0}
+.control.short input,.control.short select{max-width:none}
+table{display:block;overflow-x:auto;max-width:100%}
+th,td{overflow-wrap:break-word}
+img.result,video.result,audio.result{max-width:100%}
+.bar,.formbar{flex-wrap:wrap}
+.cards{gap:8px}.card{min-width:0;flex:1 1 40%;padding:10px 12px}
+}
 """
 
 
@@ -350,24 +408,35 @@ details.optblock[open]>summary{margin-bottom:8px;border-bottom:1px solid #1c2129
 # restore, which runs once at load, is inert from the first tick onward. The browser's
 # own scroll restoration is no substitute: it applies to history navigation (Back /
 # Forward), not to F5 or to re-clicking the same nav link.
+# Below 800 px (the phone layout in _CSS) the PAGE scrolls instead of <main>, so the
+# document's scrolling element is tracked as a pane too — on desktop it never moves.
+# Saving listens ONCE on document in the capture phase (scroll does not bubble, but it
+# is captured): a `.col` the morph brings in after load is covered without re-binding,
+# where a per-element listener bound at load silently missed it.
 _SCROLL_JS = ("<script>(function(){"
               "var q=location.search.replace(/([?&])saved=[^&]*&?/,'$1').replace(/[?&]$/,'');"
               "var b='scr:'+location.pathname;"
-              "function t(){var o=[],m=document.querySelector('main');"
+              "function t(){var o=[],m=document.querySelector('main'),se=document.scrollingElement;"
               "if(m)o.push([m,b+q+'|main']);"
+              "if(se)o.push([se,b+q+'|doc']);"
               "[].slice.call(document.querySelectorAll('.col')).forEach(function(e,j){"
               "o.push([e,j===0?b+'|master':b+q+'|c'+j]);});return o;}"
               "try{t().forEach(function(p){var v=sessionStorage.getItem(p[1]);"
               "if(v!=null)p[0].scrollTop=+v;});}catch(e){}"
               "var d=false;function save(){if(d)return;d=true;requestAnimationFrame(function(){d=false;"
               "try{t().forEach(function(p){sessionStorage.setItem(p[1],p[0].scrollTop);});}catch(e){}});}"
-              "t().forEach(function(p){p[0].addEventListener('scroll',save);});"
+              "document.addEventListener('scroll',save,true);"
               "window.addEventListener('beforeunload',save);"
               "})();</script>")
 
 
-# Click-a-header to sort any `table.sortable` (numeric-aware: a cell that is a plain
-# number sorts numerically, otherwise lexically). The choice persists per table in
+# Click-a-header to sort any `table.sortable` (numeric-aware: a cell's `data-sv` raw
+# value wins; else its text is read as a number, understanding the units the console
+# prints — `102 ms`, `1.2 s`, `3.5 min`, `5m`, `2h`, `$0.0012` — else it sorts
+# lexically; a number sorts before a non-number such as `—`). Before the units, "1.2 s,
+# 10.1 s, 102 ms" was a TEXT sort. Cells whose text is not the quantity itself carry
+# `data-sv`: the time stamp (the year is shown only when it differs), `tok i/o` (in+out)
+# and a running job's `12.0 s / ~40 s`. The choice persists per table in
 # sessionStorage and is re-applied on load — so it survives the dashboard's 4s
 # auto-refresh. A gwLiveHooks entry re-applies it after every live morph too:
 # the server renders rows in insertion order and the morph re-imposes that order
@@ -399,8 +468,12 @@ _SCROLL_JS = ("<script>(function(){"
 # views) sort as BLOCKS, so a group never gets torn apart: the group row supplies the
 # key for column 0 (it is the alias name), later columns key off the first member row.
 _SORT_JS = ("<script>(function(){"
-            "function num(td){var t=(td.textContent||'').trim().replace(/[$,\\s]/g,'');"
-            "return /^-?\\d+(\\.\\d+)?$/.test(t)?parseFloat(t):null;}"
+            "function num(td){var v=td.getAttribute('data-sv');"
+            "if(v!==null&&v!==''&&!isNaN(+v))return +v;"
+            "var t=(td.textContent||'').trim().replace(/[$,<~\\s]/g,'');"
+            "var m=/^(-?\\d+(?:\\.\\d+)?)(ms|s|min|m|h|d)?$/.exec(t);if(!m)return null;"
+            "var f={ms:1,s:1e3,min:6e4,m:6e4,h:36e5,d:864e5};"
+            "return parseFloat(m[1])*(m[2]?f[m[2]]:1);}"
             "function ind(th,a){var s=th.querySelector('.sind');"
             "if(!s){s=document.createElement('span');s.className='sind';th.appendChild(s);}"
             "s.textContent=a||'';}"
@@ -415,6 +488,7 @@ _SORT_JS = ("<script>(function(){"
             "function sortIt(tbl,idx,dir){var hdr=tbl.rows[0];var bs=blocks(tbl,hdr);"
             "bs.sort(function(a,b){var x=cellOf(a,idx),y=cellOf(b,idx);if(!x||!y)return 0;"
             "var nx=num(x),ny=num(y),r;if(nx!==null&&ny!==null)r=nx-ny;"
+            "else if(nx!==null||ny!==null)r=nx!==null?-1:1;"
             "else r=(x.textContent||'').trim().toLowerCase().localeCompare((y.textContent||'').trim().toLowerCase());"
             "return dir<0?-r:r;});"
             "var tb=tbl.tBodies[0]||tbl;"
@@ -515,6 +589,13 @@ _TABS_JS = ("<script>(function(){"
 # every live page owes: it must ALREADY contain every <script> any later state of it
 # can render — hoist them (see job_detail_page, _playground_body) and, where the script
 # has to act on nodes that arrive later, register the action in window.gwLiveHooks.
+# The poller also owns the header's #gwlive chip (rendered hidden by _nav, outside
+# <main> so the morph never touches it): "live · 4s" after every good tick, "stale
+# since hh:mm:ss" when the server answers non-2xx, "offline since …" when the fetch
+# itself fails — the time is that of the last GOOD update, i.e. the age of what the
+# page shows. Before it, a dead server just left the last numbers standing. Hidden
+# again when a response stops the poller: a page that is no longer live has nothing
+# to announce.
 _LIVE_JS = ("<script>(function(){"
             "var main=document.querySelector('main');"
             "if(!main)return;"
@@ -586,6 +667,14 @@ _LIVE_JS = ("<script>(function(){"
             "var cur=o.firstChild;"
             "for(i=0;i<out.length;i++){if(cur===out[i])cur=cur.nextSibling;"
             "else o.insertBefore(out[i],cur);}}"
+            "var chip=document.getElementById('gwlive'),okAt=Date.now();"
+            "function hms(t){var d=new Date(t);return [d.getHours(),d.getMinutes(),d.getSeconds()]"
+            ".map(function(x){return ('0'+x).slice(-2);}).join(':');}"
+            "function show(st,txt,tip){if(!chip)return;chip.hidden=!st;if(!st)return;"
+            "chip.className=st==='live'?'livechip':'livechip '+st;chip.textContent=txt;"
+            "chip.title=tip||'';}"
+            "function fresh(){okAt=Date.now();show('live','live \\u00b7 '+(base/1000)+'s',"
+            "'auto-updating every '+(base/1000)+' s \\u00b7 last update '+hms(okAt));}"
             "var wait=base,timer=null,catchUp=false;"
             "function schedule(ms){if(timer)clearTimeout(timer);timer=setTimeout(tick,ms);}"
             "function stop(){if(timer)clearTimeout(timer);timer=null;}"
@@ -594,7 +683,9 @@ _LIVE_JS = ("<script>(function(){"
             ".then(function(r){"
             "if(r.redirected&&new URL(r.url).pathname!==location.pathname){"
             "stop();location.href=r.url;return null;}"
-            "if(!r.ok){wait=Math.min(wait*2,30000);schedule(wait);return null;}"
+            "if(!r.ok){wait=Math.min(wait*2,30000);schedule(wait);"
+            "show('stale','stale since '+hms(okAt),'the server answered HTTP '+r.status+"
+            "' \\u2014 showing what it sent at '+hms(okAt)+'; retrying');return null;}"
             "return r.text();})"
             ".then(function(html){"
             "if(html===null||html===undefined)return;"
@@ -608,13 +699,15 @@ _LIVE_JS = ("<script>(function(){"
             "for(var i=0;i<window.gwLiveHooks.length;i++){"
             "try{window.gwLiveHooks[i]();}catch(e){}}"
             "var next=parseInt(main.getAttribute('data-live')||'0',10)*1000;"
-            "if(!(next>0)){stop();return;}"
-            "wait=base=next;"
+            "if(!(next>0)){stop();show('');return;}"
+            "wait=base=next;fresh();"
             "schedule(wait);})"
-            ".catch(function(){wait=Math.min(wait*2,30000);schedule(wait);});}"
+            ".catch(function(){wait=Math.min(wait*2,30000);schedule(wait);"
+            "show('offline','offline since '+hms(okAt),'the server cannot be reached \\u2014 "
+            "showing what it sent at '+hms(okAt)+'; retrying');});}"
             "document.addEventListener('visibilitychange',function(){"
             "if(!document.hidden&&catchUp&&timer){catchUp=false;schedule(0);}});"
-            "schedule(wait);"
+            "fresh();schedule(wait);"
             "})();</script>")
 
 
@@ -639,20 +732,74 @@ def _page(title: str, body: str, active: str = "", refresh: Optional[int] = None
     head = "" if nologin else _nav(active)        # login page renders without the nav
     # subnav (see SUBTABS) renders as a second header row — outside <main>, so it
     # never scrolls and sits flush under the tabs.
-    return (f'<!doctype html><html><head><meta charset="utf-8"><title>{_esc(title)} · AI-Hub</title>'
+    return (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            f'<meta name="viewport" content="width=device-width,initial-scale=1">'
+            f'<title>{_esc(title)} · AI-Hub</title>'
             f"<style>{_CSS}</style></head><body>{head}{subnav}<main{live}>{body}</main>"
             f"{_CONFIRM_JS}{_SCROLL_JS}{_SORT_JS}{_TABS_JS}{_LIVE_JS}</body></html>")
 
 
-def _field(label: str, control: str, short: bool = False, wide: bool = False) -> str:
+_CTRL_TAG = re.compile(r"<(input|select|textarea)\b([^>]*)>", re.I)
+_ATTR = lambda name: re.compile(r"""\b%s\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""" % name, re.I)
+_ID_ATTR, _NAME_ATTR, _TYPE_ATTR = _ATTR("id"), _ATTR("name"), _ATTR("type")
+
+
+def _attr(rx, attrs: str) -> str:
+    m = rx.search(attrs)
+    return next((g for g in m.groups() if g is not None), "") if m else ""
+
+
+def _label_target(control: str):
+    """(start, end, id, needs_id) of the control a field's <label> names — the first
+    input/select/textarea that is not hidden/checkbox/radio and not already wrapped in
+    its own <label> (`_checkbox`). None when there is nothing to point at."""
+    for m in _CTRL_TAG.finditer(control):
+        typ = _attr(_TYPE_ATTR, m.group(2)).lower()
+        if typ in ("hidden", "checkbox", "radio", "submit", "button"):
+            continue
+        before = control[:m.start()].lower()
+        if before.count("<label") > before.count("</label"):
+            continue
+        cid = _attr(_ID_ATTR, m.group(2))
+        if cid:
+            return m.start(), m.end(), cid, False
+        name = _attr(_NAME_ATTR, m.group(2))
+        if not name:
+            return None
+        return m.start(), m.end(), "fld-" + re.sub(r"\s+", "_", name), True
+    return None
+
+
+def _field(label: str, control: str, short: bool = False, wide: bool = False,
+           hint: str = "") -> str:
+    """One labelled form row. The <label> is tied to its control (`for` = the control's
+    id; one derived from its name — `fld-<name>` — is added when it has none), so a
+    click on the label focuses the input and a screen reader names it. `hint` is raw
+    HTML (callers escape their own text) rendered as its OWN row under the control and
+    linked via aria-describedby — appended inside the control it was a flex item that
+    squeezed the input down to a sliver."""
     cls = "control short" if short else ("control wide" if wide else "control")
-    return f'<div class="field"><label>{_esc(label)}</label><div class="{cls}">{control}</div></div>'
+    tgt = _label_target(control)
+    lab = f"<label>{_esc(label)}</label>"
+    if tgt:
+        start, end, cid, add = tgt
+        extra = (f' id="{_esc(cid)}"' if add else "") + \
+                (f' aria-describedby="{_esc(cid)}-hint"' if hint else "")
+        if extra:
+            tag = control[start:end]
+            cut = len(tag) - (2 if tag.endswith("/>") else 1)
+            control = control[:start] + tag[:cut] + extra + tag[cut:] + control[end:]
+        lab = f'<label for="{_esc(cid)}">{_esc(label)}</label>'
+    hid = f' id="{_esc(tgt[2])}-hint"' if (hint and tgt) else ""
+    fh = f'<div class="fhint"{hid}>{hint}</div>' if hint else ""
+    return (f'<div class="field{" hashint" if hint else ""}">{lab}'
+            f'<div class="{cls}">{control}</div>{fh}</div>')
 
 
 def _btn(label: str, href: str = "", kind: str = "", sm: bool = False, submit: bool = False,
          confirm: str = "", title: str = "", icon: bool = False) -> str:
     cls = "btn" + (f" {kind}" if kind else "") + (" sm" if sm else "") + (" icon" if icon else "")
-    t = f' title="{_esc(title)}"' if title else ""
+    t = (f' title="{_esc(title)}"' + (f' aria-label="{_esc(title)}"' if icon else "")) if title else ""
     # The text is DATA read by _CONFIRM_JS, never spliced into an onclick: the browser
     # decodes html.escape's `&#x27;` before parsing a handler, so a `'` in the text broke
     # the JS (the link then navigated without asking) or, chosen by an attacker, ran it.
@@ -1808,7 +1955,7 @@ async def backends_page(request: Request):
         if draining:
             badge = _badge(f"⏳ draining · {inflight} in-flight", "warn")
         elif not b["enabled"]:
-            badge = _badge("⏻ offline", "warn", "taken offline — use ⏼ bring-online to re-enable")
+            badge = _badge("⊘ offline", "warn", "taken offline — use ▶ bring-online to re-enable")
         elif b["healthy"]:
             badge = _badge("healthy", "ok")
         else:
@@ -1827,12 +1974,12 @@ async def backends_page(request: Request):
             acts_list.append(("↺", f"/ui/backends/undrain?id={quote(bid)}", "secondary",
                               "Cancel drain — put back in rotation"))
         elif b["enabled"]:
-            acts_list.append(("⏻", f"/ui/backends/drain?id={quote(bid)}", "secondary",
+            acts_list.append(("⊘", f"/ui/backends/drain?id={quote(bid)}", "secondary",
                               "Take offline when idle (drain: stop new requests, finish in-flight)",
                               f"Take {b['name']} offline once idle? New requests stop now; "
                               "in-flight requests finish first."))
         else:
-            acts_list.append(("⏼", f"/ui/backends/enable?id={quote(bid)}", "secondary",
+            acts_list.append(("▶", f"/ui/backends/enable?id={quote(bid)}", "secondary",
                               "Bring online (enable)"))
         if b.get("type") == "comfyui" and b["enabled"]:
             acts_list.append(("⟳", f"/ui/backends/restart?id={quote(bid)}", "secondary",
@@ -2629,7 +2776,7 @@ def _routing_gen_body(bmeta: dict, sel: Optional[str] = None) -> str:
     opts = "<option value=''>all backends</option>" + "".join(
         f"<option value='{_esc(b)}'{' selected' if b == sel else ''}>{_esc(b)} ({len(v)})</option>"
         for b, v in sorted(per_backend.items()))
-    picker = (f"<div style='margin:6px 0 10px'><select style=\"width:auto;{_BOX_STYLE}\" "
+    picker = (f"<div style='margin:6px 0 10px'><select class='box' style='width:auto' "
               f"onchange=\"location.href='/ui/routing?sub=gen'+"
               f"(this.value?('&amp;backend='+encodeURIComponent(this.value)):'')\">{opts}</select></div>")
 
@@ -2697,7 +2844,7 @@ def _routing_loras_body(bmeta: dict) -> str:
             for bn in sorted(hosts[name]))
         rows += f'<tr><td><code>{_esc(name)}</code></td><td>{chips}</td></tr>'
     search = (f"<input id='sf' autocomplete='off' oninput='sfRun()' placeholder='filter LoRAs…' "
-              f"style=\"min-width:260px;max-width:420px;{_BOX_STYLE}\">")
+              f"class='box' style='min-width:260px;max-width:420px'>")
     counts = " · ".join(f"{_esc(bn)}: {len(v)}" for bn, v in sorted(per_backend.items()))
     return ("<h2>LoRAs → backends</h2>"
             "<p class='hint'>Installed LoRAs per ComfyUI backend (from discovery, verbatim incl. "
@@ -3289,7 +3436,7 @@ def _mapping_list_media(iedit: str) -> str:
             backends = ", ".join(x.get("backend", "") for x in cands)
             acts = _icon_acts(
                 ("✎", f"/ui/mapping?edit={_esc(alias)}", "secondary", "Edit"),
-                ("⧉", f"/ui/mapping/copy?alias={_esc(alias)}", "secondary", "Copy"),
+                ("❐", f"/ui/mapping/copy?alias={_esc(alias)}", "secondary", "Copy"),
                 ("✕", f"/ui/mapping/delete?alias={_esc(alias)}", "danger", "Delete", f"Delete {alias}?"))
             # the task is the group header now — the row shows what differs within it
             body += _item(_esc(alias), f"{backends} · {mapped}", acts, sel=(alias == iedit))
@@ -3470,7 +3617,23 @@ def _reorder_js(alias: str) -> str:
             "if(ord().join('\\u0001')===start)return;"
             "location.href='/ui/mapping/field-order?alias='+encodeURIComponent(" + a + ")+"
             "'&'+ord().map(function(p){return 'order='+encodeURIComponent(p);}).join('&');});"
-            "});})();</script>")
+            "});"
+            # Keyboard alternative to dragging: ↑/↓ move the row and fire the SAME drop
+            # handler, so persisting stays one code path whatever it becomes. The moved
+            # button gets focus back after the save's reload.
+            "function row(n){while(n&&n.tagName!=='TR')n=n.parentNode;return n;}"
+            "tb.addEventListener('click',function(e){var b=e.target;"
+            "if(!b||!b.getAttribute||!b.getAttribute('data-mv'))return;e.preventDefault();"
+            "var tr=row(b),up=b.getAttribute('data-mv')==='-1',s=tr;"
+            "do{s=up?s.previousElementSibling:s.nextElementSibling;}while(s&&!s.hasAttribute('data-p'));"
+            "if(!tr||!s)return;tb.insertBefore(tr,up?s:s.nextSibling);"
+            "try{sessionStorage.setItem('gw:mv',tr.getAttribute('data-p')+'\\u0001'+b.getAttribute('data-mv'));}catch(x){}"
+            "tr.dispatchEvent(new Event('drop',{cancelable:true}));});"
+            "try{var f=sessionStorage.getItem('gw:mv');if(f){sessionStorage.removeItem('gw:mv');"
+            "f=f.split('\\u0001');[].forEach.call(tb.querySelectorAll('tr[data-p]'),function(r){"
+            "if(r.getAttribute('data-p')===f[0]){var k=r.querySelector('[data-mv=\"'+f[1]+'\"]');"
+            "if(k)k.focus();}});}}catch(x){}"
+            "})();</script>")
 
 
 def _same_kind(cands: list, backend_name: str) -> bool:
@@ -3578,7 +3741,11 @@ def _req_fields_rows(alias: str, wf: dict, mapping: dict, oi: dict) -> str:
                     if not is_img else "")
                    + _map_del_btn(alias, "param=" + _esc(p)))
         rows += (f'<tr draggable="true" data-p="{_esc(p)}">'
-                 f"<td><span class='grip' title='Drag to reorder'>⠿</span> {_esc(p)}{tag}</td>"
+                 f"<td><span class='grip' title='Drag to reorder'>⠿</span>"
+                 f'<button type="button" class="mv" data-mv="-1" title="Move up" '
+                 f'aria-label="Move {_esc(p)} up">↑</button><button type="button" class="mv" '
+                 f'data-mv="1" title="Move down" aria-label="Move {_esc(p)} down">↓</button>'
+                 f" {_esc(p)}{tag}</td>"
                  f"<td>{_inp('label__' + p, m.get('label', ''), placeholder=p)}</td>"
                  f"<td>{_inp('node__' + p, node)}</td>"
                  f"<td>{_inp('field__' + p, fld)}</td>"
@@ -5362,11 +5529,16 @@ async def voice_lib_play(name: str):
 
 # ── Media Jobs tab (G1): inspect a generation's inputs + outputs within its TTL ──
 
-_JOB_TICK = ("<script>function _fd(ms){ms=ms|0;if(ms<1000)return ms+' ms';var s=ms/1000;"
+# Ticks every `.jdur[data-since]` once a second. Guarded by window.gwJobTick: several
+# views append it (a page can carry it twice), and each copy used to start its own
+# setInterval rewriting the same cells. The querySelectorAll runs per tick, so cells
+# the live morph brings in later are covered by the one timer.
+_JOB_TICK = ("<script>(function(){if(window.gwJobTick)return;window.gwJobTick=1;"
+             "function fd(ms){ms=ms|0;if(ms<1000)return ms+' ms';var s=ms/1000;"
              "return s<60?s.toFixed(1)+' s':(s/60).toFixed(1)+' min';}"
-             "function _td(){var n=Date.now()/1000;document.querySelectorAll('.jdur[data-since]')"
-             ".forEach(function(e){e.textContent=_fd((n-parseFloat(e.getAttribute('data-since')))*1000);});}"
-             "setInterval(_td,1000);_td();</script>")
+             "function td(){var n=Date.now()/1000;document.querySelectorAll('.jdur[data-since]')"
+             ".forEach(function(e){e.textContent=fd((n-parseFloat(e.getAttribute('data-since')))*1000);});}"
+             "setInterval(td,1000);td();})();</script>")
 _JOB_SCLS = {"done": "ok", "failed": "bad", "running": "warn", "queued": "warn"}
 
 
@@ -5423,7 +5595,7 @@ def _job_dur_cell(j: dict, now: int) -> str:
     st = j["status"]
     cr, upd = int(j.get("created") or 0), int(j.get("updated") or 0)
     if st in ("done", "failed") and upd >= cr:
-        return f"<td class='muted'>{_dur((upd - cr) * 1000)}</td>"
+        return f"<td class='muted' data-sv=\"{(upd - cr) * 1000}\">{_dur((upd - cr) * 1000)}</td>"
     est = _expected_dur_s(j.get("alias") or "", j.get("backend") or "") \
         if st in ("running", "queued") else None
     exp = f" <span class='muted'>/ ~{_dur(est * 1000)}</span>" if est else ""
@@ -5433,7 +5605,7 @@ def _job_dur_cell(j: dict, now: int) -> str:
         live = _job_progress(j["id"]) or {}
         if live.get("eta_s") is not None:
             exp = (f" <span class='muted'>/ ~{_dur(live['eta_s'] * 1000)} left</span>")
-        return (f"<td class='muted'><span class='jdur' data-since='{cr}'>"
+        return (f"<td class='muted' data-sv=\"{max(0, now - cr) * 1000}\"><span class='jdur' data-since='{cr}'>"
                 f"{_dur((now - cr) * 1000)}</span>{exp}</td>")
     if st == "queued" and est:
         return f"<td class='muted'>—<span class='muted'> / ~{_dur(est * 1000)}</span></td>"
@@ -5448,7 +5620,7 @@ def _job_row(j: dict, now: int, *, task_col: bool = False, count_col: bool = Fal
     st, jid = j["status"], j["id"]
     cells = []
     if time_col:
-        cells.append(f"<td class='muted'>{_ts(j.get('created'))}</td>")
+        cells.append(f"<td class='muted' data-sv=\"{int(j.get('created') or 0)}\">{_ts(j.get('created'))}</td>")
     cells.append(f"<td><a href='/ui/job/{_esc(jid)}'><code>{_esc(jid[:8])}</code></a></td>")
     if task_col:
         cells.append(f"<td>{_esc(j.get('task'))}</td>")
@@ -5456,7 +5628,8 @@ def _job_row(j: dict, now: int, *, task_col: bool = False, count_col: bool = Fal
               f"<td><span class='badge {_JOB_SCLS.get(st, 'muted')}'>{_esc(_job_status_text(j))}</span></td>"]
     if count_col:
         cells.append(f"<td class='muted'>{j.get('result_count') or 0}</td>")
-    cells += [f"<td class='muted'>{_age(j.get('created'))}</td>", _job_dur_cell(j, now),
+    cells += [f"<td class='muted' data-sv=\"{max(0, now - int(j.get('created') or 0))}\">"
+              f"{_age(j.get('created'))}</td>", _job_dur_cell(j, now),
               f"<td class='muted'>{_esc(j.get('owner'))}</td>"]
     if actions:
         acts = ((_btn('✕', f'/ui/job/{jid}/cancel', 'danger', sm=True, icon=True, confirm='Cancel this job?')
@@ -5499,6 +5672,23 @@ async def _refused_media_table(user, aliases) -> str:
             + _recent_calls_table(rows, aliases, src="media"))
 
 
+_MEDIA_JOBS_PAGE = 100
+
+
+def _media_jobs_pager(user, before, rows) -> str:
+    """"← newest" / "older →" under the Media Jobs table. A keyset (`?before=<job id>`,
+    see jobs.recent), not an offset: the list is live and newest-first, so an offset
+    would shift under the reader with every new job. The live poller re-fetches the
+    SAME url, so an older page stays that page while its rows keep updating."""
+    base = "/ui/jobs?sub=media" + (f"&amp;user={quote(user)}" if user else "")
+    links = []
+    if before:
+        links.append(f"<a href='{base}'>← newest</a>")
+    if len(rows) >= _MEDIA_JOBS_PAGE:
+        links.append(f"<a href='{base}&amp;before={quote(rows[-1]['id'])}'>older →</a>")
+    return f"<div class='pager'>{' · '.join(links)}</div>" if links else ""
+
+
 async def _jobs_media_body(request: Request) -> tuple[str, Optional[int]]:
     """(body, refresh) — generation jobs (image/video/audio), newest first; excludes
     parked-chat / background-response rows, followed by the media requests that were
@@ -5510,8 +5700,10 @@ async def _jobs_media_body(request: Request) -> tuple[str, Optional[int]]:
     if not jobs.is_active():
         return ("<h2>Media Jobs</h2><p class='hint'>Job store is off — set <code>image_models</code> "
                 "or <code>jobs.enabled: true</code> in config.</p>" + refused + _FILTER_JS, None)
-    rows = await asyncio.to_thread(jobs.recent, 200, media_only=True, owner=user)
-    if not rows and not user:
+    before = (request.query_params.get("before") or "").strip() or None
+    rows = await asyncio.to_thread(jobs.recent, _MEDIA_JOBS_PAGE, media_only=True, owner=user,
+                                   before=before)
+    if not rows and not user and not before:
         return ("<h2>Media Jobs</h2><p class='hint'>No generation jobs yet. Run one in the "
                 "<a href='/ui/playground?sub=media'>Media Playground</a>.</p>"
                 + refused + _FILTER_JS, None)
@@ -5520,14 +5712,18 @@ async def _jobs_media_body(request: Request) -> tuple[str, Optional[int]]:
     now = int(time.time())
     tr = "".join(_job_row(j, now, task_col=True, count_col=True, actions=True, time_col=True)
                  for j in rows)
-    tbl = ((f"<table class='filterable'><tr><th>time</th><th>id</th><th>task</th><th>alias</th>"
-            f"<th>backend</th><th>status</th><th>imgs</th><th>age</th><th>dur</th><th>owner</th>"
-            f"<th></th></tr>{tr}</table>") if rows
-           else "<p class='muted'>no media jobs for this user</p>")
-    refresh = 5 if any(j["status"] in ("running", "queued") for j in rows) else None
+    tbl = ((f"<table class='filterable sortable' data-sk='media-jobs'><tr><th>time</th><th>id</th>"
+            f"<th>task</th><th>alias</th><th>backend</th><th>status</th><th>artifacts</th><th>age</th>"
+            f"<th>dur</th><th>owner</th><th></th></tr>{tr}</table>") if rows
+           else "<p class='muted'>no media jobs " + ("this far back" if before else "for this user") + "</p>")
+    # Always live: a job started from ANOTHER client (the API, a second browser) used to
+    # appear only on F5 because an idle list stopped polling. Idle ticks are slow; the
+    # rows are keyed (job-<id>), so a new job inserts one row instead of rewriting all.
+    refresh = 5 if any(j["status"] in ("running", "queued") for j in rows) else 15
     head = (f"<h2>Media Jobs{scope} <span class='muted' style='font-weight:normal'>"
-            f"· last {len(rows)}</span></h2>{bar}")
-    return (f"{head}{tbl}{refused}{_JOB_TICK}{_FILTER_JS}", refresh)
+            f"· {'older · ' if before else 'newest '}{len(rows)}</span></h2>{bar}")
+    return (f"{head}{tbl}{_media_jobs_pager(user, before, rows)}{refused}{_JOB_TICK}{_FILTER_JS}",
+            refresh)
 
 
 async def _calls_view_body(request: Request, kind: str) -> str:
@@ -6014,11 +6210,30 @@ async def job_cancel(job_id: str):
 # ── Tabs: stubs ─────────────────────────────────────────────────────────────────
 
 def _cost(v) -> str:
-    return f"${float(v or 0):.4f}"
+    """ONE call's cost: precision that fits the amount — a local call is "$0", a
+    cheap one "$0.0012", a dear one "$3.50". Sums use _cost_sum."""
+    v = float(v or 0)
+    if v == 0:
+        return "$0"
+    if abs(v) < 0.0001:
+        return "<$0.0001"
+    return f"${v:.4f}" if abs(v) < 0.01 else (f"${v:.3f}" if abs(v) < 1 else f"${v:.2f}")
+
+
+def _cost_sum(v) -> str:
+    """A total (cards, per-backend/model/user aggregates): cents, like any bill.
+    "$0.0040" beside "$12.3400" was four digits of noise on every figure."""
+    v = float(v or 0)
+    return "<$0.01" if 0 < v < 0.005 else f"${v:.2f}"
 
 
 def _ts(ts) -> str:
-    return time.strftime("%m-%d %H:%M:%S", time.localtime(int(ts)))
+    """Time stamp in the lists: month-day + time, with the YEAR only when it is not the
+    current one — a call log kept for a year otherwise showed last December's rows as
+    if they were this week's."""
+    t = time.localtime(int(ts or 0))
+    fmt = "%m-%d %H:%M:%S" if t.tm_year == time.localtime().tm_year else "%Y-%m-%d %H:%M:%S"
+    return time.strftime(fmt, t)
 
 
 def _age(ts) -> str:
@@ -6097,7 +6312,7 @@ def _dash_cards(d: dict, bes: list, f: Optional[dict] = None) -> str:
     card = lambda num, lbl: f"<div class='card'><div class='cnum'>{num}</div><div class='clbl'>{_esc(lbl)}</div></div>"
     nf = int((f or {}).get("total") or 0)
     fcard = (f"<div class='card' title='backend failures recorded in the last 24h — see Backend faults below'>"
-             f"<div class='cnum'{_FAULT_RED if nf else ''}>{nf}</div>"
+             f"<div class='cnum{' bad' if nf else ''}'>{nf}</div>"
              f"<div class='clbl'>backend faults · 24h</div></div>")
     return ("<div class='cards'>"
             + card(d.get("llm_inflight", 0), "LLM in flight")
@@ -6109,7 +6324,7 @@ def _dash_cards(d: dict, bes: list, f: Optional[dict] = None) -> str:
             + "</div>")
 
 
-_FAULT_RED = " style='color:#e06c6c'"
+_FAULT_RED = " style='color:var(--bad)'"      # legacy inline form; new markup uses class 'bad'
 # Fault-log kinds beyond what a discovery poll can report (_DOWN_BADGE covers those).
 _FAULT_KIND = {
     "connection_lost": "⚡ connection lost mid-job",
@@ -6232,7 +6447,7 @@ def _dash_backends(bes: list, offline: list, fmap: Optional[dict] = None) -> str
         if b.get("draining"):
             return _badge(f"⏳ draining · {b.get('inflight', 0)} in-flight", "warn")
         if not b.get("enabled"):
-            return _badge("⏻ offline", "warn")
+            return _badge("⊘ offline", "warn")
         if not b.get("healthy"):
             return _down_badge(b.get("error"))          # names the cause, not just "off"
         return _badge("busy", "warn") if b.get("busy") else _badge("ready", "ok")
@@ -6249,7 +6464,7 @@ def _dash_backends(bes: list, offline: list, fmap: Optional[dict] = None) -> str
     brows = ""
     for b in sorted(bes, key=lambda x: (srank(x), x.get("name", "").lower())):
         cap = b.get("max_concurrent")
-        inf = f"{b.get('inflight', 0)}" + (f" / {cap}" if cap else "")
+        inf = f"{b.get('inflight', 0)} / {cap if cap else '∞'}"   # no cap = unlimited, say so
         r1h = b.get("reqs_1h", 0)
         r1h_cell = f"{r1h}" if r1h else "<span class='muted'>0</span>"
         # data-k: _bid (type:name) is this row's identity, and the panel re-sorts
@@ -6349,7 +6564,7 @@ async def dashboard_page(request: Request):
     f = await asyncio.to_thread(_faults_info)
     aliases = await asyncio.to_thread(store.get_ip_aliases)
     fmap = {s.get("bid"): s for s in f.get("backends") or []}
-    body = ("<h2>Dashboard <span class='muted' style='font-weight:normal'>· live · auto-refresh 4s</span></h2>"
+    body = ("<h2>Dashboard</h2>"
             + _dash_cards(d, bes, f) + _dash_backends(bes, offline, fmap) + _dash_faults(f)
             + _dash_parked(d) + _dash_llm(d, now, aliases) + _dash_jobs(d, now) + _JOB_TICK)
     return HTMLResponse(_page("Dashboard", body, "dashboard", refresh=4))
@@ -6394,11 +6609,13 @@ def _call_row(r, aliases) -> str:
     # whole table instead of inserting one row. Prefixed to keep the key space apart
     # from the job rows', in case the two ever share a parent node.
     return (f"<tr data-k=\"call-{_esc(cid)}\">"
-            f"<td class='muted'>{_ts(ts)}</td><td>{_esc(_src_name(source, aliases))}</td><td>{_esc(backend)}</td>"
+            f"<td class='muted' data-sv=\"{int(ts or 0)}\">{_ts(ts)}</td><td>{_esc(_src_name(source, aliases))}</td><td>{_esc(backend)}</td>"
             f"<td>{_esc(alias) or ''}{('→' + _esc(model)) if model else ''}</td>"
             f"<td class='muted'>{_esc((endpoint or '').replace('/v1/', ''))}</td>"
             f"<td><span class='badge {scls}'>{_esc(status)}</span></td>"
-            f"<td>{_dur(dur)}</td><td>{intk}/{outk}</td><td>{_cost(cost)}</td>{_reasoning_cell(rsn)}<td>{view}</td></tr>")
+            f"<td data-sv=\"{int(dur or 0)}\">{_dur(dur)}</td>"
+            f"<td data-sv=\"{int(intk or 0) + int(outk or 0)}\">{intk}/{outk}</td>"
+            f"<td data-sv=\"{float(cost or 0)}\">{_cost(cost)}</td>{_reasoning_cell(rsn)}<td>{view}</td></tr>")
 
 
 def _calls_table(rows_html: str, sk: str) -> str:
@@ -6418,7 +6635,11 @@ def _recent_calls_table(rows, aliases, src: str = "llm") -> str:
     return _calls_table(rec, sk=f"{src}-calls")
 
 
-_BOX_STYLE = "padding:7px 10px;background:#0c0e12;border:1px solid #242a33;border-radius:8px;color:#cdd6e0"
+# The `.box` class in _CSS is the same look; this inline form stays only for the
+# download card, where it comes AFTER the card's own `pad` and therefore wins — the
+# class would lose to that inline padding and resize every download card.
+_BOX_STYLE = ("padding:7px 10px;background:var(--input);border:1px solid var(--line);"
+              "border-radius:8px;color:var(--text-2)")
 # Row filter for `table.filterable`, driven by the ONE `#sf` input a view renders.
 # The typed text is persisted in sessionStorage per view and re-applied on load — like
 # the sort order above, and for the same reason: it must survive REAL navigation (a tab
@@ -6457,11 +6678,11 @@ def _user_filter_bar(path: str, user, by_source, aliases) -> tuple[str, str]:
         f"<option value='{_esc(r[0])}'{' selected' if r[0] == user else ''}>{_esc(_src_name(r[0], aliases))}</option>"
         for r in by_source)
     sep = "&" if "?" in path else "?"                  # path may already carry ?sub=…
-    picker = (f"<select style=\"width:auto;{_BOX_STYLE}\" onchange=\"location.href='{path}'+"
+    picker = (f"<select class='box' style='width:auto' onchange=\"location.href='{path}'+"
               f"(this.value?('{sep}user='+encodeURIComponent(this.value)):'')\">{opts}</select>")
     search = (f"<input id='sf' autocomplete='off' oninput='sfRun()' "
               f"placeholder='filter rows: backend / alias / model / user…' "
-              f"style=\"flex:1;min-width:220px;max-width:420px;{_BOX_STYLE}\">")
+              f"class='box' style='flex:1;min-width:220px;max-width:420px'>")
     scope = (f" · <span class='muted' style='font-weight:normal'>user <b>{_esc(user)}</b> · "
              f"<a href='{path}'>clear</a></span>") if user else ""
     bar = f"<div style='display:flex;gap:10px;align-items:center;margin:6px 0 10px'>{picker}{search}</div>"
@@ -6576,7 +6797,7 @@ async def statistic_page(request: Request):
         # Media aggregates live in the JOB store, not in stats.calls — they are there to
         # show even when call recording is off, and this is the page they belong on.
         media = await asyncio.to_thread(_media_gen_panel)
-        return HTMLResponse(_page("Statistic", "<h2>Statistic</h2><p class='hint'>Call recording is off. "
+        return HTMLResponse(_page("Statistics", "<h2>Statistics</h2><p class='hint'>Call recording is off. "
             "Enable <b>stats</b> in the <a href='/ui/server'>Server</a> tab (needs a restart) to collect "
             "per-call stats here.</p>" + fpanel + media + _FILTER_JS, "statistic"))
     user = (request.query_params.get("user") or "").strip() or None
@@ -6596,9 +6817,9 @@ async def statistic_page(request: Request):
                f"under LLM Calls, Media Jobs or Voice Calls, by endpoint.")
     cards = (f"<div class='cards'>"
              f"<div class='card'><div class='cnum'>{s['total_count']}</div><div class='clbl'>calls total</div></div>"
-             f"<div class='card'><div class='cnum'>{_cost(s['total_cost'])}</div><div class='clbl'>cost total</div></div>"
+             f"<div class='card'><div class='cnum'>{_cost_sum(s['total_cost'])}</div><div class='clbl'>cost total</div></div>"
              f"<div class='card'><div class='cnum'>{s['h24_count']}</div><div class='clbl'>calls · 24h</div></div>"
-             f"<div class='card'><div class='cnum'>{_cost(s['h24_cost'])}</div><div class='clbl'>cost · 24h</div></div>"
+             f"<div class='card'><div class='cnum'>{_cost_sum(s['h24_cost'])}</div><div class='clbl'>cost · 24h</div></div>"
              f"<div class='card' title='{_esc(ref_tip)}'>"
              f"<div class='cnum'>{s['refused_24h']}</div>"
              f"<div class='clbl'>refused · 24h</div></div>"
@@ -6607,7 +6828,7 @@ async def statistic_page(request: Request):
     be = "".join(f"<tr><td>{_esc(r[0])}</td><td>{r[1]}</td><td>{r[2]}</td>"
                  + _cache_cells(r[2], r[6] if len(r) > 6 else 0, r[7] if len(r) > 7 else 0,
                                 trend.get(r[0]))
-                 + f"<td>{r[3]}</td><td>{_cost(r[4])}</td><td>{_dur(r[5])}</td></tr>"
+                 + f"<td>{r[3]}</td><td>{_cost_sum(r[4])}</td><td>{_dur(r[5])}</td></tr>"
                  for r in s["by_backend"])
     by_backend = (f"<h2>By backend</h2>"
                   f"<p class='hint'>Prompt cache: <b>cached</b> = input served from the backend's "
@@ -6628,11 +6849,11 @@ async def statistic_page(request: Request):
                       f"no forwarded calls — all {s['refused_count']} were refused"
                       if s["refused_count"] else "no calls yet") + "</p>")
     mo = "".join(f"<tr><td>{_esc(r[0]) or '—'}</td><td><code>{_esc(r[1])}</code></td><td>{r[2]}</td>"
-                 f"<td>{r[3]}</td><td>{r[4]}</td><td>{_cost(r[5])}</td></tr>" for r in s["by_model"])
+                 f"<td>{r[3]}</td><td>{r[4]}</td><td>{_cost_sum(r[5])}</td></tr>" for r in s["by_model"])
     by_model = (f"<h2>By alias / model</h2><table class='filterable sortable' data-sk='stat-model'>"
                 f"<tr><th>alias</th><th>model</th><th>calls</th>"
                 f"<th>in</th><th>out</th><th>cost</th></tr>{mo}</table>" if mo else "")
-    so = "".join(f"<tr><td>{_esc(_src_name(r[0], aliases))}</td><td>{r[1]}</td><td>{_cost(r[2])}</td></tr>" for r in s["by_source"])
+    so = "".join(f"<tr><td>{_esc(_src_name(r[0], aliases))}</td><td>{r[1]}</td><td>{_cost_sum(r[2])}</td></tr>" for r in s["by_source"])
     by_source = (f"<h2>By user / source</h2><table class='filterable sortable' data-sk='stat-source'>"
                  f"<tr><th>source</th><th>calls</th><th>cost</th></tr>"
                  f"{so}</table>" if so else "")
@@ -6641,9 +6862,9 @@ async def statistic_page(request: Request):
     recent = ("<p class='hint' style='margin-top:18px'>Per-call history (with request/response bodies) "
               "moved to the <a href='/ui/llmcalls'>LLM Calls</a> tab.</p>")
     media = await asyncio.to_thread(_media_gen_panel)
-    head = f"<h2>Statistic{scope}</h2>{bar}"
+    head = f"<h2>Statistics{scope}</h2>{bar}"
     body = head + cards + fpanel + by_backend + by_model + by_source + media + recent + _FILTER_JS
-    return HTMLResponse(_page("Statistic", body, "statistic"))
+    return HTMLResponse(_page("Statistics", body, "statistic"))
 
 
 async def call_view(call_id: int, request: Request):
@@ -7041,6 +7262,23 @@ def _show_user_keys() -> bool:
     return bool(store.get_setting("show_user_keys", True)) if store.is_active() else True
 
 
+# The Model-access table's "all <kind>" boxes. gwTogAll sets a whole group from its
+# header box; the delegated `change` listener is the other direction — ticking or
+# unticking ONE row used to leave the header claiming the opposite (review U22). The
+# header shows checked when every row is, indeterminate when some are.
+_USER_ACC_JS = ("<script>function gwTogAll(c,g){var s='input[name=model][data-grp=\"'+g+'\"]';"
+                "document.querySelectorAll(s).forEach(function(x){x.checked=c.checked;});"
+                "c.indeterminate=false;}"
+                "(function(){function sync(g){var a=document.querySelector('input[data-grp-all=\"'+g+'\"]');"
+                "if(!a)return;var bs=document.querySelectorAll('input[name=model][data-grp=\"'+g+'\"]'),on=0,i;"
+                "for(i=0;i<bs.length;i++)if(bs[i].checked)on++;"
+                "a.checked=bs.length>0&&on===bs.length;a.indeterminate=on>0&&on<bs.length;}"
+                "document.addEventListener('change',function(e){var x=e.target;"
+                "if(x&&x.name==='model'&&x.getAttribute('data-grp'))sync(x.getAttribute('data-grp'));});"
+                "[].forEach.call(document.querySelectorAll('input[data-grp-all]'),function(a){"
+                "sync(a.getAttribute('data-grp-all'));});})();</script>")
+
+
 def _user_form(u: Optional[dict]) -> str:
     g = lambda k, d="": str((u or {}).get(k) if (u or {}).get(k) is not None else d)
     has_key = bool((u or {}).get("api_key"))
@@ -7068,7 +7306,7 @@ def _user_form(u: Optional[dict]) -> str:
         if not items:
             continue
         all_ck = " checked" if all(a in allowed for a in items) else ""
-        rows += (f'<tr style="background:#13161c"><td><input type="checkbox"{all_ck} '
+        rows += (f'<tr class="grp"><td><input type="checkbox"{all_ck} data-grp-all="{kind}" '
                  f'onclick="gwTogAll(this,\'{kind}\')" title="select all {kind}"></td>'
                  f'<td colspan="2"><b>all {kind}</b> <span class="muted">({len(items)})</span></td></tr>')
         for a in items:
@@ -7077,8 +7315,7 @@ def _user_form(u: Optional[dict]) -> str:
                      f'<td><code>{_esc(a)}</code></td><td class="muted">{kind}</td></tr>')
     acc = ((f'<div class="acctbl"><table><thead><tr><th title="allow this entry">✓</th>'
             f'<th>name</th><th>kind</th></tr></thead><tbody>{rows}</tbody></table></div>'
-            "<script>function gwTogAll(c,g){var s='input[name=model][data-grp=\"'+g+'\"]';"
-            "document.querySelectorAll(s).forEach(function(x){x.checked=c.checked;});}</script>") if rows
+            + _USER_ACC_JS) if rows
            else "<p class='muted'>no aliases or backends yet</p>")
     return (f'<form action="/ui/users/save" method="post">{orig}'
             f'<div class="formbar"><h2>{"Edit User" if u else "Add User"}</h2>'
@@ -7093,12 +7330,6 @@ def _user_form(u: Optional[dict]) -> str:
                        'title="generate a random key">🔑 Generate</button>'
                      + ' <button type="button" class="btn secondary sm" onclick="gwCopyKey(this)" '
                        'title="copy to clipboard">📋 Copy</button>'
-                     + ("<p class='hint' style='margin:4px 0 0'>This user's key is filled in and hidden — "
-                        "<b>📋 Copy</b> reveals and copies it. Overwrite the field to change the key. "
-                        "Turn off <code>show_user_keys</code> in <a href='/ui/server'>Server</a> to keep "
-                        "stored keys out of this page.</p>" if show_key else
-                        "<p class='hint' style='margin:4px 0 0'>The key is shown once here — copy it now; "
-                        "after Save it is stored encrypted and no longer displayed.</p>")
                      + "<script>function _gwKeyInp(b){return b.closest('.control').querySelector('input[name=api_key]');}"
                        "function gwGenKey(b){var a=new Uint8Array(24);crypto.getRandomValues(a);"
                        "var k='sk-'+Array.from(a).map(function(x){return ('0'+x.toString(16)).slice(-2);}).join('');"
@@ -7107,7 +7338,19 @@ def _user_form(u: Optional[dict]) -> str:
                        "var d=function(){b.textContent='✓ Copied';setTimeout(function(){b.textContent='📋 Copy';},1200);};"
                        "if(navigator.clipboard&&navigator.clipboard.writeText){"
                        "navigator.clipboard.writeText(i.value).then(d,function(){document.execCommand('copy');d();});}"
-                       "else{document.execCommand('copy');d();}}</script>")
+                       "else{document.execCommand('copy');d();}}</script>",
+                     # What happens to the key after Save depends on show_user_keys — the
+                     # hint used to say "shown once" even with the setting ON, where the
+                     # editor pre-fills it again next time.
+                     hint=("This user's key is filled in and hidden — <b>📋 Copy</b> reveals and "
+                           "copies it. Overwrite the field to change the key. Turn off "
+                           "<code>show_user_keys</code> in <a href='/ui/server'>Server</a> to keep "
+                           "stored keys out of this page." if show_key else
+                           "Generate or paste a key. It is stored encrypted; with "
+                           "<code>show_user_keys</code> on (Server tab) it can be copied here again "
+                           "later." if _show_user_keys() else
+                           "The key is shown once here — copy it now; after Save it is stored "
+                           "encrypted and no longer displayed (<code>show_user_keys</code> is off)."))
             + _field("role", _select("role", ["user", "admin"], g("role", "user")))
             + _field("enabled", _checkbox("enabled", (u or {}).get("enabled", True), "enabled"))
             + _field("quota req/day", _inp("quota_req_day", g("quota_req_day"),
@@ -7186,7 +7429,7 @@ async def users_page(request: Request):
                    f"{_icon_acts(('✕', f'/ui/ipalias/delete?ip={quote(ip)}', 'danger', 'Delete', f'Delete IP alias {ip}?'))}</td></tr>")
     ip_section = ("<h2 style='margin-top:26px'>IP aliases</h2>"
                   "<p class='hint'>Friendly names for caller IPs (unauthenticated / <code>x-source</code> calls) as shown in "
-                  "Statistic. Hostnames are auto-resolved via reverse DNS on load — edit or clear as needed.</p>"
+                  "Statistics. Hostnames are auto-resolved via reverse DNS on load — edit or clear as needed.</p>"
                   + (f"<table><tr><th>IP</th><th>alias</th><th></th></tr>{iprows}</table>" if iprows
                      else "<p class='muted'>No caller IPs seen yet (calls are currently attributed to authenticated users).</p>"))
     # Design convention (mirrors Mapping): the master-detail .cols is the SOLE full-height
@@ -7290,7 +7533,7 @@ _SRV_RESTART = [
     ("__grp", "", "AI-Hub", ""),
     ("port", "int", "port", "set by launch cmd (uvicorn --port / systemd)"),
     ("__grp", "", "Stats (call log)", ""),
-    ("stats_enabled", "bool", "enabled", "record calls (dashboard in Statistic tab)"),
+    ("stats_enabled", "bool", "enabled", "record calls (dashboard in Statistics tab)"),
     ("stats_db_path", "text", "db path", ""),
     ("stats_retention_days", "int", "retention days", "0 = keep forever"),
     ("stats_body_retention_days", "int", "body retention days",
@@ -7320,8 +7563,7 @@ def _srv_runtime_row(k: str, kind: str, lbl: str, note: str, value) -> str:
     """One Server-tab runtime row. Numeric kinds render a number input; `text` a text
     input — a CIDR or port LIST in a number input cannot be submitted at all."""
     typ = "text" if kind == "text" else "number"
-    n = f" <span class='muted'>{_esc(note)}</span>" if note else ""
-    return _field(lbl, _inp(k, "" if value in (None, "") else value, typ=typ) + n)
+    return _field(lbl, _inp(k, "" if value in (None, "") else value, typ=typ), hint=_esc(note))
 
 
 async def server_page(request: Request):
@@ -7335,13 +7577,12 @@ async def server_page(request: Request):
     port_diff = bool(running_port and str(eff.get("port")) != str(running_port))
     any_restart = port_diff or any(rdiff(k) for k in _SRV_RESTART_KEYS if k != "port")
     mark = lambda cond: (" " + _badge("↻ restart", "warn")) if cond else ""
-    note = lambda n: f" <span class='muted'>{_esc(n)}</span>" if n else ""
 
     banner = ""
     if saved == "1":
         banner = "<p class='ok-banner'>✓ Saved — runtime settings applied live.</p>"
     elif saved == "restart":
-        banner = "<p class='bad'>✓ Saved — port/stats/jobs changes need a <b>restart</b> to apply.</p>"
+        banner = "<p class='ok-banner'>✓ Saved — port/stats/jobs changes need a <b>restart</b> to apply.</p>"
 
     runtime_rows = (
         _field("API key (client auth)",
@@ -7370,7 +7611,7 @@ async def server_page(request: Request):
         else:
             d = port_diff if k == "port" else rdiff(k)
             restart_rows += _field(lbl, _inp(k, _srv_disp(k, eff.get(k, "")), typ=("number" if kind == "int" else "text"))
-                                   + mark(d) + note(n))
+                                   + mark(d), hint=_esc(n))
     restart_form = (
         '<form action="/ui/server/save" method="post"><input type="hidden" name="_form" value="restart">'
         f'<div class="formbar"><h2>Restart-required{mark(any_restart)}</h2>{_btn("Save", submit=True)}</div>'
