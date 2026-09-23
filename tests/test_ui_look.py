@@ -220,5 +220,46 @@ class MediaJobsList(unittest.TestCase):
             admin._MEDIA_JOBS_PAGE = old
 
 
+class FieldLabels(unittest.TestCase):
+    """`_field` rendered a bare <label> next to its control: clicking the label did
+    nothing and a screen reader announced an unnamed text box (review U14). A hint
+    appended inside the control became a flex item that squeezed the input (U20)."""
+
+    def test_label_points_at_the_control(self):
+        html = admin._field("name", admin._inp("name", "x"))
+        self.assertIn('<label for="fld-name">name</label>', html)
+        self.assertIn('id="fld-name"', html)
+
+    def test_existing_id_is_reused(self):
+        html = admin._field("filter", "<input id='sf' name='q'>")
+        self.assertIn('<label for="sf">', html)
+        self.assertEqual(html.count("id="), 1)
+
+    def test_checkbox_labels_are_left_alone(self):
+        # _checkbox already wraps its input in a <label>; a second one pointing at it
+        # would name the control twice.
+        html = admin._field("enabled", admin._checkbox("enabled", True, "enabled"))
+        self.assertNotIn("for=", html)
+        self.assertNotIn('id="fld-', html)
+
+    def test_hidden_inputs_are_not_labelled(self):
+        html = admin._field("x", '<input type="hidden" name="h" value="1">'
+                            + admin._select("kind", ["a", "b"]))
+        self.assertIn('<label for="fld-kind">', html)
+
+    def test_hint_is_its_own_row(self):
+        html = admin._field("port", admin._inp("port", "4000"), hint="needs a <b>restart</b>")
+        ctrl = html.split('class="control"', 1)[1].split("</div>", 1)[0]
+        self.assertNotIn("restart", ctrl)
+        self.assertIn('<div class="fhint" id="fld-port-hint">needs a <b>restart</b></div>', html)
+        self.assertIn('class="field hashint"', html)
+        self.assertIn('aria-describedby="fld-port-hint"', html)
+
+    def test_icon_buttons_are_named(self):
+        html = admin._btn("✕", "/x", "danger", sm=True, icon=True, title="Delete")
+        self.assertIn('aria-label="Delete"', html)
+        self.assertNotIn("aria-label", admin._btn("Save", "/x", title="Save it"))
+
+
 if __name__ == "__main__":
     unittest.main()

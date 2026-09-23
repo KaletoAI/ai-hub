@@ -731,15 +731,67 @@ def _page(title: str, body: str, active: str = "", refresh: Optional[int] = None
             f"{_CONFIRM_JS}{_SCROLL_JS}{_SORT_JS}{_TABS_JS}{_LIVE_JS}</body></html>")
 
 
-def _field(label: str, control: str, short: bool = False, wide: bool = False) -> str:
+_CTRL_TAG = re.compile(r"<(input|select|textarea)\b([^>]*)>", re.I)
+_ATTR = lambda name: re.compile(r"""\b%s\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""" % name, re.I)
+_ID_ATTR, _NAME_ATTR, _TYPE_ATTR = _ATTR("id"), _ATTR("name"), _ATTR("type")
+
+
+def _attr(rx, attrs: str) -> str:
+    m = rx.search(attrs)
+    return next((g for g in m.groups() if g is not None), "") if m else ""
+
+
+def _label_target(control: str):
+    """(start, end, id, needs_id) of the control a field's <label> names — the first
+    input/select/textarea that is not hidden/checkbox/radio and not already wrapped in
+    its own <label> (`_checkbox`). None when there is nothing to point at."""
+    for m in _CTRL_TAG.finditer(control):
+        typ = _attr(_TYPE_ATTR, m.group(2)).lower()
+        if typ in ("hidden", "checkbox", "radio", "submit", "button"):
+            continue
+        before = control[:m.start()].lower()
+        if before.count("<label") > before.count("</label"):
+            continue
+        cid = _attr(_ID_ATTR, m.group(2))
+        if cid:
+            return m.start(), m.end(), cid, False
+        name = _attr(_NAME_ATTR, m.group(2))
+        if not name:
+            return None
+        return m.start(), m.end(), "fld-" + re.sub(r"\s+", "_", name), True
+    return None
+
+
+def _field(label: str, control: str, short: bool = False, wide: bool = False,
+           hint: str = "") -> str:
+    """One labelled form row. The <label> is tied to its control (`for` = the control's
+    id; one derived from its name — `fld-<name>` — is added when it has none), so a
+    click on the label focuses the input and a screen reader names it. `hint` is raw
+    HTML (callers escape their own text) rendered as its OWN row under the control and
+    linked via aria-describedby — appended inside the control it was a flex item that
+    squeezed the input down to a sliver."""
     cls = "control short" if short else ("control wide" if wide else "control")
-    return f'<div class="field"><label>{_esc(label)}</label><div class="{cls}">{control}</div></div>'
+    tgt = _label_target(control)
+    lab = f"<label>{_esc(label)}</label>"
+    if tgt:
+        start, end, cid, add = tgt
+        extra = (f' id="{_esc(cid)}"' if add else "") + \
+                (f' aria-describedby="{_esc(cid)}-hint"' if hint else "")
+        if extra:
+            tag = control[start:end]
+            cut = len(tag) - (2 if tag.endswith("/>") else 1)
+            control = control[:start] + tag[:cut] + extra + tag[cut:] + control[end:]
+        lab = f'<label for="{_esc(cid)}">{_esc(label)}</label>'
+    hid = f' id="{_esc(tgt[2])}-hint"' if (hint and tgt) else ""
+    fh = f'<div class="fhint"{hid}>{hint}</div>' if hint else ""
+    return (f'<div class="field{" hashint" if hint else ""}">{lab}'
+            f'<div class="{cls}">{control}</div>{fh}</div>')
 
 
 def _btn(label: str, href: str = "", kind: str = "", sm: bool = False, submit: bool = False,
          confirm: str = "", title: str = "", icon: bool = False) -> str:
     cls = "btn" + (f" {kind}" if kind else "") + (" sm" if sm else "") + (" icon" if icon else "")
-    t = f' title="{_esc(title)}"' if title else ""
+    t = (f' title="{_esc(title)}"' + (f' aria-label="{_esc(title)}"' if icon else "")) if title else ""
     # The text is DATA read by _CONFIRM_JS, never spliced into an onclick: the browser
     # decodes html.escape's `&#x27;` before parsing a handler, so a `'` in the text broke
     # the JS (the link then navigated without asking) or, chosen by an attacker, ran it.
@@ -7080,12 +7132,6 @@ def _user_form(u: Optional[dict]) -> str:
                        'title="generate a random key">🔑 Generate</button>'
                      + ' <button type="button" class="btn secondary sm" onclick="gwCopyKey(this)" '
                        'title="copy to clipboard">📋 Copy</button>'
-                     + ("<p class='hint' style='margin:4px 0 0'>This user's key is filled in and hidden — "
-                        "<b>📋 Copy</b> reveals and copies it. Overwrite the field to change the key. "
-                        "Turn off <code>show_user_keys</code> in <a href='/ui/server'>Server</a> to keep "
-                        "stored keys out of this page.</p>" if show_key else
-                        "<p class='hint' style='margin:4px 0 0'>The key is shown once here — copy it now; "
-                        "after Save it is stored encrypted and no longer displayed.</p>")
                      + "<script>function _gwKeyInp(b){return b.closest('.control').querySelector('input[name=api_key]');}"
                        "function gwGenKey(b){var a=new Uint8Array(24);crypto.getRandomValues(a);"
                        "var k='sk-'+Array.from(a).map(function(x){return ('0'+x.toString(16)).slice(-2);}).join('');"
@@ -7094,7 +7140,19 @@ def _user_form(u: Optional[dict]) -> str:
                        "var d=function(){b.textContent='✓ Copied';setTimeout(function(){b.textContent='📋 Copy';},1200);};"
                        "if(navigator.clipboard&&navigator.clipboard.writeText){"
                        "navigator.clipboard.writeText(i.value).then(d,function(){document.execCommand('copy');d();});}"
-                       "else{document.execCommand('copy');d();}}</script>")
+                       "else{document.execCommand('copy');d();}}</script>",
+                     # What happens to the key after Save depends on show_user_keys — the
+                     # hint used to say "shown once" even with the setting ON, where the
+                     # editor pre-fills it again next time.
+                     hint=("This user's key is filled in and hidden — <b>📋 Copy</b> reveals and "
+                           "copies it. Overwrite the field to change the key. Turn off "
+                           "<code>show_user_keys</code> in <a href='/ui/server'>Server</a> to keep "
+                           "stored keys out of this page." if show_key else
+                           "Generate or paste a key. It is stored encrypted; with "
+                           "<code>show_user_keys</code> on (Server tab) it can be copied here again "
+                           "later." if _show_user_keys() else
+                           "The key is shown once here — copy it now; after Save it is stored "
+                           "encrypted and no longer displayed (<code>show_user_keys</code> is off)."))
             + _field("role", _select("role", ["user", "admin"], g("role", "user")))
             + _field("enabled", _checkbox("enabled", (u or {}).get("enabled", True), "enabled"))
             + _field("quota req/day", _inp("quota_req_day", g("quota_req_day"),
@@ -7274,8 +7332,7 @@ def _srv_runtime_row(k: str, kind: str, lbl: str, note: str, value) -> str:
     """One Server-tab runtime row. Numeric kinds render a number input; `text` a text
     input — a CIDR or port LIST in a number input cannot be submitted at all."""
     typ = "text" if kind == "text" else "number"
-    n = f" <span class='muted'>{_esc(note)}</span>" if note else ""
-    return _field(lbl, _inp(k, "" if value in (None, "") else value, typ=typ) + n)
+    return _field(lbl, _inp(k, "" if value in (None, "") else value, typ=typ), hint=_esc(note))
 
 
 async def server_page(request: Request):
@@ -7289,13 +7346,12 @@ async def server_page(request: Request):
     port_diff = bool(running_port and str(eff.get("port")) != str(running_port))
     any_restart = port_diff or any(rdiff(k) for k in _SRV_RESTART_KEYS if k != "port")
     mark = lambda cond: (" " + _badge("↻ restart", "warn")) if cond else ""
-    note = lambda n: f" <span class='muted'>{_esc(n)}</span>" if n else ""
 
     banner = ""
     if saved == "1":
         banner = "<p class='ok-banner'>✓ Saved — runtime settings applied live.</p>"
     elif saved == "restart":
-        banner = "<p class='bad'>✓ Saved — port/stats/jobs changes need a <b>restart</b> to apply.</p>"
+        banner = "<p class='ok-banner'>✓ Saved — port/stats/jobs changes need a <b>restart</b> to apply.</p>"
 
     runtime_rows = (
         _field("API key (client auth)",
@@ -7324,7 +7380,7 @@ async def server_page(request: Request):
         else:
             d = port_diff if k == "port" else rdiff(k)
             restart_rows += _field(lbl, _inp(k, _srv_disp(k, eff.get(k, "")), typ=("number" if kind == "int" else "text"))
-                                   + mark(d) + note(n))
+                                   + mark(d), hint=_esc(n))
     restart_form = (
         '<form action="/ui/server/save" method="post"><input type="hidden" name="_form" value="restart">'
         f'<div class="formbar"><h2>Restart-required{mark(any_restart)}</h2>{_btn("Save", submit=True)}</div>'
