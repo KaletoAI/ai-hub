@@ -5484,6 +5484,23 @@ async def _refused_media_table(user, aliases) -> str:
             + _recent_calls_table(rows, aliases, src="media"))
 
 
+_MEDIA_JOBS_PAGE = 100
+
+
+def _media_jobs_pager(user, before, rows) -> str:
+    """"← newest" / "older →" under the Media Jobs table. A keyset (`?before=<job id>`,
+    see jobs.recent), not an offset: the list is live and newest-first, so an offset
+    would shift under the reader with every new job. The live poller re-fetches the
+    SAME url, so an older page stays that page while its rows keep updating."""
+    base = "/ui/jobs?sub=media" + (f"&amp;user={quote(user)}" if user else "")
+    links = []
+    if before:
+        links.append(f"<a href='{base}'>← newest</a>")
+    if len(rows) >= _MEDIA_JOBS_PAGE:
+        links.append(f"<a href='{base}&amp;before={quote(rows[-1]['id'])}'>older →</a>")
+    return f"<div class='pager'>{' · '.join(links)}</div>" if links else ""
+
+
 async def _jobs_media_body(request: Request) -> tuple[str, Optional[int]]:
     """(body, refresh) — generation jobs (image/video/audio), newest first; excludes
     parked-chat / background-response rows, followed by the media requests that were
@@ -5495,8 +5512,9 @@ async def _jobs_media_body(request: Request) -> tuple[str, Optional[int]]:
     if not jobs.is_active():
         return ("<h2>Media Jobs</h2><p class='hint'>Job store is off — set <code>image_models</code> "
                 "or <code>jobs.enabled: true</code> in config.</p>" + refused + _FILTER_JS, None)
-    rows = jobs.recent(200, media_only=True, owner=user)
-    if not rows and not user:
+    before = (request.query_params.get("before") or "").strip() or None
+    rows = jobs.recent(_MEDIA_JOBS_PAGE, media_only=True, owner=user, before=before)
+    if not rows and not user and not before:
         return ("<h2>Media Jobs</h2><p class='hint'>No generation jobs yet. Run one in the "
                 "<a href='/ui/playground?sub=media'>Media Playground</a>.</p>"
                 + refused + _FILTER_JS, None)
@@ -5505,14 +5523,18 @@ async def _jobs_media_body(request: Request) -> tuple[str, Optional[int]]:
     now = int(time.time())
     tr = "".join(_job_row(j, now, task_col=True, count_col=True, actions=True, time_col=True)
                  for j in rows)
-    tbl = ((f"<table class='filterable'><tr><th>time</th><th>id</th><th>task</th><th>alias</th>"
-            f"<th>backend</th><th>status</th><th>imgs</th><th>age</th><th>dur</th><th>owner</th>"
-            f"<th></th></tr>{tr}</table>") if rows
-           else "<p class='muted'>no media jobs for this user</p>")
-    refresh = 5 if any(j["status"] in ("running", "queued") for j in rows) else None
+    tbl = ((f"<table class='filterable sortable' data-sk='media-jobs'><tr><th>time</th><th>id</th>"
+            f"<th>task</th><th>alias</th><th>backend</th><th>status</th><th>artifacts</th><th>age</th>"
+            f"<th>dur</th><th>owner</th><th></th></tr>{tr}</table>") if rows
+           else "<p class='muted'>no media jobs " + ("this far back" if before else "for this user") + "</p>")
+    # Always live: a job started from ANOTHER client (the API, a second browser) used to
+    # appear only on F5 because an idle list stopped polling. Idle ticks are slow; the
+    # rows are keyed (job-<id>), so a new job inserts one row instead of rewriting all.
+    refresh = 5 if any(j["status"] in ("running", "queued") for j in rows) else 15
     head = (f"<h2>Media Jobs{scope} <span class='muted' style='font-weight:normal'>"
-            f"· last {len(rows)}</span></h2>{bar}")
-    return (f"{head}{tbl}{refused}{_JOB_TICK}{_FILTER_JS}", refresh)
+            f"· {'older · ' if before else 'newest '}{len(rows)}</span></h2>{bar}")
+    return (f"{head}{tbl}{_media_jobs_pager(user, before, rows)}{refused}{_JOB_TICK}{_FILTER_JS}",
+            refresh)
 
 
 async def _calls_view_body(request: Request, kind: str) -> str:

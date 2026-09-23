@@ -121,13 +121,24 @@ def count_by_backend_since(ts: int) -> dict:
     return {r[0]: r[1] for r in rows if r[0]}
 
 
-def recent(limit: int = 20, media_only: bool = False, owner: Optional[str] = None) -> list:
+def recent(limit: int = 20, media_only: bool = False, owner: Optional[str] = None,
+           before: Optional[str] = None) -> list:
     """Most recent jobs (metadata only), newest first. `media_only` drops the
     chat/response rows (those live under Statistic / the Responses API);
-    `owner` narrows to one job owner (the Media Jobs user filter)."""
+    `owner` narrows to one job owner (the Media Jobs user filter). `before` is a
+    job id: the page starts right after it in the same created-DESC, rowid-DESC
+    order `neighbors` walks (a keyset, so jobs arriving meanwhile shift nothing);
+    an unknown id — pruned since — yields an empty page."""
     if not _active:
         return []
     conds, args = [], []
+    if before:
+        with _conn() as c:
+            cur = c.execute("SELECT created, rowid AS rid FROM jobs WHERE id = ?", (before,)).fetchone()
+        if cur is None:
+            return []
+        conds.append("(created < ? OR (created = ? AND rowid < ?))")
+        args += [cur["created"], cur["created"], cur["rid"]]
     if media_only:
         conds.append(f"task NOT IN ({','.join('?' * len(_NON_MEDIA_TASKS))})")
         args += _NON_MEDIA_TASKS
@@ -138,7 +149,7 @@ def recent(limit: int = 20, media_only: bool = False, owner: Optional[str] = Non
     with _conn() as c:
         rows = c.execute(
             f"SELECT id, created, updated, status, task, alias, backend, owner, result_count, error, stage "
-            f"FROM jobs{flt} ORDER BY created DESC LIMIT ?", (*args, limit)).fetchall()
+            f"FROM jobs{flt} ORDER BY created DESC, rowid DESC LIMIT ?", (*args, limit)).fetchall()
     return [dict(r) for r in rows]
 
 

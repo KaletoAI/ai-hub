@@ -1198,7 +1198,13 @@ into the view you were on. Updating stops on its own once there is nothing live
 left to watch (the job finished, the drain completed) — no timer keeps running in
 the background, except that a server answering non-200 is retried with a doubling
 backoff up to every 30 s rather than given up on. Tabs in the background are
-skipped entirely and catch up the moment you switch back.
+skipped entirely and catch up the moment you switch back. A chip at the right of
+the tab bar says what the page shows: **live · 4s**, or **stale since 14:35:07**
+(the server answered with an error) / **offline since 14:35:07** (it could not be
+reached) — the time of the last good update, i.e. how old the numbers are. The
+Media Jobs list is always live (every 15 s when idle, so a job started from another
+client shows up without F5), sortable like the other lists, and pages back through
+older jobs 100 at a time (`older →`).
 
 ---
 

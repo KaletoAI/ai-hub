@@ -8,17 +8,20 @@ without `for` is a label a screen reader never announces; a live page that lost 
 server shows the last good numbers forever, with nothing saying they are old. So the
 contract is pinned on the markup and on the JS, not eyeballed.
 """
+import asyncio
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 
 _here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _here)
 import admin  # noqa: E402
+import jobs  # noqa: E402
 
 
 class PhoneLayout(unittest.TestCase):
@@ -152,6 +155,69 @@ class LiveStatusChip(unittest.TestCase):
     def test_dashboard_no_longer_hardcodes_its_cadence(self):
         import inspect
         self.assertNotIn("auto-refresh 4s", inspect.getsource(admin.dashboard_page))
+
+
+class _Q(dict):
+    def get(self, k, d=None):
+        return dict.get(self, k, d)
+
+
+class _Req:
+    def __init__(self, **qp):
+        self.query_params = _Q(qp)
+        self.cookies = {}
+
+
+class MediaJobsList(unittest.TestCase):
+    """Media Jobs was live only while a job ran (a job started from ANOTHER client never
+    appeared until F5), not sortable unlike every other list, and cut at the newest 200
+    with no way to the rest (review U13)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        jobs.init(os.path.join(self.tmp.name, "jobs.db"), os.path.join(self.tmp.name, "b"), 3600)
+        self.ids = [jobs.create("img2img", "flux", "comfy-a", job_id=f"job{i:02d}")
+                    for i in range(5)]
+        with jobs._conn() as c:                  # all five in the SAME second: rowid breaks ties
+            c.execute("UPDATE jobs SET created = 1799999000, updated = 1799999010, status='done'")
+        self._ipa = admin.store.get_ip_aliases
+        admin.store.get_ip_aliases = lambda: {}
+        self.addCleanup(setattr, admin.store, "get_ip_aliases", self._ipa)
+
+    def test_recent_pages_backwards_without_gaps_or_repeats(self):
+        first = [j["id"] for j in jobs.recent(2, media_only=True)]
+        second = [j["id"] for j in jobs.recent(2, media_only=True, before=first[-1])]
+        third = [j["id"] for j in jobs.recent(2, media_only=True, before=second[-1])]
+        self.assertEqual(first + second + third, list(reversed(self.ids)))
+
+    def test_unknown_cursor_is_an_empty_page(self):
+        self.assertEqual(jobs.recent(2, media_only=True, before="pruned-long-ago"), [])
+
+    def _body(self, **qp):
+        return asyncio.run(admin._jobs_media_body(_Req(**qp)))
+
+    def test_idle_list_is_still_live(self):
+        body, refresh = self._body()
+        self.assertTrue(refresh and refresh > 0, "an idle Media Jobs list must keep polling")
+
+    def test_list_is_sortable_with_a_stable_key(self):
+        body, _ = self._body()
+        self.assertRegex(body, r"<table class='filterable sortable' data-sk='media-jobs'>")
+        self.assertIn("<th>artifacts</th>", body)
+
+    def test_older_link_pages_through(self):
+        old = admin._MEDIA_JOBS_PAGE
+        admin._MEDIA_JOBS_PAGE = 2
+        try:
+            body, _ = self._body()
+            self.assertIn("href='/ui/jobs?sub=media&amp;before=job03'", body)
+            body, _ = self._body(before="job03")
+            self.assertIn("job02", body)
+            self.assertNotIn("job04", body)
+            self.assertIn("href='/ui/jobs?sub=media'", body)      # back to newest
+        finally:
+            admin._MEDIA_JOBS_PAGE = old
 
 
 if __name__ == "__main__":
