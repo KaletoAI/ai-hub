@@ -2682,7 +2682,7 @@ def _routing_gen_body(bmeta: dict, sel: Optional[str] = None) -> str:
     opts = "<option value=''>all backends</option>" + "".join(
         f"<option value='{_esc(b)}'{' selected' if b == sel else ''}>{_esc(b)} ({len(v)})</option>"
         for b, v in sorted(per_backend.items()))
-    picker = (f"<div style='margin:6px 0 10px'><select style=\"width:auto;{_BOX_STYLE}\" "
+    picker = (f"<div style='margin:6px 0 10px'><select class='box' style='width:auto' "
               f"onchange=\"location.href='/ui/routing?sub=gen'+"
               f"(this.value?('&amp;backend='+encodeURIComponent(this.value)):'')\">{opts}</select></div>")
 
@@ -2750,7 +2750,7 @@ def _routing_loras_body(bmeta: dict) -> str:
             for bn in sorted(hosts[name]))
         rows += f'<tr><td><code>{_esc(name)}</code></td><td>{chips}</td></tr>'
     search = (f"<input id='sf' autocomplete='off' oninput='sfRun()' placeholder='filter LoRAs…' "
-              f"style=\"min-width:260px;max-width:420px;{_BOX_STYLE}\">")
+              f"class='box' style='min-width:260px;max-width:420px'>")
     counts = " · ".join(f"{_esc(bn)}: {len(v)}" for bn, v in sorted(per_backend.items()))
     return ("<h2>LoRAs → backends</h2>"
             "<p class='hint'>Installed LoRAs per ComfyUI backend (from discovery, verbatim incl. "
@@ -6182,7 +6182,7 @@ def _dash_cards(d: dict, bes: list, f: Optional[dict] = None) -> str:
     card = lambda num, lbl: f"<div class='card'><div class='cnum'>{num}</div><div class='clbl'>{_esc(lbl)}</div></div>"
     nf = int((f or {}).get("total") or 0)
     fcard = (f"<div class='card' title='backend failures recorded in the last 24h — see Backend faults below'>"
-             f"<div class='cnum'{_FAULT_RED if nf else ''}>{nf}</div>"
+             f"<div class='cnum{' bad' if nf else ''}'>{nf}</div>"
              f"<div class='clbl'>backend faults · 24h</div></div>")
     return ("<div class='cards'>"
             + card(d.get("llm_inflight", 0), "LLM in flight")
@@ -6194,7 +6194,7 @@ def _dash_cards(d: dict, bes: list, f: Optional[dict] = None) -> str:
             + "</div>")
 
 
-_FAULT_RED = " style='color:#e06c6c'"
+_FAULT_RED = " style='color:var(--bad)'"      # legacy inline form; new markup uses class 'bad'
 # Fault-log kinds beyond what a discovery poll can report (_DOWN_BADGE covers those).
 _FAULT_KIND = {
     "connection_lost": "⚡ connection lost mid-job",
@@ -6505,7 +6505,11 @@ def _recent_calls_table(rows, aliases, src: str = "llm") -> str:
     return _calls_table(rec, sk=f"{src}-calls")
 
 
-_BOX_STYLE = "padding:7px 10px;background:#0c0e12;border:1px solid #242a33;border-radius:8px;color:#cdd6e0"
+# The `.box` class in _CSS is the same look; this inline form stays only for the
+# download card, where it comes AFTER the card's own `pad` and therefore wins — the
+# class would lose to that inline padding and resize every download card.
+_BOX_STYLE = ("padding:7px 10px;background:var(--input);border:1px solid var(--line);"
+              "border-radius:8px;color:var(--text-2)")
 # Row filter for `table.filterable`, driven by the ONE `#sf` input a view renders.
 # The typed text is persisted in sessionStorage per view and re-applied on load — like
 # the sort order above, and for the same reason: it must survive REAL navigation (a tab
@@ -6544,11 +6548,11 @@ def _user_filter_bar(path: str, user, by_source, aliases) -> tuple[str, str]:
         f"<option value='{_esc(r[0])}'{' selected' if r[0] == user else ''}>{_esc(_src_name(r[0], aliases))}</option>"
         for r in by_source)
     sep = "&" if "?" in path else "?"                  # path may already carry ?sub=…
-    picker = (f"<select style=\"width:auto;{_BOX_STYLE}\" onchange=\"location.href='{path}'+"
+    picker = (f"<select class='box' style='width:auto' onchange=\"location.href='{path}'+"
               f"(this.value?('{sep}user='+encodeURIComponent(this.value)):'')\">{opts}</select>")
     search = (f"<input id='sf' autocomplete='off' oninput='sfRun()' "
               f"placeholder='filter rows: backend / alias / model / user…' "
-              f"style=\"flex:1;min-width:220px;max-width:420px;{_BOX_STYLE}\">")
+              f"class='box' style='flex:1;min-width:220px;max-width:420px'>")
     scope = (f" · <span class='muted' style='font-weight:normal'>user <b>{_esc(user)}</b> · "
              f"<a href='{path}'>clear</a></span>") if user else ""
     bar = f"<div style='display:flex;gap:10px;align-items:center;margin:6px 0 10px'>{picker}{search}</div>"
