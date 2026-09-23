@@ -5991,9 +5991,12 @@ async def _jobs_media_body(request: Request) -> tuple[str, Optional[int]]:
     rows = await asyncio.to_thread(jobs.recent, _MEDIA_JOBS_PAGE, media_only=True, owner=user,
                                    before=before)
     if not rows and not user and not before:
+        # Live too (the idle 15 s tick): the first job an API client starts must appear
+        # without F5. _JOB_TICK rides along because the morph that brings the first
+        # rows strips every <script> it inserts (the live-page invariant).
         return ("<h2>Media Jobs</h2><p class='hint'>No generation jobs yet. Run one in the "
                 "<a href='/ui/playground?sub=media'>Media Playground</a>.</p>"
-                + refused + _FILTER_JS, None)
+                + refused + _JOB_TICK + _FILTER_JS, 15)
     scope, bar = _user_filter_bar("/ui/jobs?sub=media", user,
                                   [(o,) for o in await asyncio.to_thread(jobs.owners)], aliases)
     now = int(time.time())

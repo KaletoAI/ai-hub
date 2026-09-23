@@ -202,6 +202,20 @@ class MediaJobsList(unittest.TestCase):
         body, refresh = self._body()
         self.assertTrue(refresh and refresh > 0, "an idle Media Jobs list must keep polling")
 
+    def test_empty_list_is_live_and_already_carries_the_list_scripts(self):
+        # The EMPTY state returned early without a refresh: the first job an API client
+        # started appeared only on F5 — and the morph that brings the first rows strips
+        # every <script> it inserts, so the empty page must already hold the list's own.
+        import re
+        full, _ = self._body()
+        with jobs._conn() as c:
+            c.execute("DELETE FROM jobs")
+        body, refresh = self._body()
+        self.assertIn("No generation jobs yet", body)
+        self.assertTrue(refresh and refresh > 0, "an empty Media Jobs list must keep polling")
+        scripts = lambda h: re.findall(r"<script[^>]*>.*?</script>", h, re.S)
+        self.assertEqual([x for x in scripts(full) if x not in scripts(body)], [])
+
     def test_list_is_sortable_with_a_stable_key(self):
         body, _ = self._body()
         self.assertRegex(body, r"<table class='filterable sortable' data-sk='media-jobs'>")
