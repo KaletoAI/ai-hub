@@ -315,6 +315,36 @@ class HealthTransitions(_MainState):
         self.assertEqual(s["outages"], 1)
 
 
+class DiscoveryPersistFailure(_MainState):
+    """Persisting what a poll learned is bookkeeping: a locked store.db must not turn a
+    backend that just ANSWERED into a DOWN one (and a fault-log outage)."""
+
+    def test_a_store_error_does_not_mark_a_healthy_backend_down(self):
+        import sqlite3
+        import store
+
+        def locked(*a, **k):
+            raise sqlite3.OperationalError("database is locked")
+        saved = (store.is_active, store.save_backend_models, store.save_backend_context)
+        store.is_active = lambda: True
+        store.save_backend_models = store.save_backend_context = locked
+
+        class _Ctx(_Adapter):
+            async def discover(self, client):
+                return adapters.Capabilities(models={"m"}, pricing={}, context={"m": 4096})
+        try:
+            with self.assertLogs("main", level="WARNING") as log:
+                self._poll(EVO, _Ctx())
+        finally:
+            store.is_active, store.save_backend_models, store.save_backend_context = saved
+        bid = main.backend_id(EVO)
+        self.assertTrue(main.backend_healthy[bid])
+        self.assertEqual(main.backend_models[bid], {"m"})
+        self.assertNotIn(bid, main.backend_error)
+        self.assertEqual(faults.events_since(0), [])
+        self.assertTrue(any("database is locked" in m for m in log.output), log.output)
+
+
 class DispatchFailover(_MainState):
     def _dispatch(self, cands):
         main.backends = [b for b, _ in cands]

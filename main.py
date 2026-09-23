@@ -672,6 +672,19 @@ def _with_context(entry: dict, ctx: Optional[int]) -> dict:
     return entry
 
 
+async def _persist_discovery(label: str, save, *args) -> None:
+    """Store what a poll learned (models, context windows) — bookkeeping that must never
+    fail the POLL: inside refresh_backend's try, a locked store.db marked a backend that
+    had just answered as DOWN and opened a fault-log outage for it. Logged instead; the
+    in-memory state is updated anyway and the next change persists again."""
+    if not store.is_active():
+        return
+    try:
+        await asyncio.to_thread(save, *args)
+    except Exception as e:
+        logger.warning(f"[{label}] discovery result not persisted ({save.__name__}): {_err_text(e)}")
+
+
 async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
     """Poll a backend's capabilities via its adapter and update discovery state.
 
@@ -706,16 +719,15 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
         # happen.
         caps.models = adapters.add_model_extras(caps.models, backend)
         changed = caps.models != backend_models.get(bid)
-        if changed and store.is_active():
-            await asyncio.to_thread(store.save_backend_models, bid, caps.models)  # persist on change
+        if changed:
+            await _persist_discovery(label, store.save_backend_models, bid, caps.models)
         backend_models[bid] = caps.models
         backend_pricing[bid] = caps.pricing
         backend_loras[bid] = getattr(caps, "loras", set()) or set()
         learned = merge_learned_context(backend_context.get(bid), getattr(caps, "context", None))
         if learned != backend_context.get(bid, {}):
             backend_context[bid] = learned
-            if store.is_active():
-                await asyncio.to_thread(store.save_backend_context, bid, learned)
+            await _persist_discovery(label, store.save_backend_context, bid, learned)
         running = getattr(caps, "running", None)
         had_running = bid in backend_running
         if running is None:
