@@ -8,6 +8,7 @@ import json
 import logging
 import mimetypes
 import re
+import shlex
 import time
 from collections import deque
 from contextlib import asynccontextmanager
@@ -1746,10 +1747,31 @@ async def transcribe_audio(data: bytes, filename: str = "ref.wav") -> tuple[Opti
         return None, f"{type(ex).__name__}: {ex}"
 
 
+# A ship target's parts end up on ssh/scp command lines (and in a remote shell for the
+# mkdir), so they are held to plain host and path characters: `[user@]host` where
+# neither part can start with `-` (an ssh OPTION), and an absolute dir without `..`.
+_VOICE_HOST_RE = re.compile(r"^(?:[A-Za-z0-9_][A-Za-z0-9._-]*@)?[A-Za-z0-9_][A-Za-z0-9._-]*$")
+_VOICE_DIR_RE = re.compile(r"^/[A-Za-z0-9._/-]*$")
+
+
+def _voice_dir_ok(d: str) -> bool:
+    return bool(_VOICE_DIR_RE.match(d)) and ".." not in d.split("/")
+
+
+def parse_voice_target(t: str) -> Optional[tuple[str, str]]:
+    """'user@host:/abs/dir' → (host, dir without trailing /), None if the target is not
+    that shape. The ONLY gate before ship_voice_ref spawns ssh/scp with these values."""
+    host, sep, hdir = (t or "").partition(":")
+    hdir = hdir.rstrip("/") or ("/" if hdir else "")
+    if not sep or not _VOICE_HOST_RE.match(host) or not _voice_dir_ok(hdir):
+        return None
+    return host, hdir
+
+
 async def _scp(src: Path, host: str, remote: str) -> tuple[bool, str]:
     try:
         proc = await asyncio.create_subprocess_exec(
-            "scp", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+            "scp", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--",
             str(src), f"{host}:{remote}",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
         out, _ = await proc.communicate()
@@ -1770,10 +1792,13 @@ async def ship_voice_ref(name: str, notify=None) -> tuple[bool, str]:
         nb("err", f"unknown voice '{name}'")
         return False, f"unknown voice '{name}'"
     targets, vdir = voice_ship_config()
-    bad = [t for t in targets if ":" not in t or not t.split(":", 1)[1].startswith("/")]
-    if not targets or bad or not vdir.startswith("/"):
+    parsed = [(t, parse_voice_target(t)) for t in targets]
+    bad = [t for t, p in parsed if p is None]
+    if not targets or bad or not _voice_dir_ok(vdir):
         msg = ("no/invalid ship config — targets are 'user@host:/abs/host/dir' (comma-"
-               "separated) + a model-visible voice dir (e.g. /models/voices)")
+               "separated) + a model-visible voice dir (e.g. /models/voices); host and "
+               "dirs may only use letters, digits, . _ - and /"
+               + (f" — refused: {', '.join(bad)}" if bad else ""))
         nb("err", msg)
         return False, msg
     src = Path(e.get("file") or "")
@@ -1782,13 +1807,14 @@ async def ship_voice_ref(name: str, notify=None) -> tuple[bool, str]:
         return False, f"gateway blob missing: {src}"
     remote = f"{vdir}/{src.name}"                       # what goes into `voice`
     results = {}
-    for t in targets:
-        host, hdir = t.split(":", 1)
-        hdir = hdir.rstrip("/")
+    for t, (host, hdir) in parsed:
         nb("run", f"upload → {host}")
         try:                                            # scp can't create dirs — mkdir -p first
+            # `--` ends ssh's options before the host; the remote command is shell-parsed,
+            # hence shlex.quote on top of the validated dir.
             proc = await asyncio.create_subprocess_exec(
-                "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", host, f"mkdir -p {hdir}",
+                "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--", host,
+                f"mkdir -p -- {shlex.quote(hdir)}",
                 stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
             await proc.communicate()
         except Exception:

