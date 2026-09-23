@@ -1052,17 +1052,64 @@ async def login_page(request: Request):
     return HTMLResponse(_page("Login", _login_page(nxt=nxt), active="", nologin=True))
 
 
+# Login guessing: failed attempts per client IP inside a sliding window. In memory on
+# purpose (one instance; a restart forgetting them is harmless). Behind a reverse proxy
+# every browser shares the proxy's IP, so a burst of typos there locks the form for
+# everyone for the window — X-Forwarded-For is NOT used: it is the attacker's to choose.
+_LOGIN_MAX_FAILS = 10
+_LOGIN_WINDOW_S = 300
+_LOGIN_MAX_IPS = 4096                     # bound on the table (oldest IP evicted first)
+_login_fails: dict = {}                   # ip → [monotonic timestamps of failures]
+
+
+def _login_recent(ip: str, now: float) -> list:
+    stamps = [t for t in _login_fails.get(ip, []) if now - t < _LOGIN_WINDOW_S]
+    if stamps:
+        _login_fails[ip] = stamps
+    else:
+        _login_fails.pop(ip, None)
+    return stamps
+
+
+def _login_note_fail(ip: str, now: float) -> None:
+    stamps = _login_recent(ip, now)
+    _login_fails.pop(ip, None)                # re-insert → dict order = least recently failed first
+    _login_fails[ip] = stamps + [now]
+    while len(_login_fails) > _LOGIN_MAX_IPS:
+        _login_fails.pop(next(iter(_login_fails)))
+
+
+def _is_https(request: Request) -> bool:
+    """Whether the browser reached us over TLS — directly, or through a proxy that says
+    so. Trusting the header is safe here: a forged `https` only makes the cookie Secure,
+    which hurts nobody but the forger."""
+    proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+    return request.url.scheme == "https" or proto == "https"
+
+
 async def login_post(request: Request):
+    ip = getattr(request.client, "host", None) or "?"
+    now = time.monotonic()
+    recent = _login_recent(ip, now)
+    if len(recent) >= _LOGIN_MAX_FAILS:
+        wait = max(1, int(_LOGIN_WINDOW_S - (now - recent[0])) + 1)
+        logger.warning(f"ui: login from {ip} refused — {len(recent)} failures in "
+                       f"{_LOGIN_WINDOW_S // 60} min")
+        return HTMLResponse(_page("Login", _login_page(
+            f"Too many failed sign-ins from this address — try again in {wait} s."),
+            active="", nologin=True), status_code=429, headers={"Retry-After": str(wait)})
     f = await _form(request)
     key = (f.get("key", "") or "").strip()
     nxt = f.get("next", "/ui") or "/ui"
     admin = _resolve_admin(key)
     if not admin:
+        _login_note_fail(ip, now)
         return HTMLResponse(_page("Login", _login_page("Invalid admin key.", nxt), active="", nologin=True),
                             status_code=401)
+    _login_fails.pop(ip, None)
     resp = RedirectResponse(nxt if nxt.startswith("/ui") else "/ui", status_code=303)
-    resp.set_cookie(_SESSION_COOKIE, _make_session(admin),
-                    max_age=_SESSION_TTL, httponly=True, samesite="strict", path="/")
+    resp.set_cookie(_SESSION_COOKIE, _make_session(admin), max_age=_SESSION_TTL,
+                    httponly=True, samesite="strict", secure=_is_https(request), path="/")
     logger.info(f"ui: admin '{admin['name']}' logged in")
     return resp
 

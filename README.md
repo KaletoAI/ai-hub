@@ -1174,7 +1174,10 @@ client-integration walkthrough.
 ## The `/ui` console
 
 A server-rendered console mounted at `/ui` (sign in with an admin key once
-locked). Tabs:
+locked). Ten failed sign-ins from one address within five minutes block the form for
+that address until the window has passed (429); behind a reverse proxy that address is
+the proxy's. Served over HTTPS (directly or with `X-Forwarded-Proto: https`), the
+session cookie is marked `Secure`. Tabs:
 
 | Tab | What |
 |---|---|

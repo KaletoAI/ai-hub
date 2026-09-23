@@ -1094,7 +1094,12 @@ counts as foreign — another service on the same IP but another port lands on t
 too, deliberately. Behind a reverse proxy the public host must arrive in `Host` or
 `X-Forwarded-Host`, or browsers without fetch metadata get 403 on every POST. Every /ui
 response carries `_UI_SEC_HEADERS` (no framing, nosniff); the cookie is
-`samesite=strict`. All values the console puts into JavaScript go through
+`samesite=strict`, and `Secure` whenever the login came in over HTTPS (`_is_https`: the
+URL scheme or `X-Forwarded-Proto: https` — never unconditionally, a plain-http LAN
+install would then loop on the login). `login_post` counts failures per client IP
+(`_login_fails`, in memory, `_LOGIN_MAX_FAILS` 10 per `_LOGIN_WINDOW_S` 300 s → 429 +
+`Retry-After` without checking the key; a good login clears the IP; `X-Forwarded-For`
+deliberately ignored, so behind a proxy the limit is shared) — `test_ui_login.py`. All values the console puts into JavaScript go through
 `data-*` attributes (`data-confirm` + `_CONFIRM_JS`) or `_js_json` — never
 `html.escape` into an inline handler (`test_ui_escaping.py`).
 
