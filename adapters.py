@@ -687,6 +687,10 @@ class _StreamNormalizer:
         self.pieces = 0                     # content-bearing deltas ≈ completion tokens
         self.meta: dict = {}                # id/model/created of the last chunk seen
         self.usage_sent = False
+        # The backend reported a failure IN the stream (OpenRouter: an `error` chunk
+        # under HTTP 200). Passed through untouched — the client's SDK raises on it —
+        # but the call is booked 502, not as a clean 200 or as the client leaving.
+        self.error = False
 
     def feed(self, chunk: bytes) -> bytes:
         self.buf += chunk
@@ -727,6 +731,8 @@ class _StreamNormalizer:
             obj = json.loads(payload)
         except Exception:
             return line + "\n"
+        if isinstance(obj, dict) and obj.get("error"):
+            self.error = True
         if not isinstance(obj, dict) or "choices" not in obj:
             return line + "\n"
         for k in ("id", "model", "created", "system_fingerprint"):
@@ -810,6 +816,84 @@ def _sse_openai_error(e: BaseException) -> bytes:
 def _sse_anthropic_error(e: BaseException) -> bytes:
     return ("event: error\ndata: " + json.dumps({"type": "error", "error": {
         "type": "api_error", "message": _upstream_drop_msg(e)}}) + "\n\n").encode()
+
+
+class _StreamEnd:
+    """Ends a streamed dispatch exactly ONCE: closes the upstream response and the
+    client context, then releases the in-flight slot and writes the call-log row
+    (`release(status)`, sync). Whoever gets there first wins — the body generator's
+    `finally`, a close of a body that never started, or the finalizer."""
+
+    def __init__(self, stream_cm, client_cm, release: Callable[[int], None]):
+        self._stream_cm, self._client_cm, self._release = stream_cm, client_cm, release
+        self.done = False
+
+    async def _disconnect(self) -> None:
+        try:
+            await self._stream_cm.__aexit__(None, None, None)
+        finally:
+            await self._client_cm.__aexit__(None, None, None)
+
+    async def __call__(self, status: int) -> None:
+        if self.done:
+            return
+        self.done = True
+        try:
+            await self._disconnect()
+        finally:
+            self._release(status)
+
+    def now(self, status: int) -> None:
+        """From a finalizer, where nothing can be awaited: slot + row right away, the
+        connection closed by a task (if a loop still runs to take one)."""
+        if self.done:
+            return
+        self.done = True
+        try:
+            self._release(status)
+        finally:
+            try:
+                asyncio.get_running_loop().create_task(self._disconnect())
+            except RuntimeError:
+                pass
+
+
+class _StreamBody:
+    """The body iterator of a streamed dispatch — an async generator wrapped so its
+    cleanup does not depend on the generator having STARTED.
+
+    The upstream stream is open and the in-flight slot claimed BEFORE the adapter
+    answers, and the generator's `finally` releases them. But a generator that never
+    ran its first step runs no `finally`: `aclose()` on it is a no-op. Both bridges
+    (Messages, Responses) yield their own opening events before they read from here,
+    so a client that left in that window — Claude Code's Esc after a long park —
+    leaked the slot for good, lost the pooled connection and wrote no 499 row. Here
+    `aclose()` ends the call itself in that case, and so does the finalizer when the
+    consumer is dropped without ever running (no `aclose()` at all); a STARTED
+    generator is left to its own `finally` and asyncio's async-generator finalizer."""
+
+    def __init__(self, agen, end: _StreamEnd):
+        self._agen, self._end, self._started = agen, end, False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        self._started = True
+        return await self._agen.__anext__()
+
+    async def aclose(self) -> None:
+        try:
+            await self._agen.aclose()          # a started generator ends itself here
+        finally:
+            await self._end(499)               # no-op unless it never started
+
+    def __del__(self):
+        if not self._started and not self._end.done:
+            try:
+                self._end.now(499)
+            except Exception:
+                pass
 
 
 @dataclass
@@ -1231,6 +1315,15 @@ class OpenAIAdapter(BackendAdapter):
                             media_type=resp.headers.get("content-type"),
                             headers={**call.rheaders, **_ratelimit_headers(resp.headers)})
 
+        def release(status: int) -> None:
+            self._finish(call)
+            if norm.error and status in (200, 499):   # the backend failed, in-band
+                status = 502
+            in_tok, out_tok = norm.tokens()
+            self._record_end(req, call, status, in_tok, out_tok,
+                             cache=(norm.cache_read, norm.cache_write))
+        end = _StreamEnd(stream_cm, client_cm, release)
+
         async def generate():
             status = resp.status_code
             try:
@@ -1248,16 +1341,10 @@ class OpenAIAdapter(BackendAdapter):
                 logger.warning(f"✗ [{self.name}] {_upstream_drop_msg(e)} (mid-stream)")
                 yield _sse_openai_error(e)
             finally:
-                try:
-                    await stream_cm.__aexit__(None, None, None)
-                    await client_cm.__aexit__(None, None, None)
-                finally:
-                    self._finish(call)
-                    in_tok, out_tok = norm.tokens()
-                    self._record_end(req, call, status, in_tok, out_tok,
-                                     cache=(norm.cache_read, norm.cache_write))
+                await end(status)
 
-        return StreamingResponse(generate(), media_type="text/event-stream", headers=call.rheaders)
+        return StreamingResponse(_StreamBody(generate(), end), media_type="text/event-stream",
+                                 headers=call.rheaders)
 
     async def _dispatch_once(self, req: NormalizedRequest, call: _Call) -> Response:
         try:
@@ -1440,7 +1527,7 @@ class AnthropicAdapter(OpenAIAdapter):
                             media_type=resp.headers.get("content-type"),
                             headers={**call.rheaders, **_ratelimit_headers(resp.headers)})
 
-        counted = {"in": 0, "out": 0, "read": 0, "write": 0, "text": []}
+        counted = {"in": 0, "out": 0, "read": 0, "write": 0, "text": [], "error": False}
 
         def sniff(raw: str) -> None:
             """Read usage + text off the passing events (stats only). The cache
@@ -1455,6 +1542,8 @@ class AnthropicAdapter(OpenAIAdapter):
                     continue
                 if not isinstance(obj, dict):
                     continue
+                if obj.get("type") == "error":      # Anthropic's in-band failure event
+                    counted["error"] = True
                 u = obj.get("usage") or (obj.get("message") or {}).get("usage") or {}
                 if u:
                     counted["in"] = max(counted["in"], self._usage_of({"usage": u})[0])
@@ -1465,6 +1554,15 @@ class AnthropicAdapter(OpenAIAdapter):
                 d = obj.get("delta") or {}
                 if d.get("type") == "text_delta" and d.get("text"):
                     counted["text"].append(d["text"])
+
+        def release(status: int) -> None:
+            self._finish(call)
+            if counted["error"] and status in (200, 499):   # the backend failed, in-band
+                status = 502
+            self._record_end(req, call, status, counted["in"], counted["out"],
+                             response_text="".join(counted["text"]) or None,
+                             cache=(counted["read"], counted["write"]))
+        end = _StreamEnd(stream_cm, client_cm, release)
 
         async def generate():
             buf = ""
@@ -1486,16 +1584,10 @@ class AnthropicAdapter(OpenAIAdapter):
                 logger.warning(f"✗ [{self.name}] {_upstream_drop_msg(e)} (mid-stream)")
                 yield (b"\n\n" if buf else b"") + _sse_anthropic_error(e)
             finally:
-                try:
-                    await stream_cm.__aexit__(None, None, None)
-                    await client_cm.__aexit__(None, None, None)
-                finally:
-                    self._finish(call)
-                    self._record_end(req, call, status, counted["in"], counted["out"],
-                                     response_text="".join(counted["text"]) or None,
-                                     cache=(counted["read"], counted["write"]))
+                await end(status)
 
-        return StreamingResponse(generate(), media_type="text/event-stream", headers=call.rheaders)
+        return StreamingResponse(_StreamBody(generate(), end), media_type="text/event-stream",
+                                 headers=call.rheaders)
 
 
 # ── ComfyUI adapter ───────────────────────────────────────────────────────────

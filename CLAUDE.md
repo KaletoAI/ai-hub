@@ -1483,7 +1483,19 @@ does NOT end normally is recorded too, from the generator's `finally`
 499 when the client left (Esc in Claude Code — Starlette closes or cancels the body
 iterator), 502 when the upstream dropped mid-answer, with the tokens counted so far.
 Before, `_record` sat after the `finally` and such calls never reached the log — nor
-the month-cost quota, which sums `cost_usd` over every row.
+the month-cost quota, which sums `cost_usd` over every row. The body iterator is an
+`adapters._StreamBody`, not the bare generator: an async generator that never STARTED
+runs no `finally`, and both bridges yield their own opening event before they read from
+the adapter — so a client gone in that window (Esc after a long park; with ASGI 2.4 the
+first `send` fails) used to leak the in-flight slot for good, lose the pooled connection
+and write no row. `_StreamBody.aclose()` ends such a call itself (499), its finalizer does
+the same for a consumer dropped without any close, and `_StreamEnd` makes the end
+happen exactly once whoever gets there first. A backend's OWN in-band failure
+(OpenRouter's `data: {"error": …}` under HTTP 200, Anthropic's `event: error`) is seen
+by the normalizer/sniffer and books 502 — not 200 when it passed through, not 499 when
+a bridge stopped on it and closed the source; the Responses bridge fails on any in-band
+`error`, including OpenRouter's shape that still carries `choices` with
+`finish_reason: "error"` (it used to complete around the truncated text).
 
 ## Conventions
 

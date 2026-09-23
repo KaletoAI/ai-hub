@@ -298,7 +298,11 @@ async def responses_stream(chat_resp, raw_body: dict, alias: str):
                 if not isinstance(obj, dict):
                     continue
                 err = obj.get("error")
-                if err and not obj.get("choices"):
+                # Any in-band error ends it — also one that still carries `choices`:
+                # OpenRouter's mid-stream failure is exactly that shape (an empty delta
+                # with finish_reason "error"), which used to count as a clean finish
+                # and close as `response.completed` around the truncated text.
+                if err:
                     msg = err.get("message") if isinstance(err, dict) else err
                     raise _UpstreamStreamError(str(msg or err))
                 if obj.get("model"):
