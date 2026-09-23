@@ -5153,6 +5153,7 @@ def _voice_status(kind: str, msg: str) -> str:
 
 
 _voice_upload_prog: dict = {}   # user → {name, steps: [(kind, text)], done, ok} — live upload progress
+_ui_tasks: set = set()                  # background tasks a handler started, held till done
 
 
 def _vu_fragment(prog: dict) -> str:
@@ -5206,7 +5207,9 @@ async def voice_upload(request: Request):
             prog["done"] = True
             logger.info(f"ui: voice ref '{name}' uploaded (ok={prog['ok']})")
 
-    asyncio.create_task(_run())
+    t = asyncio.create_task(_run())
+    _ui_tasks.add(t)                        # held: the loop only keeps a weak reference (K20)
+    t.add_done_callback(_ui_tasks.discard)
     # Redirect to the GET view like every other voice action: _LIVE_JS polls
     # location.href, and this POST-only URL would answer a GET with 405 — the page
     # would render the first checklist and then never move again.

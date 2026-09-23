@@ -533,14 +533,29 @@ def _notify_slot_free() -> None:
             ev.set()
 
 
+_bg_refs: set = set()                    # fire-and-forget tasks, held until they finish
+
+
+def _bg(coro) -> asyncio.Task:
+    """`asyncio.create_task` for fire-and-forget work, with the reference HELD until the
+    task is done. The event loop keeps only a weak reference to a task, so an unreferenced
+    one can be garbage-collected mid-flight — the after-job VRAM free silently never
+    happening, or a restart whose `finally` never clears `_comfy_restarting`, after which
+    that backend can never be restarted again (K20)."""
+    t = asyncio.create_task(coro)
+    _bg_refs.add(t)
+    t.add_done_callback(_bg_refs.discard)
+    return t
+
+
 _comfy_restarting: set[str] = set()      # backend ids with a restart() in flight
 
 
 def _spawn_comfy_restart(backend: dict, adapter, why: str) -> None:
     bid = backend_id(backend)
-    _comfy_restarting.add(bid)
     logger.warning(f"[{backend['name']}] restarting ComfyUI service ({why})")
     _note_fault(backend, "watchdog", "restart", why)
+    _comfy_restarting.add(bid)               # only once nothing before the task can raise
 
     async def _run():
         try:
@@ -550,7 +565,7 @@ def _spawn_comfy_restart(backend: dict, adapter, why: str) -> None:
             _note_fault(backend, "watchdog", "restart_failed", _err_text(e))
         finally:
             _comfy_restarting.discard(bid)
-    asyncio.create_task(_run())
+    _bg(_run())
 
 
 def _maybe_auto_restart(backend: dict, adapter) -> None:
@@ -1915,11 +1930,30 @@ adapter_ctx = AdapterContext(
 
 
 def build_backend_adapters() -> None:
-    """(Re)instantiate one adapter per configured backend. Called at import and
-    after every config reload so adapters point at the current backend dicts."""
+    """(Re)bind one adapter per configured backend. Called at import, after every config
+    reload and after every backend save, so adapters point at the current backend dicts.
+
+    An adapter carries RUNTIME state — ComfyUI's restart cooldown (`last_restart`), the
+    executor watchdog's tracking, the `/object_info` slot-type cache, the prompts its jobs
+    are running (the cancel target); a cloud adapter its last credit balance. Rebuilding
+    them all on every save threw that away (K19): the auto-restart cooldown reset, so a
+    stuck box could be restarted again right after any unrelated edit, and a job running on
+    the old instance could no longer be stopped through the new one. So a backend whose
+    settings did not change KEEPS its instance, and a changed one gets a new instance that
+    `adopt_state`s what still applies (see the adapters)."""
+    old = dict(backend_adapters)
     backend_adapters.clear()
     for b in backends:
-        backend_adapters[backend_id(b)] = make_adapter(b, adapter_ctx)
+        bid = backend_id(b)
+        prev = old.get(bid)
+        if prev is not None and prev.backend == b:
+            prev.backend = b                 # same settings, the current dict object
+            backend_adapters[bid] = prev
+            continue
+        ad = make_adapter(b, adapter_ctx)
+        if prev is not None:
+            ad.adopt_state(prev)
+        backend_adapters[bid] = ad
 
 
 build_backend_adapters()
@@ -2737,7 +2771,7 @@ def _force_filter(routes: list, force: str) -> list:
     return [r for r in routes if r[0].get("name") == force] if force else routes
 
 
-def _entry_can_use(entry: dict, backend: dict) -> bool:
+def _entry_can_use(entry: dict, backend: dict, memo: Optional[dict] = None) -> bool:
     """May this waiting generation job run on `backend` right now? Mirrors the filters
     the job applies in its own poll: its own `exclude` list, the force pin, LoRA
     eligibility, and the alias actually routing to this backend while it is free.
@@ -2748,6 +2782,10 @@ def _entry_can_use(entry: dict, backend: dict) -> bool:
     designated for a backend it will never claim and, once overdue, hold that idle
     backend against every other waiter until its own park deadline.
 
+    `memo` ({alias: ready backend ids}) is shared by one designation pass: `_gen_routes`
+    reads and JSON-parses the alias's candidates — workflow JSON included — from the
+    store, and a pass asks this for every waiter × every free backend (P11).
+
     Blocking (store read via _gen_routes) — call via asyncio.to_thread from async code."""
     if backend.get("name") in (entry.get("exclude") or ()):
         return False
@@ -2755,9 +2793,12 @@ def _entry_can_use(entry: dict, backend: dict) -> bool:
         return False
     if entry.get("eligible") is not None and backend.get("name") not in entry["eligible"]:
         return False
-    ready, _allc = _gen_routes(entry["alias"])
-    bid = backend_id(backend)
-    return any(backend_id(b) == bid for b, _cand in ready)
+    memo = {} if memo is None else memo
+    ids = memo.get(entry["alias"])
+    if ids is None:
+        ready, _allc = _gen_routes(entry["alias"])
+        ids = memo[entry["alias"]] = {backend_id(b) for b, _cand in ready}
+    return backend_id(backend) in ids
 
 
 def _gen_waiting_pool() -> list:
@@ -2768,7 +2809,8 @@ def _gen_waiting_pool() -> list:
     return [e for e in _gen_waiting if not e.get("claimed")]
 
 
-def _designated_gen_waiter(backend: dict, pool: list, now: Optional[float] = None):
+def _designated_gen_waiter(backend: dict, pool: list, now: Optional[float] = None,
+                           memo: Optional[dict] = None):
     """The queued generation job this free backend belongs to, or None.
 
     Media twin of _designated_waiter (spec 2026-09-01, "Designated taker"): overdue
@@ -2776,22 +2818,23 @@ def _designated_gen_waiter(backend: dict, pool: list, now: Optional[float] = Non
     one workflow, i.e. the model set already in VRAM — else the oldest job it can
     serve. THE one place the media designation is computed, so the poll gate and the
     fresh-arrival gate cannot drift apart. Blocking — via asyncio.to_thread."""
+    memo = {} if memo is None else memo          # one store read per alias, not per waiter
     return scheduler.designated_taker(
         pool,
-        can_serve=lambda e: _entry_can_use(e, backend),
+        can_serve=lambda e: _entry_can_use(e, backend, memo),
         type_key=lambda e: e["alias"],
         last_key=backend_last_key.get(backend_id(backend)),
         now=time.monotonic() if now is None else now,
         max_wait_s=affinity_max_wait_s)
 
 
-def _may_claim_gen(entry: dict, backend: dict) -> bool:
+def _may_claim_gen(entry: dict, backend: dict, memo: Optional[dict] = None) -> bool:
     """Is this free backend THIS waiting job's to claim? A lone waiter always passes.
     Blocking — via asyncio.to_thread."""
     pool = _gen_waiting_pool()
     if len(pool) <= 1:                       # only us waiting → nothing to yield to
         return True
-    return _designated_gen_waiter(backend, pool) is entry
+    return _designated_gen_waiter(backend, pool, memo=memo) is entry
 
 
 def _designated_gen_index(entry: dict, ready: list) -> Optional[int]:
@@ -2804,8 +2847,9 @@ def _designated_gen_index(entry: dict, ready: list) -> Optional[int]:
     least one waiter proceeds while a backend is free. The chain rebuilds its `exclude`
     set once per pass, so a designation it cannot honour is released within one 2 s
     poll. Blocking — via asyncio.to_thread."""
+    memo: dict = {}                          # the routing tables cannot change within this pass
     for i, (b, _cand) in enumerate(ready):
-        if _may_claim_gen(entry, b):
+        if _may_claim_gen(entry, b, memo):
             return i
     return None
 
@@ -3040,6 +3084,43 @@ def _cloud_trace_of(req) -> dict:
     return dict(getattr(req, "cloud_trace", None) or {})
 
 
+def _billed_cloud_task(cand: dict, trace: dict, e: BaseException,
+                       prior_task: Optional[str] = None) -> Optional[str]:
+    """The vendor task a failed CLOUD attempt leaves behind — named for the job row — or
+    None when repeating the attempt (self-retry, next candidate) cannot buy anything twice.
+
+    The failover arm exists for faults that happen BEFORE work starts (a refused connect,
+    a full vendor queue, no credits). A cloud candidate also raises failover-class errors
+    AFTER its paid task was created: `_poll` gives up on a vendor unreachable past
+    `disconnect_grace` (ConnectionError) or on `max_wait` (TimeoutError, whose own text
+    says the task is "still running"), and a create POST whose ANSWER was lost (read
+    timeout, dropped connection) may well have created the task. Every one of those used to
+    re-create the task on the next attempt and pay for it again (review 2026-09-18, K1).
+
+    `prior_task` is the task id the request carried before this attempt (the chain reuses
+    one request across self-retries): a task from an EARLIER attempt that the vendor failed
+    unbilled must not make a later, never-created attempt look billed.
+    `CloudTaskRetryable` stays retryable — `_poll` raises it only for a vendor-side fault
+    that consumed no credits, which is the one case a re-run is meant for."""
+    if not adapters.cloud_kind(cand) or isinstance(e, adapters.CloudTaskRetryable):
+        return None
+    vendor = adapters.cloud_module(adapters.cloud_kind(cand)).VENDOR
+    tid = trace.get("cloud_task_id")
+    if tid and tid != prior_task:
+        return f"{vendor} task {tid}"
+    if trace.get("create_unconfirmed"):
+        return (f"a {vendor} {trace.get('endpoint') or ''} task (the create request was sent "
+                f"but its answer was lost)").replace("  ", " ")
+    return None
+
+
+def _billed_final_msg(e: BaseException, billed: str) -> str:
+    """The job-row error for a cloud failure that must not be repeated (_billed_cloud_task)."""
+    return (f"{_fault_label(e)}: {_err_text(e)} — {billed} may still be running (and "
+            f"billing) at the vendor; not re-created on another attempt, which would pay "
+            f"for it twice")
+
+
 def _gen_fail_meta(attempts: int, cloud_trace: dict) -> Optional[dict]:
     """The meta a failed generation job carries: the retry count (kept visible, runbook B)
     plus whatever a cloud candidate had already created. The cloud keys are the SAME ones
@@ -3049,6 +3130,19 @@ def _gen_fail_meta(attempts: int, cloud_trace: dict) -> Optional[dict]:
     if attempts > 1:
         meta["attempts"] = attempts
     return meta or None
+
+
+def _note_cancelled_trace(job_id: str, attempts: int, trace: dict) -> None:
+    """Put a cancelled job's cloud trace on its row (F1): the vendor finishes and bills a
+    created task whatever the gateway does, and a cancelled row without the task id leaves
+    no way to find it. Nothing to write → nothing written; merged, never a status change
+    (cancel_generation owns that). Synchronous — called from a CancelledError handler."""
+    if not trace:
+        return
+    try:
+        jobs.merge_meta(job_id, _gen_fail_meta(attempts, trace) or {})
+    except Exception as e:                      # a cancel must never turn into a crash
+        logger.warning(f"job {job_id}: could not record the cancelled cloud task: {e}")
 
 
 # bid → deque[(ts, conn_fail)] of the last generate() attempts. In-memory on
@@ -3338,7 +3432,8 @@ async def _unload_host_llms(backend: dict) -> None:
                 pass
 
 
-async def _run_job(job_id: str, alias: str, candidates: list, build_req) -> None:
+async def _run_job(job_id: str, alias: str, candidates: list, build_req,
+                   state: Optional[dict] = None) -> bool:
     """Run a generation job, failing over to the next candidate on connection-type
     errors. A backend with `self_retries: n` gets n extra attempts on ITSELF first
     (runbook B: for sporadic driver faults the same host is the cheapest second
@@ -3347,38 +3442,59 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req) -> None
     An execution error (the backend ran the prompt and it blew up) moves to the next
     candidate too, but never repeats on the SAME backend — see the `except Exception`
     arm for why that is not the same thing as a connection failover, and why a CLOUD
-    candidate is excluded from it. Stops at the first success."""
-    await asyncio.to_thread(jobs.set_status, job_id, "running")
-    last = None
-    attempts = 0
+    candidate is excluded from it. Stops at the first success.
+
+    A candidate is CLAIMED only if it is not busy at that very moment — the busy check
+    and `_inflight_inc` run with no await between them (the dispatch invariant). The list
+    was computed before several awaits (job creation, the designation lookup) and a
+    failover target was never checked at all, so either could push a backend past its
+    `max_concurrent` (K5). A busy candidate is skipped; if nothing ran to an end and some
+    candidate was skipped as busy, this returns False and the caller parks the job again,
+    passing `state` back in so attempts, the backends already tried and the execution
+    faults carry over. True = the job row holds its outcome (or the job was cancelled)."""
+    st = state if state is not None else {}
+    last = st.get("last")
+    attempts = st.get("attempts", 0)
+    tried: set = st.setdefault("tried", set())      # bids that ran — never claimed twice
+    busy_skipped = False
     # (bid, name, error) of candidates that ran the prompt and failed. Kept until the
     # job ends because a fault only counts as the BACKEND's once a later candidate has
     # succeeded — until then it is indistinguishable from a broken request.
-    exec_faults: list = []
+    exec_faults: list = st.setdefault("exec_faults", [])
     # What a CLOUD candidate had already created when it failed (task id, endpoint, the
     # request summary). A failed run returns no GenOutput, so these facts reach the job row
     # only from here — and they are the ones a cloud failure is diagnosed with: without
     # them the task id survives only inside the error TEXT and everything else not at all
     # (measured 2026-09-03, job 9cf448115b4b). Last writer wins: the candidate the job
     # actually died on is the one worth describing.
-    cloud_trace: dict = {}
+    cloud_trace: dict = st.get("cloud_trace") or {}
     for backend, cand in candidates:
         bid = backend_id(backend)
         adapter = backend_adapters.get(bid)
-        if adapter is None:
+        if adapter is None or bid in tried:
             continue
         try:
             tries = 1 + max(0, int(backend.get("self_retries") or 0))
         except (TypeError, ValueError):
             tries = 1                          # malformed config value → no self-retry
+        if backend_busy(backend):              # checked HERE, right before the claim (K5)
+            busy_skipped = True
+            continue
         _inflight_inc(bid)                     # hold ONE slot across all self-retries
-        # The job row was stamped with the FIRST candidate at creation; re-point it at
-        # the backend actually claiming it. A parked job routinely lands somewhere else
-        # (a different backend freed first, or one came back while it waited), and a row
-        # naming the wrong backend sends you reading the wrong ComfyUI's log. Same
-        # reason the chain re-points at claim and hand-off.
-        await asyncio.to_thread(jobs.set_backend, job_id, backend["name"])
+        tried.add(bid)
+        # `try` right after the claim: an await between inc and try leaked the slot for
+        # good when the job was cancelled in it (K4).
         try:
+            if not st.get("running"):
+                if not await asyncio.to_thread(jobs.set_status, job_id, "running"):
+                    return True                # cancelled while it waited — never start it
+                st["running"] = True
+            # The job row was stamped with the FIRST candidate at creation; re-point it at
+            # the backend actually claiming it. A parked job routinely lands somewhere else
+            # (a different backend freed first, or one came back while it waited), and a
+            # row naming the wrong backend sends you reading the wrong ComfyUI's log. Same
+            # reason the chain re-points at claim and hand-off.
+            await asyncio.to_thread(jobs.set_backend, job_id, backend["name"])
             for attempt in range(1, tries + 1):
                 attempts += 1
                 req = None                             # so a build_req failure cannot leave
@@ -3403,8 +3519,8 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req) -> None
                         logger.info(f"✓ job {job_id} done on [{backend['name']}] — "
                                     f"{len(out.blobs)} artifact(s)"
                                     + (f" after {attempts} attempts" if attempts > 1 else ""))
-                    asyncio.create_task(_free_comfy_vram(backend, "job done"))
-                    return
+                    _bg(_free_comfy_vram(backend, "job done"))
+                    return True
                 except _GEN_FAILOVER_ERRORS as e:
                     _record_gen_attempt(bid, conn_fail=True)
                     last = e
@@ -3415,6 +3531,15 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req) -> None
                     # Recorded on EVERY attempt: a self-retry that then succeeds leaves a
                     # clean `done` row, and the crash that forced it is only visible here.
                     _note_fault(backend, "job", _gen_fault_kind(e), f"{alias}: {what}: {_err_text(e)}")
+                    billed = _billed_cloud_task(cand, _cloud_trace_of(req), e)
+                    if billed:
+                        # A paid task exists (or may): neither a self-retry nor the next
+                        # candidate may create another one — see _billed_cloud_task.
+                        logger.warning(f"✗ job {job_id} [{backend['name']}] {what} after "
+                                       f"{billed} was created — final, not re-run")
+                        await asyncio.to_thread(jobs.fail, job_id, _billed_final_msg(e, billed),
+                                                _gen_fail_meta(attempts, cloud_trace))
+                        return True
                     if attempt < tries:
                         logger.warning(f"✗ job {job_id} [{backend['name']}] {what} "
                                        f"({type(e).__name__}: {e}) — retrying same backend "
@@ -3423,7 +3548,16 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req) -> None
                         continue
                     logger.warning(f"✗ job {job_id} [{backend['name']}] {what} "
                                    f"({type(e).__name__}: {e}) — failing over")
-                    asyncio.create_task(_free_comfy_vram(backend, "job failover"))
+                    _bg(_free_comfy_vram(backend, "job failover"))
+                except adapters.ComfyPromptInterrupted as e:
+                    # Somebody stopped OUR prompt on the backend (an operator in ComfyUI's
+                    # own UI). A decision, not a fault: no failover — that would run what was
+                    # just stopped — and no execution fault, which could quarantine a
+                    # healthy backend for 15 minutes.
+                    logger.warning(f"✗ job {job_id} [{backend['name']}] {_err_text(e)}")
+                    await asyncio.to_thread(jobs.fail, job_id, _err_text(e),
+                                            _gen_fail_meta(attempts, cloud_trace))
+                    return True
                 except Exception as e:
                     # Execution error: the backend accepted the prompt and it blew up.
                     # NEVER retried on the same backend (a re-run reproduces it), but it
@@ -3446,15 +3580,28 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req) -> None
                         logger.warning(f"✗ job {job_id} [{backend['name']}] failed: {_err_text(e)}")
                         await asyncio.to_thread(jobs.fail, job_id, _err_text(e),
                                                 _gen_fail_meta(attempts, cloud_trace))
-                        return
+                        return True
                     exec_faults.append((bid, backend["name"], e))
                     last = e
                     logger.warning(f"✗ job {job_id} [{backend['name']}] execution failed: "
                                    f"{_err_text(e)} — trying the next backend")
-                    asyncio.create_task(_free_comfy_vram(backend, "job failure"))
+                    _bg(_free_comfy_vram(backend, "job failure"))
                     break                      # next candidate; never the same backend
+                except asyncio.CancelledError:
+                    # Cancelled by the user (cancel_generation marks the row itself). The
+                    # except arms above never see a cancel — it is a BaseException — so a
+                    # cloud task that was already created and billed would leave the row
+                    # with no task id at all. Written synchronously on purpose: no await
+                    # while being cancelled.
+                    _note_cancelled_trace(job_id, attempts, _cloud_trace_of(req) or cloud_trace)
+                    raise
         finally:
             _inflight_dec(bid)
+    if busy_skipped:
+        # A candidate was taken by someone else between our pick and our claim: park
+        # again for it (the caller re-resolves) instead of reporting the job as exhausted.
+        st.update(last=last, attempts=attempts, cloud_trace=cloud_trace)
+        return False
     # Every candidate is used up. If any of them EXECUTED and failed, that error is the
     # report — "all candidate backends unreachable" would send you diagnosing a network
     # that was never involved. And no fault is charged to anyone here: when they all
@@ -3467,9 +3614,10 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req) -> None
                     f"({', '.join(n for _, n, _ in exec_faults)}), so the request is at fault")
         await asyncio.to_thread(jobs.fail, job_id, msg,
                                 _gen_fail_meta(attempts, cloud_trace))
-        return
+        return True
     await asyncio.to_thread(jobs.fail, job_id, _gen_exhausted_msg(last),
                             _gen_fail_meta(attempts, cloud_trace))
+    return True
 
 
 def _chain_mesh_param_error(s2: dict, mesh_param: str, succ_alias: str) -> Optional[str]:
@@ -3700,7 +3848,10 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
 
             backend, stage1_cand, s2, outdir = picked
             bid = backend_id(backend)
-            adapter = backend_adapters[bid]
+            adapter = backend_adapters.get(bid)
+            if adapter is None:                  # backend removed/re-saved since usable() looked
+                await asyncio.sleep(0.5)         # (K10) — the next pass re-judges it
+                continue
             # Resolve the stage-2 (successor) backend + candidate. Path relay pinned it to
             # stage 1's backend above (shared disk). Upload relay picks the successor
             # alias's best candidate — preferring stage 1's backend if it is itself one
@@ -3785,12 +3936,16 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
             s1_done = False                             # mesh in hand → stage-2 errors are final
             s1_meta = None                              # a paid stage-1 cloud task, for the job view
             s2_info = None                              # what stage 2 was actually handed (job view)
+            s1_prior_task = None                        # see the stage-1 retry loop
             req1 = req2 = None                          # per CANDIDATE: a later stage-1 failure must
                                                         # not report the previous pass's tasks
-            await asyncio.to_thread(jobs.set_status, job_id, "running")
-            await asyncio.to_thread(jobs.set_backend, job_id, backend["name"])   # cancel targets the LIVE backend
-            await asyncio.to_thread(jobs.set_stage, job_id, "1/2")   # multi-stage progress → "running 1/2"
+            # `try` right after the claim — the row updates below are awaits, and a cancel
+            # landing in one of them leaked the slot for good when they sat before it (K4).
             try:
+                if not await asyncio.to_thread(jobs.set_status, job_id, "running"):
+                    return                              # cancelled meanwhile (finally frees the slot)
+                await asyncio.to_thread(jobs.set_backend, job_id, backend["name"])   # cancel targets the LIVE backend
+                await asyncio.to_thread(jobs.set_stage, job_id, "1/2")   # multi-stage progress → "running 1/2"
                 _apply_seconds(params, stage1_cand)     # no-op re-derive (endpoint validated it)
                 # ── Stage 1: mesh (pin the export filename; ignore its own outputs) ──
                 req1 = NormalizedRequest(
@@ -3812,9 +3967,15 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 # runbook B: retry a sporadic fault on the SAME backend first — the held
                 # slot (`held`) spans the repeats; the last attempt re-raises into the
                 # existing stage-1 failover (next candidate via `tried`).
-                s1_tries = 1 + max(0, int(backend.get("self_retries") or 0))
+                try:
+                    s1_tries = 1 + max(0, int(backend.get("self_retries") or 0))
+                except (TypeError, ValueError):
+                    s1_tries = 1                        # malformed config value → no self-retry (K15)
                 for s1_attempt in range(1, s1_tries + 1):
                     gen_attempts += 1
+                    # req1 is reused across self-retries, so its trace may already name an
+                    # earlier attempt's (unbilled, retryable) task — only a NEW one counts.
+                    s1_prior_task = req1.cloud_trace.get("cloud_task_id")
                     try:
                         t0 = time.monotonic()
                         out1 = await adapter.generate(req1)
@@ -3822,8 +3983,10 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                         _note_gen_speed(alias, bid, time.monotonic() - t0)
                         break
                     except _GEN_FAILOVER_ERRORS as e:
-                        if s1_attempt >= s1_tries:
-                            raise                # outer handler records + fails over
+                        if s1_attempt >= s1_tries or _billed_cloud_task(
+                                stage1_cand, _cloud_trace_of(req1), e, s1_prior_task):
+                            raise                # outer handler records + fails over (or, for a
+                                                 # billed cloud task, ends the chain)
                         _record_gen_attempt(bid, conn_fail=True)
                         _note_fault(backend, "job", _gen_fault_kind(e),
                                     f"{alias} (chain stage 1): {_fault_label(e)}: {_err_text(e)}")
@@ -3887,7 +4050,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                     # then claim stage 2's and upload the mesh into its input dir (released
                     # first, so no A-holds-waits-B cycle).
                     _inflight_dec(held); held = None
-                    asyncio.create_task(_free_comfy_vram(backend, "chain stage 1 done"))
+                    _bg(_free_comfy_vram(backend, "chain stage 1 done"))
                     # Stage 1 ran for minutes — the successor backend picked up front may be
                     # in a transient health dip right now. The mesh bytes are in hand and no
                     # slot is held, so waiting is free: park until it is healthy again (or
@@ -3978,8 +4141,10 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                     # are rigs the cloud built to its own conventions: tag them, never re-flip
                     # them or fail them against ComfyUI-shaped rules.
                     if chain_rig in ("generic", "mixamo"):
-                        normalize_delivery(blobs, chain_rig, stage1_cand.get("texture_format"))
-                        warnings = validate_delivery(blobs, chain_rig)   # raises → job fails clearly
+                        # PIL on textures — off the event loop (P9)
+                        await asyncio.to_thread(normalize_delivery, blobs, chain_rig,
+                                                stage1_cand.get("texture_format"))
+                        warnings = await asyncio.to_thread(validate_delivery, blobs, chain_rig)   # raises → job fails clearly
                         if warnings:
                             meta["warnings"] = warnings
                 await asyncio.to_thread(jobs.complete, job_id, blobs, meta)
@@ -3987,7 +4152,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                     route = (f"{backend['name']}→{backend2['name']}" if cross else backend["name"])
                     logger.info(f"✓ chain job {job_id} on [{route}] ({alias}→{succ_alias}) "
                                 f"— {len(blobs)} artifact(s)")
-                asyncio.create_task(_free_comfy_vram(active, "chain done"))
+                _bg(_free_comfy_vram(active, "chain done"))
                 return
             except _GEN_FAILOVER_ERRORS as e:
                 _record_gen_attempt(backend_id(active), conn_fail=True)
@@ -4000,20 +4165,33 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                                    f"{_fault_label(e)}: {_err_text(e)}")
                     await asyncio.to_thread(jobs.fail, job_id, f"chain failed: {_err_text(e)}",
                                             fail_meta())
-                    asyncio.create_task(_free_comfy_vram(active, "chain failure"))
+                    _bg(_free_comfy_vram(active, "chain failure"))
+                    return
+                billed = _billed_cloud_task(stage1_cand, _cloud_trace_of(req1), e, s1_prior_task)
+                if billed:
+                    # a paid stage-1 task exists — failing over would buy it again
+                    logger.warning(f"✗ chain job {job_id} stage 1 [{backend['name']}] "
+                                   f"{_fault_label(e)} after {billed} was created — final")
+                    await asyncio.to_thread(jobs.fail, job_id,
+                                            f"chain stage 1: {_billed_final_msg(e, billed)}",
+                                            fail_meta())
                     return
                 logger.warning(f"✗ chain job {job_id} stage 1 [{backend['name']}] {_fault_label(e)} "
                                f"({type(e).__name__}: {e}) — failing over")
                 tried.add(backend["name"])
-                asyncio.create_task(_free_comfy_vram(backend, "chain stage-1 failure"))
+                _bg(_free_comfy_vram(backend, "chain stage-1 failure"))
                 continue
             except Exception as e:
                 _note_fault(active, "job", "execution", f"{alias}→{succ_alias}: {_err_text(e)}")
                 logger.warning(f"✗ chain job {job_id} [{active['name']}] ({alias}→{succ_alias}) "
                                f"failed: {_err_text(e)}")
                 await asyncio.to_thread(jobs.fail, job_id, f"chain failed: {_err_text(e)}", fail_meta())
-                asyncio.create_task(_free_comfy_vram(active, "chain failure"))
+                _bg(_free_comfy_vram(active, "chain failure"))
                 return
+            except asyncio.CancelledError:
+                # cancelled by the user: keep a created (billed) cloud task findable (F1)
+                _note_cancelled_trace(job_id, 0, fail_meta() or {})   # carries its own attempts
+                raise
             finally:
                 if held is not None:
                     _inflight_dec(held)
@@ -4027,18 +4205,49 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
 _gen_tasks: dict = {}                       # job_id → asyncio.Task (for cancellation)
 
 
-def _spawn_gen(job_id: str, coro) -> None:
-    """Run a generation coroutine as a tracked background task so it can be cancelled."""
+def _spawn_gen(job_id: str, coro) -> asyncio.Task:
+    """Run a generation coroutine as a tracked background task so it can be cancelled.
+    The done callback is the job's last line of defence: a worker that dies of an
+    exception nobody anticipated left its row `queued`/`running` until the next process
+    restart (reconcile_orphans) — a job that looks alive, forever (K10). It is marked
+    failed with the error instead; a row that already has its outcome is untouched
+    (jobs keeps terminal states final), and a cancelled task was marked by the cancel."""
     t = asyncio.create_task(coro)
     _gen_tasks[job_id] = t
-    t.add_done_callback(lambda _: _gen_tasks.pop(job_id, None))
+
+    def _done(task: asyncio.Task) -> None:
+        if _gen_tasks.get(job_id) is task:
+            _gen_tasks.pop(job_id, None)
+        if task.cancelled() or task.exception() is None:
+            return
+        e = task.exception()
+        logger.error(f"job {job_id}: generation worker crashed: {type(e).__name__}: {_err_text(e)}",
+                     exc_info=e)
+        try:
+            jobs.fail(job_id, f"internal error: {type(e).__name__}: {_err_text(e)}")
+        except Exception as e2:                  # the store itself is what failed — nothing left to do
+            logger.error(f"job {job_id}: could not mark the crashed job failed: {e2}")
+    t.add_done_callback(_done)
+    return t
+
+
+async def _run_gen_sync(job_id: str, coro) -> None:
+    """Run a SYNC generation as a tracked task and wait for it. Sync jobs used to run
+    inline in the request handler, invisible to `_gen_tasks` — so a cancel marked the row
+    failed while the worker went on to fail over or finish (K3). `asyncio.wait` never
+    raises the task's outcome into the handler: the JOB row owns it (_job_view renders
+    it), and a client that disconnects no longer takes a running job down with it."""
+    await asyncio.wait({_spawn_gen(job_id, coro)})
 
 
 async def cancel_generation(job_id: str) -> bool:
-    """Cancel a queued/running generation job: best-effort interrupt on the backend
-    (adapter.cancel — ComfyUI /interrupt frees the GPU; a cloud task API has nothing
-    to stop, the vendor finishes and bills the task), cancel the worker task, mark the job
-    failed. Returns False if the job is already finished/unknown."""
+    """Cancel a queued/running generation job: mark it failed FIRST (the job store keeps
+    a terminal state final, so nothing the worker does afterwards can mark it done), then
+    cancel the worker task — its adapter stops its OWN ComfyUI prompt on the way out
+    (targeted: a queued job never interrupts somebody else's run; a cloud task API has
+    nothing to stop, the vendor finishes and bills the task, whose id the worker records).
+    Without a worker task in this process, `adapter.cancel(job_id)` is the targeted
+    fallback. Returns False if the job is already finished/unknown."""
     job = await asyncio.to_thread(jobs.get, job_id)
     if not job or job.get("status") not in ("queued", "running"):
         return False
@@ -4054,18 +4263,31 @@ async def cancel_generation(job_id: str) -> bool:
     b = (_gen_backend_for(job.get("backend"), cand, pool) if cand is not None
          else next((x for x in pool if x.get("name") == job.get("backend")), None))
     adapter = backend_adapters.get(backend_id(b)) if b else None
-    if adapter is not None:
-        await adapter.cancel()
+    await asyncio.to_thread(jobs.fail, job_id, "cancelled by user")
     t = _gen_tasks.get(job_id)
     if t and not t.done():
         t.cancel()
-    await asyncio.to_thread(jobs.fail, job_id, "cancelled by user")
+        # Let the worker unwind — stop its prompt, release its slot — before the free
+        # below looks at the backend: with the slot still held it would skip the free.
+        await asyncio.wait({t}, timeout=15.0)
+    elif adapter is not None:
+        await adapter.cancel(job_id)
     if b:
-        asyncio.create_task(_free_comfy_vram(b, "cancel"))     # no-op for non-ComfyUI (step 3)
+        _bg(_free_comfy_vram(b, "cancel"))     # no-op for non-ComfyUI (step 3)
     return True
 
 
-async def _run_gen_parked(job_id, alias, force, build_req, eligible: Optional[set] = None):
+async def _run_gen_now(job_id, alias, force, routes, build_req, eligible: Optional[set] = None):
+    """A job that found a free backend at request time: run it on `routes`, and if the
+    backend was claimed by someone else before this job could (_run_job returns False),
+    queue it like any parked job — with the failover bookkeeping carried over."""
+    st: dict = {}
+    if not await _run_job(job_id, alias, routes, build_req, st):
+        await _run_gen_parked(job_id, alias, force, build_req, eligible, st)
+
+
+async def _run_gen_parked(job_id, alias, force, build_req, eligible: Optional[set] = None,
+                          run_state: Optional[dict] = None):
     """Hold a generation job until a backend frees (polls backend-busy), then run it —
     so a busy backend queues instead of 503'ing (async/playground). `eligible` keeps
     the LoRA constraint through the park: the job waits for a LoRA-capable backend
@@ -4075,7 +4297,12 @@ async def _run_gen_parked(job_id, alias, force, build_req, eligible: Optional[se
     because it HAD candidates (all busy), so an empty poll is a transient health flap
     (a busy ComfyUI drops its /object_info discovery poll mid-generation and is briefly
     marked DOWN). Ride it out for `park_health_grace_s`; only if EVERY candidate stays
-    gone that long is the alias treated as having no healthy backend."""
+    gone that long is the alias treated as having no healthy backend.
+
+    `run_state` is `_run_job`'s bookkeeping across claims: a claim can be lost to a
+    faster job between the designation and the claim (_run_job then returns False), and
+    the job simply keeps parking — the backends it already ran on stay tried."""
+    run_state = run_state if run_state is not None else {}
     deadline = time.monotonic() + async_park_timeout_s
     unhealthy_since = None                       # when the candidate set first went empty (flap timer)
     # In the media queue for the whole wait, so a backend that frees can be handed to
@@ -4092,14 +4319,23 @@ async def _run_gen_parked(job_id, alias, force, build_req, eligible: Optional[se
             if eligible is not None:
                 ready = [r for r in ready if r[0].get("name") in eligible]
                 allc = [r for r in allc if r[0].get("name") in eligible]
+            tried = run_state.get("tried")
+            if tried:                            # back from a lost claim: never re-run a backend
+                ready = [r for r in ready if backend_id(r[0]) not in tried]
+                allc = [r for r in allc if backend_id(r[0]) not in tried]
+                if not allc:                     # everything has run → report how it ended
+                    await _run_job(job_id, alias, [], build_req, run_state)
+                    return
             # A free candidate is only ours if the scheduler designates it for us;
             # otherwise it belongs to another waiter and we keep parking (2 s poll).
             i = (await asyncio.to_thread(_designated_gen_index, entry, ready)) if ready else None
             if i is not None:
                 entry["claimed"] = True          # holding a slot → out of the waiting pool
                 # designated candidate first, the rest stay as the failover tail
-                await _run_job(job_id, alias, [ready[i]] + ready[:i] + ready[i + 1:], build_req)
-                return
+                if await _run_job(job_id, alias, [ready[i]] + ready[:i] + ready[i + 1:],
+                                  build_req, run_state):
+                    return
+                entry["claimed"] = False         # lost the claim race → back in the queue
             now = time.monotonic()
             if allc:                             # candidates exist but are busy → keep parking
                 unhealthy_since = None
@@ -4273,20 +4509,21 @@ async def run_generation(body: dict, request: Request,
         if mode == "async":
             _spawn_gen(job_id, runner)
             return {"job_id": job_id, "status": "queued"}
-        await runner
+        await _run_gen_sync(job_id, runner)
         return await _job_view(job_id, request)
 
     if parked:
         if mode == "async":                              # queue and hand back a job id
             _spawn_gen(job_id, _run_gen_parked(job_id, alias, force, build_req, eligible))
             return {"job_id": job_id, "status": "queued"}
-        await _run_gen_parked(job_id, alias, force, build_req, eligible)   # sync: block through the park
-        return await _job_view(job_id, request)
+        await _run_gen_sync(job_id, _run_gen_parked(job_id, alias, force, build_req, eligible))
+        return await _job_view(job_id, request)                  # sync: blocked through the park
+    runner = _run_gen_now(job_id, alias, force, routes, build_req, eligible)
     if mode == "async":
-        _spawn_gen(job_id, _run_job(job_id, alias, routes, build_req))
+        _spawn_gen(job_id, runner)
         return {"job_id": job_id, "status": "queued"}
 
-    await _run_job(job_id, alias, routes, build_req)      # sync: block until done/failed
+    await _run_gen_sync(job_id, runner)                  # sync: block until done/failed
     return await _job_view(job_id, request)
 
 
@@ -4376,6 +4613,24 @@ async def _decode_upload_files(alias: str, files: dict) -> dict:
     return out
 
 
+async def _decode_ref_images(imgs: dict) -> dict:
+    """`images: {slot: base64|data-URI|URL}` → {slot: bytes}. An EMPTY value is a slot the
+    client leaves empty (the slot's own on_empty rule applies); a value that cannot be read
+    — a 404 URL, broken base64 — is a 400 naming the slot. It used to be dropped silently,
+    so the job ran on the slot's placeholder (or its baked-in image) and came back `done`
+    with a confidently wrong result (K12)."""
+    out = {}
+    for param, val in imgs.items():
+        if val in (None, ""):
+            continue
+        data = await _decode_ref_image(val)
+        if not data:
+            raise HTTPException(400, f"`images.{param}` could not be read — expected base64, "
+                                     f"a data-URI or an http(s) URL that answers 200")
+        out[param] = data
+    return out
+
+
 @app.post("/v1/generations")
 async def generations(request: Request, authorization: Optional[str] = Header(None)):
     body = await request.json()
@@ -4386,11 +4641,7 @@ async def generations(request: Request, authorization: Optional[str] = Header(No
     uploads = None
     imgs = body.pop("images", None)
     if isinstance(imgs, dict):
-        uploads = {}
-        for param, val in imgs.items():
-            data = await _decode_ref_image(val)
-            if data:
-                uploads[param] = data
+        uploads = await _decode_ref_images(imgs)
     # Optional client files for NON-image params: {"files": {<param>: <base64|data-URI|URL>}}
     # — e.g. the mesh a shrink/rig alias works on. The gateway uploads it onto whichever
     # backend runs the job, so a client never needs a path on a backend.
@@ -4970,7 +5221,8 @@ def apply_backend_change() -> None:
     async def _discover():
         await asyncio.gather(*[refresh_backend(b, http_client) for b in enabled_backends()])
     try:
-        asyncio.get_running_loop().create_task(_discover())
+        asyncio.get_running_loop()           # outside a loop (import-time callers) → skip
+        _bg(_discover())
     except RuntimeError:
         pass
 

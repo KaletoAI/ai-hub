@@ -58,7 +58,12 @@ they need via injected callables, staying hot-reload-safe.
   `backend_pricing`, `backend_loras`, `backend_healthy`), live (`backend_inflight`,
   `_gen_tasks`, `users`/`_users_by_key`), and `backend_adapters`. `load_config()`
   rebinds config globals, `refresh_backend()` populates discovery ones, and
-  `build_backend_adapters()` (re)binds one adapter per backend.
+  `build_backend_adapters()` (re)binds one adapter per backend — keeping the INSTANCE
+  of a backend whose settings did not change and handing a changed one's runtime state
+  to its replacement (`adapter.adopt_state`: ComfyUI's restart cooldown, the running
+  jobs' prompt registry, and while the URL holds the slot-type cache and watchdog; a
+  cloud adapter's balance while url+key hold). Rebuilding everything on every save reset
+  the auto-restart cooldown and orphaned the prompts of running jobs.
 - **`adapters.py`** — the pluggable per-backend protocol seam. `BackendAdapter`
   ABC; `OpenAIAdapter` (`dispatch()` forwards chat/completions/embeddings,
   owns the in-flight counter incl. the streamed-`finally` decrement; streamed
@@ -85,7 +90,17 @@ they need via injected callables, staying hot-reload-safe.
   Backends tab (⟳ restart action). `generate()` submits a parametrised
   workflow, polls `/history` every `poll_interval` (default 1) until the backend's
   `max_wait` (default 600) — the gateway's cap on ONE generation; ComfyUI itself has
-  none — then `/interrupt`s and raises `TimeoutError`, and fetches `/view`. Both
+  none — then stops its prompt and raises `TimeoutError`, and fetches `/view`. Every
+  stop goes through `_stop_prompt`, which is TARGETED: a bare `/interrupt` stops
+  whatever executes, and a cancel or `max_wait` of a prompt still WAITING killed a
+  stranger's run (which then failed over, or was charged an execution fault). It asks
+  `/queue` first — ours running → `/interrupt {"prompt_id"}` (current ComfyUI checks the
+  id, an older one ignores it, and ours is the running one), pending → `/queue
+  {"delete":[id]}`, gone or `/queue` unreadable → nothing. `generate()` registers
+  `_prompts[job_id]` while it polls and stops its own prompt when the worker task is
+  CANCELLED; a history entry carrying `execution_interrupted` (someone stopped it on the
+  box) raises `ComfyPromptInterrupted`, which `_run_job` ends the job on — no failover,
+  no execution fault. `test_gen_cancel.py`. Both
   fields are edited in the Backends tab: a store backend replaces a same-named config
   entry WHOLESALE (`rebuild_backends`), so config.yaml cannot supply them for a
   UI-managed backend. `TimeoutError` sits in `_GEN_FAILOVER_ERRORS` so it fails over,
@@ -198,7 +213,9 @@ they need via injected callables, staying hot-reload-safe.
   an empty node still errors, never an extras-only delivery; globs WITHOUT a
   node are the whole delivery). A relative `/view` path keeps its dirs as the
   subfolder (`_view_params`).
-  `normalize_delivery` (case mode + chain level, normalize-once flagged) V-flips
+  `normalize_delivery` (case mode + chain level, normalize-once flagged; it,
+  `validate_delivery` and `_check_glb_not_dummy` are PIL work and run via
+  `asyncio.to_thread`, never on the loop) V-flips
   generic texture PNGs and — alias Output option `texture_format: jpeg` —
   transcodes them to JPEG q90 (real alpha keeps PNG; ComfyUI has no JPEG export).
   **Input isolation** (`upload_prefix` on `NormalizedRequest`, `upload_prefix_for`
@@ -230,7 +247,9 @@ they need via injected callables, staying hot-reload-safe.
   ~60 sites Meshy used to be wired into. It owns the in-flight slot (incl. the `finally`
   decrement and `slot_held` for chain stages), `generate()` (run → download every
   `state.downloads` in order → thumbnail outside the rig endpoint → the job meta),
-  `_create` (serialise ONCE, size-scaled timeout ≈ 4 s/MiB — a 93 MB body once died on
+  `_create` (serialise ONCE — to bytes, in a worker thread, like Meshy's body build: a
+  rigging body is ~93 MB of base64 and dumping it on the loop stalled every request —
+  size-scaled timeout ≈ 4 s/MiB — a 93 MB body once died on
   the 30 s client timeout with an EMPTY `str(e)`), `_poll` (a 4xx, or a 200 whose BODY
   refuses the task, is a verdict about the TASK: three IN A ROW → final; transport
   errors, 5xx and 429 are about the SERVICE and get `disconnect_grace` — a poll-rate
@@ -284,7 +303,7 @@ they need via injected callables, staying hot-reload-safe.
   `adapters.public_fields(cand)` is the ONE seam schema/playground/shims read for both
   candidate kinds, and `adapters.GEN_TYPES` (types whose adapter sets
   `serves_generation`) replaces `type == "comfyui"` in `main` wherever "generation
-  backend" is meant; the GPU-host sites (`/free`, `/interrupt` via `adapter.cancel()`,
+  backend" is meant; the GPU-host sites (`/free`, the targeted prompt stop via `adapter.cancel(job_id)`,
   restart, watchdog) stay ComfyUI — a cloud task has nothing to interrupt, Meshy
   finishes and bills it. A Meshy backend is always `paid` (it bills per task);
   discovery = `GET /openapi/v1/balance` (0 → DOWN "no credits", balance + its age and
@@ -434,7 +453,15 @@ they need via injected callables, staying hot-reload-safe.
   (`set_inputs`: prompt/params/reference images, each with `sha256`+`bytes` like a
   result entry — the job view proves WHICH bytes ran; JSON in meta, no migration)
   and `reconcile_orphans()` (startup:
-  mark interrupted `running`/`queued` as failed). Carries `owner`. Reused for
+  mark interrupted `running`/`queued` as failed). Terminal states are FINAL: every status
+  writer (`set_status`, `set_stage`, `fail`, `complete`, `complete_json`) is conditioned
+  on the row still being queued/running, so the first terminal write wins — a worker
+  finishing after a cancel can neither mark the job `done` nor resurrect it to `running`
+  (`set_status` returns False then, and the worker stops), and `complete()` of a row that
+  is no longer live writes no artifact directory. `merge_meta` is the one writer that
+  reaches a terminal row (facts, never status). `prune_once` removes FINISHED jobs only —
+  a short client `ttl_s` used to delete a running job under its worker.
+  `test_jobs_lifecycle.py`. Carries `owner`. Reused for
   **background Responses** jobs (task type `response`, result via `complete_json`).
 - **`store.py`** — writable SQLite store, the console's source of truth: backends,
   chat aliases, generation aliases (+ workflow_json/mapping/fixed), users (api keys
@@ -838,9 +865,13 @@ they need via injected callables, staying hot-reload-safe.
   to enabled+healthy generation backends of the candidate's own kind
   (`adapters.cand_kind` == `adapters.backend_kind`); LoRA-aware preference +
   busy→park; a
-  `jobs.py` job runs via `adapter.generate()` (sync inline or async job-id). A
-  running job can be cancelled (`cancel_generation` → ComfyUI `/interrupt` + task
-  cancel).
+  `jobs.py` job runs via `adapter.generate()` — ALWAYS as a tracked task in
+  `_gen_tasks` (`_spawn_gen`); a sync request just waits for it (`_run_gen_sync`,
+  `asyncio.wait`, so the job row owns the outcome). A queued/running job can be cancelled:
+  `cancel_generation` marks the row failed FIRST (terminal states are final in `jobs.py`),
+  then cancels the worker task, whose adapter stops its OWN prompt (`_stop_prompt`) and
+  whose CancelledError arm records a created cloud task on the row; `adapter.cancel(job_id)`
+  is the targeted fallback when no worker task exists.
 - **Workflow chains** (`_run_chain`): a gen alias's stage-1 config carries a
   `successor` (`{alias, export_node, mesh_param, relay?, keep_from_mesh?, rig?}`);
   stage 1 exports a mesh under a gateway-pinned filename (`gwchain_<jobid>`) and
@@ -947,6 +978,15 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   the Backends tab and the Dashboard panel (`admin._loaded_text`). `test_current_model.py`.
 - **Concurrency/busy** (`backend_inflight`, `backend_busy`): incremented in
   `dispatch()`/`generate()`, decremented on completion incl. the streamed `finally`.
+  A generation job claims in `_run_job` with the busy check right before
+  `_inflight_inc` (no await between) and the `try` that releases the slot right after
+  it — the candidate list is computed several awaits earlier and a failover target was
+  never checked, so both overran `max_concurrent`, and a cancel landing in an await
+  between claim and `try` leaked the slot for good. A candidate busy at claim time is
+  skipped; if that leaves the job unfinished, `_run_job` returns False and the job parks
+  again (`_run_gen_now` → `_run_gen_parked`) with its `state` — tried backends, attempts,
+  execution faults — carried over. The chain claims the same way (busy check → inc →
+  `try` → row updates).
 - **Re-routing onto a returning backend**: waiting work is never pinned to the
   backend it queued for. `refresh_backend` calls `_notify_slot_free()` on DOWN→UP
   and on a model-set change (parked calls re-evaluate); `apply_backend_change` and
@@ -1001,7 +1041,15 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   `quarantined` in `/health` + the Backends tab, which it must be: unlike the fail rates
   this one really does change routing. **A CLOUD candidate is excluded from the failover**
   — a billed task may have failed AFTER creation, and re-running the job would buy the
-  same mesh twice (the invariant `tripo.py` protects). Covered by
+  same mesh twice (the invariant `tripo.py` protects). The same holds for the
+  FAILOVER-class errors a cloud task raises after it exists (`_poll`'s ConnectionError
+  past `disconnect_grace`, its `max_wait` TimeoutError, a create POST whose answer was
+  lost — `_create` marks that `create_unconfirmed` on the trace): `main._billed_cloud_task`
+  makes them FINAL in `_run_job` AND in the chain's stage 1 — no self-retry, no next
+  candidate, the row names the task id and that it may still run at the vendor. Only
+  `CloudTaskRetryable` (vendor-side, zero credits) still retries. A cancelled job's
+  CancelledError arm writes the trace too (`jobs.merge_meta`), so a cancelled cloud row
+  still names the task the vendor bills. Covered by
   `test_gen_quarantine.py` + `test_run_job_failover.py`.
 - **Context windows**: every `/v1/models` entry carries `context_length` when known
   (`main.model_context` → `adapters.model_context_for`: the backend's `model_context`

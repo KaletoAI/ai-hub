@@ -76,6 +76,12 @@ class ComfyExecutorStuck(Exception):
     (queue_pending non-empty, queue_running empty, same head across checks)."""
 
 
+class ComfyPromptInterrupted(RuntimeError):
+    """Our prompt was interrupted ON the backend (ComfyUI's `execution_interrupted`) — a
+    deliberate stop by someone, not a fault of the backend or the request: main ends the
+    job without failing over and books no execution fault for it."""
+
+
 class CloudNoCredits(ConnectionError):
     """A cloud task account has no credits (balance 0 on discovery; Meshy 402 / Tripo
     403+2010 on submit). A ConnectionError on purpose: _GEN_FAILOVER_ERRORS moves the job
@@ -606,9 +612,15 @@ class BackendAdapter(ABC):
         Owns the in-flight counter lifecycle. Default: unsupported."""
         raise NotImplementedError(f"{self.type} adapter has no generate path")
 
-    async def cancel(self) -> None:
-        """Best-effort: stop whatever this backend is running for the gateway (a
-        cancelled job). Default no-op — a cloud task API has nothing to interrupt."""
+    async def cancel(self, job_id: str = "") -> None:
+        """Best-effort: stop what this backend runs for job `job_id` — and nothing else
+        (a cancelled job whose worker task is not in this process). Default no-op — a
+        cloud task API has nothing to interrupt."""
+        return None
+
+    def adopt_state(self, old: "BackendAdapter") -> None:
+        """Take over the runtime state of the instance this one REPLACES after the
+        backend's settings changed (main.build_backend_adapters). Default: nothing."""
         return None
 
     # ── workflow chains (main._run_chain) — the three places a stage is backend-specific ──
@@ -2226,6 +2238,15 @@ def _format_comfy_error(messages) -> str:
         return str(messages)[:600]
 
 
+def _prompt_queue_state(queue: dict, prompt_id: str) -> Optional[str]:
+    """Where `prompt_id` sits in a ComfyUI /queue response: "running", "pending" or None."""
+    for key, state in (("queue_running", "running"), ("queue_pending", "pending")):
+        for item in (queue.get(key) or []):
+            if isinstance(item, (list, tuple)) and len(item) > 1 and item[1] == prompt_id:
+                return state
+    return None
+
+
 def _prompt_in_queue(queue: dict, prompt_id: str) -> bool:
     """Is `prompt_id` still running or pending in a ComfyUI /queue response? Each entry
     is [number, prompt_id, prompt, extra, …]; the id sits at index 1."""
@@ -2565,6 +2586,7 @@ class ComfyUIAdapter(BackendAdapter):
         self.exec_stuck: bool = False
         self.last_restart: float = 0.0        # ts of the last restart() call (cooldown)
         self.last_restart_result: str = ""    # "" | running | ok | timeout | no-manager
+        self._prompts: dict = {}              # job id → the ComfyUI prompt it runs (cancel target)
 
     async def discover(self, client: httpx.AsyncClient) -> Capabilities:
         url = self.backend["url"].rstrip("/")
@@ -2602,13 +2624,57 @@ class ComfyUIAdapter(BackendAdapter):
                 f"executor stuck: {len(pending)} prompt(s) pending, none running for "
                 f"{int(time.time() - self._stuck_since)}s (head {head})")
 
-    async def cancel(self) -> None:
-        """POST /interrupt — frees the GPU of the running prompt (main.cancel_generation)."""
+    def adopt_state(self, old: BackendAdapter) -> None:
+        """Keep what a settings change does not invalidate: the restart cooldown (a stuck
+        box must not be restarted again because someone edited its form), the running
+        jobs' prompts — the SAME dict, since the old instance's generate() keeps writing
+        it — and, while the URL is unchanged, the slot-type cache and the watchdog."""
+        if not isinstance(old, ComfyUIAdapter):
+            return
+        self._prompts = old._prompts
+        self.last_restart, self.last_restart_result = old.last_restart, old.last_restart_result
+        if old.backend.get("url") == self.backend.get("url"):
+            self._node_types = old._node_types
+            self._stuck_head, self._stuck_since = old._stuck_head, old._stuck_since
+            self._stuck_checks, self.exec_stuck = old._stuck_checks, old.exec_stuck
+
+    async def cancel(self, job_id: str = "") -> None:
+        """Stop the prompt job `job_id` submitted here — only that one (_stop_prompt). A job
+        with no submitted prompt (still queued in the gateway) touches nothing. The normal
+        cancel path does not come here: main cancels the worker task, whose generate()
+        stops its own prompt on the way out; this is the fallback without such a task."""
+        pid = self._prompts.get(job_id) if job_id else None
+        if not pid:
+            return
         try:
             async with _pooled_client(self.ctx) as client:
-                await client.post(f"{self.backend['url'].rstrip('/')}/interrupt", timeout=5.0)
+                await self._stop_prompt(client, self.backend["url"].rstrip("/"), pid)
         except Exception:
             pass
+
+    async def _stop_prompt(self, client, url: str, prompt_id: str) -> str:
+        """Stop ONE prompt of ours and nothing else; returns where it was.
+
+        ComfyUI's bare `POST /interrupt` stops whatever is EXECUTING. Sent for a job whose
+        prompt was still waiting — a cancel of a queued job, a `max_wait` expiry while the
+        box ran someone else's prompt — it killed another job's run, which then failed
+        over and could even be charged an execution fault (review 2026-09-18, K3). So ask
+        /queue first: running → `/interrupt` naming the prompt (current ComfyUI interrupts
+        only a matching prompt; an older one ignores the body, and ours IS the one running);
+        pending → `/queue {"delete": [id]}`; neither, or /queue unreadable → leave the
+        backend alone (a stop we cannot aim is worse than one we skip)."""
+        try:
+            qr = await client.get(f"{url}/queue", timeout=5.0)
+            where = _prompt_queue_state(qr.json(), prompt_id) if qr.status_code == 200 else None
+            if qr.status_code != 200:
+                return "unknown"
+            if where == "running":
+                await client.post(f"{url}/interrupt", json={"prompt_id": prompt_id}, timeout=5.0)
+            elif where == "pending":
+                await client.post(f"{url}/queue", json={"delete": [prompt_id]}, timeout=5.0)
+            return where or "gone"
+        except Exception:
+            return "unknown"
 
     async def restart(self) -> str:
         """Restart the ComfyUI service via the ComfyUI-Manager reboot endpoint.
@@ -3158,14 +3224,25 @@ class ComfyUIAdapter(BackendAdapter):
                 ws_state = {"prompt_id": prompt_id, "began": time.monotonic()}
                 ws_task = asyncio.create_task(
                     self._ws_progress(url, client_id, req.job_id, ws_state))
+                if req.job_id:
+                    self._prompts[req.job_id] = prompt_id      # what a cancel may stop
                 try:
-                    outputs = await self._poll(client, url, prompt_id, poll_interval, max_wait, started)
+                    outputs = await self._poll(client, url, prompt_id, poll_interval, max_wait)
+                except asyncio.CancelledError:
+                    # The job was cancelled (main.cancel_generation cancels this task): stop
+                    # OUR prompt on the way out — targeted, see _stop_prompt — or it keeps
+                    # the GPU busy for a result nobody will fetch.
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(self._stop_prompt(client, url, prompt_id), 10.0)
+                    raise
                 finally:
                     ws_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError, Exception):
                         await ws_task
                     if req.job_id:
                         self.ctx.note_progress(req.job_id, None)   # the row owns it now
+                        if self._prompts.get(req.job_id) == prompt_id:
+                            self._prompts.pop(req.job_id, None)
                 rig, warnings = None, []
                 if req.output_cases:                 # conditional case delivery (+ rig + validation)
                     blobs, rig = await self._fetch_by_cases(client, url, outputs, req.output_cases)
@@ -3177,8 +3254,11 @@ class ComfyUIAdapter(BackendAdapter):
                         have = {b.name for b in blobs}
                         blobs += [b for b in await self._fetch_by_globs(client, url, outputs, req.output_globs)
                                   if b.name not in have]
-                    normalize_delivery(blobs, rig, req.texture_format)   # V-flip (+ optional jpeg) textures
-                    warnings = validate_delivery(blobs, rig)
+                    # PIL work on multi-MB textures: off the event loop, which every other
+                    # request and every other job's poll shares (P9)
+                    await asyncio.to_thread(normalize_delivery, blobs, rig,
+                                            req.texture_format)   # V-flip (+ optional jpeg) textures
+                    warnings = await asyncio.to_thread(validate_delivery, blobs, rig)
                 else:
                     blobs = await self._fetch_outputs(client, url, wf, outputs, req.output_node,
                                                       req.output_ext, req.output_globs)
@@ -3190,8 +3270,8 @@ class ComfyUIAdapter(BackendAdapter):
                         raise RuntimeError(f"configured output node {req.output_node} produced "
                                            f"no fetchable artifact{extra} (no matching file in its outputs)")
                     if req.dummy_check:          # 2x2-dummy safety net (case mode does it in validate);
-                        _check_glb_not_dummy(blobs)  # opt-out for legit 1x1/2x2 constant-colour exports
-                    warnings = validate_delivery(blobs, None)   # rig-less: the >30 MB size guideline
+                        await asyncio.to_thread(_check_glb_not_dummy, blobs)   # opt-out: legit 1x1/2x2 exports
+                    warnings = await asyncio.to_thread(validate_delivery, blobs, None)   # rig-less: >30 MB guideline
         finally:
             if not req.slot_held:
                 self.ctx.inflight_dec(self.bid)
@@ -3312,7 +3392,7 @@ class ComfyUIAdapter(BackendAdapter):
                 out["eta_s"] = max(0, int(per_step * (mx - val)))
         return out
 
-    async def _poll(self, client, url, prompt_id, poll_interval, max_wait, started) -> dict:
+    async def _poll(self, client, url, prompt_id, poll_interval, max_wait) -> dict:
         # If /history stops responding *after* the run was reachable for a while,
         # ComfyUI most likely crashed ("Reconnecting"). Fail fast with a clear
         # ConnectionError (→ the router can fail over) instead of waiting out the
@@ -3340,7 +3420,12 @@ class ComfyUIAdapter(BackendAdapter):
                     entry = hist[prompt_id]
                     status = entry.get("status", {})
                     if status.get("status_str") == "error":
-                        raise RuntimeError(f"ComfyUI: {_format_comfy_error(status.get('messages'))}")
+                        msgs = status.get("messages") or []
+                        if any(isinstance(m, (list, tuple)) and m and m[0] == "execution_interrupted"
+                               for m in msgs):
+                            raise ComfyPromptInterrupted(
+                                f"ComfyUI: prompt {prompt_id} was interrupted on the backend")
+                        raise RuntimeError(f"ComfyUI: {_format_comfy_error(msgs)}")
                     return entry.get("outputs", {})
                 # Not done yet. Confirm it's still queued/running — if ComfyUI restarted,
                 # the prompt is gone from BOTH history and queue, yet /history keeps
@@ -3376,10 +3461,9 @@ class ComfyUIAdapter(BackendAdapter):
                         f"ComfyUI unreachable for >{grace:.0f}s during execution "
                         f"(likely crashed/restarting): {type(e).__name__}: {e}")
                 continue
-        try:                                    # free the GPU: stop the still-running prompt
-            await client.post(f"{url}/interrupt")
-        except Exception:
-            pass
+        # free the GPU: stop the still-running prompt — ours only (a bare /interrupt would
+        # stop whatever runs, and a prompt still waiting behind another job's is not it)
+        await self._stop_prompt(client, url, prompt_id)
         raise TimeoutError(f"ComfyUI timeout after {max_wait:.0f}s (prompt {prompt_id}); "
                            f"last poll error: {last_exc}")
 
@@ -3599,6 +3683,13 @@ class CloudTaskAdapter(BackendAdapter):
         key = (self.backend.get("api_key") or "").strip()
         return {"Authorization": f"Bearer {key}"} if key else {}
 
+    def adopt_state(self, old: BackendAdapter) -> None:
+        """The last balance stays valid while it describes the same ACCOUNT (url + key)."""
+        if (isinstance(old, CloudTaskAdapter)
+                and old.backend.get("url") == self.backend.get("url")
+                and old.backend.get("api_key") == self.backend.get("api_key")):
+            self.credits, self.credits_at = old.credits, old.credits_at
+
     # ── vendor hooks ──────────────────────────────────────────────────────────
     async def discover(self, client: httpx.AsyncClient) -> Capabilities:
         """The balance call: models + the credits shown in /health. 0 → CloudNoCredits."""
@@ -3735,13 +3826,29 @@ class CloudTaskAdapter(BackendAdapter):
         # client timeout, and httpx's WriteTimeout has an EMPTY str() — the job died as
         # "chain failed: " with nothing after the colon. So the create gets its OWN
         # size-scaled budget (~4 s per MiB ≈ a 256 KiB/s floor) without slowing the polls.
-        raw = json.dumps(body)                  # serialised ONCE, sent as content=
-        mb = len(raw) / (1024 * 1024)           # ASCII JSON: chars == bytes
-        pr = await client.post(
-            url, content=raw,
-            headers={**self._headers(), "Content-Type": "application/json"},
-            timeout=httpx.Timeout(connect=30.0, read=max(120.0, mb * 4),
-                                  write=max(60.0, mb * 4), pool=30.0))
+        # Serialised ONCE, straight to the bytes httpx sends, and in a worker thread: a
+        # rigging body is ~93 MB of base64, and dumping it on the loop stalled every other
+        # request for a third of a second (P10).
+        raw = await asyncio.to_thread(lambda: json.dumps(body).encode())
+        mb = len(raw) / (1024 * 1024)
+        try:
+            pr = await client.post(
+                url, content=raw,
+                headers={**self._headers(), "Content-Type": "application/json"},
+                timeout=httpx.Timeout(connect=30.0, read=max(120.0, mb * 4),
+                                      write=max(60.0, mb * 4), pool=30.0))
+        except (httpx.ReadTimeout, httpx.ReadError, httpx.RemoteProtocolError):
+            # The request went out WHOLE and only the answer was lost: the vendor may well
+            # have created (and will bill) the task. The error class stays as it is —
+            # main names and fault-logs by it — but the trace says so, and main then
+            # refuses to create the task a second time (main._billed_cloud_task). A
+            # connect/write failure never reached the vendor and stays freely retryable.
+            if req is not None and role is None:
+                tr = req.cloud_trace
+                tr.setdefault("backend", self.name)
+                tr.setdefault("cloud", self.mod.KIND)
+                tr.update({"endpoint": endpoint, "create_unconfirmed": True})
+            raise
         verdict = self._classify_create(pr)
         if verdict == "nocredits":
             raise CloudNoCredits(f"{self.vendor}: {self._msg(pr)}", vendor=self.vendor)
@@ -3906,8 +4013,9 @@ class MeshyAdapter(CloudTaskAdapter):
         """One task, one delivery: Meshy answers every requested format off the same
         task, so there is nothing to chase after the poll."""
         endpoint = meshy.endpoint_of(cand)
-        body = meshy.build_request(cand, _gen_values(req), req.upload_images or {},
-                                   req.upload_files or {})            # MeshyInput → final
+        # In a thread: a rigging body base64-encodes the whole mesh (P10). MeshyInput → final.
+        body = await asyncio.to_thread(meshy.build_request, cand, _gen_values(req),
+                                       req.upload_images or {}, req.upload_files or {})
         task_id = await self._create(client, self._api(f"/{endpoint}"), body, endpoint, req)
         req.cloud_trace["meshy_task_id"] = task_id      # the name existing rows/views read
         state = await self._poll(client, endpoint, task_id, opts["target_formats"], opts,

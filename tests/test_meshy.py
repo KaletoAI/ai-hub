@@ -345,6 +345,14 @@ class TestRigging(unittest.TestCase):
         body = meshy.build_request(self.C, {}, {}, {"input_mesh_path": ("h.glb", GLB)})
         self.assertEqual(meshy.request_summary(body)["model_url"], f"<{len(GLB)} bytes>")
 
+    def test_request_summary_counts_exactly_without_decoding(self):
+        # P10: the size is computed from the base64 text (a 93 MB mesh used to be decoded
+        # on the event loop just to be measured) — it must still be EXACT for every padding.
+        for extra in range(3):
+            glb = GLB + b"\x01" * extra
+            body = meshy.build_request(self.C, {}, {}, {"input_mesh_path": ("h.glb", glb)})
+            self.assertEqual(meshy.request_summary(body)["model_url"], f"<{len(glb)} bytes>")
+
     def test_formats_restricted_to_glb_fbx(self):
         c = {"meshy": {"endpoint": "rigging", "options": {"target_formats": ["obj", "usdz"]}}}
         self.assertEqual(meshy.options_of(c)["target_formats"], ["glb"])

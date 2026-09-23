@@ -313,17 +313,27 @@ def create(task: str, alias: str, backend: str, *,
     return jid
 
 
-def set_status(job_id: str, status: str) -> None:
+# A job's terminal state is FINAL: `done`/`failed` (a cancel is a `failed`) is never
+# overwritten by a worker that learns of it late. Every status writer is conditioned on
+# the row still being live — the first terminal write wins, and a cancelled job can
+# neither be completed nor resurrected to `running` by the task that is winding down.
+_LIVE = "status IN ('queued','running')"
+
+
+def set_status(job_id: str, status: str) -> bool:
+    """Move a LIVE job to `status` (in practice queued → running). False when the row is
+    already terminal (cancelled meanwhile) or gone — the caller must not start work."""
     with _conn() as c:
-        c.execute("UPDATE jobs SET status=?, updated=? WHERE id=?",
-                  (status, int(time.time()), job_id))
+        cur = c.execute(f"UPDATE jobs SET status=?, updated=? WHERE id=? AND {_LIVE}",
+                        (status, int(time.time()), job_id))
+        return cur.rowcount > 0
 
 
 def set_stage(job_id: str, stage: Optional[str]) -> None:
     """Set a job's sub-stage label (e.g. "1/2" for a multi-stage chain), shown next
     to `running` in the UI. Cleared (None) when the job leaves the running state."""
     with _conn() as c:
-        c.execute("UPDATE jobs SET stage=?, updated=? WHERE id=?",
+        c.execute(f"UPDATE jobs SET stage=?, updated=? WHERE id=? AND {_LIVE}",
                   (stage, int(time.time()), job_id))
 
 
@@ -338,14 +348,32 @@ def set_backend(job_id: str, backend: str) -> None:
 def fail(job_id: str, error: str, meta: Optional[dict] = None) -> None:
     """Mark failed. Optional `meta` (e.g. {"attempts": 2} from a self-retried
     generation) is merged into meta_json — a retried-and-still-failed job must
-    show its attempt count, or retries would mask the fault rate."""
+    show its attempt count, or retries would mask the fault rate. A no-op on a job that
+    is already terminal (see _LIVE)."""
     with _conn() as c:
         sets = "status='failed', error=?, stage=NULL, updated=?"
         args: list = [str(error), int(time.time())]
         if meta:
             sets += ", meta_json=?"
             args.append(json.dumps({**_read_meta(c, job_id), **meta}))
-        c.execute(f"UPDATE jobs SET {sets} WHERE id=?", (*args, job_id))
+        c.execute(f"UPDATE jobs SET {sets} WHERE id=? AND {_LIVE}", (*args, job_id))
+
+
+def _is_live(job_id: str) -> bool:
+    with _conn() as c:
+        row = c.execute(f"SELECT 1 FROM jobs WHERE id=? AND {_LIVE}", (job_id,)).fetchone()
+    return row is not None
+
+
+def merge_meta(job_id: str, meta: dict) -> None:
+    """Merge keys into a job's meta WITHOUT touching its status — for facts that must
+    reach the row whatever state it is in (a cancelled job's already-billed cloud task:
+    cancel_generation has marked the row failed by the time the worker learns of it)."""
+    if not meta:
+        return
+    with _conn() as c:
+        c.execute("UPDATE jobs SET meta_json=? WHERE id=?",
+                  (json.dumps({**_read_meta(c, job_id), **meta}), job_id))
 
 
 def complete(job_id: str, blobs, meta: Optional[dict] = None) -> list[dict]:
@@ -353,7 +381,14 @@ def complete(job_id: str, blobs, meta: Optional[dict] = None) -> list[dict]:
     manifest (one entry per blob: n, mime, kind, filename).
 
     Re-points the job's `backend` column to where it actually ran (`meta["backend"]`)
-    — after a failover that differs from the backend recorded at create() time."""
+    — after a failover that differs from the backend recorded at create() time.
+
+    A job that is no longer live (cancelled meanwhile, or its row pruned) gets NOTHING:
+    no status change and no artifact directory, which no row would ever point to again
+    and no prune would ever remove. Returns [] then."""
+    if not _is_live(job_id):
+        logger.info(f"jobs: job {job_id} finished after it was cancelled/removed — result dropped")
+        return []
     job_dir = os.path.join(_BLOB_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
     manifest = []
@@ -393,7 +428,7 @@ def _mark_done(c, job_id: str, meta: dict, results: list) -> None:
     if meta.get("backend"):
         sets += ", backend=?"
         args.append(meta["backend"])
-    c.execute(f"UPDATE jobs SET {sets} WHERE id=?", (*args, job_id))
+    c.execute(f"UPDATE jobs SET {sets} WHERE id=? AND {_LIVE}", (*args, job_id))
 
 
 def _read_meta(c, job_id: str) -> dict:
@@ -542,11 +577,14 @@ def reconcile_orphans() -> int:
 
 
 def prune_once() -> int:
-    """Delete jobs (rows + blobs) past their ttl. Returns how many were removed."""
+    """Delete FINISHED jobs (rows + blobs) past their ttl. Returns how many were removed.
+    A queued/running job is never pruned, however short its client-chosen `ttl_s`: its
+    worker would go on to write artifacts for a row that no longer exists."""
     now = int(time.time())
     with _conn() as c:
         ids = [r["id"] for r in c.execute(
-            "SELECT id FROM jobs WHERE (created + ttl_s) < ?", (now,)).fetchall()]
+            f"SELECT id FROM jobs WHERE (created + ttl_s) < ? AND NOT ({_LIVE})",
+            (now,)).fetchall()]
     for jid in ids:
         _delete(jid)
     if ids:
