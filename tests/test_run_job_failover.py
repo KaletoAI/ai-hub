@@ -760,6 +760,32 @@ class FreeAfterJob(unittest.TestCase):
         self.assertEqual(self.frees, [])
 
 
+
+class DesignationReadsTheStoreOncePerAlias(unittest.TestCase):
+    """P11: one designation pass asked `_gen_routes` — a store read that JSON-parses the
+    alias's whole candidate list, workflow JSON included — for every waiter × every free
+    backend, every 2 s per parked job. Silent: it only shows as a sluggish gateway once
+    a queue builds up."""
+
+    def test_one_route_lookup_per_alias_per_pass(self):
+        calls = []
+        backs = [{"name": f"g{i}", "type": "comfyui"} for i in range(4)]
+
+        def routes(alias):
+            calls.append(alias)
+            return [(b, {}) for b in backs], [(b, {}) for b in backs]
+        orig, saved = main._gen_routes, main._gen_waiting[:]
+        main._gen_routes = routes
+        main._gen_waiting[:] = [{"job_id": f"j{i}", "alias": "a", "enqueued_at": float(i)}
+                                for i in range(5)]
+        try:
+            me = main._gen_waiting[-1]            # the youngest: never designated first
+            self.assertIsNone(main._designated_gen_index(me, [(b, {}) for b in backs]))
+        finally:
+            main._gen_routes = orig
+            main._gen_waiting[:] = saved
+        self.assertEqual(calls, ["a"])
+
 class _FakeHttp:
     """http_client stand-in: /free counts posts, /system_stats reports a torch pool that
     only drops once `drop_after` posts have landed (a lost notify looks like exactly that:

@@ -2709,7 +2709,7 @@ def _force_filter(routes: list, force: str) -> list:
     return [r for r in routes if r[0].get("name") == force] if force else routes
 
 
-def _entry_can_use(entry: dict, backend: dict) -> bool:
+def _entry_can_use(entry: dict, backend: dict, memo: Optional[dict] = None) -> bool:
     """May this waiting generation job run on `backend` right now? Mirrors the filters
     the job applies in its own poll: its own `exclude` list, the force pin, LoRA
     eligibility, and the alias actually routing to this backend while it is free.
@@ -2720,6 +2720,10 @@ def _entry_can_use(entry: dict, backend: dict) -> bool:
     designated for a backend it will never claim and, once overdue, hold that idle
     backend against every other waiter until its own park deadline.
 
+    `memo` ({alias: ready backend ids}) is shared by one designation pass: `_gen_routes`
+    reads and JSON-parses the alias's candidates — workflow JSON included — from the
+    store, and a pass asks this for every waiter × every free backend (P11).
+
     Blocking (store read via _gen_routes) — call via asyncio.to_thread from async code."""
     if backend.get("name") in (entry.get("exclude") or ()):
         return False
@@ -2727,9 +2731,12 @@ def _entry_can_use(entry: dict, backend: dict) -> bool:
         return False
     if entry.get("eligible") is not None and backend.get("name") not in entry["eligible"]:
         return False
-    ready, _allc = _gen_routes(entry["alias"])
-    bid = backend_id(backend)
-    return any(backend_id(b) == bid for b, _cand in ready)
+    memo = {} if memo is None else memo
+    ids = memo.get(entry["alias"])
+    if ids is None:
+        ready, _allc = _gen_routes(entry["alias"])
+        ids = memo[entry["alias"]] = {backend_id(b) for b, _cand in ready}
+    return backend_id(backend) in ids
 
 
 def _gen_waiting_pool() -> list:
@@ -2740,7 +2747,8 @@ def _gen_waiting_pool() -> list:
     return [e for e in _gen_waiting if not e.get("claimed")]
 
 
-def _designated_gen_waiter(backend: dict, pool: list, now: Optional[float] = None):
+def _designated_gen_waiter(backend: dict, pool: list, now: Optional[float] = None,
+                           memo: Optional[dict] = None):
     """The queued generation job this free backend belongs to, or None.
 
     Media twin of _designated_waiter (spec 2026-09-01, "Designated taker"): overdue
@@ -2748,22 +2756,23 @@ def _designated_gen_waiter(backend: dict, pool: list, now: Optional[float] = Non
     one workflow, i.e. the model set already in VRAM — else the oldest job it can
     serve. THE one place the media designation is computed, so the poll gate and the
     fresh-arrival gate cannot drift apart. Blocking — via asyncio.to_thread."""
+    memo = {} if memo is None else memo          # one store read per alias, not per waiter
     return scheduler.designated_taker(
         pool,
-        can_serve=lambda e: _entry_can_use(e, backend),
+        can_serve=lambda e: _entry_can_use(e, backend, memo),
         type_key=lambda e: e["alias"],
         last_key=backend_last_key.get(backend_id(backend)),
         now=time.monotonic() if now is None else now,
         max_wait_s=affinity_max_wait_s)
 
 
-def _may_claim_gen(entry: dict, backend: dict) -> bool:
+def _may_claim_gen(entry: dict, backend: dict, memo: Optional[dict] = None) -> bool:
     """Is this free backend THIS waiting job's to claim? A lone waiter always passes.
     Blocking — via asyncio.to_thread."""
     pool = _gen_waiting_pool()
     if len(pool) <= 1:                       # only us waiting → nothing to yield to
         return True
-    return _designated_gen_waiter(backend, pool) is entry
+    return _designated_gen_waiter(backend, pool, memo=memo) is entry
 
 
 def _designated_gen_index(entry: dict, ready: list) -> Optional[int]:
@@ -2776,8 +2785,9 @@ def _designated_gen_index(entry: dict, ready: list) -> Optional[int]:
     least one waiter proceeds while a backend is free. The chain rebuilds its `exclude`
     set once per pass, so a designation it cannot honour is released within one 2 s
     poll. Blocking — via asyncio.to_thread."""
+    memo: dict = {}                          # the routing tables cannot change within this pass
     for i, (b, _cand) in enumerate(ready):
-        if _may_claim_gen(entry, b):
+        if _may_claim_gen(entry, b, memo):
             return i
     return None
 
