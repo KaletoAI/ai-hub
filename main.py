@@ -1288,11 +1288,38 @@ def check_auth(authorization: Optional[str]) -> None:
     authenticate(authorization)
 
 
+# Group grants: the user editor's "all chat / all image / all backend" boxes store one of
+# these TOKENS, resolved on every request — a snapshot of today's names would silently
+# leave out every alias or backend added later.
+GRANT_ALL_CHAT, GRANT_ALL_IMAGE, GRANT_ALL_BACKENDS = "@chat", "@image", "@backends"
+
+
+def _gen_alias_exists(name: str) -> bool:
+    if name in image_models:
+        return True
+    return bool(store.is_active() and store.get(name))
+
+
+def _expand_grants(allow) -> set:
+    """The allow-list with `@chat`/`@backends` resolved against the LIVE config (`@image`
+    is checked per model by _model_allowed / listed by /v1/models — resolving it here
+    would read the whole generation store on every request)."""
+    out = set(allow)
+    if GRANT_ALL_CHAT in out:
+        out |= set(virtual_models)
+    if GRANT_ALL_BACKENDS in out:
+        out |= {b["name"] for b in backends if b.get("name") and not _is_gen(b)}
+    return out
+
+
 def _model_allowed(user: dict, model: Optional[str]) -> bool:
-    allow = user.get("models") or []
-    if not allow or not model:
+    raw = user.get("models") or []
+    if not raw or not model:
         return True                              # empty allow-list = all models
+    allow = _expand_grants(raw)
     if model in allow:                           # exact id / chat alias / image alias
+        return True
+    if GRANT_ALL_IMAGE in allow and _gen_alias_exists(model):
         return True
     bname, bare = split_backend_prefix(model)    # backend/model
     if bname and bname in allow:                 # whole-backend grant (prefixed request)
@@ -2523,7 +2550,7 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
     user = authenticate(authorization)
     # Per-user allow-list FILTERS the catalog (empty = all). Entries may be a model id,
     # a chat/image alias, or a backend name (grants all of that backend's models).
-    allow = (user.get("models") if user else None) or []
+    allow = _expand_grants((user.get("models") if user else None) or [])
     typ = (request.query_params.get("type") or "").lower()    # ""=both, "chat", "image"
     now = int(time.time())
     seen: set[str] = set()
@@ -2578,7 +2605,7 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
         img_aliases = (list((await asyncio.to_thread(store.list_aliases)).keys())
                        if store.is_active() else list(image_models.keys()))
         for alias in img_aliases:
-            if alias not in seen and visible({alias}):
+            if alias not in seen and visible({alias, GRANT_ALL_IMAGE}):
                 seen.add(alias)
                 data.append({"id": alias, "object": "model", "created": now, "owned_by": "ai-hub (image)"})
 

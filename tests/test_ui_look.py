@@ -371,5 +371,40 @@ class ConsoleScripts(unittest.TestCase):
         self.assertIn("data-grp-all", src)
 
 
+class FieldRows(unittest.TestCase):
+    """Reported 2026-09-23 after the review deploy: the Users API-key input shrank to
+    82 px behind its Generate/Copy buttons, every hint row was cut off on the right, and
+    the Server tab's scan ports list did not fit its field — each only at a window a bit
+    narrower than the one the layout was checked in."""
+
+    def test_an_input_keeps_its_width_and_its_buttons_wrap(self):
+        self.assertRegex(admin._CSS, r"\.field>\.control\{[^}]*flex-wrap:wrap")
+        self.assertRegex(admin._CSS, r"\.field>\.control>input:not\(\[type=checkbox\]\)[^{]*\{flex:1 1 220px")
+
+    def test_a_hint_is_indented_inside_its_row_not_pushed_past_it(self):
+        rule = re.search(r"\.field>\.fhint\{([^}]*)\}", admin._CSS.split("@media")[0]).group(1)
+        self.assertNotIn("margin", rule)                  # 100 % basis + margin = overflow
+        self.assertIn("padding-left:154px", rule)
+
+    def test_a_narrow_column_stacks_label_over_control(self):
+        self.assertIn("container-type:inline-size", admin._CSS)
+        self.assertIn("@container (max-width:560px)", admin._CSS)
+
+    def test_list_settings_use_the_whole_column(self):
+        row = admin._srv_runtime_row("scan_ports", "text", "scan ports", "n", "8080, 8000")
+        self.assertIn('class="control wide"', row)
+        self.assertNotIn("wide", admin._srv_runtime_row("max_parked", "int", "max", "n", 1))
+
+    def test_logout_is_a_button_at_the_right_edge(self):
+        saved = admin._ui_locked
+        admin._ui_locked = lambda: True
+        try:
+            nav = admin._nav("dashboard")
+        finally:
+            admin._ui_locked = saved
+        self.assertIn('<a class="btn secondary sm" href="/ui/logout">Logout</a>', nav)
+        self.assertIn('class="hdr-right"', nav)
+
+
 if __name__ == "__main__":
     unittest.main()

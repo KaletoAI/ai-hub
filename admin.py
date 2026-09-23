@@ -201,12 +201,15 @@ def _nav(active: str) -> str:
     cur = ' class="on" aria-current="page"'
     links = "".join(f'<a{cur if k == active else ""} href="/ui/{k}">{_esc(label)}</a>'
                     for k, label in TABS)
-    logout = ('<a href="/ui/logout" style="color:#8b97a4;padding:14px 0 14px 14px">Logout</a>'
+    logout = ('<a class="btn secondary sm" href="/ui/logout">Logout</a>'
               if _ui_locked() else "")
     # The live-status chip sits in the header, OUTSIDE <main>: the morph never touches
     # it, and _LIVE_JS is the only writer (it stays hidden on a page that is not live).
+    # Chip and Logout share one right-aligned box, so Logout stays at the right edge
+    # whether the chip is shown or hidden.
     return (f'<header><span class="brand">AI-Hub</span><nav>{links}</nav>'
-            f'<span id="gwlive" class="livechip" role="status" hidden></span>{logout}</header>')
+            f'<span class="hdr-right"><span id="gwlive" class="livechip" role="status" hidden></span>'
+            f'{logout}</span></header>')
 
 
 _CSS = """
@@ -227,7 +230,7 @@ a{color:var(--link)}
 ::-webkit-scrollbar-thumb:hover{background:#3d4654}
 ::-webkit-scrollbar-corner{background:transparent}
 header{display:flex;align-items:center;background:var(--panel);border-bottom:1px solid var(--line-3);padding:0 20px;flex:none}
-.brand{font-weight:700;padding:14px 16px 14px 0;color:#e7ebf0}
+.brand{white-space:nowrap;font-weight:700;padding:14px 16px 14px 0;color:#e7ebf0}
 nav{display:flex;flex-wrap:wrap}
 nav a{color:var(--dim);padding:14px 14px;text-decoration:none;border-bottom:2px solid transparent;font-size:13px}
 nav a:hover{color:var(--text-hi);background:var(--hover)}
@@ -237,7 +240,8 @@ nav a:hover{color:var(--text-hi);background:var(--hover)}
 .subnav a.on{color:#fff;border-bottom-color:var(--accent)}
 nav a.on{color:#fff;border-bottom-color:var(--accent)}
 /* Live-update status (_LIVE_JS drives it): hidden on a static page. */
-.livechip{margin-left:auto;font-size:11px;padding:2px 9px;border-radius:10px;white-space:nowrap;background:#16361f;color:var(--ok)}
+.hdr-right{margin-left:auto;display:flex;align-items:center;gap:12px;padding-left:12px}
+.livechip{font-size:11px;padding:2px 9px;border-radius:10px;white-space:nowrap;background:#16361f;color:var(--ok)}
 .livechip.stale{background:#3a2f12;color:var(--warn)}
 .livechip.offline{background:#3a1b1b;color:var(--bad)}
 main{flex:1;min-height:0;overflow-y:auto;padding:18px 26px}
@@ -246,12 +250,16 @@ h2:first-child{margin-top:4px}
 p.hint{color:var(--dim);margin:0 0 14px;max-width:62ch;line-height:1.5}
 .field{display:flex;align-items:center;gap:14px;margin:10px 0}
 .field>label{flex:0 0 140px;text-align:left;color:var(--dim);font-size:13px}
-.field>.control{flex:1;min-width:0;max-width:480px;display:flex;gap:8px;align-items:center}
+.field>.control{flex:1;min-width:0;max-width:480px;display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+/* An input next to buttons (API key: Generate, Copy) keeps a usable width — the buttons
+   wrap under it instead of squeezing it to a sliver (it measured 82 px at 1000 px). */
+.field>.control>input:not([type=checkbox]):not([type=radio]),.field>.control>select{flex:1 1 220px;min-width:0}
 .field>.control.wide{max-width:none}
 /* _field(hint=…): the hint gets its OWN row under the control, never a flex item
-   beside the input (it used to squeeze the input to a sliver). */
+   beside the input (it used to squeeze the input to a sliver). Indented by PADDING: a
+   100 % basis plus a margin was 154 px wider than the row and got cut off. */
 .field.hashint{flex-wrap:wrap;row-gap:2px}
-.field>.fhint{flex:1 0 100%;margin:0 0 0 154px;color:var(--muted);font-size:12px;line-height:1.5;max-width:62ch}
+.field>.fhint{flex:1 0 100%;padding-left:154px;color:var(--muted);font-size:12px;line-height:1.5;max-width:calc(62ch + 154px)}
 .control.short input,.control.short select{max-width:150px}
 input,select,textarea{width:100%;background:var(--input);color:var(--text-hi);border:1px solid var(--line-2);border-radius:7px;padding:0 10px;height:36px;font:inherit;outline:none}
 input:focus,select:focus,textarea:focus{border-color:var(--accent)}
@@ -287,7 +295,7 @@ img.result,video.result{max-width:512px;border:1px solid var(--line-2);border-ra
 audio.result{width:512px;max-width:100%;margin:8px 0}
 pre.err{white-space:pre-wrap;word-break:break-word;background:#1a1113;border:1px solid #5a2a2a;color:#f0b6b6;border-radius:8px;padding:12px 14px;margin:8px 0;max-height:340px;overflow:auto;font:12px/1.5 ui-monospace,monospace;user-select:text}
 .cols{display:flex;gap:0;align-items:stretch;height:100%}
-.col{flex:1;min-width:0}
+.col{flex:1;min-width:0;container-type:inline-size}
 .cols>.col{flex:1 1 0;min-width:0;height:100%;overflow-y:auto;padding:0 16px 18px 0}
 .cols>.col+.col{border-left:1px solid var(--line-4);margin-left:22px;padding-left:22px}
 /* Mapping image editor: give the editor (col 2) more room for the request-fields
@@ -379,13 +387,22 @@ main{overflow:visible;padding:12px 16px}
 .field{flex-wrap:wrap;gap:4px 14px}
 .field>label{flex:1 1 100%}
 .field>.control{max-width:none;flex-wrap:wrap}
-.field>.fhint{margin-left:0}
+.field>.fhint{padding-left:0}
 .control.short input,.control.short select{max-width:none}
 table{display:block;overflow-x:auto;max-width:100%}
 th,td{overflow-wrap:break-word}
 img.result,video.result,audio.result{max-width:100%}
 .bar,.formbar{flex-wrap:wrap}
 .cards{gap:8px}.card{min-width:0;flex:1 1 40%;padding:10px 12px}
+}
+/* A narrow COLUMN on a wide screen (the Server tab's halves, an editor beside a list)
+   puts the label ABOVE the control too, so the control gets the whole column instead of
+   what is left beside a 140 px label. */
+@container (max-width:560px){
+.field{flex-wrap:wrap;gap:4px 14px}
+.field>label{flex:1 1 100%}
+.field>.control{max-width:none}
+.field>.fhint{padding-left:0}
 }
 """
 
@@ -7585,6 +7602,38 @@ _USER_ACC_JS = ("<script>function gwTogAll(c,g){var s='input[name=model][data-gr
                 "sync(a.getAttribute('data-grp-all'));});})();</script>")
 
 
+# The user editor's group boxes — the tokens main._model_allowed resolves per request
+# (main.GRANT_ALL_*; admin does not import main, test_user_group_grants pins the match).
+_GRANT_TOKENS = {"chat": "@chat", "image": "@image", "backend": "@backends"}
+
+
+def _grant_groups() -> dict:
+    """kind → the names the Model-access table lists under it."""
+    info = _gateway_info()
+    # Backend grants apply to LLM backends only (generation backends aren't in
+    # /v1/models; image access is granted via image aliases). Filtering them out also
+    # removes the confusing duplicate when an LLM and a media backend share a name.
+    return {"chat": sorted(set(info.get("virtual_models", []))),
+            "image": sorted(store.list_aliases().keys()) if store.is_active() else [],
+            "backend": sorted({b["name"] for b in info.get("backends", [])
+                               if b.get("name") and b.get("type", "openai") not in adapters.GEN_TYPES})}
+
+
+def _normalize_grants(models: list, groups: dict) -> list:
+    """Drop the member names a group token already covers (the table ticks them for
+    display, the browser submits them too) — the token is the grant, and a stored copy of
+    today's members would outlive their removal from the group."""
+    covered = set()
+    for kind, tok in _GRANT_TOKENS.items():
+        if tok in models:
+            covered |= set(groups.get(kind) or [])
+    out = []
+    for m in models:
+        if m not in covered and m not in out:
+            out.append(m)
+    return out
+
+
 def _user_form(u: Optional[dict], orig: Optional[str] = None, err: str = "") -> str:
     """`orig`/`err`: a refused Save shown again — `u` then holds what was typed and
     `orig` the stored name it was editing ("" = a new user)."""
@@ -7601,25 +7650,26 @@ def _user_form(u: Optional[dict], orig: Optional[str] = None, err: str = "") -> 
     # since access is granted at the alias level; raw model ids would be noise.
     # Empty selection = all allowed.
     allowed = set((u or {}).get("models") or [])
-    chat_al = sorted(set(_gateway_info().get("virtual_models", [])))
-    img_al = sorted(store.list_aliases().keys()) if store.is_active() else []
-    # Backend grants apply to LLM backends only (generation backends aren't in
-    # /v1/models; image access is granted via image aliases). Filtering them out also
-    # removes the confusing duplicate when an LLM and a media backend share a name.
-    bk_al = sorted({b["name"] for b in _gateway_info().get("backends", [])
-                    if b.get("name") and b.get("type", "openai") not in adapters.GEN_TYPES})
+    groups = _grant_groups()
+    chat_al, img_al, bk_al = groups["chat"], groups["image"], groups["backend"]
     # chat/image aliases granted by name; a backend grants ALL of its models (and filters
     # what this user's key sees in /v1/models). Each kind gets a "select all" header row.
     rows = ""
     for kind, items in (("chat", chat_al), ("image", img_al), ("backend", bk_al)):
         if not items:
             continue
-        all_ck = " checked" if all(a in allowed for a in items) else ""
-        rows += (f'<tr class="grp"><td><input type="checkbox"{all_ck} data-grp-all="{kind}" '
-                 f'onclick="gwTogAll(this,\'{kind}\')" title="select all {kind}"></td>'
-                 f'<td colspan="2"><b>all {kind}</b> <span class="muted">({len(items)})</span></td></tr>')
+        # The group box is a real grant: it submits the kind's TOKEN, which the gateway
+        # resolves per request — so "all chat" also covers aliases added later.
+        tok = _GRANT_TOKENS[kind]
+        grp = tok in allowed
+        all_ck = " checked" if grp else ""
+        rows += (f'<tr class="grp"><td><input type="checkbox" name="model" value="{tok}"{all_ck} '
+                 f'data-grp-all="{kind}" onclick="gwTogAll(this,\'{kind}\')" '
+                 f'title="every {kind} entry, including ones added later"></td>'
+                 f'<td colspan="2"><b>all {kind}</b> <span class="muted">({len(items)} now, '
+                 f'incl. future ones)</span></td></tr>')
         for a in items:
-            ck = " checked" if a in allowed else ""
+            ck = " checked" if (grp or a in allowed) else ""
             rows += (f'<tr><td><input type="checkbox" name="model" value="{_esc(a)}" data-grp="{kind}"{ck}></td>'
                      f'<td><code>{_esc(a)}</code></td><td class="muted">{kind}</td></tr>')
     acc = ((f'<div class="acctbl"><table><thead><tr><th title="allow this entry">✓</th>'
@@ -7815,7 +7865,7 @@ async def users_save(request: Request):
     u["enabled"] = bool(qs.get("enabled"))
     u["quota_req_day"] = q
     u["quota_cost_month"] = qc
-    u["models"] = [m for m in qs.get("model", []) if m]
+    u["models"] = _normalize_grants([m for m in qs.get("model", []) if m], _grant_groups())
     ak = g("api_key").strip()
     if ak:
         u["api_key"] = ak
@@ -7902,7 +7952,10 @@ def _srv_runtime_row(k: str, kind: str, lbl: str, note: str, value) -> str:
     """One Server-tab runtime row. Numeric kinds render a number input; `text` a text
     input — a CIDR or port LIST in a number input cannot be submitted at all."""
     typ = "text" if kind == "text" else "number"
-    return _field(lbl, _inp(k, "" if value in (None, "") else value, typ=typ), hint=_esc(note))
+    # A list (scan cidrs/ports) gets the column's full width — capped like a number
+    # field it cut "8080, 8000, 11434, 8188, 1234, 5000" off mid-list.
+    return _field(lbl, _inp(k, "" if value in (None, "") else value, typ=typ),
+                  wide=(kind == "text"), hint=_esc(note))
 
 
 async def server_page(request: Request):

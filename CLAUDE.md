@@ -31,7 +31,7 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
   restart for backend/alias changes. Read **only at startup**:
   `stats.enabled` and the stats/jobs DB paths.
 - **No linter or build step, and no blanket test suite** — only targeted stdlib
-  `unittest` files for the mechanisms that fail SILENTLY (see the fifty-seven listed under
+  `unittest` files for the mechanisms that fail SILENTLY (see the fifty-eight listed under
   `anthropic_bridge.py`): `venv/bin/python -m unittest discover -s tests -t .`.
   Everything else is verified by running the server and hitting endpoints with
   `curl` (README "Try it"), `curl -H "Authorization: Bearer <admin key>"
@@ -731,7 +731,7 @@ they need via injected callables, staying hot-reload-safe.
   running the tool. Covered by
   `test_anthropic_bridge.py` (stdlib `unittest` — a streaming tool-call bridge fails
   silently rather than crashing). `ls tests/test_*.py` is the count of record —
-  **fifty-seven** files today — and each exists for that same reason: the mechanism it
+  **fifty-eight** files today — and each exists for that same reason: the mechanism it
   guards fails SILENTLY, so it is named next to that mechanism above.
   `test_anthropic_bridge.py`, `test_prune_branch.py` (a
   dead-branch prune that cascades one node too far or too few surfaces as an aborted
@@ -1034,6 +1034,15 @@ they need via injected callables, staying hot-reload-safe.
   `Allow: POST` and a way back) for a GET to any POST-only path; `test_jobs_lifecycle.py`
   that `set_backend` leaves a terminal row alone; `test_gen_cancel.py` that a discovery
   poll spanning an adapter rebuild lands on the CURRENT instance (only for the same URL).
+  `test_user_group_grants.py` (the user editor's "all …" boxes: a snapshot of today's
+  alias names under "all chat" silently refused next week's alias — a 403 and a missing
+  /v1/models entry for a user the editor said may use "all". It pins the tokens resolving
+  per request for chat aliases, media aliases and LLM backends added later, the catalog
+  following them, the box submitting the token, and saving dropping covered names).
+  `test_ui_look.py` also pins the field rows reported after the review deploy: an input
+  keeps 220 px and its buttons wrap (the API key shrank to 82 px), a hint is indented by
+  padding (100 % + margin was cut off), a narrow column stacks label over control, list
+  settings take the whole column, and Logout is a button.
   Run them all with `python -m unittest discover -s tests -t .` (no runner dependency).
 - **`openai_image_bridge.py`** — pure request/response plumbing for the OpenAI
   image shims (`multipart_list`, `parse_size`, `coerce_scalar`, `images_uploads`
@@ -1379,6 +1388,11 @@ maps the alias, and exposes the resolved model. Recurring concepts:
 - **Allow-list filtering**: `/v1/models` authenticates the caller and filters by
   their allow-list (entries may be aliases, model ids, or **backend names** =
   all that backend's models); image aliases are included; `?type=chat|image`.
+  The user editor's "all chat / all image / all backend" boxes store GROUP TOKENS
+  (`main.GRANT_ALL_CHAT` `@chat`, `@image`, `@backends` = `admin._GRANT_TOKENS`),
+  resolved per request by `_expand_grants`/`_model_allowed` — ticking "all" used to
+  store a snapshot of today's names, so an alias or backend added later was silently
+  refused; saving drops the member names a token covers (`admin._normalize_grants`).
   `GET /v1/models/{id}` applies the same grant (`_model_allowed`) and answers outside it
   with the unknown-model 404, so a restricted key cannot probe what exists
   (`test_model_lookup_allow.py`).
