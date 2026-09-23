@@ -1145,7 +1145,10 @@ ComfyUI's cache), so the first job after one frees.
   instead (Meshy embeds it as a `model_url` data URI, Tripo uploads it to `/v3/files`
   and sends the token), so no path exists. The bytes are not kept as a job input.
   Unlike `params`, `files` is strict: unknown key or unreadable value → `400`,
-  over 64 MB → `413`.
+  over 64 MB → `413`. Naming a backend PATH for such a file field in `params`
+  instead is admin-only (`400` for a user key, unless the mapping entry sets
+  `client_path: true`), and a list or object is never accepted as a mapped
+  `params` value (in ComfyUI's API format a list is a link between nodes).
 - **`GET /v1/generations/{alias}/schema`** self-describes an alias in three lists:
   `params`, `images` (loader slots with their empty behaviour) and **`files`** — the
   uploads that are not images. A ComfyUI alias lists its mapped mesh params there

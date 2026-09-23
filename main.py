@@ -1214,6 +1214,8 @@ async def gate_request(authorization: Optional[str], request: Request, model: Op
     if user is None:
         return None
     request.state.gw_user = user["name"]
+    # admin-only request powers downstream (a backend path in generation params)
+    request.state.gw_admin = bool(user.get("_master") or user.get("role") == "admin")
     if not _model_allowed(user, model):
         raise HTTPException(403, f"user '{user['name']}' is not allowed model '{model}'")
     cap = user.get("quota_cost_month")                 # monthly cost/credit quota (E1)
@@ -4250,6 +4252,58 @@ def _upload_prefix(job_id: str, stage: str = "") -> str:
     return f"gw_{job_id}{('_' + stage) if stage else ''}"
 
 
+def _params_trusted(request) -> bool:
+    """Whether this generation request may name BACKEND paths in its params: an admin
+    key (gate_request marks it), the console (its session was checked by _ui_guard),
+    or bootstrap-open mode, where everything is open anyway."""
+    if not users and not api_key:
+        return True
+    if getattr(getattr(request, "state", None), "gw_admin", False):
+        return True
+    return str(getattr(getattr(request, "url", None), "path", "") or "").startswith("/ui")
+
+
+def _numberish(v: str) -> bool:
+    try:
+        float(v.strip())
+        return True
+    except ValueError:
+        return v.strip().lower() in ("true", "false")
+
+
+def _client_param_refusal(params: dict, wf_maps: list, trusted: bool) -> Optional[str]:
+    """Why these client params must not reach the workflows in `wf_maps` [(wf, mapping)]
+    — the alias's own and, for a chain, its successor's (params are threaded there by
+    label) — or None. Only MAPPED names are judged; unknown ones are ignored downstream.
+
+    A list or object is never a value (in ComfyUI's API format a list is a LINK), and a
+    mapped file field (adapters.is_file_param) is a path on the backend box: from a
+    plain user that reads any file ComfyUI can — another job's output included — so it
+    needs `trusted` or the mapping entry's `client_path: true`; `files` is the way in."""
+    flat = dict(params or {})
+    extra = flat.get("extra")
+    if isinstance(extra, dict):
+        flat.update(extra)
+    for wf, mapping in wf_maps:
+        for p, m in (mapping or {}).items():
+            m = m or {}
+            lbl = (m.get("label") or "").strip()
+            for name in {p, lbl} - {""}:
+                if name not in flat:
+                    continue
+                v = flat[name]
+                if isinstance(v, (list, tuple, dict)):
+                    return (f"`params.{name}` must be a single value — a list or object is "
+                            f"not a workflow value")
+                if (not trusted and not m.get("client_path") and isinstance(v, str) and v.strip()
+                        and not _numberish(v)          # is_file_param is a NAME heuristic —
+                        and not is_image_field(wf or {}, m.get("node"))   # "mesh_faces: '5000'" is no path
+                        and adapters.is_file_param(p, m)):
+                    return (f"`params.{name}` names a file on the backend — send the file "
+                            f"itself under `files.{name}` (a backend path is admin-only)")
+    return None
+
+
 JOB_MAX_TTL_DEFAULT = 7 * 86400
 
 
@@ -4289,6 +4343,17 @@ async def run_generation(body: dict, request: Request,
     routes, parked, eligible = await _gen_pick(alias, force, body)
     inputs, params = _gen_inputs_params(body)
     _apply_seconds(params, routes[0][1])         # seconds → frames (alias fps; 400 if unsupported)
+    c0 = routes[0][1]
+    wf_maps = [(c0.get("workflow_json") or {}, c0.get("mapping") or {})]
+    succ_alias = ((c0.get("successor") or {}).get("alias") or "").strip()
+    if succ_alias:
+        sc = (((await asyncio.to_thread(store.get, succ_alias)) if store.is_active() else None)
+              or image_models.get(succ_alias) or [])
+        if sc:
+            wf_maps.append((sc[0].get("workflow_json") or {}, sc[0].get("mapping") or {}))
+    refusal = _client_param_refusal(params, wf_maps, _params_trusted(request))
+    if refusal:
+        raise HTTPException(400, refusal)
 
     def build_req(backend: dict, cand: dict) -> NormalizedRequest:
         # `job_id` below is bound by the time this runs (dispatch happens after the job

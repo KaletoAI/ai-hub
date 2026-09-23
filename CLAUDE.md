@@ -126,7 +126,14 @@ they need via injected callables, staying hot-reload-safe.
   request became ~10 upstream calls in 20 s against `api.anthropic.com`, which had
   said exactly how long to wait.
   Workflow injection is **mapping-driven, convention-free** (`_apply_mapping`
-  sets `workflow[node].inputs[field]`); a mapping `label` is the param's public
+  sets `workflow[node].inputs[field]` — never to a list, which ComfyUI reads as a LINK,
+  and to an object only where the workflow holds one; `main._client_param_refusal` 400s
+  such values up front, and a client string for a mapped FILE field (`is_file_param`, a
+  path on the backend box — another job's output included) unless `_params_trusted`
+  (admin key via `gate_request`'s `gw_admin`, the /ui console, bootstrap-open) or the
+  entry carries `client_path: true` (no form field; the editor keeps it across Save);
+  judged over the alias's AND its successor's mapping, since params are threaded by
+  label — `test_mapping_values.py`); a mapping `label` is the param's public
   API name — incoming values are accepted under label OR param, and the
   auto-random seed keys on that effective name (`''` counts as unset);
   `_apply_lora_cascade` drops client LoRAs into free stack slots; `_apply_fixed`

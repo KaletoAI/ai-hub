@@ -4344,6 +4344,10 @@ async def update(request: Request):
                         x for x in re.split(r"[,\s]+", f.get(f"bypass__{p}", "") or "") if x))
                     if extra:
                         entry["on_empty_bypass"] = extra
+                # `client_path` (a file field that takes a backend path from any client,
+                # main._client_param_refusal) has no form field — keep it across a Save.
+                if ((cand.get("mapping") or {}).get(p) or {}).get("client_path"):
+                    entry["client_path"] = True
                 mapping[p] = entry
     # Editable workflow defaults (the "=" column): default__<param> writes the
     # value a request-without-this-field runs with into the workflow JSON at the

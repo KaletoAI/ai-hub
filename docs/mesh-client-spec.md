@@ -60,8 +60,8 @@ Welche Schlüssel ein Alias unter `files` annimmt, steht im Schema als eigene Li
 
 `required: true` heißt: ohne diese Datei wird der Request abgelehnt (so bei
 `Meshy-Rig`). Bei den ComfyUI-Aliasen steht `required: false`, weil dasselbe
-Eingangs-Mesh alternativ als Backend-Pfad in `params` genannt werden kann (siehe
-3.4); `accept` nennt, wenn vorhanden, die zulässigen Container.
+Eingangs-Mesh alternativ als Backend-Pfad in `params` genannt werden kann — nur mit
+Admin-Key (siehe 3.4); `accept` nennt, wenn vorhanden, die zulässigen Container.
 
 ### Antwortform (Job-View)
 
@@ -319,8 +319,9 @@ selbst. Ein vorheriges Job-Ergebnis wird also normal abgeholt
 (`GET /v1/jobs/{id}/result/{n}`) und beim Shrink-Aufruf wieder mitgeschickt.
 
 (Ein direkt in `params` gesetzter `input_mesh_path` bleibt weiterhin ein
-Dateipfad auf dem Backend — nützlich für Server-Admins mit Zugriff auf dessen
-Dateisystem, für Clients ist `files` der Weg.)
+Dateipfad auf dem Backend — aber nur mit **Admin-Key** (oder wenn das Mapping den
+Eintrag mit `client_path: true` freigibt); ein normaler User-Key bekommt dafür `400`.
+Für Clients ist `files` der Weg.)
 
 Auslieferung: `<name>_00001_.glb` + `*_basecolor*.png` + `*_metallic*.png` — hier
 **ohne** JPEG-Umkodierung, die Karten bleiben PNG.
