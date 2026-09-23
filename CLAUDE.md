@@ -764,9 +764,20 @@ they need via injected callables, staying hot-reload-safe.
   skips body parsing/stats blobs for non-text responses — via `route()`): all
   funnel through **`_dispatch_or_park()`** — `resolve_routes()` →
   ready vs busy split → `backend_adapters[bid].dispatch(NormalizedRequest)` to the
-  first ready, failing over on connection/timeout errors and on llama-swap's
-  "unable to start process" 502 (backend-local load failure, `_retryable_upstream_error`);
-  other HTTP error statuses return as-is. The adapter opens the upstream stream
+  first ready, failing over on every `httpx.TransportError` — connect errors, a pooled
+  keep-alive connection the backend had closed (`RemoteProtocolError`), a reset
+  (`ReadError`/`WriteError`); all of them surface before the client saw a byte — and on
+  llama-swap's "unable to start process" 502 (backend-local load failure,
+  `_retryable_upstream_error`); other HTTP error statuses return as-is. ONE exception:
+  a `ReadTimeout` on a `paid` backend (connected, sent, no answer within the 300 s read
+  budget — it is most likely still generating) answers 504 instead of failing over,
+  or the failover buys the same answer twice; on an unpaid backend it still fails over.
+  `adapters._CHAT_TIMEOUT` is `httpx.Timeout(300, connect=10, pool=30)` — a scalar 300
+  let a SYN-swallowing host hold the failover for five minutes. Anything else an adapter
+  raises is a clean 502 naming the backend (fault kind `error`, no failover — a bug
+  reproduces), and `main._unexpected_error` turns any exception left over on `/v1/*`
+  into a 502 through the HTTPException handler, so it is logged and `/v1/messages`
+  answers in Anthropic shape instead of a raw 500 Claude Code shows blank. The adapter opens the upstream stream
   BEFORE answering, so streamed upstream errors carry their real status too. All busy → **park by default** (FIFO queue, per-alias `park_s`)
   until a backend frees, else 503; no client field. Before dispatch,
   **sampling defaults** are folded in two stages whose ORDER is the precedence

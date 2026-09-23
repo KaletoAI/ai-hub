@@ -21,7 +21,7 @@ import uvicorn
 import yaml
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.exception_handlers import http_exception_handler
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from watchfiles import awatch
 
 import adapters
@@ -991,6 +991,20 @@ async def _rejected_call(request: Request, exc: HTTPException):
     if request.url.path.startswith("/v1/messages"):
         return _messages_error(exc.status_code, exc.detail, getattr(exc, "headers", None))
     return await http_exception_handler(request, exc)
+
+
+@app.exception_handler(Exception)
+async def _unexpected_error(request: Request, exc: Exception):
+    """An exception nobody caught. On the API it becomes a 502 in the endpoint's own
+    error shape — through the HTTPException handler, so it is logged like a refusal
+    and `/v1/messages` answers in Anthropic form (Claude Code renders a plain
+    "Internal Server Error" as a blank message). Starlette still re-raises it after
+    this response, so the traceback reaches the journal. Elsewhere (/ui) the stock
+    500 stays."""
+    if request.url.path.startswith("/v1/"):
+        return await _rejected_call(request, HTTPException(
+            502, f"gateway error: {type(exc).__name__}: {_err_text(exc)}"))
+    return PlainTextResponse("Internal Server Error", status_code=500)
 
 
 def _record_rejected(request: Request, exc: HTTPException) -> None:
@@ -2010,15 +2024,58 @@ async def _dispatch_over(candidates, path, alias, body, request, stats_endpoint=
                 _note_fault(backend, "call", "upstream", f"{real_model}: {_resp_snippet(resp)}",
                             resp.status_code)
             return resp
-        except (httpx.ConnectError, httpx.TimeoutException) as e:
+        except HTTPException:
+            raise                                 # already a deliberate answer
+        except httpx.ReadTimeout as e:
+            # Connected and sent, then no answer within the read budget: the backend is
+            # most likely STILL generating. On a paid backend a failover buys the same
+            # answer twice, so it ends here; a local one only wastes its own compute, and
+            # a hung llama-swap load is exactly when another box helps.
+            _note_fault(backend, "call", "timeout", f"{real_model}: {_err_text(e)}")
+            if backend.get("paid"):
+                logger.warning(f"✗ [{backend['name']}] no answer in {_READ_BUDGET_S:g} s — "
+                               "paid backend, not retried elsewhere")
+                raise HTTPException(504, f"backend '{backend['name']}' did not answer within "
+                                         f"{_READ_BUDGET_S:g} s — not retried on another backend, "
+                                         "because a paid backend may still be generating (and "
+                                         "billing) this request")
+            logger.warning(f"✗ [{backend['name']}] {_err_text(e)} — trying next")
+            last_error = e
+        except httpx.TransportError as e:
+            # Every transport failure surfaces BEFORE the client saw a byte (a stream is
+            # opened, headers and status read, before the adapter answers): connect
+            # errors, a pooled keep-alive connection the backend had closed
+            # (RemoteProtocolError), a reset (ReadError/WriteError). All fail over.
             logger.warning(f"✗ [{backend['name']}] {_err_text(e)} — trying next")
             # Failed over — the call may still end as a 200 elsewhere, which is exactly
             # why this is invisible anywhere but here.
-            _note_fault(backend, "call", _classify_error(e)["kind"], f"{real_model}: {_err_text(e)}")
+            _note_fault(backend, "call", _call_fault_kind(e), f"{real_model}: {_err_text(e)}")
             last_error = e
+        except Exception as e:
+            # Not a transport failure: a bug, or a backend answer the adapter could not
+            # handle. Retrying elsewhere would most likely reproduce it, so it ends here —
+            # as a clean 502 the error handler renders in the endpoint's own shape (a raw
+            # 500 reads blank in Claude Code), and in the fault log.
+            logger.exception(f"✗ [{backend['name']}] dispatch failed")
+            _note_fault(backend, "call", "error", f"{real_model}: {type(e).__name__}: {_err_text(e)}")
+            raise HTTPException(502, f"backend '{backend['name']}' failed: "
+                                     f"{type(e).__name__}: {_err_text(e)}")
     if last_resp is not None:                     # every candidate failed to load → the real 502
         return last_resp
-    raise HTTPException(503, f"All backends failed: {last_error}")
+    raise HTTPException(503, f"All backends failed: {_err_text(last_error)}")
+
+
+_READ_BUDGET_S = adapters._CHAT_TIMEOUT.read
+
+
+def _call_fault_kind(e: BaseException) -> str:
+    """Fault-log kind for a transport error on a forwarded call. A connection that was
+    established and then lost (reset, closed without a response) is `connection_lost`
+    — the backend dropped the call — while never connecting stays `unreachable`, which
+    the fault log ignores (a backend that is off is a state, not an error)."""
+    if isinstance(e, (httpx.NetworkError, httpx.ProtocolError)) and not isinstance(e, httpx.ConnectError):
+        return "connection_lost"
+    return _classify_error(e)["kind"]
 
 
 def _waiting_pool() -> list:

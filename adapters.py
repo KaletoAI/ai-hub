@@ -50,7 +50,10 @@ logger = logging.getLogger(__name__)
 
 # Outbound timeouts (seconds): discovery is short (health tick must stay snappy),
 # chat generous (long completions), ComfyUI uploads sized for LAN image posts.
-_CHAT_TIMEOUT = 300.0
+# The chat budget is a READ budget: a scalar 300 also let a host that swallows SYNs
+# hold the failover for five minutes before the next candidate got a chance. Connect
+# (incl. the TLS handshake) and waiting for a pooled connection stay short.
+_CHAT_TIMEOUT = httpx.Timeout(300.0, connect=10.0, pool=30.0)
 _DISCOVERY_TIMEOUT = 5.0
 _COMFY_DISCOVERY_TIMEOUT = 8.0
 _UPLOAD_TIMEOUT = 20.0             # floor; the real budget scales with the file (_upload_timeout_for)
