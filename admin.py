@@ -88,7 +88,8 @@ SUBTABS = {"playground": [("chat", "Chat"), ("media", "Media"), ("voice", "Voice
 
 def _subnav(parent: str, active_sub: str) -> str:
     subs = SUBTABS.get(parent) or []
-    links = "".join(f'<a class="{"on" if k == active_sub else ""}" '
+    cur = ' class="on" aria-current="page"'
+    links = "".join(f'<a{cur if k == active_sub else ""} '
                     f'href="/ui/{parent}?sub={k}">{_esc(lbl)}</a>' for k, lbl in subs)
     return f'<nav class="subnav">{links}</nav>'
 
@@ -185,102 +186,126 @@ def _esc(s) -> str:
 
 
 def _nav(active: str) -> str:
-    links = "".join(f'<a class="{"on" if k == active else ""}" href="/ui/{k}">{_esc(label)}</a>'
+    cur = ' class="on" aria-current="page"'
+    links = "".join(f'<a{cur if k == active else ""} href="/ui/{k}">{_esc(label)}</a>'
                     for k, label in TABS)
-    logout = ('<a href="/ui/logout" style="margin-left:auto;color:#8b97a4">Logout</a>'
+    logout = ('<a href="/ui/logout" style="color:#8b97a4;padding:14px 0 14px 14px">Logout</a>'
               if _ui_locked() else "")
-    return f'<header><span class="brand">AI-Hub</span><nav>{links}{logout}</nav></header>'
+    # The live-status chip sits in the header, OUTSIDE <main>: the morph never touches
+    # it, and _LIVE_JS is the only writer (it stays hidden on a page that is not live).
+    return (f'<header><span class="brand">AI-Hub</span><nav>{links}</nav>'
+            f'<span id="gwlive" class="livechip" role="status" hidden></span>{logout}</header>')
 
 
 _CSS = """
-*{box-sizing:border-box}
+/* The palette, in ONE place. Inline styles elsewhere still carry literal colours
+   (moving all ~135 would collide with every other branch); new code uses these. */
+:root{--bg:#0f1115;--bg-2:#12151b;--panel:#171a21;--row:#13161c;--input:#0c0e12;--hover:#1b1f27;--sel:#19222e;
+--line:#242a33;--line-2:#313a46;--line-3:#272b33;--line-4:#2a313c;
+--text:#d7dbe0;--text-hi:#dce4ec;--text-2:#cdd6e0;--dim:#9aa7b4;--dim-2:#8b97a4;
+--muted:#7e8b99;--link:#6cb0ef;--accent:#3b82f6;--btn:#2563eb;--btn-hover:#1d4ed8;--focus:#60a5fa;
+--ok:#5cb87f;--bad:#e06c6c;--warn:#d8b35a}
+*{box-sizing:border-box;scrollbar-width:thin;scrollbar-color:#39414e transparent}
 html,body{height:100%}
-body{font:14px/1.6 system-ui,-apple-system,sans-serif;margin:0;background:#0f1115;color:#d7dbe0;overflow:hidden;display:flex;flex-direction:column}
-a{color:#6cb0ef}
-*{scrollbar-width:thin;scrollbar-color:#39414e transparent}
+body{font:14px/1.6 system-ui,-apple-system,sans-serif;margin:0;background:var(--bg);color:var(--text);overflow:hidden;display:flex;flex-direction:column}
+a{color:var(--link)}
 ::-webkit-scrollbar{width:11px;height:11px}
 ::-webkit-scrollbar-track{background:transparent}
-::-webkit-scrollbar-thumb{background:#2d3440;border-radius:7px;border:2px solid #0f1115}
+::-webkit-scrollbar-thumb{background:#2d3440;border-radius:7px;border:2px solid var(--bg)}
 ::-webkit-scrollbar-thumb:hover{background:#3d4654}
 ::-webkit-scrollbar-corner{background:transparent}
-header{display:flex;align-items:center;background:#171a21;border-bottom:1px solid #272b33;padding:0 20px;flex:none}
+header{display:flex;align-items:center;background:var(--panel);border-bottom:1px solid var(--line-3);padding:0 20px;flex:none}
 .brand{font-weight:700;padding:14px 16px 14px 0;color:#e7ebf0}
 nav{display:flex;flex-wrap:wrap}
-nav a{color:#9aa7b4;padding:14px 14px;text-decoration:none;border-bottom:2px solid transparent;font-size:13px}
-nav a:hover{color:#dce4ec;background:#1b1f27}
-.subnav{display:flex;flex-wrap:wrap;gap:2px;padding:0 20px;background:#12151b;border-bottom:1px solid #272b33;flex:none}
-.subnav a{color:#9aa7b4;padding:8px 12px;text-decoration:none;border-bottom:2px solid transparent;font-size:13px}
-.subnav a:hover{color:#dce4ec;background:#1b1f27}
-.subnav a.on{color:#fff;border-bottom-color:#3b82f6}
-nav a.on{color:#fff;border-bottom-color:#3b82f6}
+nav a{color:var(--dim);padding:14px 14px;text-decoration:none;border-bottom:2px solid transparent;font-size:13px}
+nav a:hover{color:var(--text-hi);background:var(--hover)}
+.subnav{display:flex;flex-wrap:wrap;gap:2px;padding:0 20px;background:var(--bg-2);border-bottom:1px solid var(--line-3);flex:none}
+.subnav a{color:var(--dim);padding:8px 12px;text-decoration:none;border-bottom:2px solid transparent;font-size:13px}
+.subnav a:hover{color:var(--text-hi);background:var(--hover)}
+.subnav a.on{color:#fff;border-bottom-color:var(--accent)}
+nav a.on{color:#fff;border-bottom-color:var(--accent)}
+/* Live-update status (_LIVE_JS drives it): hidden on a static page. */
+.livechip{margin-left:auto;font-size:11px;padding:2px 9px;border-radius:10px;white-space:nowrap;background:#16361f;color:var(--ok)}
+.livechip.stale{background:#3a2f12;color:var(--warn)}
+.livechip.offline{background:#3a1b1b;color:var(--bad)}
 main{flex:1;min-height:0;overflow-y:auto;padding:18px 26px}
-h2{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#7e8b99;margin:28px 0 12px;padding-bottom:7px;border-bottom:1px solid #242a33}
+h2{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:28px 0 12px;padding-bottom:7px;border-bottom:1px solid var(--line)}
 h2:first-child{margin-top:4px}
-p.hint{color:#9aa7b4;margin:0 0 14px;max-width:62ch;line-height:1.5}
+p.hint{color:var(--dim);margin:0 0 14px;max-width:62ch;line-height:1.5}
 .field{display:flex;align-items:center;gap:14px;margin:10px 0}
-.field>label{flex:0 0 140px;text-align:left;color:#9aa7b4;font-size:13px}
+.field>label{flex:0 0 140px;text-align:left;color:var(--dim);font-size:13px}
 .field>.control{flex:1;min-width:0;max-width:480px;display:flex;gap:8px;align-items:center}
 .field>.control.wide{max-width:none}
+/* _field(hint=…): the hint gets its OWN row under the control, never a flex item
+   beside the input (it used to squeeze the input to a sliver). */
+.field.hashint{flex-wrap:wrap;row-gap:2px}
+.field>.fhint{flex:1 0 100%;margin:0 0 0 154px;color:var(--muted);font-size:12px;line-height:1.5;max-width:62ch}
 .control.short input,.control.short select{max-width:150px}
-input,select,textarea{width:100%;background:#0c0e12;color:#dce4ec;border:1px solid #313a46;border-radius:7px;padding:0 10px;height:36px;font:inherit;outline:none}
-input:focus,select:focus,textarea:focus{border-color:#3b82f6}
-textarea{height:auto;min-height:150px;padding:8px 10px;font-family:ui-monospace,monospace;font-size:12px}
+input,select,textarea{width:100%;background:var(--input);color:var(--text-hi);border:1px solid var(--line-2);border-radius:7px;padding:0 10px;height:36px;font:inherit;outline:none}
+input:focus,select:focus,textarea:focus{border-color:var(--accent)}
+textarea{height:auto;min-height:60px;padding:8px 10px;font-family:ui-monospace,monospace;font-size:12px;line-height:1.5}
 input[type=file]{padding:7px 10px;height:auto}
-input[type=checkbox]{width:auto;height:auto;margin:0 6px 0 0;vertical-align:middle;accent-color:#2563eb}
+input[type=checkbox]{width:auto;height:auto;margin:0 6px 0 0;vertical-align:middle;accent-color:var(--btn)}
+/* Keyboard focus must be visible — the inputs above set outline:none for the mouse. */
+a:focus-visible,.btn:focus-visible,.btab:focus-visible,button:focus-visible,summary:focus-visible,
+table.sortable th:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+input:focus-visible,select:focus-visible,textarea:focus-visible{border-color:var(--focus);box-shadow:0 0 0 2px rgba(96,165,250,.45)}
+input[type=checkbox]:focus-visible{outline:2px solid var(--focus);outline-offset:1px}
 .ckbox{display:inline-flex;align-items:center;margin-right:18px;color:#cdd5de;font-size:13px;cursor:pointer;white-space:nowrap}
 .ckbox code{margin:0}
-.btn{height:36px;padding:0 18px;background:#2563eb;color:#fff;border:0;border-radius:7px;font:inherit;font-weight:500;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;text-decoration:none;white-space:nowrap}
-.btn:hover{background:#1d4ed8}
-.btn.secondary{background:#2a313c}.btn.secondary:hover{background:#343c49}
+.btn{height:36px;padding:0 18px;background:var(--btn);color:#fff;border:0;border-radius:7px;font:inherit;font-weight:500;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;text-decoration:none;white-space:nowrap}
+.btn:hover{background:var(--btn-hover)}
+.btn.secondary{background:var(--line-4)}.btn.secondary:hover{background:#343c49}
 .btn.danger{background:#b4433f}.btn.danger:hover{background:#9e3a36}
 .btn.sm{height:28px;padding:0 11px;font-size:12px;border-radius:6px}
 .btn.icon{padding:0;width:32px;min-width:32px;font-size:15px}
 .btn.sm.icon{width:28px;min-width:28px;font-size:14px}
 .actions{display:flex;gap:10px;margin-top:18px;padding-left:0}
 table{border-collapse:collapse;width:100%;margin:6px 0;font-size:13px}
-th,td{border-bottom:1px solid #242a33;padding:8px 10px;text-align:left;vertical-align:middle;overflow-wrap:anywhere}
-th{color:#7e8b99;font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.04em;border-bottom-color:#313a46}
+th,td{border-bottom:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:middle;overflow-wrap:anywhere}
+th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.04em;border-bottom-color:var(--line-2)}
 td .btn{margin-right:4px}
 td input,td select{height:30px}
-.muted{color:#6b7682}.ok{color:#5cb87f}.bad{color:#e06c6c}
-code{background:#1b1f27;padding:2px 6px;border-radius:4px;font-size:12px}
-.stub{color:#7e8b99;border:1px dashed #313a46;border-radius:8px;padding:22px;margin-top:8px;line-height:1.8}
-img.result,video.result{max-width:512px;border:1px solid #313a46;border-radius:8px;margin:8px 0}
+.muted{color:var(--muted)}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}
+code{background:var(--hover);padding:2px 6px;border-radius:4px;font-size:12px}
+.stub{color:var(--muted);border:1px dashed var(--line-2);border-radius:8px;padding:22px;margin-top:8px;line-height:1.8}
+/* The boxed look of a picker/filter/download card (was the _BOX_STYLE inline string). */
+.box{padding:7px 10px;background:var(--input);border:1px solid var(--line);border-radius:8px;color:var(--text-2)}
+img.result,video.result{max-width:512px;border:1px solid var(--line-2);border-radius:8px;margin:8px 0}
 audio.result{width:512px;max-width:100%;margin:8px 0}
 pre.err{white-space:pre-wrap;word-break:break-word;background:#1a1113;border:1px solid #5a2a2a;color:#f0b6b6;border-radius:8px;padding:12px 14px;margin:8px 0;max-height:340px;overflow:auto;font:12px/1.5 ui-monospace,monospace;user-select:text}
-.cols{display:flex;gap:24px;align-items:flex-start}
+.cols{display:flex;gap:0;align-items:stretch;height:100%}
 .col{flex:1;min-width:0}
-.cols{gap:0;align-items:stretch;height:100%}
 .cols>.col{flex:1 1 0;min-width:0;height:100%;overflow-y:auto;padding:0 16px 18px 0}
-.cols>.col+.col{border-left:1px solid #2a313c;margin-left:22px;padding-left:22px}
+.cols>.col+.col{border-left:1px solid var(--line-4);margin-left:22px;padding-left:22px}
 /* Mapping image editor: give the editor (col 2) more room for the request-fields
    table, taken from the Available fields column (col 3). */
 .cols.map3>.col:nth-child(2){flex:1.9 1 0}
 .cols.map3>.col:nth-child(3){flex:0.84 1 0}
-.bar{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:0 0 8px;padding:8px 0 8px;position:sticky;top:0;z-index:10;background:#0f1115}
+.bar{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:0 0 8px;padding:8px 0 8px;position:sticky;top:0;z-index:10;background:var(--bg)}
 .bar h2{margin:0;border:0;padding:0}
 td.acts{white-space:nowrap;text-align:right;width:1%}
 td.acts .btn{margin:0 0 0 6px}
-tr.sel td{background:#19222e}
-.item{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 4px;border-bottom:1px solid #242a33}
-.item.sel{background:#19222e}
+tr.sel td{background:var(--sel)}
+.item{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 4px;border-bottom:1px solid var(--line)}
+.item.sel{background:var(--sel)}
 .item-main{min-width:0}
 .item-title{font-weight:600;font-size:13px}
-.item-sub{color:#6b7682;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.item-sub{color:var(--muted);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .item-acts{white-space:nowrap;flex:none}
 .item-acts .btn{margin:0 0 0 6px}
 .badge{font-size:11px;font-weight:500;padding:1px 7px;border-radius:10px;margin-left:7px;white-space:nowrap}
-.badge.ok{background:#16361f;color:#5cb87f}.badge.bad{background:#3a1b1b;color:#e06c6c}.badge.muted{background:#23262d;color:#7e8b99}
-.badge.warn{background:#3a2f12;color:#d8b35a}
+.badge.ok{background:#16361f;color:var(--ok)}.badge.bad{background:#3a1b1b;color:var(--bad)}.badge.muted{background:#23262d;color:var(--dim-2)}
+.badge.warn{background:#3a2f12;color:var(--warn)}
 .badge.llm{background:#13303a;color:#5fb8c8}.badge.img{background:#2a1d3a;color:#bb8ce6}
-tr.grp td{background:#13161c;font-weight:600}
-.grouphdr{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:#8b97a4;font-weight:600;margin:16px 0 6px;padding-bottom:4px;border-bottom:1px solid #242a33}
+tr.grp td{background:var(--row);font-weight:600}
+.grouphdr{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--dim-2);font-weight:600;margin:16px 0 6px;padding-bottom:4px;border-bottom:1px solid var(--line)}
 .grouphdr:first-child{margin-top:4px}
-.formbar{display:flex;gap:8px;align-items:center;margin:0 0 14px;padding:8px 0 12px;border-bottom:1px solid #242a33;position:sticky;top:0;z-index:10;background:#0f1115}
+.formbar{display:flex;gap:8px;align-items:center;margin:0 0 14px;padding:8px 0 12px;border-bottom:1px solid var(--line);position:sticky;top:0;z-index:10;background:var(--bg)}
 .formbar h2{margin:0;border:0;padding:0;flex:1}
 .formwrap{max-width:560px}
 .avail tr td:last-child{text-align:right;white-space:nowrap}
-.avail .node{color:#9aa7b4}.avail .node code{background:#13202f}
+.avail .node{color:var(--dim)}.avail .node code{background:#13202f}
 table.pins td:nth-child(2){width:62%}
 table.pins td:last-child{width:1%;white-space:nowrap;text-align:right}
 table.reqf tr[draggable]{cursor:grab}
@@ -288,38 +313,69 @@ table.reqf tr.dragging{opacity:.45}
 table.reqf tr[draggable]:hover{background:#13202f}
 table.reqf th:nth-child(3),table.reqf td:nth-child(3){width:72px}   /* node — just an id */
 table.reqf th:nth-child(4),table.reqf td:nth-child(4){width:120px}  /* field */
-.grip{color:#5a6675;cursor:grab;user-select:none;margin-right:4px}
+.grip{color:var(--muted);cursor:grab;user-select:none;margin-right:4px}
+/* Keyboard alternative to dragging a request-field row (_reorder_js). */
+button.mv{background:none;border:1px solid var(--line-2);border-radius:4px;color:var(--dim);width:20px;height:20px;padding:0;margin:0 2px 0 0;font-size:11px;line-height:1;cursor:pointer;vertical-align:middle}
+button.mv:hover{color:var(--text-hi);border-color:var(--accent)}
 .tag{font-size:10px;background:#1d3a52;color:#9fd0ff;border-radius:3px;padding:1px 5px;margin-left:4px;vertical-align:middle}
-textarea{height:auto;min-height:60px;padding:8px 10px;line-height:1.5}
-.chatout{white-space:pre-wrap;word-break:break-word;background:#0c0e12;border:1px solid #242a33;border-radius:8px;padding:12px 14px;user-select:text;font-size:13px}
-.ok-banner{background:#16361f;color:#5cb87f;border:1px solid #1f5232;border-radius:8px;padding:8px 12px;margin:8px 0}
+.chatout{white-space:pre-wrap;word-break:break-word;background:var(--input);border:1px solid var(--line);border-radius:8px;padding:12px 14px;user-select:text;font-size:13px}
+.ok-banner{background:#16361f;color:var(--ok);border:1px solid #1f5232;border-radius:8px;padding:8px 12px;margin:8px 0}
 .ok-banner.fade{animation:okfade 2.2s ease forwards}
 @keyframes okfade{0%,65%{opacity:1}100%{opacity:0;visibility:hidden}}
 /* Save confirmation that lives INSIDE the sticky form bar: a banner stacked above the
    form would push the whole editor down by its height, so the restored scroll position
    lands on shifted content — the very jump the scroll restore exists to prevent. */
-.ok-chip{color:#5cb87f;font-size:12px;white-space:nowrap}
-.acctbl{max-height:360px;overflow-y:auto;border:1px solid #242a33;border-radius:8px}
+.ok-chip{color:var(--ok);font-size:12px;white-space:nowrap}
+.acctbl{max-height:360px;overflow-y:auto;border:1px solid var(--line);border-radius:8px}
 .acctbl table{margin:0}
 .acctbl td:first-child,.acctbl th:first-child{width:1%;text-align:center}
-.acctbl thead th{position:sticky;top:0;background:#13161c;z-index:1}
+.acctbl thead th{position:sticky;top:0;background:var(--row);z-index:1}
 .cards{display:flex;gap:14px;flex-wrap:wrap;margin:10px 0 6px}
-.card{background:#13161c;border:1px solid #242a33;border-radius:10px;padding:12px 18px;min-width:130px}
+.card{background:var(--row);border:1px solid var(--line);border-radius:10px;padding:12px 18px;min-width:130px}
 .card .cnum{font-size:22px;font-weight:600;color:#e8edf2}
-.card .clbl{font-size:12px;color:#8b97a4;margin-top:2px}
+.card .cnum.bad{color:var(--bad)}
+.card .clbl{font-size:12px;color:var(--dim-2);margin-top:2px}
 table.recent{font-size:12px}
 table.sortable th{cursor:pointer;user-select:none}
 table.sortable th:hover{color:#dfe6ee}
 table.sortable th .sind{margin-left:4px;color:#5fb8c8;font-size:10px}
+.pager{display:flex;gap:10px;align-items:center;margin:10px 0}
 /* Backend form tabs: one form, four panes, only display switched (_TABS_JS). */
-.btabs{display:flex;flex-wrap:wrap;gap:2px;margin:0 0 12px;border-bottom:1px solid #242a33}
-.btab{background:none;border:0;border-bottom:2px solid transparent;border-radius:0;color:#9aa7b4;font:inherit;font-size:13px;height:auto;padding:7px 12px;width:auto;cursor:pointer}
-.btab:hover{color:#dce4ec;background:#1b1f27}
-.btab.on{color:#fff;border-bottom-color:#3b82f6}
-details.optblock{border:1px solid #242a33;border-radius:8px;padding:6px 10px;margin:0 0 12px}
-details.optblock>summary{cursor:pointer;user-select:none;font-size:12px;color:#8b97a4;padding:2px 0}
-details.optblock>summary:hover{color:#cdd6e0}
+.btabs{display:flex;flex-wrap:wrap;gap:2px;margin:0 0 12px;border-bottom:1px solid var(--line)}
+.btab{background:none;border:0;border-bottom:2px solid transparent;border-radius:0;color:var(--dim);font:inherit;font-size:13px;height:auto;padding:7px 12px;width:auto;cursor:pointer}
+.btab:hover{color:var(--text-hi);background:var(--hover)}
+.btab.on{color:#fff;border-bottom-color:var(--accent)}
+details.optblock{border:1px solid var(--line);border-radius:8px;padding:6px 10px;margin:0 0 12px}
+details.optblock>summary{cursor:pointer;user-select:none;font-size:12px;color:var(--dim-2);padding:2px 0}
+details.optblock>summary:hover{color:var(--text-2)}
 details.optblock[open]>summary{margin-bottom:8px;border-bottom:1px solid #1c2129;padding-bottom:6px}
+/* Phone / narrow window. Desktop keeps <main> as the scroll container (the fixed
+   header + subnav never scroll, see _SCROLL_JS); below 800 px the whole PAGE scrolls
+   instead, the master-detail columns stack, a field's label sits above its control,
+   and a wide table scrolls sideways inside itself instead of widening the page. */
+@media (max-width:800px){
+html,body{height:auto}
+body{overflow:visible;display:block}
+header{flex-wrap:wrap;padding:0 12px}
+.brand{padding:10px 12px 10px 0}
+nav a{padding:10px 9px}
+.subnav{padding:0 12px}
+.subnav a{padding:8px 9px}
+main{overflow:visible;padding:12px 16px}
+.cols{display:block;height:auto}
+.cols>.col{height:auto;overflow:visible;padding:0}
+.cols>.col+.col{border-left:0;margin-left:0;padding-left:0;border-top:1px solid var(--line-4);margin-top:16px;padding-top:12px}
+.field{flex-wrap:wrap;gap:4px 14px}
+.field>label{flex:1 1 100%}
+.field>.control{max-width:none;flex-wrap:wrap}
+.field>.fhint{margin-left:0}
+.control.short input,.control.short select{max-width:none}
+table{display:block;overflow-x:auto;max-width:100%}
+th,td{overflow-wrap:break-word}
+img.result,video.result,audio.result{max-width:100%}
+.bar,.formbar{flex-wrap:wrap}
+.cards{gap:8px}.card{min-width:0;flex:1 1 40%;padding:10px 12px}
+}
 """
 
 
@@ -344,18 +400,24 @@ details.optblock[open]>summary{margin-bottom:8px;border-bottom:1px solid #1c2129
 # restore, which runs once at load, is inert from the first tick onward. The browser's
 # own scroll restoration is no substitute: it applies to history navigation (Back /
 # Forward), not to F5 or to re-clicking the same nav link.
+# Below 800 px (the phone layout in _CSS) the PAGE scrolls instead of <main>, so the
+# document's scrolling element is tracked as a pane too — on desktop it never moves.
+# Saving listens ONCE on document in the capture phase (scroll does not bubble, but it
+# is captured): a `.col` the morph brings in after load is covered without re-binding,
+# where a per-element listener bound at load silently missed it.
 _SCROLL_JS = ("<script>(function(){"
               "var q=location.search.replace(/([?&])saved=[^&]*&?/,'$1').replace(/[?&]$/,'');"
               "var b='scr:'+location.pathname;"
-              "function t(){var o=[],m=document.querySelector('main');"
+              "function t(){var o=[],m=document.querySelector('main'),se=document.scrollingElement;"
               "if(m)o.push([m,b+q+'|main']);"
+              "if(se)o.push([se,b+q+'|doc']);"
               "[].slice.call(document.querySelectorAll('.col')).forEach(function(e,j){"
               "o.push([e,j===0?b+'|master':b+q+'|c'+j]);});return o;}"
               "try{t().forEach(function(p){var v=sessionStorage.getItem(p[1]);"
               "if(v!=null)p[0].scrollTop=+v;});}catch(e){}"
               "var d=false;function save(){if(d)return;d=true;requestAnimationFrame(function(){d=false;"
               "try{t().forEach(function(p){sessionStorage.setItem(p[1],p[0].scrollTop);});}catch(e){}});}"
-              "t().forEach(function(p){p[0].addEventListener('scroll',save);});"
+              "document.addEventListener('scroll',save,true);"
               "window.addEventListener('beforeunload',save);"
               "})();</script>")
 
@@ -633,7 +695,9 @@ def _page(title: str, body: str, active: str = "", refresh: Optional[int] = None
     head = "" if nologin else _nav(active)        # login page renders without the nav
     # subnav (see SUBTABS) renders as a second header row — outside <main>, so it
     # never scrolls and sits flush under the tabs.
-    return (f'<!doctype html><html><head><meta charset="utf-8"><title>{_esc(title)} · AI-Hub</title>'
+    return (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
+            f'<meta name="viewport" content="width=device-width,initial-scale=1">'
+            f'<title>{_esc(title)} · AI-Hub</title>'
             f"<style>{_CSS}</style></head><body>{head}{subnav}<main{live}>{body}</main>"
             f"{_CONFIRM_JS}{_SCROLL_JS}{_SORT_JS}{_TABS_JS}{_LIVE_JS}</body></html>")
 
