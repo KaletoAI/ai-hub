@@ -585,7 +585,15 @@ they need via injected callables, staying hot-reload-safe.
   skeleton every state (completed / stream events / background queued-failed)
   builds on. `main.py` keeps the endpoints, dispatch/parking, and background
   mode; the adapter attaches `resp.parsed_json` so the bridge never re-parses
-  the raw body.
+  the raw body. Streamed `delta.tool_calls` are collected per slot (the Messages
+  bridge's index/id rule) and emitted as complete `function_call` items after the
+  message/reasoning items (`output_item.added` → `function_call_arguments.delta`/
+  `.done` → `output_item.done`); a stream that dies — an upstream exception, an
+  in-band `error` payload, or an end with neither `finish_reason` nor `[DONE]` — ends
+  in `response.failed`, never `completed` around a truncated text. In the request
+  direction, consecutive `function_call` items (and the assistant text of that turn)
+  become ONE assistant message — one message per call is a 400 on strict servers.
+  `test_responses_bridge.py`.
 - **`anthropic_bridge.py`** — pure Messages↔Chat translation (no gateway state,
   no `main`/`adapters` imports): `messages_to_chat` / `chat_to_messages` /
   `messages_stream` (chat SSE → Anthropic SSE) / `estimate_input_tokens` and
