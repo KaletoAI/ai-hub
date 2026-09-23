@@ -893,6 +893,12 @@ async def lifespan(app: FastAPI):
     # discovered too.
     store.init(jobs_cfg.get("store_path", "store.db"))
     store.bootstrap(image_models)
+    for _alias, _cands in store.list_aliases().items():
+        if adapters.migrate_upload_pins(_cands):
+            store.upsert(_alias, _cands)
+            logger.warning(f"store: alias '{_alias}': pinned image 'playground upload' → 8×8 "
+                           "placeholder (that option always ran on the placeholder and is gone; "
+                           "bind the loader as an image request field instead)")
     backend_models.update(store.load_backend_models())   # seed last-known models (offline → 503, not 403)
     backend_context.update(store.load_backend_context())  # learned context windows survive a restart
     apply_server_settings()            # overlay UI-managed server settings onto config

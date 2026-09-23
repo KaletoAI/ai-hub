@@ -1248,9 +1248,10 @@ def _value_control(name: str, node: str, field: str, value, wf: dict, oi: dict) 
         flag = ' <span class="bad">(stale)</span>' if stale else ""
         return _select(name, o, cur) + flag
     if adapters.is_img_loader_class(cls) and field == "image":
-        o = [(adapters.UPLOAD_SENTINEL, "playground upload (8×8 if empty)"),
-             (adapters.PLACEHOLDER_SENTINEL, "8×8 placeholder (always)")]
-        if cur and cur not in (adapters.PLACEHOLDER_SENTINEL, adapters.UPLOAD_SENTINEL):
+        # A request image is an image SLOT (Request fields); a pin is the admin's fixed
+        # value — the 8×8 placeholder or one of the workflow's own files.
+        o = [(adapters.PLACEHOLDER_SENTINEL, "8×8 placeholder (always)")]
+        if cur and cur != adapters.PLACEHOLDER_SENTINEL:
             o.append((cur, cur))
         return _select(name, o, cur)
     if isinstance(file_val, bool):
