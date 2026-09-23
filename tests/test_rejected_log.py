@@ -11,6 +11,11 @@ So the caller-chosen strings are cut to a fixed length before they are stored, a
 rows — the only refusal an unauthenticated stranger can produce at will — are recorded
 at most `_UNAUTH_LOG_PER_MIN` per minute; the rest are counted and summarised in one
 log line.
+
+And the refused body itself, which is never stored, was still serialised WHOLE on the
+event loop just to cut the preview's 50 + 50 characters from it — a stall per refused
+retry of a multi-MB context that shows as nothing but a sluggish gateway. The preview
+must come out identical from the bounded stand-in (`_ends_only`).
 """
 import asyncio
 import os
@@ -86,6 +91,32 @@ class RejectedLog(unittest.TestCase):
     def test_other_refusals_are_not_rate_limited(self):
         self._run([_req(alias="a") for _ in range(main._UNAUTH_LOG_PER_MIN + 40)], status=503)
         self.assertEqual(len(self.rows), main._UNAUTH_LOG_PER_MIN + 40)
+
+    def test_the_preview_does_not_serialise_the_whole_body(self):
+        # R12: the request itself is not stored for a refusal — it only feeds the
+        # two-ends preview — yet the whole body was json.dumps'ed on the event loop,
+        # ~25-30 ms per MB, per refused retry. The text handed over stays small and
+        # yields the SAME preview as the full serialisation.
+        import json
+        big = {"model": "claude-x", "stream": True, "tools": [{"name": f"t{i}"} for i in range(5000)],
+               "messages": [{"role": "user", "content": "héllo " + "x" * 3_000_000},
+                            {"role": "assistant", "content": [{"type": "text", "text": "y" * 900}]},
+                            {"role": "user", "content": "  the  last\nquestion  " + "z" * 2_000_000 + " end"}]}
+        r = _req(alias="claude-x")
+        r.state.gw_body = big
+        self._run([r])
+        text = self.rows[0]["request_text"]
+        self.assertLess(len(text), 100_000)
+        self.assertEqual(stats._preview(text), stats._preview(json.dumps(big, ensure_ascii=False)))
+        self.assertFalse(self.rows[0]["store_request"])
+
+    def test_a_small_body_is_passed_as_is(self):
+        import json
+        body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+        r = _req(alias="m")
+        r.state.gw_body = body
+        self._run([r])
+        self.assertEqual(self.rows[0]["request_text"], json.dumps(body, ensure_ascii=False))
 
     def test_source_header_is_cut_everywhere(self):
         self.assertLessEqual(len(main._source_of(_req(source="z" * 9999))), main._LOG_FIELD_MAX)

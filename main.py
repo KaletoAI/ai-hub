@@ -1144,6 +1144,52 @@ def _unauth_row_allowed() -> bool:
     return True
 
 
+# How much of each END of a refused body `_ends_only` keeps exact: at least the window
+# `stats._preview` reads from each end before collapsing whitespace (8 × (50 + 50)).
+_PREVIEW_ENDS = 1024
+
+
+def _ends_only(v, w: int = _PREVIEW_ENDS):
+    """A stand-in for `v` whose `json.dumps` has the SAME first and last `w` characters
+    as `json.dumps(v)`, at a size bounded by `w` per nesting level instead of the body's.
+
+    A refusal stores no request (`store_request=False`), only the preview built from
+    the serialised body's two ends — and serialising a multi-MB Claude Code context on
+    the event loop for that cost ~25-30 ms per MB, per refused retry. Strings keep
+    their first and last `w` characters; a list or object keeps items from the front
+    until they serialise to `w` characters, the same from the back, and drops the
+    middle. Only the item where a run reaches `w` can itself be shortened, so the two
+    ends stay character-exact (the same separators as json.dumps' defaults)."""
+    if isinstance(v, str):
+        return v if len(v) <= 2 * w else v[:w] + v[-w:]
+    if isinstance(v, list):
+        items, dump = list(range(len(v))), (lambda i, x: json.dumps(x, ensure_ascii=False))
+    elif isinstance(v, dict):
+        keys = list(v)
+        items = keys
+        dump = (lambda k, x: json.dumps(str(k), ensure_ascii=False) + json.dumps(x, ensure_ascii=False))
+    else:
+        return v
+    front, back, acc = [], [], 0
+    for i in items:
+        x = _ends_only(v[i], w)
+        front.append((i, x))
+        acc += len(dump(i, x)) + 2
+        if acc >= w:
+            break
+    acc, stop = 0, len(front)
+    for i in reversed(items[stop:]):
+        x = _ends_only(v[i], w)
+        back.append((i, x))
+        acc += len(dump(i, x)) + 2
+        if acc >= w:
+            break
+    kept = front + back[::-1]
+    if isinstance(v, list):
+        return [x for _, x in kept]
+    return {k: x for k, x in kept}
+
+
 def _record_rejected(request: Request, exc: HTTPException) -> None:
     """Fire-and-forget stats row for a refused call. Never raises into the response
     path: a logging failure must not turn a clean 503 into a 500."""
@@ -1164,7 +1210,9 @@ def _record_rejected(request: Request, exc: HTTPException) -> None:
             alias=_clip(alias), model=None,
             endpoint=_clip(getattr(request.state, "gw_endpoint", None) or request.url.path),
             status=exc.status_code, input_tokens=0, output_tokens=0, cost_usd=0.0,
-            request_text=(json.dumps(body, ensure_ascii=False) if isinstance(body, dict) else None),
+            # Feeds the preview only (store_request=False) — its two ends are all it reads.
+            request_text=(json.dumps(_ends_only(body), ensure_ascii=False)
+                          if isinstance(body, dict) else None),
             response_text=json.dumps({"error": {"message": str(exc.detail)}}, ensure_ascii=False),
             # The reason is the body worth keeping; the request only feeds the preview —
             # an agent retrying a refused 1 MB request stored it once per retry.

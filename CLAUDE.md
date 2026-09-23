@@ -667,6 +667,9 @@ they need via injected callables, staying hot-reload-safe.
   (`retention_days`, default 0 = forever) is separate because the aggregates and the
   monthly cost quota read the rows. A refused call keeps its reason, not its request
   (`store_request=False`): one agent retrying a refused 1 MB request stored it per retry.
+  Its preview is built from `main._ends_only(body)` — a stand-in whose JSON has the SAME
+  first/last 1024 characters at a bounded size — never from the whole body dumped on the
+  loop per refusal (`test_rejected_log.py`).
   The row goes in with `has_body` in ONE autocommitted INSERT on a
   `synchronous=NORMAL` connection (WAL: no fsync per call, never inconsistent).
   `month_cost` (the monthly cost quota, asked on EVERY request of a capped user) is
