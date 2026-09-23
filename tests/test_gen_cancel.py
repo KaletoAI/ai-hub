@@ -210,6 +210,9 @@ class CancelASyncJob(unittest.TestCase):
             await asyncio.sleep(0.01)
             self.assertIn("jobS", main._gen_tasks)       # visible to cancel_generation
             self.assertTrue(await main.cancel_generation("jobS"))
+            # the worker has UNWOUND by the time cancel returns — its slot is released, so
+            # the after-cancel VRAM free does not skip the backend as still busy
+            self.assertEqual(ran_on, ["cancelled"])
             await asyncio.wait_for(sync, 2)               # the request handler returns
         asyncio.run(go())
         self.assertEqual(ran_on, ["cancelled"])

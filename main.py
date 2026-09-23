@@ -4205,6 +4205,9 @@ async def cancel_generation(job_id: str) -> bool:
     t = _gen_tasks.get(job_id)
     if t and not t.done():
         t.cancel()
+        # Let the worker unwind — stop its prompt, release its slot — before the free
+        # below looks at the backend: with the slot still held it would skip the free.
+        await asyncio.wait({t}, timeout=15.0)
     elif adapter is not None:
         await adapter.cancel(job_id)
     if b:
