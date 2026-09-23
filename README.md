@@ -1295,7 +1295,8 @@ stats:
   USD/million tokens — Together's per-million and OpenRouter's per-token schemas).
   Local backends → 0.
 - **Source** is the authenticated user, else the `X-Source` header, else client IP
-  (IP aliases give those friendly names; reverse-DNS is auto-resolved).
+  (IP aliases give those friendly names; the Users page offers reverse-DNS names and
+  stores them on *Save resolved names*).
 - **Streaming** calls record real tokens when the backend honors
   `stream_options.include_usage` (requested automatically); a backend that reports
   nothing — or all-zero usage, as LocalAI does — is replaced by gateway estimates

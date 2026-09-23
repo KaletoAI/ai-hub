@@ -628,8 +628,9 @@ they need via injected callables, staying hot-reload-safe.
   never a rewritten form `action`, which a back/forward-cache restore would then Save
   into). Query values go through `_q` (`quote(safe="")`), never `_esc`: the HTML escape
   split `a&b` into `a` plus a stray `amp;b`. `test_ui_post_only.py` walks the handlers
-  by AST (no GET route may reach a store/jobs write or a mutating callback; the one
-  exception is `_autoresolve_ips`' reverse-DNS cache) and crawls the rendered pages (no
+  by AST (no GET route may reach a store/jobs write or a mutating callback — no
+  exceptions: `_autoresolve_ips` keeps its reverse-DNS names in memory, `_ip_dns`, and
+  only the Users page's *Save resolved names* POST stores them) and crawls the rendered pages (no
   link, no `location.href` to an action). Editor forms carry `data-guard`: an edited one
   left by anything but its own submit (an action, a nav tab) gets the browser's
   unsaved-changes prompt; **Update workflow** applies the whole editor form before it
@@ -982,8 +983,8 @@ they need via injected callables, staying hot-reload-safe.
   editor's option list are pinned).
   `test_ui_post_only.py` (console actions are POST-only: a GET link fires on any
   navigation — preview, prefetch, a pasted URL — and nothing logs the store change. Walks
-  the handlers by AST (no GET route may reach a store/jobs write or a mutating callback;
-  `_autoresolve_ips`' reverse-DNS cache is the one exception), crawls the rendered pages
+  the handlers by AST (no GET route may reach a store/jobs write or a mutating callback,
+  no exceptions), crawls the rendered pages
   (no link or `location.href` to an action), checks that names with `& + # %` survive
   every action URL — the HTML escape split `a&b` into `a` + `amp;b` and ran the action on
   another alias — and that the Mapping editor keeps typed edits across Update workflow, a

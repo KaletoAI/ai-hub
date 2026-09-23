@@ -849,7 +849,7 @@ _POST_ACTIONS = frozenset((
     "/ui/reasoning/toggle", "/ui/reasoning/delete",
     "/ui/playground/voice-ship", "/ui/playground/voice-del",
     "/ui/job/{job_id}/cancel",
-    "/ui/users/delete", "/ui/ipalias/delete",
+    "/ui/users/delete", "/ui/ipalias/delete", "/ui/ipalias/save-resolved",
 ))
 _POST_ACTION_RES = [re.compile("^" + re.sub(r"\\\{[^}]*\\\}", "[^/]+", re.escape(p)) + "$")
                     for p in _POST_ACTIONS]
@@ -6563,17 +6563,22 @@ async def _reverse_dns(ip: str) -> str:
 
 _ip_resolving: set = set()          # IPs a background lookup is working on right now
 _ip_resolve_tasks: set = set()      # strong refs, or the loop may drop a running task
+_ip_dns: dict = {}                  # ip -> reverse-DNS name ('' = looked up, none) — MEMORY only
+_IP_DNS_MAX = 2000
 
 
 def _autoresolve_ips(by_source: list) -> None:
     """Best-effort: for caller IPs seen in stats with no alias yet, reverse-DNS them
-    and persist the hostname (or '' to mark 'attempted', so we don't retry forever).
-    Runs in the BACKGROUND — up to 20 lookups at 1.5 s each held the Users render
-    whenever the resolver was slow or down; the names show on the next render.
-    Takes the caller's already-fetched stats.sources() rows (one query/render)."""
+    into `_ip_dns` (a name, or '' so a dead lookup is not retried every render). Runs
+    in the BACKGROUND — up to 20 lookups at 1.5 s each held the Users render whenever
+    the resolver was slow or down; the names show on the next render. Never writes the
+    store: the Users page is a GET, and a GET changes no state — the names are offered
+    there and persisted only by the operator's "Save resolved names" (POST,
+    _save_resolved_ips). Takes the caller's already-fetched stats.sources() rows."""
     aliases = store.get_ip_aliases()
     todo = [r[0] for r in by_source
-            if _looks_like_ip(r[0]) and r[0] not in aliases and r[0] not in _ip_resolving][:20]
+            if _looks_like_ip(r[0]) and r[0] not in aliases and r[0] not in _ip_dns
+            and r[0] not in _ip_resolving][:20]
     if not todo:
         return
     _ip_resolving.update(todo)
@@ -6581,10 +6586,10 @@ def _autoresolve_ips(by_source: list) -> None:
     async def run():
         try:
             names = await asyncio.gather(*[_reverse_dns(ip) for ip in todo])
-            current = store.get_ip_aliases()      # re-read: an alias may have been set meanwhile
+            if len(_ip_dns) > _IP_DNS_MAX:
+                _ip_dns.clear()
             for ip, name in zip(todo, names):
-                current.setdefault(ip, name)
-            store.save_ip_aliases(current)
+                _ip_dns[ip] = name
         except Exception as e:
             logger.warning(f"ip alias auto-resolve failed: {e}")
         finally:
@@ -6592,6 +6597,17 @@ def _autoresolve_ips(by_source: list) -> None:
     task = asyncio.create_task(run())
     _ip_resolve_tasks.add(task)
     task.add_done_callback(_ip_resolve_tasks.discard)
+
+
+def _save_resolved_ips() -> int:
+    """Persist every resolved name whose IP has no alias yet (an operator's alias is
+    never overwritten). Returns how many were stored."""
+    current = store.get_ip_aliases()
+    new = {ip: name for ip, name in _ip_dns.items() if name and ip not in current}
+    if new:
+        current.update(new)
+        store.save_ip_aliases(current)
+    return len(new)
 
 
 def _dash_cards(d: dict, bes: list, f: Optional[dict] = None) -> str:
@@ -7720,16 +7736,27 @@ async def _users_view(qp, detail: Optional[str] = None, status: int = 200) -> HT
     ipa = store.get_ip_aliases()
     seen_ips = sorted({r[0] for r in by_source if _looks_like_ip(r[0])} | set(ipa.keys()))
     iprows = ""
+    pending = 0
     for ip in seen_ips:
-        iprows += (f"<tr><td><code>{_esc(ip)}</code></td>"
+        dns = _ip_dns.get(ip, "") if ip not in ipa else ""
+        pending += bool(dns)
+        hint = (f" <span class='muted' title='reverse DNS — not saved yet'>{_esc(dns)} "
+                f"(resolved)</span>" if dns else "")
+        iprows += (f"<tr><td><code>{_esc(ip)}</code>{hint}</td>"
                    f"<td><form action='/ui/ipalias/save' method='post' style='display:flex;gap:6px;align-items:center;margin:0'>"
-                   f"<input type='hidden' name='ip' value='{_esc(ip)}'>{_inp('name', ipa.get(ip, ''), placeholder='alias')}"
+                   f"<input type='hidden' name='ip' value='{_esc(ip)}'>"
+                   f"{_inp('name', ipa.get(ip, ''), placeholder=dns or 'alias')}"
                    f"{_btn('Save', submit=True)}</form></td>"
                    f"<td style='text-align:right;white-space:nowrap'>"
                    f"{_icon_acts(('✕', f'/ui/ipalias/delete?ip={quote(ip)}', 'danger', 'Delete', f'Delete IP alias {ip}?'))}</td></tr>")
+    save_all = (" " + _btn(f"Save resolved names ({pending})", "/ui/ipalias/save-resolved",
+                           "secondary", sm=True,
+                           title="Store every reverse-DNS name shown as (resolved) as that "
+                                 "IP's alias — existing aliases are kept") if pending else "")
     ip_section = ("<h2 style='margin-top:26px'>IP aliases</h2>"
                   "<p class='hint'>Friendly names for caller IPs (unauthenticated / <code>x-source</code> calls) as shown in "
-                  "Statistics. Hostnames are auto-resolved via reverse DNS on load — edit or clear as needed.</p>"
+                  "Statistics. Hostnames are looked up via reverse DNS on load and offered as "
+                  "<i>(resolved)</i> — nothing is stored until you save it." + save_all + "</p>"
                   + (f"<table><tr><th>IP</th><th>alias</th><th></th></tr>{iprows}</table>" if iprows
                      else "<p class='muted'>No caller IPs seen yet (calls are currently attributed to authenticated users).</p>"))
     # Design convention (mirrors Mapping): the master-detail .cols is the SOLE full-height
@@ -7747,6 +7774,12 @@ async def ipalias_save(request: Request):
     if ip:
         store.set_ip_alias(ip, name)
         logger.info(f"ui: ip alias '{ip}' → '{name or '(cleared)'}'")
+    return RedirectResponse("/ui/users", status_code=303)
+
+
+async def ipalias_save_resolved(request: Request):
+    n = _save_resolved_ips()
+    logger.info(f"ui: {n} reverse-DNS name(s) saved as IP aliases")
     return RedirectResponse("/ui/users", status_code=303)
 
 
@@ -8087,5 +8120,6 @@ def register(app) -> None:
     app.add_api_route("/ui/users/delete", users_del, methods=["POST"])
     app.add_api_route("/ui/ipalias/save", ipalias_save, methods=["POST"])
     app.add_api_route("/ui/ipalias/delete", ipalias_del, methods=["POST"])
+    app.add_api_route("/ui/ipalias/save-resolved", ipalias_save_resolved, methods=["POST"])
     app.add_api_route("/ui/server", server_page, methods=["GET"])
     app.add_api_route("/ui/server/save", server_save, methods=["POST"])

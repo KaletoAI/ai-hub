@@ -60,9 +60,10 @@ _MUTATING_CALLBACKS = {"_cancel_generation", "_drain_backend", "_cancel_drain", 
                        "_set_backend_enabled", "_voice_lib_save", "_voice_lib_delete",
                        "_voice_lib_ship", "_scan_start", "_apply_backends", "_apply_chat_aliases",
                        "_apply_server_settings", "_apply_users", "_apply_reasoning", "_apply_hosts"}
-# Views that persist a DERIVED value as a cache: the reverse-DNS name of a caller IP
-# (idempotent, not user-driven). Everything else a view touches must be read-only.
-_ALLOWED_VIEW_WRITES = {"_autoresolve_ips"}
+# Views that may write despite being a GET: none. (The Users page's reverse-DNS names
+# used to be persisted from the render; they now stay in memory until the operator
+# presses "Save resolved names", a POST.)
+_ALLOWED_VIEW_WRITES: set = set()
 
 
 def _admin_tree():

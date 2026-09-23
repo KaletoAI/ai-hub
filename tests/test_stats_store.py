@@ -364,7 +364,25 @@ class IpAutoResolve(unittest.TestCase):
         finally:
             store.get_ip_aliases, store.save_ip_aliases, admin._reverse_dns = saved
         self.assertLess(spent, 0.2)
-        self.assertEqual(mem, {"10.0.0.1": "host-10.0.0.1"})
+        # a GET never writes the store: the names wait in memory for an explicit Save
+        self.assertEqual(mem, {})
+        self.assertEqual(admin._ip_dns.get("10.0.0.1"), "host-10.0.0.1")
+
+    def test_save_resolved_persists_only_unaliased_names(self):
+        saved = (store.get_ip_aliases, store.save_ip_aliases, dict(admin._ip_dns))
+        mem = {"10.0.0.2": "mine"}
+        store.get_ip_aliases = lambda: dict(mem)
+        store.save_ip_aliases = lambda d: (mem.clear(), mem.update(d))
+        admin._ip_dns.clear()
+        admin._ip_dns.update({"10.0.0.1": "host-a", "10.0.0.2": "host-b", "10.0.0.3": ""})
+        try:
+            n = admin._save_resolved_ips()
+        finally:
+            store.get_ip_aliases, store.save_ip_aliases = saved[:2]
+            admin._ip_dns.clear()
+            admin._ip_dns.update(saved[2])
+        self.assertEqual(n, 1)
+        self.assertEqual(mem, {"10.0.0.1": "host-a", "10.0.0.2": "mine"})
 
 
 if __name__ == "__main__":
