@@ -2224,6 +2224,16 @@ async def _dispatch_over(candidates, path, alias, body, request, stats_endpoint=
                                          "generating (and billing) this request")
             logger.warning(f"✗ [{backend['name']}] {_err_text(e)} — trying next")
             last_error = e
+        except httpx.PoolTimeout:
+            # The GATEWAY's shared connection pool is exhausted — no backend saw the
+            # call. It is the same pool for every candidate, so a failover only waits
+            # the pool timeout again per backend, and charging each one a "timeout"
+            # fault blames a fleet for the gateway's own load.
+            logger.warning(f"✗ connection pool exhausted — {alias} refused "
+                           f"({adapters._CHAT_TIMEOUT.pool:g} s wait for a free connection)")
+            raise HTTPException(503, "gateway busy: no free upstream connection in the "
+                                     f"shared pool within {adapters._CHAT_TIMEOUT.pool:g} s",
+                                headers={"Retry-After": "5"})
         except httpx.TransportError as e:
             # Every transport failure surfaces BEFORE the client saw a byte (a stream is
             # opened, headers and status read, before the adapter answers): connect

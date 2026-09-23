@@ -1048,7 +1048,9 @@ they need via injected callables, staying hot-reload-safe.
   `paid` for this: the scheduler puts unpaid before paid, so a flat subscription marked
   paid would sort behind every unpaid candidate of a mixed alias.
   `adapters._CHAT_TIMEOUT` is `httpx.Timeout(300, connect=10, pool=30)` — a scalar 300
-  let a SYN-swallowing host hold the failover for five minutes. Anything else an adapter
+  let a SYN-swallowing host hold the failover for five minutes. A `PoolTimeout` (the
+  gateway's OWN shared pool exhausted, `max_connections` 200) is no backend's failure:
+  503 + `Retry-After`, no failover (same pool for every candidate) and no fault row. Anything else an adapter
   raises is a clean 502 naming the backend (fault kind `error`, no failover — a bug
   reproduces), and `main._unexpected_error` turns any exception left over on `/v1/*`
   into a 502 through the HTTPException handler, so it is logged and `/v1/messages`
