@@ -107,8 +107,9 @@ class NumericSort(unittest.TestCase):
 
     def test_units_are_understood(self):
         keys = _node_num([{"text": "1.2 s"}, {"text": "102 ms"}, {"text": "3.5 min"},
-                          {"text": "5m"}, {"text": "2h"}, {"text": "$0.0012"}])
-        self.assertEqual(keys, [1200, 102, 210000, 300000, 7200000, 0.0012])
+                          {"text": "5m"}, {"text": "2h"}, {"text": "$0.0012"},
+                          {"text": "<$0.01"}])
+        self.assertEqual(keys, [1200, 102, 210000, 300000, 7200000, 0.0012, 0.01])
 
     def test_raw_value_wins_over_the_text(self):
         self.assertEqual(_node_num([{"text": "09-23 12:00:00", "sv": "1799999400"}]),
@@ -290,6 +291,34 @@ class KeyboardReorder(unittest.TestCase):
         js = admin._reorder_js("a")
         self.assertIn("data-mv", js)
         self.assertIn("dispatchEvent", js)
+
+
+class Formatters(unittest.TestCase):
+    """U19: a sum of $0.004 read "$0.0040" next to "$12.3400"; a call-log time had no
+    year, so last December's rows looked like this week's."""
+
+    def test_sums_use_cents(self):
+        self.assertEqual(admin._cost_sum(12.34), "$12.34")
+        self.assertEqual(admin._cost_sum(0), "$0.00")
+        self.assertEqual(admin._cost_sum(0.004), "<$0.01")
+
+    def test_single_calls_stay_precise(self):
+        self.assertEqual(admin._cost(0.0012), "$0.0012")
+        self.assertEqual(admin._cost(0.25), "$0.250")
+        self.assertEqual(admin._cost(3.5), "$3.50")
+        self.assertEqual(admin._cost(0), "$0")
+        self.assertEqual(admin._cost(0.00001), "<$0.0001")
+
+    def test_timestamp_shows_the_year_only_when_it_differs(self):
+        import time
+        now = int(time.time())
+        self.assertRegex(admin._ts(now), r"^\d\d-\d\d \d\d:\d\d:\d\d$")
+        self.assertRegex(admin._ts(now - 400 * 86400), r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$")
+
+    def test_uncapped_in_flight_says_so(self):
+        html = admin._dash_backends([{"name": "a", "type": "openai", "enabled": True,
+                                      "healthy": True, "inflight": 0}], [])
+        self.assertIn("<td>0 / ∞</td>", html)
 
 
 if __name__ == "__main__":

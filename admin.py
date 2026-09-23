@@ -464,7 +464,7 @@ _SCROLL_JS = ("<script>(function(){"
 _SORT_JS = ("<script>(function(){"
             "function num(td){var v=td.getAttribute('data-sv');"
             "if(v!==null&&v!==''&&!isNaN(+v))return +v;"
-            "var t=(td.textContent||'').trim().replace(/[$,\\s]/g,'');"
+            "var t=(td.textContent||'').trim().replace(/[$,<~\\s]/g,'');"
             "var m=/^(-?\\d+(?:\\.\\d+)?)(ms|s|min|m|h|d)?$/.exec(t);if(!m)return null;"
             "var f={ms:1,s:1e3,min:6e4,m:6e4,h:36e5,d:864e5};"
             "return parseFloat(m[1])*(m[2]?f[m[2]]:1);}"
@@ -6093,11 +6093,30 @@ async def job_cancel(job_id: str):
 # ── Tabs: stubs ─────────────────────────────────────────────────────────────────
 
 def _cost(v) -> str:
-    return f"${float(v or 0):.4f}"
+    """ONE call's cost: precision that fits the amount — a local call is "$0", a
+    cheap one "$0.0012", a dear one "$3.50". Sums use _cost_sum."""
+    v = float(v or 0)
+    if v == 0:
+        return "$0"
+    if abs(v) < 0.0001:
+        return "<$0.0001"
+    return f"${v:.4f}" if abs(v) < 0.01 else (f"${v:.3f}" if abs(v) < 1 else f"${v:.2f}")
+
+
+def _cost_sum(v) -> str:
+    """A total (cards, per-backend/model/user aggregates): cents, like any bill.
+    "$0.0040" beside "$12.3400" was four digits of noise on every figure."""
+    v = float(v or 0)
+    return "<$0.01" if 0 < v < 0.005 else f"${v:.2f}"
 
 
 def _ts(ts) -> str:
-    return time.strftime("%m-%d %H:%M:%S", time.localtime(int(ts)))
+    """Time stamp in the lists: month-day + time, with the YEAR only when it is not the
+    current one — a call log kept for a year otherwise showed last December's rows as
+    if they were this week's."""
+    t = time.localtime(int(ts or 0))
+    fmt = "%m-%d %H:%M:%S" if t.tm_year == time.localtime().tm_year else "%Y-%m-%d %H:%M:%S"
+    return time.strftime(fmt, t)
 
 
 def _age(ts) -> str:
@@ -6310,7 +6329,7 @@ def _dash_backends(bes: list, offline: list, fmap: Optional[dict] = None) -> str
     brows = ""
     for b in sorted(bes, key=lambda x: (srank(x), x.get("name", "").lower())):
         cap = b.get("max_concurrent")
-        inf = f"{b.get('inflight', 0)}" + (f" / {cap}" if cap else "")
+        inf = f"{b.get('inflight', 0)} / {cap if cap else '∞'}"   # no cap = unlimited, say so
         r1h = b.get("reqs_1h", 0)
         r1h_cell = f"{r1h}" if r1h else "<span class='muted'>0</span>"
         # data-k: _bid (type:name) is this row's identity, and the panel re-sorts
@@ -6658,9 +6677,9 @@ async def statistic_page(request: Request):
                f"under LLM Calls, Media Jobs or Voice Calls, by endpoint.")
     cards = (f"<div class='cards'>"
              f"<div class='card'><div class='cnum'>{s['total_count']}</div><div class='clbl'>calls total</div></div>"
-             f"<div class='card'><div class='cnum'>{_cost(s['total_cost'])}</div><div class='clbl'>cost total</div></div>"
+             f"<div class='card'><div class='cnum'>{_cost_sum(s['total_cost'])}</div><div class='clbl'>cost total</div></div>"
              f"<div class='card'><div class='cnum'>{s['h24_count']}</div><div class='clbl'>calls · 24h</div></div>"
-             f"<div class='card'><div class='cnum'>{_cost(s['h24_cost'])}</div><div class='clbl'>cost · 24h</div></div>"
+             f"<div class='card'><div class='cnum'>{_cost_sum(s['h24_cost'])}</div><div class='clbl'>cost · 24h</div></div>"
              f"<div class='card' title='{_esc(ref_tip)}'>"
              f"<div class='cnum'>{s['refused_24h']}</div>"
              f"<div class='clbl'>refused · 24h</div></div>"
@@ -6669,7 +6688,7 @@ async def statistic_page(request: Request):
     be = "".join(f"<tr><td>{_esc(r[0])}</td><td>{r[1]}</td><td>{r[2]}</td>"
                  + _cache_cells(r[2], r[6] if len(r) > 6 else 0, r[7] if len(r) > 7 else 0,
                                 trend.get(r[0]))
-                 + f"<td>{r[3]}</td><td>{_cost(r[4])}</td><td>{_dur(r[5])}</td></tr>"
+                 + f"<td>{r[3]}</td><td>{_cost_sum(r[4])}</td><td>{_dur(r[5])}</td></tr>"
                  for r in s["by_backend"])
     by_backend = (f"<h2>By backend</h2>"
                   f"<p class='hint'>Prompt cache: <b>cached</b> = input served from the backend's "
@@ -6690,11 +6709,11 @@ async def statistic_page(request: Request):
                       f"no forwarded calls — all {s['refused_count']} were refused"
                       if s["refused_count"] else "no calls yet") + "</p>")
     mo = "".join(f"<tr><td>{_esc(r[0]) or '—'}</td><td><code>{_esc(r[1])}</code></td><td>{r[2]}</td>"
-                 f"<td>{r[3]}</td><td>{r[4]}</td><td>{_cost(r[5])}</td></tr>" for r in s["by_model"])
+                 f"<td>{r[3]}</td><td>{r[4]}</td><td>{_cost_sum(r[5])}</td></tr>" for r in s["by_model"])
     by_model = (f"<h2>By alias / model</h2><table class='filterable sortable' data-sk='stat-model'>"
                 f"<tr><th>alias</th><th>model</th><th>calls</th>"
                 f"<th>in</th><th>out</th><th>cost</th></tr>{mo}</table>" if mo else "")
-    so = "".join(f"<tr><td>{_esc(_src_name(r[0], aliases))}</td><td>{r[1]}</td><td>{_cost(r[2])}</td></tr>" for r in s["by_source"])
+    so = "".join(f"<tr><td>{_esc(_src_name(r[0], aliases))}</td><td>{r[1]}</td><td>{_cost_sum(r[2])}</td></tr>" for r in s["by_source"])
     by_source = (f"<h2>By user / source</h2><table class='filterable sortable' data-sk='stat-source'>"
                  f"<tr><th>source</th><th>calls</th><th>cost</th></tr>"
                  f"{so}</table>" if so else "")
