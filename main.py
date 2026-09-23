@@ -13,11 +13,10 @@ import time
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 from urllib.parse import urlparse
 
 import httpx
-import uvicorn
 import yaml
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.exception_handlers import http_exception_handler
@@ -1493,12 +1492,6 @@ def _nothing_loaded_error(alias: str, path: str) -> Optional[HTTPException]:
                               f"loaded on {', '.join(names)} — 'current' never loads one")
 
 
-def get_routes_for(alias: str) -> list[tuple[dict, str]]:
-    """(backend, real_model) pairs to try, in dispatch order (see resolve_routes) —
-    ready (non-busy) backends only. Thin wrapper over resolve_routes()."""
-    return resolve_routes(alias)[0]
-
-
 def alias_model_conflicts() -> list[dict]:
     """Aliases whose name also exists as a real model id on some backend.
 
@@ -1537,7 +1530,7 @@ def alias_model_conflicts() -> list[dict]:
 def routing_snapshot() -> dict:
     """Diagnostic view of how every alias and discovered model resolves.
 
-    Unlike get_routes_for(), this keeps unhealthy backends and not-yet-discovered
+    Unlike resolve_routes(), this keeps unhealthy backends and not-yet-discovered
     models in the result (flagged), so the dashboard shows the full configured
     picture rather than only what's routable right now.
     """
@@ -2604,7 +2597,7 @@ async def completions(request: Request, authorization: Optional[str] = Header(No
 @app.post("/v1/embeddings")
 async def embeddings(request: Request, authorization: Optional[str] = Header(None)):
     # Same routing as chat: body["model"] is the alias/model, picked up
-    # by get_routes_for(). Embedding responses carry usage.prompt_tokens only
+    # by resolve_routes(). Embedding responses carry usage.prompt_tokens only
     # (no completion_tokens) → cost falls out of the input-price path for free.
     # Backends that filter out embedding models (chat_only) simply won't be
     # candidates here, so the request routes to a backend that actually serves it.
@@ -2693,11 +2686,11 @@ def _gen_routes(alias: str) -> tuple[list, list]:
     return ready, allc
 
 
-def get_gen_routes(alias: str, include_busy: bool = False) -> list[tuple[dict, dict]]:
-    """Single-list view of _gen_routes() — kept for callers that need only one side
-    (image slots, LoRA listing, admin)."""
-    ready, allc = _gen_routes(alias)
-    return allc if include_busy else ready
+def get_gen_routes(alias: str) -> list[tuple[dict, dict]]:
+    """Every allowed + healthy candidate of _gen_routes(), busy ones included — for
+    callers that ask what an alias CAN run on (image slots, LoRA listing, the chain's
+    successor check), not what is free right now."""
+    return _gen_routes(alias)[1]
 
 
 def _force_filter(routes: list, force: str) -> list:
@@ -3674,7 +3667,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
             # alias's best candidate — preferring stage 1's backend if it is itself one
             # (keeps the fast in-process path).
             if relay == "upload":
-                cands2 = await asyncio.to_thread(get_gen_routes, succ_alias, True)   # successor's allowed+healthy backends
+                cands2 = await asyncio.to_thread(get_gen_routes, succ_alias)   # successor's allowed+healthy backends
                 if not cands2:
                     # No candidate configured at all is a config error — fail fast. A
                     # configured successor whose backend is merely in a transient health
@@ -3763,7 +3756,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 # ── Stage 1: mesh (pin the export filename; ignore its own outputs) ──
                 req1 = NormalizedRequest(
                     alias=alias, real_model=stage1_cand.get("model"),
-                    task=stage1_cand.get("task", "text2img"), inputs=inputs, params=params, output={},
+                    inputs=inputs, params=params,
                     workflow=stage1_cand.get("workflow"), workflow_json=s1_wf,
                     node_mapping=stage1_cand.get("mapping") or {},
                     fixed=list(stage1_cand.get("fixed") or []) + list(export.extra_fixed),
@@ -3835,7 +3828,7 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                 # path. `params` is filled in after the feed, once the mesh_ref is known.
                 req2 = NormalizedRequest(
                     alias=succ_alias, real_model=s2.get("model"),
-                    task=s2.get("task", "text2img"), inputs={}, params={}, output={},
+                    inputs={}, params={},
                     workflow=s2.get("workflow"), workflow_json=s2.get("workflow_json"),
                     node_mapping=s2.get("mapping") or {}, fixed=s2.get("fixed") or [], upload_images={},
                     upload_files={},
@@ -4188,8 +4181,7 @@ async def run_generation(body: dict, request: Request,
         # row exists) — every input upload is namespaced by it.
         return NormalizedRequest(
             alias=alias, real_model=cand.get("model"),
-            task=cand.get("task", body.get("task", "text2img")),
-            inputs=inputs, params=params, output=output,
+            inputs=inputs, params=params,
             workflow=cand.get("workflow"), workflow_json=cand.get("workflow_json"),
             node_mapping=cand.get("mapping") or {}, fixed=cand.get("fixed") or [],
             upload_images=dict(upload_images or {}), raw=request,
@@ -4266,7 +4258,7 @@ def _gen_alias_mapping(alias: str) -> tuple[dict, dict]:
     """A generation alias's (workflow, mapping) — from its first candidate, since both
     are backend-independent. Includes busy backends: resolving a request field must not
     depend on which backend happens to be free."""
-    routes = get_gen_routes(alias, include_busy=True)
+    routes = get_gen_routes(alias)
     if not routes:
         return {}, {}
     _, cand = routes[0]
@@ -4380,7 +4372,7 @@ async def gen_alias_loras(alias: str, request: Request, authorization: Optional[
     if not (known or image_models.get(alias)):
         raise HTTPException(404, f"generation alias '{alias}' not found")
     loras: set = set()
-    for b, _ in await asyncio.to_thread(get_gen_routes, alias, include_busy=True):
+    for b, _ in await asyncio.to_thread(get_gen_routes, alias):
         loras |= backend_loras.get(backend_id(b), set())
     return {"object": "list", "alias": alias, "loras": sorted(loras)}
 
@@ -4490,7 +4482,7 @@ def _gen_image_slots(alias: str) -> list:
     loaders per the mapping) — reference images map onto these positionally. Includes
     busy backends: slots are a workflow property, not gated on backend availability
     (else a busy backend would silently drop the uploaded reference images)."""
-    routes = get_gen_routes(alias, include_busy=True)
+    routes = get_gen_routes(alias)
     if not routes:
         return []
     _, cand = routes[0]

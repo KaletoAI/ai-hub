@@ -130,7 +130,7 @@ class TestTripoAdapter(unittest.TestCase):
         cand["tripo"]["endpoint"] = endpoint
         cand["tripo"]["options"].update(opts)
         return adapters.NormalizedRequest(
-            alias="Tripo-Object", real_model=model or tripo.AI_MODELS[0], task="img2mesh",
+            alias="Tripo-Object", real_model=model or tripo.AI_MODELS[0],
             params=dict(values or {}), upload_images=dict(images or {}),
             upload_files=dict(files or {}), cloud=cand["tripo"], upload_prefix="gw_j1")
 

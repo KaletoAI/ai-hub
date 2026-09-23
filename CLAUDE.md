@@ -884,7 +884,7 @@ they need via injected callables, staying hot-reload-safe.
   slot AND frees its ComfyUI VRAM once the mesh is in hand, then claims the
   stage-2 slot.
 
-### Routing rules (`get_routes_for`/`get_gen_routes` + `alias_entry`)
+### Routing rules (`resolve_routes`/`get_gen_routes` + `alias_entry`)
 
 A backend is a candidate only if enabled, healthy, **not busy** (in-flight cap),
 maps the alias, and exposes the resolved model. Recurring concepts:

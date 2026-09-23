@@ -395,10 +395,8 @@ class NormalizedRequest:
     # forwarding, so they never reach a backend.
     reasoning: Optional[str] = None                 # normalized reasoning control: "off" | "on" | None(auto)
     # ── generation extension ──
-    task: str = "chat"                              # text2img | img2video | tts | …
     inputs: dict = field(default_factory=dict)      # prompt, negative_prompt, …
     params: dict = field(default_factory=dict)      # width, height, steps, cfg, seed, …
-    output: dict = field(default_factory=dict)      # n, format, mode, ttl_s
     workflow: Optional[str] = None                  # workflow file path (share/legacy)
     workflow_json: Optional[dict] = None            # gateway-owned API workflow (preferred)
     node_mapping: dict = field(default_factory=dict)  # {param: {node, field}} request-time
@@ -2348,9 +2346,9 @@ def suggest_mapping(wf: dict) -> dict:
         m["seed"] = {"node": rn, "field": "noise_seed"}
 
     if (ks := _node_by_class(wf, "KSampler")) is not None:
-        for param, field in (("steps", "steps"), ("cfg", "cfg"),
+        for param, fname in (("steps", "steps"), ("cfg", "cfg"),
                              ("sampler", "sampler_name"), ("scheduler", "scheduler")):
-            m[param] = {"node": ks, "field": field}
+            m[param] = {"node": ks, "field": fname}
 
     # Every REMAINING node titled `input_<name>` is a declared bind point (the mesh
     # workflows follow this strictly — see sample_comfyui_workflows/README.md): the
@@ -2494,7 +2492,6 @@ class ComfyUIAdapter(BackendAdapter):
         # executor watchdog (discover-driven): pending head seen while nothing ran
         self._stuck_head: Optional[str] = None
         self._stuck_since: float = 0.0
-        self._stuck_checks: int = 0
         self.exec_stuck: bool = False
         self.last_restart: float = 0.0        # ts of the last restart() call (cooldown)
         self.last_restart_result: str = ""    # "" | running | ok | timeout | no-manager
@@ -2526,10 +2523,9 @@ class ComfyUIAdapter(BackendAdapter):
         if head is None or head != self._stuck_head:
             self._stuck_head = head               # None (healthy) or new tracking baseline
             self._stuck_since = time.time()
-            self._stuck_checks = 0
             self.exec_stuck = False
             return
-        self._stuck_checks += 1                   # same head again, still nothing running
+        # same head again, still nothing running
         after = float(self.backend.get("stuck_after_s") or _COMFY_STUCK_AFTER_S)
         if time.time() - self._stuck_since >= after:
             self.exec_stuck = True
@@ -2568,7 +2564,7 @@ class ComfyUIAdapter(BackendAdapter):
                 async with _pooled_client(self.ctx) as client:
                     r = await client.get(f"{url}/object_info", timeout=_COMFY_DISCOVERY_TIMEOUT)
                 if r.status_code == 200:
-                    self._stuck_head, self._stuck_checks = None, 0
+                    self._stuck_head = None
                     self.exec_stuck = False
                     self.last_restart_result = "ok"
                     logger.info(f"[{self.name}] ComfyUI back up after restart")

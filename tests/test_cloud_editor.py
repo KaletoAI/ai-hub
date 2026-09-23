@@ -24,7 +24,6 @@ sys.path.insert(0, _here)
 try:
     import main
     import admin
-    import adapters
     import meshy
     import tripo
 finally:
@@ -35,7 +34,6 @@ finally:
 
 class AdminKindNeutral(unittest.TestCase):
     def test_cloud_table_reads_both_id_keys(self):
-        import admin
         html = admin._cloud_table("Cloud", {"meshy_task_id": "m1", "request": {"a": 1},
                                             "endpoint": "image-to-3d"})
         self.assertIn("m1", html); self.assertIn("Meshy", html)
@@ -48,7 +46,6 @@ class AdminKindNeutral(unittest.TestCase):
         self.assertEqual(admin._cloud_table("x", {"request": {}}), "")
 
     def test_same_kind_matches_backend_type(self):
-        import admin, tripo
         # restored: _gen_backends is a module global the whole console reads, and a test
         # that leaves a stub behind decides what LATER tests see (order-dependent failures).
         self.addCleanup(setattr, admin, "_gen_backends", admin._gen_backends)
@@ -60,7 +57,6 @@ class AdminKindNeutral(unittest.TestCase):
         self.assertFalse(admin._same_kind([meshy.default_candidate("m")], "x"))
 
     def test_type_select_knows_every_cloud_url(self):
-        import admin, tripo
         html = admin._type_select("tripo")
         self.assertIn(tripo.URL, html); self.assertIn(meshy.URL, html)
         self.assertIn('value="tripo" selected', html)
@@ -71,7 +67,6 @@ class AdminKindNeutral(unittest.TestCase):
         backend would be saved pointing at the wrong vendor and only fail at discovery,
         with an auth error that names the wrong service. The handler therefore overwrites
         a url that is blank OR equals ANOTHER kind's fixed URL — never a typed one."""
-        import admin
         js = admin._type_select("meshy")
         self.assertIn("for(var k in cloudUrls)", js)          # every other kind is compared
         self.assertIn("u.value===cloudUrls[k]", js)           # …against the url field
@@ -87,7 +82,6 @@ class CloudBackendUrl(unittest.TestCase):
     naming the wrong vendor."""
 
     def test_cloud_url_for(self):
-        import admin, meshy, tripo
         self.assertEqual(admin._cloud_url_for("tripo", meshy.URL), tripo.URL)   # kind switched
         self.assertEqual(admin._cloud_url_for("tripo", ""), tripo.URL)          # blank → filled
         self.assertEqual(admin._cloud_url_for("tripo", "https://my.proxy"),
@@ -105,7 +99,6 @@ class CloudEditor(unittest.TestCase):
     endpoint is pinned here."""
 
     def _render(self, mod, endpoint):
-        import admin
         c = mod.default_candidate("b")
         c[mod.KIND]["endpoint"] = endpoint
         self.addCleanup(setattr, admin, "_gen_backends", admin._gen_backends)
@@ -154,7 +147,6 @@ class CloudEditor(unittest.TestCase):
             self.assertIn(f'name="{n}"', html)
 
     def test_cloud_update_apply_normalizes_and_copies(self):
-        import admin, tripo
         c = tripo.default_candidate("b"); cands = [c, dict(c, backend="b2")]
         form = {"cloud_endpoint": "rig", "cloud_model": "v3.0-20250812", "opt__spec": "tripo",
                 # v2.5 is the rig model that can do a non-biped; with the default (v1.0)
@@ -185,7 +177,6 @@ class CloudEditor(unittest.TestCase):
         """Save stores what the request builder would send: the editor offers all seven rig
         types (rendering one field cannot know another's value), and a combination the vendor
         refuses is normalized away at SAVE time, not discovered on a paid request."""
-        import admin, tripo
         cands = [tripo.default_candidate("b")]
         admin._cloud_update_apply("tripo", cands, {"cloud_endpoint": "rig", "cloud_model": "v3.1-20260211",
                                                    "opt__rig_model": "v1.0-20240301", "opt__rig_type": "avian",
@@ -196,7 +187,6 @@ class CloudEditor(unittest.TestCase):
         self.assertFalse(o["texture"])                  # generate_parts forbids texture/pbr/quad
 
     def test_cloud_update_apply_keeps_meshy_semantics(self):
-        import admin
         cands = [meshy.default_candidate("b")]
         admin._cloud_update_apply("meshy", cands, {"cloud_endpoint": "rigging", "cloud_model": "meshy-6",
                                                    "opt__should_remesh": "false", "opt__target_polycount": "42",

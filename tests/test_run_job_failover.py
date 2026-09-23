@@ -475,8 +475,8 @@ class AdapterModelSetKey(unittest.TestCase):
         self.NR = adapters.NormalizedRequest
 
     def _req(self, wf, mapping=None, params=None, fixed=None):
-        return self.NR(alias="a", real_model=None, task="text2img", inputs={}, params=params or {},
-                       output={}, workflow=None, workflow_json=wf, node_mapping=mapping or {},
+        return self.NR(alias="a", real_model=None, inputs={}, params=params or {},
+                       workflow=None, workflow_json=wf, node_mapping=mapping or {},
                        fixed=fixed or [])
 
     def test_high_and_low_share_the_key(self):

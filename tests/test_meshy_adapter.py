@@ -104,7 +104,7 @@ class TestMeshyAdapter(unittest.TestCase):
         if formats:
             cand["meshy"]["options"]["target_formats"] = list(formats)
         cand["meshy"]["options"].update(opts)
-        return adapters.NormalizedRequest(alias="Meshy-Object", real_model="latest", task="img2mesh",
+        return adapters.NormalizedRequest(alias="Meshy-Object", real_model="latest",
                                           params=dict(values or {}), upload_images=dict(images or {}),
                                           upload_files=dict(files or {}),
                                           meshy=cand["meshy"], upload_prefix="gw_j1")
