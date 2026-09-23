@@ -611,6 +611,13 @@ class BackendAdapter(ABC):
         backend's settings changed (main.build_backend_adapters). Default: nothing."""
         return None
 
+    def adopt_discovery(self, old: "BackendAdapter") -> None:
+        """Take over what a discovery poll wrote onto `old` after this instance replaced
+        it (a backend save landed while the poll was in flight — main.refresh_backend).
+        Only what still describes THIS backend; the rest of the poll is discarded.
+        Default: nothing."""
+        return None
+
     # ── workflow chains (main._run_chain) — the three places a stage is backend-specific ──
     def chain_export(self, cand: dict, succ: dict, params: dict, prefix: str) -> ChainExport:
         """Stage 1: how this backend will name/export the mesh. Default: not a stage 1."""
@@ -2735,7 +2742,12 @@ class ComfyUIAdapter(BackendAdapter):
             return
         self._prompts = old._prompts
         self.last_restart, self.last_restart_result = old.last_restart, old.last_restart_result
-        if old.backend.get("url") == self.backend.get("url"):
+        self.adopt_discovery(old)
+
+    def adopt_discovery(self, old: BackendAdapter) -> None:
+        """The slot-type cache and the watchdog — while the URL is unchanged (a poll of
+        the old host says nothing about the new one)."""
+        if isinstance(old, ComfyUIAdapter) and old.backend.get("url") == self.backend.get("url"):
             self._node_types = old._node_types
             self._stuck_head, self._stuck_since = old._stuck_head, old._stuck_since
             self.exec_stuck = old.exec_stuck
@@ -3777,6 +3789,9 @@ class CloudTaskAdapter(BackendAdapter):
                 and old.backend.get("url") == self.backend.get("url")
                 and old.backend.get("api_key") == self.backend.get("api_key")):
             self.credits, self.credits_at = old.credits, old.credits_at
+
+    def adopt_discovery(self, old: BackendAdapter) -> None:
+        self.adopt_state(old)            # the balance is all a cloud poll writes
 
     # ── vendor hooks ──────────────────────────────────────────────────────────
     async def discover(self, client: httpx.AsyncClient) -> Capabilities:

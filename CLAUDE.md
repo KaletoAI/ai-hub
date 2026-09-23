@@ -69,7 +69,10 @@ they need via injected callables, staying hot-reload-safe.
   to its replacement (`adapter.adopt_state`: ComfyUI's restart cooldown, the running
   jobs' prompt registry, and while the URL holds the slot-type cache and watchdog; a
   cloud adapter's balance while url+key hold). Rebuilding everything on every save reset
-  the auto-restart cooldown and orphaned the prompts of running jobs.
+  the auto-restart cooldown and orphaned the prompts of running jobs. A save that lands
+  while a discovery poll is in flight: `refresh_backend` hands what the poll wrote onto
+  the replaced instance to the current one (`adopt_discovery`, same URL/account rules)
+  and continues on the current one.
 - **`adapters.py`** — the pluggable per-backend protocol seam. `BackendAdapter`
   ABC; `OpenAIAdapter` (`dispatch()` forwards chat/completions/embeddings,
   owns the in-flight counter incl. the streamed-`finally` decrement; streamed

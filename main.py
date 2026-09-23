@@ -719,7 +719,17 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
         return                             # a poll of this backend is already in flight
     _probing.add(bid)
     try:
-        caps = await adapter.discover(client)
+        try:
+            caps = await adapter.discover(client)
+        finally:
+            # A backend save may have REPLACED the adapter while the poll was in flight
+            # (build_backend_adapters): what discover() wrote (slot types, watchdog,
+            # balance) went onto the old instance. Carry it over where it still applies,
+            # and act on the CURRENT instance from here on (auto-restart cooldown).
+            cur = backend_adapters.get(bid)
+            if cur is not None and cur is not adapter:
+                cur.adopt_discovery(adapter)
+                adapter = cur
         # The admin's allow/deny globs narrow the discovered set HERE — type-neutrally
         # (extract_models is the openai path only) and BEFORE `changed`, the persist and
         # the route-index rebuild, so /v1/models, routing, alias candidates and the
