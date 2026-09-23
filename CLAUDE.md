@@ -1148,7 +1148,13 @@ cached at discovery (`normalize_pricing`: Together per-million, OpenRouter
 per-token). Streaming records the backend's usage chunk (the adapter always
 requests `include_usage` upstream); a backend that reports zeros/nothing
 (LocalAI streams all-zero usage — measured) gets gateway estimates instead
-(content-delta count ≈ completion tokens, ~chars/4 for the prompt).
+(content-delta count ≈ completion tokens, ~chars/4 for the prompt). A stream that
+does NOT end normally is recorded too, from the generator's `finally`
+(`_record_end`, both the normalized and the Anthropic passthrough stream): status
+499 when the client left (Esc in Claude Code — Starlette closes or cancels the body
+iterator), 502 when the upstream dropped mid-answer, with the tokens counted so far.
+Before, `_record` sat after the `finally` and such calls never reached the log — nor
+the month-cost quota, which sums `cost_usd` over every row.
 
 ## Conventions
 

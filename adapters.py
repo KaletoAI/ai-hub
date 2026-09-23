@@ -783,6 +783,15 @@ class _StreamNormalizer:
                                      separators=(",", ":")) + "\n"
 
 
+# Stats status of a stream that did not end normally. Recorded from the stream's
+# `finally`, so an aborted call still books its tokens (the month-cost quota reads
+# them): the client leaving — Starlette closes the body iterator (GeneratorExit) or
+# cancels its task — is 499, nginx's "client closed request"; anything else is the
+# upstream failing mid-answer, 502.
+def _stream_end_status(e: BaseException) -> int:
+    return 499 if isinstance(e, (GeneratorExit, asyncio.CancelledError)) else 502
+
+
 @dataclass
 class _Call:
     """Per-dispatch bookkeeping shared by the stream and non-stream paths —
@@ -1132,6 +1141,15 @@ class OpenAIAdapter(BackendAdapter):
         ))
         return elapsed_ms
 
+    def _record_end(self, req: NormalizedRequest, call: _Call, status: int,
+                    in_tok: int, out_tok: int, **kw) -> None:
+        """`_record` for the END of a stream — called from its `finally`, where an
+        exception would replace the GeneratorExit/CancelledError being handled."""
+        try:
+            self._record(req, call, status, in_tok, out_tok, **kw)
+        except Exception as e:
+            logger.warning(f"[{self.name}] stats: could not record a streamed call: {e}")
+
     async def _dispatch_stream(self, req: NormalizedRequest, call: _Call) -> Response:
         ctx = self.ctx
         # Ask the backend to emit a final usage chunk so streamed calls record
@@ -1182,6 +1200,7 @@ class OpenAIAdapter(BackendAdapter):
                             headers={**call.rheaders, **_ratelimit_headers(resp.headers)})
 
         async def generate():
+            status = resp.status_code
             try:
                 async for chunk in resp.aiter_bytes():
                     out = norm.feed(chunk)
@@ -1190,13 +1209,18 @@ class OpenAIAdapter(BackendAdapter):
                 tail = norm.flush()
                 if tail:
                     yield tail
+            except BaseException as e:
+                status = _stream_end_status(e)
+                raise
             finally:
-                await stream_cm.__aexit__(None, None, None)
-                await client_cm.__aexit__(None, None, None)
-                self._finish(call)
-            in_tok, out_tok = norm.tokens()
-            self._record(req, call, resp.status_code, in_tok, out_tok,
-                         cache=(norm.cache_read, norm.cache_write))
+                try:
+                    await stream_cm.__aexit__(None, None, None)
+                    await client_cm.__aexit__(None, None, None)
+                finally:
+                    self._finish(call)
+                    in_tok, out_tok = norm.tokens()
+                    self._record_end(req, call, status, in_tok, out_tok,
+                                     cache=(norm.cache_read, norm.cache_write))
 
         return StreamingResponse(generate(), media_type="text/event-stream", headers=call.rheaders)
 
@@ -1407,6 +1431,7 @@ class AnthropicAdapter(OpenAIAdapter):
 
         async def generate():
             buf = ""
+            status = resp.status_code
             try:
                 async for chunk in resp.aiter_bytes():
                     buf += chunk.decode("utf-8", "ignore")
@@ -1414,13 +1439,18 @@ class AnthropicAdapter(OpenAIAdapter):
                         line, buf = buf.split("\n", 1)
                         sniff(line)
                     yield chunk                       # verbatim, always
+            except BaseException as e:
+                status = _stream_end_status(e)
+                raise
             finally:
-                await stream_cm.__aexit__(None, None, None)
-                await client_cm.__aexit__(None, None, None)
-                self._finish(call)
-            self._record(req, call, resp.status_code, counted["in"], counted["out"],
-                         response_text="".join(counted["text"]) or None,
-                         cache=(counted["read"], counted["write"]))
+                try:
+                    await stream_cm.__aexit__(None, None, None)
+                    await client_cm.__aexit__(None, None, None)
+                finally:
+                    self._finish(call)
+                    self._record_end(req, call, status, counted["in"], counted["out"],
+                                     response_text="".join(counted["text"]) or None,
+                                     cache=(counted["read"], counted["write"]))
 
         return StreamingResponse(generate(), media_type="text/event-stream", headers=call.rheaders)
 

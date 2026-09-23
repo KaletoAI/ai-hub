@@ -246,6 +246,93 @@ class ForwardedHeaders(unittest.TestCase):
         self.assertNotIn("x-api-key", call.headers)        # the gateway key never leaves
 
 
+def _sse(obj):
+    return f"data: {json.dumps(obj)}\n\n".encode()
+
+
+CHAT_CHUNKS = [_sse({"id": "c", "model": "m", "choices": [{"index": 0, "delta": {"content": w}}]})
+               for w in ("one ", "two ", "three")]
+ANTH_CHUNKS = [
+    b'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":40,"output_tokens":1}}}\n\n',
+    b'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}\n\n',
+    b'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":12}}\n\n',
+]
+
+
+class StreamStats(unittest.TestCase):
+    """K11: a stream that does not end normally still books its call."""
+
+    def _run(self, adapter_cls, backend, chunks, explode=None, abort_after=None, path=None):
+        rows, counts = [], {"inc": 0, "dec": 0}
+
+        async def body():
+            for c in chunks:
+                yield c
+            if explode is not None:
+                raise explode
+
+        def handler(request):
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=body())
+
+        async def go():
+            client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            ctx = _ctx(rows)
+            ctx.http_client = lambda: client
+            ctx.inflight_inc = lambda bid: counts.__setitem__("inc", counts["inc"] + 1)
+            ctx.inflight_dec = lambda bid: counts.__setitem__("dec", counts["dec"] + 1)
+            a = adapter_cls(backend, ctx)
+            req = adapters.NormalizedRequest(
+                path=path or "/v1/chat/completions", alias="m", real_model="m",
+                body={"model": "m", "stream": True, "messages": [{"role": "user", "content": "x" * 40}]},
+                raw=_raw({}), stream=True)
+            resp = await a.dispatch(req)
+            it = resp.body_iterator
+            got, err = 0, None
+            try:
+                async for _ in it:
+                    got += 1
+                    if abort_after is not None and got >= abort_after:
+                        await it.aclose()          # what Starlette does when the client leaves
+                        break
+            except Exception as e:
+                err = e
+            for _ in range(3):
+                await asyncio.sleep(0)             # let the fire-and-forget record task run
+            await client.aclose()
+            return err
+        err = asyncio.run(go())
+        return rows, counts, err
+
+    def test_a_clean_stream_books_one_200(self):
+        rows, counts, err = self._run(adapters.OpenAIAdapter, A, CHAT_CHUNKS)
+        self.assertIsNone(err)
+        self.assertEqual([r["status"] for r in rows], [200])
+        self.assertEqual(counts["inc"], counts["dec"])
+
+    def test_a_client_abort_books_499_with_the_tokens_so_far(self):
+        rows, counts, _ = self._run(adapters.OpenAIAdapter, A, CHAT_CHUNKS, abort_after=2)
+        self.assertEqual([r["status"] for r in rows], [499])
+        self.assertGreaterEqual(rows[0]["output_tokens"], 1)
+        self.assertGreater(rows[0]["input_tokens"], 0)       # the prompt was processed
+        self.assertEqual(counts["inc"], counts["dec"])
+
+    def test_an_upstream_drop_mid_stream_books_502(self):
+        rows, counts, err = self._run(adapters.OpenAIAdapter, A, CHAT_CHUNKS,
+                                      explode=httpx.ReadError("connection reset"))
+        self.assertIsInstance(err, httpx.ReadError)          # the client's stream still breaks
+        self.assertEqual([r["status"] for r in rows], [502])
+        self.assertEqual(rows[0]["output_tokens"], 3)
+        self.assertEqual(counts["inc"], counts["dec"])
+
+    def test_the_anthropic_passthrough_books_an_abort_too(self):
+        claude = {"name": "claude", "type": "anthropic", "url": "https://api.anthropic.com"}
+        rows, counts, _ = self._run(adapters.AnthropicAdapter, claude, ANTH_CHUNKS,
+                                    abort_after=3, path="/v1/messages")
+        self.assertEqual([r["status"] for r in rows], [499])
+        self.assertEqual((rows[0]["input_tokens"], rows[0]["output_tokens"]), (40, 12))
+        self.assertEqual(counts["inc"], counts["dec"])
+
+
 class Timeouts(unittest.TestCase):
     """P5: 300 s is a READ budget for long completions, never a connect budget."""
 
