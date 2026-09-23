@@ -31,7 +31,7 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
   restart for backend/alias changes. Read **only at startup**:
   `stats.enabled` and the stats/jobs DB paths.
 - **No linter or build step, and no blanket test suite** — only targeted stdlib
-  `unittest` files for the mechanisms that fail SILENTLY (see the fifty-nine listed under
+  `unittest` files for the mechanisms that fail SILENTLY (see the sixty listed under
   `anthropic_bridge.py`): `venv/bin/python -m unittest discover -s tests -t .`.
   Everything else is verified by running the server and hitting endpoints with
   `curl` (README "Try it"), `curl -H "Authorization: Bearer <admin key>"
@@ -740,7 +740,7 @@ they need via injected callables, staying hot-reload-safe.
   running the tool. Covered by
   `test_anthropic_bridge.py` (stdlib `unittest` — a streaming tool-call bridge fails
   silently rather than crashing). `ls tests/test_*.py` is the count of record —
-  **fifty-nine** files today — and each exists for that same reason: the mechanism it
+  **sixty** files today — and each exists for that same reason: the mechanism it
   guards fails SILENTLY, so it is named next to that mechanism above.
   `test_anthropic_bridge.py`, `test_prune_branch.py` (a
   dead-branch prune that cascades one node too far or too few surfaces as an aborted
@@ -1058,6 +1058,14 @@ they need via injected callables, staying hot-reload-safe.
   longer the idle right column is simply never seen again. Pins the tab set, both legacy
   redirects with their query, actions redirecting to the new tab, the idle overviews with
   alias→editor links and the backend filter, and the chat editor's live routes).
+  `test_call_cost.py` (what a call COSTS with a prompt cache: the cache split was recorded
+  but priced as fresh input, so an OpenRouter agent session whose context is ~95 % cache
+  reads was booked at 5× its bill — measured 2026-09-23, 30 xiaomi/mimo-v2.6-flash calls:
+  0.1625 $ booked, 0.0277 $ billed — and the monthly cost quota ran out early. Pins that
+  `normalize_pricing` reads OpenRouter's `input_cache_read`/`input_cache_write` (absent,
+  never 0), that `_cost_usd` prices each share at its own rate with the input price as
+  fallback and never below zero, that `_record` hands it the split, and OpenRouter's
+  `prompt_tokens_details.cache_write_tokens`).
   Run them all with `python -m unittest discover -s tests -t .` (no runner dependency).
 - **`openai_image_bridge.py`** — pure request/response plumbing for the OpenAI
   image shims (`multipart_list`, `parse_size`, `coerce_scalar`, `images_uploads`
@@ -1556,7 +1564,9 @@ cuts x-source for every row) and 401 rows are capped at `_UNAUTH_LOG_PER_MIN` (6
 minute, the overflow summarised in one log line (`test_rejected_log.py`). The same handler renders `/v1/messages` errors in
 Anthropic shape, so that form lives in ONE place. Cost from pricing
 cached at discovery (`normalize_pricing`: Together per-million, OpenRouter
-per-token). Streaming records the backend's usage chunk (the adapter always
+per-token, plus OpenRouter's cache prices), computed ONCE in `_record` via
+`main._cost_usd`, which prices `cache_read`/`cache_write` at their own rate (input
+price where none is listed) — a cache read is often 1/50 of fresh input. Streaming records the backend's usage chunk (the adapter always
 requests `include_usage` upstream); a backend that reports zeros/nothing
 (LocalAI streams all-zero usage — measured) gets gateway estimates instead
 (content-delta count ≈ completion tokens, ~chars/4 for the prompt). A stream that

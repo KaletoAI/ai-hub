@@ -138,6 +138,11 @@ def normalize_pricing(m: dict) -> Optional[dict[str, float]]:
       - OpenRouter: pricing.prompt / pricing.completion — strings, per *single*
                     token, so multiplied by 1e6 to match the per-million convention
     Local backends (llama-swap / vLLM) carry no pricing → None.
+
+    OpenRouter also prices the prompt cache (`input_cache_read`/`input_cache_write`)
+    → `cache_read`/`cache_write`, set only when listed: absent means "billed as
+    input", never 0 — a read is often 1/50 of the input price, and pricing it as
+    fresh input booked an agent session at 5× its bill (2026-09-23, MiMo).
     """
     p = m.get("pricing")
     if not isinstance(p, dict):
@@ -145,8 +150,12 @@ def normalize_pricing(m: dict) -> Optional[dict[str, float]]:
     if "input" in p or "output" in p:            # Together-style (per-million)
         return {"input": _to_float(p.get("input")), "output": _to_float(p.get("output"))}
     if "prompt" in p or "completion" in p:        # OpenRouter-style (per-token)
-        return {"input": _to_float(p.get("prompt")) * 1_000_000,
-                "output": _to_float(p.get("completion")) * 1_000_000}
+        out = {"input": _to_float(p.get("prompt")) * 1_000_000,
+               "output": _to_float(p.get("completion")) * 1_000_000}
+        for key, src in (("cache_read", "input_cache_read"), ("cache_write", "input_cache_write")):
+            if p.get(src) not in (None, ""):
+                out[key] = _to_float(p.get(src)) * 1_000_000
+        return out
     return None
 
 
@@ -521,7 +530,7 @@ class AdapterContext:
     auth_headers: Callable[[dict], dict]
     inflight_inc: Callable[[str], None]
     inflight_dec: Callable[[str], None]
-    cost_usd: Callable[[str, Optional[str], int, int], float]
+    cost_usd: Callable[..., float]        # (bid, model, in, out, cache_read, cache_write)
     source_of: Callable[[Request], str]
     record_call: Callable[..., Any]
     log_enabled: Callable[[], bool]
@@ -755,7 +764,8 @@ class _StreamNormalizer:
             self.cache_read = max(self.cache_read,
                                   int(det.get("cached_tokens") or u.get("cached_tokens") or 0))
             self.cache_write = max(self.cache_write,
-                                   int(u.get("cache_creation_input_tokens") or 0))
+                                   int(det.get("cache_write_tokens")
+                                       or u.get("cache_creation_input_tokens") or 0))
         if not obj.get("choices"):                            # terminal usage chunk
             if u is None:
                 return line + "\n"                            # odd keepalive — leave it
@@ -1238,7 +1248,7 @@ class OpenAIAdapter(BackendAdapter):
         usage = (resp_json.get("usage") or {}) if isinstance(resp_json, dict) else {}
         details = usage.get("prompt_tokens_details") or {}
         read = int(details.get("cached_tokens") or usage.get("cached_tokens") or 0)
-        write = int(usage.get("cache_creation_input_tokens") or 0)
+        write = int(details.get("cache_write_tokens") or usage.get("cache_creation_input_tokens") or 0)
         return read, write
 
     def _finish(self, call: _Call) -> None:
@@ -1259,7 +1269,7 @@ class OpenAIAdapter(BackendAdapter):
             duration_ms=elapsed_ms, backend=self.name, source=call.source,
             alias=req.alias, model=call.real_model, endpoint=(req.stats_endpoint or req.path),
             status=status, input_tokens=in_tok, output_tokens=out_tok,
-            cost_usd=ctx.cost_usd(self.bid, call.real_model, in_tok, out_tok),
+            cost_usd=ctx.cost_usd(self.bid, call.real_model, in_tok, out_tok, cache[0], cache[1]),
             request_text=call.req_text or None, response_text=response_text,
             response_audio=response_audio,
             reasoning=call.reasoning_ctl,

@@ -208,7 +208,7 @@ def rebuild_virtual_models() -> None:
 backend_models: dict[str, set[str]] = {}                       # name → {model_id, ...}
 backend_healthy: dict[str, bool] = {}                          # name → bool
 backend_error: dict[str, dict] = {}                            # bid → why discovery failed (see _classify_error)
-backend_pricing: dict[str, dict[str, dict[str, float]]] = {}   # name → {model_id → {input, output}}
+backend_pricing: dict[str, dict[str, dict[str, float]]] = {}   # name → {model_id → {input, output[, cache_read, cache_write]}}
 backend_loras: dict[str, set[str]] = {}                        # id → {lora filename, ...} (ComfyUI)
 # bid → (kept, total) of the last discovery poll, when the backend carries an
 # allow/deny model filter. A whitelist typo would otherwise leave the backend healthy
@@ -2132,13 +2132,24 @@ def delete_voice_ref(name: str) -> None:
     apply_voice_library()
 
 
-def _cost_usd(bid: str, model_id: Optional[str], in_tok: int, out_tok: int) -> float:
+def _cost_usd(bid: str, model_id: Optional[str], in_tok: int, out_tok: int,
+              cache_read: int = 0, cache_write: int = 0) -> float:
     """USD cost for a call from cached pricing (Together-style /v1/models), keyed by
-    the backend id (`type:name`, same as `backend_pricing`). 0 if unknown."""
+    the backend id (`type:name`, same as `backend_pricing`). 0 if unknown.
+
+    `cache_read`/`cache_write` are SUBSETS of `in_tok`; each is priced at its own
+    rate where the backend lists one, else as input. Clamped so a backend reporting
+    more cached than prompt tokens never books a credit."""
     if not model_id:
         return 0.0
     p = backend_pricing.get(bid, {}).get(model_id, {})
-    return ((in_tok or 0) * p.get("input", 0.0) + (out_tok or 0) * p.get("output", 0.0)) / 1_000_000
+    inp = p.get("input", 0.0)
+    total = max(in_tok or 0, 0)
+    read = min(max(cache_read or 0, 0), total)
+    write = min(max(cache_write or 0, 0), total - read)
+    fresh = total - read - write
+    return (fresh * inp + read * p.get("cache_read", inp) + write * p.get("cache_write", inp)
+            + (out_tok or 0) * p.get("output", 0.0)) / 1_000_000
 
 
 # ── Adapter wiring ─────────────────────────────────────────────────────────────
