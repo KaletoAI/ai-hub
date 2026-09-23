@@ -60,8 +60,8 @@ Welche Schlüssel ein Alias unter `files` annimmt, steht im Schema als eigene Li
 
 `required: true` heißt: ohne diese Datei wird der Request abgelehnt (so bei
 `Meshy-Rig`). Bei den ComfyUI-Aliasen steht `required: false`, weil dasselbe
-Eingangs-Mesh alternativ als Backend-Pfad in `params` genannt werden kann (siehe
-3.4); `accept` nennt, wenn vorhanden, die zulässigen Container.
+Eingangs-Mesh alternativ als Backend-Pfad in `params` genannt werden kann — nur mit
+Admin-Key (siehe 3.4); `accept` nennt, wenn vorhanden, die zulässigen Container.
 
 ### Antwortform (Job-View)
 
@@ -319,8 +319,9 @@ selbst. Ein vorheriges Job-Ergebnis wird also normal abgeholt
 (`GET /v1/jobs/{id}/result/{n}`) und beim Shrink-Aufruf wieder mitgeschickt.
 
 (Ein direkt in `params` gesetzter `input_mesh_path` bleibt weiterhin ein
-Dateipfad auf dem Backend — nützlich für Server-Admins mit Zugriff auf dessen
-Dateisystem, für Clients ist `files` der Weg.)
+Dateipfad auf dem Backend — aber nur mit **Admin-Key** (oder wenn das Mapping den
+Eintrag mit `client_path: true` freigibt); ein normaler User-Key bekommt dafür `400`.
+Für Clients ist `files` der Weg.)
 
 Auslieferung: `<name>_00001_.glb` + `*_basecolor*.png` + `*_metallic*.png` — hier
 **ohne** JPEG-Umkodierung, die Karten bleiben PNG.
@@ -397,7 +398,7 @@ Dateisystem, das Mesh reist als Datei mit (`required: true` im Schema).
 | Symptom | Bedeutung / Reaktion |
 |---|---|
 | `status: "failed"` + `error` | Workflow-/Validierungsfehler (z. B. „no basecolor PNG", „embedded texture is a 2x2 dummy", per-Node-Fehler des Backends). Nicht blind retrien — Fehlertext auswerten. |
-| `503` beim Start | Für den Alias existiert kein gesundes Backend (bzw. keines, das das geforderte `backend`-Pin/LoRA erfüllt) — Alias und `/health` prüfen, kein blinder Retry. |
+| `503` beim Start | Für den Alias existiert kein gesundes Backend (bzw. keines, das das geforderte `backend`-Pin/LoRA erfüllt) — Alias und `/health` prüfen (die Details dort nur mit Admin-Key), kein blinder Retry. |
 | `status: "failed"`, `error` beginnt mit `park timeout:` | Alle Backends waren die ganze Park-Zeit belegt — später neu einreichen. |
 | Job hängt lange in `running` | Mesh-Jobs dauern Minuten; `progress` beachten. Hunyuan3D mit `face_num` > 40000: siehe 3.2 — vermeiden. |
 | `status: "failed"` bei `Meshy-Rig` / `Meshy-Humanoid-Cloud` | Meshys Rigging hat abgelehnt (kein erkennbarer Biped, zu viele Dreiecke, unbrauchbare Pose) — endgültig, Credits werden erstattet. Mesh prüfen (3.5), nicht retrien. Fehlt `files.input_mesh_path` oder ist die Datei kein binäres glTF, scheitert der Job mit `status: "failed"` (Meldung „`files.input_mesh_path` is required" bzw. „Meshy rigging takes a binary glTF (.glb) mesh") — **bevor** ein Task angelegt wird, also ohne Credits. `400` beim Start heißt dagegen: unbekannter `files`-Schlüssel oder unlesbarer Wert; ab 64 MB kommt `413`. |

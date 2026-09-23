@@ -162,7 +162,23 @@ Two layers, both optional:
   form is ever shown, as before.
 
 **Bootstrap-open → locked.** With no users *and* no master key, the gateway and
-console are fully open. Add an admin user (or set a master key) to lock it down.
+console are fully open. Add an admin user (or set a master key) to lock it down:
+from the first user or master key on, the API needs a key AND the console a login.
+The Users tab therefore refuses a first user that is not an admin, and refuses
+deleting, demoting or disabling the last admin while no master key is set — either
+would leave nobody able to sign in, or silently open the console again. A gateway
+already in that state (users, but no enabled admin with a key and no master key)
+stays locked; set `api_key:` in `config.yaml` (hot-reloaded) and sign in with it.
+
+**Limits on what clients send.** Request bodies are capped at `max_body_mb`
+(config.yaml, default 200, hot-reloaded; `0` = off) → `413`. A reference image or
+`files` entry given as a URL is fetched by the gateway only from a PUBLIC address:
+every address the host resolves to is checked, the connection goes to the checked
+address, redirects are not followed and the body is capped at 64 MB. A host that
+resolves to loopback/private/link-local/multicast is refused with `400` — list the
+ranges you trust (a LAN NAS) in `ref_url_allow_cidrs`. `images` keys that are not an
+image slot of the alias are ignored without being fetched, and the OpenAI shims'
+`ref_images` beyond the alias's slot count are never downloaded.
 
 **Job ownership.** Generation jobs and background responses are owner-gated:
 `GET`/cancel of a job (and its result/input artifacts) is allowed only for its
@@ -435,7 +451,10 @@ or a `503` (with `Retry-After`) if the wait runs out.
 - **Park time is per-alias** (`park_s` in the chat-alias editor, or config
   `alias_park`): blank = the global default (`park_timeout_s`, **60 s**, Server
   tab), `0` = parking off for that alias (immediate `503` when busy). `max_parked`
-  caps the queue.
+  caps the queue. Async generation jobs have their own cap, `max_queued_gen`
+  (Server tab, default **200** queued or running; `0` = none): beyond it a new
+  `mode: async` job gets `503` + `Retry-After`. A client's job `ttl_s` is capped at
+  `jobs.max_ttl_s` (config, default 7 days).
 - **Fair:** when a slot frees, the scheduler designates one waiter for it —
   overdue first, else the one whose type key the backend just ran, else the
   oldest it can serve (no head-of-line blocking across aliases). Live queue is
@@ -1126,7 +1145,10 @@ ComfyUI's cache), so the first job after one frees.
   instead (Meshy embeds it as a `model_url` data URI, Tripo uploads it to `/v3/files`
   and sends the token), so no path exists. The bytes are not kept as a job input.
   Unlike `params`, `files` is strict: unknown key or unreadable value → `400`,
-  over 64 MB → `413`.
+  over 64 MB → `413`. Naming a backend PATH for such a file field in `params`
+  instead is admin-only (`400` for a user key, unless the mapping entry sets
+  `client_path: true`), and a list or object is never accepted as a mapped
+  `params` value (in ComfyUI's API format a list is a link between nodes).
 - **`GET /v1/generations/{alias}/schema`** self-describes an alias in three lists:
   `params`, `images` (loader slots with their empty behaviour) and **`files`** — the
   uploads that are not images. A ComfyUI alias lists its mapped mesh params there
@@ -1168,13 +1190,16 @@ client-integration walkthrough.
 ## The `/ui` console
 
 A server-rendered console mounted at `/ui` (sign in with an admin key once
-locked). Tabs:
+locked). Ten failed sign-ins from one address within five minutes block the form for
+that address until the window has passed (429); behind a reverse proxy that address is
+the proxy's. Served over HTTPS (directly or with `X-Forwarded-Proto: https`), the
+session cookie is marked `Secure`. Tabs:
 
 | Tab | What |
 |---|---|
 | **Dashboard** | live per-backend status (a down backend names its cause) + in-flight, a **backend faults · 24h** card, column and panel (see [Backend fault log](#backend-fault-log)), parked calls, media-job counts/recent, recent LLM calls |
 | **Server** | runtime + restart-required settings (API key, caps, park time/queue, `affinity_max_wait_s`, stats/jobs, TTL/prune) |
-| **Backends** | add/edit/remove backends (LLM, ComfyUI, Meshy, Tripo), incl. the `paid` cost tier; the editor is split into **General** (name, type, url, host, cost tier, concurrency, credential), **Models** (whitelist/blacklist, discovery filters, bare-id listing, context windows), **Behavior** (prompt-cache passthrough, sampling defaults, self-retries) and one tab named after the type (**ComfyUI** / **Cloud task API** / **Anthropic**); the **Hosts · GPU policy** panel below the list edits the per-box VRAM flags (see [Hosts & VRAM policy](#hosts--vram-policy)) |
+| **Backends** | add/edit/remove backends (LLM, ComfyUI, Meshy, Tripo), incl. the `paid` cost tier; the editor is split into **General** (name, type, url, host, cost tier, concurrency, credential — never shown again once stored: blank keeps it, *clear* removes it), **Models** (whitelist/blacklist, discovery filters, bare-id listing, context windows), **Behavior** (prompt-cache passthrough, sampling defaults, self-retries) and one tab named after the type (**ComfyUI** / **Cloud task API** / **Anthropic**); the **Hosts · GPU policy** panel below the list edits the per-box VRAM flags (see [Hosts & VRAM policy](#hosts--vram-policy)) |
 | **Input & Routing** | sub-tabs **Input** (what clients can call — chat aliases, generation models, endpoints), **Chat aliases** (the live alias→backend map + alias/model collisions), **LLM models**, **Media aliases**, **Image models**, **LoRAs** — all searchable |
 | **Mapping** | register a ComfyUI workflow, wire its node mapping, pin values (a cloud alias — Meshy, Tripo — needs no workflow: one schema-driven editor renders its endpoint + option defaults instead); chat-alias editor (per-alias `park_s` + reasoning default) |
 | **Reasoning** | the normalized-thinking rule list (model glob × backend set → adapter) + test resolver |
@@ -1362,7 +1387,7 @@ The gateway therefore keeps a **voice reference library** (Playground → Voice)
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/health` | per-backend health/models/`paid`/tok-s + busy/inflight + conflicts |
+| `GET` | `/health` | liveness (`status` + backend counts) for anyone; with an admin key (Bearer or `x-api-key`), a `/ui` session, or in bootstrap-open mode the full snapshot: per-backend health/`models_count`/`paid`/tok-s + busy/inflight + hosts + conflicts; `?verbose=1` adds every backend's model ids |
 | `*` | `/ui/**` | the management console |
 
 Every proxied LLM response carries **`x-gateway-backend`** (which backend served
@@ -1412,8 +1437,9 @@ curl $B/v1/images/generations -H "Authorization: Bearer $KEY" \
 # LoRAs valid for an alias
 curl $B/v1/generations/flux/loras -H "Authorization: Bearer $KEY"
 
-# Backend health snapshot
-curl $B/health
+# Backend health snapshot (full view needs an admin key once the gateway is locked;
+# add ?verbose=1 for every backend's model ids)
+curl $B/health -H "Authorization: Bearer $KEY"
 ```
 
 ---
@@ -1429,6 +1455,15 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now ai-hub
 journalctl -u ai-hub -f
 ```
+
+The unit runs as `root` (the voice-reference ship uses root's SSH key) inside a systemd
+sandbox that works for root: `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=full`
+(/usr, /boot, /etc read-only), the kernel/cgroup/clock protections, `RestrictSUIDSGID`,
+`RestrictNamespaces` and a socket-family allow-list. It deliberately leaves `ProtectHome`
+off (`~/.ssh`, the faster-whisper cache in `~/.cache`) and uses `full`, not `strict`
+(the DBs, `jobs/`, `voiceref/` live in `/opt/ai-hub`). Running as a dedicated user is
+possible but needs that user to own `/opt/ai-hub` and to hold its own SSH key on every
+voice host — a decision for the operator, not the unit file.
 
 `deploy.sh` is an rsync-over-SSH helper (`DEPLOY_HOST=root@host ./deploy.sh`):
 syncs code (excluding `config.yaml`, `venv/`), installs requirements in a remote

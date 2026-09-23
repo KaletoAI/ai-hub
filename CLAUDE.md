@@ -34,11 +34,17 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
   `unittest` files for the mechanisms that fail SILENTLY (see the thirty-three listed under
   `anthropic_bridge.py`): `venv/bin/python -m unittest discover -s tests -t .`.
   Everything else is verified by running the server and hitting endpoints with
-  `curl` (README "Try it"), `curl localhost:4000/health` for a routing snapshot, or
+  `curl` (README "Try it"), `curl -H "Authorization: Bearer <admin key>"
+  localhost:4000/health` for a routing snapshot (`?verbose=1` lists model ids; without an
+  admin key a locked gateway answers only `status` + counts — `main.health_endpoint`,
+  `test_health_access.py`; `main.health()` stays the full snapshot for code), or
   compile-gating (`venv/bin/python -m py_compile *.py`) before deploy.
 - `requirements.txt` omits `watchfiles`; it ships with `uvicorn[standard]`. Keep it.
 - Deploy with `DEPLOY_HOST=root@host ./deploy.sh` (rsync/tar over SSH, remote venv
-  install, systemd sync, restart). rsync IS present on both dev and the prod box
+  install, systemd sync, restart). `ai-hub.service` runs as root inside a root-compatible
+  sandbox (NoNewPrivileges, PrivateTmp, ProtectSystem=full, kernel/cgroup protections,
+  AF_NETLINK kept for Scan network); ProtectHome/ProtectSystem=strict would break the
+  voice ship and the DB writes silently — `test_service_unit.py` pins both halves. rsync IS present on both dev and the prod box
   (re-checked 2026-08-18; an older note claiming otherwise was stale). Always
   compile-gate first — a broken file fails the restart silently.
 
@@ -154,7 +160,14 @@ they need via injected callables, staying hot-reload-safe.
   request became ~10 upstream calls in 20 s against `api.anthropic.com`, which had
   said exactly how long to wait.
   Workflow injection is **mapping-driven, convention-free** (`_apply_mapping`
-  sets `workflow[node].inputs[field]`); a mapping `label` is the param's public
+  sets `workflow[node].inputs[field]` — never to a list, which ComfyUI reads as a LINK,
+  and to an object only where the workflow holds one; `main._client_param_refusal` 400s
+  such values up front, and a client string for a mapped FILE field (`is_file_param`, a
+  path on the backend box — another job's output included) unless `_params_trusted`
+  (admin key via `gate_request`'s `gw_admin`, the /ui console, bootstrap-open) or the
+  entry carries `client_path: true` (no form field; the editor keeps it across Save);
+  judged over the alias's AND its successor's mapping, since params are threaded by
+  label — `test_mapping_values.py`); a mapping `label` is the param's public
   API name — incoming values are accepted under label OR param, and the
   auto-random seed keys on that effective name (`''` counts as unset);
   `_apply_lora_cascade` drops client LoRAs into free stack slots; `_apply_fixed`
@@ -482,7 +495,11 @@ they need via injected callables, staying hot-reload-safe.
   config, then authoritative. `decrypt_secret` lets LEGACY plaintext pass through (old
   rows keep working until re-saved); anything that must have been minted by the gateway
   itself — the /ui session cookie — decrypts with `strict=True`, or a hand-typed value
-  is accepted as genuine.
+  is accepted as genuine. A BACKEND's api key is the opposite of a user key: never
+  rendered back (`_backend_form` shows a blank password field + an `api_key_clear` box;
+  blank keeps the stored key, and for a config backend being copied into the store
+  `backend_save` takes it from the live backend via `_backend_api_key` — the summary only
+  carries `api_key_set`; `test_backend_key_field.py`).
 - **`admin.py`** — the `/ui` console (mounted via `admin.register(app)` +
   `add_api_route`, *not* `include_router` — broken in this starlette build;
   callbacks injected via `admin.bind(...)`). Session-gated by `_ui_guard` once
@@ -1028,7 +1045,11 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   `inflight_inc` runs with no `await` between it and `resolve_routes`). Park time
   per alias via `alias_park_s` (store `alias_park` + config), else `park_timeout_s`
   (default 60); `0` disables. Timeout → 503 + `Retry-After`. "Parked calls" panel
-  on the Dashboard. **Async chat has no OpenAI spec** — async lives on the Responses
+  on the Dashboard. The media counterpart is `max_queued_gen` (Server tab, default 200):
+  `run_generation` refuses a new ASYNC job with 503 once `_gen_tasks` holds that many
+  (sync jobs hold a connection and cap themselves), and `_clamp_ttl` caps a client's
+  `ttl_s` at `jobs.max_ttl_s` (default 7 days) — `test_gen_limits.py`.
+  **Async chat has no OpenAI spec** — async lives on the Responses
   background mode: `POST /v1/responses {background:true}` → `resp_<jobid>` queued →
   `GET /v1/responses/{id}` poll → `POST …/cancel`; the worker (`_run_bg_response`)
   parks in the same queue (jobs.py task `response`).
@@ -1121,6 +1142,9 @@ maps the alias, and exposes the resolved model. Recurring concepts:
 - **Allow-list filtering**: `/v1/models` authenticates the caller and filters by
   their allow-list (entries may be aliases, model ids, or **backend names** =
   all that backend's models); image aliases are included; `?type=chat|image`.
+  `GET /v1/models/{id}` applies the same grant (`_model_allowed`) and answers outside it
+  with the unknown-model 404, so a restricted key cannot probe what exists
+  (`test_model_lookup_allow.py`).
 - **Alias/model-name collisions** (`alias_model_conflicts`): surfaced in the
   Input & Routing tab, split `covered` vs actionable `shadowed` (`/health` carries
   the shadowing entries only).
@@ -1182,7 +1206,15 @@ maps the alias, and exposes the resolved model. Recurring concepts:
 `authenticate()` resolves a Bearer token to a user (`_users_by_key`) or the
 master `_MASTER_ADMIN` (the top-level `api_key`); `gate_request()` enforces the
 allow-list (`_model_allowed`, incl. whole-backend grants) + quotas and attributes
-the call. Bootstrap-open with no users and no master key. The `/ui` console
+the call. Bootstrap-open with no users and no master key. `ui_locked()` is the SAME
+condition the API uses (any user or a master key) — locking only on an ADMIN credential
+left a gateway with only `role: user` accounts API-closed and console-open. The users
+editor keeps "someone can sign in" true via `main.admin_change_refusal` (a first
+non-admin user, and deleting/demoting/disabling the last enabled admin with a key while
+no master key exists, are refused with a `?refused=<code>` banner from the fixed
+`_USER_REFUSALS` table); an old store.db already in the users-but-no-admin state stays
+locked and the login page names `api_key` in config.yaml as the way in
+(`test_ui_lock.py`). The `/ui` console
 session is gated by `_ui_guard` once locked: an encrypted cookie (`strict`) carrying
 `main.admin_session_tag` — the fingerprint of the credential it was opened with,
 re-checked per request, so rotating a key or demoting/deleting an admin ends its
@@ -1194,9 +1226,29 @@ counts as foreign — another service on the same IP but another port lands on t
 too, deliberately. Behind a reverse proxy the public host must arrive in `Host` or
 `X-Forwarded-Host`, or browsers without fetch metadata get 403 on every POST. Every /ui
 response carries `_UI_SEC_HEADERS` (no framing, nosniff); the cookie is
-`samesite=strict`. All values the console puts into JavaScript go through
+`samesite=strict`, and `Secure` whenever the login came in over HTTPS (`_is_https`: the
+URL scheme or `X-Forwarded-Proto: https` — never unconditionally, a plain-http LAN
+install would then loop on the login). `login_post` counts failures per client IP
+(`_login_fails`, in memory, `_LOGIN_MAX_FAILS` 10 per `_LOGIN_WINDOW_S` 300 s → 429 +
+`Retry-After` without checking the key; a good login clears the IP; `X-Forwarded-For`
+deliberately ignored, so behind a proxy the limit is shared) — `test_ui_login.py`. All values the console puts into JavaScript go through
 `data-*` attributes (`data-confirm` + `_CONFIRM_JS`) or `_js_json` — never
 `html.escape` into an inline handler (`test_ui_escaping.py`).
+
+**What clients send is bounded.** `main._BodyLimit` (pure ASGI, added BEFORE
+`admin.register` so it sits inside `_ui_guard` — a BaseHTTPMiddleware's task group would
+turn its 413 into a 500) caps every body at `max_body_mb` (config, default 200, hot):
+Content-Length refused up front, chunked counted in `receive` and raised as
+HTTPException(413) from the endpoint's own read. `admin._form`/`_form_multi` read through
+`_form_raw` with `_FORM_MAX_BYTES` (16 MB). Client URLs (`_decode_ref_blob` →
+`_fetch_ref_url`) are an SSRF-with-readback surface (the bytes come back at
+`/v1/jobs/<id>/input/<n>`): every resolved address must pass `ref_addr_blocked` (not
+global or multicast = blocked; v4-mapped judged as v4; `ref_url_allow_cidrs` opens
+ranges), the request goes to the CHECKED IP with the original Host header and
+`sni_hostname` (no second lookup → no rebinding), no redirects, body counted against
+`_REF_FETCH_MAX_BYTES`. `/v1/generations` fetches only `images` keys in
+`_gen_image_slot_names` (param or label), the image shim only as many `ref_images` as
+the alias has slots (`test_ref_url_fetch.py`, `test_body_limit.py`).
 
 ### Stats recording
 
@@ -1230,7 +1282,10 @@ to take the newest 300 of the whole log and filter afterwards, which left Voice 
 empty on any busy LLM day, and the Media Jobs tick ran all six `summary()` scans just
 for that (≈0.6 s at 300k rows; now one indexed read of `(refused)` rows). The user
 pickers read `stats.sources()` (every source, index-only), and `summary()`/`sources()`
-are memoised 30 s (`_MEMO_TTL_S`) — the per-call lists never are. The same handler renders `/v1/messages` errors in
+are memoised 30 s (`_MEMO_TTL_S`) — the per-call lists never are. A refused row holds what the CALLER chose (model, x-source,
+path — before or without auth), so `_clip` cuts each to `_LOG_FIELD_MAX` (200; `_source_of`
+cuts x-source for every row) and 401 rows are capped at `_UNAUTH_LOG_PER_MIN` (60) per
+minute, the overflow summarised in one log line (`test_rejected_log.py`). The same handler renders `/v1/messages` errors in
 Anthropic shape, so that form lives in ONE place. Cost from pricing
 cached at discovery (`normalize_pricing`: Together per-million, OpenRouter
 per-token). Streaming records the backend's usage chunk (the adapter always
@@ -1276,4 +1331,8 @@ the month-cost quota, which sums `cost_usd` over every row.
   `voice`; `voice:"lib:<name>"` resolves to the shipped path + ref_text in
   `route()`. An empty ref_text is auto-transcribed: local faster-whisper first
   (lazy CPU import; the one heavyweight entry in `requirements.txt`), a backend
-  whisper model as fallback.
+  whisper model as fallback. The playground's synthesis stash (`voice_audio`) and the
+  call log's stored audio (`call_audio`) are served under the BACKEND's Content-Type from
+  the /ui origin, so `admin._audio_headers` plays only `audio/*` and turns anything else
+  (svg, html …) into an `application/octet-stream` attachment, nosniff always
+  (`test_audio_content_type.py`).

@@ -146,6 +146,12 @@ _apply_server_settings: Callable[[], None] = lambda: None
 _apply_users: Callable[[], None] = lambda: None
 _resolve_admin: Callable = lambda key: None
 _ui_locked: Callable[[], bool] = lambda: False
+# Whether anyone can sign in (master key or an enabled admin user with a key).
+_admin_credential_exists: Callable[[], bool] = lambda: True
+# users-after-the-change → refusal code (see _USER_REFUSALS) or None.
+_admin_change_refusal: Callable[[list], Optional[str]] = lambda users_after: None
+# (name, type) → the live backend's api_key (config or store), never rendered.
+_backend_api_key: Callable[[str, str], Optional[str]] = lambda name, typ: None
 # (admin name, is_master) → fingerprint of that admin's CURRENT credential, None = no
 # longer an admin. Sessions carry it, so revoking the credential revokes them.
 _admin_session_tag: Callable[[Optional[str], bool], Optional[str]] = lambda name, master: None
@@ -1024,9 +1030,16 @@ async def _ui_guard(request: Request, call_next):
 
 def _login_page(error: str = "", nxt: str = "/ui") -> str:
     err = f"<p class='bad'>{_esc(error)}</p>" if error else ""
+    # Users exist but none can sign in (an old store.db — the editor no longer lets
+    # the console get here): name the one way back in instead of a dead login form.
+    stuck = ("" if _admin_credential_exists() else
+             "<p class='bad'>No admin can sign in: users exist, but none of them is an enabled "
+             "<b>admin</b> with a key, and no master key is set. Set <code>api_key: &lt;a long "
+             "random key&gt;</code> in <code>config.yaml</code> (reloaded on save, no restart) "
+             "and sign in with it.</p>")
     body = (f"<div style='max-width:360px;margin:8vh auto;text-align:left'>"
             f"<h2>AI-Hub login</h2><p class='hint'>Enter an <b>admin API key</b> to access the console.</p>"
-            f"{err}<form action='/ui/login' method='post'>"
+            f"{stuck}{err}<form action='/ui/login' method='post'>"
             f"<input type='hidden' name='next' value='{_esc(nxt)}'>"
             f"{_field('admin key', _inp('key', '', placeholder='Bearer token', typ='password'))}"
             f"<div class='field'><label></label><div class='control'>{_btn('Sign in', submit=True)}</div></div>"
@@ -1041,17 +1054,64 @@ async def login_page(request: Request):
     return HTMLResponse(_page("Login", _login_page(nxt=nxt), active="", nologin=True))
 
 
+# Login guessing: failed attempts per client IP inside a sliding window. In memory on
+# purpose (one instance; a restart forgetting them is harmless). Behind a reverse proxy
+# every browser shares the proxy's IP, so a burst of typos there locks the form for
+# everyone for the window — X-Forwarded-For is NOT used: it is the attacker's to choose.
+_LOGIN_MAX_FAILS = 10
+_LOGIN_WINDOW_S = 300
+_LOGIN_MAX_IPS = 4096                     # bound on the table (oldest IP evicted first)
+_login_fails: dict = {}                   # ip → [monotonic timestamps of failures]
+
+
+def _login_recent(ip: str, now: float) -> list:
+    stamps = [t for t in _login_fails.get(ip, []) if now - t < _LOGIN_WINDOW_S]
+    if stamps:
+        _login_fails[ip] = stamps
+    else:
+        _login_fails.pop(ip, None)
+    return stamps
+
+
+def _login_note_fail(ip: str, now: float) -> None:
+    stamps = _login_recent(ip, now)
+    _login_fails.pop(ip, None)                # re-insert → dict order = least recently failed first
+    _login_fails[ip] = stamps + [now]
+    while len(_login_fails) > _LOGIN_MAX_IPS:
+        _login_fails.pop(next(iter(_login_fails)))
+
+
+def _is_https(request: Request) -> bool:
+    """Whether the browser reached us over TLS — directly, or through a proxy that says
+    so. Trusting the header is safe here: a forged `https` only makes the cookie Secure,
+    which hurts nobody but the forger."""
+    proto = (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip().lower()
+    return request.url.scheme == "https" or proto == "https"
+
+
 async def login_post(request: Request):
+    ip = getattr(request.client, "host", None) or "?"
+    now = time.monotonic()
+    recent = _login_recent(ip, now)
+    if len(recent) >= _LOGIN_MAX_FAILS:
+        wait = max(1, int(_LOGIN_WINDOW_S - (now - recent[0])) + 1)
+        logger.warning(f"ui: login from {ip} refused — {len(recent)} failures in "
+                       f"{_LOGIN_WINDOW_S // 60} min")
+        return HTMLResponse(_page("Login", _login_page(
+            f"Too many failed sign-ins from this address — try again in {wait} s."),
+            active="", nologin=True), status_code=429, headers={"Retry-After": str(wait)})
     f = await _form(request)
     key = (f.get("key", "") or "").strip()
     nxt = f.get("next", "/ui") or "/ui"
     admin = _resolve_admin(key)
     if not admin:
+        _login_note_fail(ip, now)
         return HTMLResponse(_page("Login", _login_page("Invalid admin key.", nxt), active="", nologin=True),
                             status_code=401)
+    _login_fails.pop(ip, None)
     resp = RedirectResponse(nxt if nxt.startswith("/ui") else "/ui", status_code=303)
-    resp.set_cookie(_SESSION_COOKIE, _make_session(admin),
-                    max_age=_SESSION_TTL, httponly=True, samesite="strict", path="/")
+    resp.set_cookie(_SESSION_COOKIE, _make_session(admin), max_age=_SESSION_TTL,
+                    httponly=True, samesite="strict", secure=_is_https(request), path="/")
     logger.info(f"ui: admin '{admin['name']}' logged in")
     return resp
 
@@ -1064,15 +1124,34 @@ async def logout(request: Request):
 
 # ── POST body parsing (no python-multipart) ─────────────────────────────────────
 
+# A url-encoded console form is text typed or pasted by an admin — even a pasted
+# workflow JSON is a few hundred KB. Uploads (meshes, audio, images) go through
+# _multipart, which only the app-wide body cap (main `max_body_mb`) bounds.
+_FORM_MAX_BYTES = 16 * 1024 * 1024
+
+
+async def _form_raw(request: Request) -> str:
+    """The url-encoded body, read with a byte cap WHILE it streams (413 past it) —
+    `request.body()` would hold whatever arrives before anything could check it."""
+    if not hasattr(request, "stream"):                   # a test stub with body() only
+        return (await request.body()).decode("utf-8", "replace")
+    buf = bytearray()
+    async for chunk in request.stream():
+        buf += chunk
+        if len(buf) > _FORM_MAX_BYTES:
+            raise HTTPException(413, f"form body exceeds {_FORM_MAX_BYTES // (1024 * 1024)} MB")
+    return bytes(buf).decode("utf-8", "replace")
+
+
 async def _form(request: Request) -> dict:
-    raw = (await request.body()).decode("utf-8", "replace")
+    raw = await _form_raw(request)
     return {k: v[-1] for k, v in parse_qs(raw, keep_blank_values=True).items()}
 
 
 async def _form_multi(request: Request) -> dict:
     """Like _form(), but keeps EVERY value per key ({k: [v, …]}) — for handlers with
     checkbox lists (reasoning backends, user model grants) that _form would collapse."""
-    raw = (await request.body()).decode("utf-8", "replace")
+    raw = await _form_raw(request)
     return parse_qs(raw, keep_blank_values=True)
 
 
@@ -1372,7 +1451,13 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
               "(a cloud API). The scheduler sends a request to the fastest free <b>unpaid</b> backend "
               "and reaches for a paid one only when no unpaid backend is free.</p>"
             + _field("max_concurrent", _inp("max_concurrent", g("max_concurrent"), placeholder="optional, e.g. 1", typ="number"))
-            + _field("api key", _inp("api_key", g("api_key"), placeholder="optional — cloud backends"))
+            # Never rendered back (it is a cloud secret): blank keeps the stored key —
+            # or a config backend's, see backend_save — and "clear" removes it.
+            + _field("api key", _inp("api_key", "", typ="password",
+                                     placeholder=("•••• set — blank keeps it"
+                                                  if (src.get("api_key") or src.get("api_key_set"))
+                                                  else "optional — cloud backends"))
+                     + _checkbox("api_key_clear", False, "clear", "remove the stored key on Save"))
             + "</div>"
 
             # ── Models ────────────────────────────────────────────────────────────
@@ -2150,8 +2235,17 @@ async def backend_save(request: Request):
         b["comfy_input_dir"] = cid
     else:
         b.pop("comfy_input_dir", None)         # blank = derive from the output dir
-    if (f.get("api_key", "") or "").strip():
-        b["api_key"] = f["api_key"].strip()
+    ak = (f.get("api_key", "") or "").strip()
+    if ak:
+        b["api_key"] = ak
+    elif f.get("api_key_clear"):
+        b.pop("api_key", None)
+    elif not b.get("api_key"):
+        # A config backend's first Save copies it into the store — its key is not in the
+        # (masked) form, so it comes from the live backend, or the copy loses auth.
+        live = _backend_api_key(oname, otype)
+        if live:
+            b["api_key"] = live
     mctx = (f.get("model_context", "") or "").strip()
     if mctx:
         b["model_context"] = mctx               # `glob=tokens` lines; parsed on every read
@@ -4267,6 +4361,10 @@ async def update(request: Request):
                         x for x in re.split(r"[,\s]+", f.get(f"bypass__{p}", "") or "") if x))
                     if extra:
                         entry["on_empty_bypass"] = extra
+                # `client_path` (a file field that takes a backend path from any client,
+                # main._client_param_refusal) has no form field — keep it across a Save.
+                if ((cand.get("mapping") or {}).get(p) or {}).get("client_path"):
+                    entry["client_path"] = True
                 mapping[p] = entry
     # Editable workflow defaults (the "=" column): default__<param> writes the
     # value a request-without-this-field runs with into the workflow JSON at the
@@ -5138,13 +5236,26 @@ async def voiceplay_send(request: Request):
                               subnav=_subnav("playground", "voice")))
 
 
+def _audio_headers(mime: Optional[str]) -> tuple:
+    """(media_type, headers) for serving bytes a TTS backend CLAIMS are audio. Its
+    Content-Type is the backend's to choose, and served as-is from /ui an `image/svg+xml`
+    or `text/html` body would run script in the console's origin — so only `audio/*`
+    plays; anything else is a download, and nosniff forbids guessing either way."""
+    base = (mime or "").split(";", 1)[0].strip().lower()
+    if base.startswith("audio/"):
+        return mime, {"X-Content-Type-Options": "nosniff"}
+    return "application/octet-stream", {"X-Content-Type-Options": "nosniff",
+                                        "Content-Disposition": 'attachment; filename="audio.bin"'}
+
+
 async def voice_audio(request: Request):
     """Serve the current user's last synthesis result (stash — no persistence)."""
     stash = _voice_out.get(_session_user(request) or "default")
     if not stash:
         raise HTTPException(404, "no synthesis result")
     data, mime = stash
-    return Response(data, media_type=mime)
+    media_type, headers = _audio_headers(mime)
+    return Response(data, media_type=media_type, headers=headers)
 
 
 def _voice_status(kind: str, msg: str) -> str:
@@ -6578,7 +6689,8 @@ async def call_audio(call_id: int):
     if hit is None:
         raise HTTPException(404, "no audio stored for this call")
     path, mime = hit
-    return FileResponse(path, media_type=mime)
+    media_type, headers = _audio_headers(mime)       # the stored type is the backend's claim
+    return FileResponse(path, media_type=media_type, headers=headers)
 
 
 # ── Reasoning tab: normalized thinking toggle (per-model × per-backend rules) ────
@@ -7011,6 +7123,21 @@ def _user_form(u: Optional[dict]) -> str:
             + "</form>")
 
 
+# Why the users editor refused a change (admin_change_refusal's codes). A fixed table,
+# so the redirect's query string can never inject text into the page.
+_USER_REFUSALS = {
+    "last_admin": "that would remove the last admin who can sign in — the console would "
+                  "open to everyone. Make another user an <b>admin</b> (enabled, with a key) "
+                  "or set a master API key in <a href='/ui/server'>Server</a> first.",
+    "last_admin_open": "that would remove the last admin who can sign in — the console AND the "
+                       "API would open to everyone. Set a master API key in "
+                       "<a href='/ui/server'>Server</a> first if that is really what you want.",
+    "no_admin": "the first user must be an enabled <b>admin</b> with a key (or set a master API "
+                "key in <a href='/ui/server'>Server</a>) — a user locks the console, and without "
+                "an admin nobody could sign in.",
+}
+
+
 async def users_page(request: Request):
     qp = request.query_params
     edit = qp.get("edit", "")
@@ -7031,8 +7158,11 @@ async def users_page(request: Request):
         items += _item(f"{_esc(u['name'])} {role_b}{st} {key_b}", sub, acts, sel=(u["name"] == edit))
     items = items or "<p class='muted'>No users — the gateway is open (bootstrap). Add one to require keys.</p>"
     warn = ("<p class='ok-banner'>Bootstrap mode: no users and no master key → the API and /ui are "
-            "open. Add an <b>admin</b> user (or set a master API key in Server) to lock it down.</p>"
-            if open_auth else "")
+            "open. Add an <b>admin</b> user first (or set a master API key in Server) to lock it "
+            "down.</p>" if open_auth else "")
+    why = _USER_REFUSALS.get(qp.get("refused", ""))
+    if why:
+        warn = f"<p class='bad'>Not saved: {why}</p>" + warn
     list_html = (f'<div class="bar"><h2>Users</h2>{_btn("+ New user", "/ui/users?new=1")}</div>'
                  "<p class='hint'>Each user authenticates with their API key; calls are attributed to "
                  "them (stats, job ownership). Empty model list = all allowed.</p>" + items)
@@ -7107,6 +7237,12 @@ async def users_save(request: Request):
     ak = g("api_key").strip()
     if ak:
         u["api_key"] = ak
+    after = [x for x in store.list_users() if x.get("name") not in (orig, name)] + [u]
+    refused = _admin_change_refusal(after)
+    if refused:
+        back = f"edit={quote(orig)}" if orig and store.get_user(orig) else "new=1"
+        logger.warning(f"ui: user '{name}' not saved — {refused}")
+        return RedirectResponse(f"/ui/users?{back}&refused={refused}", status_code=303)
     if orig and orig != name and store.get_user(orig) is not None:
         store.delete_user(orig)
     store.upsert_user(u)
@@ -7118,6 +7254,10 @@ async def users_save(request: Request):
 async def users_del(request: Request):
     name = (request.query_params.get("name", "") or "").strip()
     if name:
+        refused = _admin_change_refusal([u for u in store.list_users() if u.get("name") != name])
+        if refused:
+            logger.warning(f"ui: user '{name}' not deleted — {refused}")
+            return RedirectResponse(f"/ui/users?refused={refused}", status_code=303)
         store.delete_user(name)
         _apply_users()
         logger.info(f"ui: user '{name}' deleted")
@@ -7130,6 +7270,9 @@ _SRV_RUNTIME = [
     ("max_concurrent", "int", "default max_concurrent", "blank = unlimited"),
     ("park_timeout_s", "int", "default park time", "seconds a call waits for a free backend when all are busy (blank = 60; per-alias override in Mapping; 0 = off)"),
     ("max_parked", "int", "max parked calls", "queue cap — beyond this a busy call gets 503 (blank = 100)"),
+    ("max_queued_gen", "int", "max queued media jobs",
+     "async generation jobs queued or running at once — beyond this a new async job gets 503 "
+     "(default 200; 0 = no cap)"),
     ("affinity_max_wait_s", "float", "affinity max wait",
      "seconds — a queued request older than this beats the same-type preference and takes "
      "the next free backend"),

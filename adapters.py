@@ -2207,8 +2207,18 @@ def _apply_mapping(wf: dict, mapping: dict, values: dict, protected: Optional[se
             continue
         node, field = binding.get("node"), binding.get("field")
         if node in wf and field and (node, field) not in protected:
-            wf[node].setdefault("inputs", {})[field] = values[param]
-            applied[param] = values[param]
+            inputs = wf[node].setdefault("inputs", {})
+            v = values[param]
+            # In ComfyUI's API format a list IS a link (`["12", 0]` = node 12's output 0):
+            # a value that is one would re-plumb the workflow, not set a field. An object
+            # only goes where the workflow itself holds one (a structured widget value).
+            if isinstance(v, (list, tuple)) or (isinstance(v, dict)
+                                                and not isinstance(inputs.get(field), dict)):
+                logger.warning(f"mapping: '{param}' → node {node}.{field} skipped — "
+                               f"{type(v).__name__} is not a workflow value")
+                continue
+            inputs[field] = v
+            applied[param] = v
     return applied
 
 

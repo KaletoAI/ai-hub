@@ -4,6 +4,7 @@ import calendar
 import fnmatch
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import mimetypes
@@ -437,6 +438,10 @@ async_park_timeout_s: float = 600.0
 # ~30 s) without hanging a genuinely-offline alias to the full park deadline.
 park_health_grace_s: float = 90.0
 max_parked: int = 100
+# Cap on async generation jobs queued or running at once (`_gen_tasks`) — the media
+# counterpart of max_parked: each is a task + a job row + stored inputs, and without a
+# cap a loop of `mode: async` requests queues without end. Server tab.
+max_queued_gen: int = 200
 # Freed-backend type affinity (spec 2026-09-01): a woken parked call claims a freed
 # backend only if the scheduler designates IT for that backend, so a backend prefers a
 # waiter that needs the model it just ran (no reload). The affinity may hold a queued
@@ -1012,6 +1017,61 @@ async def lifespan(app: FastAPI):
 # ── App ───────────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="AI-Hub", lifespan=lifespan)
+
+# Request bodies are read whole (request.json()/body()) — nothing bounded them, so one
+# client could hand the gateway an arbitrarily large body to hold in memory (review S10).
+# `max_body_mb` (config.yaml, hot-reloaded; 0 = off) caps every request: a declared
+# Content-Length over it is refused before a byte is read, a chunked body is counted
+# while it streams. The default stays far above the largest legitimate body — a 64 MB
+# mesh under `files` is ~86 MB as base64 JSON.
+MAX_BODY_MB_DEFAULT = 200
+
+
+def max_body_bytes() -> int:
+    try:
+        mb = float((config or {}).get("max_body_mb", MAX_BODY_MB_DEFAULT))
+    except (TypeError, ValueError, NameError):
+        mb = MAX_BODY_MB_DEFAULT
+    return int(mb * 1024 * 1024) if mb > 0 else 0
+
+
+class _BodyLimit:
+    """Pure ASGI (not BaseHTTPMiddleware): it has to sit in the receive path."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        limit = max_body_bytes() if scope["type"] == "http" else 0
+        if not limit:
+            return await self.app(scope, receive, send)
+        msg = f"request body exceeds {limit / (1024 * 1024):g} MB (max_body_mb)"
+        cl = dict(scope.get("headers") or []).get(b"content-length")
+        try:
+            declared = int(cl) if cl is not None else None
+        except ValueError:
+            declared = None
+        if declared is not None and declared > limit:
+            return await JSONResponse({"detail": msg}, status_code=413)(scope, receive, send)
+        seen = 0
+
+        async def counted():
+            nonlocal seen
+            m = await receive()
+            if m.get("type") == "http.request":
+                seen += len(m.get("body") or b"")
+                if seen > limit:
+                    # Raised inside the endpoint's body read → the app's HTTPException
+                    # handler answers 413 (and logs the refusal like any other).
+                    raise HTTPException(413, msg)
+            return m
+        await self.app(scope, counted, send)
+
+
+# Added BEFORE admin.register: middleware added later wraps the earlier one, so this
+# sits INSIDE the console's BaseHTTPMiddleware guard — whose receive runs in a task
+# group that would turn the 413 into an ExceptionGroup (a 500) on its way out.
+app.add_middleware(_BodyLimit)
 admin.register(app)                     # generation management UI at /ui
 
 
@@ -1048,10 +1108,42 @@ async def _unexpected_error(request: Request, exc: Exception):
     return PlainTextResponse("Internal Server Error", status_code=500)
 
 
+# Refusals are logged before (or without) authentication, so the row holds what the
+# CALLER chose: the model field, x-source, the path. Cut to a fixed length — an
+# anonymous client could otherwise store a 50 MB "model name" per request — and 401
+# rows, the refusal any stranger can produce at will, are capped per minute so a key
+# scanner cannot push every real call out of the LLM Calls view.
+_LOG_FIELD_MAX = 200
+_UNAUTH_LOG_PER_MIN = 60
+_unauth_log: dict = {}            # {"minute": int, "n": recorded, "dropped": int}
+
+
+def _clip(v) -> Optional[str]:
+    if v is None:
+        return None
+    return (v if isinstance(v, str) else json.dumps(v, ensure_ascii=False, default=str))[:_LOG_FIELD_MAX]
+
+
+def _unauth_row_allowed() -> bool:
+    minute = int(time.time() // 60)
+    if _unauth_log.get("minute") != minute:
+        if _unauth_log.get("dropped"):
+            logger.warning(f"stats: {_unauth_log['dropped']} further 401 refusal(s) not logged "
+                           f"(cap {_UNAUTH_LOG_PER_MIN}/min)")
+        _unauth_log.update(minute=minute, n=0, dropped=0)
+    if _unauth_log["n"] >= _UNAUTH_LOG_PER_MIN:
+        _unauth_log["dropped"] += 1
+        return False
+    _unauth_log["n"] += 1
+    return True
+
+
 def _record_rejected(request: Request, exc: HTTPException) -> None:
     """Fire-and-forget stats row for a refused call. Never raises into the response
     path: a logging failure must not turn a clean 503 into a 500."""
     if not stats.is_active():
+        return
+    if exc.status_code == 401 and not _unauth_row_allowed():
         return
     try:
         body = getattr(request.state, "gw_body", None)
@@ -1059,12 +1151,12 @@ def _record_rejected(request: Request, exc: HTTPException) -> None:
         if alias is None and isinstance(body, dict):
             alias = body.get("model")
         asyncio.create_task(stats.record_call(
-            duration_ms=0, backend=_REJECTED_BACKEND, source=_source_of(request),
+            duration_ms=0, backend=_REJECTED_BACKEND, source=_clip(_source_of(request)),
             # `model` stays empty: it holds the REAL model a backend served, and no
             # backend ever resolved one here — filling it with the alias would render
             # as "x→x" in the call list and claim a resolution that never happened.
-            alias=alias, model=None,
-            endpoint=getattr(request.state, "gw_endpoint", None) or request.url.path,
+            alias=_clip(alias), model=None,
+            endpoint=_clip(getattr(request.state, "gw_endpoint", None) or request.url.path),
             status=exc.status_code, input_tokens=0, output_tokens=0, cost_usd=0.0,
             request_text=(json.dumps(body, ensure_ascii=False) if isinstance(body, dict) else None),
             response_text=json.dumps({"error": {"message": str(exc.detail)}}, ensure_ascii=False),
@@ -1180,6 +1272,8 @@ async def gate_request(authorization: Optional[str], request: Request, model: Op
     if user is None:
         return None
     request.state.gw_user = user["name"]
+    # admin-only request powers downstream (a backend path in generation params)
+    request.state.gw_admin = bool(user.get("_master") or user.get("role") == "admin")
     if not _model_allowed(user, model):
         raise HTTPException(403, f"user '{user['name']}' is not allowed model '{model}'")
     cap = user.get("quota_cost_month")                 # monthly cost/credit quota (E1)
@@ -1255,10 +1349,34 @@ def admin_session_tag(name: Optional[str], master: bool) -> Optional[str]:
 
 
 def ui_locked() -> bool:
-    """True once an admin credential exists (master key or an admin user) → /ui needs
-    login. Bootstrap-open (no admin anywhere) returns False so you can't lock yourself
-    out before setting one up."""
-    return bool(api_key) or any(u.get("role") == "admin" for u in users)
+    """True once ANY credential exists (master key or any user) → /ui needs login —
+    the same condition that closes the API (`authenticate`). Locking only on an ADMIN
+    credential left a gateway with nothing but `role: user` accounts API-closed and
+    console-open to the whole LAN. Bootstrap-open (no users, no key) returns False."""
+    return bool(api_key) or bool(users)
+
+
+def admin_credential_exists(user_list: Optional[list] = None,
+                            key: Optional[str] = None) -> bool:
+    """Whether someone can sign in to /ui: a master key, or an ENABLED admin user that
+    has a key (what `resolve_admin` accepts). Defaults to the live state."""
+    ulist = users if user_list is None else user_list
+    if key if key is not None else api_key:
+        return True
+    return any(u.get("role") == "admin" and u.get("enabled", True) and u.get("api_key")
+               for u in ulist)
+
+
+def admin_change_refusal(users_after: list) -> Optional[str]:
+    """Why a users-editor change must be refused, or None. Two states are never entered
+    from the console: users without any admin credential (the console locks and nobody
+    can sign in), and a locked gateway losing its last admin credential (the console —
+    and with no users left, the API — silently opens again). A master key covers both."""
+    if admin_credential_exists(users_after):
+        return None
+    if admin_credential_exists():
+        return ("last_admin" if users_after else "last_admin_open")
+    return "no_admin" if users_after else None
 
 
 def alias_entry(alias: str, backend_name: str) -> tuple[Optional[str], Optional[int]]:
@@ -1619,7 +1737,9 @@ def _source_of(request: Request) -> str:
     u = getattr(request.state, "gw_user", None)        # authenticated user wins
     if u:
         return u
-    return request.headers.get("x-source") or (request.client.host if request.client else "unknown")
+    # x-source is the caller's to choose and lands in every stats row → bounded.
+    return ((request.headers.get("x-source") or "")[:_LOG_FIELD_MAX]
+            or (request.client.host if request.client else "unknown"))
 
 
 def _normalize_reasoning(body: dict) -> Optional[str]:
@@ -2383,7 +2503,11 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
 
 @app.get("/v1/models/{model_id:path}")
 async def get_model(model_id: str, authorization: Optional[str] = Header(None)):
-    check_auth(authorization)
+    user = authenticate(authorization)
+    # The same grant the request path enforces; outside it the answer is the unknown-model
+    # 404, so a restricted key cannot probe what exists beyond its allow-list.
+    if user is not None and not _model_allowed(user, model_id):
+        raise HTTPException(404, f"Model '{model_id}' not found")
     now = int(time.time())
     llm = [b for b in enabled_backends() if not _is_gen(b)]
     if model_id in virtual_models:
@@ -4453,6 +4577,74 @@ def _upload_prefix(job_id: str, stage: str = "") -> str:
     return f"gw_{job_id}{('_' + stage) if stage else ''}"
 
 
+def _params_trusted(request) -> bool:
+    """Whether this generation request may name BACKEND paths in its params: an admin
+    key (gate_request marks it), the console (its session was checked by _ui_guard),
+    or bootstrap-open mode, where everything is open anyway."""
+    if not users and not api_key:
+        return True
+    if getattr(getattr(request, "state", None), "gw_admin", False):
+        return True
+    return str(getattr(getattr(request, "url", None), "path", "") or "").startswith("/ui")
+
+
+def _numberish(v: str) -> bool:
+    try:
+        float(v.strip())
+        return True
+    except ValueError:
+        return v.strip().lower() in ("true", "false")
+
+
+def _client_param_refusal(params: dict, wf_maps: list, trusted: bool) -> Optional[str]:
+    """Why these client params must not reach the workflows in `wf_maps` [(wf, mapping)]
+    — the alias's own and, for a chain, its successor's (params are threaded there by
+    label) — or None. Only MAPPED names are judged; unknown ones are ignored downstream.
+
+    A list or object is never a value (in ComfyUI's API format a list is a LINK), and a
+    mapped file field (adapters.is_file_param) is a path on the backend box: from a
+    plain user that reads any file ComfyUI can — another job's output included — so it
+    needs `trusted` or the mapping entry's `client_path: true`; `files` is the way in."""
+    flat = dict(params or {})
+    extra = flat.get("extra")
+    if isinstance(extra, dict):
+        flat.update(extra)
+    for wf, mapping in wf_maps:
+        for p, m in (mapping or {}).items():
+            m = m or {}
+            lbl = (m.get("label") or "").strip()
+            for name in {p, lbl} - {""}:
+                if name not in flat:
+                    continue
+                v = flat[name]
+                if isinstance(v, (list, tuple, dict)):
+                    return (f"`params.{name}` must be a single value — a list or object is "
+                            f"not a workflow value")
+                if (not trusted and not m.get("client_path") and isinstance(v, str) and v.strip()
+                        and not _numberish(v)          # is_file_param is a NAME heuristic —
+                        and not is_image_field(wf or {}, m.get("node"))   # "mesh_faces: '5000'" is no path
+                        and adapters.is_file_param(p, m)):
+                    return (f"`params.{name}` names a file on the backend — send the file "
+                            f"itself under `files.{name}` (a backend path is admin-only)")
+    return None
+
+
+JOB_MAX_TTL_DEFAULT = 7 * 86400
+
+
+def _clamp_ttl(v) -> Optional[int]:
+    """A client's job `ttl_s`, capped at `jobs.max_ttl_s` (config, default 7 days) —
+    unbounded, `10**12` kept a job's inputs and results on disk for good. Anything that
+    is not a positive int stays None (→ the store's default TTL), as before."""
+    if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+        return None
+    try:
+        cap = int(jobs_cfg.get("max_ttl_s", JOB_MAX_TTL_DEFAULT))
+    except (TypeError, ValueError):
+        cap = JOB_MAX_TTL_DEFAULT
+    return min(v, cap) if cap > 0 else v
+
+
 async def run_generation(body: dict, request: Request,
                          upload_images: Optional[dict] = None,
                          upload_files: Optional[dict] = None) -> dict:
@@ -4467,12 +4659,26 @@ async def run_generation(body: dict, request: Request,
     alias = body.get("model", "")
     output = dict(body.get("output") or {})
     mode = output.get("mode") or body.get("mode") or "sync"
-    ttl_s = output.get("ttl_s") or body.get("ttl_s")
+    ttl_s = _clamp_ttl(output.get("ttl_s") or body.get("ttl_s"))
+    if mode == "async" and len(_gen_tasks) >= max_queued_gen > 0:
+        raise HTTPException(503, f"too many queued generation jobs ({max_queued_gen}) — retry "
+                                 f"later", headers={"Retry-After": "10"})
     force = (body.get("backend") or "").strip()          # pin to one backend (playground testing)
 
     routes, parked, eligible = await _gen_pick(alias, force, body)
     inputs, params = _gen_inputs_params(body)
     _apply_seconds(params, routes[0][1])         # seconds → frames (alias fps; 400 if unsupported)
+    c0 = routes[0][1]
+    wf_maps = [(c0.get("workflow_json") or {}, c0.get("mapping") or {})]
+    succ_alias = ((c0.get("successor") or {}).get("alias") or "").strip()
+    if succ_alias:
+        sc = (((await asyncio.to_thread(store.get, succ_alias)) if store.is_active() else None)
+              or image_models.get(succ_alias) or [])
+        if sc:
+            wf_maps.append((sc[0].get("workflow_json") or {}, sc[0].get("mapping") or {}))
+    refusal = _client_param_refusal(params, wf_maps, _params_trusted(request))
+    if refusal:
+        raise HTTPException(400, refusal)
 
     def build_req(backend: dict, cand: dict) -> NormalizedRequest:
         # `job_id` below is bound by the time this runs (dispatch happens after the job
@@ -4663,7 +4869,15 @@ async def generations(request: Request, authorization: Optional[str] = Header(No
     uploads = None
     imgs = body.pop("images", None)
     if isinstance(imgs, dict):
-        uploads = await _decode_ref_images(imgs)
+        # Only keys that ARE image slots of this alias (param or label) are fetched and
+        # kept: anything else was ignored by the adapter anyway, but it was still
+        # downloaded and stored as a job input — a free fetch-and-keep for any URL.
+        slots = await asyncio.to_thread(_gen_image_slot_names, body.get("model", ""))
+        for param in imgs:
+            if param not in slots:
+                logger.info(f"generations: ignoring images.{str(param)[:60]} — not an image "
+                            f"slot of '{str(body.get('model', ''))[:80]}'")
+        uploads = await _decode_ref_images({p: v for p, v in imgs.items() if p in slots})
     # Optional client files for NON-image params: {"files": {<param>: <base64|data-URI|URL>}}
     # — e.g. the mesh a shrink/rig alias works on. The gateway uploads it onto whichever
     # backend runs the job, so a client never needs a path on a backend.
@@ -4806,6 +5020,18 @@ def _gen_image_slots(alias: str) -> list:
     return image_params(cand.get("workflow_json") or {}, cand.get("mapping") or {})
 
 
+def _gen_image_slot_names(alias: str) -> set:
+    """Every name `images` may use for this alias: each image slot's param AND its
+    public label (the adapter accepts both; a cloud alias's slot names are its labels)."""
+    names = set(_gen_image_slots(alias))
+    wf, mapping = _gen_alias_mapping(alias)
+    for p in names.copy():
+        lbl = ((mapping.get(p) or {}).get("label") or "").strip()
+        if lbl:
+            names.add(lbl)
+    return names
+
+
 _EXT_BY_MIME = {                            # what a data-URI MIME means as a file extension —
     "model/gltf-binary": "glb",             # the model types mimetypes doesn't know
     "model/gltf+json": "gltf",
@@ -4831,13 +5057,100 @@ async def _decode_ref_blob(ref) -> Optional[tuple[bytes, str]]:
         ref = rest
     if ref.startswith(("http://", "https://")):
         ext = ext or Path(urlparse(ref).path).suffix.lstrip(".")
-        try:
-            r = await http_client.get(ref, timeout=20.0)
-        except Exception:
-            return None
-        return (r.content, _clean_ext(ext)) if r.status_code == 200 else None
+        data = await _fetch_ref_url(ref)
+        return (data, _clean_ext(ext)) if data is not None else None
     try:
         return base64.b64decode(ref), _clean_ext(ext)
+    except Exception:
+        return None
+
+
+# ── Client-supplied URLs (reference images, `files`) ──────────────────────────────
+# The gateway fetches these ON THE CLIENT'S BEHALF and keeps the bytes readable at
+# /v1/jobs/<id>/input/<n> — so an unfiltered fetch lets any key holder read what only
+# the gateway can reach: a backend's admin port, a router UI, 169.254.169.254, the
+# gateway's own /ui on localhost (review S5). Every address the name resolves to must be
+# PUBLIC, the connection goes to exactly the address that was checked (a second lookup
+# could answer differently — DNS rebinding), redirects are never followed (the shared
+# client's default; a 3xx is a failed fetch), and the body is counted while it streams.
+# `ref_url_allow_cidrs` (config.yaml) opens chosen private ranges, e.g. the LAN NAS.
+_REF_FETCH_MAX_BYTES = _UPLOAD_MAX_BYTES
+
+
+def _ref_allow_nets() -> list:
+    nets = []
+    for c in (config.get("ref_url_allow_cidrs") or []) if isinstance(config, dict) else []:
+        try:
+            nets.append(ipaddress.ip_network(str(c).strip(), strict=False))
+        except ValueError:
+            logger.warning(f"ref_url_allow_cidrs: ignoring '{c}' (not a network)")
+    return nets
+
+
+def ref_addr_blocked(addr: str, allow: Optional[list] = None) -> bool:
+    """True for an address a client URL must not reach: anything not globally routable
+    (loopback, RFC 1918, link-local, CGNAT, ULA, unspecified, documentation, …) and
+    multicast — unless an `allow` network contains it. An IPv4-mapped IPv6 address is
+    judged as the IPv4 it carries (`::ffff:127.0.0.1` is loopback)."""
+    try:
+        ip = ipaddress.ip_address(addr.split("%", 1)[0])
+    except ValueError:
+        return True
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    if any(ip in n for n in (allow or [])):
+        return False
+    return (not ip.is_global) or ip.is_multicast
+
+
+async def _resolve_ref_host(host: str, port: int) -> list:
+    """Every address `host` resolves to (a literal IP resolves to itself)."""
+    infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    return list(dict.fromkeys(i[4][0] for i in infos))
+
+
+async def _fetch_ref_url(url: str) -> Optional[bytes]:
+    """GET a client-supplied http(s) URL under the rules above. None = not readable
+    (unresolvable, refused, non-200); 400 = the target is not allowed; 413 = too big."""
+    u = urlparse(url)
+    host = u.hostname
+    if not host:
+        return None
+    try:
+        port = u.port or (443 if u.scheme == "https" else 80)
+    except ValueError:
+        return None
+    try:
+        addrs = await _resolve_ref_host(host, port)
+    except (OSError, UnicodeError):
+        return None
+    allow = _ref_allow_nets()
+    bad = [a for a in addrs if ref_addr_blocked(a, allow)]
+    if not addrs or bad:
+        logger.warning(f"ref url refused: {host} → {', '.join(bad or ['nothing'])}")
+        raise HTTPException(400, f"reference URL host '{host}' resolves to a private, loopback "
+                                 f"or link-local address — the gateway only fetches public "
+                                 f"URLs (send the bytes as base64 instead, or allow the range "
+                                 f"in ref_url_allow_cidrs)")
+    ip = addrs[0].split("%", 1)[0]
+    pinned = u._replace(netloc=(f"[{ip}]" if ":" in ip else ip) + f":{port}").geturl()
+    ext = {"sni_hostname": host} if u.scheme == "https" else {}
+    limit = _REF_FETCH_MAX_BYTES
+    try:
+        async with http_client.stream("GET", pinned, headers={"Host": u.netloc.rsplit("@", 1)[-1]},
+                                      extensions=ext, timeout=20.0) as r:
+            if r.status_code != 200:
+                return None
+            if int(r.headers.get("content-length") or 0) > limit:
+                raise HTTPException(413, f"reference URL body exceeds {limit // (1024 * 1024)} MB")
+            buf = bytearray()
+            async for chunk in r.aiter_bytes():
+                buf += chunk
+                if len(buf) > limit:
+                    raise HTTPException(413, f"reference URL body exceeds {limit // (1024 * 1024)} MB")
+            return bytes(buf)
+    except HTTPException:
+        raise
     except Exception:
         return None
 
@@ -4865,8 +5178,12 @@ async def images_generations(request: Request, authorization: Optional[str] = He
         raise HTTPException(400, "`prompt` is required")
     w, h = parse_size(body.get("size"))
     refs = body.get("ref_images") or []
-    decoded = [await _decode_ref_image(r) for r in refs]
+    if not isinstance(refs, list):
+        raise HTTPException(400, "`ref_images` must be a list")
     slots = await asyncio.to_thread(_gen_image_slots, alias)   # ONE lookup — uploads + log
+    # images_uploads keeps one image per slot; fetching the rest would only download
+    # (and, for URLs, reach out for) bytes that are thrown away.
+    decoded = [await _decode_ref_image(r) for r in refs[:len(slots)]]
     uploads = images_uploads(decoded, slots) if refs else None
     extra = {k: v for k, v in body.items() if k not in OAI_IMG_KEYS}   # dynamic workflow params
     logger.info(f"images/generations '{alias}': ref_images={len(refs)} "   # where client images land
@@ -5236,6 +5553,7 @@ def gateway_info() -> dict:
             "max_concurrent": b.get("max_concurrent"),
             "chat_only": bool(b.get("chat_only")), "serverless_only": bool(b.get("serverless_only")),
             "local": bool(b.get("local")), "paid": bool(b.get("paid")),
+            "api_key_set": bool(b.get("api_key")),      # the key itself never leaves main
             "sampling_defaults": b.get("sampling_defaults") or None,
             # The filter globs themselves, not just the resulting counts: the backend
             # editor falls back to THIS summary for a config-defined backend (nothing in
@@ -5357,7 +5675,7 @@ def apply_server_settings() -> None:
     next restart (the stats server is built once at startup). The gateway listening
     port is set by the launch command, so it is informational here."""
     global api_key, log_per_call, model_prefix, max_concurrent_default, health_check_interval
-    global park_timeout_s, async_park_timeout_s, park_health_grace_s, max_parked
+    global park_timeout_s, async_park_timeout_s, park_health_grace_s, max_parked, max_queued_gen
     global fast_probe_interval_s, affinity_max_wait_s
     s = store.get_settings() if store.is_active() else {}
     if "api_key" in s:
@@ -5391,6 +5709,11 @@ def apply_server_settings() -> None:
     if "max_parked" in s:
         try:
             max_parked = int(s["max_parked"])
+        except (TypeError, ValueError):
+            pass
+    if "max_queued_gen" in s:
+        try:
+            max_queued_gen = int(s["max_queued_gen"])
         except (TypeError, ValueError):
             pass
     if "affinity_max_wait_s" in s:
@@ -5435,6 +5758,7 @@ def server_info() -> dict:
             # the stored value (apply then drops it → the setting looks unsaveable).
             "park_timeout_s": int(park_timeout_s) if park_timeout_s == int(park_timeout_s) else park_timeout_s,
             "max_parked": max_parked,
+            "max_queued_gen": max_queued_gen,
             "affinity_max_wait_s": (int(affinity_max_wait_s)
                                     if affinity_max_wait_s == int(affinity_max_wait_s)
                                     else affinity_max_wait_s),
@@ -5496,6 +5820,11 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
            apply_users=apply_users,
            resolve_admin=resolve_admin, ui_locked=ui_locked,
            admin_session_tag=admin_session_tag,
+           admin_credential_exists=admin_credential_exists,
+           admin_change_refusal=admin_change_refusal,
+           backend_api_key=lambda name, typ: next(
+               (b.get("api_key") for b in backends
+                if b["name"] == name and b.get("type", "openai") == typ), None),
            dashboard_snapshot=dashboard_snapshot, cancel_generation=cancel_generation,
            drain_backend=begin_drain, cancel_drain=cancel_drain,
            set_backend_enabled=set_backend_enabled,
@@ -5513,8 +5842,34 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
                                   for b in backends if b.get("type") == "comfyui"})
 
 
+def _health_full_allowed(request: Request, authorization: Optional[str],
+                         x_api_key: Optional[str]) -> bool:
+    """The full /health snapshot is for admins: bootstrap-open (everything is open
+    anyway), an admin credential as Bearer or x-api-key, or a valid /ui session."""
+    if not users and not api_key:
+        return True
+    token = authorization[7:] if authorization and authorization.startswith("Bearer ") else None
+    if resolve_admin(token) or resolve_admin(x_api_key):
+        return True
+    return bool(admin._session_user(request))
+
+
 @app.get("/health")
-async def health():
+async def health_endpoint(request: Request, authorization: Optional[str] = Header(None),
+                          x_api_key: Optional[str] = Header(None)):
+    """Liveness for everyone, the inventory for admins (see _health_full_allowed).
+    Model ids only with `?verbose=1` — every backend listing every model made this the
+    largest unasked-for response the gateway sends."""
+    if not _health_full_allowed(request, authorization, x_api_key):
+        en = [b for b in backends if is_enabled(b)]
+        return {"status": "ok", "backends_total": len(en),
+                "backends_healthy": sum(1 for b in en if backend_healthy.get(backend_id(b), False))}
+    verbose = request.query_params.get("verbose", "") not in ("", "0", "false", "no")
+    return await health(verbose=verbose)
+
+
+async def health(verbose: bool = True) -> dict:
+    """The full health snapshot (admin view of /health; tests read it directly)."""
     fmap = {s["bid"]: s for s in (await asyncio.to_thread(faults_info))["backends"]}
     return {
         "status": "ok",
@@ -5531,7 +5886,9 @@ async def health():
                 "paid": bool(b.get("paid")),
                 "tps": round(backend_tps.get(backend_id(b), 0.0), 1),
                 "sampling_defaults": b.get("sampling_defaults") or None,
-                "models": sorted(backend_models.get(backend_id(b), set())) if is_enabled(b) else [],
+                "models_count": len(backend_models.get(backend_id(b), set())) if is_enabled(b) else 0,
+                **({"models": sorted(backend_models.get(backend_id(b), set())) if is_enabled(b) else []}
+                   if verbose else {}),
                 # What the fault log holds for the last 24h (faults.py) — the current
                 # `error` above is gone the moment the next poll succeeds.
                 "faults_24h": {k: (fmap.get(backend_id(b)) or {}).get(k, 0)

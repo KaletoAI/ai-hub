@@ -207,8 +207,12 @@ class EveryFieldRenderedOnce(unittest.TestCase):
         # The other half of "rendered once": rendered with the STORED value, not blank.
         html = _render("comfyui", True)
         for val in ('value="gpt-*, claude-*"', 'value="*-embed, *:free"',
-                    'value="sek"', 'value="/o"', 'value="/i"'):
+                    'value="/o"', 'value="/i"'):
             self.assertIn(val, html)
+        # The one exception: the api key is a secret and never rendered back — blank
+        # KEEPS it on Save (test_backend_key_field.py), so it cannot be lost this way.
+        self.assertNotIn('value="sek"', html)
+        self.assertIn("set — blank keeps it", html)
 
 
 class PanesAndTabs(unittest.TestCase):
