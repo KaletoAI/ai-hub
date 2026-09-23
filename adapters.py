@@ -939,11 +939,18 @@ def _ratelimit_headers(headers) -> dict:
     return {"retry-after": val} if val else {}
 
 
+def _gateway_headers(headers) -> dict:
+    """The gateway's own diagnostics headers of a dispatch response —
+    `x-gateway-backend` (who answered) and `x-reasoning-control` (what the reasoning
+    toggle did) — for every builder that re-wraps that response (the bridges)."""
+    return {k: v for k, v in (headers or {}).items()
+            if k.lower().startswith(("x-gateway", "x-reasoning"))}
+
+
 def _anthropic_error(status: int, etype: str, message: str, headers=None) -> JSONResponse:
     """An error in the shape Claude Code expects — it parses `error.message` and
     shows it; an OpenAI-shaped error body would surface as an unhelpful blank."""
-    keep = {k: v for k, v in (headers or {}).items()
-            if k.lower().startswith(("x-gateway", "x-reasoning"))}
+    keep = _gateway_headers(headers)
     keep.update(_ratelimit_headers(headers))
     return JSONResponse({"type": "error", "error": {"type": etype, "message": message[:2000]}},
                         status_code=status, headers=keep)
@@ -1128,9 +1135,7 @@ class OpenAIAdapter(BackendAdapter):
         if chat_body.get("stream") and isinstance(resp, StreamingResponse):
             return StreamingResponse(
                 anthropic_bridge.messages_stream(resp, req.alias, input_tokens=estimate),
-                media_type="text/event-stream",
-                headers={k: v for k, v in (resp.headers or {}).items()
-                         if k.lower().startswith(("x-gateway", "x-reasoning"))})
+                media_type="text/event-stream", headers=_gateway_headers(resp.headers))
         chat_json = getattr(resp, "parsed_json", None)
         if not isinstance(chat_json, dict):
             try:
@@ -1138,8 +1143,7 @@ class OpenAIAdapter(BackendAdapter):
             except Exception:
                 chat_json = {}
         return JSONResponse(anthropic_bridge.chat_to_messages(chat_json, req.alias),
-                            headers={k: v for k, v in (resp.headers or {}).items()
-                                     if k.lower().startswith(("x-gateway", "x-reasoning"))})
+                            headers=_gateway_headers(resp.headers))
 
     def _prepare(self, req: NormalizedRequest) -> _Call:
         """Shared per-dispatch setup: outgoing headers + payload (gateway-private

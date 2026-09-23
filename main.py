@@ -2690,7 +2690,8 @@ async def responses(request: Request, authorization: Optional[str] = Header(None
     if wants_stream:                                   # A3: translate chat SSE → Responses SSE
         if isinstance(resp, StreamingResponse):
             return StreamingResponse(responses_stream(resp, raw_body, alias),
-                                     media_type="text/event-stream")
+                                     media_type="text/event-stream",
+                                     headers=adapters._gateway_headers(resp.headers))
         err = _dispatch_json(resp)
         # The upstream's retry-after is an instruction to the caller, not diagnostics —
         # it must survive this re-raise like every other response rebuild (see
@@ -2701,7 +2702,8 @@ async def responses(request: Request, authorization: Optional[str] = Header(None
     if resp.status_code >= 400:
         raise HTTPException(resp.status_code, (json.dumps(chat_resp_json) or "")[:500],
                             headers=adapters._ratelimit_headers(resp.headers) or None)
-    return JSONResponse(chat_to_responses(chat_resp_json), status_code=resp.status_code)
+    return JSONResponse(chat_to_responses(chat_resp_json), status_code=resp.status_code,
+                        headers=adapters._gateway_headers(resp.headers))
 
 
 @app.get("/v1/responses/{response_id}")

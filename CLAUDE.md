@@ -148,7 +148,9 @@ they need via injected callables, staying hot-reload-safe.
   Code context cost ~25-30 ms/MB of event loop per pass. `stats._preview` likewise
   collapses only the two ends it shows, never the whole body.
   Going the other way, every response builder keeps only its OWN headers
-  (`call.rheaders` = `x-gateway-backend` + `x-reasoning-control`) — an upstream
+  (`call.rheaders` = `x-gateway-backend` + `x-reasoning-control`; a builder that
+  re-wraps a dispatch response — both bridges, `main.responses` streamed and plain —
+  copies them with `_gateway_headers`) — an upstream
   `content-length` would describe a body the gateway re-serializes — with ONE
   exception: `_ratelimit_headers()` carries the upstream's `retry-after` through,
   because that header is not diagnostics but an instruction to the caller. It is

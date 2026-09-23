@@ -16,6 +16,10 @@ the source — which the adapter then read as the client leaving and booked 499 
 closed request"), and on the plain chat path the stream ended "normally" and booked 200.
 Either way the call log blamed nobody for a backend failure.
 
+And /v1/responses answered without `x-gateway-backend`/`x-reasoning-control` (streamed
+and plain), the two headers every other endpoint carries — "which backend served this?"
+had no answer on the one endpoint N8N uses.
+
 Run: venv/bin/python -m unittest tests.test_stream_lifecycle -v
 """
 import asyncio
@@ -272,6 +276,46 @@ class InBandBackendError(unittest.TestCase):
             return [p async for p in resp.body_iterator]
         h, _ = self._run(CHAT + DONE, consume)
         self.assertEqual([r["status"] for r in h.rows], [200])
+
+
+class ResponsesKeepsGatewayHeaders(unittest.TestCase):
+    """R18: /v1/responses said nothing about which backend answered or what reasoning
+    control was applied — the two headers every other endpoint carries."""
+
+    def setUp(self):
+        from fastapi.testclient import TestClient
+        from fastapi.responses import JSONResponse, StreamingResponse
+        self._saved = (main.api_key, main.users, main._users_by_key, main._dispatch_or_park)
+        main.api_key, main.users, main._users_by_key = "", [], {}
+        hdrs = {"x-gateway-backend": "dx10-01", "x-reasoning-control": "enable_thinking=false"}
+
+        async def fake(alias, path, body, request, stats_endpoint=None):
+            if body.get("stream"):
+                async def gen():
+                    for c in CHAT + DONE:
+                        yield c
+                return StreamingResponse(gen(), media_type="text/event-stream", headers=hdrs)
+            r = JSONResponse({"id": "c", "model": "m", "choices": [
+                {"index": 0, "message": {"role": "assistant", "content": "hi"},
+                 "finish_reason": "stop"}]}, headers=hdrs)
+            return r
+        main._dispatch_or_park = fake
+        self.c = TestClient(main.app)
+
+    def tearDown(self):
+        (main.api_key, main.users, main._users_by_key, main._dispatch_or_park) = self._saved
+
+    def test_streamed(self):
+        r = self.c.post("/v1/responses", json={"model": "m", "input": "hi", "stream": True})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers.get("x-gateway-backend"), "dx10-01")
+        self.assertEqual(r.headers.get("x-reasoning-control"), "enable_thinking=false")
+
+    def test_not_streamed(self):
+        r = self.c.post("/v1/responses", json={"model": "m", "input": "hi"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.headers.get("x-gateway-backend"), "dx10-01")
+        self.assertEqual(r.headers.get("x-reasoning-control"), "enable_thinking=false")
 
 
 if __name__ == "__main__":
