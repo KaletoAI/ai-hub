@@ -1152,7 +1152,8 @@ ComfyUI's cache), so the first job after one frees.
   field is one whose name ends in `path` (`input_mesh_path`) or whose workflow field is
   a file field, and only a value that names a file (`/`, `\`, `~` or an extension) is
   judged — `mesh_format: glb` is a setting, not a path. And a list or object is never accepted as a mapped
-  `params` value (in ComfyUI's API format a list is a link between nodes).
+  `params` value, nor as `prompt`/`negative_prompt` (`400`; in ComfyUI's API format a
+  list is a link between nodes).
 - **`GET /v1/generations/{alias}/schema`** self-describes an alias in three lists:
   `params`, `images` (loader slots with their empty behaviour) and **`files`** — the
   uploads that are not images. A ComfyUI alias lists its mapped mesh params there

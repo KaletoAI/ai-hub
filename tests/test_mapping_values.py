@@ -122,6 +122,24 @@ class ClientRefusal(unittest.TestCase):
             main.api_key, main.users = saved
 
 
+class PromptValues(unittest.TestCase):
+    """prompt / negative_prompt ride as `inputs`, not `params` — same rule, same 400.
+    A list there was skipped with a WARNING by the injector and the job ran `done` on
+    the workflow's DEFAULT prompt: a confident picture of something nobody asked for."""
+
+    def test_list_or_object_prompt_is_refused(self):
+        from fastapi import HTTPException
+        for body in ({"prompt": ["a cat", "a dog"]}, {"negative_prompt": {"text": "blur"}}):
+            with self.assertRaises(HTTPException) as cm:
+                main._gen_inputs_params(body)
+            self.assertEqual(cm.exception.status_code, 400)
+            self.assertIn(next(iter(body)), cm.exception.detail)
+
+    def test_plain_prompts_pass(self):
+        inputs, _ = main._gen_inputs_params({"prompt": "a cat", "negative_prompt": ""})
+        self.assertEqual(inputs, {"prompt": "a cat", "negative_prompt": ""})
+
+
 class EditorCheckbox(unittest.TestCase):
     """`client_path` is set in the Mapping editor, and survives a Save both ways."""
 

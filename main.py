@@ -3023,6 +3023,13 @@ def _gen_inputs_params(body: dict) -> tuple[dict, dict]:
         "prompt": body.get("prompt", ""),
         "negative_prompt": body.get("negative_prompt", ""),
     }
+    # The same rule _client_param_refusal applies to `params`: a list or object is not a
+    # workflow value. The injector skips it with a WARNING, so the job would run `done`
+    # on the workflow's DEFAULT prompt instead of failing.
+    for k, v in inputs.items():
+        if isinstance(v, (list, tuple, dict)):
+            raise HTTPException(400, f"`{k}` must be a single value — a list or object is "
+                                     f"not a workflow value")
     params = dict(body.get("params") or {})
     for k in ("width", "height", "steps", "cfg", "seed", "sampler", "scheduler", "seconds"):
         if k in body and k not in params:        # top-level convenience knobs
