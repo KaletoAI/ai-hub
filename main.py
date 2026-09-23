@@ -1901,11 +1901,30 @@ adapter_ctx = AdapterContext(
 
 
 def build_backend_adapters() -> None:
-    """(Re)instantiate one adapter per configured backend. Called at import and
-    after every config reload so adapters point at the current backend dicts."""
+    """(Re)bind one adapter per configured backend. Called at import, after every config
+    reload and after every backend save, so adapters point at the current backend dicts.
+
+    An adapter carries RUNTIME state — ComfyUI's restart cooldown (`last_restart`), the
+    executor watchdog's tracking, the `/object_info` slot-type cache, the prompts its jobs
+    are running (the cancel target); a cloud adapter its last credit balance. Rebuilding
+    them all on every save threw that away (K19): the auto-restart cooldown reset, so a
+    stuck box could be restarted again right after any unrelated edit, and a job running on
+    the old instance could no longer be stopped through the new one. So a backend whose
+    settings did not change KEEPS its instance, and a changed one gets a new instance that
+    `adopt_state`s what still applies (see the adapters)."""
+    old = dict(backend_adapters)
     backend_adapters.clear()
     for b in backends:
-        backend_adapters[backend_id(b)] = make_adapter(b, adapter_ctx)
+        bid = backend_id(b)
+        prev = old.get(bid)
+        if prev is not None and prev.backend == b:
+            prev.backend = b                 # same settings, the current dict object
+            backend_adapters[bid] = prev
+            continue
+        ad = make_adapter(b, adapter_ctx)
+        if prev is not None:
+            ad.adopt_state(prev)
+        backend_adapters[bid] = ad
 
 
 build_backend_adapters()

@@ -58,7 +58,12 @@ they need via injected callables, staying hot-reload-safe.
   `backend_pricing`, `backend_loras`, `backend_healthy`), live (`backend_inflight`,
   `_gen_tasks`, `users`/`_users_by_key`), and `backend_adapters`. `load_config()`
   rebinds config globals, `refresh_backend()` populates discovery ones, and
-  `build_backend_adapters()` (re)binds one adapter per backend.
+  `build_backend_adapters()` (re)binds one adapter per backend — keeping the INSTANCE
+  of a backend whose settings did not change and handing a changed one's runtime state
+  to its replacement (`adapter.adopt_state`: ComfyUI's restart cooldown, the running
+  jobs' prompt registry, and while the URL holds the slot-type cache and watchdog; a
+  cloud adapter's balance while url+key hold). Rebuilding everything on every save reset
+  the auto-restart cooldown and orphaned the prompts of running jobs.
 - **`adapters.py`** — the pluggable per-backend protocol seam. `BackendAdapter`
   ABC; `OpenAIAdapter` (`dispatch()` forwards chat/completions/embeddings,
   owns the in-flight counter incl. the streamed-`finally` decrement; streamed

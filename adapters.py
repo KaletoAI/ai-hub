@@ -615,6 +615,11 @@ class BackendAdapter(ABC):
         cloud task API has nothing to interrupt."""
         return None
 
+    def adopt_state(self, old: "BackendAdapter") -> None:
+        """Take over the runtime state of the instance this one REPLACES after the
+        backend's settings changed (main.build_backend_adapters). Default: nothing."""
+        return None
+
     # ── workflow chains (main._run_chain) — the three places a stage is backend-specific ──
     def chain_export(self, cand: dict, succ: dict, params: dict, prefix: str) -> ChainExport:
         """Stage 1: how this backend will name/export the mesh. Default: not a stage 1."""
@@ -2545,6 +2550,20 @@ class ComfyUIAdapter(BackendAdapter):
                 f"executor stuck: {len(pending)} prompt(s) pending, none running for "
                 f"{int(time.time() - self._stuck_since)}s (head {head})")
 
+    def adopt_state(self, old: BackendAdapter) -> None:
+        """Keep what a settings change does not invalidate: the restart cooldown (a stuck
+        box must not be restarted again because someone edited its form), the running
+        jobs' prompts — the SAME dict, since the old instance's generate() keeps writing
+        it — and, while the URL is unchanged, the slot-type cache and the watchdog."""
+        if not isinstance(old, ComfyUIAdapter):
+            return
+        self._prompts = old._prompts
+        self.last_restart, self.last_restart_result = old.last_restart, old.last_restart_result
+        if old.backend.get("url") == self.backend.get("url"):
+            self._node_types = old._node_types
+            self._stuck_head, self._stuck_since = old._stuck_head, old._stuck_since
+            self._stuck_checks, self.exec_stuck = old._stuck_checks, old.exec_stuck
+
     async def cancel(self, job_id: str = "") -> None:
         """Stop the prompt job `job_id` submitted here — only that one (_stop_prompt). A job
         with no submitted prompt (still queued in the gateway) touches nothing. The normal
@@ -3586,6 +3605,13 @@ class CloudTaskAdapter(BackendAdapter):
     def _headers(self) -> dict:
         key = (self.backend.get("api_key") or "").strip()
         return {"Authorization": f"Bearer {key}"} if key else {}
+
+    def adopt_state(self, old: BackendAdapter) -> None:
+        """The last balance stays valid while it describes the same ACCOUNT (url + key)."""
+        if (isinstance(old, CloudTaskAdapter)
+                and old.backend.get("url") == self.backend.get("url")
+                and old.backend.get("api_key") == self.backend.get("api_key")):
+            self.credits, self.credits_at = old.credits, old.credits_at
 
     # ── vendor hooks ──────────────────────────────────────────────────────────
     async def discover(self, client: httpx.AsyncClient) -> Capabilities:

@@ -1,4 +1,5 @@
-"""Cancelling a generation job — and stopping exactly that job's work, nothing else.
+"""Cancelling a generation job — and stopping exactly that job's work, nothing else —
+plus the lifecycle around it: a worker that crashes, an adapter rebuilt under a job.
 
 Why this fails SILENTLY: ComfyUI's bare `POST /interrupt` stops whatever is executing.
 A cancel of a job whose prompt was still WAITING, or a `max_wait` expiry while the box
@@ -292,6 +293,57 @@ class WorkerCrash(unittest.TestCase):
             return True
         asyncio.run(main._run_gen_sync("jobF", fine()))
         self.assertIsNone(self.jobs.failed)
+
+
+class AdapterRebuildKeepsState(unittest.TestCase):
+    """K19: every backend save rebuilt EVERY adapter, dropping its runtime state. The
+    auto-restart cooldown reset (a stuck box could be restarted again right after an
+    unrelated edit), the watchdog forgot what it had seen, and a job running on the old
+    instance could no longer be cancelled through the new one — its prompt registry was
+    gone. All of it silent: the adapter simply starts over."""
+
+    def setUp(self):
+        self._saved = (main.backends[:], dict(main.backend_adapters))
+        self.comfy = {"name": "gpu", "type": "comfyui", "url": "http://gpu:8188"}
+        self.cloud = {"name": "m", "type": "meshy", "url": "https://api.meshy.ai", "api_key": "k"}
+        main.backends[:] = [self.comfy, self.cloud]
+        main.build_backend_adapters()
+        ad = main.backend_adapters["comfyui:gpu"]
+        ad.last_restart, ad._node_types, ad._prompts["job1"] = 123.0, {"X": {}}, "p1"
+        main.backend_adapters["meshy:m"].credits = 42
+
+    def tearDown(self):
+        main.backends[:] = self._saved[0]
+        main.backend_adapters.clear()
+        main.backend_adapters.update(self._saved[1])
+
+    def _rebuild(self, comfy=None, cloud=None):
+        main.backends[:] = [comfy or dict(self.comfy), cloud or dict(self.cloud)]
+        main.build_backend_adapters()
+        return main.backend_adapters["comfyui:gpu"], main.backend_adapters["meshy:m"]
+
+    def test_an_unchanged_backend_keeps_its_instance(self):
+        before = main.backend_adapters["comfyui:gpu"]
+        ad, _ = self._rebuild()
+        self.assertIs(ad, before)
+        self.assertIs(ad.backend, main.backends[0])          # bound to the CURRENT dict
+
+    def test_a_changed_backend_keeps_what_still_applies(self):
+        old = main.backend_adapters["comfyui:gpu"]
+        ad, cl = self._rebuild(comfy={**self.comfy, "max_wait": 900},
+                               cloud={**self.cloud, "max_wait": 900})
+        self.assertIsNot(ad, old)
+        self.assertEqual(ad.last_restart, 123.0)
+        self.assertIs(ad._prompts, old._prompts)              # the running job stays cancellable
+        self.assertEqual(ad._node_types, {"X": {}})
+        self.assertEqual(cl.credits, 42)
+
+    def test_a_new_url_drops_the_host_bound_caches_but_not_the_cooldown(self):
+        ad, cl = self._rebuild(comfy={**self.comfy, "url": "http://other:8188"},
+                               cloud={**self.cloud, "api_key": "other"})
+        self.assertEqual(ad._node_types, {})
+        self.assertEqual(ad.last_restart, 123.0)
+        self.assertIsNone(cl.credits)                          # another account's balance
 
 if __name__ == "__main__":
     unittest.main()
