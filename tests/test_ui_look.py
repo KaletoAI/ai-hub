@@ -261,5 +261,36 @@ class FieldLabels(unittest.TestCase):
         self.assertNotIn("aria-label", admin._btn("Save", "/x", title="Save it"))
 
 
+class Glyphs(unittest.TestCase):
+    """⏻ ⏼ ⧉ are in no font a stock Linux desktop ships (DejaVu, Noto Sans; checked
+    with fc-list): the Backends and Mapping action buttons rendered as empty boxes
+    (review U15). Nothing errors — the button just has no face."""
+
+    TOFU = "\u23fb\u23fc\u23fd\u29c9"      # ⏻ ⏼ ⏽ ⧉
+
+    def test_console_uses_no_tofu_glyphs(self):
+        with open(admin.__file__, encoding="utf-8") as fh:
+            src = fh.read()
+        found = sorted({c for c in src if c in self.TOFU})
+        self.assertEqual(found, [], f"glyphs without a common Linux font: {found}")
+
+
+class KeyboardReorder(unittest.TestCase):
+    """Request fields could only be reordered by mouse drag (review U16)."""
+
+    def test_rows_carry_move_buttons(self):
+        rows = admin._req_fields_rows("a", {"3": {"class_type": "KSampler", "inputs": {"steps": 20}}},
+                                      {"steps": {"node": "3", "field": "steps"},
+                                       "cfg": {"node": "3", "field": "cfg"}}, {})
+        self.assertIn('data-mv="-1"', rows)
+        self.assertIn('data-mv="1"', rows)
+        self.assertIn('aria-label="Move steps up"', rows)
+
+    def test_move_reuses_the_drop_path(self):
+        js = admin._reorder_js("a")
+        self.assertIn("data-mv", js)
+        self.assertIn("dispatchEvent", js)
+
+
 if __name__ == "__main__":
     unittest.main()

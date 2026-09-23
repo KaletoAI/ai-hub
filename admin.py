@@ -1868,7 +1868,7 @@ async def backends_page(request: Request):
         if draining:
             badge = _badge(f"⏳ draining · {inflight} in-flight", "warn")
         elif not b["enabled"]:
-            badge = _badge("⏻ offline", "warn", "taken offline — use ⏼ bring-online to re-enable")
+            badge = _badge("⊘ offline", "warn", "taken offline — use ▶ bring-online to re-enable")
         elif b["healthy"]:
             badge = _badge("healthy", "ok")
         else:
@@ -1887,12 +1887,12 @@ async def backends_page(request: Request):
             acts_list.append(("↺", f"/ui/backends/undrain?id={quote(bid)}", "secondary",
                               "Cancel drain — put back in rotation"))
         elif b["enabled"]:
-            acts_list.append(("⏻", f"/ui/backends/drain?id={quote(bid)}", "secondary",
+            acts_list.append(("⊘", f"/ui/backends/drain?id={quote(bid)}", "secondary",
                               "Take offline when idle (drain: stop new requests, finish in-flight)",
                               f"Take {b['name']} offline once idle? New requests stop now; "
                               "in-flight requests finish first."))
         else:
-            acts_list.append(("⏼", f"/ui/backends/enable?id={quote(bid)}", "secondary",
+            acts_list.append(("▶", f"/ui/backends/enable?id={quote(bid)}", "secondary",
                               "Bring online (enable)"))
         if b.get("type") == "comfyui" and b["enabled"]:
             acts_list.append(("⟳", f"/ui/backends/restart?id={quote(bid)}", "secondary",
@@ -3340,7 +3340,7 @@ def _mapping_list_media(iedit: str) -> str:
             backends = ", ".join(x.get("backend", "") for x in cands)
             acts = _icon_acts(
                 ("✎", f"/ui/mapping?edit={_esc(alias)}", "secondary", "Edit"),
-                ("⧉", f"/ui/mapping/copy?alias={_esc(alias)}", "secondary", "Copy"),
+                ("❐", f"/ui/mapping/copy?alias={_esc(alias)}", "secondary", "Copy"),
                 ("✕", f"/ui/mapping/delete?alias={_esc(alias)}", "danger", "Delete", f"Delete {alias}?"))
             # the task is the group header now — the row shows what differs within it
             body += _item(_esc(alias), f"{backends} · {mapped}", acts, sel=(alias == iedit))
@@ -3521,7 +3521,23 @@ def _reorder_js(alias: str) -> str:
             "if(ord().join('\\u0001')===start)return;"
             "location.href='/ui/mapping/field-order?alias='+encodeURIComponent(" + a + ")+"
             "'&'+ord().map(function(p){return 'order='+encodeURIComponent(p);}).join('&');});"
-            "});})();</script>")
+            "});"
+            # Keyboard alternative to dragging: ↑/↓ move the row and fire the SAME drop
+            # handler, so persisting stays one code path whatever it becomes. The moved
+            # button gets focus back after the save's reload.
+            "function row(n){while(n&&n.tagName!=='TR')n=n.parentNode;return n;}"
+            "tb.addEventListener('click',function(e){var b=e.target;"
+            "if(!b||!b.getAttribute||!b.getAttribute('data-mv'))return;e.preventDefault();"
+            "var tr=row(b),up=b.getAttribute('data-mv')==='-1',s=tr;"
+            "do{s=up?s.previousElementSibling:s.nextElementSibling;}while(s&&!s.hasAttribute('data-p'));"
+            "if(!tr||!s)return;tb.insertBefore(tr,up?s:s.nextSibling);"
+            "try{sessionStorage.setItem('gw:mv',tr.getAttribute('data-p')+'\\u0001'+b.getAttribute('data-mv'));}catch(x){}"
+            "tr.dispatchEvent(new Event('drop',{cancelable:true}));});"
+            "try{var f=sessionStorage.getItem('gw:mv');if(f){sessionStorage.removeItem('gw:mv');"
+            "f=f.split('\\u0001');[].forEach.call(tb.querySelectorAll('tr[data-p]'),function(r){"
+            "if(r.getAttribute('data-p')===f[0]){var k=r.querySelector('[data-mv=\"'+f[1]+'\"]');"
+            "if(k)k.focus();}});}}catch(x){}"
+            "})();</script>")
 
 
 def _same_kind(cands: list, backend_name: str) -> bool:
@@ -3629,7 +3645,11 @@ def _req_fields_rows(alias: str, wf: dict, mapping: dict, oi: dict) -> str:
                     if not is_img else "")
                    + _map_del_btn(alias, "param=" + _esc(p)))
         rows += (f'<tr draggable="true" data-p="{_esc(p)}">'
-                 f"<td><span class='grip' title='Drag to reorder'>⠿</span> {_esc(p)}{tag}</td>"
+                 f"<td><span class='grip' title='Drag to reorder'>⠿</span>"
+                 f'<button type="button" class="mv" data-mv="-1" title="Move up" '
+                 f'aria-label="Move {_esc(p)} up">↑</button><button type="button" class="mv" '
+                 f'data-mv="1" title="Move down" aria-label="Move {_esc(p)} down">↓</button>'
+                 f" {_esc(p)}{tag}</td>"
                  f"<td>{_inp('label__' + p, m.get('label', ''), placeholder=p)}</td>"
                  f"<td>{_inp('node__' + p, node)}</td>"
                  f"<td>{_inp('field__' + p, fld)}</td>"
@@ -6271,7 +6291,7 @@ def _dash_backends(bes: list, offline: list, fmap: Optional[dict] = None) -> str
         if b.get("draining"):
             return _badge(f"⏳ draining · {b.get('inflight', 0)} in-flight", "warn")
         if not b.get("enabled"):
-            return _badge("⏻ offline", "warn")
+            return _badge("⊘ offline", "warn")
         if not b.get("healthy"):
             return _down_badge(b.get("error"))          # names the cause, not just "off"
         return _badge("busy", "warn") if b.get("busy") else _badge("ready", "ok")
