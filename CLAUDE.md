@@ -580,7 +580,13 @@ they need via injected callables, staying hot-reload-safe.
   an `anthropic` backend forwards verbatim (see `AnthropicAdapter`). Translation
   policy: drop what is inert (`cache_control`, history `thinking` blocks,
   server-side tools), raise `UnsupportedContent` → 400 where dropping would
-  silently answer about content the model never saw (documents/PDFs). Covered by
+  silently answer about content the model never saw (documents/PDFs), and MOVE what
+  chat can carry elsewhere: images inside a `tool_result` (Claude Code's Read on an
+  image file) go into a user message right after the turn's tool messages, because
+  the chat `tool` role is text-only. A message carrying tool calls maps to
+  `stop_reason: tool_use` even when the backend said `stop` (Ollama and some
+  vLLM/LocalAI builds do) — `end_turn` there ends Claude Code's turn instead of
+  running the tool. Covered by
   `test_anthropic_bridge.py` (stdlib `unittest` — a streaming tool-call bridge fails
   silently rather than crashing). `ls tests/test_*.py` is the count of record —
   **thirty-three** files today — and each exists for that same reason: the mechanism it
