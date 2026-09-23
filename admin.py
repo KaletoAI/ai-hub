@@ -979,8 +979,9 @@ def _cross_site(request: Request) -> bool:
         return False
     if src == "null":
         return True
-    own = {h.strip().lower() for h in (request.headers.get("host", ""),
-                                       request.headers.get("x-forwarded-host", "")) if h.strip()}
+    # A proxy chain appends to X-Forwarded-Host ("a, b"), so every entry counts as ours.
+    hosts = [request.headers.get("host", "")] + request.headers.get("x-forwarded-host", "").split(",")
+    own = {h.strip().lower() for h in hosts if h.strip()}
     return urlsplit(src).netloc.lower() not in own
 
 
@@ -1596,9 +1597,9 @@ def _type_select(current: str) -> str:
     never transpiled, and test_admin_live pins the console's JS to ES5."""
     opts = "".join(f'<option value="{t}"{" selected" if t == current else ""}>{t}</option>'
                    for t in ("comfyui", "meshy", "tripo", "openai", "anthropic"))
-    # single-quoted: this JS sits inside a double-quoted HTML attribute, and JSON's
-    # double quotes would close it early.
-    urls = json.dumps(_cloud_urls()).replace('"', "'")
+    # This JS sits inside a double-quoted HTML attribute: attribute-escape the JSON, the
+    # browser decodes `&quot;` back before the handler is parsed.
+    urls = _esc(_js_json(_cloud_urls()))
     return ('<select name="type" onchange="var t=this.value,cloudUrls=' + urls + ","
             "l=document.getElementById('llmopts'),c=document.getElementById('comfyopts'),"
             "m=document.getElementById('cloudopts'),a=document.getElementById('anthopts'),"

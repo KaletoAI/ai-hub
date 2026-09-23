@@ -83,6 +83,11 @@ class CrossSite(unittest.TestCase):
         self.assertNotEqual(r.status_code, 403)
         r = self.c.post("/ui/login", data={"key": "x"}, follow_redirects=False)  # curl: no headers
         self.assertNotEqual(r.status_code, 403)
+        # behind a proxy chain: Host rewritten, the public name in X-Forwarded-Host's list
+        r = self.c.post("/ui/login", data={"key": "x"}, follow_redirects=False,
+                        headers={"origin": "https://hub.example", "host": "127.0.0.1:4000",
+                                 "x-forwarded-host": "hub.example, inner.proxy"})
+        self.assertNotEqual(r.status_code, 403)
 
     def test_api_is_not_affected(self):
         r = self.c.get("/health", headers={"sec-fetch-site": "cross-site"})

@@ -428,7 +428,10 @@ they need via injected callables, staying hot-reload-safe.
   pre-fills an existing key so it can be copied again — masked, gated by the
   `show_user_keys` setting, default ON, `admin._show_user_keys()`), IP aliases,
   server settings. Seeded once from
-  config, then authoritative.
+  config, then authoritative. `decrypt_secret` lets LEGACY plaintext pass through (old
+  rows keep working until re-saved); anything that must have been minted by the gateway
+  itself — the /ui session cookie — decrypts with `strict=True`, or a hand-typed value
+  is accepted as genuine.
 - **`admin.py`** — the `/ui` console (mounted via `admin.register(app)` +
   `add_api_route`, *not* `include_router` — broken in this starlette build;
   callbacks injected via `admin.bind(...)`). Session-gated by `_ui_guard` once
@@ -1072,7 +1075,20 @@ maps the alias, and exposes the resolved model. Recurring concepts:
 master `_MASTER_ADMIN` (the top-level `api_key`); `gate_request()` enforces the
 allow-list (`_model_allowed`, incl. whole-backend grants) + quotas and attributes
 the call. Bootstrap-open with no users and no master key. The `/ui` console
-session is gated by `_ui_guard` once locked.
+session is gated by `_ui_guard` once locked: an encrypted cookie (`strict`) carrying
+`main.admin_session_tag` — the fingerprint of the credential it was opened with,
+re-checked per request, so rotating a key or demoting/deleting an admin ends its
+sessions. Before that, `_ui_guard` refuses every CROSS-SITE request to /ui
+(`_cross_site`: `Sec-Fetch-Site` other than `same-origin`/`none`, else a foreign
+Origin/Referer; no header = curl, passes): POST → 403, GET → a page whose same-origin
+*Continue* link runs it, because ~30 console actions are GET links. Note `same-site`
+counts as foreign — another service on the same IP but another port lands on that page
+too, deliberately. Behind a reverse proxy the public host must arrive in `Host` or
+`X-Forwarded-Host`, or browsers without fetch metadata get 403 on every POST. Every /ui
+response carries `_UI_SEC_HEADERS` (no framing, nosniff); the cookie is
+`samesite=strict`. All values the console puts into JavaScript go through
+`data-*` attributes (`data-confirm` + `_CONFIRM_JS`) or `_js_json` — never
+`html.escape` into an inline handler (`test_ui_escaping.py`).
 
 ### Stats recording
 
