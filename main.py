@@ -439,6 +439,10 @@ async_park_timeout_s: float = 600.0
 # ~30 s) without hanging a genuinely-offline alias to the full park deadline.
 park_health_grace_s: float = 90.0
 max_parked: int = 100
+# Cap on async generation jobs queued or running at once (`_gen_tasks`) — the media
+# counterpart of max_parked: each is a task + a job row + stored inputs, and without a
+# cap a loop of `mode: async` requests queues without end. Server tab.
+max_queued_gen: int = 200
 # Freed-backend type affinity (spec 2026-09-01): a woken parked call claims a freed
 # backend only if the scheduler designates IT for that backend, so a backend prefers a
 # waiter that needs the model it just ran (no reload). The affinity may hold a queued
@@ -4246,6 +4250,22 @@ def _upload_prefix(job_id: str, stage: str = "") -> str:
     return f"gw_{job_id}{('_' + stage) if stage else ''}"
 
 
+JOB_MAX_TTL_DEFAULT = 7 * 86400
+
+
+def _clamp_ttl(v) -> Optional[int]:
+    """A client's job `ttl_s`, capped at `jobs.max_ttl_s` (config, default 7 days) —
+    unbounded, `10**12` kept a job's inputs and results on disk for good. Anything that
+    is not a positive int stays None (→ the store's default TTL), as before."""
+    if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+        return None
+    try:
+        cap = int(jobs_cfg.get("max_ttl_s", JOB_MAX_TTL_DEFAULT))
+    except (TypeError, ValueError):
+        cap = JOB_MAX_TTL_DEFAULT
+    return min(v, cap) if cap > 0 else v
+
+
 async def run_generation(body: dict, request: Request,
                          upload_images: Optional[dict] = None,
                          upload_files: Optional[dict] = None) -> dict:
@@ -4260,7 +4280,10 @@ async def run_generation(body: dict, request: Request,
     alias = body.get("model", "")
     output = dict(body.get("output") or {})
     mode = output.get("mode") or body.get("mode") or "sync"
-    ttl_s = output.get("ttl_s") or body.get("ttl_s")
+    ttl_s = _clamp_ttl(output.get("ttl_s") or body.get("ttl_s"))
+    if mode == "async" and len(_gen_tasks) >= max_queued_gen > 0:
+        raise HTTPException(503, f"too many queued generation jobs ({max_queued_gen}) — retry "
+                                 f"later", headers={"Retry-After": "10"})
     force = (body.get("backend") or "").strip()          # pin to one backend (playground testing)
 
     routes, parked, eligible = await _gen_pick(alias, force, body)
@@ -5219,7 +5242,7 @@ def apply_server_settings() -> None:
     next restart (the stats server is built once at startup). The gateway listening
     port is set by the launch command, so it is informational here."""
     global api_key, log_per_call, model_prefix, max_concurrent_default, health_check_interval
-    global park_timeout_s, async_park_timeout_s, park_health_grace_s, max_parked
+    global park_timeout_s, async_park_timeout_s, park_health_grace_s, max_parked, max_queued_gen
     global fast_probe_interval_s, affinity_max_wait_s
     s = store.get_settings() if store.is_active() else {}
     if "api_key" in s:
@@ -5253,6 +5276,11 @@ def apply_server_settings() -> None:
     if "max_parked" in s:
         try:
             max_parked = int(s["max_parked"])
+        except (TypeError, ValueError):
+            pass
+    if "max_queued_gen" in s:
+        try:
+            max_queued_gen = int(s["max_queued_gen"])
         except (TypeError, ValueError):
             pass
     if "affinity_max_wait_s" in s:
@@ -5296,6 +5324,7 @@ def server_info() -> dict:
             # the stored value (apply then drops it → the setting looks unsaveable).
             "park_timeout_s": int(park_timeout_s) if park_timeout_s == int(park_timeout_s) else park_timeout_s,
             "max_parked": max_parked,
+            "max_queued_gen": max_queued_gen,
             "affinity_max_wait_s": (int(affinity_max_wait_s)
                                     if affinity_max_wait_s == int(affinity_max_wait_s)
                                     else affinity_max_wait_s),

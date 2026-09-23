@@ -443,6 +443,7 @@ virtual_models:
 #   db_path: jobs.db
 #   blob_dir: jobs               # artifact files live under jobs/<id>/<n>.<ext>
 #   default_ttl_s: 86400         # how long a result stays retrievable (24h)
+#   max_ttl_s: 604800            # cap on a client's own `ttl_s` (7 days; hot-reloaded)
 #   prune_interval_s: 3600       # how often expired jobs are swept
 #   store_path: store.db         # writable generation-alias store (UI source of truth)
 

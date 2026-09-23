@@ -451,7 +451,10 @@ or a `503` (with `Retry-After`) if the wait runs out.
 - **Park time is per-alias** (`park_s` in the chat-alias editor, or config
   `alias_park`): blank = the global default (`park_timeout_s`, **60 s**, Server
   tab), `0` = parking off for that alias (immediate `503` when busy). `max_parked`
-  caps the queue.
+  caps the queue. Async generation jobs have their own cap, `max_queued_gen`
+  (Server tab, default **200** queued or running; `0` = none): beyond it a new
+  `mode: async` job gets `503` + `Retry-After`. A client's job `ttl_s` is capped at
+  `jobs.max_ttl_s` (config, default 7 days).
 - **Fair:** when a slot frees, the scheduler designates one waiter for it —
   overdue first, else the one whose type key the backend just ran, else the
   oldest it can serve (no head-of-line blocking across aliases). Live queue is

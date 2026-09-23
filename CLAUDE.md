@@ -931,7 +931,11 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   `inflight_inc` runs with no `await` between it and `resolve_routes`). Park time
   per alias via `alias_park_s` (store `alias_park` + config), else `park_timeout_s`
   (default 60); `0` disables. Timeout → 503 + `Retry-After`. "Parked calls" panel
-  on the Dashboard. **Async chat has no OpenAI spec** — async lives on the Responses
+  on the Dashboard. The media counterpart is `max_queued_gen` (Server tab, default 200):
+  `run_generation` refuses a new ASYNC job with 503 once `_gen_tasks` holds that many
+  (sync jobs hold a connection and cap themselves), and `_clamp_ttl` caps a client's
+  `ttl_s` at `jobs.max_ttl_s` (default 7 days) — `test_gen_limits.py`.
+  **Async chat has no OpenAI spec** — async lives on the Responses
   background mode: `POST /v1/responses {background:true}` → `resp_<jobid>` queued →
   `GET /v1/responses/{id}` poll → `POST …/cancel`; the worker (`_run_bg_response`)
   parks in the same queue (jobs.py task `response`).

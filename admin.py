@@ -7217,6 +7217,9 @@ _SRV_RUNTIME = [
     ("max_concurrent", "int", "default max_concurrent", "blank = unlimited"),
     ("park_timeout_s", "int", "default park time", "seconds a call waits for a free backend when all are busy (blank = 60; per-alias override in Mapping; 0 = off)"),
     ("max_parked", "int", "max parked calls", "queue cap — beyond this a busy call gets 503 (blank = 100)"),
+    ("max_queued_gen", "int", "max queued media jobs",
+     "async generation jobs queued or running at once — beyond this a new async job gets 503 "
+     "(default 200; 0 = no cap)"),
     ("affinity_max_wait_s", "float", "affinity max wait",
      "seconds — a queued request older than this beats the same-type preference and takes "
      "the next free backend"),
