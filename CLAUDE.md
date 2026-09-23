@@ -31,7 +31,7 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
   restart for backend/alias changes. Read **only at startup**:
   `stats.enabled` and the stats/jobs DB paths.
 - **No linter or build step, and no blanket test suite** — only targeted stdlib
-  `unittest` files for the mechanisms that fail SILENTLY (see the thirty-one listed under
+  `unittest` files for the mechanisms that fail SILENTLY (see the thirty-two listed under
   `anthropic_bridge.py`): `venv/bin/python -m unittest discover -s tests -t .`.
   Everything else is verified by running the server and hitting endpoints with
   `curl` (README "Try it"), `curl localhost:4000/health` for a routing snapshot, or
@@ -579,7 +579,7 @@ they need via injected callables, staying hot-reload-safe.
   silently answer about content the model never saw (documents/PDFs). Covered by
   `test_anthropic_bridge.py` (stdlib `unittest` — a streaming tool-call bridge fails
   silently rather than crashing). `ls tests/test_*.py` is the count of record —
-  **thirty-one** files today — and each exists for that same reason: the mechanism it
+  **thirty-two** files today — and each exists for that same reason: the mechanism it
   guards fails SILENTLY, so it is named next to that mechanism above.
   `test_anthropic_bridge.py`, `test_prune_branch.py` (a
   dead-branch prune that cascades one node too far or too few surfaces as an aborted
@@ -696,6 +696,14 @@ they need via injected callables, staying hot-reload-safe.
   script. Confirm texts are now `data-confirm` read by the one delegated `_CONFIRM_JS`
   handler `_page` emits; JSON inside `<script>` goes through `_js_json`, which escapes
   `<`/`>`/`&` so a backend-reported model id cannot close the block).
+  `test_ui_csrf.py` (cross-site requests to /ui: ~30 console actions are plain GET links
+  and a `samesite=lax` cookie rides on a cross-site top-level GET — any page the admin
+  opened could delete users or restart a ComfyUI; bootstrap-open has no cookie at all.
+  `_ui_guard` now refuses what `_cross_site` flags — `Sec-Fetch-Site` other than
+  `same-origin`/`none`, else a foreign Origin/Referer; no header at all = curl, passes —
+  with 403 for a POST and, for a GET, a page whose same-origin *Continue* link runs it, so
+  links from chat or mail still work one click later. Every /ui response carries
+  `_UI_SEC_HEADERS` (no framing, nosniff) and the cookie is `samesite=strict`).
   Run them all with `python -m unittest discover -s tests -t .` (no runner dependency).
 - **`openai_image_bridge.py`** — pure request/response plumbing for the OpenAI
   image shims (`multipart_list`, `parse_size`, `coerce_scalar`, `images_uploads`

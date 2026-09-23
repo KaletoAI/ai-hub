@@ -23,7 +23,7 @@ import socket
 import struct
 import time
 from typing import Callable, Optional
-from urllib.parse import parse_qs, quote, urlencode
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import httpx
 from fastapi import HTTPException, Request
@@ -958,14 +958,67 @@ def _session_user(request: Request) -> Optional[str]:
         return None
 
 
+# Sent with every /ui response: the console must not be framed (clickjacking), and a
+# response is never re-interpreted as another content type.
+_UI_SEC_HEADERS = {"X-Frame-Options": "DENY",
+                   "Content-Security-Policy": "frame-ancestors 'none'",
+                   "X-Content-Type-Options": "nosniff",
+                   "Referrer-Policy": "same-origin"}
+
+
+def _cross_site(request: Request) -> bool:
+    """True when the browser says this request was started by ANOTHER site. Fetch
+    metadata first (every current browser sends it; `none` = typed URL/bookmark), else
+    Origin/Referer against our own host. No header at all is not a browser context
+    (curl, scripts) and passes — the session still gates those."""
+    site = request.headers.get("sec-fetch-site")
+    if site:
+        return site not in ("same-origin", "none")
+    src = request.headers.get("origin") or request.headers.get("referer")
+    if not src:
+        return False
+    if src == "null":
+        return True
+    own = {h.strip().lower() for h in (request.headers.get("host", ""),
+                                       request.headers.get("x-forwarded-host", "")) if h.strip()}
+    return urlsplit(src).netloc.lower() not in own
+
+
+def _cross_site_page(target: str) -> str:
+    return (f"<h2>Opened from another site</h2>"
+            f"<p>This console link was opened from a different site. Actions here change "
+            f"the gateway, so it only runs when you open it yourself:</p>"
+            f"<p><code>{_esc(target)}</code></p>"
+            f"<p>{_btn('Continue', href=target)} {_btn('Dashboard', href='/ui')}</p>")
+
+
 async def _ui_guard(request: Request, call_next):
-    """Block /ui (except the login routes) without a valid admin session — but only
-    once the gateway is locked (an admin credential exists)."""
+    """Guard for everything under /ui.
+
+    1. Cross-site requests never reach a handler. About thirty console actions are
+       plain GET links, and the session cookie alone does not stop a foreign page from
+       firing them (bootstrap-open has no cookie at all). A foreign POST gets 403; a
+       foreign GET gets a page whose same-origin link does it — so links from chat or
+       mail still work, one click later.
+    2. Without a valid admin session → login, but only once the gateway is locked (an
+       admin credential exists)."""
     p = request.url.path
-    if p.startswith("/ui") and not p.startswith("/ui/login") and _ui_locked():
-        if not _session_user(request):
-            return RedirectResponse(f"/ui/login?next={quote(p)}", status_code=303)
-    return await call_next(request)
+    if not p.startswith("/ui"):
+        return await call_next(request)
+    if _cross_site(request):
+        if request.method in ("GET", "HEAD"):
+            target = p + (f"?{request.url.query}" if request.url.query else "")
+            resp = HTMLResponse(_page("Opened from another site", _cross_site_page(target),
+                                      active="", nologin=True), status_code=403)
+        else:
+            resp = HTMLResponse("cross-site request refused", status_code=403)
+    elif not p.startswith("/ui/login") and _ui_locked() and not _session_user(request):
+        resp = RedirectResponse(f"/ui/login?next={quote(p)}", status_code=303)
+    else:
+        resp = await call_next(request)
+    for k, v in _UI_SEC_HEADERS.items():
+        resp.headers.setdefault(k, v)
+    return resp
 
 
 def _login_page(error: str = "", nxt: str = "/ui") -> str:
@@ -997,7 +1050,7 @@ async def login_post(request: Request):
                             status_code=401)
     resp = RedirectResponse(nxt if nxt.startswith("/ui") else "/ui", status_code=303)
     resp.set_cookie(_SESSION_COOKIE, _make_session(admin),
-                    max_age=_SESSION_TTL, httponly=True, samesite="lax", path="/")
+                    max_age=_SESSION_TTL, httponly=True, samesite="strict", path="/")
     logger.info(f"ui: admin '{admin['name']}' logged in")
     return resp
 
