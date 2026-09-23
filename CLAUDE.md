@@ -995,6 +995,19 @@ they need via injected callables, staying hot-reload-safe.
   and "1.5"/"-1"/"1e3" became an UNLIMITED cap or quota. Each refusal is a 400 with the
   form re-rendered as typed, nothing is written; voice ship targets are checked on Save
   with main's own rules).
+  `test_stream_lifecycle.py` (how a streamed dispatch ENDS: an async generator that never
+  started runs no `finally`, and both bridges yield their own first event before reading
+  the adapter — a client gone in that window leaked the in-flight slot for good, lost
+  the pooled connection and wrote no row; the backend just parked calls it had room for.
+  Pins `_StreamBody`/`_StreamEnd` — aclose after the bridges' first event, a close of a
+  never-read body, a consumer dropped without any close: inc == dec and exactly one 499
+  row — a backend's in-band error booked 502 on all four paths (it read as 499 "client
+  left" behind a bridge and as 200 on the plain stream), the Responses bridge failing on
+  OpenRouter's error-with-`choices` shape, and `x-gateway-backend`/`x-reasoning-control`
+  on `/v1/responses`). `test_chat_dispatch.py` also pins the Anthropic 504 on a
+  ReadTimeout (no failover, not `paid`) and a `PoolTimeout` as the gateway's own 503
+  without failover or fault row; `test_rejected_log.py` that a refusal's preview comes
+  from `_ends_only`, never a dump of the whole body.
   Run them all with `python -m unittest discover -s tests -t .` (no runner dependency).
 - **`openai_image_bridge.py`** — pure request/response plumbing for the OpenAI
   image shims (`multipart_list`, `parse_size`, `coerce_scalar`, `images_uploads`
