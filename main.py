@@ -4602,13 +4602,12 @@ def _upload_prefix(job_id: str, stage: str = "") -> str:
 
 def _params_trusted(request) -> bool:
     """Whether this generation request may name BACKEND paths in its params: an admin
-    key (gate_request marks it), the console (its session was checked by _ui_guard),
-    or bootstrap-open mode, where everything is open anyway."""
+    key (gate_request marks it `gw_admin`), or bootstrap-open mode, where everything is
+    open anyway. The console needs no rule of its own: its playground reaches
+    /v1/generations as a self-call carrying the logged-in admin's key (admin._self_api)."""
     if not users and not api_key:
         return True
-    if getattr(getattr(request, "state", None), "gw_admin", False):
-        return True
-    return str(getattr(getattr(request, "url", None), "path", "") or "").startswith("/ui")
+    return bool(getattr(getattr(request, "state", None), "gw_admin", False))
 
 
 def _numberish(v: str) -> bool:

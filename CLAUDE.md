@@ -170,8 +170,10 @@ they need via injected callables, staying hot-reload-safe.
   `mesh_format`/`remesh_mode` enums) whose VALUE names a file (`looks_like_path`: a
   separator, `~`, or an extension — a bare `x.glb` resolves in the shared input dir), i.e.
   a path on the backend box, another job's output included, unless `_params_trusted`
-  or the entry carries `client_path: true` (Mapping editor checkbox *client may send a
-  backend path* on every file row; unticked = cleared);
+  (an admin key via `gate_request`'s `gw_admin`, or bootstrap-open — the console's
+  playground qualifies through its self-call's admin key, not by a /ui rule) or the
+  entry carries `client_path: true` (Mapping editor checkbox *client may send a backend
+  path* on every file row; unticked = cleared);
   judged over the alias's AND its successor's mapping, since params are threaded by
   label — `test_mapping_values.py`); a mapping `label` is the param's public
   API name — incoming values are accepted under label OR param, and the
@@ -895,7 +897,9 @@ they need via injected callables, staying hot-reload-safe.
   reads any file ComfyUI can read — another job's output included — and delivers it as a
   harmless-looking result. Pins that the injector skips lists and mismatched dicts,
   `_client_param_refusal`'s 400 for stage 1 and successor, backend paths only for an
-  admin, the console, bootstrap-open or `client_path: true`, and numeric strings passing).
+  admin key, bootstrap-open or `client_path: true` (a Mapping checkbox), only VALUES that
+  name a file judged (`quad`, `5000` pass), the same 400 for a list prompt, and that
+  `mesh_format`-style settings are no file fields).
   `test_audio_content_type.py` (the voice playground stash and stored call audio were
   served from the /ui origin under the BACKEND's content type — SVG or HTML from there
   runs script in the admin session. Pins: only `audio/*` plays, anything else is an

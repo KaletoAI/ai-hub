@@ -11,8 +11,9 @@ ordinary rig of an ordinary mesh.
 
 So: a list or object is never a mapped value (400 up front; the injector itself also
 skips it, so no other path can smuggle one in), and a file field takes a client string
-only from an admin (the documented "a backend path in params is for server admins"),
-from the console, in bootstrap-open mode, or when the mapping entry says `client_path:
+only from an admin key (the documented "a backend path in params is for server admins";
+the console playground's self-call carries the logged-in admin's key), in bootstrap-open
+mode, or when the mapping entry says `client_path:
 true`. Everyone else sends the file under `files`, which the gateway uploads itself.
 The gateway's own chain hand-off (the stage-2 mesh path) is not a client value and is
 untouched.
@@ -115,7 +116,9 @@ class ClientRefusal(unittest.TestCase):
             self.assertFalse(main._params_trusted(req("/v1/generations")))
             self.assertFalse(main._params_trusted(req("/v1/generations", False)))
             self.assertTrue(main._params_trusted(req("/v1/generations", True)))
-            self.assertTrue(main._params_trusted(req("/ui/playground/media")))
+            # a /ui path is no credential: the playground reaches /v1/generations as a
+            # self-call carrying the console user's own key, which is what counts
+            self.assertFalse(main._params_trusted(req("/ui/playground/media")))
             main.api_key = ""
             self.assertTrue(main._params_trusted(req("/v1/generations")))     # bootstrap-open
         finally:
