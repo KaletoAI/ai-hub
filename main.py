@@ -1144,6 +1144,52 @@ def _unauth_row_allowed() -> bool:
     return True
 
 
+# How much of each END of a refused body `_ends_only` keeps exact: at least the window
+# `stats._preview` reads from each end before collapsing whitespace (8 × (50 + 50)).
+_PREVIEW_ENDS = 1024
+
+
+def _ends_only(v, w: int = _PREVIEW_ENDS):
+    """A stand-in for `v` whose `json.dumps` has the SAME first and last `w` characters
+    as `json.dumps(v)`, at a size bounded by `w` per nesting level instead of the body's.
+
+    A refusal stores no request (`store_request=False`), only the preview built from
+    the serialised body's two ends — and serialising a multi-MB Claude Code context on
+    the event loop for that cost ~25-30 ms per MB, per refused retry. Strings keep
+    their first and last `w` characters; a list or object keeps items from the front
+    until they serialise to `w` characters, the same from the back, and drops the
+    middle. Only the item where a run reaches `w` can itself be shortened, so the two
+    ends stay character-exact (the same separators as json.dumps' defaults)."""
+    if isinstance(v, str):
+        return v if len(v) <= 2 * w else v[:w] + v[-w:]
+    if isinstance(v, list):
+        items, dump = list(range(len(v))), (lambda i, x: json.dumps(x, ensure_ascii=False))
+    elif isinstance(v, dict):
+        keys = list(v)
+        items = keys
+        dump = (lambda k, x: json.dumps(str(k), ensure_ascii=False) + json.dumps(x, ensure_ascii=False))
+    else:
+        return v
+    front, back, acc = [], [], 0
+    for i in items:
+        x = _ends_only(v[i], w)
+        front.append((i, x))
+        acc += len(dump(i, x)) + 2
+        if acc >= w:
+            break
+    acc, stop = 0, len(front)
+    for i in reversed(items[stop:]):
+        x = _ends_only(v[i], w)
+        back.append((i, x))
+        acc += len(dump(i, x)) + 2
+        if acc >= w:
+            break
+    kept = front + back[::-1]
+    if isinstance(v, list):
+        return [x for _, x in kept]
+    return {k: x for k, x in kept}
+
+
 def _record_rejected(request: Request, exc: HTTPException) -> None:
     """Fire-and-forget stats row for a refused call. Never raises into the response
     path: a logging failure must not turn a clean 503 into a 500."""
@@ -1164,7 +1210,9 @@ def _record_rejected(request: Request, exc: HTTPException) -> None:
             alias=_clip(alias), model=None,
             endpoint=_clip(getattr(request.state, "gw_endpoint", None) or request.url.path),
             status=exc.status_code, input_tokens=0, output_tokens=0, cost_usd=0.0,
-            request_text=(json.dumps(body, ensure_ascii=False) if isinstance(body, dict) else None),
+            # Feeds the preview only (store_request=False) — its two ends are all it reads.
+            request_text=(json.dumps(_ends_only(body), ensure_ascii=False)
+                          if isinstance(body, dict) else None),
             response_text=json.dumps({"error": {"message": str(exc.detail)}}, ensure_ascii=False),
             # The reason is the body worth keeping; the request only feeds the preview —
             # an agent retrying a refused 1 MB request stored it once per retry.
@@ -2215,15 +2263,25 @@ async def _dispatch_over(candidates, path, alias, body, request, stats_endpoint=
             # answer twice, so it ends here; a local one only wastes its own compute, and
             # a hung llama-swap load is exactly when another box helps.
             _note_fault(backend, "call", "timeout", f"{real_model}: {_err_text(e)}")
-            if backend.get("paid"):
+            if _bills_while_generating(backend):
                 logger.warning(f"✗ [{backend['name']}] no answer in {_READ_BUDGET_S:g} s — "
-                               "paid backend, not retried elsewhere")
+                               "billed backend, not retried elsewhere")
                 raise HTTPException(504, f"backend '{backend['name']}' did not answer within "
                                          f"{_READ_BUDGET_S:g} s — not retried on another backend, "
-                                         "because a paid backend may still be generating (and "
-                                         "billing) this request")
+                                         "because a paid or subscription backend may still be "
+                                         "generating (and billing) this request")
             logger.warning(f"✗ [{backend['name']}] {_err_text(e)} — trying next")
             last_error = e
+        except httpx.PoolTimeout:
+            # The GATEWAY's shared connection pool is exhausted — no backend saw the
+            # call. It is the same pool for every candidate, so a failover only waits
+            # the pool timeout again per backend, and charging each one a "timeout"
+            # fault blames a fleet for the gateway's own load.
+            logger.warning(f"✗ connection pool exhausted — {alias} refused "
+                           f"({adapters._CHAT_TIMEOUT.pool:g} s wait for a free connection)")
+            raise HTTPException(503, "gateway busy: no free upstream connection in the "
+                                     f"shared pool within {adapters._CHAT_TIMEOUT.pool:g} s",
+                                headers={"Retry-After": "5"})
         except httpx.TransportError as e:
             # Every transport failure surfaces BEFORE the client saw a byte (a stream is
             # opened, headers and status read, before the adapter answers): connect
@@ -2249,6 +2307,16 @@ async def _dispatch_over(candidates, path, alias, body, request, stats_endpoint=
 
 
 _READ_BUDGET_S = adapters._CHAT_TIMEOUT.read
+
+
+def _bills_while_generating(backend: dict) -> bool:
+    """Does a request this backend gave up on still cost something? `paid` backends
+    bill per token, and an `anthropic` one keeps generating against the subscription
+    quota or the API key's bill. It is deliberately NOT marked `paid` for that: the
+    scheduler orders unpaid before paid, and a flat subscription tagged `paid` would
+    sort behind every unpaid candidate of a mixed alias — Claude Code sessions moving
+    to per-token OpenRouter or a local model. Only this no-failover rule needs it."""
+    return bool(backend.get("paid")) or backend.get("type") == "anthropic"
 
 
 def _call_fault_kind(e: BaseException) -> str:
@@ -2690,7 +2758,8 @@ async def responses(request: Request, authorization: Optional[str] = Header(None
     if wants_stream:                                   # A3: translate chat SSE → Responses SSE
         if isinstance(resp, StreamingResponse):
             return StreamingResponse(responses_stream(resp, raw_body, alias),
-                                     media_type="text/event-stream")
+                                     media_type="text/event-stream",
+                                     headers=adapters._gateway_headers(resp.headers))
         err = _dispatch_json(resp)
         # The upstream's retry-after is an instruction to the caller, not diagnostics —
         # it must survive this re-raise like every other response rebuild (see
@@ -2701,7 +2770,8 @@ async def responses(request: Request, authorization: Optional[str] = Header(None
     if resp.status_code >= 400:
         raise HTTPException(resp.status_code, (json.dumps(chat_resp_json) or "")[:500],
                             headers=adapters._ratelimit_headers(resp.headers) or None)
-    return JSONResponse(chat_to_responses(chat_resp_json), status_code=resp.status_code)
+    return JSONResponse(chat_to_responses(chat_resp_json), status_code=resp.status_code,
+                        headers=adapters._gateway_headers(resp.headers))
 
 
 @app.get("/v1/responses/{response_id}")

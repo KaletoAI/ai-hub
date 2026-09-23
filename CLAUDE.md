@@ -148,7 +148,9 @@ they need via injected callables, staying hot-reload-safe.
   Code context cost ~25-30 ms/MB of event loop per pass. `stats._preview` likewise
   collapses only the two ends it shows, never the whole body.
   Going the other way, every response builder keeps only its OWN headers
-  (`call.rheaders` = `x-gateway-backend` + `x-reasoning-control`) — an upstream
+  (`call.rheaders` = `x-gateway-backend` + `x-reasoning-control`; a builder that
+  re-wraps a dispatch response — both bridges, `main.responses` streamed and plain —
+  copies them with `_gateway_headers`) — an upstream
   `content-length` would describe a body the gateway re-serializes — with ONE
   exception: `_ratelimit_headers()` carries the upstream's `retry-after` through,
   because that header is not diagnostics but an instruction to the caller. It is
@@ -665,6 +667,9 @@ they need via injected callables, staying hot-reload-safe.
   (`retention_days`, default 0 = forever) is separate because the aggregates and the
   monthly cost quota read the rows. A refused call keeps its reason, not its request
   (`store_request=False`): one agent retrying a refused 1 MB request stored it per retry.
+  Its preview is built from `main._ends_only(body)` — a stand-in whose JSON has the SAME
+  first/last 1024 characters at a bounded size — never from the whole body dumped on the
+  loop per refusal (`test_rejected_log.py`).
   The row goes in with `has_body` in ONE autocommitted INSERT on a
   `synchronous=NORMAL` connection (WAL: no fsync per call, never inconsistent).
   `month_cost` (the monthly cost quota, asked on EVERY request of a capped user) is
@@ -990,6 +995,19 @@ they need via injected callables, staying hot-reload-safe.
   and "1.5"/"-1"/"1e3" became an UNLIMITED cap or quota. Each refusal is a 400 with the
   form re-rendered as typed, nothing is written; voice ship targets are checked on Save
   with main's own rules).
+  `test_stream_lifecycle.py` (how a streamed dispatch ENDS: an async generator that never
+  started runs no `finally`, and both bridges yield their own first event before reading
+  the adapter — a client gone in that window leaked the in-flight slot for good, lost
+  the pooled connection and wrote no row; the backend just parked calls it had room for.
+  Pins `_StreamBody`/`_StreamEnd` — aclose after the bridges' first event, a close of a
+  never-read body, a consumer dropped without any close: inc == dec and exactly one 499
+  row — a backend's in-band error booked 502 on all four paths (it read as 499 "client
+  left" behind a bridge and as 200 on the plain stream), the Responses bridge failing on
+  OpenRouter's error-with-`choices` shape, and `x-gateway-backend`/`x-reasoning-control`
+  on `/v1/responses`). `test_chat_dispatch.py` also pins the Anthropic 504 on a
+  ReadTimeout (no failover, not `paid`) and a `PoolTimeout` as the gateway's own 503
+  without failover or fault row; `test_rejected_log.py` that a refusal's preview comes
+  from `_ends_only`, never a dump of the whole body.
   Run them all with `python -m unittest discover -s tests -t .` (no runner dependency).
 - **`openai_image_bridge.py`** — pure request/response plumbing for the OpenAI
   image shims (`multipart_list`, `parse_size`, `coerce_scalar`, `images_uploads`
@@ -1039,11 +1057,16 @@ they need via injected callables, staying hot-reload-safe.
   (`ReadError`/`WriteError`); all of them surface before the client saw a byte — and on
   llama-swap's "unable to start process" 502 (backend-local load failure,
   `_retryable_upstream_error`); other HTTP error statuses return as-is. ONE exception:
-  a `ReadTimeout` on a `paid` backend (connected, sent, no answer within the 300 s read
-  budget — it is most likely still generating) answers 504 instead of failing over,
-  or the failover buys the same answer twice; on an unpaid backend it still fails over.
+  a `ReadTimeout` on a `paid` or `anthropic` backend (`_bills_while_generating`;
+  connected, sent, no answer within the 300 s read budget — it is most likely still
+  generating) answers 504 instead of failing over, or the failover buys the same answer
+  twice; on an unpaid backend it still fails over. An `anthropic` backend is NOT made
+  `paid` for this: the scheduler puts unpaid before paid, so a flat subscription marked
+  paid would sort behind every unpaid candidate of a mixed alias.
   `adapters._CHAT_TIMEOUT` is `httpx.Timeout(300, connect=10, pool=30)` — a scalar 300
-  let a SYN-swallowing host hold the failover for five minutes. Anything else an adapter
+  let a SYN-swallowing host hold the failover for five minutes. A `PoolTimeout` (the
+  gateway's OWN shared pool exhausted, `max_connections` 200) is no backend's failure:
+  503 + `Retry-After`, no failover (same pool for every candidate) and no fault row. Anything else an adapter
   raises is a clean 502 naming the backend (fault kind `error`, no failover — a bug
   reproduces), and `main._unexpected_error` turns any exception left over on `/v1/*`
   into a 502 through the HTTPException handler, so it is logged and `/v1/messages`
@@ -1483,7 +1506,19 @@ does NOT end normally is recorded too, from the generator's `finally`
 499 when the client left (Esc in Claude Code — Starlette closes or cancels the body
 iterator), 502 when the upstream dropped mid-answer, with the tokens counted so far.
 Before, `_record` sat after the `finally` and such calls never reached the log — nor
-the month-cost quota, which sums `cost_usd` over every row.
+the month-cost quota, which sums `cost_usd` over every row. The body iterator is an
+`adapters._StreamBody`, not the bare generator: an async generator that never STARTED
+runs no `finally`, and both bridges yield their own opening event before they read from
+the adapter — so a client gone in that window (Esc after a long park; with ASGI 2.4 the
+first `send` fails) used to leak the in-flight slot for good, lose the pooled connection
+and write no row. `_StreamBody.aclose()` ends such a call itself (499), its finalizer does
+the same for a consumer dropped without any close, and `_StreamEnd` makes the end
+happen exactly once whoever gets there first. A backend's OWN in-band failure
+(OpenRouter's `data: {"error": …}` under HTTP 200, Anthropic's `event: error`) is seen
+by the normalizer/sniffer and books 502 — not 200 when it passed through, not 499 when
+a bridge stopped on it and closed the source; the Responses bridge fails on any in-band
+`error`, including OpenRouter's shape that still carries `choices` with
+`finish_reason: "error"` (it used to complete around the truncated text).
 
 ## Conventions
 

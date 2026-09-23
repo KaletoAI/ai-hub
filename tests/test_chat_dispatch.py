@@ -6,7 +6,10 @@ connection the backend had already closed (`RemoteProtocolError`) or a reset
 "Internal Server Error" — which Claude Code renders as a blank error, and which reads
 like a gateway bug rather than a backend that dropped the call. The opposite mistake is
 just as quiet: a paid backend that did not answer within the 300 s read timeout is
-likely still generating (and billing) the answer, so failing over bought it twice. A
+likely still generating (and billing) the answer, so failing over bought it twice — and
+an Anthropic backend (subscription or API key) is that case too, without being `paid`. An
+exhausted gateway connection pool (`PoolTimeout`) was failed over across the whole alias
+and booked as a timeout fault of every backend, although none of them saw the call. A
 connect timeout of 300 s held the failover for five minutes on a host that swallows
 SYNs. Headers were forwarded by a four-entry denylist, so a browser's cookies (the /ui
 session among them), `x-forwarded-for` and `accept-encoding: br` — which the backend
@@ -125,6 +128,31 @@ class Failover(_MainState):
         self.assertEqual(self._dispatch([(A, _Adapter(fail=httpx.ReadTimeout(""))),
                                          (B, second)]).status_code, 200)
         self.assertEqual(second.calls, 1)
+
+    def test_a_read_timeout_on_an_anthropic_backend_is_not_bought_twice(self):
+        # R6: a subscription/API-key Claude backend keeps generating (and consuming quota
+        # or billing) after the gateway gave up — the same case as a paid one. It is NOT
+        # marked `paid`, which would demote it behind every unpaid chat candidate.
+        claude = {"name": "claude", "type": "anthropic", "url": "https://api.anthropic.com"}
+        second = self._ok()
+        with self.assertRaises(HTTPException) as cm:
+            self._dispatch([(claude, _Adapter(fail=httpx.ReadTimeout(""))), (B, second)],
+                           path="/v1/messages")
+        self.assertEqual(cm.exception.status_code, 504)
+        self.assertEqual(second.calls, 0)
+        self.assertIn("claude", cm.exception.detail)
+
+    def test_a_pool_timeout_is_the_gateways_own_503_not_a_backend_fault(self):
+        # R13: every connection of the shared pool is in use. The backend never saw the
+        # call — failing over waits the pool timeout again per candidate (same pool) and
+        # booked a "timeout" fault against every backend of the alias.
+        first, second = _Adapter(fail=httpx.PoolTimeout("")), self._ok()
+        with self.assertRaises(HTTPException) as cm:
+            self._dispatch([(A, first), (B, second)])
+        self.assertEqual(cm.exception.status_code, 503)
+        self.assertEqual(second.calls, 0)
+        self.assertIn("Retry-After", cm.exception.headers or {})
+        self.assertEqual(faults.events_since(0), [])
 
     def test_a_connect_timeout_on_a_paid_backend_fails_over(self):
         # Never connected = nothing was sent, nothing can be billed.
