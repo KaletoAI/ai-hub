@@ -612,6 +612,15 @@ _LIVE_JS = ("<script>(function(){"
             "})();</script>")
 
 
+# One delegated handler for every `data-confirm` (see _btn). Capture phase on document,
+# so it also covers links the live morph inserts later, and runs before any other click
+# handler on the element.
+_CONFIRM_JS = ("<script>document.addEventListener('click',function(e){"
+               "var a=e.target&&e.target.closest?e.target.closest('[data-confirm]'):null;"
+               "if(a&&!window.confirm(a.getAttribute('data-confirm'))){"
+               "e.preventDefault();e.stopPropagation();}},true);</script>")
+
+
 def _page(title: str, body: str, active: str = "", refresh: Optional[int] = None,
           nologin: bool = False, subnav: str = "") -> str:
     # `refresh` no longer reloads the page. It marks <main> as live and _LIVE_JS
@@ -626,7 +635,7 @@ def _page(title: str, body: str, active: str = "", refresh: Optional[int] = None
     # never scrolls and sits flush under the tabs.
     return (f'<!doctype html><html><head><meta charset="utf-8"><title>{_esc(title)} · AI-Hub</title>'
             f"<style>{_CSS}</style></head><body>{head}{subnav}<main{live}>{body}</main>"
-            f"{_SCROLL_JS}{_SORT_JS}{_TABS_JS}{_LIVE_JS}</body></html>")
+            f"{_CONFIRM_JS}{_SCROLL_JS}{_SORT_JS}{_TABS_JS}{_LIVE_JS}</body></html>")
 
 
 def _field(label: str, control: str, short: bool = False, wide: bool = False) -> str:
@@ -638,10 +647,20 @@ def _btn(label: str, href: str = "", kind: str = "", sm: bool = False, submit: b
          confirm: str = "", title: str = "", icon: bool = False) -> str:
     cls = "btn" + (f" {kind}" if kind else "") + (" sm" if sm else "") + (" icon" if icon else "")
     t = f' title="{_esc(title)}"' if title else ""
-    onclick = f' onclick="return confirm(\'{_esc(confirm)}\')"' if confirm else ""
+    # The text is DATA read by _CONFIRM_JS, never spliced into an onclick: the browser
+    # decodes html.escape's `&#x27;` before parsing a handler, so a `'` in the text broke
+    # the JS (the link then navigated without asking) or, chosen by an attacker, ran it.
+    dc = f' data-confirm="{_esc(confirm)}"' if confirm else ""
     if submit:
         return f'<button type="submit" class="{cls}"{t}>{_esc(label)}</button>'
-    return f'<a class="{cls}" href="{_esc(href)}"{onclick}{t}>{_esc(label)}</a>'
+    return f'<a class="{cls}" href="{_esc(href)}"{dc}{t}>{_esc(label)}</a>'
+
+
+def _js_json(obj) -> str:
+    """json.dumps for a value embedded in a <script> block: `<`, `>` and `&` become
+    \\u escapes, so a string like `</script>` stays a string instead of ending the block."""
+    return (json.dumps(obj).replace("<", "\\u003c").replace(">", "\\u003e")
+            .replace("&", "\\u0026"))
 
 
 def _icon_acts(*specs) -> str:
@@ -2934,7 +2953,7 @@ def _chatplay_form(vals: dict) -> str:
                "var dl=document.getElementById('cpmodels');if(!dl)return;"
                "var ms=(bk&&CP_BK[bk])?CP_BK[bk]:CP_ALL;"
                "dl.innerHTML=ms.map(function(m){var o=document.createElement('option');o.value=m;"
-               "return o.outerHTML;}).join('');}</script>") % (json.dumps(bk_models), json.dumps(all_models))
+               "return o.outerHTML;}).join('');}</script>") % (_js_json(bk_models), _js_json(all_models))
     return ('<form action="/ui/chatplay/send" method="post" onsubmit="return cpSending(this)">'
             f'<div class="formbar"><h2>Chat Playground</h2>{_btn("Send", submit=True)}</div>'
             + _field("backend", bk_select, short=True)
@@ -2972,7 +2991,7 @@ def _chat_result_html(res: dict) -> str:
     except Exception:
         content = json.dumps(data, indent=2)[:4000]
     usage = data.get("usage") or {}
-    utxt = (f" · tokens {usage.get('prompt_tokens', '?')}+{usage.get('completion_tokens', '?')}"
+    utxt = (f" · tokens {_esc(usage.get('prompt_tokens', '?'))}+{_esc(usage.get('completion_tokens', '?'))}"
             if usage else "")
     return (f"<h2>Response</h2><p class='muted'>{meta}{utxt}</p>"
             f"<div class='chatout'>{_esc(content)}</div>")
@@ -3287,7 +3306,7 @@ def _reorder_js(alias: str) -> str:
     """Vanilla drag-to-reorder for the request-fields rows. On drop, if the order
     changed, persist it via /ui/mapping/field-order (one ?order= per param) and the
     redirect reloads the editor — the same order then drives the Playground."""
-    a = json.dumps(alias)        # safe JS string literal
+    a = _js_json(alias)         # safe JS string literal, also inside <script>
     return ("<script>(function(){"
             "var tb=document.getElementById('reqfields');if(!tb)return;"
             "function ord(){return [].map.call(tb.querySelectorAll('tr[data-p]'),"
@@ -3640,7 +3659,8 @@ async def _pinned_block(alias: str, cands: list, fixed: list, wf: dict, oi: dict
     bn0 = str(cands[0].get("backend"))
     tabs = "".join(
         f'<button type="button" class="ptab{" on" if i == 0 else ""}" '
-        f"onclick=\"pinTab(this,'{_esc(str(c.get('backend')))}')\">{_esc(str(c.get('backend')))}</button>"
+        f"data-pt=\"{_esc(str(c.get('backend')))}\" "
+        f"onclick=\"pinTab(this,this.getAttribute('data-pt'))\">{_esc(str(c.get('backend')))}</button>"
         for i, c in enumerate(cands))
     panels = f'<div class="ppanel" data-pt="{_esc(bn0)}">{primary_rows}</div>'
     # override backends' own models fetched in PARALLEL (cold /object_info is slow)
@@ -5007,9 +5027,10 @@ def _voice_lib_panel(status_html: str = "") -> str:
           "the gateway.</span></div></div>"
         + "</form>"
         + "<script>function vlPlay(a){var r=document.getElementById('vpresult');if(!r)return false;"
-          "var n=a.getAttribute('data-v');"
-          "r.innerHTML=\"<h2>Result</h2><p class='muted'>\\ud83d\\udcda reference: <b>\"+n+\"</b></p>"
-          "<audio class='result' controls autoplay src='/ui/playground/voice-lib/\"+encodeURIComponent(n)+"
+          "var n=a.getAttribute('data-v'),x=function(s){return String(s).replace(/[&<>\"']/g,"
+          "function(c){return '&#'+c.charCodeAt(0)+';';});};"
+          "r.innerHTML=\"<h2>Result</h2><p class='muted'>\\ud83d\\udcda reference: <b>\"+x(n)+\"</b></p>"
+          "<audio class='result' controls autoplay src='/ui/playground/voice-lib/\"+x(encodeURIComponent(n))+"
           "\"?t=\"+Date.now()+\"'></audio>\";return false;}"
           "function vuSending(f){var r=document.getElementById('vpresult');"
           "if(r)r.innerHTML=\"<h2>Result</h2><p class='muted'>\\u23f3 <b>Uploading voice\\u2026</b> · "
@@ -6618,7 +6639,7 @@ def _reasoning_form(rule: Optional[dict], idx, test: Optional[dict] = None,
              "var dl=document.getElementById('rtmodels');if(!dl)return;"
              "var ms=(bk&&RT_BK[bk])?RT_BK[bk]:RT_ALL;"
              "dl.innerHTML=ms.map(function(m){var o=document.createElement('option');"
-             "o.value=m;return o.outerHTML;}).join('');}</script>") % (json.dumps(rt_bk), json.dumps(rt_all))
+             "o.value=m;return o.outerHTML;}).join('');}</script>") % (_js_json(rt_bk), _js_json(rt_all))
     test_panel = (
         "<div style='margin-top:16px;padding-top:12px;border-top:1px solid #272b33'>"
         "<h2>Live test</h2><p class='hint'>Fire a real call to one backend with the "
