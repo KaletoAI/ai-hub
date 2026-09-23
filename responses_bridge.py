@@ -95,18 +95,26 @@ def responses_to_chat(body: dict) -> dict:
                 content = _content_parts_to_text(item.get("content", ""))
                 messages.append({"role": role, "content": content})
             elif itype == "function_call":
-                messages.append({
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [{
-                        "id": item.get("call_id") or item.get("id"),
-                        "type": "function",
-                        "function": {
-                            "name": item.get("name", ""),
-                            "arguments": item.get("arguments", "{}"),
-                        },
-                    }],
-                })
+                call = {
+                    "id": item.get("call_id") or item.get("id"),
+                    "type": "function",
+                    "function": {
+                        "name": item.get("name", ""),
+                        "arguments": item.get("arguments", "{}"),
+                    },
+                }
+                # Parallel calls are ONE assistant turn in chat: consecutive
+                # function_call items (and the assistant text right before them) join
+                # the same message. One message per call — assistant, assistant, tool,
+                # tool — is rejected by strict servers (vLLM/OpenAI 400) and renders a
+                # different prompt on lenient ones.
+                prev = messages[-1] if messages else None
+                if prev is not None and prev.get("role") == "assistant":
+                    prev.setdefault("tool_calls", []).append(call)
+                    if prev.get("content") == "":
+                        prev["content"] = None
+                else:
+                    messages.append({"role": "assistant", "content": None, "tool_calls": [call]})
             elif itype == "function_call_output":
                 messages.append({
                     "role": "tool",
@@ -200,15 +208,46 @@ def chat_to_responses(chat_resp: dict) -> dict:
     )
 
 
+class _UpstreamStreamError(Exception):
+    """An error the backend reported INSIDE its SSE stream (`data: {"error": …}`)."""
+
+
+def _tool_slot(tc: dict, last_key):
+    """Which collected tool call a chat `delta.tool_calls` fragment belongs to — the
+    same rule as anthropic_bridge.messages_stream: the index when the backend numbers
+    its calls, else a new id starts a new call and an id-less fragment continues the
+    last one (keying everything on a missing index would merge two calls)."""
+    if tc.get("index") is not None:
+        return ("i", tc["index"])
+    if tc.get("id"):
+        return ("id", tc["id"])
+    return last_key or ("i", 0)
+
+
 async def responses_stream(chat_resp, raw_body: dict, alias: str):
     """A3: translate a backend chat-completion SSE stream into Responses API SSE
     events. Consumes the adapter StreamingResponse's body_iterator (so in-flight
-    accounting + stats still fire in the adapter when it drains).
+    accounting + stats still fire in the adapter when it drains) and closes it
+    explicitly on every exit — a client disconnect lands in THIS generator, and the
+    adapter's (which holds the slot and the upstream connection) must not wait for
+    garbage collection.
 
     Thinking-model chunks (`delta.reasoning`/`reasoning_content`) are forwarded as
     reasoning-summary events on a reasoning item (output_index 1 — the message item
     stays at 0, its events having already been announced) instead of being dropped;
-    clients that don't know reasoning events simply ignore them."""
+    clients that don't know reasoning events simply ignore them.
+
+    Tool calls (`delta.tool_calls`) become `function_call` output items. Like the
+    Messages bridge, their fragments are COLLECTED and each call is emitted complete
+    once the stream ends (`output_item.added` → `function_call_arguments.delta` →
+    `.done` → `output_item.done`, after the message and reasoning items): a chat
+    backend may interleave two calls' fragments, number them inconsistently or omit
+    the index, and a client can only run a tool once its arguments parse anyway.
+
+    A stream that dies — an exception from upstream, an in-band `error` payload, or an
+    end with neither `finish_reason` nor `[DONE]` — ends in `response.failed`, never
+    `response.completed`: completing around a truncated text makes the client store
+    half an answer as the whole one."""
     resp_id = _oid("resp")
     item_id = _oid("msg")
     rs_id = _oid("rs")
@@ -232,8 +271,14 @@ async def responses_stream(chat_resp, raw_body: dict, alias: str):
              "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}})
 
     full, think, buf, usage = "", "", "", None
+    tools: list[dict] = []                    # collected tool calls, in arrival order
+    slots: dict = {}                          # chat slot key → index into `tools`
+    last_key = None
+    finished = False                          # finish_reason or [DONE] seen
+    failure: Optional[str] = None
+    source = chat_resp.body_iterator
     try:
-        async for chunk in chat_resp.body_iterator:
+        async for chunk in source:
             buf += chunk.decode("utf-8", "ignore") if isinstance(chunk, (bytes, bytearray)) else chunk
             while "\n" in buf:
                 line, buf = buf.split("\n", 1)
@@ -241,7 +286,10 @@ async def responses_stream(chat_resp, raw_body: dict, alias: str):
                 if not line.startswith("data:"):
                     continue
                 data = line[5:].strip()
-                if not data or data == "[DONE]":
+                if data == "[DONE]":
+                    finished = True
+                    continue
+                if not data:
                     continue
                 try:
                     obj = json.loads(data)
@@ -249,11 +297,18 @@ async def responses_stream(chat_resp, raw_body: dict, alias: str):
                     continue
                 if not isinstance(obj, dict):
                     continue
+                err = obj.get("error")
+                if err and not obj.get("choices"):
+                    msg = err.get("message") if isinstance(err, dict) else err
+                    raise _UpstreamStreamError(str(msg or err))
                 if obj.get("model"):
                     model = obj["model"]
                 if obj.get("usage"):
                     usage = obj["usage"]
-                d = (obj.get("choices") or [{}])[0].get("delta") or {}
+                choice = (obj.get("choices") or [{}])[0]
+                if choice.get("finish_reason"):
+                    finished = True
+                d = choice.get("delta") or {}
                 rdelta = d.get("reasoning") or d.get("reasoning_content")
                 if isinstance(rdelta, str) and rdelta:
                     if not think:                       # first thinking token → announce the item
@@ -267,8 +322,46 @@ async def responses_stream(chat_resp, raw_body: dict, alias: str):
                     full += delta
                     yield ev("response.output_text.delta", {"item_id": item_id,
                              "output_index": 0, "content_index": 0, "delta": delta})
+                for tc in d.get("tool_calls") or []:
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function") or {}
+                    key = last_key = _tool_slot(tc, last_key)
+                    if key not in slots:
+                        slots[key] = len(tools)
+                        tools.append({"id": tc.get("id") or "", "name": fn.get("name") or "",
+                                      "args": ""})
+                    t = tools[slots[key]]
+                    if tc.get("id") and not t["id"]:
+                        t["id"] = tc["id"]
+                    if fn.get("name") and not t["name"]:
+                        t["name"] = fn["name"]
+                    t["args"] += fn.get("arguments") or ""
+    except _UpstreamStreamError as e:
+        failure = f"upstream error: {e}"
     except Exception as e:
-        logger.warning(f"responses SSE translate aborted: {e}")
+        failure = f"upstream stream failed: {str(e) or type(e).__name__}"
+    finally:
+        aclose = getattr(source, "aclose", None)
+        if aclose is not None:
+            try:
+                await aclose()
+            except Exception:                  # already closed / never started
+                pass
+    if failure is None and not finished:
+        failure = "upstream stream ended before the answer was complete"
+
+    u = None
+    if usage:
+        u = {"input_tokens": usage.get("prompt_tokens", 0),
+             "output_tokens": usage.get("completion_tokens", 0),
+             "total_tokens": usage.get("total_tokens", 0)}
+    if failure is not None:
+        logger.warning(f"responses SSE translate aborted: {failure}")
+        yield ev("response.failed", {"response": response_shell(
+            resp_id, "failed", model, created, usage=u,
+            error={"code": "server_error", "message": failure})})
+        return
 
     part = {"type": "output_text", "text": full, "annotations": []}
     yield ev("response.output_text.done", {"item_id": item_id, "output_index": 0,
@@ -285,11 +378,19 @@ async def responses_stream(chat_resp, raw_body: dict, alias: str):
                  "output_index": 1, "summary_index": 0, "text": think})
         yield ev("response.output_item.done", {"output_index": 1, "item": rs_item})
         output.append(rs_item)
-    u = None
-    if usage:
-        u = {"input_tokens": usage.get("prompt_tokens", 0),
-             "output_tokens": usage.get("completion_tokens", 0),
-             "total_tokens": usage.get("total_tokens", 0)}
+    for t in tools:                            # complete function_call items, in arrival order
+        idx = len(output)
+        item = {"type": "function_call", "id": _oid("fc"), "call_id": t["id"] or _oid("call"),
+                "name": t["name"], "arguments": "", "status": "in_progress"}
+        yield ev("response.output_item.added", {"output_index": idx, "item": item})
+        if t["args"]:
+            yield ev("response.function_call_arguments.delta", {"item_id": item["id"],
+                     "output_index": idx, "delta": t["args"]})
+        yield ev("response.function_call_arguments.done", {"item_id": item["id"],
+                 "output_index": idx, "name": t["name"], "arguments": t["args"]})
+        done_item = dict(item, arguments=t["args"], status="completed")
+        yield ev("response.output_item.done", {"output_index": idx, "item": done_item})
+        output.append(done_item)
     yield ev("response.completed",
              {"response": response_shell(resp_id, "completed", model, created,
                                          output=output, usage=u)})
