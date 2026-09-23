@@ -333,6 +333,87 @@ class StreamStats(unittest.TestCase):
         self.assertEqual(counts["inc"], counts["dec"])
 
 
+class SerializedOnce(unittest.TestCase):
+    """P4: a multi-MB body (a Claude Code context, base64 images) was serialized twice on
+    the event loop — once for the stats text, once more by httpx's `json=` — ~25-30 ms
+    per MB each. It is now serialized ONCE, sent as bytes and reused as the stats text."""
+
+    def _run(self, stream):
+        sent, rows = [], []
+
+        def handler(request):
+            sent.append((request.content, request.headers.get("content-type")))
+            if stream:
+                return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                                      content=b"data: [DONE]\n\n")
+            return httpx.Response(200, headers={"content-type": "application/json"},
+                                  content=b'{"choices":[],"usage":{"prompt_tokens":1}}')
+
+        import httpx._content as hc
+        saved = hc.json_dumps
+
+        def refuse(*a, **k):
+            raise AssertionError("httpx serialized the body a second time")
+
+        async def go():
+            client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+            ctx = _ctx(rows)
+            ctx.http_client = lambda: client
+            a = adapters.OpenAIAdapter(A, ctx)
+            body = {"model": "m", "stream": stream,
+                    "messages": [{"role": "user", "content": "Grüße " + "x" * 5000}]}
+            req = adapters.NormalizedRequest(path="/v1/chat/completions", alias="m", real_model="m",
+                                             body=body, raw=_raw({"content-type": "text/plain"}),
+                                             stream=stream)
+            resp = await a.dispatch(req)
+            if stream:
+                async for _ in resp.body_iterator:
+                    pass
+            for _ in range(3):
+                await asyncio.sleep(0)
+            await client.aclose()
+        hc.json_dumps = refuse
+        try:
+            asyncio.run(go())
+        finally:
+            hc.json_dumps = saved
+        return sent, rows
+
+    def test_plain_call(self):
+        sent, rows = self._run(stream=False)
+        content, ctype = sent[0]
+        self.assertEqual(ctype, "application/json")
+        self.assertEqual(json.loads(content)["messages"][0]["content"][:5], "Grüße")
+        self.assertEqual(rows[0]["request_text"].encode("utf-8"), content)
+
+    def test_streamed_call(self):
+        sent, rows = self._run(stream=True)
+        content, ctype = sent[0]
+        self.assertEqual(ctype, "application/json")
+        self.assertTrue(json.loads(content)["stream_options"]["include_usage"])
+        self.assertEqual(rows[0]["request_text"].encode("utf-8"), content)
+
+
+class Preview(unittest.TestCase):
+    """P4: the call-list preview is head + tail — it must not walk a multi-MB body."""
+
+    def test_same_result_as_collapsing_the_whole_text(self):
+        import stats
+        for text in ('{"a": 1}', "  lead   ws\n" + "word " * 50000 + "\n tail  end ",
+                     "x" * 300, "a b " * 30):
+            full = " ".join(text.split())
+            want = full if len(full) <= 100 else f"{full[:50]} … {full[-50:]}"
+            self.assertEqual(stats._preview(text), want)
+
+    def test_does_not_split_the_whole_body(self):
+        import stats
+
+        class Huge(str):
+            def split(self, *a, **k):
+                raise AssertionError("split over the whole body")
+        self.assertTrue(stats._preview(Huge("y " * 200000)).startswith("y y"))
+
+
 class Timeouts(unittest.TestCase):
     """P5: 300 s is a READ budget for long completions, never a connect budget."""
 

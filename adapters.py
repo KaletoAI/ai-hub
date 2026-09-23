@@ -803,7 +803,7 @@ class _Call:
     reasoning_ctl: Optional[str]        # x-reasoning-control value ("off:prefill", …) or None
     rheaders: dict                      # gateway response headers (serving backend + reasoning control)
     source: str
-    req_text: str
+    req_text: str                       # the body as SENT — set by _encode(), reused by stats
     started: float
     log_on: bool
     act: Any                            # live-call registry token
@@ -1047,6 +1047,7 @@ class OpenAIAdapter(BackendAdapter):
         b = self.backend
         ctx = self.ctx
         headers = _forward_headers(req.raw.headers)
+        headers["content-type"] = "application/json"   # the body is sent as encoded bytes
         headers.update(self._backend_auth())
         real_model = req.body.get("model")
         fwd, reasoning_ctl = self._payload(req)
@@ -1065,9 +1066,19 @@ class OpenAIAdapter(BackendAdapter):
         return _Call(
             url=f"{b['url']}{req.path}", headers=headers, fwd=fwd, real_model=real_model,
             reasoning_ctl=reasoning_ctl, rheaders=rheaders,
-            source=ctx.source_of(req.raw), req_text=json.dumps(fwd, ensure_ascii=False),
+            source=ctx.source_of(req.raw), req_text="",
             started=time.monotonic(), log_on=ctx.log_enabled(), act=act,
         )
+
+    @staticmethod
+    def _encode(call: _Call, body: dict) -> bytes:
+        """Serialize the outgoing body ONCE: the bytes go to the backend (`content=`,
+        not httpx's `json=`, which would serialize it again) and the same text is the
+        stats row's request body. A Claude Code context or a base64 image is several
+        MB, and every pass over it is ~25-30 ms/MB on the event loop. Compact UTF-8,
+        like httpx's own encoder."""
+        call.req_text = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+        return call.req_text.encode("utf-8")
 
     def _backend_auth(self) -> dict:
         """Credential headers for THIS backend. Overridden where the protocol wants
@@ -1134,7 +1145,7 @@ class OpenAIAdapter(BackendAdapter):
             alias=req.alias, model=call.real_model, endpoint=(req.stats_endpoint or req.path),
             status=status, input_tokens=in_tok, output_tokens=out_tok,
             cost_usd=ctx.cost_usd(self.bid, call.real_model, in_tok, out_tok),
-            request_text=call.req_text, response_text=response_text,
+            request_text=call.req_text or None, response_text=response_text,
             response_audio=response_audio,
             reasoning=call.reasoning_ctl,
             cache_read=cache[0], cache_write=cache[1],
@@ -1174,8 +1185,9 @@ class OpenAIAdapter(BackendAdapter):
         client_cm = _pooled_client(ctx)
         client = None
         try:
+            payload = self._encode(call, body)
             client = await client_cm.__aenter__()
-            stream_cm = client.stream("POST", call.url, json=body,
+            stream_cm = client.stream("POST", call.url, content=payload,
                                       headers=call.headers, timeout=_CHAT_TIMEOUT)
             resp = await stream_cm.__aenter__()
         except BaseException:
@@ -1226,8 +1238,9 @@ class OpenAIAdapter(BackendAdapter):
 
     async def _dispatch_once(self, req: NormalizedRequest, call: _Call) -> Response:
         try:
+            payload = self._encode(call, call.fwd)
             async with _pooled_client(self.ctx) as client:
-                resp = await client.post(call.url, json=call.fwd,
+                resp = await client.post(call.url, content=payload,
                                          headers=call.headers, timeout=_CHAT_TIMEOUT)
         finally:
             self._finish(call)
@@ -1378,8 +1391,9 @@ class AnthropicAdapter(OpenAIAdapter):
         client_cm = _pooled_client(ctx)
         client = None
         try:
+            payload = self._encode(call, call.fwd)
             client = await client_cm.__aenter__()
-            stream_cm = client.stream("POST", call.url, json=call.fwd,
+            stream_cm = client.stream("POST", call.url, content=payload,
                                       headers=call.headers, timeout=_CHAT_TIMEOUT)
             resp = await stream_cm.__aenter__()
         except BaseException:

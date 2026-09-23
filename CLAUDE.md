@@ -119,6 +119,11 @@ they need via injected callables, staying hot-reload-safe.
   purpose: the Anthropic passthrough relies on whatever Claude Code sends
   (`anthropic-*`, `x-stainless-*`, `x-app`, user-agent) and OpenRouter reads
   `HTTP-Referer`/`X-Title` — an allowlist would silently strip the next such header.
+  The outgoing body is serialized ONCE (`OpenAIAdapter._encode`, compact UTF-8 like
+  httpx's own encoder): sent as `content=` bytes, not `json=` (which serialized it a
+  second time), and the same text is the stats row's request body — a multi-MB Claude
+  Code context cost ~25-30 ms/MB of event loop per pass. `stats._preview` likewise
+  collapses only the two ends it shows, never the whole body.
   Going the other way, every response builder keeps only its OWN headers
   (`call.rheaders` = `x-gateway-backend` + `x-reasoning-control`) — an upstream
   `content-length` would describe a body the gateway re-serializes — with ONE
