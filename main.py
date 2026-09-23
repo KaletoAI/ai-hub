@@ -2389,7 +2389,11 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
 
 @app.get("/v1/models/{model_id:path}")
 async def get_model(model_id: str, authorization: Optional[str] = Header(None)):
-    check_auth(authorization)
+    user = authenticate(authorization)
+    # The same grant the request path enforces; outside it the answer is the unknown-model
+    # 404, so a restricted key cannot probe what exists beyond its allow-list.
+    if user is not None and not _model_allowed(user, model_id):
+        raise HTTPException(404, f"Model '{model_id}' not found")
     now = int(time.time())
     llm = [b for b in enabled_backends() if not _is_gen(b)]
     if model_id in virtual_models:

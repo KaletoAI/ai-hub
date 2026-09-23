@@ -1027,6 +1027,9 @@ maps the alias, and exposes the resolved model. Recurring concepts:
 - **Allow-list filtering**: `/v1/models` authenticates the caller and filters by
   their allow-list (entries may be aliases, model ids, or **backend names** =
   all that backend's models); image aliases are included; `?type=chat|image`.
+  `GET /v1/models/{id}` applies the same grant (`_model_allowed`) and answers outside it
+  with the unknown-model 404, so a restricted key cannot probe what exists
+  (`test_model_lookup_allow.py`).
 - **Alias/model-name collisions** (`alias_model_conflicts`): surfaced in the
   Input & Routing tab, split `covered` vs actionable `shadowed` (`/health` carries
   the shadowing entries only).
