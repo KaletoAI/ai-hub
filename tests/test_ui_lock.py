@@ -134,7 +134,7 @@ class UsersEditor(unittest.TestCase):
         self._login("kai-key")
         self._add("bob", "user", "bob-key")
         self.assertIsNotNone(store.get_user("bob"))
-        r = self.c.get("/ui/users/delete?name=kai", follow_redirects=False)
+        r = self.c.post("/ui/users/delete?name=kai", follow_redirects=False)
         self.assertIn("refused=", r.headers["location"])
         self.assertIsNotNone(store.get_user("kai"))
         r = self.c.post("/ui/users/save", data={"orig": "kai", "name": "kai", "role": "user",
@@ -152,7 +152,7 @@ class UsersEditor(unittest.TestCase):
         self.assertIn("/ui/login", r.headers["location"])
         # a second admin makes deleting the first one fine
         self._add("eve", "admin", "eve-key")
-        r = self.c.get("/ui/users/delete?name=bob", follow_redirects=False)
+        r = self.c.post("/ui/users/delete?name=bob", follow_redirects=False)
         self.assertNotIn("refused=", r.headers["location"])
         self.assertIsNone(store.get_user("bob"))
 

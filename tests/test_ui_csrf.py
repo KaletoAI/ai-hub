@@ -54,11 +54,20 @@ class CrossSite(unittest.TestCase):
                             headers={"sec-fetch-site": site})
             self.assertEqual(r.status_code, 403, site)
 
-    def test_cross_site_get_does_not_run_the_action_but_offers_a_link(self):
+    def test_cross_site_get_offers_a_same_origin_link(self):
+        r = self.c.get("/ui/users?edit=a%26b", follow_redirects=False,
+                       headers={"sec-fetch-site": "cross-site"})
+        self.assertEqual(r.status_code, 403)
+        self.assertIn('href="/ui/users?edit=a%26b"', r.text)
+
+    def test_cross_site_get_of_an_action_offers_no_way_to_run_it(self):
+        # Actions are POST-only now (test_ui_post_only): a link can never start one, so
+        # the page must not turn the foreign link into a button that does.
         r = self.c.get("/ui/users/delete?name=a%26b", follow_redirects=False,
                        headers={"sec-fetch-site": "cross-site"})
         self.assertEqual(r.status_code, 403)
-        self.assertIn('href="/ui/users/delete?name=a%26b"', r.text)
+        self.assertNotIn('formaction="/ui/users/delete', r.text)
+        self.assertNotIn('href="/ui/users/delete', r.text)
 
     def test_own_requests_pass(self):
         for site in ("same-origin", "none"):          # none = typed URL / bookmark

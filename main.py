@@ -935,6 +935,12 @@ async def lifespan(app: FastAPI):
     # discovered too.
     store.init(jobs_cfg.get("store_path", "store.db"))
     store.bootstrap(image_models)
+    for _alias, _cands in store.list_aliases().items():
+        if adapters.migrate_upload_pins(_cands):
+            store.upsert(_alias, _cands)
+            logger.warning(f"store: alias '{_alias}': pinned image 'playground upload' → 8×8 "
+                           "placeholder (that option always ran on the placeholder and is gone; "
+                           "bind the loader as an image request field instead)")
     backend_models.update(store.load_backend_models())   # seed last-known models (offline → 503, not 403)
     backend_context.update(store.load_backend_context())  # learned context windows survive a restart
     apply_server_settings()            # overlay UI-managed server settings onto config
@@ -5836,7 +5842,7 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
            probe_reasoning=probe_reasoning,
            voice_lib_save=save_voice_ref, voice_lib_delete=delete_voice_ref,
            voice_lib_ship=ship_voice_ref, voice_ship_config=voice_ship_config,
-           apply_voice_library=apply_voice_library,
+           parse_voice_target=parse_voice_target, voice_dir_ok=_voice_dir_ok,
            apply_hosts=apply_hosts,
            backend_loras=lambda: {b["name"]: sorted(backend_loras.get(backend_id(b), set()))
                                   for b in backends if b.get("type") == "comfyui"})

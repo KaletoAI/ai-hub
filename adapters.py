@@ -408,7 +408,6 @@ class NormalizedRequest:
     workflow_json: Optional[dict] = None            # gateway-owned API workflow (preferred)
     node_mapping: dict = field(default_factory=dict)  # {param: {node, field}} request-time
     fixed: list = field(default_factory=list)       # [{node, field, value}] admin-pinned (models, …)
-    upload_image: Optional[bytes] = None            # legacy single reference image (back-compat)
     upload_images: dict = field(default_factory=dict)  # {param: bytes} per request-field image uploads
     upload_files: dict = field(default_factory=dict)  # {param: (suggested filename, bytes)} client-supplied
                                                     # non-image files (meshes) — uploaded PER dispatch, so
@@ -1902,7 +1901,23 @@ def _clip_nodes(wf: dict, want: str) -> Optional[str]:
 
 _IMG_LOADER_CLASSES = ("LoadImage", "LoadAndResizeImage", "LoadImageMask")
 PLACEHOLDER_SENTINEL = "__gw_placeholder__"          # fixed-binding value → upload + use an 8×8 image
-UPLOAD_SENTINEL = "__gw_upload__"                    # fixed-binding value → use the playground upload
+# The removed "playground upload (8×8 if empty)" pin. Nothing ever supplied that upload,
+# so such a pin always ran on the placeholder; a request image belongs in an image SLOT
+# of the mapping. Stored pins are rewritten at startup (migrate_upload_pins); the
+# resolver still reads a leftover as the placeholder rather than sending the raw string.
+LEGACY_UPLOAD_SENTINEL = "__gw_upload__"
+
+
+def migrate_upload_pins(cands: list) -> int:
+    """Rewrite LEGACY_UPLOAD_SENTINEL pins to PLACEHOLDER_SENTINEL in place (what they
+    did at run time anyway); returns how many were rewritten."""
+    n = 0
+    for c in cands or []:
+        for b in (c or {}).get("fixed") or []:
+            if b.get("value") == LEGACY_UPLOAD_SENTINEL:
+                b["value"] = PLACEHOLDER_SENTINEL
+                n += 1
+    return n
 
 
 def is_img_loader_class(cls) -> bool:
@@ -2959,32 +2974,16 @@ class ComfyUIAdapter(BackendAdapter):
             return f"{outdir}/{mesh_name}"
         return input_path_ref(backend2, await self.upload_input(mesh_bytes, mesh_name))
 
-    async def _resolve_image_sentinels(self, fixed: list, upload: Optional[bytes],
-                                       prefix: str, used: list) -> list:
-        """Replace image sentinels in fixed bindings with real uploaded names.
-        A node pinned to the playground upload uses the uploaded image, or falls
-        back to the 8×8 placeholder when nothing was uploaded — so the placeholder
-        is simply the 'no reference' alternative right at the upload step."""
-        has_ph = any(b.get("value") == PLACEHOLDER_SENTINEL for b in fixed)
-        has_up = any(b.get("value") == UPLOAD_SENTINEL for b in fixed)
-        if not (has_ph or has_up):
+    async def _resolve_image_sentinels(self, fixed: list) -> list:
+        """Replace the placeholder sentinel in fixed bindings with the uploaded 8×8
+        placeholder's name (a leftover legacy upload pin counts as one — see
+        LEGACY_UPLOAD_SENTINEL)."""
+        sentinels = (PLACEHOLDER_SENTINEL, LEGACY_UPLOAD_SENTINEL)
+        if not any(b.get("value") in sentinels for b in fixed):
             return fixed
-        need_ph = has_ph or (has_up and not upload)        # placeholder also backs an empty upload
-        up_name = upload_slot_name(prefix, "upload")       # job-unique, never a shared 'gw_upload.png'
         async with _pooled_client(self.ctx) as c:
-            ph = await self._upload_placeholder(c) if need_ph else None
-            up = await self._upload_image(c, bytes(upload), up_name) if (has_up and upload) else None
-        if up:
-            used.append(up_name)
-        def sub(b):
-            v = b.get("value")
-            if v == PLACEHOLDER_SENTINEL:
-                return {**b, "value": ph} if ph else b
-            if v == UPLOAD_SENTINEL:
-                name = up or ph                             # uploaded image, else 8×8 placeholder
-                return {**b, "value": name} if name else b
-            return b
-        return [sub(b) for b in fixed]
+            ph = await self._upload_placeholder(c)
+        return [({**b, "value": ph} if b.get("value") in sentinels and ph else b) for b in fixed]
 
     async def _apply_image_params(self, wf: dict, mapping: dict, params: list,
                                   uploads: dict, prefix: str, used: list,
@@ -3125,8 +3124,7 @@ class ComfyUIAdapter(BackendAdapter):
         # cleanup. No two jobs ever address the same input file (see upload_slot_name).
         prefix = upload_prefix_for(req.upload_prefix)
         uploaded: list = []
-        fixed = await self._resolve_image_sentinels(list(req.fixed or []), req.upload_image,
-                                                    prefix, uploaded)
+        fixed = await self._resolve_image_sentinels(list(req.fixed or []))
         fixed_applied = _apply_fixed(wf, fixed)                # pin models / switches / ref-images
         protected = {(b.get("node"), b.get("field")) for b in fixed   # pins the API cannot override
                      if b.get("node") and b.get("field")}
@@ -3158,8 +3156,6 @@ class ComfyUIAdapter(BackendAdapter):
             lbl = ((mapping.get(p) or {}).get("label") or "").strip()
             if lbl and lbl != p and lbl in uploads and p not in uploads:
                 uploads[p] = uploads.pop(lbl)
-        if req.upload_image and len(img_params) == 1 and img_params[0] not in uploads:
-            uploads[img_params[0]] = req.upload_image          # back-compat single upload
         for p in img_params:
             values.pop(p, None)
         for p in (req.upload_files or {}):

@@ -615,6 +615,31 @@ they need via injected callables, staying hot-reload-safe.
   colours come from the `:root` palette in `_CSS` (`var(--muted)` …), boxed pickers use
   `.box`; a sortable cell whose text is not the quantity carries `data-sv` (raw value),
   and `_SORT_JS`'s `num()` reads the console's units (`102 ms`, `1.2 s`, `5m`, `$`).
+  **Every console action is a POST** (`_POST_ACTIONS`; `register()` gives exactly those
+  routes `methods=["POST"]`): a GET link fires on anything that makes a browser navigate
+  (link preview, prefetch, a pasted URL). `_btn` renders any href to such a route as a
+  `<button form="gw-act" formaction=…>` — ONE empty form per page, emitted with
+  `_CONFIRM_JS` outside `<main>` (the morph never touches it), because the editors' ✕/∅
+  buttons sit INSIDE another form and a nested `<form>` is invalid HTML. The "+ Add …"
+  selects carry their URL in `data-post` and call `gwPost` (a throw-away submit button —
+  never a rewritten form `action`, which a back/forward-cache restore would then Save
+  into). Query values go through `_q` (`quote(safe="")`), never `_esc`: the HTML escape
+  split `a&b` into `a` plus a stray `amp;b`. `test_ui_post_only.py` walks the handlers
+  by AST (no GET route may reach a store/jobs write or a mutating callback; the one
+  exception is `_autoresolve_ips`' reverse-DNS cache) and crawls the rendered pages (no
+  link, no `location.href` to an action). Editor forms carry `data-guard`: an edited one
+  left by anything but its own submit (an action, a nav tab) gets the browser's
+  unsaved-changes prompt; **Update workflow** applies the whole editor form before it
+  swaps the JSON (`_apply_update_form`, shared with Save), and the request-field
+  drag-reorder SAVES the form — `update` builds the mapping in row order, so the DOM order
+  is the stored order. A refused create/save answers **400 with the form re-rendered as
+  typed** plus the reason (`_backends_view`/`_users_view`/`_mapping_view` take a `detail`
+  override; `_form_err`), never a bare page with "← Back" to an empty form: names that
+  exist (store OR config) are refused instead of merged/overwritten, a media-alias rename
+  onto a taken name saves the rest and says so (`&taken=`), and numbers go through
+  `_int_field`/`_float_field` — blank is the ONLY "unset", "1.5"/"-1"/"1e3" is an error
+  (a decimal comma is accepted for money). Voice ship targets are checked on Save with
+  main's own `parse_voice_target`/`_voice_dir_ok` (bound in). `test_ui_form_validation.py`.
 - **Media has no call log — it has the job store.** A ComfyUI/cloud generation is a
   JOB, not a forwarded call, so it never reaches `stats.calls` and every table in the
   Statistic tab was blind to it (it looked unmeasured; it never was). `jobs.gen_stats_rows()`
@@ -1234,7 +1259,9 @@ re-checked per request, so rotating a key or demoting/deleting an admin ends its
 sessions. Before that, `_ui_guard` refuses every CROSS-SITE request to /ui
 (`_cross_site`: `Sec-Fetch-Site` other than `same-origin`/`none`, else a foreign
 Origin/Referer; no header = curl, passes): POST → 403, GET → a page whose same-origin
-*Continue* link runs it, because ~30 console actions are GET links. Note `same-site`
+*Continue* link opens it — for a VIEW only: every state-changing console route is
+POST-only (`admin._POST_ACTIONS`), so for an action URL that page offers no way to run
+it. Note `same-site`
 counts as foreign — another service on the same IP but another port lands on that page
 too, deliberately. Behind a reverse proxy the public host must arrive in `Host` or
 `X-Forwarded-Host`, or browsers without fetch metadata get 403 on every POST. Every /ui

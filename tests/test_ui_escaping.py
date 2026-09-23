@@ -80,8 +80,9 @@ class ScriptJson(unittest.TestCase):
         import json
         self.assertEqual(json.loads(out), {"b": ["</script><img src=x onerror=alert(1)>", "a&b"]})
 
-    def test_reorder_js_alias_is_script_safe(self):
-        self.assertNotIn("</script><img", admin._reorder_js("</script><img src=x>"))
+    def test_reorder_js_carries_no_alias(self):
+        # The drop saves the editor form itself — no alias is spliced into the script.
+        self.assertNotIn("location.href", admin._reorder_js())
 
 
 class PlaygroundResult(unittest.TestCase):

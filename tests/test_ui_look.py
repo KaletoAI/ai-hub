@@ -288,7 +288,7 @@ class KeyboardReorder(unittest.TestCase):
         self.assertIn('aria-label="Move steps up"', rows)
 
     def test_move_reuses_the_drop_path(self):
-        js = admin._reorder_js("a")
+        js = admin._reorder_js()
         self.assertIn("data-mv", js)
         self.assertIn("dispatchEvent", js)
 
