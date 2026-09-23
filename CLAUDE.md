@@ -116,8 +116,9 @@ they need via injected callables, staying hot-reload-safe.
   `content-length` would describe a body the gateway re-serializes — with ONE
   exception: `_ratelimit_headers()` carries the upstream's `retry-after` through,
   because that header is not diagnostics but an instruction to the caller. It is
-  merged in at all four places that rebuild a response from an upstream one
-  (`_dispatch_once`, both stream error paths, `_anthropic_error`), covered by
+  merged in at every place that rebuilds a response from an upstream one
+  (`_dispatch_once`, both stream error paths, `_anthropic_error`, and the two
+  HTTPException re-raises in `main.responses` — plain and streamed), covered by
   `test_ratelimit_headers.py`. Dropping it fails silently — the client still gets
   its 429 and just retries blind: measured 2026-09-01 on prod, one Claude Code
   request became ~10 upstream calls in 20 s against `api.anthropic.com`, which had

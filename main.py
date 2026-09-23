@@ -2448,10 +2448,15 @@ async def responses(request: Request, authorization: Optional[str] = Header(None
             return StreamingResponse(responses_stream(resp, raw_body, alias),
                                      media_type="text/event-stream")
         err = _dispatch_json(resp)
-        raise HTTPException(resp.status_code, (json.dumps(err) or "")[:500])
+        # The upstream's retry-after is an instruction to the caller, not diagnostics —
+        # it must survive this re-raise like every other response rebuild (see
+        # adapters._ratelimit_headers).
+        raise HTTPException(resp.status_code, (json.dumps(err) or "")[:500],
+                            headers=adapters._ratelimit_headers(resp.headers) or None)
     chat_resp_json = _dispatch_json(resp)
     if resp.status_code >= 400:
-        raise HTTPException(resp.status_code, (json.dumps(chat_resp_json) or "")[:500])
+        raise HTTPException(resp.status_code, (json.dumps(chat_resp_json) or "")[:500],
+                            headers=adapters._ratelimit_headers(resp.headers) or None)
     return JSONResponse(chat_to_responses(chat_resp_json), status_code=resp.status_code)
 
 
