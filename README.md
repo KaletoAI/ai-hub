@@ -1496,6 +1496,51 @@ sudo systemctl disable llm-gateway.service
 sudo rm /etc/systemd/system/llm-gateway.service
 ```
 
+**Upgrading to the 2026-09-23 review release.** No manual migration: `stats.db` gets a
+new index (`idx_calls_ts_backend`, the old `idx_calls_ts` is dropped) and `faults.db` a
+`bkey` column on first start, both in place. What an operator will notice:
+
+- **Console sign-in.** Every `/ui` session ends once — sign in again. The console now
+  locks as soon as ANY user or a master `api_key` exists (before: only with an admin);
+  the Users tab refuses a first user that is not an admin, and refuses removing,
+  demoting or disabling the last admin while no master key is set.
+- **Console actions are POST-only.** Old bookmarks or scripts that fired an action by
+  GET (`/ui/backends/delete?…`, `/ui/job/<id>/cancel`, …) no longer run it: they get a
+  `405` console page. A link into `/ui` from another site (or another port on the same
+  host) lands on an intermediate page with a *Continue* link first. The Users page no
+  longer stores reverse-DNS names by itself — they are offered as *(resolved)*, and
+  *Save resolved names* stores them.
+- **`/health` without an admin credential** answers `status` + backend counts only; the
+  full snapshot needs the master or an admin key (or a console session), and model ids
+  appear only with `?verbose=1` — adjust monitoring that parsed the old body.
+- **Generation requests:** a reference image or `files` URL pointing at a private /
+  loopback / link-local address is `400` until its range is listed in
+  `ref_url_allow_cidrs`; a backend PATH in a file field's `params` is admin-only unless
+  the field ticks *client may send a backend path* (`client_path`) in the Mapping editor;
+  a list or object in `params`, `prompt` or `negative_prompt` is `400`; an unreadable
+  reference image is `400` instead of a silent placeholder.
+- **Limits:** request bodies capped at `max_body_mb` (default 200 → `413`), async
+  generation jobs at `max_queued_gen` (default 200 queued/running → `503`), a client's
+  `ttl_s` at `jobs.max_ttl_s` (7 days).
+- **Stats:** stored request/response bodies are now gzipped, capped at `body_max_kb`
+  (256 per side, head + tail kept) and deleted after `body_retention_days` (14; the call
+  rows stay) — the first start prunes older bodies. Statistic aggregates may be up to
+  30 s old, the fault summary up to 5 s; at most 60 `401` rows per minute are logged.
+- **Chat dispatch:** a `ReadTimeout` on a `paid` backend answers `504` instead of failing
+  over (it was buying the answer twice); the connect timeout is 10 s (was 300 s), and
+  every transport error (a reset, a closed keep-alive) now fails over. Client headers
+  such as cookies, `x-forwarded-*`, `origin`/`referer`/`sec-*` and `accept-encoding` are
+  no longer forwarded to backends. A stream the upstream breaks mid-answer ends with an
+  in-band error event instead of a cut connection; aborted and dropped streams are
+  booked (499/502) and count toward the cost quota.
+- **Generation jobs:** a cloud task (Meshy/Tripo) is never created a second time once it
+  exists — no failover or self-retry after that point, timeouts and outages end the job;
+  a sync generation keeps running when the client disconnects (it is a job; poll it);
+  a cancel stops only that job's own ComfyUI prompt and may take up to 15 s to return.
+- **Service unit:** `ai-hub.service` gains a systemd sandbox (still `root`, see above);
+  `deploy.sh` installs it — after the restart, check the voice-reference ship, *Scan
+  network* and whisper transcription once.
+
 > **Secrets & data never to commit:** `config.yaml`, `store.db` (+ `secret.key` —
 > they travel together, keys encrypted at rest), `stats.db*`, `jobs.db*`,
 > `jobs/`, `*.key`. All gitignored.
