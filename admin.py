@@ -65,13 +65,15 @@ def _cloud_url_for(new_type: str, url: str) -> str:
 _MODEL_EXTS = (".safetensors", ".gguf", ".ckpt", ".pt", ".pth", ".bin", ".sft", ".onnx")
 _LOADER_HINTS = ("loader", "checkpoint", "unet", "clip", "vae", "lora", "gguf", "controlnet")
 
+# Daily views first, administration (Server, Users) last. The route stays /ui/statistic
+# — only the label reads "Statistics".
 TABS = [
-    ("dashboard", "Dashboard"), ("server", "Server"), ("backends", "Backends"),
+    ("dashboard", "Dashboard"), ("backends", "Backends"),
     ("routing", "Input & Routing"), ("mapping", "Mapping"),
     ("reasoning", "Reasoning"),
     ("playground", "Playground"),
     ("jobs", "Jobs & Calls"),
-    ("statistic", "Statistic"), ("users", "Users"),
+    ("statistic", "Statistics"), ("server", "Server"), ("users", "Users"),
 ]
 DEFAULT_TAB = "dashboard"
 
@@ -6637,7 +6639,7 @@ async def statistic_page(request: Request):
         # Media aggregates live in the JOB store, not in stats.calls — they are there to
         # show even when call recording is off, and this is the page they belong on.
         media = await asyncio.to_thread(_media_gen_panel)
-        return HTMLResponse(_page("Statistic", "<h2>Statistic</h2><p class='hint'>Call recording is off. "
+        return HTMLResponse(_page("Statistics", "<h2>Statistics</h2><p class='hint'>Call recording is off. "
             "Enable <b>stats</b> in the <a href='/ui/server'>Server</a> tab (needs a restart) to collect "
             "per-call stats here.</p>" + fpanel + media + _FILTER_JS, "statistic"))
     user = (request.query_params.get("user") or "").strip() or None
@@ -6701,9 +6703,9 @@ async def statistic_page(request: Request):
     recent = ("<p class='hint' style='margin-top:18px'>Per-call history (with request/response bodies) "
               "moved to the <a href='/ui/llmcalls'>LLM Calls</a> tab.</p>")
     media = await asyncio.to_thread(_media_gen_panel)
-    head = f"<h2>Statistic{scope}</h2>{bar}"
+    head = f"<h2>Statistics{scope}</h2>{bar}"
     body = head + cards + fpanel + by_backend + by_model + by_source + media + recent + _FILTER_JS
-    return HTMLResponse(_page("Statistic", body, "statistic"))
+    return HTMLResponse(_page("Statistics", body, "statistic"))
 
 
 async def call_view(call_id: int, request: Request):
@@ -7234,7 +7236,7 @@ async def users_page(request: Request):
                    f"{_icon_acts(('✕', f'/ui/ipalias/delete?ip={quote(ip)}', 'danger', 'Delete', f'Delete IP alias {ip}?'))}</td></tr>")
     ip_section = (f"<h2 style='margin-top:26px'>IP aliases</h2>"
                   f"<p class='hint'>Friendly names for caller IPs (unauthenticated / <code>x-source</code> calls) as shown in "
-                  f"Statistic. Hostnames are auto-resolved via reverse DNS on load — edit or clear as needed.</p>"
+                  f"Statistics. Hostnames are auto-resolved via reverse DNS on load — edit or clear as needed.</p>"
                   + (f"<table><tr><th>IP</th><th>alias</th><th></th></tr>{iprows}</table>" if iprows
                      else "<p class='muted'>No caller IPs seen yet (calls are currently attributed to authenticated users).</p>"))
     # Design convention (mirrors Mapping): the master-detail .cols is the SOLE full-height
@@ -7325,7 +7327,7 @@ _SRV_RESTART = [
     ("__grp", "", "AI-Hub", ""),
     ("port", "int", "port", "set by launch cmd (uvicorn --port / systemd)"),
     ("__grp", "", "Stats (call log)", ""),
-    ("stats_enabled", "bool", "enabled", "record calls (dashboard in Statistic tab)"),
+    ("stats_enabled", "bool", "enabled", "record calls (dashboard in Statistics tab)"),
     ("stats_db_path", "text", "db path", ""),
     ("stats_retention_days", "int", "retention days", "0 = keep forever"),
     ("__grp", "", "Jobs (image/video generation)", ""),
