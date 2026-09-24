@@ -1,0 +1,339 @@
+{
+  "3": {
+    "inputs": {
+      "width": [
+        "147",
+        0
+      ],
+      "height": [
+        "148",
+        0
+      ],
+      "batch_size": 1
+    },
+    "class_type": "EmptyLatentImage",
+    "_meta": {
+      "title": "input_size"
+    }
+  },
+  "10": {
+    "inputs": {
+      "images": [
+        "123",
+        0
+      ]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "output_final"
+    }
+  },
+  "61": {
+    "inputs": {
+      "value": ""
+    },
+    "class_type": "PrimitiveStringMultiline",
+    "_meta": {
+      "title": "input_prompt_positiv"
+    }
+  },
+  "63": {
+    "inputs": {
+      "value": ""
+    },
+    "class_type": "PrimitiveStringMultiline",
+    "_meta": {
+      "title": "input_prompt_negativ"
+    }
+  },
+  "69": {
+    "inputs": {
+      "value": 0
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "input_seed"
+    }
+  },
+  "82": {
+    "inputs": {
+      "samples": [
+        "149",
+        0
+      ],
+      "vae": [
+        "116",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "116": {
+    "inputs": {
+      "vae_name": "qwen_image_2.1_vae_bf16.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "input_vae"
+    }
+  },
+  "121": {
+    "inputs": {
+      "clip_name": "qwen3vl_8b_heretic_int8_convrot.safetensors",
+      "type": "qwen_image",
+      "device": "default"
+    },
+    "class_type": "ClipLoaderGGUF",
+    "_meta": {
+      "title": "input_clip"
+    }
+  },
+  "123": {
+    "inputs": {
+      "method": "mkl",
+      "strength": [
+        "141",
+        0
+      ],
+      "multithread": true,
+      "image_target": [
+        "82",
+        0
+      ],
+      "image_ref": [
+        "126",
+        0
+      ]
+    },
+    "class_type": "ColorMatchV2",
+    "_meta": {
+      "title": "ColorMatchV2"
+    }
+  },
+  "126": {
+    "inputs": {
+      "image": "Vallerie_1773402900_23e5fe48_1.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "input_reference_image_1"
+    }
+  },
+  "127": {
+    "inputs": {
+      "image": "Diego_1772140790_c3aeaaaf_1.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "input_reference_image_2"
+    }
+  },
+  "128": {
+    "inputs": {
+      "image": "1781011414.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "input_reference_image_3"
+    }
+  },
+  "130": {
+    "inputs": {
+      "lora_01": "None",
+      "strength_01": 1,
+      "lora_02": "None",
+      "strength_02": 1,
+      "lora_03": "None",
+      "strength_03": 1,
+      "lora_04": "None",
+      "strength_04": 1,
+      "model": [
+        "145",
+        0
+      ],
+      "clip": [
+        "121",
+        0
+      ]
+    },
+    "class_type": "Lora Loader Stack (rgthree)",
+    "_meta": {
+      "title": "input_lora"
+    }
+  },
+  "140": {
+    "inputs": {
+      "image": [
+        "126",
+        0
+      ]
+    },
+    "class_type": "GetImageSize",
+    "_meta": {
+      "title": "Get Image Size"
+    }
+  },
+  "141": {
+    "inputs": {
+      "expression": "(a > 64) * 0.5",
+      "values.a": [
+        "140",
+        0
+      ]
+    },
+    "class_type": "ComfyMathExpression",
+    "_meta": {
+      "title": "Math Expression"
+    }
+  },
+  "144": {
+    "inputs": {
+      "any_02": [
+        "150",
+        0
+      ]
+    },
+    "class_type": "Any Switch (rgthree)",
+    "_meta": {
+      "title": "Any Switch (rgthree)"
+    }
+  },
+  "145": {
+    "inputs": {
+      "attention": "pytorch attention",
+      "model": [
+        "144",
+        0
+      ]
+    },
+    "class_type": "ModelAttentionBackend",
+    "_meta": {
+      "title": "Attention: pytorch (noetig auf dx10-02, xformers/sm_121)"
+    }
+  },
+  "146": {
+    "inputs": {
+      "prompt": [
+        "61",
+        0
+      ],
+      "negative_prompt": [
+        "63",
+        0
+      ],
+      "resolution": [
+        "147",
+        0
+      ],
+      "clip": [
+        "130",
+        1
+      ],
+      "images.image_1": [
+        "126",
+        0
+      ],
+      "images.image_2": [
+        "127",
+        0
+      ],
+      "images.image_3": [
+        "128",
+        0
+      ],
+      "vae": [
+        "116",
+        0
+      ]
+    },
+    "class_type": "TextEncodeQwenImage21",
+    "_meta": {
+      "title": "Text Encode Qwen Image 2.1"
+    }
+  },
+  "147": {
+    "inputs": {
+      "value": 1024
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "input_width"
+    }
+  },
+  "148": {
+    "inputs": {
+      "value": 1024
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "input_height"
+    }
+  },
+  "149": {
+    "inputs": {
+      "seed": [
+        "69",
+        0
+      ],
+      "steps": 40,
+      "cfg": 1,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1,
+      "model": [
+        "152",
+        0
+      ],
+      "positive": [
+        "146",
+        0
+      ],
+      "negative": [
+        "146",
+        1
+      ],
+      "latent_image": [
+        "3",
+        0
+      ]
+    },
+    "class_type": "KSampler",
+    "_meta": {
+      "title": "KSampler"
+    }
+  },
+  "150": {
+    "inputs": {
+      "unet_name": "qwen_image_2.1-Q8_0.gguf"
+    },
+    "class_type": "UnetLoaderGGUF",
+    "_meta": {
+      "title": "input_gguf"
+    }
+  },
+  "152": {
+    "inputs": {
+      "max_shift": 0.69,
+      "base_shift": 0.5,
+      "width": [
+        "147",
+        0
+      ],
+      "height": [
+        "148",
+        0
+      ],
+      "model": [
+        "130",
+        0
+      ]
+    },
+    "class_type": "ModelSamplingFlux",
+    "_meta": {
+      "title": "ModelSamplingFlux"
+    }
+  }
+}
