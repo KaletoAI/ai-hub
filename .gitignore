@@ -33,3 +33,5 @@ skills-lock.json
 skills-lock.json.bak
 # Never ship documents that landed in the samples folder by accident
 sample_comfyui_workflows/*.pdf
+# Planning notes (specs/plans) stay local — not part of the public repo
+docs/superpowers/
