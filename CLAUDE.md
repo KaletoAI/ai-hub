@@ -198,11 +198,14 @@ they need via injected callables, staying hot-reload-safe.
   (pre-cascade behaviour — never guess what a node needs). A branch that would take
   the alias's `output_node` with it fails the job UP FRONT naming the slot, instead
   of submitting a workflow that cannot deliver. The same slot's `on_empty_bypass`
-  (`slot_empty_bypass`, Mapping's *also bypass* field) names extra ids the cascade
-  CANNOT take — a main-path node whose image socket is optional, which would then run
-  on nothing; those are BYPASSED, not pruned (pruning cuts the path behind them), by
-  joining `req.bypass` for the single `_apply_bypass` pass, so both sources dedupe,
-  chain-resolve and report together under `bypassed`;
+  (`slot_empty_bypass`, Mapping's *also bypass* field) names main-path nodes that
+  only exist for that image; those are BYPASSED, not pruned (pruning cuts the path
+  behind them), by joining `req.bypass` for the single `_apply_bypass` pass, so both
+  sources dedupe, chain-resolve and report together under `bypassed`. The cascade
+  never enters a listed node, EVEN over a required socket (`_prune_branch(keep=)`):
+  otherwise it pruned the node before the bypass ran and followed on to the output —
+  measured 2026-09-24, Qwen2.1: ColorMatchV2's required `image_ref` took the only
+  PreviewImage along, "Prompt has no outputs" on every text-only request;
   **Live progress** (`_ws_progress` + the pure `_progress_apply`/`_progress_view`):
   REST cannot say how far along a run is — `/queue` names the running prompt and
   `/history` appears only once it is over — so the job view had to estimate from the

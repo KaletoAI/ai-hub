@@ -183,6 +183,56 @@ class EmptySlotBypassApplied(unittest.TestCase):
         self.assertEqual(wf["71"]["inputs"]["model"], ["60", 0])   # rewired past it, not cut
 
 
+class BypassBeatsPrune(unittest.TestCase):
+    """A node listed in the slot's `on_empty_bypass` whose image socket is REQUIRED:
+    the cascade used to prune it before the bypass ran, and the cascade then followed
+    through to the output node. Measured 2026-09-24, alias Qwen2.1, jobs 03e5e049163f &
+    co.: loader 126 → ColorMatchV2 123 (`image_ref` required, listed for bypass) →
+    PreviewImage 10 (the only output), so every text-only request failed with
+    "Prompt has no outputs". Listing a node for bypass means BYPASS it, required or not."""
+
+    TYPES = {"Loader": {"out": ["IMAGE"], "in": {}, "req": ["image"]},
+             "Decode": {"out": ["IMAGE"], "in": {}, "req": ["samples"]},
+             "ColorMatch": {"out": ["IMAGE"],
+                            "in": {"image_target": "IMAGE", "image_ref": "IMAGE",
+                                   "strength": "FLOAT"},
+                            "req": ["image_target", "image_ref", "method", "strength"]},
+             "Size": {"out": ["INT", "INT"], "in": {"image": "IMAGE"}, "req": ["image"]},
+             "Math": {"out": ["FLOAT"], "in": {}, "req": ["expression", "values"]},
+             "Preview": {"out": [], "in": {"images": "IMAGE"}, "req": ["images"]}}
+
+    def _wf(self):
+        return {
+            "126": {"class_type": "Loader", "inputs": {"image": "ref.png"}},
+            "82":  {"class_type": "Decode", "inputs": {"samples": "x"}},
+            "140": {"class_type": "Size", "inputs": {"image": ["126", 0]}},
+            "141": {"class_type": "Math", "inputs": {"expression": "a", "values.a": ["140", 0]}},
+            "123": {"class_type": "ColorMatch",
+                    "inputs": {"method": "mkl", "strength": ["141", 0],
+                               "image_target": ["82", 0], "image_ref": ["126", 0]}},
+            "10":  {"class_type": "Preview", "inputs": {"images": ["123", 0]}},
+        }
+
+    def test_listed_node_is_bypassed_not_pruned(self):
+        wf = self._wf()
+        m = {"node": "126", "field": "image", "on_empty": "disable",
+             "on_empty_bypass": ["123", "140", "141"]}
+        keep = adapters.slot_empty_bypass(m)
+        removed = adapters._prune_branch(wf, "126", self.TYPES, keep=keep)
+        self.assertEqual(removed, ["126"])                     # the cascade stops at listed nodes
+        self.assertNotIn("image_ref", wf["123"]["inputs"])    # …which still lose the dead link
+        applied = adapters._apply_bypass(wf, keep, self.TYPES)
+        self.assertEqual(sorted(applied), ["123", "140", "141"])
+        self.assertIn("10", wf)                                # the output node survives
+        self.assertEqual(wf["10"]["inputs"]["images"], ["82", 0])   # rewired past the match
+
+    def test_without_the_listing_the_output_dies(self):
+        """The cascade itself is unchanged: an unlisted required consumer still dies."""
+        wf = self._wf()
+        removed = adapters._prune_branch(wf, "126", self.TYPES)
+        self.assertIn("10", removed)
+
+
 class NodeTypeEntry(unittest.TestCase):
 
     def test_required_field_names_are_captured(self):

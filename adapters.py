@@ -2223,8 +2223,10 @@ def slot_empty_bypass(m: dict) -> list:
     companion to `on_empty: disable`. Pruning the loader only kills what REQUIRES the
     image; a node in the main path that merely passes something through (an apply/switch
     node whose image socket is optional) survives the cascade and would still run on
-    nothing. Listing it here removes it ComfyUI mode-4 style instead: its consumers are
-    rewired to its same-typed input, so the main path stays connected.
+    nothing, and one whose image socket is REQUIRED (a colour match against the
+    reference) would take the whole path behind it down. Listing it here removes it
+    ComfyUI mode-4 style instead — the cascade stops at it (`_prune_branch(keep=)`) and
+    its consumers are rewired to its same-typed input, so the main path stays connected.
 
     Bypass, not prune, on purpose — pruning such a node would cut the path behind it.
     The ids join the backend's own `bypass` list, so ONE `_apply_bypass` pass handles
@@ -2239,7 +2241,7 @@ def slot_empty_bypass(m: dict) -> list:
     return list(dict.fromkeys(s for s in (str(x).strip() for x in ids) if s))
 
 
-def _prune_branch(wf: dict, nid: str, node_types: dict) -> list:
+def _prune_branch(wf: dict, nid: str, node_types: dict, keep=()) -> list:
     """Deactivate a node AND the dead branch it leaves behind. Removes `nid`, drops every
     input link pointing at it (`[nid, slot]`), and CASCADES onto any consumer that thereby
     lost a REQUIRED input — ComfyUI aborts the whole prompt on a missing required input,
@@ -2254,7 +2256,15 @@ def _prune_branch(wf: dict, nid: str, node_types: dict) -> list:
 
     `node_types` is the /object_info-derived map (`req` per class). A class missing from
     it stops the cascade there — the old single-node behaviour, never a guess about what
-    a node needs. Returns the ids removed, in removal order."""
+    a node needs. Returns the ids removed, in removal order.
+
+    `keep` = the slot's `on_empty_bypass` ids: such a node loses its dead link like any
+    other consumer but is never cascaded into, even over a REQUIRED socket — it is about
+    to be BYPASSED, which rewires its consumers past it. Pruning it instead took the path
+    behind it along (measured 2026-09-24, Qwen2.1: ColorMatchV2's required `image_ref`
+    pulled the only PreviewImage with it → "Prompt has no outputs" on every text-only
+    request)."""
+    keep = {str(k) for k in keep}
     removed: list = []
     queue = [str(nid)]
     while queue:
@@ -2278,7 +2288,7 @@ def _prune_branch(wf: dict, nid: str, node_types: dict) -> list:
                                f"{lost} to a disabled node, but /object_info for that "
                                "class is unavailable — not cascading")
                 continue
-            if any(fld in req for fld in lost):
+            if cid not in keep and any(fld in req for fld in lost):
                 queue.append(cid)
     return removed
 
@@ -3218,12 +3228,14 @@ class ComfyUIAdapter(BackendAdapter):
                         continue              # no 8×8 fallback (e.g. inpaint image/mask) →
                                               # keep the workflow's own value / error if empty
                     if mode == "disable":     # drop the loader AND whatever cannot run
-                        gone = _prune_branch(wf, nid, node_types)   # without it (dead branch)
+                        # without it (dead branch) — except the slot's opt-in extras,
+                        # which are bypassed (not pruned), so a node in the main path is
+                        # skipped without cutting the path behind it
+                        extras = slot_empty_bypass(m)
+                        gone = _prune_branch(wf, nid, node_types, keep=extras)
                         if gone:
                             pruned[p] = gone
-                        # …plus the slot's opt-in extras, bypassed (not pruned) so a node
-                        # in the main path is skipped without cutting the path behind it
-                        extra_bypass.extend(slot_empty_bypass(m))
+                        extra_bypass.extend(extras)
                         applied.append(p)
                         continue
                     name = await self._upload_placeholder(c)
