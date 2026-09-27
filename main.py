@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import calendar
+import copy
 import fnmatch
 import hashlib
 import hmac
@@ -5782,6 +5783,20 @@ def cancel_drain(bid: str) -> bool:
     return True
 
 
+def _config_backend_entry(b: dict) -> dict:
+    """A config-defined backend as the store copy `set_backend_enabled` writes. The
+    store entry replaces the config entry WHOLESALE (rebuild_backends), so it must carry
+    EVERY configured key — an allowlist silently dropped `host`, the ComfyUI output/input
+    dirs, `max_wait`, `auto_restart`, the model filters, … on the first toggle, and the
+    Thunder lifecycle toggles on every start and stop. Excluded: `enabled` (set by the
+    caller) and `_`-prefixed runtime keys. The one key rebuild_backends derives onto the
+    live dict is `paid`, and it is kept: for a cloud type it is forced True on every
+    rebuild anyway, for the rest it is `bool(paid)` — exactly what the config meant.
+    `api_key` stays plaintext here; store.upsert_backend encrypts it like any store entry."""
+    return {k: copy.deepcopy(v) for k, v in b.items()
+            if k != "enabled" and not str(k).startswith("_")}
+
+
 def set_backend_enabled(bid: str, on: bool) -> bool:
     """Persist a backend's `enabled` flag (store) and rebuild. Backs the drain-finalize
     and the UI take-offline / bring-online actions. False if the backend is unknown."""
@@ -5789,9 +5804,7 @@ def set_backend_enabled(bid: str, on: bool) -> bool:
     if b is None:
         return False
     entry = dict(store.get_backend(b["name"], b.get("type", "openai")) or
-                 {k: b[k] for k in ("name", "type", "url", "priority", "max_concurrent",
-                                    "api_key", "chat_only", "serverless_only", "local",
-                                    "paid", "thunder") if k in b})
+                 _config_backend_entry(b))
     entry.update({"name": b["name"], "type": b.get("type", "openai"), "enabled": bool(on)})
     store.upsert_backend(entry)
     logger.info(f"[{b['name']}] {'enabled' if on else 'disabled'} via console")
@@ -5820,6 +5833,7 @@ thunder_controllers: dict = {}              # name → thunderctl.Controller
 # a retired controller and the shutdown can cancel them; also held by _bg.
 _thunder_tasks: dict = {}
 _thunder_booted = False                     # lifespan ran _thunder_boot (new ones start at once)
+_thunder_warned: set = set()                # names warned "config removed while instance runs"
 
 
 def _is_thunder(b: dict) -> bool:
@@ -5839,6 +5853,11 @@ def _thunder_load_state(name: str) -> Optional[dict]:
 
 
 def _thunder_save_state(name: str, d: dict) -> None:
+    """Read-modify-write of the ONE shared setting. Safe only because neither this
+    function nor thunderctl's `_persist` awaits between the read and the write — every
+    controller saves on the event loop thread, one after the other. Moving this to a
+    worker thread (asyncio.to_thread) would open a lost-update race: two controllers
+    reading the same dict, the later write erasing the other's instance record."""
     cur = store.get_setting(_THUNDER_STATE_KEY)
     if cur is None:
         cur = {}
@@ -5885,21 +5904,21 @@ def _thunder_deps() -> "thunderctl.Deps":
         default_nodes=lambda: (ops / "thunder-nodes.default.txt").read_text("utf-8"))
 
 
-def _thunder_task_done(name: str, what: str):
+def _thunder_task_done(name: str, what: str, answered: Optional[set] = None):
     def done(t: asyncio.Task) -> None:
         if t.cancelled():
             return
         e = t.exception()
-        if e is not None:
+        if e is not None and not (answered and t in answered):
             # a refusal that came after the first await (start's unreconciled check),
             # or a bug — either way the console's action already answered
             logger.warning(f"[thunder {name}] {what}: {type(e).__name__}: {e}")
     return done
 
 
-def _thunder_spawn(name: str, what: str, coro) -> asyncio.Task:
+def _thunder_spawn(name: str, what: str, coro, answered: Optional[set] = None) -> asyncio.Task:
     t = _bg(coro)
-    t.add_done_callback(_thunder_task_done(name, what))
+    t.add_done_callback(_thunder_task_done(name, what, answered))
     held = [x for x in _thunder_tasks.get(name, []) if not x.done()]
     held.append(t)
     _thunder_tasks[name] = held
@@ -5929,6 +5948,7 @@ def sync_thunder_controllers() -> None:
     or backend is gone is retired only when off and idle."""
     want = {b["name"]: b for b in backends if _is_thunder(b)}
     for name, b in want.items():
+        _thunder_warned.discard(name)       # block is back: warn again if it goes
         c = thunder_controllers.get(name)
         if c is None:
             c = thunder_controllers[name] = thunderctl.Controller(b, _thunder_deps())
@@ -5938,9 +5958,11 @@ def sync_thunder_controllers() -> None:
             c.backend = b
     for name in [n for n in thunder_controllers if n not in want]:
         c = thunder_controllers[name]
-        if c.state.phase == "off" and not getattr(c, "_op", None):
+        if c.state.phase == "off" and c.op is None:
+            _thunder_warned.discard(name)
             _thunder_retire(name)
-        else:
+        elif name not in _thunder_warned:   # once per controller, not per rebuild
+            _thunder_warned.add(name)
             logger.warning(f"[thunder {name}] backend config removed while instance runs "
                            f"({c.state.phase}) — controller kept; stop it from the console")
 
@@ -5989,9 +6011,13 @@ async def thunder_action(name: str, action: str) -> str:
     if op is None:
         return f"unknown action {action!r}"
     meth, label = op
-    t = _thunder_spawn(name, label, getattr(c, meth)())
+    answered: set = set()
+    t = _thunder_spawn(name, label, getattr(c, meth)(), answered)
     await asyncio.sleep(0)                  # let the op run up to its first await
     if t.done() and not t.cancelled():
+        # the done-callback runs after this (call_soon order): the refusal is the
+        # answer here, so it is not logged a second time as a background failure
+        answered.add(t)
         e = t.exception()
         if isinstance(e, RuntimeError):
             return f"{label} refused: {e}"

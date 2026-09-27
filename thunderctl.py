@@ -533,6 +533,11 @@ class Controller:
     def persist_blocked(self) -> bool:
         return self._persist_blocked
 
+    @property
+    def op(self) -> Optional[str]:
+        """The operation in flight (start/stop/restart/resume), None when idle."""
+        return self._op
+
     def _unblock_persist(self) -> None:
         """Allow saving again. Only for `resume()`, once it has established from
         `/instances/list` which instance (if any) this backend owns — from then on the

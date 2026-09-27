@@ -2282,27 +2282,28 @@ class _FakeCtl:
         self.refuse = refuse or {}
         self.calls = []
         self.gate = asyncio.Event()
+        self.op = None               # DATA, like Controller.op — a method would be truthy
 
-    async def _op(self, name):
+    async def _call(self, name):
         self.calls.append(name)
         if name in self.refuse:
             raise RuntimeError(self.refuse[name])
         await self.gate.wait()
 
     def start(self):
-        return self._op("start")
+        return self._call("start")
 
     def stop(self):
-        return self._op("stop")
+        return self._call("stop")
 
     def restart_comfy(self):
-        return self._op("restart")
+        return self._call("restart")
 
     def resume(self):
-        return self._op("resume")
+        return self._call("resume")
 
     def run_forever(self):
-        return self._op("run_forever")
+        return self._call("run_forever")
 
     def forget_unreconciled(self):
         self.calls.append("forget")
@@ -2387,23 +2388,98 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         finally:
             m.config_backends = saved_cfg
 
-    def test_set_backend_enabled_keeps_thunder_block_of_config_backend(self):
-        # a config-defined Thunder backend: enabling it writes a store copy, which
-        # overrides config WHOLESALE — without its thunder block the controller would
-        # lose its config mid-start
+    def test_set_backend_enabled_keeps_config_backend_whole(self):
+        # a config-defined Thunder backend: the lifecycle enables it on every start and
+        # disables it on every stop, and each toggle writes a store copy that overrides
+        # config WHOLESALE — every configured key must survive, the thunder block included
         m = self.m
         saved_cfg = m.config_backends
-        m.config_backends = [self._tb()]
+        extra = {"host": "thunder-box", "comfy_output_dir": "/home/ubuntu/ComfyUI/output",
+                 "max_wait": 900, "auto_restart": True,
+                 "models_allow": "flux*", "bypass": ["12"]}
+        m.config_backends = [dict(self._tb(), **extra)]
         try:
             m.rebuild_backends()
             c = m.thunder_controllers["tc"]
-            self.assertTrue(m.set_backend_enabled("comfyui:tc", False))
-            self.assertEqual((self.store.get_backend("tc", "comfyui") or {}).get("thunder"),
-                             {"gpu_type": "a6000"})
-            self.assertIs(m.thunder_controllers["tc"], c)
+            for on in (True, False, True, False):          # two start/stop cycles
+                self.assertTrue(m.set_backend_enabled("comfyui:tc", on))
+                stored = self.store.get_backend("tc", "comfyui") or {}
+                live = next(b for b in m.backends if b["name"] == "tc")
+                for k, v in extra.items():
+                    self.assertEqual(stored.get(k), v, k)
+                    self.assertEqual(live.get(k), v, k)
+                self.assertEqual(stored.get("thunder"), {"gpu_type": "a6000"})
+                self.assertEqual(stored.get("api_key"), "tok")   # decrypted on read
+                self.assertIs(stored.get("enabled"), on)
+                self.assertIs(m.thunder_controllers["tc"], c)
+                self.assertIs(c.backend, live)
             self.assertEqual(c.cfg, {"gpu_type": "a6000"})
+            self.assertEqual(m.backend_host(c.backend), "thunder-box")
         finally:
             m.config_backends = saved_cfg
+
+    def test_config_backend_entry_is_the_whole_dict_minus_enabled(self):
+        m = self.m
+        b = {"name": "n", "type": "comfyui", "enabled": False, "_tmp": 1,
+             "thunder": {"nodes": ["a"]}, "paid": False, "stuck_after_s": 120}
+        e = m._config_backend_entry(b)
+        self.assertEqual(e, {"name": "n", "type": "comfyui", "thunder": {"nodes": ["a"]},
+                             "paid": False, "stuck_after_s": 120})
+        e["thunder"]["nodes"].append("b")                   # a copy, not the live block
+        self.assertEqual(b["thunder"]["nodes"], ["a"])
+
+    def test_removed_block_warns_once_per_controller(self):
+        m = self.m
+        m.backends = [self._tb()]
+        m.sync_thunder_controllers()
+        c = m.thunder_controllers["tc"]
+        c.state.phase = "ready"
+        gone = [{"name": "tc", "type": "comfyui", "url": "http://x"}]
+        m.backends = gone
+        with self.assertLogs("main", "WARNING") as cm:
+            m.sync_thunder_controllers()
+            m.sync_thunder_controllers()
+            m.sync_thunder_controllers()
+        self.assertEqual(len([x for x in cm.output if "config removed" in x]), 1)
+        # the block returns and goes again → warned again
+        m.backends = [self._tb()]
+        m.sync_thunder_controllers()
+        m.backends = gone
+        with self.assertLogs("main", "WARNING") as cm:
+            m.sync_thunder_controllers()
+        self.assertEqual(len([x for x in cm.output if "config removed" in x]), 1)
+
+    def test_off_controller_with_op_in_flight_is_not_retired(self):
+        # a start is `off` until the create — retiring it then would orphan the instance
+        m = self.m
+        fc = _FakeCtl("tc")
+        fc.op = "starting"
+        m.thunder_controllers = {"tc": fc}
+        m.backends = []
+        with self.assertLogs("main", "WARNING"):
+            m.sync_thunder_controllers()
+        self.assertIs(m.thunder_controllers.get("tc"), fc)
+        fc.op = None
+        m.sync_thunder_controllers()
+        self.assertEqual(m.thunder_controllers, {})
+
+    async def test_real_controller_refusal_comes_back_as_text(self):
+        # pins the contract thunder_action relies on: Controller.stop() refuses BEFORE
+        # its first await, so the refusal is the answer — not a background log line
+        m = self.m
+        m.backends = [self._tb()]
+        m.sync_thunder_controllers()
+        c = m.thunder_controllers["tc"]
+        self.assertIsInstance(c, thunderctl.Controller)
+        self.assertEqual(c.state.phase, "off")
+        with self.assertNoLogs("main", "WARNING"):          # answered, not logged twice
+            self.assertEqual(await m.thunder_action("tc", "stop"),
+                             "stop refused: not running")
+            self.assertEqual(await m.thunder_action("tc", "restart"),
+                             "ComfyUI restart refused: no running instance to restart "
+                             "ComfyUI on (off)")
+            await asyncio.sleep(0)                          # let the done-callbacks run
+        self.assertIsNone(c.op)
 
     def test_deps_wiring(self):
         m = self.m
