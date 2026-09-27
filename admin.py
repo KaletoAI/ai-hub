@@ -181,6 +181,11 @@ _voice_dir_ok: Callable[[str], bool] = lambda d: True
 _apply_hosts: Callable[[], None] = lambda: None           # refresh main's hosts_meta cache
 # ComfyUI backend name → sorted installed LoRA filenames (discovery, verbatim).
 _backend_loras: Callable[[], dict] = lambda: {}
+# Thunder Compute backends (main.thunder_controllers): names, a controller's view()
+# (None = no such controller) and the async console action (name, action) → message.
+_thunder_names: Callable[[], list] = lambda: []
+_thunder_view: Callable[[str], Optional[dict]] = lambda name: None
+_thunder_action: Callable = None
 
 
 def bind(**overrides) -> None:

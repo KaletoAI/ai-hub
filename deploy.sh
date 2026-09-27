@@ -27,6 +27,8 @@ RSYNC_EXCLUDES=(
     --exclude='jobs.db'      --exclude='jobs.db-wal'   --exclude='jobs.db-shm'
     --exclude='faults.db'    --exclude='faults.db-wal' --exclude='faults.db-shm'
     --exclude='jobs/'        --exclude='calls/'    --exclude='voiceref/'
+    --exclude='thunder.key'  --exclude='thunder.key.pub'  --exclude='thunder-known_hosts/'
+    --exclude='modelsrc.key' --exclude='modelsrc.key.pub' --exclude='modelsrc-known_hosts'
     --exclude='deploy.sh'
 )
 TAR_EXCLUDES=(
@@ -42,6 +44,8 @@ TAR_EXCLUDES=(
     --exclude='./jobs.db'     --exclude='./jobs.db-wal'  --exclude='./jobs.db-shm'
     --exclude='./faults.db'   --exclude='./faults.db-wal' --exclude='./faults.db-shm'
     --exclude='./jobs'        --exclude='./calls'   --exclude='./voiceref'
+    --exclude='./thunder.key'  --exclude='./thunder.key.pub'  --exclude='./thunder-known_hosts'
+    --exclude='./modelsrc.key' --exclude='./modelsrc.key.pub' --exclude='./modelsrc-known_hosts'
     --exclude='./deploy.sh'
 )
 

@@ -2244,5 +2244,326 @@ class BootstrapParse(unittest.TestCase):
         self.assertEqual(r["unknown"], {"models/b c.bin": 7})
 
 
+
+# ── main wiring (Task 7) ──────────────────────────────────────────────────────
+
+_MAIN = None
+
+
+def _main():
+    """Import main lazily (only MainWiring needs it) from a temp cwd with an empty
+    config — the same trick test_faults/test_health_access use."""
+    global _MAIN
+    if _MAIN is None:
+        import sys
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        prev = os.getcwd()
+        tmp = tempfile.mkdtemp(prefix="thunder-main-")
+        _TMPDIRS.append(tmp)
+        with open(os.path.join(tmp, "config.yaml"), "w") as f:
+            f.write('api_key: ""\nbackends: []\n')
+        os.chdir(tmp)
+        sys.path.insert(0, here)
+        try:
+            import main as m
+        finally:
+            os.chdir(prev)
+        _MAIN = m
+    return _MAIN
+
+
+class _FakeCtl:
+    """Stands in for a Controller in the wiring tests: records calls, raises what the
+    test scripts (a refusal is a RuntimeError before the first await)."""
+    def __init__(self, name, phase="off", uuid="", refuse=None):
+        self.name = name
+        self.backend = {"name": name, "type": "comfyui", "thunder": {"gpu_type": "a6000"}}
+        self.state = thunderctl.State(phase=phase, uuid=uuid)
+        self.refuse = refuse or {}
+        self.calls = []
+        self.gate = asyncio.Event()
+
+    async def _op(self, name):
+        self.calls.append(name)
+        if name in self.refuse:
+            raise RuntimeError(self.refuse[name])
+        await self.gate.wait()
+
+    def start(self):
+        return self._op("start")
+
+    def stop(self):
+        return self._op("stop")
+
+    def restart_comfy(self):
+        return self._op("restart")
+
+    def resume(self):
+        return self._op("resume")
+
+    def run_forever(self):
+        return self._op("run_forever")
+
+    def forget_unreconciled(self):
+        self.calls.append("forget")
+
+    async def aclose(self):
+        self.calls.append("aclose")
+
+    def view(self):
+        return {"phase": self.state.phase, "uptime_s": 42, "cost_per_h": 0.57,
+                "log": ["x"]}
+
+
+class MainWiring(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        m = self.m = _main()
+        import store
+        self.store = store
+        self._saved = {n: getattr(m, n) for n in (
+            "backends", "thunder_controllers", "_thunder_tasks", "_thunder_booted",
+            "backend_inflight", "_draining", "jobs_cfg")}
+        self._saved_store = (store._DB_PATH, store._active)
+        self.tmp = tempfile.mkdtemp(prefix="thunder-wiring-")
+        _TMPDIRS.append(self.tmp)
+        store.init(os.path.join(self.tmp, "store.db"))
+        m.thunder_controllers = {}
+        m._thunder_tasks = {}
+        m._thunder_booted = False
+        m.jobs_cfg = dict(m.jobs_cfg, store_path=os.path.join(self.tmp, "store.db"))
+
+    def tearDown(self):
+        for n, v in self._saved.items():
+            setattr(self.m, n, v)
+        self.store._DB_PATH, self.store._active = self._saved_store
+
+    @staticmethod
+    def _tb(name="tc", **thunder_kw):
+        return {"name": name, "type": "comfyui", "url": "http://127.0.0.1:18188",
+                "api_key": "tok", "thunder": {"gpu_type": "a6000", **thunder_kw}}
+
+    def test_controllers_follow_backend_list(self):
+        m = self.m
+        plain = {"name": "k12", "type": "comfyui", "url": "http://10.0.0.1:8188"}
+        m.backends = [plain, self._tb()]
+        m.sync_thunder_controllers()
+        self.assertEqual(list(m.thunder_controllers), ["tc"])
+        c = m.thunder_controllers["tc"]
+        self.assertIsInstance(c, thunderctl.Controller)
+        # a rebuild hands NEW dicts: the instance stays, its backend is the current one
+        fresh = self._tb(gpu_type="h100")
+        m.backends = [dict(plain), fresh]
+        m.sync_thunder_controllers()
+        self.assertIs(m.thunder_controllers["tc"], c)
+        self.assertIs(c.backend, fresh)
+        self.assertEqual(c.cfg["gpu_type"], "h100")
+        # block removed while an instance runs → kept, warned
+        c.state.phase = "ready"
+        m.backends = [plain, {"name": "tc", "type": "comfyui", "url": "http://x"}]
+        with self.assertLogs("main", "WARNING") as cm:
+            m.sync_thunder_controllers()
+        self.assertIs(m.thunder_controllers.get("tc"), c)
+        self.assertIn("backend config removed while instance runs", "\n".join(cm.output))
+        # … and once it is off, the next sync removes it
+        c.state.phase = "off"
+        m.sync_thunder_controllers()
+        self.assertEqual(m.thunder_controllers, {})
+        # a thunder block on a non-ComfyUI backend is no Thunder backend
+        m.backends = [{"name": "llm", "type": "openai", "url": "http://x", "thunder": {"a": 1}}]
+        m.sync_thunder_controllers()
+        self.assertEqual(m.thunder_controllers, {})
+
+    def test_rebuild_backends_syncs_controllers(self):
+        m = self.m
+        self.store.upsert_backend(self._tb())
+        saved_cfg = m.config_backends
+        m.config_backends = []
+        try:
+            m.rebuild_backends()
+            c = m.thunder_controllers["tc"]
+            m.rebuild_backends()
+            self.assertIs(m.thunder_controllers["tc"], c)
+            self.assertIs(c.backend, next(b for b in m.backends if b["name"] == "tc"))
+        finally:
+            m.config_backends = saved_cfg
+
+    def test_set_backend_enabled_keeps_thunder_block_of_config_backend(self):
+        # a config-defined Thunder backend: enabling it writes a store copy, which
+        # overrides config WHOLESALE — without its thunder block the controller would
+        # lose its config mid-start
+        m = self.m
+        saved_cfg = m.config_backends
+        m.config_backends = [self._tb()]
+        try:
+            m.rebuild_backends()
+            c = m.thunder_controllers["tc"]
+            self.assertTrue(m.set_backend_enabled("comfyui:tc", False))
+            self.assertEqual((self.store.get_backend("tc", "comfyui") or {}).get("thunder"),
+                             {"gpu_type": "a6000"})
+            self.assertIs(m.thunder_controllers["tc"], c)
+            self.assertEqual(c.cfg, {"gpu_type": "a6000"})
+        finally:
+            m.config_backends = saved_cfg
+
+    def test_deps_wiring(self):
+        m = self.m
+        m.backends = [self._tb(), self._tb("tb")]
+        m.sync_thunder_controllers()
+        deps = m.thunder_controllers["tc"].deps
+        self.assertEqual(deps.datadir, self.tmp)
+        self.assertIs(deps.set_enabled, m.set_backend_enabled)
+        self.assertIs(deps.begin_drain, m.begin_drain)
+        self.assertIs(deps.note_fault, m._note_fault)
+        m.backend_inflight = {"comfyui:tc": 2}
+        m._draining = {"comfyui:tc"}
+        self.assertEqual(deps.inflight("comfyui:tc"), 2)
+        self.assertEqual(deps.inflight("comfyui:tb"), 0)
+        self.assertTrue(deps.is_draining("comfyui:tc"))
+        self.assertFalse(deps.is_draining("comfyui:tb"))
+        # persistence: one settings key, one entry per backend name, others untouched
+        deps.save_state("tc", {"phase": "ready", "uuid": "u1"})
+        deps.save_state("tb", {"phase": "off"})
+        self.assertEqual(self.store.get_setting("thunder_state"),
+                         {"tc": {"phase": "ready", "uuid": "u1"}, "tb": {"phase": "off"}})
+        self.assertEqual(deps.load_state("tc"), {"phase": "ready", "uuid": "u1"})
+        self.assertIsNone(deps.load_state("nope"))
+        # every controller's uuid is known (orphans = instances nobody owns)
+        m.thunder_controllers["tc"].state.uuid = "u1"
+        m.thunder_controllers["tb"].state.uuid = "u2"
+        self.assertEqual(deps.known_uuids(), {"u1", "u2"})
+        # the repo files
+        self.assertTrue(deps.bootstrap_script().startswith(b"#!"))
+        self.assertIsInstance(deps.default_nodes(), str)
+        self.assertTrue(deps.default_nodes().strip())
+        cl = deps.client_factory()
+        self.assertIsNot(cl, m.http_client)
+        self.assertIsNot(cl, deps.client_factory())
+
+    def test_unreadable_setting_is_never_overwritten(self):
+        m = self.m
+        self.store.set_settings({"thunder_state": ["garbage"]})
+        m.backends = [self._tb()]
+        m.sync_thunder_controllers()
+        c = m.thunder_controllers["tc"]
+        self.assertTrue(c.persist_blocked)          # load failed → no start, no save
+        with self.assertRaises(ValueError):
+            c.deps.save_state("tc", {"phase": "off"})
+        self.assertEqual(self.store.get_setting("thunder_state"), ["garbage"])
+
+    async def test_probe_comfy(self):
+        m = self.m
+        seen = []
+
+        def handler(req):
+            seen.append((str(req.url), req.extensions.get("timeout")))
+            return httpx.Response(200 if "good" in str(req.url) else 502)
+        saved = m.http_client
+        m.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            deps = m._thunder_deps()
+            self.assertTrue(await deps.probe_comfy("http://good:1"))
+            self.assertFalse(await deps.probe_comfy("http://bad:1"))
+        finally:
+            await m.http_client.aclose()
+            m.http_client = saved
+        self.assertEqual(seen[0][0], "http://good:1/object_info")
+        self.assertEqual(seen[0][1]["read"], 10)
+
+    async def test_probe_comfy_transport_error_is_false(self):
+        m = self.m
+
+        def handler(req):
+            raise httpx.ConnectError("refused")
+        saved = m.http_client
+        m.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            self.assertFalse(await m._thunder_deps().probe_comfy("http://x:1"))
+        finally:
+            await m.http_client.aclose()
+            m.http_client = saved
+
+    async def test_actions_run_in_background_and_refusals_are_text(self):
+        m = self.m
+        c = _FakeCtl("tc", refuse={"stop": "not running"})
+        m.thunder_controllers = {"tc": c}
+        msg = await m.thunder_action("tc", "start")
+        self.assertIn("start", msg)
+        self.assertEqual(c.calls, ["start"])
+        # held (not GC-able) and still running: the call did not wait for the op
+        held = [t for t in m._bg_refs if not t.done()]
+        self.assertTrue(held)
+        msg = await m.thunder_action("tc", "stop")
+        self.assertIn("not running", msg)
+        await m.thunder_action("tc", "restart")
+        self.assertEqual(c.calls[-1], "restart")
+        c.state.unreconciled_uuids = ["u9"]
+        await m.thunder_action("tc", "forget_unreconciled")
+        self.assertEqual(c.calls[-1], "forget")
+        self.assertIn("unknown", await m.thunder_action("nope", "start"))
+        self.assertIn("unknown", await m.thunder_action("tc", "explode"))
+        c.gate.set()
+        await asyncio.sleep(0)
+
+    async def test_thunder_view_and_names(self):
+        m = self.m
+        c = _FakeCtl("tc", phase="ready")
+        m.thunder_controllers = {"tc": c}
+        self.assertEqual(m.thunder_view("tc")["phase"], "ready")
+        self.assertIsNone(m.thunder_view("nope"))
+        import admin
+        self.assertEqual(admin._thunder_names(), ["tc"])
+        self.assertIs(admin._thunder_view, m.thunder_view)
+        self.assertIs(admin._thunder_action, m.thunder_action)
+
+    async def test_boot_resumes_and_runs_each_controller_and_shutdown_closes(self):
+        m = self.m
+        a, b = _FakeCtl("a", phase="ready"), _FakeCtl("b")
+        m.thunder_controllers = {"a": a, "b": b}
+        m._thunder_boot()
+        await asyncio.sleep(0)
+        self.assertEqual(sorted(a.calls), ["resume", "run_forever"])
+        self.assertEqual(sorted(b.calls), ["resume", "run_forever"])
+        # a controller that appears later (backend added in the console) is started too
+        m.backends = [self._tb("late")]
+        m.sync_thunder_controllers()
+        late = m.thunder_controllers["late"]
+        self.assertEqual(len(m._thunder_tasks["late"]), 2)
+        for t in m._thunder_tasks["late"]:
+            t.cancel()
+        await m._thunder_shutdown()
+        self.assertIn("aclose", a.calls)
+        self.assertIn("aclose", b.calls)
+        # the background loops are gone, the instance was never touched
+        for ts in m._thunder_tasks.values():
+            self.assertTrue(all(t.done() for t in ts))
+        self.assertNotIn("stop", a.calls)
+        self.assertEqual(late.state.phase, "off")
+
+    async def test_health_carries_thunder_block_in_full_view(self):
+        m = self.m
+        tb = self._tb()
+        m.backends = [tb, {"name": "k12", "type": "comfyui", "url": "http://10.0.0.1:8188"}]
+        m.thunder_controllers = {"tc": _FakeCtl("tc", phase="ready")}
+        h = await m.health(verbose=False)
+        self.assertEqual(h["backends"]["comfyui:tc"]["thunder"],
+                         {"phase": "ready", "uptime_s": 42, "cost_per_h": 0.57})
+        self.assertNotIn("thunder", h["backends"]["comfyui:k12"])
+
+    def test_deploy_and_gitignore_exclude_keys(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        names = ["thunder.key", "thunder.key.pub", "thunder-known_hosts",
+                 "modelsrc.key", "modelsrc.key.pub", "modelsrc-known_hosts"]
+        with open(os.path.join(root, ".gitignore")) as f:
+            gi = {ln.strip().rstrip("/") for ln in f}
+        with open(os.path.join(root, "deploy.sh")) as f:
+            sh = f.read()
+        rs = sh.split("RSYNC_EXCLUDES=(", 1)[1].split("\n)", 1)[0]
+        tr = sh.split("TAR_EXCLUDES=(", 1)[1].split("\n)", 1)[0]
+        for n in names:
+            self.assertIn(n, gi, ".gitignore")
+            self.assertRegex(rs, r"--exclude='%s/?'" % n.replace(".", r"\."), "rsync")
+            self.assertRegex(tr, r"--exclude='\./%s/?'" % n.replace(".", r"\."), "tar")
+
+
 if __name__ == "__main__":
     unittest.main()

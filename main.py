@@ -32,9 +32,11 @@ import jobs
 import reasoning
 import scheduler
 import netscan
+import os
 import socket
 import stats
 import store
+import thunderctl
 from adapters import (AdapterContext, ComfyExecutorStuck, NormalizedRequest, image_params,
                       is_image_field, lora_counterpart, lora_groups,
                       make_adapter, normalize_delivery, validate_delivery)
@@ -155,6 +157,9 @@ def rebuild_backends() -> None:
         host_backends.setdefault(h, []).append(bid)
     apply_hosts()
     rebuild_route_index()                  # backend set/enabled flags changed
+    # Every rebuild hands out NEW backend dicts; a Thunder controller reads its token and
+    # `thunder` block from the dict it holds, so it must be given the current one.
+    sync_thunder_controllers()
 
 
 def apply_hosts() -> None:
@@ -990,6 +995,10 @@ async def lifespan(app: FastAPI):
 
     log_config_summary()
     await asyncio.gather(*[refresh_backend(b, http_client) for b in enabled_backends()])
+    # Thunder controllers exist since rebuild_backends(); now each reconciles its persisted
+    # state with Thunder's instance list (an instance that billed through the restart
+    # gets its tunnel back) and starts its background loop.
+    _thunder_boot()
     health_task = asyncio.create_task(health_loop())
     probe_task = asyncio.create_task(fast_probe_loop())
     watch_task = asyncio.create_task(watch_config_loop())
@@ -1027,6 +1036,7 @@ async def lifespan(app: FastAPI):
         jobs_prune_task.cancel()
     if prune_task is not None:
         prune_task.cancel()
+    await _thunder_shutdown()          # tunnels + Thunder clients; the instances run on
     await http_client.aclose()         # drain the shared connection pool last
 
 
@@ -5781,7 +5791,7 @@ def set_backend_enabled(bid: str, on: bool) -> bool:
     entry = dict(store.get_backend(b["name"], b.get("type", "openai")) or
                  {k: b[k] for k in ("name", "type", "url", "priority", "max_concurrent",
                                     "api_key", "chat_only", "serverless_only", "local",
-                                    "paid") if k in b})
+                                    "paid", "thunder") if k in b})
     entry.update({"name": b["name"], "type": b.get("type", "openai"), "enabled": bool(on)})
     store.upsert_backend(entry)
     logger.info(f"[{b['name']}] {'enabled' if on else 'disabled'} via console")
@@ -5794,6 +5804,215 @@ def _finalize_drain(bid: str) -> None:
     _draining.discard(bid)
     set_backend_enabled(bid, False)
     logger.info(f"backends changed → {len(backends)} effective")
+
+
+# ── Thunder Compute (thunderctl.py) ───────────────────────────────────────────
+# One Controller per `comfyui` backend carrying a `thunder` block, keyed by backend
+# name. The controller owns a billing cloud instance, so it outlives its config: a
+# block removed (or a backend deleted) while the instance runs keeps the controller —
+# dropping it would leave the instance billing with nobody to snapshot or delete it.
+
+_HERE = Path(__file__).resolve().parent
+_THUNDER_STATE_KEY = "thunder_state"        # store setting: backend name → State dict
+_THUNDER_PROBE_S = 10
+thunder_controllers: dict = {}              # name → thunderctl.Controller
+# name → the controller's background tasks (resume, run_forever, console actions), so
+# a retired controller and the shutdown can cancel them; also held by _bg.
+_thunder_tasks: dict = {}
+_thunder_booted = False                     # lifespan ran _thunder_boot (new ones start at once)
+
+
+def _is_thunder(b: dict) -> bool:
+    return b.get("type") == "comfyui" and bool(b.get("thunder"))
+
+
+def _thunder_load_state(name: str) -> Optional[dict]:
+    d = store.get_setting(_THUNDER_STATE_KEY)
+    if d is None:
+        return None
+    if not isinstance(d, dict):
+        # raised, not read as {}: the controller then refuses to start and never saves
+        # over a record that may name a running instance (thunderctl._load_failed)
+        raise ValueError(f"store setting {_THUNDER_STATE_KEY} is a {type(d).__name__}, "
+                         "not a dict")
+    return d.get(name)
+
+
+def _thunder_save_state(name: str, d: dict) -> None:
+    cur = store.get_setting(_THUNDER_STATE_KEY)
+    if cur is None:
+        cur = {}
+    if not isinstance(cur, dict):
+        # writing {name: d} would erase every other backend's instance record
+        raise ValueError(f"store setting {_THUNDER_STATE_KEY} is unreadable — not saved")
+    cur[name] = d
+    store.set_settings({_THUNDER_STATE_KEY: cur})
+
+
+def _thunder_known_uuids() -> set:
+    """Instances some controller owns — `orphans()` lists everything else."""
+    return {c.state.uuid for c in thunder_controllers.values() if c.state.uuid}
+
+
+async def _thunder_probe(url: str) -> bool:
+    """Does ComfyUI answer through the tunnel? Streamed: /object_info is megabytes and
+    the status is all the controller asks — it probes every few seconds while starting."""
+    try:
+        async with http_client.stream("GET", url.rstrip("/") + "/object_info",
+                                      timeout=_THUNDER_PROBE_S) as r:
+            return r.status_code == 200
+    except httpx.HTTPError:
+        return False
+
+
+def _thunder_deps() -> "thunderctl.Deps":
+    ops = _HERE / "ops"
+    return thunderctl.Deps(
+        # own client per controller (closed by Controller.aclose): Thunder calls must not
+        # compete with proxied traffic for the shared pool, nor outlive a closed one
+        client_factory=lambda: httpx.AsyncClient(),
+        load_state=_thunder_load_state, save_state=_thunder_save_state,
+        set_enabled=set_backend_enabled, begin_drain=begin_drain,
+        inflight=lambda bid: backend_inflight.get(bid, 0),
+        is_draining=lambda bid: bid in _draining,
+        note_fault=_note_fault,
+        # thunder.key / thunder-known_hosts/ sit next to store.db (and secret.key)
+        datadir=os.path.dirname(os.path.abspath(jobs_cfg.get("store_path", "store.db"))),
+        probe_comfy=_thunder_probe,
+        bootstrap_script=lambda: (ops / "thunder-bootstrap.sh").read_bytes(),
+        log=logger.info,
+        known_uuids=_thunder_known_uuids,
+        default_nodes=lambda: (ops / "thunder-nodes.default.txt").read_text("utf-8"))
+
+
+def _thunder_task_done(name: str, what: str):
+    def done(t: asyncio.Task) -> None:
+        if t.cancelled():
+            return
+        e = t.exception()
+        if e is not None:
+            # a refusal that came after the first await (start's unreconciled check),
+            # or a bug — either way the console's action already answered
+            logger.warning(f"[thunder {name}] {what}: {type(e).__name__}: {e}")
+    return done
+
+
+def _thunder_spawn(name: str, what: str, coro) -> asyncio.Task:
+    t = _bg(coro)
+    t.add_done_callback(_thunder_task_done(name, what))
+    held = [x for x in _thunder_tasks.get(name, []) if not x.done()]
+    held.append(t)
+    _thunder_tasks[name] = held
+    return t
+
+
+def _thunder_run(name: str, c) -> None:
+    _thunder_spawn(name, "resume", c.resume())
+    _thunder_spawn(name, "background loop", c.run_forever())
+
+
+def _thunder_retire(name: str) -> None:
+    c = thunder_controllers.pop(name)
+    for t in _thunder_tasks.pop(name, []):
+        t.cancel()
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return                              # no loop → nothing was ever opened
+    _bg(c.aclose())
+
+
+def sync_thunder_controllers() -> None:
+    """Match the controllers to the current backend list (rebuild_backends calls it):
+    a new Thunder backend gets a controller (started at once after boot), an existing
+    one keeps its INSTANCE and is handed the current backend dict, and one whose block
+    or backend is gone is retired only when off and idle."""
+    want = {b["name"]: b for b in backends if _is_thunder(b)}
+    for name, b in want.items():
+        c = thunder_controllers.get(name)
+        if c is None:
+            c = thunder_controllers[name] = thunderctl.Controller(b, _thunder_deps())
+            if _thunder_booted:
+                _thunder_run(name, c)
+        else:
+            c.backend = b
+    for name in [n for n in thunder_controllers if n not in want]:
+        c = thunder_controllers[name]
+        if c.state.phase == "off" and not getattr(c, "_op", None):
+            _thunder_retire(name)
+        else:
+            logger.warning(f"[thunder {name}] backend config removed while instance runs "
+                           f"({c.state.phase}) — controller kept; stop it from the console")
+
+
+def _thunder_boot() -> None:
+    """Lifespan, after the first discovery: resume + background loop per controller."""
+    global _thunder_booted
+    _thunder_booted = True
+    for name, c in list(thunder_controllers.items()):
+        _thunder_run(name, c)
+
+
+async def _thunder_shutdown() -> None:
+    """Lifespan end: stop the background work, then each controller's tunnel and
+    client. The INSTANCES are not touched — they keep running and resume() finds them."""
+    global _thunder_booted
+    _thunder_booted = False
+    tasks = [t for ts in _thunder_tasks.values() for t in ts if not t.done()]
+    for t in tasks:
+        t.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    for name, c in list(thunder_controllers.items()):
+        try:
+            await c.aclose()
+        except Exception as e:
+            logger.warning(f"[thunder {name}] shutdown: {type(e).__name__}: {e}")
+
+
+_THUNDER_OPS = {"start": ("start", "start"), "stop": ("stop", "stop"),
+                "restart": ("restart_comfy", "ComfyUI restart")}
+
+
+async def thunder_action(name: str, action: str) -> str:
+    """Console action on a Thunder backend. start/stop/restart run as held background
+    tasks — a start takes up to hours — and the call answers after the op's first step:
+    a refusal (RuntimeError before its first await: "already …", "not running") comes
+    back as the message, never as an exception into the console."""
+    c = thunder_controllers.get(name)
+    if c is None:
+        return f"unknown Thunder backend {name!r}"
+    if action == "forget_unreconciled":
+        c.forget_unreconciled()
+        return "unreconciled instances forgotten"
+    op = _THUNDER_OPS.get(action)
+    if op is None:
+        return f"unknown action {action!r}"
+    meth, label = op
+    t = _thunder_spawn(name, label, getattr(c, meth)())
+    await asyncio.sleep(0)                  # let the op run up to its first await
+    if t.done() and not t.cancelled():
+        e = t.exception()
+        if isinstance(e, RuntimeError):
+            return f"{label} refused: {e}"
+        if e is not None:
+            return f"{label} failed: {type(e).__name__}: {e}"
+        return f"{label} done"
+    return f"{label} requested"
+
+
+def thunder_view(name: str) -> Optional[dict]:
+    c = thunder_controllers.get(name)
+    return c.view() if c is not None else None
+
+
+def _thunder_info(b: dict) -> dict:
+    """/health (admin view): the Thunder lifecycle of a Thunder backend."""
+    c = thunder_controllers.get(b["name"]) if b.get("type") == "comfyui" else None
+    if c is None:
+        return {}
+    v = c.view()
+    return {"thunder": {k: v.get(k) for k in ("phase", "uptime_s", "cost_per_h")}}
 
 
 def apply_chat_aliases() -> None:
@@ -5990,6 +6209,8 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
            voice_lib_ship=ship_voice_ref, voice_ship_config=voice_ship_config,
            parse_voice_target=parse_voice_target, voice_dir_ok=_voice_dir_ok,
            apply_hosts=apply_hosts,
+           thunder_view=thunder_view, thunder_action=thunder_action,
+           thunder_names=lambda: list(thunder_controllers),
            backend_loras=lambda: {b["name"]: sorted(backend_loras.get(backend_id(b), set()))
                                   for b in backends if b.get("type") == "comfyui"})
 
@@ -6046,6 +6267,7 @@ async def health(verbose: bool = True) -> dict:
                 "faults_24h": {k: (fmap.get(backend_id(b)) or {}).get(k, 0)
                                for k in ("faults", "outages", "downtime_s")},
                 **_comfy_watch_info(b), **_cloud_info(b), **_model_filter_info(b), **_loaded_info(b),
+                **_thunder_info(b),
             }
             for b in backends
         },

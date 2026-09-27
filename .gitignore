@@ -24,6 +24,13 @@ faults.db-shm
 jobs/
 calls/
 voiceref/
+# Thunder Compute: gateway ssh keys + per-instance known_hosts (next to store.db)
+thunder.key
+thunder.key.pub
+thunder-known_hosts/
+modelsrc.key
+modelsrc.key.pub
+modelsrc-known_hosts
 # Sample workflows: ship the curated ones directly; keep raw originals out of git
 sample_comfyui_workflows/org/
 # Agent/tool state and session artefacts
