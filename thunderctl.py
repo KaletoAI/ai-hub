@@ -73,9 +73,21 @@ _COMFY_READY_S = 10 * 60        # first start loads custom nodes (3D packs impor
 _COMFY_PROBE_S = 3
 _STDERR_LOG_LINES = 20          # stderr tail logged for a failed remote step
 
+_CREATED_SKEW_S = 5 * 60        # createdAt may precede our request by clock skew …
+_CREATED_LATE_S = 15 * 60       # … and follow it by Thunder's own queueing
 _COMMIT_RE = re.compile(r"[0-9a-fA-F]{40}")
-# The loop script is flock-guarded, so starting it while it runs is a no-op.
-_START_CMD = "setsid nohup ~/start-comfy.sh >/dev/null 2>&1 < /dev/null &"
+# The loop script is flock-guarded, so starting it while it runs is a no-op. A missing
+# script (a bootstrap that died before writing it) fails in seconds with a named reason
+# instead of a 10-minute probe timeout that says nothing.
+_START_CMD = ("test -x ~/start-comfy.sh || { echo 'start-comfy.sh missing' >&2; exit 3; }; "
+              "setsid nohup ~/start-comfy.sh >/dev/null 2>&1 < /dev/null &")
+# The bootstrap's output also goes to a file ON THE INSTANCE: `sshrun.run` answers a
+# timeout with (124, b"", b"timeout") and loses everything it read, and a dropped ssh
+# loses it too — the log file is where the last GW:PHASE is fetched from then. Wrapped
+# in `bash -o pipefail -c` so the SCRIPT's exit status survives the `| tee` whatever
+# the login shell is; `bash -s` reads the script from ssh's stdin, tee only the pipe.
+_BOOTSTRAP_LOG = "~/gw-bootstrap.log"
+_BOOTSTRAP_TAIL = 200
 # Kill ComfyUI (the loop restarts it 2 s later) and start the loop in case it is not
 # alive (a failed bootstrap, a killed wrapper). The bracket keeps the pattern from
 # matching the remote `bash -c "<this command>"` itself — pkill spares only its own
@@ -262,6 +274,10 @@ class State:
     # for in every snapshot until deleted) and custom_nodes packs it brought
     bootstrap_unknown: dict = field(default_factory=dict)
     bootstrap_template_nodes: list = field(default_factory=list)
+    # what the last create asked for and when — the only way to recognise OUR instance
+    # when create answered without a uuid (Ruling 10), also after a gateway restart
+    created_template: str = ""
+    create_requested_at: float = 0.0
     log: list = field(default_factory=list)         # not persisted
     transfers: dict = field(default_factory=dict)   # not persisted
 
@@ -389,7 +405,8 @@ def bootstrap_verdict(rc: int, rep: dict, err: str) -> str:
     elif rc == 3 and smoke is None:
         why.append("smoke test failed")
     elif rc not in (0, 3):
-        last = next((ln.strip() for ln in reversed((err or "").splitlines()) if ln.strip()), "")
+        last = next((ln.strip() for ln in reversed((err or "").splitlines())
+                     if ln.strip() and not ln.startswith("GW:")), "")
         why.append(f"bootstrap exited rc {rc}{where}" + (f": {last}" if last else ""))
     if not why and not (smoke == "ok" and rep["done"]):
         why.append(f"bootstrap ended without GW:SMOKE ok / GW:DONE{where}")
@@ -425,7 +442,6 @@ class Controller:
         self._snaps: Optional[list[dict]] = None      # last /snapshots/list, for view()
         self._persist_blocked = False
         self._op: Optional[str] = None                 # start/restart in flight
-        self._created_template = ""                    # what the last create asked for
         self._nodes_text = ""                          # node list of the pending bootstrap
         self.state = State()
         try:
@@ -723,7 +739,8 @@ class Controller:
         """Our instance in a FRESH list (Ruling 10): by uuid only. Only when create
         answered without a uuid, the item at our index is accepted — and only if
         nobody else owns its uuid and it carries the template we asked for (Thunder
-        reuses indices); its uuid is then adopted and persisted."""
+        reuses indices) and, where the list carries a readable `createdAt`, was created
+        around our request; its uuid is then adopted and persisted."""
         s = self.state
         if s.uuid:
             return next((it for it in items if it.get("uuid") == s.uuid), None)
@@ -731,12 +748,36 @@ class Controller:
             return None
         it = next((x for x in items if x.get("index") == s.index), None)
         if (it is None or not it.get("uuid") or it["uuid"] in self._known_uuids()
-                or it.get("template", "").lower() != self._created_template.lower()):
+                or not s.created_template
+                or str(it.get("template") or "").lower() != s.created_template.lower()
+                or not self._created_near(it.get("created_at"))):
             return None
         s.uuid = it["uuid"]
         self._log(f"instance at index {s.index} adopted: uuid {s.uuid}")
         self._persist()
         return it
+
+    def _created_near(self, created) -> bool:
+        """Was an instance with this `createdAt` created around our create request?
+        Epoch seconds or milliseconds, or an ISO timestamp; anything unreadable (or no
+        request time) is no evidence either way → True, the template check stands
+        alone. A LATER instance at a reused index is what this excludes: ours must have
+        disappeared for a stranger to get the index, so its createdAt lies after it."""
+        t0 = self.state.create_requested_at
+        if not t0 or created in (None, ""):
+            return True
+        t = None
+        try:
+            t = float(created)
+            if t > 1e12:
+                t /= 1000.0     # milliseconds
+        except (TypeError, ValueError):
+            try:
+                from datetime import datetime
+                t = datetime.fromisoformat(str(created).replace("Z", "+00:00")).timestamp()
+            except (TypeError, ValueError):
+                return True
+        return t0 - _CREATED_SKEW_S <= t <= t0 + _CREATED_LATE_S
 
     def _known_uuids(self) -> set:
         try:
@@ -832,10 +873,15 @@ class Controller:
             raise RuntimeError(f"node list upload failed (rc {rc}): "
                                + " | ".join(_tail(err, 3)))
         self._log(f"bootstrap: ComfyUI {self._commit()[:12]}, node list uploaded")
-        rc, out, err = await self._exec(f"bash -s -- {sshrun.q(self._commit())}",
+        inner = f"bash -s -- {sshrun.q(self._commit())} 2>&1 | tee {_BOOTSTRAP_LOG}"
+        rc, out, err = await self._exec(f"bash -o pipefail -c {sshrun.q(inner)}",
                                         stdin=self.deps.bootstrap_script(),
                                         timeout=_BOOTSTRAP_S)
         text = (out or b"").decode("utf-8", "replace")
+        if rc != 0 and not text.strip():
+            # timeout (sshrun.run keeps nothing) or a dropped connection: the log on
+            # the instance still says how far it got
+            text = await self._bootstrap_log_tail()
         for line in text.splitlines():
             if line.strip():
                 self._log(line)
@@ -845,7 +891,8 @@ class Controller:
         s.bootstrap_unknown = dict(rep["unknown"])
         s.bootstrap_template_nodes = list(rep["template_nodes"])
         self._persist()
-        why = bootstrap_verdict(rc, rep, (err or b"").decode("utf-8", "replace"))
+        # the script's own last line names the cause; ssh's stderr only when it has none
+        why = bootstrap_verdict(rc, rep, (err or b"").decode("utf-8", "replace") + "\n" + text)
         if why:
             for line in _tail(err):
                 self._log(f"stderr: {line}")
@@ -856,6 +903,20 @@ class Controller:
                       f"{gb:.1f} GB — delete them before the first stop or every "
                       "snapshot carries them")
         self._log("bootstrap done")
+
+    async def _bootstrap_log_tail(self) -> str:
+        try:
+            rc, out, err = await self._exec(f"tail -n {_BOOTSTRAP_TAIL} {_BOOTSTRAP_LOG}",
+                                            timeout=60)
+        except Exception as e:
+            self._log(f"bootstrap log unavailable: {_errtext(e)}")
+            return ""
+        if rc != 0:
+            self._log(f"bootstrap log unavailable (rc {rc}): " + " | ".join(_tail(err, 3)))
+            return ""
+        self._log(f"bootstrap output lost — last {_BOOTSTRAP_TAIL} lines of "
+                  f"{_BOOTSTRAP_LOG} follow")
+        return (out or b"").decode("utf-8", "replace")
 
     async def _wait_comfy(self, settle: bool = False) -> None:
         """Probe ComfyUI through the tunnel every 3 s until it answers. `settle`: wait
@@ -906,23 +967,34 @@ class Controller:
         finally:
             self._op = None
 
+    def _enable(self) -> None:
+        """Step 0. A backend that stays disabled is never polled or routed to — an
+        instance created for it would bill for nothing, so a failure here ends the
+        start before the create."""
+        try:
+            ok = self.deps.set_enabled(self.bid, True)
+        except Exception as e:
+            raise _PreCreate(f"cannot enable backend {self.bid}: {_errtext(e)}") from e
+        if ok is False:
+            raise _PreCreate(f"cannot enable backend {self.bid}: not a known backend")
+
     async def _start(self) -> None:
         s = self.state
+        enabled = False
         try:
-            self.deps.set_enabled(self.bid, True)
-        except Exception as e:
-            self._log(f"enabling the backend failed: {e!r}")
-        try:
+            self._enable()
+            enabled = True
             created = await self._create()
         except Exception as e:
             msg = _errtext(e)
             if isinstance(e, thunder.ThunderError) and e.status is None:
                 msg += " (an instance may exist anyway — check the orphan list)"
             self._set_phase("off", f"start failed: {msg}")
-            try:
-                self.deps.set_enabled(self.bid, False)    # off = disabled (spec "Stop" 1)
-            except Exception as e2:
-                self._log(f"disabling the backend failed: {e2!r}")
+            if enabled:
+                try:
+                    self.deps.set_enabled(self.bid, False)   # off = disabled (spec "Stop" 1)
+                except Exception as e2:
+                    self._log(f"disabling the backend failed: {e2!r}")
             return
         needs_bootstrap = created
         try:
@@ -977,7 +1049,8 @@ class Controller:
         pub = await self.deps.keygen(self._key_path())
         self._log(f"creating instance: template {template}, disk {disk_gb} GB"
                   + ("" if snap else " (first start: bootstrap follows)"))
-        self._created_template = template
+        s.created_template, s.create_requested_at = template, self.deps.now()
+        self._persist()
         created = await self.api.create(thunder.create_body(cfg, template, disk_gb, pub))
         # from here on an instance exists and bills: persist it BEFORE any wait
         s.index, s.uuid = created["index"], created["uuid"]

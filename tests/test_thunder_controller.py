@@ -580,10 +580,14 @@ class Start(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["disk_size_gb"], 100)
         cmds = _ssh_cmds(fake)
         boot = [x for x in cmds if "bash -s --" in x]
-        self.assertEqual(boot, [f"bash -s -- {COMMIT}"])
-        self.assertIn("setsid nohup ~/start-comfy.sh >/dev/null 2>&1 < /dev/null &", cmds)
-        self.assertEqual(c.h.phases, ["creating", "connecting", "bootstrapping", "starting",
-                                      "ready"])
+        self.assertEqual(boot, ["bash -o pipefail -c "
+                                f"'bash -s -- {COMMIT} 2>&1 | tee ~/gw-bootstrap.log'"])
+        self.assertIn(thunderctl._START_CMD, cmds)
+        self.assertTrue(thunderctl._START_CMD.endswith(
+            "setsid nohup ~/start-comfy.sh >/dev/null 2>&1 < /dev/null &"))
+        # "off" first: template + request time are persisted before the create
+        self.assertEqual(c.h.phases, ["off", "creating", "connecting", "bootstrapping",
+                                      "starting", "ready"])
         self.assertEqual((saved["thunder"]["uuid"], saved["thunder"]["index"]), ("u0", "0"))
         self.assertEqual((c.state.ip, c.state.port), ("10.0.0.5", 30022))
         self.assertEqual(c.state.started_at, 1_790_000_000.0)
@@ -596,7 +600,7 @@ class Start(unittest.IsolatedAsyncioTestCase):
         await c.start()
         remote = [(argv[-1], stdin) for argv, stdin in calls]
         up = [i for i, (cmd, _) in enumerate(remote) if cmd == "cat > ~/.gw-nodes.txt"]
-        run = [i for i, (cmd, _) in enumerate(remote) if cmd.startswith("bash -s --")]
+        run = [i for i, (cmd, _) in enumerate(remote) if "bash -s --" in cmd]
         self.assertEqual(len(up), 1)
         self.assertLess(up[0], run[0])
         self.assertEqual(remote[up[0]][1], b"https://github.com/a/pack@0123abc\n")
@@ -648,14 +652,26 @@ class Start(unittest.IsolatedAsyncioTestCase):
         fake.status_script = ["PROVISIONING", "RESTORING", "RESTORING", "RUNNING"]
         c, _, _, _ = make(fake)
         await c.start()
-        self.assertEqual(c.h.phases, ["creating", "restoring", "connecting", "starting",
-                                      "ready"])
+        self.assertEqual(c.h.phases, ["off", "creating", "restoring", "connecting",
+                                      "starting", "ready"])
 
     async def test_uuid_persisted_before_wait(self):
         fake = FakeThunder()
         fake.status_script = ["PROVISIONING"] * 50
         c, saved, _, _ = make(fake)
+        at_first_wait = []
+        orig_sleep = c.deps.sleep
+
+        async def sleep(sec):
+            if not at_first_wait:
+                at_first_wait.append((dict(saved.get("thunder") or {}), list(fake.calls)))
+            await orig_sleep(sec)
+        c.deps.sleep = sleep
         await c.start()
+        first_state, calls_then = at_first_wait[0]
+        self.assertEqual((first_state["uuid"], first_state["index"]), ("u0", "0"))
+        self.assertEqual(first_state["phase"], "creating")
+        self.assertIn("/instances/list", [p for _, p, _ in calls_then])
         self.assertEqual(c.state.phase, "failed")
         self.assertEqual(c.state.failed_phase, "creating")
         self.assertEqual(saved["thunder"]["uuid"], "u0")     # the instance is not forgotten
@@ -700,7 +716,7 @@ class Start(unittest.IsolatedAsyncioTestCase):
 
         async def ssh(argv, stdin=None, timeout=60):
             fake.calls.append(("SSH", argv[-1], stdin))
-            if argv[-1].startswith("bash -s"):
+            if "bash -s" in argv[-1]:
                 fake.instances["0"]["httpPorts"] = [8188]     # the template opened it
                 return (0, b"GW:SMOKE ok\nGW:DONE\n", b"")
             return (0, b"", b"")
@@ -708,7 +724,7 @@ class Start(unittest.IsolatedAsyncioTestCase):
         await c.start()
         self.assertEqual(c.state.phase, "ready", c.state.error)
         kinds = [(m, p) for m, p, _ in fake.calls]
-        boot = next(i for i, (m, p) in enumerate(kinds) if m == "SSH" and p.startswith("bash -s"))
+        boot = next(i for i, (m, p) in enumerate(kinds) if m == "SSH" and "bash -s" in p)
         patch = kinds.index(("PATCH", "/instances/0/ports"))
         start = next(i for i, (m, p) in enumerate(kinds) if m == "SSH" and "start-comfy" in p)
         self.assertLess(boot, patch)
@@ -918,6 +934,67 @@ class Start(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(c.state.phase, "ready", c.state.error)
 
 
+    async def test_enable_failure_ends_in_off_before_create(self):
+        # a backend that stays disabled is never polled or routed to: an instance
+        # created for it would bill for nothing
+        for behaviour in ("raise", "false"):
+            fake = FakeThunder()
+            c, _, _, _ = make(fake)
+            calls = []
+
+            def set_enabled(bid, on, behaviour=behaviour):
+                calls.append(on)
+                if behaviour == "raise":
+                    raise OSError("store locked")
+                return False
+            c.deps.set_enabled = set_enabled
+            await c.start()
+            self.assertEqual(c.state.phase, "off", behaviour)
+            self.assertIn("cannot enable", c.state.error)
+            self.assertEqual(_creates(fake), [])
+            self.assertEqual(fake.calls, [])
+            self.assertEqual(calls, [True])       # no pointless disable afterwards
+
+    async def test_bootstrap_timeout_reads_the_log_on_the_instance(self):
+        # sshrun.run answers a timeout with (124, b"", b"timeout") — everything it read
+        # is gone; the tee'd log file on the instance says how far it got
+        tail = (b"GW:PHASE nodes\nGW:PHASE extensions\nbuilding cumesh wheel ...\n")
+        fake = FakeThunder()
+        c, _, _, _ = make(fake, ssh_script={"bash -s": (124, b"", b"timeout"),
+                                            "tail -n 200 ~/gw-bootstrap.log": (0, tail, b"")})
+        await c.start()
+        self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "bootstrapping"))
+        self.assertIn("timed out", c.state.error)
+        self.assertIn("phase extensions", c.state.error)
+        self.assertTrue(any("building cumesh wheel" in ln for ln in c.state.log))
+        self.assertIn("tail -n 200 ~/gw-bootstrap.log", _ssh_cmds(fake))
+
+    async def test_bootstrap_dropped_connection_reads_the_log(self):
+        tail = b"GW:PHASE venv\nbootstrap: cannot build the venv\n"
+        fake = FakeThunder()
+        c, _, _, _ = make(fake, ssh_script={"bash -s": (255, b"", b"Connection reset"),
+                                            "tail -n 200": (0, tail, b"")})
+        await c.start()
+        self.assertIn("rc 255 in phase venv", c.state.error)
+        self.assertIn("cannot build the venv", c.state.error)
+
+    async def test_bootstrap_output_present_needs_no_log_fetch(self):
+        fake = FakeThunder()
+        c, _, _, _ = make(fake, ssh_script={"bash -s": (1, b"GW:PHASE venv\nbootstrap: x\n", b"")})
+        await c.start()
+        self.assertIn("rc 1 in phase venv: bootstrap: x", c.state.error)
+        self.assertFalse([x for x in _ssh_cmds(fake) if x.startswith("tail ")])
+
+    async def test_missing_start_script_fails_fast_with_a_reason(self):
+        fake = FakeThunder()
+        _ready_snap(fake)
+        c, _, _, _ = make(fake, ssh_script={"test -x ~/start-comfy.sh":
+                                            (3, b"", b"start-comfy.sh missing\n")})
+        await c.start()
+        self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "starting"))
+        self.assertIn("start-comfy.sh missing", c.state.error)
+        self.assertLess(c.h.clock[0] - 1_790_000_000.0, 60)     # no 10-min probe wait
+
     def _uuidless_create(self, c, fake, template):
         def handler(req):
             r = fake.handler(req)
@@ -949,6 +1026,57 @@ class Start(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):          # an index still names an instance
             await c.start()
 
+    def _restored(self, fake, **state):
+        c, saved, _, _ = make(fake)
+        saved["thunder"] = dict({"phase": "creating", "uuid": "", "index": "0",
+                                 "created_template": "comfy-ui",
+                                 "create_requested_at": 1_790_000_000.0}, **state)
+        return thunderctl.Controller(c.backend, c.deps), saved
+
+    async def test_template_and_request_time_are_persisted_before_create(self):
+        fake = FakeThunder()
+        c, saved, _, _ = make(fake)
+        seen = []
+
+        def handler(req):
+            if req.url.path == "/instances/create":
+                seen.append(dict(saved.get("thunder") or {}))
+            return fake.handler(req)
+        c.deps.client_factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await c.start()
+        self.assertEqual(seen[0]["created_template"], "comfy-ui")
+        self.assertEqual(seen[0]["create_requested_at"], 1_790_000_000.0)
+
+    def test_restored_state_adopts_uuidless_instance(self):
+        # a gateway restart during `creating`: the persisted template still identifies it
+        c, saved = self._restored(FakeThunder())
+        items = [{"index": "0", "uuid": "u0", "template": "comfy-ui",
+                  "created_at": "1790000030"}]
+        self.assertEqual(c._find_ours(items)["uuid"], "u0")
+        self.assertEqual(saved["thunder"]["uuid"], "u0")
+
+    def test_created_at_outside_the_window_is_not_ours(self):
+        c, _ = self._restored(FakeThunder())
+        for created in ("1790003600", 1_790_003_600_000, "2026-09-27T12:00:00Z",
+                        "1789990000"):
+            items = [{"index": "0", "uuid": "u9", "template": "comfy-ui",
+                      "created_at": created}]
+            self.assertIsNone(c._find_ours(items), created)
+        # milliseconds and ISO inside the window, and an unreadable value, pass
+        for created in (1_790_000_060_000, "2026-09-21T14:14:00+00:00", "soon", None):
+            c.state.uuid = ""
+            items = [{"index": "0", "uuid": "u9", "template": "comfy-ui",
+                      "created_at": created}]
+            self.assertIsNotNone(c._find_ours(items), created)
+
+    def test_none_template_in_list_is_not_ours(self):
+        c, _ = self._restored(FakeThunder())
+        self.assertIsNone(c._find_ours([{"index": "0", "uuid": "u9", "template": None}]))
+
+    def test_no_persisted_template_adopts_nothing(self):
+        c, _ = self._restored(FakeThunder(), created_template="")
+        self.assertIsNone(c._find_ours([{"index": "0", "uuid": "u9", "template": ""}]))
+
 class RestartComfy(unittest.IsolatedAsyncioTestCase):
     async def _ready(self, **kw):
         fake = FakeThunder()
@@ -966,19 +1094,31 @@ class RestartComfy(unittest.IsolatedAsyncioTestCase):
         cmds = [p for m, p, _ in fake.calls[n:] if m == "SSH"]
         self.assertEqual(len(cmds), 1)
         self.assertIn("pkill -f", cmds[0])
-        self.assertTrue(cmds[0].endswith(
-            "setsid nohup ~/start-comfy.sh >/dev/null 2>&1 < /dev/null &"))
+        self.assertTrue(cmds[0].endswith("; " + thunderctl._START_CMD))
         self.assertEqual(c.h.phases[-2:], ["starting", "ready"])
 
     async def test_pkill_pattern_matches_comfy_but_not_the_remote_shell(self):
-        # the remote `bash -c "<cmd>"` carries the pattern in ITS command line: a plain
-        # pattern would kill the shell running the restart before it starts the loop
+        # The command line to match is the one start-comfy.sh really runs — read from
+        # the heredoc the bootstrap writes, not copied by hand. The remote
+        # `bash -c "<cmd>"` carries the pattern in ITS command line: a plain pattern
+        # would kill the shell running the restart before it starts the loop.
+        # pkill -f reads the pattern as an ERE; for brackets and literals re agrees.
         import re
         import shlex
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "ops", "thunder-bootstrap.sh")
+        with open(path, encoding="utf-8") as f:
+            script = f.read()
+        heredoc = script.split("<<'START_COMFY_EOF'\n", 1)[1].split("\nSTART_COMFY_EOF", 1)[0]
+        line = next(ln for ln in heredoc.splitlines() if " main.py " in ln)
+        argv = shlex.split(line.split("\\")[0].split("9>&-")[0])
+        self.assertEqual(argv[0], "$COMFY_PY")
+        comfy = " ".join(["/home/ubuntu/ComfyUI/venv/bin/python"] + argv[1:])
+        self.assertIn("--listen 127.0.0.1", comfy)
         pat = shlex.split(thunderctl._RESTART_CMD.split(";")[0])[2]
-        comfy = "/home/ubuntu/ComfyUI/venv/bin/python main.py --listen 127.0.0.1 --port 8188 --disable-cuda-malloc"
-        self.assertTrue(re.search(pat, comfy))
+        self.assertTrue(re.search(pat, comfy), comfy)
         self.assertFalse(re.search(pat, "bash -c " + thunderctl._RESTART_CMD))
+        self.assertFalse(re.search(pat, "bash -c " + shlex.quote(thunderctl._RESTART_CMD)))
         self.assertFalse(re.search(pat, "/bin/bash /home/ubuntu/start-comfy.sh"))
 
     async def test_restart_closes_ports_first(self):
