@@ -1,6 +1,7 @@
 """ssh argv builders, path guard, supervisor (sshrun.py).
 run: venv/bin/python -m unittest tests.test_sshrun -v"""
 import asyncio
+import gc
 import os
 import tempfile
 import unittest
@@ -104,7 +105,8 @@ class Run(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.3)
         await sup.stop()
         self.assertGreaterEqual(sup.restarts, 2)
-        self.assertTrue(any("boom" in m and "3" in m for m in logs), logs)
+        self.assertTrue(any(m.startswith("tunnel exited rc=3 ") and m.endswith(": boom")
+                            for m in logs), logs)
 
     async def test_supervisor_stop_ends_a_live_process(self):
         # a healthy tunnel never exits by itself — stop() must end it, leave no zombie
@@ -149,6 +151,89 @@ class Run(unittest.IsolatedAsyncioTestCase):
         await sup.stop()
         self.assertGreaterEqual(len(n), 2)
         self.assertTrue(logs)
+
+    async def test_start_during_stop_runs_one_loop_and_orphans_nothing(self):
+        # review 2026-09-27: stop() dropped its task before the old loop ended, so a
+        # start() in that window reset the old loop's stop flag — two loops, and a
+        # `sleep 30` that survived the final stop()
+        for mid_flight in (False, True):
+            with self.subTest(mid_flight=mid_flight):
+                procs, alive_at_spawn = [], []
+
+                async def spawn(*argv, **kw):
+                    alive_at_spawn.append(sum(1 for p in procs if p.returncode is None))
+                    p = await asyncio.create_subprocess_exec(*argv, **kw)
+                    procs.append(p)
+                    return p
+
+                sup = sshrun.Supervisor(lambda: ["sleep", "30"], log=lambda m: None,
+                                        spawn=spawn, min_backoff=0.01, max_backoff=0.02)
+                sup.start()
+                await self._until(lambda: sup.running)
+                t = asyncio.ensure_future(sup.stop())
+                if mid_flight:
+                    await asyncio.sleep(0)          # stop() is now awaiting the loop
+                sup.start()
+                await t
+                if mid_flight:
+                    await self._until(lambda: sup.running)   # the new loop took over
+                await sup.stop()
+                self.assertFalse(sup.running)
+                self.assertEqual(len(procs), 2 if mid_flight else 1)
+                self.assertEqual(max(alive_at_spawn), 0)    # never two at once
+                for p in procs:
+                    self.assertIsNotNone(p.returncode)
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(p.pid, 0)
+
+    async def test_raising_log_does_not_end_supervision(self):
+        n = []
+
+        def argv():
+            n.append(1)
+            return ["sh", "-c", "exit 1"]
+
+        def log(m):
+            raise RuntimeError("logger down")
+
+        sup = sshrun.Supervisor(argv, log=log, min_backoff=0.01, max_backoff=0.02)
+        sup.start()
+        await asyncio.sleep(0.3)
+        await sup.stop()
+        self.assertGreaterEqual(len(n), 3)
+        self.assertFalse(sup.running)
+
+    async def test_start_after_crashed_loop_retrieves_its_exception(self):
+        class Boom(BaseException):      # escapes every `except Exception`
+            pass
+
+        ctxs, logs = [], []
+        asyncio.get_running_loop().set_exception_handler(lambda l, c: ctxs.append(c))
+        calls = []
+
+        def argv():
+            calls.append(1)
+            if len(calls) == 1:
+                raise Boom()
+            return ["sleep", "30"]
+
+        sup = sshrun.Supervisor(argv, log=logs.append, min_backoff=0.01, max_backoff=0.02)
+        sup.start()
+        await asyncio.sleep(0.05)       # the first loop is dead by now
+        sup.start()
+        await self._until(lambda: sup.running)
+        await sup.stop()
+        gc.collect()
+        await asyncio.sleep(0)
+        self.assertEqual(ctxs, [])      # no "Task exception was never retrieved"
+        self.assertTrue(any("Boom" in m for m in logs), logs)
+
+    async def _until(self, cond, timeout=2.0):
+        for _ in range(int(timeout / 0.01)):
+            if cond():
+                return
+            await asyncio.sleep(0.01)
+        self.fail("condition not reached")
 
     async def test_keygen(self):
         with tempfile.TemporaryDirectory() as d:

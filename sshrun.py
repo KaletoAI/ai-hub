@@ -87,8 +87,9 @@ def safe_rel(rel: str) -> str:
     """A relative path that stays inside the tree it is resolved against, returned
     unchanged; `ValueError` otherwise. One trailing `/` is allowed (a directory entry
     of the model catalog, e.g. a whole Hub repo) — every other empty segment is not.
-    A first segment starting with `-` is refused too: quoting does not stop a remote
-    `cat`/`rm` from reading it as an option."""
+    A FIRST segment starting with `-` is refused too: quoting does not stop a remote
+    `cat`/`rm` from reading it as an option. Only the first segment is guarded
+    (`models/-x` passes) — a later segment cannot stand at the start of an argument."""
     if not isinstance(rel, str) or not rel:
         raise ValueError("empty path")
     if "\\" in rel:
@@ -172,12 +173,29 @@ async def run(argv: list[str], stdin: Optional[bytes] = None,
     return p.returncode, out, err
 
 
+class _Run:
+    """One start()…stop() cycle of a Supervisor. Per-run, not per-supervisor: a
+    start() that arrives while stop() is still waiting for the old loop must not
+    reset THAT loop's stop flag or share its process slot — two loops would then
+    both respawn, and stop() could only ever reach one of the processes."""
+    __slots__ = ("task", "proc", "stopping", "wake", "attempts")
+
+    def __init__(self):
+        self.task: Optional[asyncio.Task] = None
+        self.proc = None
+        self.stopping = False
+        self.wake = asyncio.Event()
+        self.attempts = 0
+
+
 class Supervisor:
     """Keeps `argv_fn()` running: respawns it whenever it exits, with a backoff from
     `min_backoff` doubling to `max_backoff` (reset after a run of `STABLE_S`).
     `argv_fn` is called per spawn, so a changed ip/port/known_hosts is picked up on
     the next restart. `log(str)` gets one line per exit with rc, runtime and the
-    stderr tail. `spawn` is the `create_subprocess_exec` seam for tests."""
+    stderr tail — best effort: a raising `log` never ends supervision. `spawn` is the
+    `create_subprocess_exec` seam for tests. At most ONE process is alive at a time,
+    also across a stop() → start() overlap (the new loop waits for the old one)."""
 
     def __init__(self, argv_fn: Callable[[], list[str]], log: Callable[[str], None],
                  spawn=asyncio.create_subprocess_exec,
@@ -187,106 +205,129 @@ class Supervisor:
         self._spawn = spawn
         self._min = min_backoff
         self._max = max_backoff
-        self._task: Optional[asyncio.Task] = None
-        self._proc = None
-        self._stopping = False
-        self._attempts = 0
-        self._wake = asyncio.Event()
+        self._cur: Optional[_Run] = None     # the latest run, kept after it stopped
 
     @property
     def running(self) -> bool:
         """A tunnel process is alive right now (not: the supervisor is active)."""
-        return self._proc is not None and self._proc.returncode is None
+        r = self._cur
+        return r is not None and r.proc is not None and r.proc.returncode is None
 
     @property
     def restarts(self) -> int:
-        """Spawn attempts after the first one."""
-        return max(0, self._attempts - 1)
+        """Spawn attempts after the first one, in the current run."""
+        return max(0, self._cur.attempts - 1) if self._cur is not None else 0
+
+    def _say(self, msg: str) -> None:
+        try:
+            self._log(msg)
+        except Exception:
+            pass                        # a broken logger must not end supervision
+
+    def _collect(self, t: asyncio.Task) -> None:
+        """Retrieve a finished loop's exception — unretrieved, asyncio reports it as
+        "Task exception was never retrieved" when the task is collected."""
+        if t.done() and not t.cancelled():
+            exc = t.exception()
+            if exc is not None:
+                self._say(f"tunnel supervisor loop crashed: {exc!r}")
 
     def start(self) -> None:
-        if self._task is not None and not self._task.done():
-            return
-        self._stopping = False
-        self._attempts = 0
-        self._wake = asyncio.Event()
-        self._task = asyncio.get_running_loop().create_task(self._loop())
+        old = self._cur
+        if old is not None and old.task is not None:
+            if not old.task.done() and not old.stopping:
+                return                  # already running
+            if old.task.done():
+                self._collect(old.task)
+        prev = old.task if old is not None and old.task is not None \
+            and not old.task.done() else None
+        r = _Run()
+        r.task = asyncio.get_running_loop().create_task(self._loop(r, prev))
+        self._cur = r
 
     async def stop(self) -> None:
-        """Stop respawning, end and reap the current process. Idempotent.
+        """Stop respawning, end and reap the current process. Idempotent; a second
+        stop() while one is in flight waits for the same end.
 
         The loop is woken and left to exit BY ITSELF rather than cancelled outright:
         a cancel landing inside `create_subprocess_exec` makes asyncio `poll()` the
         fresh child, which reaps it behind the child watcher's back ("exit status
-        already read"). Escalation: terminate → kill after the grace → cancel."""
-        self._stopping = True
-        t, self._task = self._task, None
-        if t is None:
+        already read"). Escalation: SIGTERM → SIGKILL after the grace → cancel."""
+        r = self._cur
+        if r is None or r.task is None:
             return
-        self._wake.set()
+        r.stopping = True
+        r.wake.set()
+        t = r.task
         for sig in (signal.SIGTERM, signal.SIGKILL, None):
-            p = self._proc
-            if sig is not None and p is not None:
-                _signal(p, sig)
+            if t.done():
+                break
+            if sig is not None and r.proc is not None:
+                _signal(r.proc, sig)
             if sig is None:
                 t.cancel()              # last resort: the loop is stuck somewhere
-            try:
-                await asyncio.wait_for(asyncio.shield(t), _TERM_GRACE_S)
-                return
-            except asyncio.TimeoutError:
-                continue
-            except asyncio.CancelledError:
-                if t.cancelled():
-                    return
-                raise                   # the CALLER was cancelled
-            except Exception as e:      # the loop itself crashed: stopping succeeded
-                try:
-                    self._log(f"tunnel supervisor ended with an error: {e!r}")
-                except Exception:
-                    pass
-                return
+            # asyncio.wait: neither raises the loop's exception nor cancels it on
+            # timeout; a cancelled CALLER still gets its CancelledError
+            await asyncio.wait([t], timeout=_TERM_GRACE_S)
+        if t.done():
+            self._collect(t)
 
-    async def _loop(self) -> None:
+    async def _loop(self, r: _Run, prev: Optional[asyncio.Task]) -> None:
         delay = self._min
         try:
-            while not self._stopping:
-                self._attempts += 1
+            if prev is not None:
+                # the previous run is still ending (stop() → start() overlap): its
+                # ssh holds the forward's local port until it is reaped
+                await asyncio.wait([prev])
+            while not r.stopping:
+                r.attempts += 1
                 ran = 0.0
                 try:
-                    p = await self._spawn(*self._argv_fn(),
-                                          stdin=asyncio.subprocess.DEVNULL,
-                                          stdout=asyncio.subprocess.DEVNULL,
-                                          stderr=asyncio.subprocess.PIPE)
-                except Exception as e:       # missing ssh binary, argv_fn raising
-                    self._log(f"tunnel spawn failed: {e}")
-                else:
-                    self._proc = p
-                    if self._stopping:       # stop() arrived during the spawn
-                        break
-                    t0 = time.monotonic()
-                    tail = b""
-                    if p.stderr is not None:
-                        # read continuously: a full stderr pipe would stall ssh itself
-                        while True:
-                            chunk = await p.stderr.read(4096)
-                            if not chunk:
-                                break
-                            tail = (tail + chunk)[-_STDERR_TAIL:]
-                    rc = await p.wait()
-                    ran = time.monotonic() - t0
-                    msg = tail.decode("utf-8", "replace").strip()
-                    self._log(f"tunnel exited rc={rc} after {ran:.1f}s"
-                              + (f": {msg}" if msg else ""))
-                if self._stopping:
+                    ran = await self._once(r)
+                except Exception as e:  # unexpected (stderr read, wait, a stub)
+                    self._say(f"tunnel supervisor error: {e!r}")
+                    p = r.proc
+                    if p is not None and p.returncode is None:
+                        await _reap(p)  # never leave it running under a respawn
+                if r.stopping:
                     break
                 sleep_s, delay = next_backoff(delay, ran, self._min, self._max)
                 try:
-                    await asyncio.wait_for(self._wake.wait(), sleep_s)
+                    await asyncio.wait_for(r.wake.wait(), sleep_s)
                 except asyncio.TimeoutError:
                     pass
         finally:
-            p = self._proc
+            p = r.proc
             if p is not None and p.returncode is None:
                 await _reap(p)          # the proc stays referenced: `running` reads its rc
+
+    async def _once(self, r: _Run) -> float:
+        """Spawn once and wait for the exit → seconds it ran (0 if it never started)."""
+        try:
+            p = await self._spawn(*self._argv_fn(),
+                                  stdin=asyncio.subprocess.DEVNULL,
+                                  stdout=asyncio.subprocess.DEVNULL,
+                                  stderr=asyncio.subprocess.PIPE)
+        except Exception as e:          # missing ssh binary, argv_fn raising
+            self._say(f"tunnel spawn failed: {e}")
+            return 0.0
+        r.proc = p
+        if r.stopping:                  # stop() arrived during the spawn
+            return 0.0
+        t0 = time.monotonic()
+        tail = b""
+        if p.stderr is not None:
+            # read continuously: a full stderr pipe would stall ssh itself
+            while True:
+                chunk = await p.stderr.read(4096)
+                if not chunk:
+                    break
+                tail = (tail + chunk)[-_STDERR_TAIL:]
+        rc = await p.wait()
+        ran = time.monotonic() - t0
+        msg = tail.decode("utf-8", "replace").strip()
+        self._say(f"tunnel exited rc={rc} after {ran:.1f}s" + (f": {msg}" if msg else ""))
+        return ran
 
 
 async def keygen(path: str) -> str:
