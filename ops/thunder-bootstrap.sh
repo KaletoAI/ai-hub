@@ -9,6 +9,8 @@
 # Lines starting with `GW:` are the machine-readable part of the output:
 #
 #   GW:PHASE <name>                   entering a phase (the log is shown in the panel)
+#   GW:TEMPLATE_NODE <dir>            a custom_nodes/ pack the template brought (not in
+#                                     the node list; reported, never deleted)
 #   GW:NODE_FAIL <name> <reason>      one node pack failed; the bootstrap goes on
 #   GW:UNKNOWN_MODEL <rel>\t<bytes>   a model the TEMPLATE brought (not in any manifest —
 #                                     delete it before the first snapshot or pay for it
@@ -135,6 +137,22 @@ make_venv() {  # make_venv <dir>: Python $PY_VER venv with pip in it
   "$HOME/.local/bin/uv" venv --quiet --seed --python "$PY_VER" "$dir" || return 1
 }
 
+# build_venv <dir>: new venv with the pinned torch. 1 = no venv/torch install,
+# 2 = installed but not the expected CUDA build (reason on stdout).
+build_venv() {
+  local dir=$1 py=$1/bin/python why
+  make_venv "$dir" || return 1
+  "$py" -m pip install --quiet --upgrade pip setuptools wheel || return 1
+  "$py" -m pip install --quiet "torch==$TORCH_VER" "torchvision==$TORCHVISION_VER" \
+    "torchaudio==$TORCHAUDIO_VER" --index-url "https://download.pytorch.org/whl/$TORCH_CUDA" \
+    || return 1
+  if ! why=$(venv_ok "$py" 2>&1); then
+    echo "venv: ${why##*$'\n'}"
+    return 2
+  fi
+  echo "new venv: $why"
+}
+
 # registry_install <id> <version> <dir>: the Comfy registry's zip of that exact version.
 # The API answers a version record whose `downloadUrl` is the zip (read with the venv's
 # python — jq is not on the image). A marker file makes a re-run skip the download.
@@ -150,7 +168,7 @@ registry_install() {
       'import json,sys; print(json.load(sys.stdin)["downloadUrl"])'); then
     NODE_REASON=no-downloadUrl; return 1
   fi
-  tmp=$(mktemp -d) || return 1
+  tmp=$(mktemp -d) || { NODE_REASON=tmp; return 1; }
   if ! curl -fsSL --retry 3 -o "$tmp/node.zip" "$url"; then
     rm -rf "$tmp"; NODE_REASON=download; return 1
   fi
@@ -219,10 +237,15 @@ install_nodes() {
 #    wheels/Linux/Torch<digits>/ (Torch2110 = torch 2.11.0) — installed --no-deps so a
 #    wheel cannot pull another torch;
 #  - ComfyUI-Hunyuan3d-2-1 builds two from source (hy3dpaint/…, nvcc from CUDA 13.0).
-# SMOKE_MODS collects what the smoke test must be able to import: every wheel a pack
-# ships for ANY torch build (so a pack with no wheel for OUR torch fails the smoke test
-# instead of failing at the first 3D job), plus the two source builds.
+# SMOKE_MODS is what the smoke test must be able to import. It STARTS with the fixed
+# baseline — the modules the Trellis2/Hunyuan3D node code imports on k12-gpu — so a
+# pack that failed to install cannot drop its modules from the test and let the
+# bootstrap end in `GW:SMOKE ok`. On top: every wheel a pack ships for ANY torch build
+# (a pack with no wheel for OUR torch fails the smoke test instead of the first 3D job).
+SMOKE_BASELINE="cumesh o_voxel flex_gemm nvdiffrast.torch nvdiffrec_render custom_rasterizer custom_rasterizer_kernel mesh_inpaint_processor"
 declare -A SMOKE_MODS=()
+for _m in $SMOKE_BASELINE; do SMOKE_MODS[$_m]=1; done
+unset _m
 install_extensions() {
   local d name w mod pair sub tt=${TORCH_VER//./} pytag=cp${PY_VER//./}
   local -a whls
@@ -267,6 +290,38 @@ run_install_scripts() {
     [ -f "$d/install.py" ] || continue
     echo "install.py of ${d##*/}"
     (cd "$d" && timeout 1800 "$PY" install.py) || node_fail "${d##*/}" install.py
+  done
+}
+
+# disable_rc_autostart <rcfile>: comment out the template's `start-comfyui` hook.
+# Only when an ACTIVE line is left, so a re-run neither rewrites the file nor
+# overwrites the first backup (the one holding the original) with an edited copy.
+disable_rc_autostart() {
+  local rc=$1
+  if [ -f "$rc" ] && grep -q '^[^#]*start-comfyui' "$rc"; then
+    sed -i.gw-bak '/start-comfyui/{/^[[:space:]]*#/!s/^/# gw-disabled: /}' "$rc"
+    echo "disabled the template autostart in $rc (backup ${rc}.gw-bak)"
+  fi
+}
+
+# report_template_nodes <custom_nodes dir> <nodes file>: every pack dir the node list
+# does not name came with the template — `GW:TEMPLATE_NODE <dir>`. Reported, never
+# deleted; the likely case is the template's own ComfyUI-Manager under another
+# spelling, i.e. two Managers once ours is installed.
+report_template_nodes() {
+  local cn=$1 list=$2 line rc d
+  local -A listed=()
+  while IFS= read -r line || [ -n "$line" ]; do
+    rc=0
+    parse_node_line "$line" || rc=$?
+    if [ "$rc" -eq 0 ]; then listed[$NODE_NAME]=1; fi
+  done <"$list"
+  [ -d "$cn" ] || return 0
+  for d in "$cn"/*/; do
+    [ -d "$d" ] || continue
+    d=${d%/}; d=${d##*/}
+    [ "$d" = __pycache__ ] && continue
+    if [ -z "${listed[$d]:-}" ]; then echo "GW:TEMPLATE_NODE $d"; fi
   done
 }
 
@@ -340,8 +395,9 @@ finish() {  # finish <smoke result>
 main() {
   local COMMIT=${1:-} d why smoke rc
   NODES=${2:-$HOME/.gw-nodes.txt}
-  if ! [[ $COMMIT =~ ^[0-9a-fA-F]{7,40}$ ]]; then
-    echo "usage: bash -s -- <comfy_commit> [<nodes_file>]" >&2
+  if ! [[ $COMMIT =~ ^[0-9a-fA-F]{40}$ ]]; then
+    # full sha only: the fetch-by-sha fallback (a commit on no branch head) needs it
+    echo "usage: bash -s -- <comfy_commit (full 40-hex sha)> [<nodes_file>]" >&2
     exit 2
   fi
   [ -f "$NODES" ] || die "node list $NODES not found (the controller uploads it first)"
@@ -382,12 +438,8 @@ main() {
     fi
   done
   pkill -f "$CUI/main.py" || true
-  for d in "$HOME/.bashrc" "$HOME/.profile"; do
-    if [ -f "$d" ] && grep -q 'start-comfyui' "$d"; then
-      sed -i.gw-bak '/start-comfyui/{/^[[:space:]]*#/!s/^/# gw-disabled: /}' "$d"
-      echo "disabled the template autostart in $d (backup ${d}.gw-bak)"
-    fi
-  done
+  disable_rc_autostart "$HOME/.bashrc"
+  disable_rc_autostart "$HOME/.profile"
 
   phase inventory
   # Before the checkout: whatever sits in models/ now came with the template.
@@ -396,6 +448,7 @@ main() {
       || echo "inventory of $CUI/models incomplete (find failed)" >&2
   fi
   echo "$(wc -l <"$UNKNOWN") template model file(s) found"
+  report_template_nodes "$CUI/custom_nodes" "$NODES"
 
   phase checkout
   if [ ! -e "$CUI/.git" ]; then git -C "$CUI" init --quiet; fi
@@ -404,27 +457,36 @@ main() {
 
   phase venv
   PY=
+  local -a unsuitable=()
   for d in "$CUI/venv" "$CUI/.venv"; do
     [ -e "$d" ] || continue
     if why=$(venv_ok "$d/bin/python" 2>&1); then
       PY="$d/bin/python"; echo "keeping $d ($why)"; break
     fi
-    # the template's venv, built for another torch: the wheels would not load in it,
-    # and it would be paid for in every snapshot
-    echo "replacing $d: ${why##*$'\n'}"
-    rm -rf "$d"
+    echo "not using $d: ${why##*$'\n'}"
+    unsuitable+=("$d")
   done
   if [ -z "$PY" ]; then
-    make_venv "$CUI/venv" || die "cannot create a Python $PY_VER venv"
-    PY="$CUI/venv/bin/python"
-    "$PY" -m pip install --quiet --upgrade pip setuptools wheel
-    "$PY" -m pip install --quiet "torch==$TORCH_VER" "torchvision==$TORCHVISION_VER" \
-      "torchaudio==$TORCHAUDIO_VER" --index-url "https://download.pytorch.org/whl/$TORCH_CUDA"
-    if ! why=$(venv_ok "$PY" 2>&1); then
-      echo "venv: ${why##*$'\n'}"
+    # Built at its final path (a venv does not survive being renamed: console-script
+    # shebangs name it), with the old one parked beside it until the new one works —
+    # a failed build puts the template's venv back for the diagnosis.
+    rm -rf "$CUI/venv.gw-old"
+    if [ -e "$CUI/venv" ]; then mv "$CUI/venv" "$CUI/venv.gw-old"; fi
+    rc=0
+    build_venv "$CUI/venv" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+      rm -rf "$CUI/venv"
+      if [ -e "$CUI/venv.gw-old" ]; then mv "$CUI/venv.gw-old" "$CUI/venv"; fi
+      if [ "$rc" -eq 1 ]; then die "cannot build the venv (Python $PY_VER or the torch install failed)"; fi
       finish "fail torch-cuda"
     fi
-    echo "new venv: $why"
+    PY="$CUI/venv/bin/python"
+    # only now: the template's venvs, built for another torch — the wheels would not
+    # load in them, and they would be paid for in every snapshot
+    rm -rf "$CUI/venv.gw-old"
+    for d in "${unsuitable[@]}"; do
+      if [ "$d" != "$CUI/venv" ]; then rm -rf "$d"; fi
+    done
   fi
   "$PY" -m pip install --quiet setuptools wheel
   # From here on no pip call may move torch: a node requirement that wants another

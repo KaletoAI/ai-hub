@@ -1,8 +1,10 @@
 """Static checks on the VM bootstrap script (runs on Thunder, not here).
 run: venv/bin/python -m unittest tests.test_thunder_scripts -v"""
+import os
 import pathlib
 import re
 import subprocess
+import tempfile
 import unittest
 
 P = pathlib.Path("ops/thunder-bootstrap.sh")
@@ -99,6 +101,68 @@ class NodeLineParser(unittest.TestCase):
         for ln in NODES.read_text().splitlines():
             rc = _parse(ln)[0]
             self.assertIn(rc, (0, 1), ln)
+
+
+
+def _lib(snippet, *args, home=None):
+    """Run <snippet> with the script sourced as a library (main() not run)."""
+    env = dict(os.environ)
+    if home:
+        env["HOME"] = home
+    return subprocess.run(
+        ["bash", "-c", 'GW_BOOTSTRAP_LIB=1 source "$0"; shift 0; ' + snippet,
+         str(P), *args],
+        capture_output=True, text=True, env=env)
+
+
+class FixRound1(unittest.TestCase):
+    BASELINE = {"cumesh", "o_voxel", "flex_gemm", "nvdiffrast.torch",
+                "nvdiffrec_render", "custom_rasterizer", "custom_rasterizer_kernel",
+                "mesh_inpaint_processor"}
+
+    def test_smoke_baseline_present_without_any_pack(self):
+        # a Trellis2/Hunyuan pack that failed to install must not drop its modules
+        # from the smoke test (it would end in GW:SMOKE ok + GW:DONE)
+        r = _lib('NODE_DIRS=(); install_extensions >/dev/null; '
+                 'printf "%s\\n" "${!SMOKE_MODS[@]}"')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(self.BASELINE <= set(r.stdout.split()), r.stdout)
+
+    def test_short_commit_is_refused(self):
+        r = subprocess.run(["bash", str(P), "1d61dcc"], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("40-hex", r.stderr)
+
+    def test_rc_autostart_backup_survives_a_rerun(self):
+        with tempfile.TemporaryDirectory() as t:
+            rc = pathlib.Path(t, ".bashrc")
+            original = "export A=1\n~/start-comfyui.sh &\n"
+            rc.write_text(original)
+            for _ in range(2):
+                r = _lib('disable_rc_autostart "$1"', str(rc))
+                self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(pathlib.Path(t, ".bashrc.gw-bak").read_text(), original)
+            self.assertEqual(rc.read_text(),
+                             "export A=1\n# gw-disabled: ~/start-comfyui.sh &\n")
+
+    def test_template_nodes_reported_not_listed_ones(self):
+        with tempfile.TemporaryDirectory() as t:
+            cn = pathlib.Path(t, "custom_nodes")
+            for d in ("ComfyUI-Manager", "comfyui-manager", "gguf", "__pycache__"):
+                (cn / d).mkdir(parents=True)
+            (cn / "example_node.py.example").write_text("")
+            nodes = pathlib.Path(t, "nodes.txt")
+            nodes.write_text("# c\nhttps://github.com/ltdrdata/ComfyUI-Manager.git@"
+                             + "a" * 40 + "\nregistry:gguf@2.9.8\n")
+            r = _lib('report_template_nodes "$1" "$2"', str(cn), str(nodes))
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout.split("\n")[:-1], ["GW:TEMPLATE_NODE comfyui-manager"])
+
+    def test_unsuitable_venv_removed_only_after_the_new_one_built(self):
+        s = P.read_text()
+        main = s[s.index("phase venv"):s.index("phase nodes")]
+        self.assertLess(main.index("build_venv"), main.index('rm -rf "$d"'))
+        self.assertIn('mv "$CUI/venv.gw-old" "$CUI/venv"', main)
 
 
 if __name__ == "__main__":
