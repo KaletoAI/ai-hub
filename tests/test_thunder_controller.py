@@ -2300,6 +2300,9 @@ class FakeVM:
         self.killed = []
         self.argvs = []
         self.seen = []            # (verb, controller phase) per sync command
+        self.heads = []           # (plan path, curl config) per HEAD
+        self.head_len = {}        # url -> Content-Length a HEAD reports instead of sizes[url]
+        self.no_length = set()    # urls whose HEAD names no Content-Length
         fake.on_modify = lambda old, new: setattr(self, "avail", self.avail + (new - old) * _GiB)
 
     def wrap(self, c):
@@ -2312,6 +2315,7 @@ class FakeVM:
                 return await orig(argv, stdin=stdin, timeout=timeout)
             self.fake.calls.append(("SSH", cmd, stdin))
             self.seen.append((cmd.split()[1], c.state.phase))
+            await asyncio.sleep(0)        # a real ssh suspends: cancels land here
             return self.run(cmd, stdin)
         c.deps.ssh = ssh
 
@@ -2387,6 +2391,15 @@ class FakeVM:
             self._advance(path)
             state = "GW:RUN" if self.lockpid.get(path) in self.procs else "GW:END"
             out = f"{state}\n{self.files.get(path + '.part', -1)}\n{self.logs.get(path, '')}"
+        elif verb == "gw-head":
+            url = re.search(r'^url = "(.*)"$', text, re.M).group(1)
+            self.heads.append((path, text))
+            n = self.head_len.get(url, self.sizes.get(url))
+            if n is None:
+                return (0, b"HTTP/2 404\r\ncontent-length: 9\r\n\r\n", b"")
+            length = "" if url in self.no_length else f"Content-Length: {n}\r\n"
+            out = ("HTTP/2 302\r\nlocation: https://cdn.example/x\r\ncontent-length: 0\r\n"
+                   f"\r\nHTTP/2 200\r\n{length}\r\n")
         elif verb == "gw-sha":
             out = f"{self.sha.get(self.part_url.get(path), '0' * 64)}  x\n"
         elif verb == "gw-done":
@@ -2788,6 +2801,180 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
         self.assertLess(verbs.index("gw-kill"), verbs.index("gw-prune"))
         self.assertFalse([f for f in vm.files if ".part" in f])
 
+    async def test_stop_during_a_sync_neither_grows_the_disk_nor_restores_the_old_manifest(self):
+        import threading
+        k, g = _dm("keep.safetensors"), _dm("gone.safetensors")
+        fake, vm, c, box, _ = _sync_make(
+            aliases={"keep": _cand("keep.safetensors"), "gone": _cand("gone.safetensors")},
+            catalog=[_url("keep.safetensors"), _url("gone.safetensors")])
+        vm.sizes = {"https://example.com/keep.safetensors": 7,
+                    "https://example.com/gone.safetensors": 9}
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.ready_aliases == {"keep", "gone"}))
+        # the aliases change: "gone" goes, "big" needs more disk than there is free
+        del box["aliases"]["gone"]
+        box["aliases"]["big"] = _cand("big.safetensors")
+        box["catalog"].append(_url("big.safetensors"))
+        vm.sizes["https://example.com/big.safetensors"] = 50 * _GiB
+        vm.avail = 10 * _GiB
+        entered, release = threading.Event(), threading.Event()
+        orig, armed = c.deps.alias_needs, [True]
+
+        def needs(name):                  # the tick's plan hangs in its store read …
+            if armed[0]:
+                armed[0] = False
+                entered.set()
+                release.wait(10)
+            return orig(name)
+        c.deps.alias_needs = needs
+        real = vm.run
+        at_prune = []
+
+        def run(cmd, stdin):              # … until the stop has written the pruned manifest
+            if cmd.startswith(": gw-prune "):
+                at_prune.append(len(c._syncs))      # the sync is ended BEFORE the prune
+            r = real(cmd, stdin)
+            if cmd.startswith(": gw-manifest-write ") and c.state.phase == "pruning":
+                release.set()
+            return r
+        vm.run = run
+        tick = asyncio.ensure_future(c._sync_tick())        # what run_forever does
+        try:
+            self.assertTrue(await _until(entered.is_set))
+            await c.stop()
+            self.assertEqual(c.state.phase, "off", c.state.error)
+            release.set()
+            await _until(tick.done)
+            for _ in range(20):
+                await asyncio.sleep(0)
+            self.assertIsNone(await tick)                     # the loop is not cancelled
+        finally:
+            release.set()
+        self.assertEqual([p for m, p, b in fake.calls if p.endswith("/modify")], [])
+        self.assertEqual(sorted(c.state.manifests["s0"]), [k])
+        self.assertEqual(sorted(c._current_manifest()), [k])
+        self.assertEqual(c._syncs, set())
+        self.assertEqual(at_prune, [0])
+
+    async def test_cancel_between_mv_and_manifest_keeps_the_entry(self):
+        p, url = _dm("x.safetensors"), "https://example.com/x.safetensors"
+        fake, vm, c, box, _ = _sync_make(aliases={"img": _cand("x.safetensors")},
+                                         catalog=[_url("x.safetensors")])
+        vm.sizes[url] = 5
+        await c.start()
+        # another manifest writer holds the lock: the finished file waits for it after
+        # its mv — and a stop cancels it right there
+        await c._manifest_lock.acquire()
+        self.assertTrue(await _until(lambda: vm.files.get(p) == 5 and p in c._fetches))
+        for _ in range(10):
+            await asyncio.sleep(0)
+        c._fetches[p].cancel()
+        self.assertTrue(await _until(lambda: _idle(c)))
+        c._manifest_lock.release()
+        self.assertEqual(vm.files[p], 5)
+        self.assertNotIn(p, json.loads(vm.manifest or "{}"))  # its write never happened
+        self.assertEqual(c._unsaved[p]["size"], 5)
+        await c.sync_once()
+        self.assertTrue(c.is_alias_ready("img"))              # present, not re-fetched
+        self.assertEqual(len(vm.started), 1)
+        await c.stop()
+        self.assertEqual(json.loads(vm.manifest)[p]["size"], 5)
+        self.assertEqual(c.state.manifests["s0"][p]["size"], 5)
+
+    async def test_retries_back_off(self):
+        url = "https://example.com/x.safetensors"
+        fake, vm, c, box, _ = _sync_make(aliases={"img": _cand("x.safetensors")},
+                                         catalog=[_url("x.safetensors")])
+        vm.fail[url] = "curl: (7) Failed to connect\n"
+        waits = []
+        orig = c.deps.sleep
+
+        async def sleep(sec):
+            if asyncio.current_task() in c._fetches.values() and sec != thunderctl._SYNC_POLL_S:
+                waits.append(sec)
+            await orig(sec)
+        c.deps.sleep = sleep
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.plan["per_alias"]["img"]["blocked"]))
+        self.assertEqual(waits, [15, 45])
+        self.assertEqual(len(vm.started), 3)
+
+    async def test_head_learns_url_sizes_with_the_token_rules(self):
+        hf = "https://huggingface.co/o/r/resolve/main"
+        cat = [_url("h.safetensors", hf), _url("e.safetensors")]
+        fake, vm, c, box, _ = _sync_make(aliases={"img": _cand("h.safetensors", "e.safetensors")},
+                                         catalog=cat)
+        vm.sizes = {f"{hf}/h.safetensors": 40, "https://example.com/e.safetensors": 60}
+        vm.chunk = 10
+        vm.cap = {u: 20 for u in vm.sizes}
+        await c.start()
+        heads = {p: t for p, t in vm.heads}
+        self.assertIn(f'header = "Authorization: Bearer {_TOKEN}"', heads[_dm("h.safetensors")])
+        self.assertNotIn(_TOKEN, heads[_dm("e.safetensors")])
+        self.assertIn("max-time", heads[_dm("e.safetensors")])
+        for argv in vm.argvs:
+            self.assertFalse([x for x in argv if _TOKEN in x], argv)
+        self.assertEqual(c.plan["per_alias"]["img"]["need_bytes"], 100)
+        self.assertEqual(sorted(e["size"] for e in c.plan["fetch"]), [40, 60])
+        self.assertTrue(await _until(lambda: len(c.view()["transfers"]) == 2 and all(
+            t["bytes"] == 20 and t["eta"] is not None for t in c.view()["transfers"])))
+        self.assertEqual(sorted(t["total"] for t in c.view()["transfers"]), [40, 60])
+        vm.cap.clear()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+        self.assertEqual(len(vm.heads), 2)                    # once per URL and session
+        self.assertNotIn(_TOKEN, "\n".join(c.state.log))
+
+    async def test_head_without_length_stays_unknown_and_a_wrong_size_fails(self):
+        a, b = "https://example.com/a.safetensors", "https://example.com/b.safetensors"
+        fake, vm, c, box, _ = _sync_make(aliases={"one": _cand("a.safetensors"),
+                                                  "two": _cand("b.safetensors")},
+                                         catalog=[_url("a.safetensors"), _url("b.safetensors")])
+        vm.sizes = {a: 5, b: 5}
+        vm.no_length.add(a)
+        vm.head_len[b] = 99                           # the server lied / the file changed
+        await c.start()
+        self.assertEqual({e["path"]: e["size"] for e in c.plan["fetch"]},
+                         {_dm("a.safetensors"): None, _dm("b.safetensors"): 99})
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("one")
+                                     and c.plan["per_alias"]["two"]["blocked"]))
+        self.assertIn("size 5 ≠ 99", c.alias_status("two"))
+        self.assertTrue(any("no Content-Length" in ln for ln in c.state.log))
+
+    async def test_unreadable_manifest_is_warned_about(self):
+        fake, vm, c, box, _ = _sync_make(aliases={"img": _cand("x.safetensors")},
+                                         catalog=[_url("x.safetensors")])
+        vm.sizes["https://example.com/x.safetensors"] = 3
+        vm.manifest = "{not json"
+        await c.start()
+        self.assertTrue([ln for ln in c.state.log if "WARNING: manifest" in ln
+                         and "unreadable" in ln])
+        n = len(c.state.log)
+        vm.manifest = "{}"
+        await c.sync_once()
+        self.assertFalse([ln for ln in c.state.log[n:] if "WARNING: manifest" in ln])
+
+    async def test_token_a_curl_config_cannot_carry_is_withheld(self):
+        hf = "https://huggingface.co/o/r/resolve/main"
+        for bad in ('hf_a"b', "hf_a\\b", "hf_a\nheader = x", "hf_a\x01b"):
+            fake, vm, c, box, _ = _sync_make(aliases={"img": _cand("h.safetensors")},
+                                             catalog=[_url("h.safetensors", hf)], token=bad)
+            vm.sizes[f"{hf}/h.safetensors"] = 4
+            await c.start()
+            self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+            for _, cfg in vm.started + vm.heads:
+                self.assertNotIn("header", cfg, repr(bad))
+                self.assertNotIn(bad, cfg)
+            self.assertTrue([ln for ln in c.state.log if "hf_token withheld" in ln], repr(bad))
+
+    def test_parse_head(self):
+        ok = "HTTP/1.1 302 Found\r\nContent-Length: 0\r\n\r\nHTTP/2 200\r\ncontent-length: 1234\r\n"
+        self.assertEqual(thunderctl.parse_head(ok), 1234)
+        self.assertIsNone(thunderctl.parse_head("HTTP/2 200\r\netag: x\r\n"))
+        self.assertIsNone(thunderctl.parse_head("HTTP/2 302\r\ncontent-length: 5\r\n\r\n"
+                                                "HTTP/2 403\r\ncontent-length: 7\r\n"))
+        self.assertIsNone(thunderctl.parse_head(""))
+        self.assertIsNone(thunderctl.parse_head("HTTP/2 200\r\ncontent-length: -1\r\n"))
+
     async def test_unknown_files_listed_never_pruned(self):
         stranger, old = "models/checkpoints/stranger.safetensors", "models/loras/old.safetensors"
         fake, vm, c, box, _ = _sync_make(aliases={"img": _cand("x.safetensors")},
@@ -2913,15 +3100,15 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
                                          catalog=[_url("big.safetensors")])
         _ready_snap(fake, sid="s9", min_gb=100)
         c.state.manifests = {"s9": {f: {"size": 150 * _GiB, "source": "url", "aliases": ["img"]}}}
-        self.assertEqual(c._required_bytes_hint("s9"), 150 * _GiB)
-        self.assertEqual(c._required_bytes_hint(""), 0)       # URL size unknown
+        self.assertEqual(await c._required_bytes_hint("s9"), 150 * _GiB)
+        self.assertEqual(await c._required_bytes_hint(""), 0)       # URL size unknown
         vm.files[f] = 150 * _GiB                        # the restored disk holds it
         vm.manifest = json.dumps(c.state.manifests["s9"])
         await c.start()
         self.assertEqual(_creates(fake)[0]["disk_size_gb"], 170)
         # a broken dep never stops a start: the hint is 0 then
         c.deps.alias_needs = lambda n: 1 / 0
-        self.assertEqual(c._required_bytes_hint("s9"), 0)
+        self.assertEqual(await c._required_bytes_hint("s9"), 0)
 
     async def test_view_plan_summary_and_transfers(self):
         fake, vm, c, box, _ = _sync_make(
@@ -3016,6 +3203,11 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
 _STUB_CURL = """#!/bin/sh
 # stub curl: options from stdin (--config -), writes to -o; a TERM ends it
 cfg=$(cat)
+case " $* " in *" -sIL "*)
+  printf '%s' "$cfg" > "$HOME/head-cfg"
+  printf 'HTTP/1.1 302 Found\r\nContent-Length: 0\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\n'
+  exit 0;;
+esac
 out=
 while [ $# -gt 0 ]; do [ "$1" = -o ] && out=$2; shift; done
 printf '%s' "$cfg" > "$HOME/cfg-seen"
@@ -3133,6 +3325,16 @@ class RemoteShell(unittest.TestCase):
         self.assertEqual(os.listdir(os.path.dirname(keep)), ["keep.safetensors"])
         rc, out, err = self.sh(thunderctl._prune_cmd([]))
         self.assertEqual(out.split(), ["GW:PRUNED"])
+
+    def test_head_reports_the_final_content_length(self):
+        rel = "models/vae/v.safetensors"
+        cfg = thunderctl.curl_config("https://huggingface.co/v", _TOKEN, head=True)
+        rc, out, err = self.sh(thunderctl._head_cmd(rel), cfg.encode())
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(thunderctl.parse_head(out), 7)
+        with open(os.path.join(self.home, "head-cfg")) as f:
+            self.assertEqual(f.read(), cfg.rstrip("\n"))
+        self.assertNotIn(_TOKEN, thunderctl._head_cmd(rel))
 
     def test_manifest_read_write_and_df(self):
         rc, out, _ = self.sh(thunderctl._MANIFEST_READ)
