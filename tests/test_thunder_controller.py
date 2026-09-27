@@ -83,15 +83,16 @@ def tearDownModule():
 
 
 def make(fake, backend=None, ssh_script=None, datadir=None, default_nodes="",
-         probe=None):
+         probe=None, state=None):
     """A controller on the stub API. `c.h` carries the harness: `clock` (a list; the
     fake sleep ADVANCES it, so every timeout is reachable without waiting), `phases`
     (every persisted phase in order), `faults`, `tunnels`. `ssh_script` maps a
     substring of the remote command to a result, or to a LIST of results consumed in
     order (the last one sticks); the bootstrap succeeds by default. Every ssh call is also appended to `fake.calls` as
     ("SSH", remote_cmd, stdin), so the order against API calls is checkable. The
-    datadir is a fresh temp dir per controller unless given."""
-    saved = {}
+    datadir is a fresh temp dir per controller unless given. `state` is a persisted
+    record the controller loads at construction (a gateway restart)."""
+    saved = {} if state is None else {"thunder": state}
     enabled = {}
     ssh_calls = []
     clock = [1_790_000_000.0]
@@ -1179,6 +1180,835 @@ class RestartComfy(unittest.IsolatedAsyncioTestCase):
         seen.clear()
         await c.restart_comfy()
         self.assertGreater(seen[0], t0)
+
+
+def _paths(fake, start=0):
+    return [(m, p) for m, p, _ in fake.calls[start:]]
+
+
+def _inst(fake, idx="0", uuid="u0", **kw):
+    """A listed, RUNNING instance (no status script: the list reports what is set)."""
+    fake.status_script = []
+    fake.instances[idx] = dict({"uuid": uuid, "status": "RUNNING", "ip": "10.0.0.5",
+                                "port": 30022, "httpPorts": [], "template": "comfy-ui"}, **kw)
+    return fake.instances[idx]
+
+
+def _persisted(**kw):
+    return dict({"phase": "ready", "uuid": "u0", "index": "0", "ip": "10.0.0.5",
+                 "port": 30022, "started_at": 1_789_990_000.0, "disk_gb": 120}, **kw)
+
+
+class Stop(unittest.IsolatedAsyncioTestCase):
+    """Spec "Stop" 1–4: draining → pruning → snapshotting → deleting → off."""
+
+    async def _ready(self, **kw):
+        fake = FakeThunder()
+        c, saved, enabled, calls = make(fake, **kw)
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        return fake, c, saved, enabled
+
+    async def test_stop_order_drain_snapshot_delete(self):
+        fake, c, saved, enabled = await self._ready()
+        n, nphases = len(fake.calls), len(c.h.phases)
+        await c.refresh_prices()
+        await c.stop()
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        self.assertEqual(c.h.phases[nphases:], ["draining", "pruning", "snapshotting",
+                                                "deleting", "off"])
+        kinds = _paths(fake, n)
+        snap = kinds.index(("POST", "/snapshots/create"))
+        delete = kinds.index(("POST", "/instances/0/delete"))
+        du = next(i for i, (m, p) in enumerate(kinds) if m == "SSH" and p == thunderctl._DU_CMD)
+        self.assertLess(du, snap)
+        self.assertLess(snap, delete)
+        body = next(b for m, p, b in fake.calls[n:] if p == "/snapshots/create")
+        self.assertEqual(body["instanceId"], "0")
+        self.assertRegex(body["name"], r"^aihub-thunder-\d{8}t\d{6}z$")
+        self.assertEqual(fake.instances, {})
+        # nothing bills any more: ids gone, session cost stops
+        for k in ("uuid", "index", "ip"):
+            self.assertEqual(saved["thunder"][k], "", k)
+        self.assertEqual((saved["thunder"]["port"], saved["thunder"]["started_at"]), (0, 0.0))
+        self.assertIsNone(c.view()["session_cost"])
+        self.assertEqual(c.state.pending_snapshot, "s0")
+        self.assertEqual(c.state.manifests, {"s0": {}})
+        self.assertIs(enabled["comfyui:thunder"], False)
+        self.assertFalse(c.h.tunnels[-1].running)
+        self.assertEqual(c.h.faults, [])
+
+    async def test_stop_waits_for_inflight(self):
+        fake, c, _, _ = await self._ready()
+        seq, drained = [2, 1, 0], []
+        c.deps.begin_drain = lambda bid: drained.append(bid) or True
+
+        def inflight(bid):
+            v = seq.pop(0) if seq else 0
+            fake.calls.append(("INFLIGHT", str(v), None))
+            return v
+        c.deps.inflight = inflight
+        n = len(fake.calls)
+        await c.stop()
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        self.assertEqual(drained, ["comfyui:thunder"])
+        kinds = _paths(fake, n)
+        polls = [i for i, (m, _) in enumerate(kinds) if m == "INFLIGHT"]
+        self.assertEqual(len(polls), 3)                      # 2, 1, 0 → three rounds
+        self.assertLess(polls[-1], kinds.index(("POST", "/snapshots/create")))
+        log = "\n".join(c.state.log)
+        self.assertIn("waiting for 2 job(s)", log)
+        self.assertIn("waiting for 1 job(s)", log)
+
+    async def test_drain_waits_until_the_drain_itself_is_over(self):
+        fake, c, _, _ = await self._ready()
+        states = [True, True, False]
+        c.deps.is_draining = lambda bid: states.pop(0) if states else False
+        seen = []
+
+        async def sleep(sec):
+            seen.append((sec, c.view()["waiting_jobs"]))
+            c.h.clock[0] += sec
+        c.deps.sleep = sleep
+        await c.stop()
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        self.assertEqual(seen[:2], [(2, 0), (2, 0)])
+        self.assertIsNone(c.view()["waiting_jobs"])
+
+    async def test_stop_measures_base_bytes(self):
+        fake, c, saved, _ = await self._ready(ssh_script={"du -sb": (0, b"12345678\n", b"")})
+        await c.stop()
+        self.assertEqual(saved["thunder"]["base_bytes"], 12345678)
+        self.assertIn(thunderctl._DU_CMD, _ssh_cmds(fake))
+        self.assertEqual(thunderctl._DU_CMD,
+                         "du -sb --exclude=ComfyUI/models --exclude=hf-cache ~ | cut -f1")
+
+    async def test_failed_du_keeps_old_base_and_still_stops(self):
+        fake, c, saved, _ = await self._ready(ssh_script={"du -sb": (255, b"", b"refused\n")})
+        c.state.base_bytes = 777
+        await c.stop()
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        self.assertEqual(saved["thunder"]["base_bytes"], 777)
+        self.assertTrue(any("base size not measured" in ln for ln in c.state.log))
+
+    async def test_delete_that_never_disappears_fails_not_off(self):
+        fake, c, saved, _ = await self._ready()
+
+        def handler(req):
+            if req.url.path.endswith("/delete"):
+                fake.calls.append((req.method, req.url.path, None))
+                return httpx.Response(200, json={"message": "ok"})   # … and deletes nothing
+            return fake.handler(req)
+        c.deps.client_factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        c._api = c._client = None
+        n = len(c.h.phases)
+        t0 = c.h.clock[0]
+        await c.stop()
+        self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "deleting"))
+        self.assertNotIn("off", c.h.phases[n:])
+        self.assertEqual(saved["thunder"]["uuid"], "u0")       # still known: it bills
+        self.assertGreater(saved["thunder"]["started_at"], 0)
+        self.assertGreaterEqual(c.h.clock[0] - t0, 5 * 60)
+        self.assertLess(c.h.clock[0] - t0, 5 * 60 + 60)
+        self.assertEqual(c.h.faults[-1][1:3], ("lifecycle", "error"))
+        # a second stop resumes at deleting: no second snapshot
+        c.deps.client_factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(fake.handler))
+        c._api = c._client = None
+        await c.stop()
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        self.assertEqual(len(fake.snaps), 1)
+
+    async def test_failed_snapshot_request_resumes_with_the_same_name(self):
+        fake, c, _, _ = await self._ready()
+        fail = [True]
+
+        def handler(req):
+            if req.url.path == "/snapshots/create" and fail[0]:
+                fail[0] = False
+                return httpx.Response(500, text="snapshot service down")
+            return fake.handler(req)
+        c.deps.client_factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        c._api = c._client = None
+        await c.stop()
+        self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "snapshotting"))
+        self.assertIn("0", fake.instances)                    # kept: its changes are unsaved
+        name = c.state.pending_snapshot_name
+        c.h.clock[0] += 3600                                   # a later retry …
+        await c.stop()
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        self.assertEqual([s["name"] for s in fake.snaps], [name])   # … keeps the name
+
+    async def test_stop_refusals(self):
+        fake = FakeThunder()
+        c, saved, _, _ = make(fake)
+        with self.assertRaises(RuntimeError):                  # nothing running
+            await c.stop()
+        saved["thunder"] = "garbage"
+        c2 = thunderctl.Controller(c.backend, c.deps)
+        with self.assertRaises(RuntimeError):                  # unreconciled (Note for Task 6)
+            await c2.stop()
+        self.assertEqual(fake.calls, [])
+
+    async def test_restart_comfy_refused_after_a_failed_stop_step(self):
+        fake, c, _, _ = await self._ready()
+        c.state.phase, c.state.failed_phase = "failed", "deleting"
+        with self.assertRaises(RuntimeError):
+            await c.restart_comfy()
+
+    async def test_stop_while_resume_of_an_off_backend_is_refused(self):
+        fake = FakeThunder()
+        c, _, _, _ = make(fake, state={"phase": "off"})
+        gate = asyncio.Event()
+
+        async def handler(req):
+            await gate.wait()
+            return fake.handler(req)
+        c.state.pending_snapshot = "s1"
+        c.deps.client_factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        resume = asyncio.ensure_future(c.resume())
+        while c._op != "resuming":
+            await asyncio.sleep(0)
+        with self.assertRaises(RuntimeError):
+            await c.stop()
+        gate.set()
+        await resume
+
+    async def test_concurrent_stop_is_refused(self):
+        fake, c, _, _ = await self._ready()
+        c.deps.inflight = lambda bid: 1                        # a job that runs on
+        first = asyncio.ensure_future(c.stop())
+        for _ in range(5):
+            await asyncio.sleep(0)
+        with self.assertRaises(RuntimeError):
+            await c.stop()
+        with self.assertRaises(RuntimeError):                  # and no start meanwhile
+            await c.start()
+        c.deps.inflight = lambda bid: 0
+        await first
+        self.assertEqual(c.state.phase, "off", c.state.error)
+
+    async def test_stop_from_failed_connecting_deletes_without_snapshot(self):
+        fake = FakeThunder()
+        c, _, enabled, _ = make(fake, ssh_script={"true": (255, b"", b"Connection refused")})
+        await c.start()
+        self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "connecting"))
+        n = len(fake.calls)
+        await c.stop()
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        self.assertNotIn(("POST", "/snapshots/create"), _paths(fake, n))
+        self.assertEqual(fake.instances, {})
+        self.assertIs(enabled["comfyui:thunder"], False)
+
+    async def test_failed_bootstrap_snapshot_is_marked_and_bootstraps_again(self):
+        fake = FakeThunder()
+        c, saved, _, _ = make(fake, ssh_script={"bash -s": (124, b"", b"timeout")})
+        await c.start()
+        self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "bootstrapping"))
+        await c.stop()
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        self.assertEqual(saved["thunder"]["incomplete_snapshots"], ["s0"])
+        self.assertTrue(any("half-finished" in ln for ln in c.state.log))
+        fake.snaps[0]["status"] = "READY"
+        await c.watch_snapshots()
+        self.assertEqual(c.state.snapshot_id, "s0")
+        # a start from it restores the snapshot AND runs the bootstrap again
+        c.deps.ssh = make(fake)[0].deps.ssh                   # a bootstrap that succeeds
+        fake.status_script = ["PROVISIONING", "RUNNING"]
+        n = len(fake.calls)
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        self.assertEqual(_creates(fake)[-1]["template"], fake.snaps[0]["name"])
+        self.assertTrue([p for m, p, _ in fake.calls[n:] if m == "SSH" and "bash -s" in p])
+        self.assertFalse(c.state.bootstrap_incomplete)
+        # … and the snapshot of THAT session is a complete one
+        await c.stop()
+        self.assertEqual(c.state.incomplete_snapshots, ["s0"])
+        self.assertEqual(c.state.pending_snapshot, "s1")
+
+    async def test_instance_vanished_before_snapshot_is_off_with_fault(self):
+        fake, c, _, enabled = await self._ready()
+        fake.instances.clear()
+        n = len(fake.calls)
+        await c.stop()
+        self.assertEqual(c.state.phase, "off")
+        self.assertIn("vanished", c.state.error)
+        self.assertNotIn(("POST", "/snapshots/create"), _paths(fake, n))
+        self.assertEqual(c.h.faults[-1][1:3], ("lifecycle", "instance_vanished"))
+        self.assertEqual(c.state.started_at, 0.0)
+        self.assertIs(enabled["comfyui:thunder"], False)
+
+    async def test_known_hosts_file_goes_with_the_instance(self):
+        fake, c, _, _ = await self._ready()
+        kh = c._known_hosts_path("u0")
+        with open(kh, "w") as f:
+            f.write("[10.0.0.5]:30022 ssh-ed25519 AAAA\n")
+        await c.stop()
+        self.assertFalse(os.path.exists(kh))
+
+
+class AbortStart(unittest.IsolatedAsyncioTestCase):
+    """Ruling 13: stop() while a start() runs aborts the start and stops from the phase
+    it reached."""
+
+    async def _settle(self):
+        for _ in range(20):
+            await asyncio.sleep(0)
+
+    async def test_abort_before_create_is_off_and_disabled(self):
+        fake = FakeThunder()
+        c, _, enabled, _ = make(fake)
+        gate, entered = asyncio.Event(), asyncio.Event()
+
+        async def keygen(path):
+            entered.set()
+            await gate.wait()
+            return "ssh-ed25519 AAAA"
+        c.deps.keygen = keygen
+        start = asyncio.ensure_future(c.start())
+        await entered.wait()
+        self.assertIs(enabled["comfyui:thunder"], True)
+        await c.stop()
+        await start                                          # returns, does not raise
+        self.assertEqual(c.state.phase, "off")
+        self.assertIn("aborted", c.state.error)
+        self.assertIs(enabled["comfyui:thunder"], False)
+        self.assertEqual(_creates(fake), [])
+        self.assertIsNone(c._op)
+        gate.set()
+        await c.start()                                      # nothing blocks a new start
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+
+    async def test_abort_during_create_post_still_deletes_the_instance(self):
+        # the POST was out when the stop came: the instance exists and bills — its id
+        # must be learned before giving up, or nobody ever deletes it
+        fake = FakeThunder()
+        c, saved, _, _ = make(fake)
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def handler(req):
+            r = fake.handler(req)
+            if req.url.path == "/instances/create":
+                entered.set()
+                await release.wait()
+            return r
+        c.deps.client_factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        start = asyncio.ensure_future(c.start())
+        await entered.wait()
+        stop = asyncio.ensure_future(c.stop())
+        await self._settle()
+        release.set()
+        await stop
+        await start
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        self.assertEqual(fake.instances, {})
+        self.assertIn(("POST", "/instances/0/delete"), _paths(fake))
+        self.assertNotIn(("POST", "/snapshots/create"), _paths(fake))
+
+    async def test_abort_while_waiting_for_running_deletes_without_snapshot(self):
+        fake = FakeThunder()
+        fake.status_script = ["PROVISIONING"] * 1000
+        c, _, enabled, _ = make(fake)
+        start = asyncio.ensure_future(c.start())
+        while c.state.phase != "creating":
+            await asyncio.sleep(0)
+        await c.stop()
+        await start
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        self.assertEqual(fake.instances, {})
+        self.assertNotIn(("POST", "/snapshots/create"), _paths(fake))
+        self.assertIs(enabled["comfyui:thunder"], False)
+        self.assertEqual(c.h.faults, [])
+
+    async def test_abort_during_bootstrap_snapshots_it_marked(self):
+        fake = FakeThunder()
+        c, _, _, _ = make(fake)
+        orig, running = c.deps.ssh, []
+
+        async def ssh(argv, stdin=None, timeout=60):
+            if "bash -s" in argv[-1]:
+                running.append(True)
+                try:
+                    await asyncio.Event().wait()             # a bootstrap that takes hours
+                finally:
+                    running.pop()                            # sshrun.run kills its ssh here
+            return await orig(argv, stdin=stdin, timeout=timeout)
+        c.deps.ssh = ssh
+        start = asyncio.ensure_future(c.start())
+        while not running:
+            await asyncio.sleep(0)
+        self.assertEqual(c.state.phase, "bootstrapping")
+        await c.stop()
+        await start
+        self.assertEqual(running, [])                        # the bootstrap's ssh ended
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        self.assertEqual(c.state.incomplete_snapshots, ["s0"])
+        self.assertEqual(fake.instances, {})
+
+    async def test_abort_restart_comfy(self):
+        fake = FakeThunder()
+        _ready_snap(fake)
+        answers = [True]
+
+        async def probe(url):
+            return answers[0]
+        c, _, _, _ = make(fake, probe=probe)
+        await c.start()
+        answers[0] = False                                   # the restart hangs probing
+        restart = asyncio.ensure_future(c.restart_comfy())
+        while c.state.phase != "starting":
+            await asyncio.sleep(0)
+        await c.stop()
+        await restart
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        self.assertEqual(fake.instances, {})
+
+    async def test_outer_cancel_is_not_swallowed(self):
+        # a gateway shutdown cancels the start task itself: that must propagate
+        fake = FakeThunder()
+        fake.status_script = ["PROVISIONING"] * 1000
+        c, _, _, _ = make(fake)
+        start = asyncio.ensure_future(c.start())
+        while c.state.phase != "creating":
+            await asyncio.sleep(0)
+        start.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await start
+        self.assertEqual(c.state.phase, "creating")          # resume() picks it up
+        self.assertIsNone(c._op)
+
+
+class Resume(unittest.IsolatedAsyncioTestCase):
+    """Spec "Nach Gateway-Neustart": the persisted state against /instances/list."""
+
+    async def test_resume_mid_snapshotting_does_not_double_snapshot(self):
+        fake = FakeThunder()
+        _inst(fake)
+        name = "aihub-thunder-20260927t100000z"
+        fake.snaps.append({"id": "s5", "name": name, "status": "CREATING",
+                           "minimumDiskSizeGb": 120, "createdAt": 50})
+        # a restart between the snapshot POST and persisting its id
+        c, saved, enabled, _ = make(fake, state=_persisted(
+            phase="snapshotting", pending_snapshot_name=name))
+        await c.resume()
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        self.assertNotIn(("POST", "/snapshots/create"), _paths(fake))
+        self.assertEqual(len(fake.snaps), 1)
+        self.assertEqual(c.state.pending_snapshot, "s5")
+        self.assertEqual(fake.instances, {})
+        self.assertIs(enabled["comfyui:thunder"], False)
+
+    async def test_resume_mid_snapshotting_with_id_skips_to_delete_idempotently(self):
+        fake = FakeThunder()
+        _inst(fake)
+        name = "aihub-thunder-20260927t100000z"
+        fake.snaps.append({"id": "s5", "name": name, "status": "CREATING",
+                           "minimumDiskSizeGb": 120, "createdAt": 50})
+        c, _, _, _ = make(fake, state=_persisted(
+            phase="snapshotting", pending_snapshot="s5", pending_snapshot_name=name))
+        await c.resume()
+        self.assertEqual(c.state.phase, "off")
+        self.assertEqual(len(fake.snaps), 1)
+
+    async def test_resume_finds_instance_by_index_when_uuid_unknown(self):
+        # Review focus 1 under Ruling 10: create answered without a uuid, the gateway
+        # restarted mid-stop; the index is used only because the item there carries the
+        # template we asked for, created around our request — its uuid is adopted
+        fake = FakeThunder()
+        _inst(fake, idx="3", uuid="u3", template="comfy-ui", createdAt=1_790_000_010)
+        c, saved, _, _ = make(fake, state=_persisted(
+            phase="pruning", uuid="", index="3", created_template="comfy-ui",
+            create_requested_at=1_790_000_000.0))
+        await c.resume()
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        kinds = _paths(fake)
+        self.assertIn(("POST", "/snapshots/create"), kinds)
+        self.assertIn(("POST", "/instances/u3/delete"), kinds)   # by the ADOPTED uuid
+        self.assertEqual(fake.instances, {})
+
+    async def test_resume_never_takes_a_stranger_at_our_index(self):
+        # Thunder reuses indices: our uuid is gone, somebody else's instance sits at
+        # our old index — it is never snapshotted or deleted (Ruling 10)
+        fake = FakeThunder()
+        _inst(fake, idx="0", uuid="u9")
+        c, _, _, _ = make(fake, state=_persisted(phase="draining"))
+        await c.resume()
+        self.assertEqual(c.state.phase, "off")
+        self.assertIn("vanished", c.state.error)
+        self.assertIn("0", fake.instances)
+        kinds = _paths(fake)
+        self.assertFalse([p for m, p in kinds if p.endswith("/delete")
+                          or p == "/snapshots/create"])
+        self.assertEqual(_ssh_cmds(fake), [])                # not even an ssh to it
+        self.assertEqual(c.h.phases, ["off"])                # no stop step was entered
+        self.assertEqual(c.h.faults[-1][1:3], ("lifecycle", "instance_vanished"))
+
+    async def test_resume_ready_closes_ports_again(self):
+        # Review focus 2: the port guard also runs after a restart
+        fake = FakeThunder()
+        _inst(fake, httpPorts=[8188])
+        c, _, _, _ = make(fake, state=_persisted())
+        await c.resume()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        kinds = _paths(fake)
+        patch = kinds.index(("PATCH", "/instances/0/ports"))
+        self.assertLess(patch, kinds.index(("TUNNEL", "start")))
+        self.assertEqual(fake.instances["0"]["httpPorts"], [])
+        self.assertTrue(c.h.tunnels[-1].running)
+
+    async def test_resume_ready_with_port_that_stays_open_fails(self):
+        fake = FakeThunder()
+        _inst(fake, httpPorts=[8188])
+        fake.ignore_port_remove = True
+        c, _, _, _ = make(fake, state=_persisted())
+        await c.resume()
+        self.assertEqual(c.state.phase, "failed")
+        self.assertEqual(c.h.tunnels, [])
+
+    async def test_resume_ready_restarts_comfy_that_does_not_answer(self):
+        fake = FakeThunder()
+        _inst(fake)
+        restarted = []
+
+        async def probe(url):
+            return bool(restarted)
+        c, _, _, _ = make(fake, probe=probe, state=_persisted())
+        orig = c.deps.ssh
+
+        async def ssh(argv, stdin=None, timeout=60):
+            if "pkill" in argv[-1]:
+                restarted.append(True)
+            return await orig(argv, stdin=stdin, timeout=timeout)
+        c.deps.ssh = ssh
+        await c.resume()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        self.assertEqual(restarted, [True])
+
+    async def test_resume_ready_that_answers_needs_no_restart(self):
+        fake = FakeThunder()
+        _inst(fake)
+        c, _, _, _ = make(fake, state=_persisted())
+        await c.resume()
+        self.assertEqual(c.state.phase, "ready")
+        self.assertEqual(_ssh_cmds(fake), [])
+
+    async def test_resume_vanished_instance_is_off_with_fault(self):
+        fake = FakeThunder()
+        fake.status_script = []
+        c, saved, enabled, _ = make(fake, state=_persisted())
+        await c.resume()
+        self.assertEqual(c.state.phase, "off")
+        self.assertIn("vanished", c.state.error)
+        self.assertEqual(saved["thunder"]["uuid"], "")
+        self.assertEqual(saved["thunder"]["started_at"], 0.0)
+        self.assertEqual(c.h.faults[-1][1:3], ("lifecycle", "instance_vanished"))
+        self.assertIs(enabled["comfyui:thunder"], False)
+
+    async def test_resume_after_the_delete_is_plain_off(self):
+        fake = FakeThunder()
+        fake.status_script = []
+        fake.snaps.append({"id": "s5", "name": "aihub-thunder-20260927t100000z",
+                           "status": "CREATING", "minimumDiskSizeGb": 120, "createdAt": 50})
+        c, _, _, _ = make(fake, state=_persisted(phase="deleting", pending_snapshot="s5"))
+        await c.resume()
+        self.assertEqual((c.state.phase, c.state.error), ("off", ""))
+        self.assertEqual(c.h.faults, [])
+        self.assertEqual(c.state.pending_snapshot, "s5")      # still watched
+
+    async def test_resume_off_runs_the_watcher(self):
+        fake = FakeThunder()
+        _ready_snap(fake, "aihub-thunder-20260925t120000z", "s1", created=5)
+        _ready_snap(fake, "aihub-thunder-20260926t120000z", "s2", created=9)
+        c, _, _, _ = make(fake, state={"phase": "off", "snapshot_id": "s1",
+                                       "pending_snapshot": "s2",
+                                       "manifests": {"s1": {}, "s2": {}}})
+        await c.resume()
+        self.assertEqual(c.state.snapshot_id, "s2")
+        self.assertEqual([s["id"] for s in fake.snaps], ["s2"])
+        self.assertNotIn("/instances/list", [p for _, p in _paths(fake)])
+
+    async def test_resume_continues_an_interrupted_restore(self):
+        fake = FakeThunder()
+        _inst(fake, template="aihub-thunder-20260926t120000z")
+        c, _, _, _ = make(fake, state=_persisted(phase="restoring", ip="", port=0))
+        await c.resume()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        self.assertIn(thunderctl._START_CMD, _ssh_cmds(fake))
+        self.assertFalse([x for x in _ssh_cmds(fake) if "bash -s" in x])
+
+    async def test_resume_interrupted_first_start_runs_the_bootstrap(self):
+        fake = FakeThunder()
+        _inst(fake)
+        c, _, _, _ = make(fake, state=_persisted(phase="creating", ip="", port=0,
+                                                 bootstrap_incomplete=True))
+        await c.resume()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        self.assertTrue([x for x in _ssh_cmds(fake) if "bash -s" in x])
+
+    async def test_resume_interrupted_bootstrap_fails_and_keeps_instance(self):
+        fake = FakeThunder()
+        _inst(fake)
+        c, _, _, _ = make(fake, state=_persisted(phase="bootstrapping",
+                                                 bootstrap_incomplete=True))
+        await c.resume()
+        self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "bootstrapping"))
+        self.assertIn("0", fake.instances)
+        self.assertTrue(c.h.tunnels[-1].running)             # Restart ComfyUI can work
+        self.assertFalse([x for x in _ssh_cmds(fake) if "bash -s" in x])
+        await c.stop()                                       # its snapshot is marked
+        self.assertEqual(c.state.incomplete_snapshots, ["s0"])
+
+    async def test_resume_failed_reattaches_but_stays_failed(self):
+        fake = FakeThunder()
+        _inst(fake, httpPorts=[8188])
+        c, _, _, _ = make(fake, state=_persisted(phase="failed", failed_phase="starting",
+                                                 error="x"))
+        await c.resume()
+        self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "starting"))
+        self.assertEqual(fake.instances["0"]["httpPorts"], [])
+        self.assertTrue(c.h.tunnels[-1].running)
+
+    async def test_resume_failed_stop_continues_the_stop(self):
+        fake = FakeThunder()
+        _inst(fake)
+        c, _, _, _ = make(fake, state=_persisted(phase="failed", failed_phase="deleting",
+                                                 pending_snapshot="s5"))
+        await c.resume()
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        self.assertEqual(fake.instances, {})
+
+    async def test_resume_list_error_is_retried_by_run_forever(self):
+        fake = FakeThunder()
+        _inst(fake)
+        down = [True]
+
+        def handler(req):
+            if req.url.path == "/instances/list" and down[0]:
+                return httpx.Response(503, text="maintenance")
+            return fake.handler(req)
+        c, _, _, _ = make(fake, state=_persisted())
+        c.deps.client_factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await c.resume()
+        self.assertEqual(c.state.phase, "ready")               # untouched …
+        self.assertEqual(c.h.tunnels, [])                      # … and not yet reattached
+        down[0] = False
+        await _one_round(c)
+        self.assertTrue(c.h.tunnels and c.h.tunnels[-1].running)
+
+    async def test_unreadable_state_reconciles_to_off_without_strangers(self):
+        fake = FakeThunder()
+        fake.status_script = []
+        c, saved, _, _ = make(fake, state="garbage")
+        self.assertTrue(c.persist_blocked)
+        await c.resume()
+        self.assertFalse(c.persist_blocked)
+        self.assertEqual(saved["thunder"]["phase"], "off")
+
+    async def test_unreadable_state_with_strangers_is_failed_without_instance(self):
+        fake = FakeThunder()
+        _inst(fake, idx="4", uuid="u4")
+        c, saved, _, _ = make(fake, state="garbage")
+        c.deps.known_uuids = lambda: {"u-other"}
+        await c.resume()
+        self.assertFalse(c.persist_blocked)
+        self.assertEqual((c.state.phase, c.state.uuid, c.state.index), ("failed", "", ""))
+        self.assertIn("u4", c.state.error)
+        self.assertNotEqual(c.state.failed_phase, thunderctl.LOAD_FAILED)
+        self.assertEqual([o["uuid"] for o in c.view()["orphans"]], ["u4"])
+        self.assertIn("4", fake.instances)                    # never deleted
+        await c.stop()                                         # nothing of ours to stop
+        self.assertEqual(c.state.phase, "off")
+        self.assertIn("4", fake.instances)
+
+    async def test_unreadable_state_reread_on_resume(self):
+        fake = FakeThunder()
+        _inst(fake)
+        c0, saved, _, _ = make(fake)
+        record = _persisted()
+        tries = [0]
+
+        def load(name):
+            tries[0] += 1
+            if tries[0] == 1:
+                raise OSError("store locked")
+            return record
+        c0.deps.load_state = load
+        c = thunderctl.Controller(c0.backend, c0.deps)
+        c._tunnel_factory = c0._tunnel_factory
+        c.h = c0.h
+        self.assertTrue(c.persist_blocked)
+        await c.resume()
+        self.assertFalse(c.persist_blocked)
+        self.assertEqual((c.state.phase, c.state.uuid), ("ready", "u0"))
+
+    async def test_resume_unreconciled_list_error_stays_blocked(self):
+        fake = FakeThunder()
+
+        def handler(req):
+            return httpx.Response(503, text="down")
+        c, saved, _, _ = make(fake, state="garbage")
+        c.deps.client_factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await c.resume()
+        self.assertTrue(c.persist_blocked)
+        self.assertEqual(saved["thunder"], "garbage")
+        with self.assertRaises(RuntimeError):
+            await c.start()
+
+
+async def _one_round(c):
+    """One run_forever round: its first 60 s sleep passes, the second ends the loop."""
+    orig, n = c.deps.sleep, [0]
+
+    async def sleep(sec):
+        if sec == thunderctl._WATCH_S:
+            n[0] += 1
+            if n[0] > 1:
+                raise asyncio.CancelledError()
+        await orig(sec)
+    c.deps.sleep = sleep
+    try:
+        await c.run_forever()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        c.deps.sleep = orig
+
+
+class Watcher(unittest.IsolatedAsyncioTestCase):
+    """Spec "Stop" 4: the pending snapshot → READY (rotation) or FAILED (fault)."""
+
+    async def test_rotation_after_ready(self):
+        fake = FakeThunder()
+        _ready_snap(fake, "aihub-thunder-20260924t120000z", "s1", created=3)
+        _ready_snap(fake, "aihub-thunder-20260925t120000z", "s2", created=5)
+        fake.snaps.append({"id": "s3", "name": "aihub-thunder-20260926t120000z",
+                           "status": "CREATING", "minimumDiskSizeGb": 120, "createdAt": 9})
+        fake.snaps.append({"id": "x1", "name": "aihub-other-20260920t120000z",
+                           "status": "READY", "minimumDiskSizeGb": 120, "createdAt": 1})
+        c, saved, _, _ = make(fake, state={"phase": "off", "snapshot_id": "s2",
+                                           "pending_snapshot": "s3",
+                                           "manifests": {"s1": {}, "s2": {}, "s3": {"m": 1}}})
+        await c.watch_snapshots()                             # still CREATING
+        self.assertEqual(c.state.pending_snapshot, "s3")
+        self.assertEqual(len(fake.snaps), 4)
+        fake.snaps[2]["status"] = "READY"
+        await c.watch_snapshots()
+        self.assertEqual((c.state.snapshot_id, c.state.pending_snapshot), ("s3", ""))
+        self.assertEqual(sorted(s["id"] for s in fake.snaps), ["s3", "x1"])
+        self.assertEqual(saved["thunder"]["manifests"], {"s3": {"m": 1}})
+
+    async def test_failed_snapshot_keeps_old_and_falls_back_manifest(self):
+        fake = FakeThunder()
+        _ready_snap(fake, "aihub-thunder-20260925t120000z", "s2", created=5)
+        fake.snaps.append({"id": "s3", "name": "aihub-thunder-20260926t120000z",
+                           "status": "FAILED", "minimumDiskSizeGb": 120, "createdAt": 9})
+        c, saved, _, _ = make(fake, state={"phase": "off", "snapshot_id": "s2",
+                                           "pending_snapshot": "s3",
+                                           "incomplete_snapshots": ["s3"],
+                                           "manifests": {"s2": {"a": 1}, "s3": {"b": 2}}})
+        await c.watch_snapshots()
+        self.assertEqual((c.state.snapshot_id, c.state.pending_snapshot), ("s2", ""))
+        self.assertEqual(saved["thunder"]["manifests"], {"s2": {"a": 1}})
+        self.assertEqual(saved["thunder"]["incomplete_snapshots"], [])
+        self.assertEqual([s["id"] for s in fake.snaps], ["s2", "s3"])   # s2 stays
+        self.assertEqual(c.h.faults[-1][1:], ("lifecycle", "snapshot_failed",
+                                              "aihub-thunder-20260926t120000z"))
+        self.assertEqual(thunder.newest_ready(await c.api.snapshots(), "thunder")["id"], "s2")
+
+    async def test_new_snapshot_without_created_at_is_never_rotated_away(self):
+        fake = FakeThunder()
+        _ready_snap(fake, "aihub-thunder-20260925t120000z", "s2", created=5)
+        fake.snaps.append({"id": "s3", "name": "aihub-thunder-20260926t120000z",
+                           "status": "READY", "minimumDiskSizeGb": 120})
+        c, _, _, _ = make(fake, state={"phase": "off", "pending_snapshot": "s3"})
+        await c.watch_snapshots()
+        self.assertEqual(c.state.snapshot_id, "s3")
+        self.assertIn("s3", [s["id"] for s in fake.snaps])
+
+    async def test_pending_missing_from_the_list_fails_after_some_rounds(self):
+        fake = FakeThunder()
+        c, _, _, _ = make(fake, state={"phase": "off", "pending_snapshot": "s7",
+                                       "pending_snapshot_name": "aihub-thunder-x",
+                                       "manifests": {"s7": {}}})
+        for _ in range(thunderctl._PENDING_MISSES - 1):
+            await c.watch_snapshots()
+            self.assertEqual(c.state.pending_snapshot, "s7")
+        await c.watch_snapshots()
+        self.assertEqual(c.state.pending_snapshot, "")
+        self.assertEqual(c.state.manifests, {})
+        self.assertEqual(c.h.faults[-1][2:], ("snapshot_failed", "aihub-thunder-x"))
+
+    async def test_list_error_changes_nothing(self):
+        fake = FakeThunder()
+        c, _, _, _ = make(fake, state={"phase": "off", "pending_snapshot": "s7"})
+        c.deps.client_factory = lambda: httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda r: httpx.Response(502)))
+        await c.watch_snapshots()
+        self.assertEqual(c.state.pending_snapshot, "s7")
+        self.assertEqual(c.h.faults, [])
+
+    async def test_rotation_delete_error_is_logged(self):
+        fake = FakeThunder()
+        _ready_snap(fake, "aihub-thunder-20260925t120000z", "s2", created=5)
+        _ready_snap(fake, "aihub-thunder-20260926t120000z", "s3", created=9)
+        c, _, _, _ = make(fake, state={"phase": "off", "pending_snapshot": "s3",
+                                       "manifests": {"s2": {}, "s3": {}}})
+
+        def handler(req):
+            if req.method == "DELETE":
+                return httpx.Response(500, text="nope")
+            return fake.handler(req)
+        c.deps.client_factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await c.watch_snapshots()
+        self.assertEqual(c.state.snapshot_id, "s3")
+        self.assertIn("s2", c.state.manifests)                # not deleted → kept
+        self.assertTrue(any("deleting snapshot s2 failed" in ln for ln in c.state.log))
+
+    async def test_stop_recording_a_newer_pending_meanwhile_wins(self):
+        # the watcher awaits the list while a stop records the NEXT pending snapshot:
+        # the READY answer about the old one must not promote the new id
+        fake = FakeThunder()
+        _ready_snap(fake, "aihub-thunder-20260926t120000z", "s3", created=9)
+        c, _, _, _ = make(fake, state={"phase": "off", "snapshot_id": "s1",
+                                       "pending_snapshot": "s3"})
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def handler(req):
+            if req.url.path == "/snapshots/list":
+                entered.set()
+                await release.wait()
+            return fake.handler(req)
+        c.deps.client_factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        watch = asyncio.ensure_future(c.watch_snapshots())
+        await entered.wait()
+        c.state.pending_snapshot = "s9"
+        release.set()
+        await watch
+        self.assertEqual((c.state.snapshot_id, c.state.pending_snapshot), ("s1", "s9"))
+
+    async def test_run_forever_watches_while_pending(self):
+        fake = FakeThunder()
+        _ready_snap(fake, "aihub-thunder-20260926t120000z", "s3", created=9)
+        c, _, _, _ = make(fake, state={"phase": "off", "pending_snapshot": "s3"})
+        await _one_round(c)
+        self.assertEqual(c.state.snapshot_id, "s3")
+        n = len(fake.calls)
+        await _one_round(c)                                   # nothing pending: no calls
+        self.assertEqual(len(fake.calls), n)
+
+
+class Orphans(unittest.IsolatedAsyncioTestCase):
+    async def test_orphans_are_unowned_instances_only_and_never_deleted(self):
+        fake = FakeThunder()
+        _inst(fake, idx="0", uuid="u0")
+        _inst(fake, idx="1", uuid="u1")
+        _inst(fake, idx="2", uuid="u2")
+        _inst(fake, idx="3", uuid="u3", status="DELETED")
+        c, _, _, _ = make(fake, state=_persisted())
+        c.deps.known_uuids = lambda: {"u1"}                    # another backend's
+        out = await c.orphans()
+        self.assertEqual([o["uuid"] for o in out], ["u2"])
+        self.assertEqual([o["uuid"] for o in c.view()["orphans"]], ["u2"])
+        self.assertEqual([m for m, _ in _paths(fake)], ["GET"])
 
 
 class BootstrapParse(unittest.TestCase):

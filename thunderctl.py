@@ -26,6 +26,19 @@ before `create` ends in `off`; after it in `failed(<phase>)` with the instance K
 diagnosis. The bootstrap's verdict is read from its `GW:` lines by tag
 (`parse_bootstrap`/`bootstrap_verdict`, ledger Ruling 9).
 
+The stop path (`stop()`, spec "Stop") is draining → pruning → snapshotting → deleting →
+`off`, each step re-entrant: the snapshot NAME is persisted before its POST and looked
+up before creating (a restart in between never takes a second one), and the delete is
+only done once a fresh `/instances/list` no longer shows the instance — one that stays
+is `failed(deleting)`, never `off`, because it bills. Only a confirmed-gone instance
+clears the ids and `started_at` (the session cost stops there). A stop() aborts a start
+in flight and stops from the phase it reached (Ruling 13); a snapshot taken before the
+bootstrap finished is marked (`incomplete_snapshots`) so a start from it bootstraps
+again. `watch_snapshots()` settles the pending snapshot (READY → rotation, FAILED →
+fault, the last READY one stays the template) and `resume()` reconciles the persisted
+state with the instance list after a gateway restart. Every mutating call uses an item
+found in a FRESH list by `_find_ours` (Ruling 10); `orphans()` only ever displays.
+
 Never imports `main`: everything the controller needs from the gateway arrives in
 `Deps`, so it stays hot-reload-safe and testable against a stub API and a fake ssh.
 `ThunderApi` owns the HTTP: Bearer token, `httpx.Timeout(30, connect=10)`, any 2xx
@@ -96,6 +109,24 @@ _BOOTSTRAP_TAIL = 200
 # venv the bootstrap picked (`ComfyUI/main.py` never appears in that command line).
 _RESTART_CMD = ("pkill -f '[m]ain[.]py --listen 127[.]0[.]0[.]1 --port "
                 f"{_COMFY_PORT}'; " + _START_CMD)
+
+# stop path / background timing
+_DRAIN_POLL_S = 2               # inflight check while draining (no timeout: a job may finish)
+_DELETE_POLL_S = 10             # /instances/list after the delete …
+_DELETE_WAIT_S = 5 * 60         # … until the instance is gone, else failed(deleting)
+_DU_TIMEOUT_S = 10 * 60         # `du` over the home directory (a venv has 100k files)
+# Everything under ~ except the two model roots: what the NEXT disk needs besides models.
+_DU_CMD = "du -sb --exclude=ComfyUI/models --exclude=hf-cache ~ | cut -f1"
+_WATCH_S = 60                   # snapshot watcher / resume retry interval
+_PENDING_MISSES = 3             # rounds a pending snapshot may be absent from the list
+_RESUME_PROBE_S = 30            # a freshly started tunnel needs a moment before ComfyUI answers
+_STOP_STEPS = ("draining", "pruning", "snapshotting", "deleting")
+# Phases before any bootstrap ran: the instance holds nothing a snapshot should keep (a
+# template, or an unchanged copy of the snapshot it was restored from).
+_PRE_BOOT = ("creating", "restoring", "connecting")
+# ops a stop() may abort (Ruling 13): an operator must be able to end a hanging, billing
+# start; "stopping" itself is never aborted
+_ABORTABLE = ("starting", "restarting ComfyUI", "resuming")
 
 
 # ── Thunder REST client ──────────────────────────────────────────────────────
@@ -269,11 +300,21 @@ class State:
     base_bytes: int = 0
     snapshot_id: str = ""           # the snapshot the running instance was started from
     pending_snapshot: str = ""      # id of the snapshot taken at the last stop, until READY/FAILED
+    # its name, persisted BEFORE the create: a restart between the POST and persisting
+    # the id finds the snapshot by name instead of taking a second one
+    pending_snapshot_name: str = ""
     manifests: dict = field(default_factory=dict)   # snapshot id → model manifest
     # what the last bootstrap reported: models the TEMPLATE brought (rel → bytes; paid
     # for in every snapshot until deleted) and custom_nodes packs it brought
     bootstrap_unknown: dict = field(default_factory=dict)
     bootstrap_template_nodes: list = field(default_factory=list)
+    # True from the create of an instance that needs the bootstrap until the bootstrap
+    # succeeded (or ComfyUI was confirmed running): a snapshot taken meanwhile holds a
+    # half-finished install — a timed-out bootstrap may even still run on the box
+    bootstrap_incomplete: bool = False
+    # snapshot ids taken while `bootstrap_incomplete`: a start from one runs the
+    # bootstrap again (kept apart from `manifests`, whose entries are model files)
+    incomplete_snapshots: list = field(default_factory=list)
     # what the last create asked for and when — the only way to recognise OUR instance
     # when create answered without a uuid (Ruling 10), also after a gateway restart
     created_template: str = ""
@@ -427,6 +468,10 @@ class _PreCreate(Exception):
     """A start failed before any instance existed → `off`, not `failed`."""
 
 
+class _Vanished(Exception):
+    """The instance disappeared under a stop before its snapshot → `off` + fault."""
+
+
 # ── controller ───────────────────────────────────────────────────────────────
 
 class Controller:
@@ -441,7 +486,13 @@ class Controller:
         self._tunnel = None
         self._snaps: Optional[list[dict]] = None      # last /snapshots/list, for view()
         self._persist_blocked = False
-        self._op: Optional[str] = None                 # start/restart in flight
+        self._op: Optional[str] = None                 # start/restart/stop/resume in flight
+        self._op_task: Optional[asyncio.Task] = None   # the abortable op's task (Ruling 13)
+        self._aborted: Optional[asyncio.Task] = None   # the op task stop() cancelled
+        self._drain_waiting: Optional[int] = None      # jobs a draining stop waits for
+        self._orphans: list[dict] = []                 # last orphans() answer, for view()
+        self._resume_pending = False                   # resume() could not reach the API
+        self._pending_misses = 0                       # watcher rounds without the pending row
         self._nodes_text = ""                          # node list of the pending bootstrap
         self.state = State()
         try:
@@ -659,6 +710,7 @@ class Controller:
             table = pricing.get("pricing") if isinstance(pricing.get("pricing"), dict) else pricing
             monthly = thunder.snapshot_monthly(table, gb)
         return {"id": s.snapshot_id, "pending": s.pending_snapshot,
+                "pending_name": s.pending_snapshot_name,
                 "name": (row or {}).get("name", ""), "status": (row or {}).get("status", ""),
                 # Thunder reports no snapshot size; its minimum restore disk is the
                 # closest figure it gives, so $/month is an upper bound
@@ -677,7 +729,10 @@ class Controller:
                 "snapshot": self._snapshot_view(), "log": list(s.log[-_LOG_MAX:]),
                 "transfers": dict(s.transfers), "persist_blocked": self._persist_blocked,
                 "bootstrap_unknown": dict(s.bootstrap_unknown),
-                "bootstrap_template_nodes": list(s.bootstrap_template_nodes)}
+                "bootstrap_template_nodes": list(s.bootstrap_template_nodes),
+                "bootstrap_incomplete": s.bootstrap_incomplete,
+                "op": self._op, "waiting_jobs": self._drain_waiting,
+                "orphans": [dict(x) for x in self._orphans]}
 
     # lifecycle
     def _refuse_if_unreconciled(self) -> None:
@@ -902,6 +957,8 @@ class Controller:
             self._log(f"bootstrap: {len(s.bootstrap_unknown)} template model file(s), "
                       f"{gb:.1f} GB — delete them before the first stop or every "
                       "snapshot carries them")
+        s.bootstrap_incomplete = False
+        self._persist()
         self._log("bootstrap done")
 
     async def _bootstrap_log_tail(self) -> str:
@@ -944,6 +1001,24 @@ class Controller:
                                + " | ".join(_tail(err, 3)))
         await self._wait_comfy(settle)
 
+    # ops: one lifecycle operation at a time
+    async def _run_op(self, name: str, coro) -> None:
+        """Run `coro` as THE operation of this controller, in its own task, so a stop()
+        can cancel exactly it (Ruling 13) without cancelling whoever awaits it. A cancel
+        that stop() issued is swallowed here — stop owns the outcome from then on; any
+        other cancel (gateway shutdown) propagates."""
+        self._op = name
+        t = asyncio.ensure_future(coro)
+        self._op_task = t
+        try:
+            await t
+        except asyncio.CancelledError:
+            if not (t.cancelled() and self._aborted is t):
+                raise
+        finally:
+            if self._op_task is t:
+                self._op, self._op_task = None, None
+
     async def start(self) -> None:
         """Spec "Start" 0–6 (P1: no model sync — `starting` → `ready`).
 
@@ -952,7 +1027,8 @@ class Controller:
         state: a failure before `create` → `off` with the reason (nothing bills), a
         failure after it → `failed(<phase>)` with the instance KEPT (diagnosis; the
         stop path removes it). The uuid is persisted before the first wait, so a
-        gateway restart during the up to ~30 min to RUNNING still knows the instance."""
+        gateway restart during the up to ~30 min to RUNNING still knows the instance.
+        A stop() meanwhile aborts it and takes over from the phase it reached."""
         self._refuse_if_unreconciled()
         self._refuse_if_busy()
         s = self.state
@@ -961,11 +1037,7 @@ class Controller:
             raise RuntimeError(f"already {s.phase}"
                                + (f" (instance {s.uuid or s.index})" if s.uuid or s.index else ""))
         self._commit()
-        self._op = "starting"
-        try:
-            await self._start()
-        finally:
-            self._op = None
+        await self._run_op("starting", self._start())
 
     def _enable(self) -> None:
         """Step 0. A backend that stays disabled is never polled or routed to — an
@@ -978,8 +1050,14 @@ class Controller:
         if ok is False:
             raise _PreCreate(f"cannot enable backend {self.bid}: not a known backend")
 
+    def _disable(self) -> None:
+        """`off` = disabled (spec "Stop" 1): no discovery against a dead tunnel port."""
+        try:
+            self.deps.set_enabled(self.bid, False)
+        except Exception as e:
+            self._log(f"disabling the backend failed: {e!r}")
+
     async def _start(self) -> None:
-        s = self.state
         enabled = False
         try:
             self._enable()
@@ -991,13 +1069,18 @@ class Controller:
                 msg += " (an instance may exist anyway — check the orphan list)"
             self._set_phase("off", f"start failed: {msg}")
             if enabled:
-                try:
-                    self.deps.set_enabled(self.bid, False)   # off = disabled (spec "Stop" 1)
-                except Exception as e2:
-                    self._log(f"disabling the backend failed: {e2!r}")
+                self._disable()
             return
-        needs_bootstrap = created
+        await self._after_create(created)
+
+    async def _after_create(self, needs_bootstrap: bool) -> None:
+        """Steps 3–6 from a created instance on: RUNNING → port guard → tunnel → ssh →
+        bootstrap (if needed) → ComfyUI. Also how resume() continues a start the
+        gateway restart interrupted before the bootstrap."""
+        s = self.state
         try:
+            if needs_bootstrap and not self._nodes_text:
+                self._nodes_text = self._node_list()     # lost with a restart
             item = await self._wait_running(s.disk_gb)
             s.ip, s.port = str(item["ip"]), int(item["port"])
             self._persist()
@@ -1007,19 +1090,30 @@ class Controller:
             await self._start_tunnel()
             await self._wait_ssh()
             if needs_bootstrap:
+                s.bootstrap_incomplete = True
                 self._set_phase("bootstrapping")
                 await self._bootstrap()
             await self._ensure_ports_closed(await self._fresh_item())
             self._set_phase("starting")
             await self._start_comfy(_START_CMD)
-            self._set_phase("ready")
+            self._ready()
         except Exception as e:
             self._fail(_errtext(e))
+
+    def _ready(self) -> None:
+        """ComfyUI answers: whatever the bootstrap left undone, this instance works — a
+        snapshot of it is a good template (an operator who fixed a failed bootstrap by
+        hand and restarted ComfyUI has confirmed exactly that)."""
+        if self.state.bootstrap_incomplete:
+            self._log("ComfyUI answers — the unfinished bootstrap counts as done now")
+            self.state.bootstrap_incomplete = False
+        self._set_phase("ready")
 
     async def _create(self) -> bool:
         """Steps 1–3 up to the create: template, disk, key, `POST /instances/create`;
         index/uuid persisted with phase `creating`. → whether the instance needs the
-        bootstrap (no READY snapshot of ours to restore from)."""
+        bootstrap (no READY snapshot of ours to restore from, or the newest one was
+        taken before a bootstrap finished)."""
         s, cfg = self.state, self.cfg
         for k in ("gpu_type", "vcpus"):
             if not cfg.get(k):
@@ -1029,8 +1123,12 @@ class Controller:
         self._snaps = snaps
         snap = thunder.newest_ready(snaps, self.name)
         if snap is not None:
-            template, needs_bootstrap = snap["name"], False
-            self._nodes_text = ""
+            template = snap["name"]
+            needs_bootstrap = snap["id"] in s.incomplete_snapshots
+            if needs_bootstrap:
+                self._log(f"snapshot {snap['name']} was taken before its bootstrap finished "
+                          "— the bootstrap runs again on it")
+            self._nodes_text = self._node_list() if needs_bootstrap else ""
         else:
             template = str(cfg.get("bootstrap_template") or "comfy-ui")
             needs_bootstrap = True
@@ -1051,17 +1149,36 @@ class Controller:
                   + ("" if snap else " (first start: bootstrap follows)"))
         s.created_template, s.create_requested_at = template, self.deps.now()
         self._persist()
-        created = await self.api.create(thunder.create_body(cfg, template, disk_gb, pub))
+        fut = asyncio.ensure_future(
+            self.api.create(thunder.create_body(cfg, template, disk_gb, pub)))
+        try:
+            created = await asyncio.shield(fut)
+        except asyncio.CancelledError as cancel:
+            # stop() aborted the start while the POST was out: the instance may exist
+            # and bill already — learn its id before giving up, or nobody deletes it
+            try:
+                created = await fut
+            except Exception as e:
+                self._log(f"create aborted; its answer: {_errtext(e)}")
+                raise cancel
+            self._created(created, disk_gb, snap, needs_bootstrap)
+            raise cancel
+        self._created(created, disk_gb, snap, needs_bootstrap)
+        return needs_bootstrap
+
+    def _created(self, created: dict, disk_gb: int, snap: Optional[dict],
+                 needs_bootstrap: bool) -> None:
         # from here on an instance exists and bills: persist it BEFORE any wait
+        s = self.state
         s.index, s.uuid = created["index"], created["uuid"]
         s.ip, s.port = "", 0
         s.disk_gb = disk_gb
         s.started_at = self.deps.now()
         s.snapshot_id = snap["id"] if snap else ""
+        s.bootstrap_incomplete = needs_bootstrap
         if needs_bootstrap:
             s.bootstrap_unknown, s.bootstrap_template_nodes = {}, []
         self._set_phase("creating")
-        return needs_bootstrap
 
     async def restart_comfy(self) -> None:
         """Restart ComfyUI on the running instance (panel button; spec "Start" 5 says
@@ -1073,25 +1190,521 @@ class Controller:
         s = self.state
         if s.phase not in ("ready", "failed") or not (s.uuid and s.ip and s.port):
             raise RuntimeError(f"no running instance to restart ComfyUI on ({s.phase})")
-        self._op = "restarting ComfyUI"
+        if s.phase == "failed" and s.failed_phase in _STOP_STEPS:
+            raise RuntimeError(f"a stop did not finish ({s.failed_phase}) — stop again")
+        await self._run_op("restarting ComfyUI", self._restart())
+
+    async def _restart(self) -> None:
         try:
-            try:
-                await self._ensure_ports_closed(await self._fresh_item())
-                if self._tunnel is None:
-                    await self._start_tunnel()
-                self._set_phase("starting")
-                await self._start_comfy(_RESTART_CMD, settle=True)
-                self._set_phase("ready")
-            except Exception as e:
-                self._fail(_errtext(e))
-        finally:
-            self._op = None
+            await self._ensure_ports_closed(await self._fresh_item())
+            if self._tunnel is None:
+                await self._start_tunnel()
+            self._set_phase("starting")
+            await self._start_comfy(_RESTART_CMD, settle=True)
+            self._ready()
+        except Exception as e:
+            self._fail(_errtext(e))
+
+    # ── stop (spec "Stop" 1–4) ──────────────────────────────────────────────
+
+    async def _before_snapshot(self) -> None:
+        """Hook of the `pruning` step. P1: nothing to do. P2 (Task 11): end transfers,
+        delete the plan's prune list and stray `.part`s, write the manifest."""
+
+    async def _stop_transfers(self) -> None:
+        """Hook of the `draining` step (spec "Stop" 1: transfers end BEFORE the
+        snapshot, or it freezes growing `.part`s). P1: there are none."""
+
+    def _current_manifest(self) -> dict:
+        """The model manifest the snapshot carries (`manifests[sid]`). P1: `{}`."""
+        return {}
 
     async def stop(self) -> None:
-        raise NotImplementedError("Thunder stop path not implemented yet")
+        """Spec "Stop": draining → pruning → snapshotting → deleting → `off`.
+
+        Every step is re-entrant, so the same call finishes a stop a gateway restart
+        or a failure interrupted: it starts at the step the state names. A start or
+        ComfyUI restart in flight is ABORTED first and the stop runs from the phase it
+        reached (Ruling 13) — before `create` that is just `off` with the backend
+        disabled again; before any bootstrap ran (`creating|restoring|connecting`) the
+        instance holds nothing worth a snapshot and is deleted straight away.
+
+        Refused (raises): an unreconciled state (it may name a billing instance we
+        cannot identify), nothing running, a stop already in flight. A failure after
+        that ends in `failed(<step>)` with the instance kept — never `off` while it
+        may still bill; stop() again resumes from that step."""
+        self._refuse_if_unreconciled()
+        if self._op == "stopping":
+            raise RuntimeError("already stopping")
+        prev_op = self._op
+        prev = self._op_task if prev_op in _ABORTABLE else None
+        if prev is not None and prev.done():
+            prev = None
+        if self.state.phase == "off" and prev_op != "starting":
+            raise RuntimeError("not running")
+        self._op, self._op_task = "stopping", None
+        try:
+            if prev is not None:
+                self._log(f"stop: aborting {prev_op}")
+                self._aborted = prev
+                prev.cancel()
+                await asyncio.wait([prev])
+            s = self.state
+            if not (s.uuid or s.index):
+                # no instance was ever created (or it is long forgotten): nothing bills
+                self._disable()
+                self._set_phase("off", "start aborted before an instance was created"
+                                if prev is not None and prev_op == "starting" else "")
+                return
+            await self._stop_run()
+        finally:
+            self._op = None
+            self._drain_waiting = None
+
+    async def _stop_run(self) -> None:
+        s = self.state
+        p = s.failed_phase if s.phase == "failed" else s.phase
+        if p in _STOP_STEPS:
+            first = p
+            self._log(f"stop: resuming at {p}")
+        elif p in _PRE_BOOT:
+            first = "deleting"
+            self._log(f"stop: instance never got past {p} — nothing to snapshot, deleting it")
+        else:
+            first = "draining"
+        if s.bootstrap_incomplete and first != "deleting":
+            self._log("stop: the bootstrap did not finish (after a timeout it may even "
+                      "still run on the instance) — the snapshot may hold a half-finished "
+                      "install; it is marked, and a start from it bootstraps again")
+        steps = _STOP_STEPS[_STOP_STEPS.index(first):]
+        try:
+            if "draining" in steps:
+                await self._drain()
+            if "pruning" in steps:
+                await self._prune()
+            if "snapshotting" in steps:
+                await self._snapshot(fresh_name=first != "snapshotting")
+            await self._delete()
+        except _Vanished as e:
+            await self._gone(str(e), fault=True)
+        except Exception as e:
+            self._fail(_errtext(e))
+
+    async def _drain(self) -> None:
+        """Step 1. The existing drain (routing stops now, the backend is disabled once
+        idle — wanted for `off`). No timeout: a running job may finish; the panel shows
+        how many are left."""
+        self._set_phase("draining")
+        try:
+            if not self.deps.begin_drain(self.bid):
+                self._log("drain: backend already offline")
+        except Exception as e:
+            self._log(f"drain could not start: {e!r}")
+        await self._stop_transfers()
+        last = None
+        while True:
+            n = int(self.deps.inflight(self.bid) or 0)
+            if n <= 0 and not self.deps.is_draining(self.bid):
+                break
+            if n != last:
+                self._log(f"draining: waiting for {n} job(s) to finish" if n > 0
+                          else "draining: waiting for the drain to complete")
+                last = n
+            self._drain_waiting = n
+            await self.deps.sleep(_DRAIN_POLL_S)
+        self._drain_waiting = None
+
+    async def _prune(self) -> None:
+        """Step 2: the P2 hook, then `base_bytes` (everything but the model roots) —
+        what the next disk needs besides models. A failed measurement keeps the last
+        value: it sizes a disk, it must not stop a stop."""
+        s = self.state
+        self._set_phase("pruning")
+        await self._before_snapshot()
+        if not (s.ip and s.port):
+            self._log("base size not measured: no ssh address known")
+            return
+        try:
+            rc, out, err = await self._exec(_DU_CMD, timeout=_DU_TIMEOUT_S)
+        except Exception as e:
+            rc, out, err = -1, b"", _errtext(e).encode()
+        text = (out or b"").decode("utf-8", "replace").strip()
+        if rc == 0 and text.isdigit():
+            s.base_bytes = int(text)
+            self._log(f"base install: {s.base_bytes / 1024 ** 3:.1f} GB")
+            self._persist()
+        else:
+            self._log(f"base size not measured (rc {rc}): " + " | ".join(_tail(err, 3)))
+
+    async def _our_item(self) -> Optional[dict]:
+        """Our instance in a FRESH list (Ruling 10, via `_find_ours`), None when it is
+        gone: not listed, or listed with a gone status. A list error raises."""
+        it = self._find_ours(await self.api.list_instances())
+        if it is None or thunder.is_gone_status(it.get("status")):
+            return None
+        return it
+
+    def _record_pending(self, sid: str) -> None:
+        s = self.state
+        s.pending_snapshot = sid
+        self._pending_misses = 0
+        s.manifests[sid] = self._current_manifest()
+        if s.bootstrap_incomplete and sid not in s.incomplete_snapshots:
+            s.incomplete_snapshots.append(sid)
+            self._log(f"snapshot {s.pending_snapshot_name} marked: bootstrap incomplete")
+        self._persist()
+
+    async def _snapshot(self, fresh_name: bool) -> None:
+        """Step 3. Idempotent: the name is persisted before the POST, and a snapshot
+        that already carries it (a restart between POST and persist, a retry) is taken
+        over instead of created twice."""
+        s = self.state
+        if fresh_name or not s.pending_snapshot_name:
+            if s.pending_snapshot:
+                # the rotation removes it once the new one is READY (or it failed)
+                self._log(f"previous snapshot {s.pending_snapshot} is not READY yet — "
+                          "the watcher follows the new one")
+            s.pending_snapshot_name = thunder.snapshot_name(self.name, self.deps.now())
+        self._set_phase("snapshotting")
+        snaps = await self.api.snapshots()
+        self._snaps = snaps
+        row = next((x for x in snaps if x.get("name") == s.pending_snapshot_name
+                    and x.get("id")), None)
+        if row is not None:
+            self._log(f"snapshot {row['name']} exists already ({row['status']}) — not taken twice")
+            self._record_pending(row["id"])
+            return
+        item = await self._our_item()
+        if item is None:
+            raise _Vanished(f"instance {s.uuid or s.index} vanished before its snapshot "
+                            "was taken — this session's changes are lost")
+        sid = await self.api.create_snapshot(item, s.pending_snapshot_name)
+        self._log(f"snapshot {s.pending_snapshot_name} requested ({sid})")
+        self._record_pending(sid)
+
+    async def _delete(self) -> None:
+        """Step 3b. Delete, then CONFIRM through fresh lists that the instance is gone;
+        one that stays listed for 5 min is `failed(deleting)`, never `off` — it bills."""
+        s = self.state
+        self._set_phase("deleting")
+        await self._stop_tunnel()
+        uuid_known = bool(s.uuid)
+        item = await self._our_item()
+        if item is None:
+            if uuid_known:
+                self._log("instance already gone")
+                await self._gone("")
+            else:
+                # Ruling 10: never delete by a stored index alone
+                await self._gone(f"instance at index {s.index} could not be identified as "
+                                 "ours — not deleted; if it runs it shows in the orphan list",
+                                 fault=True)
+            return
+        await self.api.delete(item)
+        self._log(f"delete requested for {item.get('uuid') or item.get('index')}")
+        deadline = self.deps.now() + _DELETE_WAIT_S
+        while True:
+            try:
+                still = await self._our_item()
+            except thunder.ThunderError as e:
+                still = item                     # unknown ≠ gone
+                self._log(f"instance list failed while deleting: {e}")
+            if still is None:
+                break
+            if self.deps.now() >= deadline:
+                raise TimeoutError(f"instance {item.get('uuid')} still listed "
+                                   f"{_DELETE_WAIT_S // 60} min after its delete "
+                                   f"(status {still.get('status') or '?'})")
+            await self.deps.sleep(_DELETE_POLL_S)
+        self._log("instance deleted")
+        await self._gone("")
+
+    async def _gone(self, why: str, fault: bool = False) -> None:
+        """The instance is confirmed gone: nothing bills any more, so the session cost
+        stops (started_at 0) and the ids go — a later index is somebody else's."""
+        s = self.state
+        uuid = s.uuid
+        await self._stop_tunnel()
+        s.index, s.uuid, s.ip, s.port = "", "", "", 0
+        s.started_at = 0.0
+        s.bootstrap_incomplete = False
+        self._set_phase("off", why)
+        if uuid:
+            try:
+                os.remove(self._known_hosts_path(uuid))
+            except (OSError, ValueError):
+                pass
+        self._disable()
+        if fault:
+            try:
+                self.deps.note_fault(self.backend, "lifecycle", "instance_vanished", why)
+            except Exception as e:
+                self._log(f"fault log unavailable: {e!r}")
+
+    # ── snapshot watcher (spec "Stop" 4) ────────────────────────────────────
+
+    def _forget_snapshot(self, sid: str) -> None:
+        s = self.state
+        s.manifests.pop(sid, None)
+        if sid in s.incomplete_snapshots:
+            s.incomplete_snapshots.remove(sid)
+
+    async def watch_snapshots(self) -> None:
+        """One round: the pending snapshot READY → it becomes `snapshot_id` and the
+        rotation deletes what `thunder.rotation` names (never the new one); FAILED (or
+        missing from the list for several rounds) → fault, `snapshot_id` stays on the
+        last READY one and the failed one's manifest goes. CREATING → next round."""
+        s = self.state
+        pid = s.pending_snapshot
+        if not pid:
+            return
+        try:
+            snaps = await self.api.snapshots()
+        except thunder.ThunderError as e:
+            self._log(f"snapshot list unavailable ({e.status or 'transport'}): {e}")
+            return
+        if s is not self.state or s.pending_snapshot != pid:
+            return                       # a stop recorded a newer one meanwhile
+        self._snaps = snaps
+        row = next((x for x in snaps if x.get("id") == pid), None)
+        if row is None:
+            self._pending_misses += 1
+            if self._pending_misses < _PENDING_MISSES:
+                self._log(f"pending snapshot {pid} not listed (yet)")
+                return
+            status = "MISSING"
+        else:
+            status = row.get("status") or ""
+        name = (row or {}).get("name") or s.pending_snapshot_name or pid
+        if status == "READY":
+            self._pending_misses = 0
+            s.snapshot_id, s.pending_snapshot, s.pending_snapshot_name = pid, "", ""
+            self._log(f"snapshot {name} READY")
+            self._persist()
+            for sid in thunder.rotation(snaps, self.name):
+                if sid in (pid, s.pending_snapshot):
+                    continue                 # never the one just made (a missing createdAt)
+                try:
+                    await self.api.delete_snapshot(sid)
+                except thunder.ThunderError as e:
+                    self._log(f"rotation: deleting snapshot {sid} failed: {e}")
+                    continue
+                self._forget_snapshot(sid)
+                self._log(f"rotation: snapshot {sid} deleted")
+            self._persist()
+        elif status in ("FAILED", "MISSING"):
+            self._pending_misses = 0
+            s.pending_snapshot, s.pending_snapshot_name = "", ""
+            self._forget_snapshot(pid)
+            self._persist()
+            why = "failed" if status == "FAILED" else "vanished from the snapshot list"
+            self._log(f"snapshot {name} {why} — the last READY one ({s.snapshot_id or 'none'}) "
+                      "stays the start template; this session's changes are lost")
+            try:
+                self.deps.note_fault(self.backend, "lifecycle", "snapshot_failed", name)
+            except Exception as e:
+                self._log(f"fault log unavailable: {e!r}")
+
+    # ── orphans ─────────────────────────────────────────────────────────────
+
+    async def orphans(self) -> list[dict]:
+        """Instances of this account no controller owns (`deps.known_uuids()`, plus our
+        own) — shown with their cost, NEVER deleted: a stranger's instance cannot be
+        told from a lost one of ours. A list error keeps the last answer."""
+        try:
+            items = await self.api.list_instances()
+        except thunder.ThunderError as e:
+            self._log(f"orphan check: instance list unavailable: {e}")
+            return list(self._orphans)
+        known = self._known_uuids()
+        if self.state.uuid:
+            known.add(self.state.uuid)
+        self._orphans = [it for it in items if it.get("uuid") not in known
+                         and not thunder.is_gone_status(it.get("status"))]
+        return list(self._orphans)
+
+    # ── after a gateway restart ─────────────────────────────────────────────
 
     async def resume(self) -> None:
-        raise NotImplementedError("Thunder resume not implemented yet")
+        """Lifespan, after `rebuild_backends`: reconcile the persisted state with
+        `/instances/list` (spec "Nach Gateway-Neustart"). An interrupted stop runs on,
+        an interrupted start before the bootstrap continues, a live instance gets its
+        tunnel back (ComfyUI restarted when it does not answer), a vanished one ends in
+        `off`. An API that cannot be reached leaves everything as it is and
+        `run_forever` retries. Runs as an op, so a stop() meanwhile aborts it."""
+        if self._op is not None:
+            self._log(f"resume skipped: {self._op} in progress")
+            return
+        await self._run_op("resuming", self._resume())
+
+    async def _resume(self) -> None:
+        if self._persist_blocked and not await self._reconcile_unread():
+            return
+        s = self.state
+        if s.phase == "off":
+            self._resume_pending = False
+            await self.watch_snapshots()
+            return
+        if not (s.uuid or s.index):
+            self._resume_pending = False
+            if s.phase != "failed":      # `failed` without instance stays for the panel
+                await self._gone(f"no instance recorded in phase {s.phase}")
+            return
+        try:
+            items = await self.api.list_instances()
+        except thunder.ThunderError as e:
+            self._log(f"resume: instance list unavailable ({e}) — retrying")
+            self._resume_pending = True
+            return
+        self._resume_pending = False
+        it = self._find_ours(items)
+        if it is not None and thunder.is_gone_status(it.get("status")):
+            it = None
+        p = s.failed_phase if s.phase == "failed" else s.phase
+        if it is None:
+            if p == "snapshotting":
+                await self._adopt_pending_by_name()
+            if p in ("snapshotting", "deleting") and (s.pending_snapshot or p == "deleting"):
+                self._log("resume: instance gone — the stop had finished its snapshot")
+                await self._gone("")
+            else:
+                await self._gone(f"instance {s.uuid or s.index} vanished while the gateway "
+                                 f"was down (phase {p})", fault=True)
+            await self.watch_snapshots()
+            return
+        if p in _STOP_STEPS:
+            self._log(f"resume: continuing the interrupted stop at {p}")
+            await self._stop_run()
+            return
+        if s.phase == "failed":
+            await self._reattach(it, keep_failed=True)
+            return
+        if s.phase in _PRE_BOOT:
+            self._log(f"resume: continuing the interrupted start at {s.phase}")
+            await self._after_create(s.bootstrap_incomplete)
+            return
+        if s.phase == "bootstrapping":
+            await self._reattach(it, keep_failed=True)
+            self._fail("bootstrap interrupted by a gateway restart (it may still run on "
+                       "the instance, see ~/gw-bootstrap.log) — Restart ComfyUI once it is "
+                       "done, or Stop")
+            return
+        # starting / syncing / ready
+        try:
+            await self._reattach(it)
+        except Exception as e:
+            self._fail(_errtext(e))
+            return
+        if await self._probe_briefly():
+            self._ready()
+        else:
+            self._log("resume: ComfyUI does not answer — restarting it")
+            await self._restart()
+
+    async def _reattach(self, item: dict, keep_failed: bool = False) -> None:
+        """Port guard first (a restart must not find the instance behind a public port
+        the template reopened), then ip/port from the fresh list and a new tunnel."""
+        s = self.state
+        try:
+            item = await self._ensure_ports_closed(item)
+        except Exception as e:
+            if not keep_failed:
+                raise
+            self._log(f"resume: {_errtext(e)} — no tunnel")
+            return
+        if item.get("ip") and item.get("port"):
+            s.ip, s.port = str(item["ip"]), int(item["port"])
+            self._persist()
+        if s.ip and s.port:
+            await self._start_tunnel()
+
+    async def _probe_briefly(self) -> bool:
+        deadline = self.deps.now() + _RESUME_PROBE_S
+        while True:
+            try:
+                if await self.deps.probe_comfy(self.url):
+                    self._log("ComfyUI answers")
+                    return True
+            except Exception:
+                pass
+            if self.deps.now() >= deadline:
+                return False
+            await self.deps.sleep(_COMFY_PROBE_S)
+
+    async def _adopt_pending_by_name(self) -> None:
+        """A restart hit `snapshotting` between the POST and persisting its id: the
+        persisted name finds it."""
+        s = self.state
+        if s.pending_snapshot or not s.pending_snapshot_name:
+            return
+        try:
+            snaps = await self.api.snapshots()
+        except thunder.ThunderError as e:
+            self._log(f"snapshot list unavailable ({e.status or 'transport'}): {e}")
+            return
+        row = next((x for x in snaps if x.get("name") == s.pending_snapshot_name
+                    and x.get("id")), None)
+        if row is not None:
+            self._log(f"snapshot {row['name']} found by name ({row['id']})")
+            self._record_pending(row["id"])
+
+    async def _reconcile_unread(self) -> bool:
+        """The stored record could not be read at construction (`_load_failed`). Read it
+        again (a locked store recovers); still unreadable → `/instances/list` decides:
+        no unowned instance → nothing of ours can bill → `off`; unowned ones → `failed`
+        WITHOUT an instance, naming them (they show in the orphan list; never adopted,
+        Ruling 10). Saving resumes either way. → whether resume() may continue with a
+        re-read state."""
+        try:
+            loaded = self.deps.load_state(self.name)
+            readable = loaded is None or isinstance(loaded, dict)
+        except Exception:
+            readable = False
+        if readable:
+            log = self.state.log
+            self.state = state_from(loaded)
+            self.state.log = log
+            self._unblock_persist()
+            self._log("stored state re-read")
+            return True
+        try:
+            items = await self.api.list_instances()
+        except thunder.ThunderError as e:
+            self._log(f"resume: instance list unavailable ({e}) — state stays unreconciled")
+            self._resume_pending = True
+            return False
+        self._resume_pending = False
+        known = self._known_uuids()
+        strangers = [it for it in items if it.get("uuid") not in known
+                     and not thunder.is_gone_status(it.get("status"))]
+        self._orphans = strangers
+        self._unblock_persist()
+        s = self.state
+        s.failed_phase = ""
+        if strangers:
+            ids = ", ".join(it.get("uuid") or it.get("index") or "?" for it in strangers)
+            self._set_phase("failed", f"stored state unreadable; unowned instance(s) listed "
+                                      f"({ids}) — one may be this backend's: check and "
+                                      "delete by hand")
+        else:
+            self._set_phase("off", "stored state was unreadable; no unowned instance is "
+                                   "running")
+        return False
+
+    # ── background ──────────────────────────────────────────────────────────
 
     async def run_forever(self) -> None:
-        raise NotImplementedError("Thunder background loop not implemented yet")
+        """Background loop (spawned by main next to resume()): every 60 s the snapshot
+        watcher while a snapshot is pending, and resume() again while it could not
+        reach the API. P2 adds the model sync here."""
+        while True:
+            await self.deps.sleep(_WATCH_S)
+            try:
+                if self._resume_pending and self._op is None:
+                    await self.resume()
+                if self.state.pending_snapshot:
+                    await self.watch_snapshots()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._log(f"background round failed: {_errtext(e)}")
