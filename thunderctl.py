@@ -22,8 +22,9 @@ Never imports `main`: everything the controller needs from the gateway arrives i
 `ThunderApi` owns the HTTP: Bearer token, `httpx.Timeout(30, connect=10)`, any 2xx
 is success (`create` answers 201, `/snapshots/create` 202), anything else a
 `thunder.ThunderError` carrying the status. Which id form `/instances/{id}/…` wants
-is documented contradictorily (index vs uuid), so every such call tries the index
-first and the uuid on a 404 — to verify live. Covered by test_thunder_controller.py.
+is documented contradictorily (index vs uuid), so every such call tries the UUID
+first and the index only on a 404 (a reused index could name a stranger's instance, a
+uuid cannot) — to verify live. Covered by test_thunder_controller.py.
 """
 from __future__ import annotations
 
@@ -83,33 +84,40 @@ class ThunderApi:
             raise thunder.ThunderError(
                 f"{method} {path}: {type(e).__name__}: {e}"[:_ERR_MAX], None) from e
 
-    @staticmethod
-    def _check(r: httpx.Response) -> httpx.Response:
+    def _redact(self, text: str) -> str:
+        """An error body goes into the panel log and the fault log; an API that echoes
+        the request (Authorization included) must not put the token there."""
+        return text.replace(self._token, "***") if self._token else text
+
+    def _check(self, r: httpx.Response) -> httpx.Response:
         if not 200 <= r.status_code < 300:
-            raise thunder.ThunderError((r.text or f"HTTP {r.status_code}")[:_ERR_MAX],
-                                       r.status_code)
+            raise thunder.ThunderError(
+                self._redact(r.text or f"HTTP {r.status_code}")[:_ERR_MAX], r.status_code)
         return r
 
-    @staticmethod
-    def _json(r: httpx.Response):
+    def _json(self, r: httpx.Response):
         if not r.content:
             return {}
         try:
             return r.json()
         except ValueError as e:
-            raise thunder.ThunderError(f"invalid JSON: {r.text[:200]}", r.status_code) from e
+            raise thunder.ThunderError(f"invalid JSON: {self._redact(r.text[:200])}",
+                                       r.status_code) from e
 
     async def _call(self, method: str, path: str, body=None):
         return self._json(self._check(await self._req(method, path, body)))
 
     async def _by_id(self, method: str, item: dict, suffix: str, body=None,
                      gone_ok: bool = False) -> Optional[httpx.Response]:
-        """`/instances/{id}/<suffix>` with the index, then the uuid on a 404 (which form
-        the API wants is undocumented). `gone_ok`: 404 on every form means the instance
-        no longer exists — the goal of a delete, so not an error there. NOTE the index
-        is only safe while `item` came from a fresh list matched by uuid: Thunder reuses
-        small indices, and a stale one can name somebody else's instance."""
-        ids = [str(item.get(k) or "") for k in ("index", "uuid")]
+        """`/instances/{id}/<suffix>` with the UUID first, the index only on a 404
+        (ledger Ruling 11; the openapi names the parameter "Instance ID (index)" for
+        modify/ports but plain "Instance ID" for delete, so which form each accepts is
+        verified live). UUID first because Thunder REUSES small indices: a stale index
+        can name somebody else's instance, a uuid never can. `gone_ok`: 404 on every
+        form means the instance no longer exists — the goal of a delete, so not an
+        error there. The index is still only safe while `item` came from a fresh list
+        matched by uuid (Ruling 10) — never pass an index taken from the state alone."""
+        ids = ["" if item.get(k) is None else str(item.get(k)) for k in ("uuid", "index")]
         ids = [i for n, i in enumerate(ids) if i and i not in ids[:n]]
         if not ids:
             raise thunder.ThunderError("instance has neither index nor uuid", None)
@@ -153,10 +161,14 @@ class ThunderApi:
         return thunder.parse_snapshots(await self._call("GET", "/snapshots/list"))
 
     async def create_snapshot(self, item: dict, name: str) -> str:
-        """→ the new snapshot's id. `instanceId` takes the index (int, as `identifier`
-        is one) — to verify live, like every other id form here."""
-        idx = str(item.get("index") or "")
-        inst: Any = int(idx) if idx.isdigit() else (idx or str(item.get("uuid") or ""))
+        """→ the new snapshot's id. `instanceId` is a STRING in the openapi
+        (`CreateSnapshotRequest`) — an int would be a 400 on every stop — and carries
+        the index, as the instance endpoints' "(index)" parameters do; the uuid only
+        when no index is known. To verify live."""
+        idx, uuid = item.get("index"), item.get("uuid")
+        inst = str(idx) if idx is not None and str(idx) != "" else str(uuid or "")
+        if not inst:
+            raise thunder.ThunderError("instance has neither index nor uuid", None)
         d = await self._call("POST", "/snapshots/create", {"instanceId": inst, "name": name})
         sid = str((d or {}).get("id") or "") if isinstance(d, dict) else ""
         if not sid:
@@ -217,6 +229,7 @@ class State:
 
 
 _VOLATILE = ("log", "transfers")
+LOAD_FAILED = "load"            # failed_phase marker: the stored record could not be read
 
 
 def _coerce(default, v):
@@ -294,12 +307,44 @@ class Controller:
         self._client: Optional[httpx.AsyncClient] = None
         self._tunnel = None
         self._snaps: Optional[list[dict]] = None      # last /snapshots/list, for view()
-        loaded = None
+        self._persist_blocked = False
+        self.state = State()
         try:
             loaded = deps.load_state(self.name)
         except Exception as e:
-            deps.log(f"[thunder {self.name}] state load failed: {e!r}")
-        self.state = state_from(loaded)
+            self._load_failed(f"state load failed: {e!r}")
+        else:
+            if loaded is None:
+                pass                    # no record: this backend never had an instance
+            elif not isinstance(loaded, dict):
+                self._load_failed(f"state load failed: stored entry is a "
+                                  f"{type(loaded).__name__}, not a dict")
+            else:
+                self.state = state_from(loaded)
+
+    def _load_failed(self, msg: str) -> None:
+        """The stored record exists but could not be read. It may name a RUNNING,
+        billing instance, so this is not "off": `off` would let start() create a second
+        instance, and its first `_persist` would overwrite the intact record with an
+        empty uuid — the first instance then bills with nobody knowing it. Instead:
+        `failed` with the `LOAD_FAILED` marker, saving suppressed and start() refused
+        until `resume()` has reconciled with `/instances/list` and calls
+        `_unblock_persist()`."""
+        self.state = State(phase="failed", failed_phase=LOAD_FAILED, error=msg)
+        self._persist_blocked = True
+        self._log(msg)
+
+    @property
+    def persist_blocked(self) -> bool:
+        return self._persist_blocked
+
+    def _unblock_persist(self) -> None:
+        """Allow saving again. Only for `resume()`, once it has established from
+        `/instances/list` which instance (if any) this backend owns — from then on the
+        in-memory state is the truth and may overwrite the unreadable record."""
+        if self._persist_blocked:
+            self._persist_blocked = False
+            self._log("state reconciled — saving resumed")
 
     # identity / config
     @property
@@ -347,6 +392,10 @@ class Controller:
 
     # persistence / log
     def _persist(self) -> None:
+        if self._persist_blocked:
+            # never overwrite a record we could not read (see _load_failed)
+            self._log("state not saved: stored record unread, waiting for reconcile")
+            return
         d = asdict(self.state)
         for k in _VOLATILE:
             d.pop(k, None)
@@ -467,10 +516,16 @@ class Controller:
                 "uptime_s": uptime, "disk_gb": s.disk_gb, "cost_per_h": cph,
                 "session_cost": (cph * uptime / 3600) if (cph is not None and running) else None,
                 "snapshot": self._snapshot_view(), "log": list(s.log[-_LOG_MAX:]),
-                "transfers": dict(s.transfers)}
+                "transfers": dict(s.transfers), "persist_blocked": self._persist_blocked}
 
     # lifecycle — the start and stop paths come next; until then they refuse loudly
+    def _refuse_if_unreconciled(self) -> None:
+        if self._persist_blocked:
+            raise RuntimeError(f"state not loaded ({self.state.error or 'unreadable'}) — "
+                               "an instance may still be running; resume first")
+
     async def start(self) -> None:
+        self._refuse_if_unreconciled()
         raise NotImplementedError("Thunder start path not implemented yet")
 
     async def stop(self) -> None:

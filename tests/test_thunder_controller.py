@@ -45,6 +45,8 @@ class FakeThunder:
         if p.endswith("/ports"):
             ident = p.split("/")[2]
             body = json.loads(req.content)
+            if ident not in self.instances:           # uuid form tried first (Ruling 11)
+                return httpx.Response(404, json={"error": "not_found"})
             it = self.instances[ident]
             it["httpPorts"] = [x for x in it["httpPorts"] if x not in body.get("remove_ports", [])]
             return httpx.Response(200, json={})
@@ -180,15 +182,118 @@ class Persistence(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(c.state.log[-1].endswith("line 249"))
 
 
-class Api(unittest.IsolatedAsyncioTestCase):
-    async def test_api_delete_falls_back_to_uuid(self):
+class LoadFailure(unittest.IsolatedAsyncioTestCase):
+    """An unreadable stored record may name a running, billing instance: never "off"."""
+
+    def _check_blocked(self, c, saved):
+        self.assertEqual(c.state.phase, "failed")
+        self.assertEqual(c.state.failed_phase, thunderctl.LOAD_FAILED)
+        self.assertIn("state load failed", c.state.error)
+        before = dict(saved)
+        c._set_phase("failed", "still unread")
+        c._persist()
+        self.assertEqual(saved, before)          # the intact record is not overwritten
+        self.assertTrue(c.view()["persist_blocked"])
+
+    async def test_load_raising_blocks_persist_and_start(self):
         fake = FakeThunder()
-        fake.delete_by = "uuid"
+        c, saved, _, _ = make(fake)
+        saved["thunder"] = {"phase": "ready", "uuid": "u9"}
+
+        def boom(n):
+            raise OSError("store locked")
+        c.deps.load_state = boom
+        c2 = thunderctl.Controller(c.backend, c.deps)
+        self._check_blocked(c2, saved)
+        self.assertEqual(saved["thunder"]["uuid"], "u9")
+        with self.assertRaises(RuntimeError):
+            await c2.start()
+        self.assertEqual(fake.calls, [])         # no create was even attempted
+
+    async def test_load_non_dict_blocks_persist_and_start(self):
+        fake = FakeThunder()
+        c, saved, _, _ = make(fake)
+        saved["thunder"] = ["garbage"]
+        c2 = thunderctl.Controller(c.backend, c.deps)
+        self._check_blocked(c2, saved)
+        self.assertEqual(saved["thunder"], ["garbage"])
+        with self.assertRaises(RuntimeError):
+            await c2.start()
+
+    async def test_unblock_persist_resumes_saving(self):
+        fake = FakeThunder()
+        c, saved, _, _ = make(fake)
+        saved["thunder"] = "garbage"
+        c2 = thunderctl.Controller(c.backend, c.deps)
+        c2._unblock_persist()                    # what resume() does once reconciled
+        c2._set_phase("off")
+        self.assertEqual(saved["thunder"]["phase"], "off")
+        self.assertFalse(c2.persist_blocked)
+
+    async def test_no_record_is_plain_off(self):
+        c, saved, _, _ = make(FakeThunder())
+        self.assertEqual(c.state.phase, "off")
+        self.assertFalse(c.persist_blocked)
+
+
+class TokenHygiene(unittest.IsolatedAsyncioTestCase):
+    async def test_token_never_in_errors_view_state_or_log(self):
+        token = "thunder-SECRET-token-123"
+        mode = ["error"]
+
+        def handler(req):
+            if mode[0] == "transport":
+                raise httpx.ConnectError(f"cannot reach {req.url}")
+            # an API that echoes the request back, Authorization included
+            return httpx.Response(500, text=f"boom: {dict(req.headers)}")
+        fake = FakeThunder()
+        backend = {"name": "thunder", "type": "comfyui", "api_key": token,
+                   "thunder": {"gpu_type": "a6000", "num_gpus": 1, "vcpus": 8}}
+        c, saved, _, _ = make(fake, backend=backend)
+        c.deps.client_factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        errors = []
+        for m in ("error", "transport"):
+            mode[0] = m
+            try:
+                await c.api.list_instances()
+            except thunder.ThunderError as e:
+                errors.append(str(e))
+            await c.refresh_prices()
+            await c.refresh_snapshots()
+        c._set_phase("failed", errors[0])
+        self.assertEqual(len(errors), 2)
+        self.assertIn("500", c.state.log[0] + " ".join(c.state.log))
+        for where, text in (("errors", " ".join(errors)),
+                            ("view", json.dumps(c.view())),
+                            ("saved", json.dumps(saved)),
+                            ("log", "\n".join(c.state.log))):
+            self.assertNotIn(token, text, where)
+
+
+class Api(unittest.IsolatedAsyncioTestCase):
+    async def test_api_delete_falls_back_to_index(self):
+        # uuid first (Ruling 11: a stale index can name a stranger's instance)
+        fake = FakeThunder()
+        fake.delete_by = "index"
         fake.instances["0"] = {"uuid": "u0", "status": "RUNNING"}
         await _api(fake).delete({"index": "0", "uuid": "u0"})
         self.assertEqual(fake.instances, {})
         paths = [p for _, p, _ in fake.calls]
-        self.assertEqual(paths, ["/instances/0/delete", "/instances/u0/delete"])
+        self.assertEqual(paths, ["/instances/u0/delete", "/instances/0/delete"])
+
+    async def test_api_delete_by_uuid_never_touches_index(self):
+        fake = FakeThunder()
+        fake.delete_by = "uuid"
+        fake.instances["0"] = {"uuid": "u0", "status": "RUNNING"}
+        await _api(fake).delete({"index": "0", "uuid": "u0"})
+        self.assertEqual([p for _, p, _ in fake.calls], ["/instances/u0/delete"])
+
+    async def test_int_index_zero_is_kept(self):
+        # `item.get("index") or ""` dropped index 0
+        fake = FakeThunder()
+        fake.instances["0"] = {"uuid": "u0", "status": "RUNNING"}
+        await _api(fake).delete({"index": 0, "uuid": ""})
+        self.assertEqual([p for _, p, _ in fake.calls], ["/instances/0/delete"])
 
     async def test_api_delete_both_404_is_ok(self):
         fake = FakeThunder()
@@ -197,12 +302,12 @@ class Api(unittest.IsolatedAsyncioTestCase):
 
     async def test_api_non_2xx_raises_thundererror_with_status(self):
         def handler(req):
-            return httpx.Response(401, text="bad token " + "x" * 1000)
+            return httpx.Response(401, text="unauthorized " + "x" * 1000)
         api = thunderctl.ThunderApi(httpx.AsyncClient(transport=httpx.MockTransport(handler)), "tok")
         with self.assertRaises(thunder.ThunderError) as cm:
             await api.list_instances()
         self.assertEqual(cm.exception.status, 401)
-        self.assertIn("bad token", str(cm.exception))
+        self.assertIn("unauthorized", str(cm.exception))
         self.assertLessEqual(len(str(cm.exception)), 300)
 
     async def test_transport_error_is_thundererror_without_status(self):
@@ -242,23 +347,24 @@ class Api(unittest.IsolatedAsyncioTestCase):
         snaps = await api.snapshots()
         self.assertEqual(snaps[0]["min_disk_gb"], 120)
 
-    async def test_remove_ports_uses_index_form(self):
+    async def test_remove_ports_uuid_then_index(self):
         fake = FakeThunder()
         fake.instances["0"] = {"uuid": "u0", "httpPorts": [8188, 22]}
         await _api(fake).remove_ports({"index": "0", "uuid": "u0"}, [8188])
-        self.assertEqual(fake.calls[-1], ("PATCH", "/instances/0/ports", {"remove_ports": [8188]}))
+        self.assertEqual(fake.calls, [("PATCH", "/instances/u0/ports", {"remove_ports": [8188]}),
+                                      ("PATCH", "/instances/0/ports", {"remove_ports": [8188]})])
         self.assertEqual(fake.instances["0"]["httpPorts"], [22])
 
-    async def test_modify_falls_back_to_uuid_and_raises_when_both_404(self):
+    async def test_modify_falls_back_to_index_and_raises_when_both_404(self):
         calls = []
 
         def handler(req):
             calls.append(req.url.path)
-            return httpx.Response(200, json={}) if req.url.path == "/instances/u0/modify" \
+            return httpx.Response(200, json={}) if req.url.path == "/instances/0/modify" \
                 else httpx.Response(404)
         api = thunderctl.ThunderApi(httpx.AsyncClient(transport=httpx.MockTransport(handler)), "tok")
         await api.modify({"index": "0", "uuid": "u0"}, {"disk_size_gb": 200})
-        self.assertEqual(calls, ["/instances/0/modify", "/instances/u0/modify"])
+        self.assertEqual(calls, ["/instances/u0/modify", "/instances/0/modify"])
         with self.assertRaises(thunder.ThunderError) as cm:
             await api.modify({"index": "1", "uuid": "u1"}, {"disk_size_gb": 200})
         self.assertEqual(cm.exception.status, 404)
@@ -269,8 +375,12 @@ class Api(unittest.IsolatedAsyncioTestCase):
         sid = await api.create_snapshot({"index": "0", "uuid": "u0"}, "aihub-thunder-x")
         self.assertEqual(sid, "s0")
         self.assertEqual(fake.calls[-1][2]["name"], "aihub-thunder-x")
+        # openapi CreateSnapshotRequest.instanceId is a STRING — an int is a 400
+        self.assertEqual(fake.calls[-1][2]["instanceId"], "0")
+        await api.create_snapshot({"index": 0, "uuid": "u0"}, "aihub-thunder-y")
+        self.assertEqual(fake.calls[-1][2]["instanceId"], "0")
         await api.delete_snapshot(sid)
-        self.assertEqual(fake.snaps, [])
+        self.assertEqual([x["id"] for x in fake.snaps], ["s1"])
 
     async def test_pricing_and_specs_cached_one_hour(self):
         fake = FakeThunder()
