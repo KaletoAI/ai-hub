@@ -17,6 +17,15 @@ The steps are imperative and idempotent, not a pure `next_step` state machine
 name already exists → not created twice; an instance already gone → delete is
 done), so a resume can re-enter any phase.
 
+The start path (`start()`, spec "Start" 0–6) has two rules that hold whatever fails:
+the instance's uuid is persisted BEFORE the first wait (a restart during the up to
+half an hour to RUNNING must not forget it), and `bootstrapping`/`starting` are never
+entered while Thunder forwards a public HTTP port (`_ensure_ports_closed`: its port
+forwarding has no auth, and ComfyUI behind it is code execution for anyone). A failure
+before `create` ends in `off`; after it in `failed(<phase>)` with the instance KEPT for
+diagnosis. The bootstrap's verdict is read from its `GW:` lines by tag
+(`parse_bootstrap`/`bootstrap_verdict`, ledger Ruling 9).
+
 Never imports `main`: everything the controller needs from the gateway arrives in
 `Deps`, so it stays hot-reload-safe and testable against a stub API and a fake ssh.
 `ThunderApi` owns the HTTP: Bearer token, `httpx.Timeout(30, connect=10)`, any 2xx
@@ -30,7 +39,9 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import math
 import os
+import re
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Awaitable, Callable, Optional
@@ -50,6 +61,29 @@ _ERR_MAX = 300                  # chars of an API error body kept in the message
 _LOG_MAX = 200                  # lines in the per-backend log ring
 _COMFY_PORT = 8188              # ComfyUI on the instance, loopback only
 _SSH_USER = "ubuntu"
+
+# start path timing
+_CREATE_POLL_S = 10             # /instances/list while creating/restoring
+_CREATE_BASE_S = 15 * 60        # create timeout = base + per started 100 GB of disk:
+_RESTORE_PER_100GB_S = 8 * 60   #   Thunder's docs: a restore takes up to 8 min / 100 GB
+_SSH_READY_S = 5 * 60           # a RUNNING instance whose sshd does not answer by then
+_SSH_PROBE_S = 5
+_BOOTSTRAP_S = 3 * 3600         # venv + torch + node packs + CUDA extension builds
+_COMFY_READY_S = 10 * 60        # first start loads custom nodes (3D packs import slowly)
+_COMFY_PROBE_S = 3
+_STDERR_LOG_LINES = 20          # stderr tail logged for a failed remote step
+
+_COMMIT_RE = re.compile(r"[0-9a-fA-F]{40}")
+# The loop script is flock-guarded, so starting it while it runs is a no-op.
+_START_CMD = "setsid nohup ~/start-comfy.sh >/dev/null 2>&1 < /dev/null &"
+# Kill ComfyUI (the loop restarts it 2 s later) and start the loop in case it is not
+# alive (a failed bootstrap, a killed wrapper). The bracket keeps the pattern from
+# matching the remote `bash -c "<this command>"` itself — pkill spares only its own
+# process, and a pattern that hit the shell would kill the restart half-way. It
+# matches the loop's `<venv python> main.py --listen 127.0.0.1 --port 8188 …`, whatever
+# venv the bootstrap picked (`ComfyUI/main.py` never appears in that command line).
+_RESTART_CMD = ("pkill -f '[m]ain[.]py --listen 127[.]0[.]0[.]1 --port "
+                f"{_COMFY_PORT}'; " + _START_CMD)
 
 
 # ── Thunder REST client ──────────────────────────────────────────────────────
@@ -224,6 +258,10 @@ class State:
     snapshot_id: str = ""           # the snapshot the running instance was started from
     pending_snapshot: str = ""      # id of the snapshot taken at the last stop, until READY/FAILED
     manifests: dict = field(default_factory=dict)   # snapshot id → model manifest
+    # what the last bootstrap reported: models the TEMPLATE brought (rel → bytes; paid
+    # for in every snapshot until deleted) and custom_nodes packs it brought
+    bootstrap_unknown: dict = field(default_factory=dict)
+    bootstrap_template_nodes: list = field(default_factory=list)
     log: list = field(default_factory=list)         # not persisted
     transfers: dict = field(default_factory=dict)   # not persisted
 
@@ -246,6 +284,8 @@ def _coerce(default, v):
             return "" if v is None else str(v)
         if isinstance(default, dict):
             return dict(v) if isinstance(v, dict) else {}
+        if isinstance(default, list):
+            return list(v) if isinstance(v, list) else []
     except (TypeError, ValueError):
         pass
     return default
@@ -292,6 +332,82 @@ class Deps:
     ssh: Callable[..., Awaitable[tuple]] = sshrun.run
     spawn: Optional[Callable[..., Awaitable[Any]]] = None     # None = create_subprocess_exec
     known_uuids: Callable[[], set] = field(default=lambda: set())
+    keygen: Callable[[str], Awaitable[str]] = sshrun.keygen   # path → public key
+    default_nodes: Callable[[], str] = field(default=lambda: "")  # ops/thunder-nodes.default.txt
+
+
+# ── bootstrap output ─────────────────────────────────────────────────────────
+
+def parse_bootstrap(out: str) -> dict:
+    """The `GW:` lines of `ops/thunder-bootstrap.sh`'s stdout (its header documents
+    them). Matched by TAG — the first whitespace-separated token of a line that starts
+    with `GW:` — never by position: the script prints other lines in between, and a
+    later version may add tags (ledger Ruling 9). An UNKNOWN_MODEL path that could
+    leave the model tree (`safe_rel`) is dropped here — the panel later offers to
+    DELETE these paths."""
+    r = {"phase": "", "smoke": None, "done": False, "node_fails": [], "unknown": {},
+         "template_nodes": [], "bad": []}
+    for line in (out or "").splitlines():
+        if not line.startswith("GW:"):
+            continue
+        tag, _, rest = line.partition(" ")
+        rest = rest.strip("\r")
+        if tag == "GW:PHASE":
+            r["phase"] = rest.strip()
+        elif tag == "GW:SMOKE":
+            r["smoke"] = rest.strip()
+        elif tag == "GW:DONE":
+            r["done"] = True
+        elif tag == "GW:NODE_FAIL":
+            r["node_fails"].append(rest.strip())
+        elif tag == "GW:TEMPLATE_NODE":
+            if rest.strip():
+                r["template_nodes"].append(rest.strip())
+        elif tag == "GW:UNKNOWN_MODEL":
+            rel, _, size = rest.rpartition("\t")   # no tab → rel "" → refused
+            try:
+                n = int(size)
+                r["unknown"][sshrun.safe_rel(rel)] = n
+            except ValueError:
+                r["bad"].append(line)
+    return r
+
+
+def bootstrap_verdict(rc: int, rep: dict, err: str) -> str:
+    """"" when the bootstrap succeeded, else why not. Success needs ALL of: rc 0,
+    `GW:SMOKE ok`, `GW:DONE` and no `GW:NODE_FAIL` at all (Ruling 9: a pack that did not
+    install fails workflows later with a plausible-looking error)."""
+    why = []
+    if rep["node_fails"]:
+        why.append("node packs failed: " + "; ".join(rep["node_fails"]))
+    smoke = rep["smoke"]
+    if smoke is not None and smoke != "ok":
+        why.append("smoke test " + smoke)
+    where = f" in phase {rep['phase']}" if rep["phase"] else ""
+    if rc == 124:
+        why.append(f"timed out after {_BOOTSTRAP_S // 3600} h{where}")
+    elif rc == 3 and smoke is None:
+        why.append("smoke test failed")
+    elif rc not in (0, 3):
+        last = next((ln.strip() for ln in reversed((err or "").splitlines()) if ln.strip()), "")
+        why.append(f"bootstrap exited rc {rc}{where}" + (f": {last}" if last else ""))
+    if not why and not (smoke == "ok" and rep["done"]):
+        why.append(f"bootstrap ended without GW:SMOKE ok / GW:DONE{where}")
+    return "; ".join(why)
+
+
+def _tail(b: bytes, n: int = _STDERR_LOG_LINES) -> list[str]:
+    lines = [ln for ln in (b or b"").decode("utf-8", "replace").splitlines() if ln.strip()]
+    return lines[-n:]
+
+
+def _errtext(e: BaseException) -> str:
+    """`str()` of a TimeoutError or an httpx error can be empty."""
+    return str(e) or type(e).__name__
+
+
+class _PreCreate(Exception):
+    """A start failed before any instance existed → `off`, not `failed`."""
 
 
 # ── controller ───────────────────────────────────────────────────────────────
@@ -308,6 +424,9 @@ class Controller:
         self._tunnel = None
         self._snaps: Optional[list[dict]] = None      # last /snapshots/list, for view()
         self._persist_blocked = False
+        self._op: Optional[str] = None                 # start/restart in flight
+        self._created_template = ""                    # what the last create asked for
+        self._nodes_text = ""                          # node list of the pending bootstrap
         self.state = State()
         try:
             loaded = deps.load_state(self.name)
@@ -443,6 +562,22 @@ class Controller:
         file would either refuse the next instance or have to trust any key."""
         return os.path.join(self.deps.datadir, "thunder-known_hosts", sshrun.safe_rel(uuid))
 
+    def _reset_known_hosts(self, uuid: str) -> str:
+        """A NEW instance: its host key is new too, so a file left for this uuid (a
+        retry, a reused uuid) must go before the first ssh — accept-new then records
+        the key this instance presents. The directory is 0700: the files say which
+        hosts this gateway talks to."""
+        path = self._known_hosts_path(uuid)
+        d = os.path.dirname(path)
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        os.chmod(d, 0o700)
+        try:
+            os.remove(path)
+            self._log(f"known_hosts for {uuid} reset")
+        except FileNotFoundError:
+            pass
+        return path
+
     def _tunnel_argv(self) -> list[str]:
         """Called by the Supervisor per spawn, so it follows the CURRENT instance."""
         s = self.state
@@ -455,6 +590,14 @@ class Controller:
         """The tunnel Supervisor seam (tests replace it per instance)."""
         return sshrun.Supervisor(self._tunnel_argv, lambda m: self._log(m),
                                  spawn=self.deps.spawn or asyncio.create_subprocess_exec)
+
+    async def _start_tunnel(self) -> None:
+        """A fresh Supervisor for the current instance. An old one is stopped (and its
+        ssh reaped) first: its process holds the local port, and the new tunnel would
+        exit at once on ExitOnForwardFailure."""
+        await self._stop_tunnel()
+        self._tunnel = self._tunnel_factory()
+        self._tunnel.start()
 
     async def _stop_tunnel(self) -> None:
         t, self._tunnel = self._tunnel, None
@@ -516,23 +659,363 @@ class Controller:
                 "uptime_s": uptime, "disk_gb": s.disk_gb, "cost_per_h": cph,
                 "session_cost": (cph * uptime / 3600) if (cph is not None and running) else None,
                 "snapshot": self._snapshot_view(), "log": list(s.log[-_LOG_MAX:]),
-                "transfers": dict(s.transfers), "persist_blocked": self._persist_blocked}
+                "transfers": dict(s.transfers), "persist_blocked": self._persist_blocked,
+                "bootstrap_unknown": dict(s.bootstrap_unknown),
+                "bootstrap_template_nodes": list(s.bootstrap_template_nodes)}
 
-    # lifecycle — the start and stop paths come next; until then they refuse loudly
+    # lifecycle
     def _refuse_if_unreconciled(self) -> None:
         if self._persist_blocked:
             raise RuntimeError(f"state not loaded ({self.state.error or 'unreadable'}) — "
                                "an instance may still be running; resume first")
 
+    def _refuse_if_busy(self) -> None:
+        if self._op is not None:
+            raise RuntimeError(f"already {self._op}")
+
+    def _fail(self, msg: str) -> None:
+        """An instance exists (and bills): `failed(<phase>)`, never `off` — the stop
+        path needs the uuid to snapshot and delete it. The fault log keeps it after the
+        panel has moved on."""
+        self._set_phase("failed", msg)
+        try:
+            self.deps.note_fault(self.backend, "lifecycle", "error", msg)
+        except Exception as e:
+            self._log(f"fault log unavailable: {e!r}")
+
+    def _cfg_int(self, key: str, default: int) -> int:
+        v = self.cfg.get(key)
+        try:
+            return int(v) if v is not None and v != "" else default
+        except (TypeError, ValueError):
+            raise _PreCreate(f"thunder.{key} is not a number: {v!r}")
+
+    def _required_bytes_hint(self) -> int:
+        """Bytes the aliases' models need on the new disk. P1: 0 (no model sync); P2
+        returns the plan's total so the disk is sized before the create."""
+        return 0
+
+    def _node_list(self) -> str:
+        """The node list the bootstrap installs: the backend's own, else the default
+        list (Ruling 12) — never an empty file, which installs nothing and then fails
+        the smoke test with a reason that points nowhere near the cause."""
+        nodes = self.cfg.get("nodes")
+        if isinstance(nodes, str):
+            nodes = nodes.splitlines()
+        text = "\n".join(str(x) for x in (nodes or []) if str(x).strip())
+        if not text.strip():
+            text = str(self.deps.default_nodes() or "")
+        if not any(ln.strip() and not ln.strip().startswith("#") for ln in text.splitlines()):
+            raise _PreCreate("no custom-node list to bootstrap with (thunder.nodes is "
+                             "empty and there is no default list)")
+        return text if text.endswith("\n") else text + "\n"
+
+    def _commit(self) -> str:
+        c = self.cfg.get("comfy_commit")
+        c = "" if c is None else str(c).strip()
+        if not _COMMIT_RE.fullmatch(c):
+            # the bootstrap exits 2 on anything else — after an instance was paid for
+            raise RuntimeError(f"thunder.comfy_commit must be a full 40-hex commit sha, "
+                               f"got {c!r}")
+        return c
+
+    def _find_ours(self, items: list[dict]) -> Optional[dict]:
+        """Our instance in a FRESH list (Ruling 10): by uuid only. Only when create
+        answered without a uuid, the item at our index is accepted — and only if
+        nobody else owns its uuid and it carries the template we asked for (Thunder
+        reuses indices); its uuid is then adopted and persisted."""
+        s = self.state
+        if s.uuid:
+            return next((it for it in items if it.get("uuid") == s.uuid), None)
+        if not s.index:
+            return None
+        it = next((x for x in items if x.get("index") == s.index), None)
+        if (it is None or not it.get("uuid") or it["uuid"] in self._known_uuids()
+                or it.get("template", "").lower() != self._created_template.lower()):
+            return None
+        s.uuid = it["uuid"]
+        self._log(f"instance at index {s.index} adopted: uuid {s.uuid}")
+        self._persist()
+        return it
+
+    def _known_uuids(self) -> set:
+        try:
+            return set(self.deps.known_uuids() or ())
+        except Exception:
+            return set()
+
+    async def _fresh_item(self) -> dict:
+        it = self._find_ours(await self.api.list_instances())
+        if it is None:
+            raise thunder.ThunderError(
+                f"instance {self.state.uuid or self.state.index} is not in /instances/list",
+                None)
+        if thunder.is_gone_status(it.get("status")):
+            raise thunder.ThunderError(f"instance {it.get('uuid')} is {it.get('status')}", None)
+        return it
+
+    async def _ensure_ports_closed(self, item: dict) -> dict:
+        """Port guard (spec "Start", hard): Thunder's HTTP port forwarding is PUBLIC
+        without auth, and ComfyUI behind it means code execution (Manager) and file
+        reads (`/view`) for anyone. `item` must come from a fresh list (Ruling 10).
+        Open ports are removed and the list read AGAIN — a 200 on the PATCH is not
+        proof — and ports still open raise, so `bootstrapping`/`starting` are never
+        entered with a public port. → the fresh item."""
+        ports = thunder.ports_open(item)
+        if not ports:
+            return item
+        self._log(f"public http ports {ports} open on the instance — removing")
+        await self.api.remove_ports(item, ports)
+        fresh = await self._fresh_item()
+        still = thunder.ports_open(fresh)
+        if still:
+            raise thunder.ThunderError(
+                f"public http ports {still} still open after removing them — "
+                "ComfyUI is not started behind a public port", None)
+        self._log("public http ports closed")
+        return fresh
+
+    def _ssh_argv(self, cmd: str) -> list[str]:
+        s = self.state
+        return sshrun.exec_argv(self._key_path(), self._known_hosts_path(s.uuid),
+                                f"{_SSH_USER}@{s.ip}", s.port, cmd)
+
+    async def _exec(self, cmd: str, stdin: Optional[bytes] = None,
+                    timeout: float = 60) -> tuple[int, bytes, bytes]:
+        return await self.deps.ssh(self._ssh_argv(cmd), stdin=stdin, timeout=timeout)
+
+    async def _wait_running(self, disk_gb: int) -> dict:
+        """Poll until RUNNING with ip + port. Status values are undocumented, so
+        anything else is "not yet" — except RESTORING (its own phase) and a gone
+        status. A failing list is retried: one 502 must not end a 20-minute wait."""
+        limit = _CREATE_BASE_S + _RESTORE_PER_100GB_S * math.ceil(max(1, disk_gb) / 100)
+        deadline = self.deps.now() + limit
+        status, last_err = "not listed", ""
+        while True:
+            try:
+                it = self._find_ours(await self.api.list_instances())
+            except thunder.ThunderError as e:
+                it, last_err = None, str(e)
+                self._log(f"instance list failed while waiting: {e}")
+            if it is not None:
+                status = it.get("status") or "?"
+                if thunder.is_gone_status(status):
+                    raise thunder.ThunderError(f"instance {it.get('uuid')} became {status} "
+                                               "while starting", None)
+                if status == "RESTORING" and self.state.phase != "restoring":
+                    self._set_phase("restoring")
+                if thunder.is_running(status) and it.get("ip") and it.get("port"):
+                    return it
+            if self.deps.now() >= deadline:
+                raise TimeoutError(f"instance not RUNNING after {limit // 60} min "
+                                   f"(status {status})" +
+                                   (f"; last list error: {last_err}" if last_err else ""))
+            await self.deps.sleep(_CREATE_POLL_S)
+
+    async def _wait_ssh(self) -> None:
+        deadline = self.deps.now() + _SSH_READY_S
+        while True:
+            rc, _, err = await self._exec("true", timeout=30)
+            if rc == 0:
+                self._log("ssh reachable")
+                return
+            last = (_tail(err, 1) or [f"rc {rc}"])[0]
+            if self.deps.now() >= deadline:
+                raise TimeoutError(f"ssh not reachable after {_SSH_READY_S // 60} min: {last}")
+            await self.deps.sleep(_SSH_PROBE_S)
+
+    async def _bootstrap(self) -> None:
+        s = self.state
+        rc, _, err = await self._exec("cat > ~/.gw-nodes.txt",
+                                      stdin=self._nodes_text.encode("utf-8"))
+        if rc != 0:
+            raise RuntimeError(f"node list upload failed (rc {rc}): "
+                               + " | ".join(_tail(err, 3)))
+        self._log(f"bootstrap: ComfyUI {self._commit()[:12]}, node list uploaded")
+        rc, out, err = await self._exec(f"bash -s -- {sshrun.q(self._commit())}",
+                                        stdin=self.deps.bootstrap_script(),
+                                        timeout=_BOOTSTRAP_S)
+        text = (out or b"").decode("utf-8", "replace")
+        for line in text.splitlines():
+            if line.strip():
+                self._log(line)
+        rep = parse_bootstrap(text)
+        for line in rep["bad"]:
+            self._log(f"bootstrap: unreadable report line ignored: {line!r}")
+        s.bootstrap_unknown = dict(rep["unknown"])
+        s.bootstrap_template_nodes = list(rep["template_nodes"])
+        self._persist()
+        why = bootstrap_verdict(rc, rep, (err or b"").decode("utf-8", "replace"))
+        if why:
+            for line in _tail(err):
+                self._log(f"stderr: {line}")
+            raise RuntimeError(why)
+        if s.bootstrap_unknown:
+            gb = sum(s.bootstrap_unknown.values()) / 1024 ** 3
+            self._log(f"bootstrap: {len(s.bootstrap_unknown)} template model file(s), "
+                      f"{gb:.1f} GB — delete them before the first stop or every "
+                      "snapshot carries them")
+        self._log("bootstrap done")
+
+    async def _wait_comfy(self, settle: bool = False) -> None:
+        """Probe ComfyUI through the tunnel every 3 s until it answers. `settle`: wait
+        one interval first — right after a pkill the old process may still answer."""
+        deadline = self.deps.now() + _COMFY_READY_S
+        if settle:
+            await self.deps.sleep(_COMFY_PROBE_S)
+        while True:
+            try:
+                ok = bool(await self.deps.probe_comfy(self.url))
+            except Exception:
+                ok = False              # tunnel not up yet, ComfyUI still importing
+            if ok:
+                self._log("ComfyUI answers")
+                return
+            if self.deps.now() >= deadline:
+                raise TimeoutError(f"ComfyUI did not answer on {self.url} within "
+                                   f"{_COMFY_READY_S // 60} min (see ~/comfy.log)")
+            await self.deps.sleep(_COMFY_PROBE_S)
+
+    async def _start_comfy(self, cmd: str, settle: bool = False) -> None:
+        rc, _, err = await self._exec(cmd, timeout=60)
+        if rc != 0:
+            raise RuntimeError(f"starting ComfyUI failed (rc {rc}): "
+                               + " | ".join(_tail(err, 3)))
+        await self._wait_comfy(settle)
+
     async def start(self) -> None:
+        """Spec "Start" 0–6 (P1: no model sync — `starting` → `ready`).
+
+        Refusals (unreconciled state, an instance already known, a bad commit, a
+        start in flight) RAISE before anything happens. Everything else ends in the
+        state: a failure before `create` → `off` with the reason (nothing bills), a
+        failure after it → `failed(<phase>)` with the instance KEPT (diagnosis; the
+        stop path removes it). The uuid is persisted before the first wait, so a
+        gateway restart during the up to ~30 min to RUNNING still knows the instance."""
         self._refuse_if_unreconciled()
-        raise NotImplementedError("Thunder start path not implemented yet")
+        self._refuse_if_busy()
+        s = self.state
+        if s.phase != "off" and not (s.phase == "failed" and not s.uuid and not s.index):
+            # `failed` with an index but no uuid still names an instance (Ruling 10)
+            raise RuntimeError(f"already {s.phase}"
+                               + (f" (instance {s.uuid or s.index})" if s.uuid or s.index else ""))
+        self._commit()
+        self._op = "starting"
+        try:
+            await self._start()
+        finally:
+            self._op = None
+
+    async def _start(self) -> None:
+        s = self.state
+        try:
+            self.deps.set_enabled(self.bid, True)
+        except Exception as e:
+            self._log(f"enabling the backend failed: {e!r}")
+        try:
+            created = await self._create()
+        except Exception as e:
+            msg = _errtext(e)
+            if isinstance(e, thunder.ThunderError) and e.status is None:
+                msg += " (an instance may exist anyway — check the orphan list)"
+            self._set_phase("off", f"start failed: {msg}")
+            try:
+                self.deps.set_enabled(self.bid, False)    # off = disabled (spec "Stop" 1)
+            except Exception as e2:
+                self._log(f"disabling the backend failed: {e2!r}")
+            return
+        needs_bootstrap = created
+        try:
+            item = await self._wait_running(s.disk_gb)
+            s.ip, s.port = str(item["ip"]), int(item["port"])
+            self._persist()
+            item = await self._ensure_ports_closed(item)
+            self._set_phase("connecting")
+            self._reset_known_hosts(s.uuid)
+            await self._start_tunnel()
+            await self._wait_ssh()
+            if needs_bootstrap:
+                self._set_phase("bootstrapping")
+                await self._bootstrap()
+            await self._ensure_ports_closed(await self._fresh_item())
+            self._set_phase("starting")
+            await self._start_comfy(_START_CMD)
+            self._set_phase("ready")
+        except Exception as e:
+            self._fail(_errtext(e))
+
+    async def _create(self) -> bool:
+        """Steps 1–3 up to the create: template, disk, key, `POST /instances/create`;
+        index/uuid persisted with phase `creating`. → whether the instance needs the
+        bootstrap (no READY snapshot of ours to restore from)."""
+        s, cfg = self.state, self.cfg
+        for k in ("gpu_type", "vcpus"):
+            if not cfg.get(k):
+                raise _PreCreate(f"thunder.{k} is not set")
+        num_gpus = self._cfg_int("num_gpus", 1)
+        snaps = await self.api.snapshots()
+        self._snaps = snaps
+        snap = thunder.newest_ready(snaps, self.name)
+        if snap is not None:
+            template, needs_bootstrap = snap["name"], False
+            self._nodes_text = ""
+        else:
+            template = str(cfg.get("bootstrap_template") or "comfy-ui")
+            needs_bootstrap = True
+            self._nodes_text = self._node_list()
+        spec = thunder.spec_for(await self.api.specs(), str(cfg["gpu_type"]), num_gpus)
+        storage = (spec or {}).get("storageGB") if isinstance((spec or {}).get("storageGB"), dict) else {}
+        if spec is None:
+            self._log(f"no /v2/specs entry for {cfg['gpu_type']} x{num_gpus} — disk "
+                      "limits unknown, Thunder decides")
+        disk_gb = thunder.choose_disk_gb(
+            required_bytes=self._required_bytes_hint(), base_bytes=s.base_bytes,
+            reserve_gb=self._cfg_int("reserve_gb", 20),
+            snapshot_min_gb=(snap or {}).get("min_disk_gb") or 0,
+            spec_min=int(storage.get("min") or 0), spec_max=int(storage.get("max") or 0),
+            num_gpus=num_gpus)
+        pub = await self.deps.keygen(self._key_path())
+        self._log(f"creating instance: template {template}, disk {disk_gb} GB"
+                  + ("" if snap else " (first start: bootstrap follows)"))
+        self._created_template = template
+        created = await self.api.create(thunder.create_body(cfg, template, disk_gb, pub))
+        # from here on an instance exists and bills: persist it BEFORE any wait
+        s.index, s.uuid = created["index"], created["uuid"]
+        s.ip, s.port = "", 0
+        s.disk_gb = disk_gb
+        s.started_at = self.deps.now()
+        s.snapshot_id = snap["id"] if snap else ""
+        if needs_bootstrap:
+            s.bootstrap_unknown, s.bootstrap_template_nodes = {}, []
+        self._set_phase("creating")
+        return needs_bootstrap
+
+    async def restart_comfy(self) -> None:
+        """Restart ComfyUI on the running instance (panel button; spec "Start" 5 says
+        `starting` is repeatable from `ready`). Also the way out of a failed bootstrap
+        or start once the cause is fixed on the box. Port guard first, like any entry
+        into `starting`."""
+        self._refuse_if_unreconciled()
+        self._refuse_if_busy()
+        s = self.state
+        if s.phase not in ("ready", "failed") or not (s.uuid and s.ip and s.port):
+            raise RuntimeError(f"no running instance to restart ComfyUI on ({s.phase})")
+        self._op = "restarting ComfyUI"
+        try:
+            try:
+                await self._ensure_ports_closed(await self._fresh_item())
+                if self._tunnel is None:
+                    await self._start_tunnel()
+                self._set_phase("starting")
+                await self._start_comfy(_RESTART_CMD, settle=True)
+                self._set_phase("ready")
+            except Exception as e:
+                self._fail(_errtext(e))
+        finally:
+            self._op = None
 
     async def stop(self) -> None:
         raise NotImplementedError("Thunder stop path not implemented yet")
-
-    async def restart_comfy(self) -> None:
-        raise NotImplementedError("Thunder ComfyUI restart not implemented yet")
 
     async def resume(self) -> None:
         raise NotImplementedError("Thunder resume not implemented yet")

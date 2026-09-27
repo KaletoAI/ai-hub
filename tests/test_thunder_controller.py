@@ -2,6 +2,10 @@
 run: venv/bin/python -m unittest tests.test_thunder_controller -v"""
 import asyncio
 import json
+import os
+import shutil
+import tempfile
+import types
 import unittest
 
 import httpx
@@ -21,6 +25,7 @@ class FakeThunder:
         self.status_script = ["PROVISIONING", "RUNNING"]
         self.http_ports_on_create = []
         self.delete_by = "index"     # which id form /delete accepts
+        self.ignore_port_remove = False   # a /ports PATCH that answers 200 and changes nothing
 
     def handler(self, req: httpx.Request) -> httpx.Response:
         p, m = req.url.path, req.method
@@ -48,7 +53,8 @@ class FakeThunder:
             if ident not in self.instances:           # uuid form tried first (Ruling 11)
                 return httpx.Response(404, json={"error": "not_found"})
             it = self.instances[ident]
-            it["httpPorts"] = [x for x in it["httpPorts"] if x not in body.get("remove_ports", [])]
+            if not self.ignore_port_remove:
+                it["httpPorts"] = [x for x in it["httpPorts"] if x not in body.get("remove_ports", [])]
             return httpx.Response(200, json={})
         if p == "/snapshots/create":
             body = json.loads(req.content)
@@ -67,39 +73,100 @@ class FakeThunder:
         return httpx.Response(404)
 
 
-def make(fake, backend=None, ssh_script=None):
+COMMIT = "1d61dcc35c35541388c0001bacc7703db14e8bea"
+_TMPDIRS = []
+
+
+def tearDownModule():
+    for d in _TMPDIRS:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def make(fake, backend=None, ssh_script=None, datadir=None, default_nodes="",
+         probe=None):
+    """A controller on the stub API. `c.h` carries the harness: `clock` (a list; the
+    fake sleep ADVANCES it, so every timeout is reachable without waiting), `phases`
+    (every persisted phase in order), `faults`, `tunnels`. `ssh_script` maps a
+    substring of the remote command to a result, or to a LIST of results consumed in
+    order (the last one sticks); the bootstrap succeeds by default. Every ssh call is also appended to `fake.calls` as
+    ("SSH", remote_cmd, stdin), so the order against API calls is checkable. The
+    datadir is a fresh temp dir per controller unless given."""
     saved = {}
     enabled = {}
     ssh_calls = []
+    clock = [1_790_000_000.0]
+    phases, faults, tunnels = [], [], []
+    if datadir is None:
+        datadir = tempfile.mkdtemp(prefix="thunderctl-test-")
+        _TMPDIRS.append(datadir)
+    # a bootstrap that succeeds unless the test scripts otherwise
+    script = {"bash -s": (0, b"GW:PHASE smoke\nGW:SMOKE ok\nGW:DONE\n", b"")}
+    script.update(ssh_script or {})
 
     async def ssh(argv, stdin=None, timeout=60):
         ssh_calls.append((argv, stdin))
-        for pat, res in (ssh_script or {}).items():
+        fake.calls.append(("SSH", argv[-1], stdin))
+        for pat, res in script.items():
             if pat in argv[-1]:
+                if isinstance(res, list):
+                    return res.pop(0) if len(res) > 1 else res[0]
                 return res
         return (0, b"", b"")
 
+    async def sleep(s):
+        clock[0] += s
+        await asyncio.sleep(0)
+
+    def save_state(n, d):
+        saved[n] = json.loads(json.dumps(d))
+        if not phases or phases[-1] != d.get("phase"):
+            phases.append(d.get("phase"))
+
+    async def keygen(path):
+        return "ssh-ed25519 AAAAtest ai-hub"
+
     deps = thunderctl.Deps(
         client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(fake.handler), base_url="https://t"),
-        load_state=lambda n: saved.get(n), save_state=lambda n, d: saved.__setitem__(n, json.loads(json.dumps(d))),
+        load_state=lambda n: saved.get(n), save_state=save_state,
         set_enabled=lambda bid, on: enabled.__setitem__(bid, on) or True,
         begin_drain=lambda bid: True, inflight=lambda bid: 0, is_draining=lambda bid: False,
-        note_fault=lambda *a, **k: None, datadir="/tmp", log=lambda m: None,
-        now=lambda: 1_790_000_000.0, sleep=lambda s: asyncio.sleep(0),
-        ssh=ssh, spawn=None, probe_comfy=lambda url: asyncio.sleep(0, True),
-        bootstrap_script=lambda: b"#!/bin/bash\necho GW:DONE\n")
+        note_fault=lambda *a, **k: faults.append(a), datadir=datadir, log=lambda m: None,
+        now=lambda: clock[0], sleep=sleep,
+        ssh=ssh, spawn=None, probe_comfy=probe or (lambda url: asyncio.sleep(0, True)),
+        bootstrap_script=lambda: b"#!/bin/bash\necho GW:DONE\n",
+        keygen=keygen, default_nodes=lambda: default_nodes)
     b = backend or {"name": "thunder", "type": "comfyui", "api_key": "tok",
                     "thunder": {"gpu_type": "a6000", "num_gpus": 1, "vcpus": 8, "local_port": 18188,
-                                "bootstrap_template": "comfy-ui", "reserve_gb": 20, "nodes": [], "comfy_commit": "abc"}}
+                                "bootstrap_template": "comfy-ui", "reserve_gb": 20,
+                                "nodes": ["https://github.com/a/pack@0123abc"],
+                                "comfy_commit": COMMIT}}
     c = thunderctl.Controller(b, deps)
-    c._tunnel_factory = lambda: _NoTunnel()       # never spawn ssh in tests
+
+    def tunnel():
+        t = _NoTunnel(c, fake)
+        tunnels.append(t)
+        return t
+    c._tunnel_factory = tunnel                    # never spawn ssh in tests
+    c.h = types.SimpleNamespace(clock=clock, phases=phases, faults=faults, tunnels=tunnels)
     return c, saved, enabled, ssh_calls
 
 
 class _NoTunnel:
-    running = True
-    def start(self): pass
-    async def stop(self): self.running = False
+    """Records what the world looked like when the tunnel was started."""
+    def __init__(self, c=None, fake=None):
+        self.c, self.fake = c, fake
+        self.running = False
+        self.kh_existed = None
+
+    def start(self):
+        self.running = True
+        if self.c is not None and self.c.state.uuid:
+            self.kh_existed = os.path.exists(self.c._known_hosts_path(self.c.state.uuid))
+        if self.fake is not None:
+            self.fake.calls.append(("TUNNEL", "start", None))
+
+    async def stop(self):
+        self.running = False
 
 
 def _api(fake, **kw):
@@ -468,8 +535,9 @@ class Tunnel(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(argv[-2:], ["--", "ubuntu@10.0.0.5"])
         self.assertIn("127.0.0.1:18188:127.0.0.1:8188", argv)
         self.assertIn("ExitOnForwardFailure=yes", argv)
-        self.assertIn("UserKnownHostsFile=/tmp/thunder-known_hosts/u0", argv)
-        self.assertEqual(argv[argv.index("-i") + 1], "/tmp/thunder.key")
+        d = c.deps.datadir
+        self.assertIn(f"UserKnownHostsFile={d}/thunder-known_hosts/u0", argv)
+        self.assertEqual(argv[argv.index("-i") + 1], f"{d}/thunder.key")
 
     async def test_tunnel_argv_refuses_without_instance(self):
         fake = FakeThunder()
@@ -481,6 +549,512 @@ class Tunnel(unittest.IsolatedAsyncioTestCase):
         c, _, _, _ = make(FakeThunder())
         self.assertEqual(c.bid, "comfyui:thunder")
         self.assertEqual(c.url, "http://127.0.0.1:18188")
+
+
+
+def _ready_snap(fake, name="aihub-thunder-20260926t120000z", sid="s9", min_gb=120, created=9):
+    fake.snaps.append({"id": sid, "name": name, "status": "READY",
+                       "minimumDiskSizeGb": min_gb, "createdAt": created})
+
+
+def _creates(fake):
+    return [b for m, p, b in fake.calls if p == "/instances/create"]
+
+
+def _ssh_cmds(fake):
+    return [p for m, p, _ in fake.calls if m == "SSH"]
+
+
+class Start(unittest.IsolatedAsyncioTestCase):
+    """Spec "Start" steps 0–6 (P1: starting → ready, no model sync yet)."""
+
+    async def test_start_first_time_bootstraps_from_template(self):
+        fake = FakeThunder()
+        c, saved, enabled, _ = make(fake)
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        self.assertIs(enabled["comfyui:thunder"], True)
+        body = _creates(fake)[0]
+        self.assertEqual(body["template"], "comfy-ui")
+        self.assertEqual(body["public_key"], "ssh-ed25519 AAAAtest ai-hub")
+        self.assertEqual(body["disk_size_gb"], 100)
+        cmds = _ssh_cmds(fake)
+        boot = [x for x in cmds if "bash -s --" in x]
+        self.assertEqual(boot, [f"bash -s -- {COMMIT}"])
+        self.assertIn("setsid nohup ~/start-comfy.sh >/dev/null 2>&1 < /dev/null &", cmds)
+        self.assertEqual(c.h.phases, ["creating", "connecting", "bootstrapping", "starting",
+                                      "ready"])
+        self.assertEqual((saved["thunder"]["uuid"], saved["thunder"]["index"]), ("u0", "0"))
+        self.assertEqual((c.state.ip, c.state.port), ("10.0.0.5", 30022))
+        self.assertEqual(c.state.started_at, 1_790_000_000.0)
+        self.assertTrue(c.h.tunnels and c.h.tunnels[-1].running)
+
+    async def test_bootstrap_uploads_node_list_then_runs_script_with_it_on_stdin(self):
+        fake = FakeThunder()
+        c, _, _, calls = make(fake)
+        c.deps.bootstrap_script = lambda: b"#!/bin/bash\necho GW:SMOKE ok\necho GW:DONE\n"
+        await c.start()
+        remote = [(argv[-1], stdin) for argv, stdin in calls]
+        up = [i for i, (cmd, _) in enumerate(remote) if cmd == "cat > ~/.gw-nodes.txt"]
+        run = [i for i, (cmd, _) in enumerate(remote) if cmd.startswith("bash -s --")]
+        self.assertEqual(len(up), 1)
+        self.assertLess(up[0], run[0])
+        self.assertEqual(remote[up[0]][1], b"https://github.com/a/pack@0123abc\n")
+        self.assertEqual(remote[run[0]][1], b"#!/bin/bash\necho GW:SMOKE ok\necho GW:DONE\n")
+        # every argv ends in `-- ubuntu@ip <cmd>` with the instance's port and our key
+        argv = calls[0][0]
+        self.assertEqual(argv[-3:-1], ["--", "ubuntu@10.0.0.5"])
+        self.assertEqual(argv[argv.index("-p") + 1], "30022")
+        self.assertEqual(argv[argv.index("-i") + 1], os.path.join(c.deps.datadir, "thunder.key"))
+
+    async def test_empty_node_list_uploads_the_default_list(self):
+        # Ruling 12: an empty file would install no packs and fail the smoke test with a
+        # misleading reason
+        fake = FakeThunder()
+        c, _, _, calls = make(fake, default_nodes="# default\nregistry:x@1.0\n")
+        c.backend["thunder"]["nodes"] = []
+        await c.start()
+        up = [stdin for argv, stdin in calls if argv[-1] == "cat > ~/.gw-nodes.txt"]
+        self.assertEqual(up, [b"# default\nregistry:x@1.0\n"])
+
+    async def test_no_node_list_at_all_refuses_before_create(self):
+        fake = FakeThunder()
+        c, _, enabled, _ = make(fake)
+        c.backend["thunder"]["nodes"] = []
+        await c.start()
+        self.assertEqual(c.state.phase, "off")
+        self.assertIn("node", c.state.error)
+        self.assertEqual(_creates(fake), [])         # nothing is paid for
+        self.assertIs(enabled["comfyui:thunder"], False)
+
+    async def test_start_from_newest_ready_snapshot_skips_bootstrap(self):
+        fake = FakeThunder()
+        _ready_snap(fake, "aihub-thunder-20260925t120000z", "s1", min_gb=110, created=5)
+        _ready_snap(fake, "aihub-thunder-20260926t120000z", "s2", min_gb=120, created=9)
+        c, _, _, _ = make(fake)
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        body = _creates(fake)[0]
+        self.assertEqual(body["template"], "aihub-thunder-20260926t120000z")
+        self.assertEqual(body["disk_size_gb"], 120)      # never below the snapshot's minimum
+        self.assertFalse([x for x in _ssh_cmds(fake) if "bash -s" in x or ".gw-nodes" in x])
+        self.assertEqual(c.state.snapshot_id, "s2")
+        self.assertEqual(c.state.disk_gb, 120)
+        self.assertNotIn("bootstrapping", c.h.phases)
+
+    async def test_restoring_status_is_its_own_phase(self):
+        fake = FakeThunder()
+        _ready_snap(fake)
+        fake.status_script = ["PROVISIONING", "RESTORING", "RESTORING", "RUNNING"]
+        c, _, _, _ = make(fake)
+        await c.start()
+        self.assertEqual(c.h.phases, ["creating", "restoring", "connecting", "starting",
+                                      "ready"])
+
+    async def test_uuid_persisted_before_wait(self):
+        fake = FakeThunder()
+        fake.status_script = ["PROVISIONING"] * 50
+        c, saved, _, _ = make(fake)
+        await c.start()
+        self.assertEqual(c.state.phase, "failed")
+        self.assertEqual(c.state.failed_phase, "creating")
+        self.assertEqual(saved["thunder"]["uuid"], "u0")     # the instance is not forgotten
+        self.assertEqual(saved["thunder"]["index"], "0")
+        self.assertIn("0", fake.instances)                    # and not deleted either
+        # 15 min + 8 min per started 100 GB (disk 100 GB)
+        self.assertGreaterEqual(c.h.clock[0] - 1_790_000_000.0, 23 * 60)
+        self.assertLess(c.h.clock[0] - 1_790_000_000.0, 23 * 60 + 30)
+        self.assertEqual(_ssh_cmds(fake), [])
+        self.assertEqual(len(c.h.faults), 1)
+        self.assertEqual(c.h.faults[0][1:3], ("lifecycle", "error"))
+
+    async def test_open_http_port_is_removed_before_connecting(self):
+        fake = FakeThunder()
+        fake.http_ports_on_create = [8188]
+        c, _, _, _ = make(fake)
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        kinds = [(m, p) for m, p, _ in fake.calls]
+        patch = kinds.index(("PATCH", "/instances/0/ports"))
+        first_ssh = next(i for i, (m, _) in enumerate(kinds) if m in ("SSH", "TUNNEL"))
+        self.assertLess(patch, first_ssh)
+        self.assertEqual(fake.calls[patch][2], {"remove_ports": [8188]})
+        # uuid form first (Ruling 11)
+        self.assertEqual(kinds[patch - 1], ("PATCH", "/instances/u0/ports"))
+
+    async def test_port_that_stays_open_fails_never_starts(self):
+        fake = FakeThunder()
+        fake.http_ports_on_create = [8188]
+        fake.ignore_port_remove = True
+        c, _, _, _ = make(fake)
+        await c.start()
+        self.assertEqual(c.state.phase, "failed")
+        self.assertIn("8188", c.state.error)
+        self.assertFalse([x for x in _ssh_cmds(fake) if "start-comfy.sh" in x])
+        self.assertEqual(c.h.tunnels, [])                    # never connected at all
+        self.assertIn("0", fake.instances)
+
+    async def test_port_opened_during_bootstrap_is_closed_before_starting(self):
+        fake = FakeThunder()
+        c, _, _, _ = make(fake)
+
+        async def ssh(argv, stdin=None, timeout=60):
+            fake.calls.append(("SSH", argv[-1], stdin))
+            if argv[-1].startswith("bash -s"):
+                fake.instances["0"]["httpPorts"] = [8188]     # the template opened it
+                return (0, b"GW:SMOKE ok\nGW:DONE\n", b"")
+            return (0, b"", b"")
+        c.deps.ssh = ssh
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        kinds = [(m, p) for m, p, _ in fake.calls]
+        boot = next(i for i, (m, p) in enumerate(kinds) if m == "SSH" and p.startswith("bash -s"))
+        patch = kinds.index(("PATCH", "/instances/0/ports"))
+        start = next(i for i, (m, p) in enumerate(kinds) if m == "SSH" and "start-comfy" in p)
+        self.assertLess(boot, patch)
+        self.assertLess(patch, start)
+
+    async def test_bootstrap_smoke_fail_keeps_instance(self):
+        fake = FakeThunder()
+        c, saved, _, _ = make(fake, ssh_script={"bash -s": (3, b"GW:SMOKE fail cumesh\n", b"")})
+        await c.start()
+        self.assertEqual(c.state.phase, "failed")
+        self.assertEqual(c.state.failed_phase, "bootstrapping")
+        self.assertIn("cumesh", c.state.error)
+        self.assertIn("0", fake.instances)
+        self.assertEqual(saved["thunder"]["uuid"], "u0")
+        self.assertFalse([x for x in _ssh_cmds(fake) if "start-comfy.sh" in x])
+        self.assertEqual(len(c.h.faults), 1)
+
+    async def test_node_fail_fails_even_when_done(self):
+        # Ruling 9: a missing node pack makes workflows fail later with a plausible error
+        out = (b"GW:PHASE nodes\nGW:NODE_FAIL ComfyUI-Foo pip-failed\nGW:SMOKE ok\n"
+               b"GW:DONE\n")
+        fake = FakeThunder()
+        c, _, _, _ = make(fake, ssh_script={"bash -s": (0, out, b"")})
+        await c.start()
+        self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "bootstrapping"))
+        self.assertIn("ComfyUI-Foo", c.state.error)
+        self.assertFalse([x for x in _ssh_cmds(fake) if "start-comfy.sh" in x])
+
+    async def test_bootstrap_nonzero_rc_fails(self):
+        fake = FakeThunder()
+        c, _, _, _ = make(fake, ssh_script={"bash -s": (1, b"GW:PHASE venv\n",
+                                                        b"x\nbootstrap: cannot build the venv\n")})
+        await c.start()
+        self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "bootstrapping"))
+        self.assertIn("rc 1", c.state.error)
+        self.assertIn("venv", c.state.error)
+
+    async def test_bootstrap_without_done_fails(self):
+        fake = FakeThunder()
+        c, _, _, _ = make(fake, ssh_script={"bash -s": (0, b"GW:PHASE nodes\n", b"")})
+        await c.start()
+        self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "bootstrapping"))
+
+    async def test_bootstrap_reports_are_collected_and_persisted(self):
+        out = (b"GW:PHASE inventory\nsome noise\n"
+               b"GW:TEMPLATE_NODE ComfyUI-Manager\n"
+               b"GW:UNKNOWN_MODEL models/checkpoints/sd15.safetensors\t2132625894\n"
+               b"GW:UNKNOWN_MODEL models/../../.ssh/id\t5\n"
+               b"GW:SMOKE ok\nGW:DONE\n")
+        fake = FakeThunder()
+        c, saved, _, _ = make(fake, ssh_script={"bash -s": (0, out, b"")})
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        self.assertEqual(saved["thunder"]["bootstrap_unknown"],
+                         {"models/checkpoints/sd15.safetensors": 2132625894})
+        self.assertEqual(saved["thunder"]["bootstrap_template_nodes"], ["ComfyUI-Manager"])
+        v = c.view()
+        self.assertEqual(v["bootstrap_unknown"], {"models/checkpoints/sd15.safetensors": 2132625894})
+        self.assertEqual(v["bootstrap_template_nodes"], ["ComfyUI-Manager"])
+        joined = "\n".join(c.state.log)
+        self.assertIn("GW:TEMPLATE_NODE ComfyUI-Manager", joined)
+        self.assertIn("some noise", joined)
+        # a restart keeps them (the panel shows them until they are deleted)
+        c2 = thunderctl.Controller(c.backend, c.deps)
+        self.assertEqual(c2.state.bootstrap_template_nodes, ["ComfyUI-Manager"])
+
+    async def test_known_hosts_reset_for_new_uuid(self):
+        fake = FakeThunder()
+        c, _, _, _ = make(fake)
+        kh = c._known_hosts_path("u0")
+        os.makedirs(os.path.dirname(kh), exist_ok=True)
+        with open(kh, "w") as f:
+            f.write("[10.0.0.5]:30022 ssh-ed25519 AAAAold\n")
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        self.assertIs(c.h.tunnels[0].kh_existed, False)
+        self.assertFalse(os.path.exists(kh))
+        self.assertEqual(os.stat(os.path.dirname(kh)).st_mode & 0o777, 0o700)
+
+    async def test_ssh_probe_retries_until_reachable(self):
+        fake = FakeThunder()
+        c, _, _, _ = make(fake, ssh_script={"true": [(255, b"", b"refused"), (255, b"", b"x"),
+                                                      (0, b"", b"")]})
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        self.assertEqual(_ssh_cmds(fake).count("true"), 3)
+
+    async def test_ssh_never_reachable_fails_connecting(self):
+        fake = FakeThunder()
+        c, _, _, _ = make(fake, ssh_script={"true": (255, b"", b"Connection refused")})
+        await c.start()
+        self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "connecting"))
+        self.assertIn("Connection refused", c.state.error)
+        self.assertLessEqual(c.h.clock[0] - 1_790_000_000.0, 5 * 60 + 60)
+
+    async def test_comfy_probe_waits_then_ready(self):
+        seen = []
+
+        async def probe(url):
+            seen.append(url)
+            return len(seen) >= 3
+        fake = FakeThunder()
+        _ready_snap(fake)
+        c, _, _, _ = make(fake, probe=probe)
+        await c.start()
+        self.assertEqual(c.state.phase, "ready")
+        self.assertEqual(seen, ["http://127.0.0.1:18188"] * 3)
+
+    async def test_comfy_never_answers_fails_starting(self):
+        async def probe(url):
+            raise httpx.ConnectError("refused")      # a raising probe counts as "not yet"
+        fake = FakeThunder()
+        _ready_snap(fake)
+        c, _, _, _ = make(fake, probe=probe)
+        await c.start()
+        self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "starting"))
+        self.assertIn("0", fake.instances)
+
+    async def test_api_error_before_create_is_off_with_message(self):
+        fake = FakeThunder()
+        c, _, enabled, _ = make(fake)
+
+        def handler(req):
+            if req.url.path == "/snapshots/list":
+                return httpx.Response(503, text="maintenance")
+            return fake.handler(req)
+        c.deps.client_factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await c.start()
+        self.assertEqual(c.state.phase, "off")
+        self.assertIn("maintenance", c.state.error)
+        self.assertEqual(_creates(fake), [])
+        self.assertIs(enabled["comfyui:thunder"], False)
+
+    async def test_bad_comfy_commit_is_refused_up_front(self):
+        fake = FakeThunder()
+        c, _, enabled, _ = make(fake)
+        for bad in ("abc", "", "1d61dcc3", COMMIT + "0", "g" * 40, None):
+            c.backend["thunder"]["comfy_commit"] = bad
+            with self.assertRaises(RuntimeError) as cm:
+                await c.start()
+            self.assertIn("comfy_commit", str(cm.exception))
+        self.assertEqual(fake.calls, [])
+        self.assertEqual(enabled, {})
+
+    async def test_start_refused_while_an_instance_is_known(self):
+        fake = FakeThunder()
+        c, _, _, _ = make(fake)
+        for phase, uuid, index in (("ready", "u1", "1"), ("creating", "u1", "1"),
+                                   ("failed", "u1", "1"), ("failed", "", "3")):
+            c.state.phase, c.state.uuid, c.state.index = phase, uuid, index
+            with self.assertRaises(RuntimeError):
+                await c.start()
+        self.assertEqual(fake.calls, [])
+
+    async def test_failed_without_instance_may_start_again(self):
+        fake = FakeThunder()
+        c, _, _, _ = make(fake)
+        c.state.phase, c.state.failed_phase, c.state.error = "failed", "creating", "x"
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+
+    async def test_concurrent_start_is_refused(self):
+        fake = FakeThunder()
+        c, _, _, _ = make(fake)
+        first = asyncio.ensure_future(c.start())
+        await asyncio.sleep(0)
+        with self.assertRaises(RuntimeError):
+            await c.start()
+        await first
+        self.assertEqual(len(_creates(fake)), 1)
+
+    async def test_create_error_is_off_not_failed(self):
+        fake = FakeThunder()
+        c, _, _, _ = make(fake)
+
+        def handler(req):
+            if req.url.path == "/instances/create":
+                return httpx.Response(400, text="bad gpu")
+            return fake.handler(req)
+        c.deps.client_factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await c.start()
+        self.assertEqual(c.state.phase, "off")
+        self.assertIn("bad gpu", c.state.error)
+        self.assertEqual(c.state.uuid, "")
+
+    async def test_instance_that_vanishes_while_waiting_fails(self):
+        fake = FakeThunder()
+        fake.status_script = ["PROVISIONING", "DELETED"]
+        c, _, _, _ = make(fake)
+        await c.start()
+        self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "creating"))
+        self.assertIn("DELETED", c.state.error)
+
+    async def test_list_error_while_waiting_is_retried(self):
+        fake = FakeThunder()
+        c, _, _, _ = make(fake)
+        n = [0]
+
+        def handler(req):
+            if req.url.path == "/instances/list":
+                n[0] += 1
+                if n[0] == 1:
+                    return httpx.Response(502, text="gateway")
+            return fake.handler(req)
+        c.deps.client_factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+
+
+    def _uuidless_create(self, c, fake, template):
+        def handler(req):
+            r = fake.handler(req)
+            if req.url.path == "/instances/create":
+                idx = str(fake.next_index - 1)
+                fake.instances[idx]["template"] = template
+                return httpx.Response(201, json={"identifier": int(idx)})
+            return r
+        c.deps.client_factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    async def test_create_without_uuid_adopts_our_instance_by_index_and_template(self):
+        fake = FakeThunder()
+        c, saved, _, _ = make(fake)
+        self._uuidless_create(c, fake, "comfy-ui")
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        self.assertEqual(saved["thunder"]["uuid"], "u0")
+
+    async def test_create_without_uuid_never_adopts_a_stranger(self):
+        # Ruling 10: Thunder reuses indices — the item at our index with another
+        # template is not ours, so it is never connected to (let alone deleted)
+        fake = FakeThunder()
+        c, saved, _, _ = make(fake)
+        self._uuidless_create(c, fake, "base")
+        await c.start()
+        self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "creating"))
+        self.assertEqual((saved["thunder"]["uuid"], saved["thunder"]["index"]), ("", "0"))
+        self.assertEqual(_ssh_cmds(fake), [])
+        with self.assertRaises(RuntimeError):          # an index still names an instance
+            await c.start()
+
+class RestartComfy(unittest.IsolatedAsyncioTestCase):
+    async def _ready(self, **kw):
+        fake = FakeThunder()
+        _ready_snap(fake)
+        c, saved, enabled, calls = make(fake, **kw)
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        return fake, c
+
+    async def test_restart_kills_comfy_and_runs_the_loop_again(self):
+        fake, c = await self._ready()
+        n = len(fake.calls)
+        await c.restart_comfy()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        cmds = [p for m, p, _ in fake.calls[n:] if m == "SSH"]
+        self.assertEqual(len(cmds), 1)
+        self.assertIn("pkill -f", cmds[0])
+        self.assertTrue(cmds[0].endswith(
+            "setsid nohup ~/start-comfy.sh >/dev/null 2>&1 < /dev/null &"))
+        self.assertEqual(c.h.phases[-2:], ["starting", "ready"])
+
+    async def test_pkill_pattern_matches_comfy_but_not_the_remote_shell(self):
+        # the remote `bash -c "<cmd>"` carries the pattern in ITS command line: a plain
+        # pattern would kill the shell running the restart before it starts the loop
+        import re
+        import shlex
+        pat = shlex.split(thunderctl._RESTART_CMD.split(";")[0])[2]
+        comfy = "/home/ubuntu/ComfyUI/venv/bin/python main.py --listen 127.0.0.1 --port 8188 --disable-cuda-malloc"
+        self.assertTrue(re.search(pat, comfy))
+        self.assertFalse(re.search(pat, "bash -c " + thunderctl._RESTART_CMD))
+        self.assertFalse(re.search(pat, "/bin/bash /home/ubuntu/start-comfy.sh"))
+
+    async def test_restart_closes_ports_first(self):
+        fake, c = await self._ready()
+        fake.instances["0"]["httpPorts"] = [8188]
+        n = len(fake.calls)
+        await c.restart_comfy()
+        kinds = [(m, p) for m, p, _ in fake.calls[n:]]
+        self.assertLess(kinds.index(("PATCH", "/instances/0/ports")),
+                        next(i for i, (m, _) in enumerate(kinds) if m == "SSH"))
+
+    async def test_restart_from_failed_bootstrap(self):
+        fake = FakeThunder()
+        c, _, _, _ = make(fake, ssh_script={"bash -s": (3, b"GW:SMOKE fail x\n", b"")})
+        await c.start()
+        self.assertEqual(c.state.phase, "failed")
+        await c.restart_comfy()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+
+    async def test_restart_refused_without_instance(self):
+        fake = FakeThunder()
+        c, _, _, _ = make(fake)
+        with self.assertRaises(RuntimeError):
+            await c.restart_comfy()
+        c.state.phase, c.state.uuid = "failed", ""
+        with self.assertRaises(RuntimeError):
+            await c.restart_comfy()
+        self.assertEqual(fake.calls, [])
+
+    async def test_restart_refused_when_unreconciled(self):
+        fake = FakeThunder()
+        c, saved, _, _ = make(fake)
+        saved["thunder"] = "garbage"
+        c2 = thunderctl.Controller(c.backend, c.deps)
+        with self.assertRaises(RuntimeError):
+            await c2.restart_comfy()
+
+    async def test_restart_that_never_answers_fails_starting(self):
+        answers = [True]
+
+        async def probe(url):
+            return answers[0]
+        fake, c = await self._ready(probe=probe)
+        answers[0] = False
+        await c.restart_comfy()
+        self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "starting"))
+
+    async def test_restart_waits_before_first_probe(self):
+        # the old process may still answer for a moment after pkill
+        seen, box = [], []
+
+        async def probe(url):
+            seen.append(box[0].h.clock[0] if box else None)
+            return True
+        fake, c = await self._ready(probe=probe)
+        box.append(c)
+        t0 = c.h.clock[0]
+        seen.clear()
+        await c.restart_comfy()
+        self.assertGreater(seen[0], t0)
+
+
+class BootstrapParse(unittest.TestCase):
+    def test_prefix_not_position(self):
+        r = thunderctl.parse_bootstrap(
+            "noise GW:SMOKE ok\nGW:SMOKEY ok\nGW:PHASE smoke\n  GW:NODE_FAIL x y\n"
+            "GW:SMOKE fail a,b\nGW:DONE\n")
+        self.assertEqual(r["smoke"], "fail a,b")
+        self.assertEqual(r["node_fails"], [])      # indented = not a GW line
+        self.assertTrue(r["done"])
+        self.assertEqual(r["phase"], "smoke")
+
+    def test_unknown_model_bad_size_is_skipped(self):
+        r = thunderctl.parse_bootstrap("GW:UNKNOWN_MODEL models/a.bin\tlots\n"
+                                       "GW:UNKNOWN_MODEL models/b c.bin\t7\n")
+        self.assertEqual(r["unknown"], {"models/b c.bin": 7})
 
 
 if __name__ == "__main__":
