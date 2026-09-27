@@ -43,15 +43,15 @@ class Instances(unittest.TestCase):
 class Snapshots(unittest.TestCase):
     def snaps(self):
         return thunder.parse_snapshots([
-            {"id": "s1", "name": "aihub-thunder-20260901T000000Z", "status": "READY", "minimumDiskSizeGb": 120, "createdAt": 100},
-            {"id": "s2", "name": "aihub-thunder-20260902T000000Z", "status": "READY", "minimumDiskSizeGb": 130, "createdAt": 200},
-            {"id": "s3", "name": "aihub-thunder-20260903T000000Z", "status": "FAILED", "minimumDiskSizeGb": 0, "createdAt": 300},
-            {"id": "x1", "name": "aihub-other-20260901T000000Z", "status": "READY", "minimumDiskSizeGb": 50, "createdAt": 50},
+            {"id": "s1", "name": "aihub-thunder-20260901t000000z", "status": "READY", "minimumDiskSizeGb": 120, "createdAt": 100},
+            {"id": "s2", "name": "aihub-thunder-20260902t000000z", "status": "READY", "minimumDiskSizeGb": 130, "createdAt": 200},
+            {"id": "s3", "name": "aihub-thunder-20260903t000000z", "status": "FAILED", "minimumDiskSizeGb": 0, "createdAt": 300},
+            {"id": "x1", "name": "aihub-other-20260901t000000z", "status": "READY", "minimumDiskSizeGb": 50, "createdAt": 50},
             {"id": "x2", "name": "mine-manual", "status": "READY", "minimumDiskSizeGb": 50, "createdAt": 400},
         ])
 
     def test_name(self):
-        self.assertEqual(thunder.snapshot_name("Thunder_A6000", 0), "aihub-thunder-a6000-19700101T000000Z")
+        self.assertEqual(thunder.snapshot_name("Thunder_A6000", 0), "aihub-thunder-a6000-19700101t000000z")
 
     def test_newest_ready_ignores_failed_and_foreign(self):
         self.assertEqual(thunder.newest_ready(self.snaps(), "thunder")["id"], "s2")
@@ -65,26 +65,45 @@ class Snapshots(unittest.TestCase):
 
     def test_rotation_sorts_by_created_at_not_name(self):
         s = thunder.parse_snapshots([
-            {"id": "old", "name": "aihub-t-20990101T000000Z", "status": "READY", "createdAt": 1},
-            {"id": "new", "name": "aihub-t-20000101T000000Z", "status": "READY", "createdAt": 2}])
+            {"id": "old", "name": "aihub-t-20990101t000000z", "status": "READY", "createdAt": 1},
+            {"id": "new", "name": "aihub-t-20000101t000000z", "status": "READY", "createdAt": 2}])
         self.assertEqual(thunder.rotation(s, "t"), ["old"])
 
     def test_creating_snapshot_blocks_nothing_but_is_not_deleted(self):
         s = thunder.parse_snapshots([
-            {"id": "a", "name": "aihub-t-1", "status": "READY", "createdAt": 1},
-            {"id": "b", "name": "aihub-t-2", "status": "CREATING", "createdAt": 2}])
+            {"id": "a", "name": "aihub-t-20260901t000000z", "status": "READY", "createdAt": 1},
+            {"id": "b", "name": "aihub-t-20260902t000000z", "status": "CREATING", "createdAt": 2}])
         self.assertEqual(thunder.rotation(s, "t"), [])
 
     def test_prefix_of_another_backend_is_not_ours(self):
         # `aihub-thunder-` is also the start of backend `thunder-a6000`'s snapshots:
         # rotating `thunder` must never delete (or restore from) those.
         s = thunder.parse_snapshots([
-            {"id": "mine", "name": "aihub-thunder-20260901T000000Z", "status": "READY", "createdAt": 1},
-            {"id": "other", "name": "aihub-thunder-a6000-20260902T000000Z", "status": "READY", "createdAt": 2},
-            {"id": "otherf", "name": "aihub-thunder-a6000-20260903T000000Z", "status": "FAILED", "createdAt": 3}])
+            {"id": "mine", "name": "aihub-thunder-20260901t000000z", "status": "READY", "createdAt": 1},
+            {"id": "other", "name": "aihub-thunder-a6000-20260902t000000z", "status": "READY", "createdAt": 2},
+            {"id": "otherf", "name": "aihub-thunder-a6000-20260903t000000z", "status": "FAILED", "createdAt": 3}])
         self.assertEqual(thunder.rotation(s, "thunder"), [])
         self.assertEqual(thunder.newest_ready(s, "thunder")["id"], "mine")
         self.assertEqual(thunder.newest_ready(s, "thunder-a6000")["id"], "other")
+
+
+    def test_hand_made_snapshot_with_our_prefix_is_not_ours(self):
+        s = thunder.parse_snapshots([
+            {"id": "manual", "name": "aihub-thunder-manual", "status": "READY", "createdAt": 1},
+            {"id": "upper", "name": "aihub-thunder-20260901T000000Z", "status": "FAILED", "createdAt": 2},
+            {"id": "mine", "name": "aihub-thunder-20260902t000000z", "status": "READY", "createdAt": 3}])
+        self.assertEqual(thunder.rotation(s, "thunder"), [])
+        self.assertEqual(thunder.newest_ready(s, "thunder")["id"], "mine")
+        only_manual = [x for x in s if x["id"] == "manual"]
+        self.assertIsNone(thunder.newest_ready(only_manual, "thunder"))
+
+    def test_snapshot_without_id_is_never_deleted(self):
+        s = thunder.parse_snapshots([
+            {"name": "aihub-t-20260901t000000z", "status": "FAILED", "createdAt": 1},
+            {"id": "", "name": "aihub-t-20260902t000000z", "status": "READY", "createdAt": 2},
+            {"id": "b", "name": "aihub-t-20260903t000000z", "status": "READY", "createdAt": 3}])
+        self.assertEqual(thunder.rotation(s, "t"), [])
+        self.assertNotIn("", thunder.rotation(s, "t"))
 
 
 class Disk(unittest.TestCase):
@@ -107,7 +126,16 @@ class Cost(unittest.TestCase):
     def test_hourly(self):
         spec = thunder.spec_for(SPECS, "a6000", 1)
         self.assertAlmostEqual(thunder.hourly_cost(PRICING, "a6000", 1, 8, 200, spec),
-                               0.35 + 2 * 0.04 + 200 * 0.0003)
+                               0.35 + 2 * 0.04 + 100 * 0.0003)
+
+    def test_included_disk_is_not_billed(self):
+        # Thunder includes 100 GB per GPU: only what lies beyond is billed per GB·h.
+        spec = thunder.spec_for(SPECS, "a6000", 1)
+        self.assertAlmostEqual(thunder.hourly_cost(PRICING, "a6000", 1, 6, 100, spec), 0.35)
+        pricing = dict(PRICING, a6000_x2=0.70)
+        self.assertAlmostEqual(thunder.hourly_cost(pricing, "a6000", 2, 6, 200, None), 0.70)
+        self.assertAlmostEqual(thunder.hourly_cost(pricing, "a6000", 2, 6, 250, None),
+                               0.70 + 50 * 0.0003)
 
     def test_unknown_gpu_is_none(self):
         self.assertIsNone(thunder.hourly_cost(PRICING, "b200", 1, 8, 100, None))

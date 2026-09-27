@@ -30,6 +30,10 @@ _GB = 1024 ** 3
 _GONE = {"DELETED", "TERMINATED", "DELETING"}
 _HOURS_PER_MONTH = 730          # Thunder bills snapshots per GB·hour; 730 h ≈ one month
 _DISK_PER_GPU_GB = 100          # included per GPU and the smallest disk Thunder creates
+# What follows `aihub-<slug>-` in a name this module wrote. Fully lowercase so the whole
+# name stays within [a-z0-9-] (the one character rule Thunder could enforce).
+_STAMP_FMT = "%Y%m%dt%H%M%Sz"
+_STAMP_RE = re.compile(r"\d{8}t\d{6}z")
 
 
 class ThunderError(RuntimeError):
@@ -152,17 +156,17 @@ def snapshot_prefix(backend_name: str) -> str:
 
 
 def snapshot_name(backend_name: str, now: float) -> str:
-    return snapshot_prefix(backend_name) + time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
+    return snapshot_prefix(backend_name) + time.strftime(_STAMP_FMT, time.gmtime(now))
 
 
 def _owned(snap: dict, backend_name: str) -> bool:
     """Is this snapshot one THIS backend wrote? The prefix alone is not enough: backend
     `thunder`'s prefix `aihub-thunder-` is also the start of every snapshot of a backend
-    `thunder-a6000`, and rotation would delete the other backend's snapshots. What
-    follows our prefix is a timestamp, which never contains a hyphen."""
+    `thunder-a6000`, and a hand-made `aihub-thunder-manual` carries it too — rotation
+    would delete both. So what follows the prefix must be exactly the timestamp
+    `snapshot_name` writes."""
     name, prefix = snap.get("name") or "", snapshot_prefix(backend_name)
-    rest = name[len(prefix):]
-    return name.startswith(prefix) and rest != "" and "-" not in rest
+    return name.startswith(prefix) and _STAMP_RE.fullmatch(name[len(prefix):]) is not None
 
 
 def newest_ready(snaps: list[dict], backend_name: str) -> Optional[dict]:
@@ -176,14 +180,15 @@ def rotation(snaps: list[dict], backend_name: str) -> list[str]:
     """Ids of this backend's snapshots that may be deleted: every READY one OLDER than
     the newest READY, and every FAILED one. The newest READY is never returned (it is
     the only way back to the instance), CREATING never (it may become that newest one),
-    and a foreign or hand-made snapshot never."""
+    and a foreign or hand-made snapshot never. A row without an id is never returned
+    either: `DELETE /snapshots/` with an empty id is not a request anyone should send."""
     mine = [s for s in snaps if _owned(s, backend_name)]
     keep = newest_ready(mine, backend_name)
     out = [s["id"] for s in mine if s.get("status") == "FAILED"]
     if keep is not None:
         out += [s["id"] for s in mine if s.get("status") == "READY" and s is not keep
                 and (s.get("created_at") or 0) < (keep.get("created_at") or 0)]
-    return out
+    return [i for i in out if i]
 
 
 # ---- disk / specs / cost ------------------------------------------------------------
@@ -226,8 +231,9 @@ def hourly_cost(pricing: dict, gpu_type: str, num_gpus: int, vcpus: int, disk_gb
                 spec: Optional[dict]) -> Optional[float]:
     """$/h of a running instance from `/v2/pricing`: the GPU configuration's rate +
     every vCPU above the SMALLEST option of the spec (that is how Thunder bills them —
-    pinned in the test, to verify against a real invoice) + disk per GB·h. None when
-    the configuration has no price: a made-up number is worse than none."""
+    pinned in the test, to verify against a real invoice) + disk per GB·h for what lies
+    BEYOND the 100 GB per GPU Thunder includes. None when the configuration has no
+    price: a made-up number is worse than none."""
     rate = (pricing or {}).get(_config_key(gpu_type, num_gpus))
     if rate is None:
         return None
@@ -235,8 +241,9 @@ def hourly_cost(pricing: dict, gpu_type: str, num_gpus: int, vcpus: int, disk_gb
     opts = [o for o in (_int(x) for x in ((spec or {}).get("vcpuOptions") or [])) if o is not None]
     if opts:
         extra = max(0, int(vcpus or 0) - min(opts))
+    billable_gb = max(0, int(disk_gb or 0) - _DISK_PER_GPU_GB * max(1, int(num_gpus or 1)))
     return (float(rate) + extra * float(pricing.get("additional_vcpus") or 0)
-            + int(disk_gb or 0) * float(pricing.get("disk_gb") or 0))
+            + billable_gb * float(pricing.get("disk_gb") or 0))
 
 
 def snapshot_monthly(pricing: dict, gb: float) -> Optional[float]:
