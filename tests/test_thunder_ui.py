@@ -218,6 +218,12 @@ class Form(_Base):
         b.update(over)
         return b
 
+    def test_url_hint_says_how_to_get_a_real_url_back(self):
+        html = admin._backend_form(self._b(), [])
+        self.assertIn("derived from the Thunder block", html)
+        plain = admin._backend_form({"name": "c", "type": "comfyui", "url": "http://x:1"}, [])
+        self.assertNotIn("derived from the Thunder block", plain)
+
     def test_url_readonly_not_disabled(self):
         html = admin._backend_form(self._b(), [])
         m = re.search(r'<input[^>]*name="url"[^>]*>', html)
@@ -286,7 +292,7 @@ class Panel(_Base):
         for p in ("/ui/thunder/start", "/ui/thunder/stop", "/ui/thunder/restart",
                   "/ui/thunder/forget"):
             self.assertIn(p, admin._POST_ACTIONS)
-        self.views = {"tc": _view(phase="ready", unreconciled_uuids=["u-9"])}
+        self.views = {"tc": _view(phase="ready", uuid="u1", unreconciled_uuids=["u-9"])}
         html = self.page()
         self.assertNotRegex(html, r'<a[^>]*href="/ui/thunder/')
         for p in ("stop", "restart", "forget"):
@@ -309,7 +315,7 @@ class Panel(_Base):
         self.assertNotIn("/ui/thunder/start", html)
 
     def test_stop_and_forget_ask_first(self):
-        self.views = {"tc": _view(phase="ready", unreconciled_uuids=["u-9"])}
+        self.views = {"tc": _view(phase="ready", uuid="u1", unreconciled_uuids=["u-9"])}
         html = self.page()
         for p in ("stop", "forget"):
             m = re.search(rf'<button[^>]*formaction="/ui/thunder/{p}[^"]*"[^>]*>', html)
@@ -327,6 +333,46 @@ class Panel(_Base):
     def test_live_while_an_op_is_in_flight_in_phase_off(self):
         self.views = {"tc": _view(phase="off", op="starting")}
         self.assertIn('<main data-live="3">', self.page())
+
+    def test_editor_is_never_live(self):
+        # The morph would reset the visibility the type select's JS set (switch "+ New"
+        # to comfyui and 3 s later its panes vanish) — only the plain list is live.
+        self.views = {"tc": _view(phase="ready")}
+        store.upsert_backend({"name": "tc", "type": "comfyui", "url": "http://127.0.0.1:18188",
+                              "thunder": {"gpu_type": "a6000", "vcpus": 8}})
+        for qp in ({"edit": "comfyui:tc"}, {"new": "1"}, {"host": "thunder-tc"}):
+            html = self.page(qp)
+            self.assertIn("<main>", html, qp)
+            self.assertNotIn("<main data-live", html, qp)
+        self.assertIn('<main data-live="3">', self.page())
+
+    def test_refused_save_is_never_live(self):
+        self.views = {"tc": _view(phase="ready")}
+        r = self.save(_thunder_form(name="x", thunder_vcpus=""))
+        self.assertEqual(r.status_code, 400)
+        self.assertNotIn("<main data-live", r.body.decode())
+
+    def test_buttons_follow_the_controller_refusals(self):
+        # op in flight: no Start, no Restart (the controller answers "already …")
+        self.views = {"tc": _view(phase="failed", op="stopping")}
+        html = self.page()
+        self.assertNotIn("/ui/thunder/start", html)
+        self.assertNotIn("/ui/thunder/restart", html)
+        self.assertIn("/ui/thunder/stop", html)
+        # failed before the create (no instance): Start yes, Restart no (needs the uuid)
+        self.views = {"tc": _view(phase="failed", failed_phase="creating")}
+        html = self.page()
+        self.assertIn("/ui/thunder/start", html)
+        self.assertNotIn("/ui/thunder/restart", html)
+        self.views = {"tc": _view(phase="ready", uuid="u1")}
+        self.assertIn("/ui/thunder/restart", self.page())
+
+    def test_odd_numbers_in_the_view_do_not_break_the_tab(self):
+        self.views = {"tc": _view(phase="draining", waiting_jobs="?", uptime_s="x",
+                                  cost_per_h="n/a", bootstrap_unknown={"a.bin": "big"})}
+        html = self.page()
+        self.assertIn("a.bin", html)
+        self.assertIn("0.0 GB", html)
 
     def test_not_live_when_everything_is_off(self):
         self.views = {"tc": _view(phase="off")}
@@ -346,8 +392,7 @@ class Panel(_Base):
                       "index": "3", "created_at": "2026-09-27"}])}
         html = self.page()
         self.assertIn('data-k="thunder-tc"', html)
-        self.assertIn("failed", html)
-        self.assertIn("bootstrapping", html)
+        self.assertIn('<span class="badge bad">failed (bootstrapping)</span>', html)
         self.assertIn("smoke &lt;failed&gt;", html)
         self.assertNotIn("smoke <failed>", html)
         self.assertIn("stopping", html)                 # the op in flight

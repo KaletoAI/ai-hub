@@ -5889,9 +5889,10 @@ async def _thunder_probe(url: str) -> bool:
 
 
 def _thunder_default_nodes() -> str:
-    """ops/thunder-nodes.default.txt — the console pre-fills a new Thunder block with it,
-    and the controller bootstraps with it when a backend's own list is empty. "" when
-    the file is unreadable (the form then starts empty, the controller refuses)."""
+    """ops/thunder-nodes.default.txt for the backend FORM only (a new Thunder block's
+    nodes textarea): "" when unreadable, so the console still renders. The controller
+    deliberately uses the UNGUARDED reader in `_thunder_deps` — there an unreadable
+    default list must fail the start, not bootstrap with nothing."""
     try:
         return (_HERE / "ops" / "thunder-nodes.default.txt").read_text("utf-8")
     except OSError as e:

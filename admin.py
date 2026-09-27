@@ -1757,6 +1757,7 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
     # only the current type's visible) — the type select toggles them client-side, so
     # switching type must not need a round trip.
     cur_type = g("type", "openai")
+    th_on = isinstance(src.get("thunder"), dict) and bool(src.get("thunder"))
     cmod = adapters.cloud_module(cur_type) if cur_type in adapters.CLOUD_TYPES else None
     num = lambda x: str(int(x)) if float(x) == int(x) else str(x)   # 5.0 → "5" (a placeholder)
     host_inp = (f'<input name="host" value="{_esc(g("host"))}" list="hostlist" '
@@ -1785,7 +1786,9 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
             # A Thunder backend's url is DERIVED (the tunnel port) — readonly, never
             # disabled: a disabled input is not submitted, and absent reads as cleared.
             + _field("url", _inp("url", g("url"), placeholder="http://host:8080",
-                                 readonly=isinstance(src.get("thunder"), dict) and bool(src.get("thunder"))))
+                                 readonly=th_on),
+                     hint=("derived from the Thunder block (the tunnel port) — to use a real URL, "
+                           "untick Thunder (ComfyUI tab) and save, then set it here" if th_on else ""))
             + _field("host", host_inp)
             + "<p class='hint' style='margin:-4px 0 10px'>The physical box this backend runs on — backends "
               "on one host share its GPU/VRAM (basis for host policies). Blank = derived from the URL "
@@ -2153,7 +2156,11 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200) ->
     edit_id = qp.get("edit", "")
     # Captured NOW: every branch below assigns `detail`, so testing it at the end made
     # the tab never live — drain, scan and a running Thunder instance all froze.
-    refused = detail is not None
+    # Live only on the plain list: an open editor (edit/new/host form) or a refused Save
+    # stays static — the morph's attribute sync would reset every visibility the type
+    # select's handler set (switch to comfyui, and 3 s later its panes vanish).
+    static = (detail is not None or bool(edit_id) or bool(qp.get("new"))
+              or bool(qp.get("host")))
     binfo = _gateway_info().get("backends", [])
     # editable from either source: store (full dict incl. api_key) or the live summary (config)
     editing = None
@@ -2280,7 +2287,7 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200) ->
     # until its create) changes phase on its own: the card must follow it
     thunder_busy = any(v.get("phase") != "off" or v.get("op") for _n, v in tviews)
     live = 4 if draining_now else (2 if scan_st.get("running") else (3 if thunder_busy else None))
-    return HTMLResponse(_page("Backends", body, "backends", refresh=None if refused else live),
+    return HTMLResponse(_page("Backends", body, "backends", refresh=None if static else live),
                         status_code=status)
 
 
@@ -3009,8 +3016,16 @@ def _money(v, digits: int = 2) -> str:
         return "—"
 
 
+def _nbytes(v) -> int:
+    """A byte count from the controller's report — 0 for anything that is not one."""
+    try:
+        return max(0, int(v or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _hms(s) -> str:
-    s = max(0, int(s or 0))
+    s = _nbytes(s)                       # same guard: a non-number reads as 0
     return f"{s // 3600}h {s % 3600 // 60:02d}m" if s >= 3600 else f"{s // 60}m {s % 60:02d}s"
 
 
@@ -3030,7 +3045,7 @@ def _thunder_card(name: str, v: dict, cfg: Optional[dict]) -> str:
         rows.append(f'<p class="bad" data-k="{_esc(k)}-blocked">State record unreadable — '
                     "start/stop are refused until it is reconciled (see the log).</p>")
     if v.get("waiting_jobs") is not None and (phase == "draining" or op):
-        n = int(v.get("waiting_jobs") or 0)
+        n = _nbytes(v.get("waiting_jobs"))
         rows.append(f'<p class="hint" data-k="{_esc(k)}-drain">Draining — waiting for '
                     f"{n} job{'s' if n != 1 else ''} to finish before the snapshot.</p>")
     t = cfg or {}
@@ -3086,7 +3101,7 @@ def _thunder_card(name: str, v: dict, cfg: Optional[dict]) -> str:
     if unk:
         urows = "".join(
             f'<tr data-k="{_esc(k)}-unk-{_esc(p)}"><td><code>{_esc(p)}</code></td>'
-            f'<td data-sv="{int(n or 0)}">{(int(n or 0)) / 1024 ** 3:.1f} GB</td></tr>'
+            f'<td data-sv="{_nbytes(n)}">{_nbytes(n) / 1024 ** 3:.1f} GB</td></tr>'
             for p, n in sorted(unk.items()))
         rows.append(f'<details data-k="{_esc(k)}-unknown"><summary>Models the template brought '
                     f"along ({len(unk)})</summary><table><tr><th>file</th><th>size</th></tr>"
@@ -3097,7 +3112,10 @@ def _thunder_card(name: str, v: dict, cfg: Optional[dict]) -> str:
                     f"brought along: {_esc(', '.join(tn))}</div>")
     q = _q(name)
     acts = ""
-    if (phase == "off" and not op) or (phase == "failed" and not v.get("uuid") and not v.get("index")):
+    # mirrors the controller's refusals: an op in flight refuses Start and Restart;
+    # `failed` with an instance (uuid or index) refuses Start; Restart needs the uuid
+    if not op and (phase == "off" or (phase == "failed" and not v.get("uuid")
+                                      and not v.get("index"))):
         acts += _btn("Start", f"/ui/thunder/start?name={q}", sm=True,
                      title="Create the instance (from the last snapshot) — it bills from now on")
     if phase != "off" or op:
@@ -3105,7 +3123,7 @@ def _thunder_card(name: str, v: dict, cfg: Optional[dict]) -> str:
                      confirm=f"Stop {name}? Running jobs finish first, then the instance is "
                              "snapshotted and deleted.",
                      title="Drain, snapshot and delete the instance")
-    if phase in ("ready", "failed") and not op:
+    if phase in ("ready", "failed") and not op and v.get("uuid"):
         acts += _btn("Restart ComfyUI", f"/ui/thunder/restart?name={q}", "secondary", sm=True,
                      title="Restart ComfyUI on the running instance")
     if uu:
