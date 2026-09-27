@@ -3,6 +3,8 @@ run: venv/bin/python -m unittest tests.test_thunder_controller -v"""
 import asyncio
 import json
 import os
+import re
+import shlex
 import shutil
 import tempfile
 import types
@@ -10,6 +12,7 @@ import unittest
 
 import httpx
 
+import modelsync as ms
 import sshrun
 import thunder
 import thunderctl
@@ -26,6 +29,8 @@ class FakeThunder:
         self.http_ports_on_create = []
         self.delete_by = "index"     # which id form /delete accepts
         self.ignore_port_remove = False   # a /ports PATCH that answers 200 and changes nothing
+        self.storage = {"min": 100, "max": 500}   # /v2/specs storageGB of a6000_x1
+        self.on_modify = None        # callback(old_gb, new_gb) — the VM's disk grows
 
     def handler(self, req: httpx.Request) -> httpx.Response:
         p, m = req.url.path, req.method
@@ -38,7 +43,8 @@ class FakeThunder:
         if p == "/instances/create":
             idx = str(self.next_index); self.next_index += 1
             self.instances[idx] = {"uuid": f"u{idx}", "status": "PROVISIONING", "ip": "10.0.0.5",
-                                   "port": 30022, "httpPorts": list(self.http_ports_on_create)}
+                                   "port": 30022, "httpPorts": list(self.http_ports_on_create),
+                                   "disk_size_gb": json.loads(req.content).get("disk_size_gb", 0)}
             return httpx.Response(201, json={"identifier": int(idx), "uuid": f"u{idx}", "key": ""})
         if p.endswith("/delete"):
             ident = p.split("/")[2]
@@ -56,6 +62,17 @@ class FakeThunder:
             if not self.ignore_port_remove:
                 it["httpPorts"] = [x for x in it["httpPorts"] if x not in body.get("remove_ports", [])]
             return httpx.Response(200, json={})
+        if p.endswith("/modify"):
+            ident = p.split("/")[2]
+            body = json.loads(req.content)
+            if ident not in self.instances:           # uuid form tried first (Ruling 11)
+                return httpx.Response(404, json={"error": "not_found"})
+            it = self.instances[ident]
+            old = it.get("disk_size_gb", 0)
+            it["disk_size_gb"] = body.get("disk_size_gb")
+            if self.on_modify is not None:
+                self.on_modify(old, body.get("disk_size_gb"))
+            return httpx.Response(200, json={})
         if p == "/snapshots/create":
             body = json.loads(req.content)
             sid = f"s{len(self.snaps)}"
@@ -69,7 +86,7 @@ class FakeThunder:
         if p == "/v2/pricing":
             return httpx.Response(200, json={"pricing": {"a6000_x1": 0.35, "additional_vcpus": 0.04, "disk_gb": 0.0003, "snapshot_gb": 0.00006849}})
         if p == "/v2/specs":
-            return httpx.Response(200, json={"specs": {"a6000_x1": {"vcpuOptions": [6, 8], "storageGB": {"min": 100, "max": 500}}}})
+            return httpx.Response(200, json={"specs": {"a6000_x1": {"vcpuOptions": [6, 8], "storageGB": dict(self.storage)}}})
         return httpx.Response(404)
 
 
@@ -567,7 +584,7 @@ def _ssh_cmds(fake):
 
 
 class Start(unittest.IsolatedAsyncioTestCase):
-    """Spec "Start" steps 0–6 (P1: starting → ready, no model sync yet)."""
+    """Spec "Start" steps 0–6 (starting → syncing → ready)."""
 
     async def test_start_first_time_bootstraps_from_template(self):
         fake = FakeThunder()
@@ -588,7 +605,7 @@ class Start(unittest.IsolatedAsyncioTestCase):
             "setsid nohup ~/start-comfy.sh >/dev/null 2>&1 < /dev/null &"))
         # "off" first: template + request time are persisted before the create
         self.assertEqual(c.h.phases, ["off", "creating", "connecting", "bootstrapping",
-                                      "starting", "ready"])
+                                      "starting", "syncing", "ready"])
         self.assertEqual((saved["thunder"]["uuid"], saved["thunder"]["index"]), ("u0", "0"))
         self.assertEqual((c.state.ip, c.state.port), ("10.0.0.5", 30022))
         self.assertEqual(c.state.started_at, 1_790_000_000.0)
@@ -654,7 +671,7 @@ class Start(unittest.IsolatedAsyncioTestCase):
         c, _, _, _ = make(fake)
         await c.start()
         self.assertEqual(c.h.phases, ["off", "creating", "restoring", "connecting",
-                                      "starting", "ready"])
+                                      "starting", "syncing", "ready"])
 
     async def test_uuid_persisted_before_wait(self):
         fake = FakeThunder()
@@ -2072,13 +2089,15 @@ class Resume(unittest.IsolatedAsyncioTestCase):
 
 
 async def _one_round(c):
-    """One run_forever round: its first 60 s sleep passes, the second ends the loop."""
+    """One 60 s run_forever round: its 5 s ticks pass until the 60 s work ran, the next
+    tick ends the loop."""
     orig, n = c.deps.sleep, [0]
+    ticks = thunderctl._WATCH_S // thunderctl._SYNC_POLL_S
 
     async def sleep(sec):
-        if sec == thunderctl._WATCH_S:
+        if sec == thunderctl._SYNC_POLL_S:
             n[0] += 1
-            if n[0] > 1:
+            if n[0] > ticks:
                 raise asyncio.CancelledError()
         await orig(sec)
     c.deps.sleep = sleep
@@ -2246,6 +2265,887 @@ class BootstrapParse(unittest.TestCase):
 
 
 # ── main wiring (Task 7) ──────────────────────────────────────────────────────
+
+# ── model sync (spec "Controller": URL transfer, triggers, disk growth; "Stop" 1–2) ──
+
+_GiB = 1024 ** 3
+_TOKEN = "hf_SECRET_TOKEN_123"
+
+
+class FakeVM:
+    """The instance's side of the model sync, in memory. `files` holds PLAN paths
+    (`models/…`, `hf-cache/…`) incl. the `.part`/`.part.lock`/`.part.log` artefacts,
+    `manifest` the text of ~/.gw-modelsync.json, `avail` what `df` reports. It answers
+    the controller's remote commands by their `: gw-<verb> [path] ;` tag and passes
+    every other command to the harness ssh. A curl moves `chunk` bytes of its URL's
+    size (`sizes`) per poll, ends with `fail[url]` on its stderr, or makes no progress
+    while its URL is in `hold`; `sha[url]` is what sha256sum reports for its bytes."""
+
+    def __init__(self, fake):
+        self.fake = fake
+        self.files = {}
+        self.manifest = None
+        self.manifest_writes = []
+        self.avail = 400 * _GiB
+        self.sizes, self.fail, self.sha = {}, {}, {}
+        self.hold = set()
+        self.cap = {}             # url -> bytes its curl stops at (a slow download)
+        self.chunk = 10 ** 12
+        self.procs = {}           # pid -> url
+        self.lockpid = {}         # plan path -> pid in its .part.lock
+        self.part_url = {}        # plan path -> url its .part came from
+        self.logs = {}            # plan path -> curl stderr
+        self.next_pid = 4000
+        self.started = []         # (plan path, curl config on stdin)
+        self.killed = []
+        self.argvs = []
+        self.seen = []            # (verb, controller phase) per sync command
+        fake.on_modify = lambda old, new: setattr(self, "avail", self.avail + (new - old) * _GiB)
+
+    def wrap(self, c):
+        orig = c.deps.ssh
+
+        async def ssh(argv, stdin=None, timeout=60):
+            self.argvs.append(list(argv))
+            cmd = argv[-1]
+            if not cmd.startswith(": gw-"):
+                return await orig(argv, stdin=stdin, timeout=timeout)
+            self.fake.calls.append(("SSH", cmd, stdin))
+            self.seen.append((cmd.split()[1], c.state.phase))
+            return self.run(cmd, stdin)
+        c.deps.ssh = ssh
+
+    @staticmethod
+    def plan_of(remote):
+        return remote[len("ComfyUI/"):] if remote.startswith("ComfyUI/models/") else remote
+
+    @staticmethod
+    def remote(path):
+        return "ComfyUI/" + path if path.startswith("models/") else path
+
+    @staticmethod
+    def _rm_args(toks):
+        i = toks.index("rm")
+        j = toks.index("--", i) + 1
+        out = []
+        while j < len(toks) and toks[j] not in ("&&", ";"):
+            out.append(FakeVM.plan_of(toks[j]))
+            j += 1
+        return out
+
+    def _start(self, path, cfg):
+        url = re.search(r'^url = "(.*)"$', cfg, re.M).group(1)
+        pid = self.next_pid
+        self.next_pid += 1
+        self.procs[pid] = url
+        self.lockpid[path] = pid
+        self.part_url[path] = url
+        self.logs[path] = ""
+        self.files.setdefault(path + ".part", 0)
+        self.files[path + ".part.lock"] = 5
+        self.files[path + ".part.log"] = 0
+        self.started.append((path, cfg))
+
+    def _advance(self, path):
+        pid = self.lockpid.get(path)
+        url = self.procs.get(pid)
+        if url is None:
+            return
+        if url in self.fail:
+            self.logs[path] = self.fail[url]
+            del self.procs[pid]
+        elif url not in self.hold:
+            have = self.files.get(path + ".part", 0)
+            n = min(self.sizes[url], have + self.chunk, self.cap.get(url, self.sizes[url]))
+            self.files[path + ".part"] = n
+            if n >= self.sizes[url]:
+                del self.procs[pid]
+
+    def run(self, cmd, stdin):
+        toks = shlex.split(cmd)
+        verb = toks[1]
+        path = toks[2] if len(toks) > 2 and toks[2] != ";" else None
+        text = (stdin or b"").decode()
+        out = ""
+        if verb == "gw-index":
+            out = "".join(f"{self.remote(p)}\t{n}\n" for p, n in sorted(self.files.items()))
+            out += "GW:END\n"
+        elif verb == "gw-manifest":
+            out = self.manifest if self.manifest is not None else "{}\n"
+        elif verb == "gw-manifest-write":
+            self.manifest = text
+            self.manifest_writes.append(json.loads(text))
+        elif verb == "gw-df":
+            out = f"{self.avail}\n"
+        elif verb == "gw-fetch":
+            if self.lockpid.get(path) in self.procs:
+                out = "GW:ADOPT\n"
+            else:
+                self._start(path, text)
+                out = "GW:STARTED\n"
+        elif verb == "gw-poll":
+            self._advance(path)
+            state = "GW:RUN" if self.lockpid.get(path) in self.procs else "GW:END"
+            out = f"{state}\n{self.files.get(path + '.part', -1)}\n{self.logs.get(path, '')}"
+        elif verb == "gw-sha":
+            out = f"{self.sha.get(self.part_url.get(path), '0' * 64)}  x\n"
+        elif verb == "gw-done":
+            n = self.files.pop(path + ".part")
+            self.files[path] = n
+            self.files.pop(path + ".part.lock", None)
+            self.files.pop(path + ".part.log", None)
+            self.lockpid.pop(path, None)
+            out = f"{n}\n"
+        elif verb == "gw-discard":
+            for suf in (".part", ".part.lock", ".part.log"):
+                self.files.pop(path + suf, None)
+            self.lockpid.pop(path, None)
+        elif verb == "gw-kill":
+            for p, pid in list(self.lockpid.items()):
+                if pid in self.procs:
+                    del self.procs[pid]
+                    self.killed.append(p)
+            out = "GW:KILLED\n"
+        elif verb == "gw-prune":
+            if "rm" in toks:
+                for p in self._rm_args(toks):
+                    self.files.pop(p, None)
+                out += "GW:RM-OK\n"
+            for p in [p for p in self.files if p.endswith((".part", ".part.lock", ".part.log"))]:
+                del self.files[p]
+            self.lockpid.clear()
+            out += "GW:PRUNED\n"
+        elif verb == "gw-delete":
+            for p in self._rm_args(toks):
+                self.files.pop(p, None)
+            out = "GW:DELETED\n"
+        else:
+            return (127, b"", f"unknown verb {verb}".encode())
+        return (0, out.encode(), b"")
+
+
+def _wf(*files):
+    """A workflow with one UNETLoader per weight file (→ models/diffusion_models/…)."""
+    return {str(i): {"class_type": "UNETLoader", "inputs": {"unet_name": f, "weight_dtype": "default"}}
+            for i, f in enumerate(files, 1)}
+
+
+def _dm(name):
+    return f"models/diffusion_models/{name}"
+
+
+def _sync_make(aliases=None, catalog=None, src=None, token=_TOKEN, **kw):
+    """A controller with the model-sync deps wired to `box` (aliases → candidate,
+    catalog) and a FakeVM behind its ssh."""
+    fake = FakeThunder()
+    vm = FakeVM(fake)
+    c, saved, enabled, calls = make(fake, **kw)
+    box = {"aliases": dict(aliases or {}), "catalog": list(catalog or [])}
+
+    def needs(name):
+        return [ms.alias_need(a, ms.refs_for(cand, cand["workflow_json"], []), box["catalog"])
+                for a, cand in sorted(box["aliases"].items()) if cand.get("backend") == name]
+    c.deps.alias_needs = needs
+    c.deps.alias_signature = lambda name: json.dumps(box, sort_keys=True)
+    c.deps.url_catalog = lambda: ms.url_catalog(box["catalog"])
+    c.deps.source_index = lambda: dict(src or {})
+    c.deps.hf_token = lambda: token
+    vm.wrap(c)
+    c.h.calls = calls
+    return fake, vm, c, box, saved
+
+
+def _cand(*files):
+    return {"backend": "thunder", "workflow_json": _wf(*files)}
+
+
+def _url(name, host="https://example.com", sha=None):
+    e = {"file": _dm(name), "url": f"{host}/{name}"}
+    if sha:
+        e["sha256"] = sha
+    return e
+
+
+async def _until(pred, secs=5.0):
+    """Spin the loop until `pred()` holds (the transfer tasks and the thread hops of a
+    sync need real turns of the event loop)."""
+    loop = asyncio.get_running_loop()
+    end = loop.time() + secs
+    while loop.time() < end:
+        if pred():
+            return True
+        await asyncio.sleep(0)
+    return pred()
+
+
+def _idle(c):
+    return not c._fetches and (c._kicker is None or c._kicker.done())
+
+
+def _gw(fake, verb, start=0):
+    return [i for i, (m, p, _) in enumerate(fake.calls[start:]) if m == "SSH"
+            and p.startswith(f": {verb} ")]
+
+
+class ModelSync(unittest.IsolatedAsyncioTestCase):
+    """The sync loop: plan, per-alias readiness, URL transfers on the VM, disk growth,
+    prune at stop (spec "Controller", "Stop" 1–2)."""
+
+    async def test_ready_only_after_all_files_present(self):
+        a, b = _dm("a.safetensors"), _dm("b.safetensors")
+        fake, vm, c, box, _ = _sync_make(
+            aliases={"img": _cand("a.safetensors", "b.safetensors")},
+            catalog=[_url("a.safetensors"), _url("b.safetensors")])
+        vm.sizes = {"https://example.com/a.safetensors": 100,
+                    "https://example.com/b.safetensors": 300}
+        vm.chunk = 50
+        vm.hold.add("https://example.com/b.safetensors")
+        self.assertFalse(c.is_alias_ready("img"))               # no plan yet
+        self.assertIsNone(c.plan)
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        self.assertEqual(c.h.phases[-3:], ["starting", "syncing", "ready"])
+        self.assertIsNotNone(c.plan)
+        self.assertFalse(c.is_alias_ready("img"))
+        # a finished, b still downloading: a is present, the alias is not ready
+        self.assertTrue(await _until(lambda: a in vm.files and c.plan is not None and any(
+            f["path"] == a and f["present"] for f in c.plan["per_alias"]["img"]["files"])))
+        self.assertFalse(c.is_alias_ready("img"))
+        self.assertNotIn("img", c.ready_aliases)
+        self.assertIn("syncing on thunder", c.alias_status("img"))
+        self.assertIn(b, [t["file"] for t in c.view()["transfers"]])
+        vm.hold.clear()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+        self.assertEqual(c.alias_status("img"), "models for img are ready on thunder")
+        man = json.loads(vm.manifest)
+        self.assertEqual(man[a]["size"], 100)
+        self.assertEqual(man[b]["size"], 300)
+        self.assertEqual((man[a]["source"], man[a]["aliases"]), ("url", ["img"]))
+        self.assertEqual(vm.files[a], 100)
+        self.assertNotIn(a + ".part", vm.files)
+        self.assertEqual(c.view()["transfers"], [])
+        # readiness is also a phase question
+        c.state.phase = "draining"
+        self.assertFalse(c.is_alias_ready("img"))
+        self.assertEqual(c.alias_status("img"), "thunder instance is draining")
+        c.state.phase = "syncing"
+        self.assertTrue(c.is_alias_ready("img"))
+        self.assertFalse(c.is_alias_ready("other"))
+        self.assertIn("not planned", c.alias_status("other"))
+
+    async def test_at_most_three_transfers_at_once(self):
+        names = [f"f{i}.safetensors" for i in range(5)]
+        fake, vm, c, box, _ = _sync_make(aliases={"img": _cand(*names)},
+                                         catalog=[_url(n) for n in names])
+        vm.sizes = {f"https://example.com/{n}": 10 for n in names}
+        vm.hold = set(vm.sizes)
+        await c.start()
+        await _until(lambda: len(vm.started) >= 3)
+        for _ in range(50):
+            await asyncio.sleep(0)
+        self.assertEqual(len(vm.started), 3)
+        self.assertEqual(len(c._fetches), 3)
+        vm.hold.clear()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+        self.assertEqual(len(vm.started), 5)
+
+    async def test_alias_removed_during_session_keeps_files_until_stop(self):
+        k, g = _dm("keep.safetensors"), _dm("gone.safetensors")
+        fake, vm, c, box, saved = _sync_make(
+            aliases={"keep": _cand("keep.safetensors"), "gone": _cand("gone.safetensors")},
+            catalog=[_url("keep.safetensors"), _url("gone.safetensors")])
+        vm.sizes = {"https://example.com/keep.safetensors": 7,
+                    "https://example.com/gone.safetensors": 9}
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.ready_aliases == {"keep", "gone"}))
+        n = len(fake.calls)
+        del box["aliases"]["gone"]                  # signature changes
+        await c._sync_tick()
+        self.assertEqual(c.plan["prune"], [g])
+        self.assertIn(g, vm.files)                  # never deleted during a session
+        self.assertEqual(_gw(fake, "gw-prune", n), [])
+        self.assertEqual(c.ready_aliases, {"keep"})
+        await c.stop()
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        self.assertNotIn(g, vm.files)
+        self.assertIn(k, vm.files)
+        man = json.loads(vm.manifest)
+        self.assertEqual(sorted(man), [k])
+        self.assertEqual(man[k]["aliases"], ["keep"])
+        self.assertEqual(c.state.manifests["s0"], man)
+        self.assertEqual(saved["thunder"]["manifests"]["s0"], man)
+        kinds = _paths(fake, n)
+        prune = _gw(fake, "gw-prune", n)[0]
+        self.assertLess(prune, kinds.index(("POST", "/snapshots/create")))
+
+    async def test_held_files_of_a_blocked_alias_survive_the_stop(self):
+        h = _dm("held.safetensors")
+        fake, vm, c, box, _ = _sync_make(aliases={"img": _cand("held.safetensors")},
+                                         catalog=[_url("held.safetensors")])
+        vm.sizes = {"https://example.com/held.safetensors": 5}
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+        # the alias now loads a file no source has → blocked; its synced file is held
+        box["aliases"]["img"] = _cand("nowhere.safetensors")
+        await c._sync_tick()
+        self.assertFalse(c.is_alias_ready("img"))
+        self.assertEqual(c.plan["held"], [[h, 5, "img"]])
+        await c.stop()
+        self.assertIn(h, vm.files)
+        self.assertIn(h, json.loads(vm.manifest))
+
+    async def test_running_download_adopted_not_restarted(self):
+        p, url = _dm("big.safetensors"), "https://example.com/big.safetensors"
+        fake = FakeThunder()
+        _inst(fake)
+        vm = FakeVM(fake)
+        c, _, _, _ = make(fake, state=_persisted())
+        box = {"img": _cand("big.safetensors")}
+        cat = [_url("big.safetensors")]
+        c.deps.alias_needs = lambda n: [ms.alias_need(
+            "img", ms.refs_for(box["img"], box["img"]["workflow_json"], []), cat)]
+        c.deps.alias_signature = lambda n: "sig1"
+        c.deps.url_catalog = lambda: ms.url_catalog(cat)
+        vm.wrap(c)
+        # a curl the previous gateway process started is still running on the box
+        vm.sizes[url] = 30
+        vm.chunk = 10
+        vm.procs[3999] = url
+        vm.lockpid[p] = 3999
+        vm.part_url[p] = url
+        vm.files.update({p + ".part": 10, p + ".part.lock": 5, p + ".part.log": 0})
+        await c.resume()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        self.assertIsNone(c.plan)                     # not before the first sync
+        await c._sync_tick()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+        self.assertEqual(vm.started, [])              # no second curl on the same .part
+        self.assertEqual(vm.files[p], 30)
+        self.assertTrue(any("adopted" in ln for ln in c.state.log))
+
+    async def test_hf_token_only_for_hf_hosts_and_never_in_argv(self):
+        hf = "https://huggingface.co/org/repo/resolve/main"
+        cat = [_url("h.safetensors", hf), _url("e.safetensors"),
+               _url("s.safetensors", "https://huggingface.co.evil.example"),
+               _url("w.safetensors", "https://hf.co/org/repo")]
+        names = ["h.safetensors", "e.safetensors", "s.safetensors", "w.safetensors"]
+        fake, vm, c, box, _ = _sync_make(aliases={"img": _cand(*names)}, catalog=cat)
+        vm.sizes = {e["url"]: 4 for e in cat}
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+        cfg = {p: t for p, t in vm.started}
+        self.assertIn(f'header = "Authorization: Bearer {_TOKEN}"', cfg[_dm("h.safetensors")])
+        self.assertIn(f'header = "Authorization: Bearer {_TOKEN}"', cfg[_dm("w.safetensors")])
+        for other in ("e.safetensors", "s.safetensors"):
+            self.assertNotIn(_TOKEN, cfg[_dm(other)])
+            self.assertNotIn("Authorization", cfg[_dm(other)])
+        self.assertIn(f'url = "{hf}/h.safetensors"', cfg[_dm("h.safetensors")])
+        # never in any argv (ps shows argv), the log, the view or a fault
+        self.assertTrue(vm.argvs)
+        for argv in vm.argvs + [a for a, _ in c.h.calls]:
+            self.assertFalse([x for x in argv if _TOKEN in x], argv)
+        self.assertNotIn(_TOKEN, "\n".join(c.state.log))
+        self.assertNotIn(_TOKEN, json.dumps(c.view(), default=str))
+        self.assertNotIn(_TOKEN, json.dumps(c.h.faults, default=str))
+
+    async def test_token_left_out_of_a_failed_transfers_messages(self):
+        url = "https://huggingface.co/o/r/resolve/main/x.safetensors"
+        fake, vm, c, box, _ = _sync_make(aliases={"img": _cand("x.safetensors")},
+                                         catalog=[_url("x.safetensors", "https://huggingface.co/o/r/resolve/main")])
+        vm.fail[url] = f"curl: (22) The requested URL returned error: 401 (sent {_TOKEN})\n"
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and "img" in (c.plan or {}).get(
+            "per_alias", {}) and c.plan["per_alias"]["img"]["blocked"]))
+        blob = "\n".join(c.state.log) + json.dumps(c.view(), default=str) + json.dumps(
+            c.h.faults, default=str) + c.alias_status("img")
+        self.assertNotIn(_TOKEN, blob)
+        self.assertIn("401", c.alias_status("img"))
+
+    async def test_failed_transfer_blocks_after_three_attempts_with_fault(self):
+        url = "https://example.com/x.safetensors"
+        fake, vm, c, box, _ = _sync_make(aliases={"img": _cand("x.safetensors")},
+                                         catalog=[_url("x.safetensors")])
+        vm.fail[url] = "curl: (22) The requested URL returned error: 404\n"
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.plan["per_alias"]["img"]["blocked"]))
+        self.assertEqual(len(vm.started), 3)
+        self.assertFalse(c.is_alias_ready("img"))
+        st = c.alias_status("img")
+        self.assertIn("blocked on thunder", st)
+        self.assertIn("transfer failed", st)
+        self.assertIn("404", st)
+        sync_faults = [f for f in c.h.faults if f[1:3] == ("sync", "transfer")]
+        self.assertEqual(len(sync_faults), 1)
+        self.assertIn(_dm("x.safetensors"), sync_faults[0][3])
+        # no retry loop: the next sync keeps it blocked without a fourth curl
+        await c.sync_once()
+        await _until(lambda: _idle(c))
+        self.assertEqual(len(vm.started), 3)
+        # the operator fixes the catalog (signature changes) → tried again
+        vm.fail.clear()
+        vm.sizes[url] = 3
+        box["catalog"] = [_url("x.safetensors")] + [{"match": {"alias": "other"}, "paths": []}]
+        await c._sync_tick()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+
+    async def test_sha256_mismatch_discards_the_part(self):
+        url = "https://example.com/x.safetensors"
+        fake, vm, c, box, _ = _sync_make(aliases={"img": _cand("x.safetensors")},
+                                         catalog=[_url("x.safetensors", sha="ab" * 32)])
+        vm.sizes[url] = 8
+        vm.sha[url] = "cd" * 32
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.plan["per_alias"]["img"]["blocked"]))
+        self.assertIn("sha256", c.alias_status("img"))
+        self.assertNotIn(_dm("x.safetensors"), vm.files)
+        self.assertNotIn(_dm("x.safetensors") + ".part", vm.files)
+        self.assertEqual(len(_gw(fake, "gw-discard")), 3)
+        # the right bytes pass and their sha is recorded
+        vm.sha[url] = "AB" * 32
+        box["catalog"] = [_url("x.safetensors", sha="AB" * 32)]
+        await c._sync_tick()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+        self.assertEqual(json.loads(vm.manifest)[_dm("x.safetensors")]["sha256"], "ab" * 32)
+
+    async def test_disk_growth_calls_modify(self):
+        big, url = _dm("big.safetensors"), "https://example.com/big.safetensors"
+        fake, vm, c, box, saved = _sync_make(
+            aliases={"img": _cand("big.safetensors")}, catalog=[_url("big.safetensors")],
+            src={big: 50 * _GiB})
+        vm.sizes[url] = 50 * _GiB
+        vm.avail = 30 * _GiB                      # < 50 GiB fetch + 20 GiB reserve
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        self.assertEqual(_creates(fake)[0]["disk_size_gb"], 100)
+        mods = [(p, b) for m, p, b in fake.calls if p.endswith("/modify")]
+        # uuid form first (404 in the stub), then the index — both from a fresh list
+        self.assertEqual(mods, [("/instances/u0/modify", {"disk_size_gb": 140}),
+                                ("/instances/0/modify", {"disk_size_gb": 140})])
+        lists = [i for i, (m, p, _) in enumerate(fake.calls) if p == "/instances/list"]
+        first_mod = next(i for i, (m, p, _) in enumerate(fake.calls) if p.endswith("/modify"))
+        self.assertTrue([i for i in lists if i < first_mod])
+        self.assertEqual((c.state.disk_gb, saved["thunder"]["disk_gb"]), (140, 140))
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+
+    async def test_disk_beyond_spec_max_blocks_the_alias(self):
+        big, url = _dm("big.safetensors"), "https://example.com/big.safetensors"
+        fake, vm, c, box, _ = _sync_make(
+            aliases={"img": _cand("big.safetensors"), "small": _cand("s.safetensors")},
+            catalog=[_url("big.safetensors"), _url("s.safetensors")], src={big: 300 * _GiB})
+        vm.sizes = {url: 300 * _GiB, "https://example.com/s.safetensors": 1}
+        vm.avail = 25 * _GiB                      # something else fills the disk
+        await c.start()
+        self.assertEqual(c.state.disk_gb, 320)
+        self.assertEqual([p for m, p, b in fake.calls if p.endswith("/modify")], [])
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("small")))
+        self.assertFalse(c.is_alias_ready("img"))
+        self.assertIn("disk", c.alias_status("img"))
+        self.assertNotIn(big, [p for p, _ in vm.started])
+
+    async def test_stop_kills_transfers_before_snapshot(self):
+        p, url = _dm("x.safetensors"), "https://example.com/x.safetensors"
+        fake, vm, c, box, _ = _sync_make(aliases={"img": _cand("x.safetensors")},
+                                         catalog=[_url("x.safetensors")])
+        vm.sizes[url] = 100
+        vm.chunk = 10
+        vm.hold.add(url)
+        await c.start()
+        self.assertTrue(await _until(lambda: c.view()["transfers"]))
+        n = len(fake.calls)
+        await c.stop()
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        kinds = _paths(fake, n)
+        kill = _gw(fake, "gw-kill", n)
+        self.assertTrue(kill)
+        self.assertLess(kill[0], kinds.index(("POST", "/snapshots/create")))
+        self.assertLess(kill[0], _gw(fake, "gw-prune", n)[0])
+        # ended while DRAINING (jobs may still run for a long time)
+        self.assertIn(("gw-kill", "draining"), vm.seen)
+        self.assertEqual(vm.killed, [p])
+        self.assertEqual(vm.procs, {})
+        self.assertFalse([f for f in vm.files if ".part" in f])
+        self.assertEqual(c.view()["transfers"], [])
+        self.assertEqual(c._fetches, {})
+        self.assertNotIn(p, json.loads(vm.manifest))
+
+    async def test_stop_resumed_after_restart_kills_downloads_before_prune(self):
+        # the gateway restarted mid-stop: no transfer task exists, the curl still runs
+        p, url = _dm("x.safetensors"), "https://example.com/x.safetensors"
+        fake = FakeThunder()
+        _inst(fake)
+        vm = FakeVM(fake)
+        c, _, _, _ = make(fake, state=_persisted(phase="pruning"))
+        vm.wrap(c)
+        vm.sizes[url] = 30
+        vm.hold.add(url)
+        vm.procs[3999] = url
+        vm.lockpid[p] = 3999
+        vm.files.update({p + ".part": 10, p + ".part.lock": 5, p + ".part.log": 0})
+        await c.resume()
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        self.assertEqual(vm.killed, [p])
+        verbs = [v for v, _ in vm.seen]
+        self.assertLess(verbs.index("gw-kill"), verbs.index("gw-prune"))
+        self.assertFalse([f for f in vm.files if ".part" in f])
+
+    async def test_unknown_files_listed_never_pruned(self):
+        stranger, old = "models/checkpoints/stranger.safetensors", "models/loras/old.safetensors"
+        fake, vm, c, box, _ = _sync_make(aliases={"img": _cand("x.safetensors")},
+                                         catalog=[_url("x.safetensors")])
+        vm.sizes["https://example.com/x.safetensors"] = 3
+        vm.files = {stranger: 123, old: 44, "hf-cache/token": 40}
+        vm.manifest = json.dumps({old: {"size": 44, "source": "lan", "aliases": "nobody"}})
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+        self.assertEqual(c.plan["unknown"], [[stranger, 123]])
+        self.assertEqual(c.plan["prune"], [old])
+        self.assertEqual(c.view()["plan"]["unknown"], [[stranger, 123]])
+        n = len(fake.calls)
+        await c.stop()
+        self.assertIn(stranger, vm.files)
+        self.assertIn("hf-cache/token", vm.files)
+        self.assertNotIn(old, vm.files)
+        prune_cmd = fake.calls[n + _gw(fake, "gw-prune", n)[0]][1]
+        self.assertNotIn("stranger", prune_cmd)
+        self.assertNotIn("token", prune_cmd)
+        # the manifest written at stop carries `aliases` as a list everywhere
+        for e in json.loads(vm.manifest).values():
+            self.assertIsInstance(e["aliases"], list)
+
+    async def test_delete_unknown_only_deletes_unknown_files(self):
+        stranger = "models/checkpoints/stranger.safetensors"
+        fake, vm, c, box, _ = _sync_make(aliases={"img": _cand("x.safetensors")},
+                                         catalog=[_url("x.safetensors")])
+        vm.sizes["https://example.com/x.safetensors"] = 3
+        vm.files = {stranger: 123}
+        with self.assertRaises(RuntimeError):
+            await c.delete_unknown([stranger])          # no instance
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+        with self.assertRaises(ValueError):             # a needed file is no "unknown"
+            await c.delete_unknown([stranger, _dm("x.safetensors")])
+        self.assertIn(stranger, vm.files)
+        self.assertEqual(await c.delete_unknown([stranger]), 1)
+        self.assertNotIn(stranger, vm.files)
+        self.assertEqual(c.plan["unknown"], [])
+        self.assertIn(_dm("x.safetensors"), vm.files)
+
+    async def test_lan_files_wait_for_the_lan_source(self):
+        lanf = _dm("lan.safetensors")
+        # "img": in no source at all; "known": in a (P3-style) source index but no URL
+        fake, vm, c, box, _ = _sync_make(
+            aliases={"img": _cand("nowhere.safetensors"), "known": _cand("lan.safetensors")},
+            src={lanf: 9})
+        await c.start()
+        self.assertEqual(c.plan["fetch"][0]["source"], "lan")
+        for a in ("img", "known"):
+            st = c.alias_status(a)
+            self.assertIn("waiting for LAN source (not configured)", st)
+            self.assertFalse(c.is_alias_ready(a))
+            self.assertTrue([b for b in c.view()["plan"]["aliases"][a]["blocked"]
+                             if b.startswith("waiting for LAN source (not configured)")])
+        self.assertNotIn("not in source", c.alias_status("img"))
+        self.assertEqual(vm.started, [])
+
+    async def test_signature_change_triggers_a_sync(self):
+        fake, vm, c, box, _ = _sync_make(aliases={"img": _cand("x.safetensors")},
+                                         catalog=[_url("x.safetensors")])
+        vm.sizes["https://example.com/x.safetensors"] = 3
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c)))
+        n = len(_gw(fake, "gw-index"))
+        await c._sync_tick()                            # unchanged, nothing running
+        self.assertEqual(len(_gw(fake, "gw-index")), n)
+        box["aliases"]["two"] = _cand("x.safetensors")
+        await c._sync_tick()
+        self.assertEqual(len(_gw(fake, "gw-index")), n + 1)
+        self.assertTrue(c.is_alias_ready("two"))
+        # not outside syncing|ready
+        box["aliases"]["three"] = _cand("x.safetensors")
+        c.state.phase = "starting"
+        await c._sync_tick()
+        self.assertEqual(len(_gw(fake, "gw-index")), n + 1)
+
+    async def test_transfer_ending_during_a_comfy_restart_still_starts_the_next(self):
+        names = [f"f{i}.safetensors" for i in range(4)]
+        fake, vm, c, box, _ = _sync_make(aliases={"img": _cand(*names)},
+                                         catalog=[_url(n) for n in names])
+        vm.sizes = {f"https://example.com/{n}": 10 for n in names}
+        vm.hold = set(vm.sizes)
+        await c.start()
+        self.assertTrue(await _until(lambda: len(c._fetches) == 3))
+        c.state.phase = "starting"                    # ComfyUI restarting
+        vm.hold.clear()
+        self.assertTrue(await _until(lambda: not c._fetches))
+        self.assertEqual(len(vm.started), 3)          # no sync outside syncing|ready …
+        c.state.phase = "ready"
+        await c._sync_tick()                          # … the pending re-plan runs now
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+        self.assertEqual(len(vm.started), 4)
+
+    async def test_run_forever_polls_the_signature_every_5s(self):
+        fake, vm, c, box, _ = _sync_make(aliases={"img": _cand("x.safetensors")},
+                                         catalog=[_url("x.safetensors")])
+        vm.sizes["https://example.com/x.safetensors"] = 3
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c)))
+        box["aliases"]["two"] = _cand("x.safetensors")
+        n = len(_gw(fake, "gw-index"))
+        orig, ticks = c.deps.sleep, [0]
+
+        async def sleep(sec):
+            if sec == thunderctl._SYNC_POLL_S and asyncio.current_task() is loop_task:
+                ticks[0] += 1
+                if ticks[0] > 1:
+                    raise asyncio.CancelledError()
+            await orig(sec)
+        c.deps.sleep = sleep
+        loop_task = asyncio.ensure_future(c.run_forever())
+        with self.assertRaises(asyncio.CancelledError):
+            await loop_task
+        c.deps.sleep = orig
+        self.assertEqual(len(_gw(fake, "gw-index")), n + 1)
+        self.assertTrue(c.is_alias_ready("two"))
+
+    async def test_required_bytes_hint_uses_the_snapshots_manifest(self):
+        f = _dm("big.safetensors")
+        fake, vm, c, box, _ = _sync_make(aliases={"img": _cand("big.safetensors")},
+                                         catalog=[_url("big.safetensors")])
+        _ready_snap(fake, sid="s9", min_gb=100)
+        c.state.manifests = {"s9": {f: {"size": 150 * _GiB, "source": "url", "aliases": ["img"]}}}
+        self.assertEqual(c._required_bytes_hint("s9"), 150 * _GiB)
+        self.assertEqual(c._required_bytes_hint(""), 0)       # URL size unknown
+        vm.files[f] = 150 * _GiB                        # the restored disk holds it
+        vm.manifest = json.dumps(c.state.manifests["s9"])
+        await c.start()
+        self.assertEqual(_creates(fake)[0]["disk_size_gb"], 170)
+        # a broken dep never stops a start: the hint is 0 then
+        c.deps.alias_needs = lambda n: 1 / 0
+        self.assertEqual(c._required_bytes_hint("s9"), 0)
+
+    async def test_view_plan_summary_and_transfers(self):
+        fake, vm, c, box, _ = _sync_make(
+            aliases={"img": _cand("x.safetensors"), "bad": _cand("nowhere.safetensors")},
+            catalog=[_url("x.safetensors", "https://huggingface.co/o/r/resolve/main")])
+        url = "https://huggingface.co/o/r/resolve/main/x.safetensors"
+        vm.sizes[url] = 100
+        vm.chunk = 25
+        vm.cap[url] = 50
+        self.assertIsNone(c.view()["plan"])
+        await c.start()
+        self.assertTrue(await _until(lambda: c.view()["transfers"]
+                                     and c.view()["transfers"][0]["bytes"] == 50
+                                     and c.view()["transfers"][0]["rate"] is not None))
+        v = c.view()
+        row = v["transfers"][0]
+        for k in ("file", "source", "bytes", "total", "rate", "eta"):
+            self.assertIn(k, row)
+        self.assertEqual((row["file"], row["source"]), (_dm("x.safetensors"), "url"))
+        self.assertNotIn(_TOKEN, json.dumps(v, default=str))
+        self.assertNotIn(url, json.dumps(v["transfers"]))
+        a = v["plan"]["aliases"]["img"]
+        for k in ("need_bytes", "have_bytes", "missing", "blocked", "hints", "held", "ready"):
+            self.assertIn(k, a)
+        self.assertEqual((a["missing"], a["ready"], a["held"]), (1, False, 0))
+        self.assertTrue(v["plan"]["aliases"]["bad"]["blocked"])
+        vm.cap.clear()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+        self.assertTrue(c.view()["plan"]["aliases"]["img"]["ready"])
+        self.assertEqual(c.view()["ready_aliases"], ["img"])
+
+    async def test_sync_failure_keeps_start_and_is_retried(self):
+        fake, vm, c, box, _ = _sync_make(aliases={"img": _cand("x.safetensors")},
+                                         catalog=[_url("x.safetensors")])
+        vm.sizes["https://example.com/x.safetensors"] = 3
+        real = vm.run
+        broken = [True]
+
+        def run(cmd, stdin):
+            if broken[0] and cmd.startswith(": gw-index "):
+                return (255, b"", b"Connection reset")
+            return real(cmd, stdin)
+        vm.run = run
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        self.assertIsNone(c.plan)
+        self.assertFalse(c.is_alias_ready("img"))
+        self.assertTrue(c.view()["sync_error"])
+        broken[0] = False
+        c.h.clock[0] += thunderctl._SYNC_REFRESH_S
+        await c._sync_tick()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+        self.assertEqual(c.view()["sync_error"], "")
+
+    async def test_manifest_write_is_atomic_and_manifest_aliases_are_lists(self):
+        fake, vm, c, box, _ = _sync_make(aliases={"img": _cand("x.safetensors")},
+                                         catalog=[_url("x.safetensors")])
+        vm.sizes["https://example.com/x.safetensors"] = 3
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+        cmd = fake.calls[_gw(fake, "gw-manifest-write")[0]][1]
+        self.assertIn("cat > .gw-modelsync.json.tmp && mv -f .gw-modelsync.json.tmp "
+                      ".gw-modelsync.json", cmd)
+        for m in vm.manifest_writes:
+            for e in m.values():
+                self.assertIsInstance(e["aliases"], list)
+
+    def test_remote_paths_stay_under_the_two_roots(self):
+        self.assertEqual(thunderctl.remote_path("models/vae/a.safetensors"),
+                         "ComfyUI/models/vae/a.safetensors")
+        self.assertEqual(thunderctl.remote_path("hf-cache/hub/x"), "hf-cache/hub/x")
+        for bad in ("models/../x", "/etc/passwd", "other/x", "models/", "hf-cache/.ssh/k",
+                    "models/a\nb"):
+            with self.assertRaises(ValueError, msg=bad):
+                thunderctl.remote_path(bad)
+        idx = thunderctl.parse_index("ComfyUI/models/vae/a.st\t5\nhf-cache/hub/b\t7\n"
+                                     "hf-cache/.locks/c\t1\nComfyUI/custom_nodes/x\t3\n"
+                                     "junk\nGW:END\n")
+        self.assertEqual(idx, {"models/vae/a.st": 5, "hf-cache/hub/b": 7})
+        with self.assertRaises(RuntimeError):            # cut off → never "all missing"
+            thunderctl.parse_index("ComfyUI/models/vae/a.st\t5\n")
+
+    def test_curl_config_quotes_nothing_it_cannot_carry(self):
+        cfg = thunderctl.curl_config("https://example.com/a", "")
+        self.assertIn('url = "https://example.com/a"', cfg)
+        self.assertNotIn("header", cfg)
+        self.assertNotIn("location-trusted", cfg)
+        cfg = thunderctl.curl_config("https://huggingface.co/a", "tok")
+        self.assertIn('header = "Authorization: Bearer tok"', cfg)
+
+
+_STUB_CURL = """#!/bin/sh
+# stub curl: options from stdin (--config -), writes to -o; a TERM ends it
+cfg=$(cat)
+out=
+while [ $# -gt 0 ]; do [ "$1" = -o ] && out=$2; shift; done
+printf '%s' "$cfg" > "$HOME/cfg-seen"
+i=0
+while [ $i -lt "${STUB_SLEEP:-0}" ]; do sleep 1; i=$((i+1)); done
+if [ -n "$STUB_FAIL" ]; then echo "curl: (22) $STUB_FAIL" >&2; exit 22; fi
+printf 'payload' >> "$out"
+"""
+
+
+@unittest.skipUnless(shutil.which("bash") and shutil.which("setsid") and os.path.isdir("/proc"),
+                     "needs bash, setsid and /proc")
+class RemoteShell(unittest.TestCase):
+    """The remote sync commands run for real in `bash -c` (what sshd runs) against a
+    temp HOME and a stub curl — quoting, the lock/adopt logic, the kill and the prune
+    only ever fail on a live instance otherwise."""
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp(prefix="thunder-vm-")
+        _TMPDIRS.append(self.home)
+        os.makedirs(os.path.join(self.home, "bin"))
+        os.makedirs(os.path.join(self.home, "ComfyUI", "models"))
+        stub = os.path.join(self.home, "bin", "curl")
+        with open(stub, "w") as f:
+            f.write(_STUB_CURL)
+        os.chmod(stub, 0o755)
+        self.env = dict(os.environ, HOME=self.home,
+                        PATH=os.path.join(self.home, "bin") + os.pathsep + os.environ["PATH"])
+
+    def sh(self, cmd, stdin=b"", **env):
+        import subprocess
+        r = subprocess.run(["bash", "-c", cmd], input=stdin, capture_output=True,
+                           env=dict(self.env, **env), timeout=30)
+        return r.returncode, r.stdout.decode(), r.stderr.decode()
+
+    def poll(self, rel, secs=10.0):
+        import time as _t
+        end = _t.monotonic() + secs
+        while True:
+            rc, out, err = self.sh(thunderctl._poll_cmd(rel))
+            self.assertEqual(rc, 0, err)
+            if out.startswith("GW:END") or _t.monotonic() > end:
+                return out.splitlines()
+            _t.sleep(0.1)
+
+    def test_fetch_poll_done_roundtrip(self):
+        rel = "models/diffusion_models/it's a file.safetensors"
+        cfg = thunderctl.curl_config("https://huggingface.co/x", _TOKEN)
+        rc, out, err = self.sh(thunderctl._fetch_cmd(rel), cfg.encode(), STUB_SLEEP="2")
+        self.assertEqual((rc, out.strip()), (0, "GW:STARTED"), err)
+        # while it runs: a second start adopts, and no process shows the token
+        rc, out, _ = self.sh(thunderctl._fetch_cmd(rel), cfg.encode())
+        self.assertEqual(out.strip(), "GW:ADOPT")
+        for pid in [p for p in os.listdir("/proc") if p.isdigit()]:
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    self.assertNotIn(_TOKEN.encode(), f.read(), pid)
+            except OSError:
+                pass
+        state, size, *log = self.poll(rel)
+        self.assertEqual((state, size, log), ("GW:END", "7", []))
+        with open(os.path.join(self.home, "cfg-seen")) as f:
+            self.assertEqual(f.read(), cfg.rstrip("\n"))
+        rc, out, err = self.sh(thunderctl._done_cmd(rel))
+        self.assertEqual((rc, out.strip()), (0, "7"), err)
+        final = os.path.join(self.home, "ComfyUI", thunderctl.remote_path(rel)[len("ComfyUI/"):])
+        with open(final) as f:
+            self.assertEqual(f.read(), "payload")
+        self.assertEqual(sorted(os.listdir(os.path.dirname(final))),
+                         ["it's a file.safetensors"])
+        rc, out, _ = self.sh(thunderctl._INDEX_CMD)
+        self.assertEqual(thunderctl.parse_index(out), {rel: 7})
+        rc, out, _ = self.sh(thunderctl._sha_cmd(rel.replace(".safetensors", ".x")))
+        self.assertNotEqual(rc, 0)                    # no .part: sha fails, not "empty"
+
+    def test_curl_error_lands_in_the_poll(self):
+        rel = "hf-cache/hub/x.bin"
+        cfg = thunderctl.curl_config("https://example.com/x", "")
+        self.sh(thunderctl._fetch_cmd(rel), cfg.encode(), STUB_FAIL="404 not found")
+        state, size, *log = self.poll(rel)
+        self.assertEqual(state, "GW:END")
+        self.assertIn("curl: (22) 404 not found", "\n".join(log))
+        rc, _, err = self.sh(thunderctl._discard_cmd(rel))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(os.listdir(os.path.join(self.home, "hf-cache", "hub")), [])
+
+    def test_stale_lock_of_another_process_is_not_adopted_or_killed(self):
+        rel = "models/vae/v.safetensors"
+        d = os.path.join(self.home, "ComfyUI", "models", "vae")
+        os.makedirs(d)
+        with open(os.path.join(d, "v.safetensors.part.lock"), "w") as f:
+            f.write(f"{os.getpid()}\n")               # alive, but no curl (this test)
+        rc, out, _ = self.sh(thunderctl._KILL_CMD)
+        self.assertEqual((rc, out.strip()), (0, "GW:KILLED"))   # we are still here
+        cfg = thunderctl.curl_config("https://example.com/v", "")
+        rc, out, err = self.sh(thunderctl._fetch_cmd(rel), cfg.encode())
+        self.assertEqual(out.strip(), "GW:STARTED", err)
+        self.assertEqual(self.poll(rel)[:2], ["GW:END", "7"])
+
+    def test_kill_then_prune(self):
+        rel = "models/loras/l.safetensors"
+        keep = os.path.join(self.home, "ComfyUI", "models", "loras", "keep.safetensors")
+        old = os.path.join(self.home, "ComfyUI", "models", "loras", "old one.safetensors")
+        cfg = thunderctl.curl_config("https://example.com/l", "")
+        self.sh(thunderctl._fetch_cmd(rel), cfg.encode(), STUB_SLEEP="20")
+        for p in (keep, old):
+            with open(p, "w") as f:
+                f.write("x")
+        self.assertEqual(self.sh(thunderctl._poll_cmd(rel))[1].splitlines()[0], "GW:RUN")
+        rc, out, err = self.sh(thunderctl._KILL_CMD)
+        self.assertEqual((rc, out.strip()), (0, "GW:KILLED"), err)
+        self.assertEqual(self.sh(thunderctl._poll_cmd(rel))[1].splitlines()[0], "GW:END")
+        rc, out, err = self.sh(thunderctl._prune_cmd(["models/loras/old one.safetensors"]))
+        self.assertEqual((rc, out.split()), (0, ["GW:RM-OK", "GW:PRUNED"]), err)
+        self.assertEqual(os.listdir(os.path.dirname(keep)), ["keep.safetensors"])
+        rc, out, err = self.sh(thunderctl._prune_cmd([]))
+        self.assertEqual(out.split(), ["GW:PRUNED"])
+
+    def test_manifest_read_write_and_df(self):
+        rc, out, _ = self.sh(thunderctl._MANIFEST_READ)
+        self.assertEqual(thunderctl.parse_manifest(out), {})
+        rc, out, err = self.sh(thunderctl._MANIFEST_WRITE, b'{"models/a": {"size": 1}}')
+        self.assertEqual(rc, 0, err)
+        rc, out, _ = self.sh(thunderctl._MANIFEST_READ)
+        self.assertEqual(thunderctl.parse_manifest(out), {"models/a": {"size": 1, "aliases": []}})
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".gw-modelsync.json.tmp")))
+        rc, out, err = self.sh(thunderctl._DF_CMD)
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(out.strip().isdigit(), out)
+
 
 _MAIN = None
 
@@ -2514,6 +3414,73 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         cl = deps.client_factory()
         self.assertIsNot(cl, m.http_client)
         self.assertIsNot(cl, deps.client_factory())
+
+    def test_model_sync_deps(self):
+        m = self.m
+        saved_img = m.image_models
+        wf = {"1": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux.safetensors"}},
+              "2": {"class_type": "VAELoader", "inputs": {"vae_name": "ae.safetensors"}}}
+        path = os.path.join(self.tmp, "wf.json")
+        with open(path, "w") as f:
+            json.dump({"1": {"class_type": "CLIPLoader",
+                             "inputs": {"clip_name": "t5.safetensors"}}}, f)
+        self.store.upsert("img", [
+            {"backend": "tc", "workflow_json": wf,
+             "mapping": {"model": {"node": "1", "field": "unet_name", "label": "input_model"}},
+             "fixed": [{"node": "2", "field": "vae_name", "value": "pinned.safetensors"}]},
+            {"backend": "k12", "workflow_json": {"9": {"class_type": "VAELoader",
+                                                       "inputs": {"vae_name": "k.st"}}}}])
+        self.store.upsert("mesh", [{"backend": "tc", "meshy": {"endpoint": "image-to-3d"}}])
+        m.image_models = {"cfgalias": [{"backend": "tc", "workflow": path}],
+                          "img": [{"backend": "tc", "workflow_json": {}}]}   # store wins
+        try:
+            m.backends = [self._tb()]
+            m.sync_thunder_controllers()
+            deps = m.thunder_controllers["tc"].deps
+            self.assertIs(deps.alias_needs, m.thunder_alias_needs)
+            needs = {n.alias: n for n in deps.alias_needs("tc")}
+            self.assertEqual(sorted(needs), ["cfgalias", "img"])     # no cloud, no k12
+            self.assertEqual(sorted((r.cls, r.value, r.selectable) for r in needs["img"].refs),
+                             [("UNETLoader", "flux.safetensors", True),
+                              ("VAELoader", "pinned.safetensors", False)])
+            self.assertEqual([r.value for r in needs["cfgalias"].refs], ["t5.safetensors"])
+            self.assertEqual(deps.alias_needs("k12")[0].refs[0].value, "k.st")
+            # the catalog: defaults while unset, the setting once set, [] when garbage
+            self.assertEqual(deps.url_catalog(), {})
+            cat = [{"file": "models/vae/ae.safetensors", "url": "https://hf.co/x/ae.safetensors"},
+                   {"match": {"alias": "img"}, "paths": ["models/loras/"]}]
+            sig0 = deps.alias_signature("tc")
+            self.assertEqual(sig0, deps.alias_signature("tc"))          # stable
+            self.store.set_settings({"modelsync_catalog": cat})
+            self.assertEqual(deps.url_catalog(), {"models/vae/ae.safetensors":
+                                                  {"url": "https://hf.co/x/ae.safetensors"}})
+            self.assertEqual(needs["img"].catalog, [])
+            self.assertEqual({n.alias: n for n in deps.alias_needs("tc")}["img"].catalog,
+                             ["models/loras/"])
+            sig1 = deps.alias_signature("tc")
+            self.assertNotEqual(sig1, sig0)                              # catalog counts
+            # another backend's candidate changes nothing, this backend's does
+            self.store.upsert("other", [{"backend": "k12", "workflow_json": wf}])
+            self.assertEqual(deps.alias_signature("tc"), sig1)
+            self.store.upsert("other", [{"backend": "tc", "workflow_json": wf}])
+            sig2 = deps.alias_signature("tc")
+            self.assertNotEqual(sig2, sig1)
+            self.store.delete("other")
+            self.assertEqual(deps.alias_signature("tc"), sig1)
+            # a path workflow's content counts (same path, new file)
+            with open(path, "w") as f:
+                json.dump({"1": {"class_type": "CLIPLoader",
+                                 "inputs": {"clip_name": "t5-v2.safetensors"}}}, f)
+            os.utime(path, (1, 1))
+            self.assertNotEqual(deps.alias_signature("tc"), sig1)
+            self.store.set_settings({"modelsync_catalog": {"not": "a list"}})
+            self.assertEqual(deps.url_catalog(), {})
+            self.assertEqual(deps.source_index(), {})
+            self.assertEqual(deps.hf_token(), "")
+            self.store.set_settings({"hf_token": "hf_x"})
+            self.assertEqual(deps.hf_token(), "hf_x")
+        finally:
+            m.image_models = saved_img
 
     def test_unreadable_setting_is_never_overwritten(self):
         m = self.m

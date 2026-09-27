@@ -39,6 +39,22 @@ fault, the last READY one stays the template) and `resume()` reconciles the pers
 state with the instance list after a gateway restart. Every mutating call uses an item
 found in a FRESH list by `_find_ours` (Ruling 10); `orphans()` only ever displays.
 
+The model sync (`sync_once`, spec "Controller"): the destination index is rebuilt by
+`find` over both roots on every plan (the manifest `~/.gw-modelsync.json` says only
+where a file CAME from, never that it exists), `modelsync.plan` decides, and
+`plan`/`ready_aliases` are written there and nowhere else — routing (Task 12) asks
+`is_alias_ready`, which is False before the first plan and outside `syncing|ready`. What
+only the controller knows joins an alias's `blocked` list: no LAN source yet ("waiting
+for LAN source (not configured)"), a transfer that gave up after three attempts (also a
+fault), a disk that cannot grow enough. URL files download ON the instance (≤ 3 curls,
+`setsid`, a lockfile holding the curl's pid, options incl. the Hugging Face token — only
+for a Hugging Face host — on stdin, never argv), and a live lockfile is ADOPTED after a
+gateway restart, never answered with a second curl on the same `.part`. Files leave the
+disk only at stop (`_before_snapshot`): the plan's `prune` list, never `held` or
+`unknown` ones — those go only by the operator's `delete_unknown`. Triggers: the start
+path, a 5-s signature poll in `run_forever`, a re-plan when a transfer ends and every 60 s
+while transfers run.
+
 Never imports `main`: everything the controller needs from the gateway arrives in
 `Deps`, so it stays hot-reload-safe and testable against a stub API and a fake ssh.
 `ThunderApi` owns the HTTP: Bearer token, `httpx.Timeout(30, connect=10)`, any 2xx
@@ -51,17 +67,21 @@ uuid cannot) — to verify live. Covered by test_thunder_controller.py.
 from __future__ import annotations
 
 import asyncio
+import copy
 import dataclasses
+import json
 import math
 import os
+import posixpath
 import re
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Awaitable, Callable, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 
+import modelsync
 import sshrun
 import thunder
 
@@ -132,6 +152,25 @@ _PRE_BOOT = ("creating", "restoring", "connecting")
 # ops a stop() may abort (Ruling 13): an operator must be able to end a hanging, billing
 # start; "stopping" itself is never aborted
 _ABORTABLE = ("starting", "restarting ComfyUI", "resuming")
+
+# model sync (spec "Controller": URL transfer, triggers, disk growth; "Stop" 1–2)
+_SYNC_PHASES = ("syncing", "ready")   # the phases a plan is made (and trusted) in
+_SYNC_POLL_S = 5                # signature check / transfer poll interval
+_SYNC_REFRESH_S = 60            # a re-plan while transfers run, or after a failed sync
+_MAX_FETCH = 3                  # URL transfers at once
+_FETCH_ATTEMPTS = 3             # then the file's aliases are blocked (+ fault)
+_POLL_FAILS_MAX = 60            # consecutive failed polls (5 min) end an attempt
+_STALL_S = 600                  # curl aborts itself below 1 B/s for this long
+_SHA_TIMEOUT_S = 30 * 60        # sha256sum of a 20 GB file on a network disk
+_PRUNE_TIMEOUT_S = 10 * 60
+_GROW_RECHECK = 6               # df re-reads after a disk modify …
+_GROW_RECHECK_S = 10            # … this far apart (the filesystem grows behind it)
+_HF_HOSTS = frozenset({"huggingface.co", "hf.co"})
+_MANIFEST = ".gw-modelsync.json"
+# plan path prefix → path under the instance's home (spec "Zwei Wurzeln")
+_ROOT_MAP = (("models/", "ComfyUI/models/"), ("hf-cache/", "hf-cache/"))
+_LAN_WAIT = "waiting for LAN source (not configured)"
+_NOT_IN_SOURCE = "not in source: "
 
 
 # ── Thunder REST client ──────────────────────────────────────────────────────
@@ -399,6 +438,15 @@ class Deps:
     known_uuids: Callable[[], set] = field(default=lambda: set())
     keygen: Callable[[str], Awaitable[str]] = sshrun.keygen   # path → public key
     default_nodes: Callable[[], str] = field(default=lambda: "")  # ops/thunder-nodes.default.txt
+    # model sync (P2): what the aliases on this backend need, a hash of exactly that
+    # input (candidates + catalog), the source's files, the public download sources and
+    # the Hugging Face token. The two alias readers are blocking store reads — the
+    # controller calls them in a worker thread.
+    alias_needs: Callable[[str], list] = field(default=lambda name: [])
+    alias_signature: Callable[[str], str] = field(default=lambda name: "")
+    source_index: Callable[[], dict] = field(default=lambda: {})
+    url_catalog: Callable[[], dict] = field(default=lambda: {})
+    hf_token: Callable[[], str] = field(default=lambda: "")
 
 
 # ── bootstrap output ─────────────────────────────────────────────────────────
@@ -472,6 +520,190 @@ def _errtext(e: BaseException) -> str:
     return str(e) or type(e).__name__
 
 
+# ── model sync: paths and remote commands ────────────────────────────────────
+# Every remote sync command starts with a `: gw-<verb> [path] ;` no-op: `ps` and the
+# journal then say which file a process is about (and the test VM parses it). Each
+# runs from the home directory with ROOT-RELATIVE paths, so what `find` prints maps to
+# a plan path without knowing the home. Paths go through `remote_path` (`safe_rel`)
+# and `sshrun.q`, and `--` precedes them wherever a command takes options.
+
+def remote_path(rel: str) -> str:
+    """A plan path (`models/…` | `hf-cache/…`) → its path under the instance's home.
+    Anything else — a dot segment, an absolute path, a third root, a directory — is a
+    ValueError: an `rm` or a download must never reach outside the two model roots."""
+    rel = sshrun.safe_rel(rel)
+    if rel.endswith("/"):
+        raise ValueError(f"directory, not a file: {rel!r}")
+    for key, remote in _ROOT_MAP:
+        if rel.startswith(key) and len(rel) > len(key):
+            return remote + rel[len(key):]
+    raise ValueError(f"path outside the model roots: {rel!r}")
+
+
+def plan_path(remote: str) -> Optional[str]:
+    """The inverse of `remote_path` (None for anything outside the roots or unsafe)."""
+    for key, rp in _ROOT_MAP:
+        if remote.startswith(rp) and len(remote) > len(rp):
+            try:
+                return sshrun.safe_rel(key + remote[len(rp):])
+            except ValueError:
+                return None
+    return None
+
+
+_INDEX_CMD = (": gw-index ; cd ~ && find ComfyUI/models hf-cache -type f "
+              "-printf '%p\\t%s\\n' 2>/dev/null ; echo GW:END")
+_MANIFEST_READ = f": gw-manifest ; cat ~/{_MANIFEST} 2>/dev/null || echo {{}}"
+# atomic: a dropped connection leaves the old manifest, never half a new one
+_MANIFEST_WRITE = (f": gw-manifest-write ; cd ~ && cat > {_MANIFEST}.tmp && "
+                   f"mv -f {_MANIFEST}.tmp {_MANIFEST}")
+_DF_CMD = ": gw-df ; df -B1 --output=avail ~ | tail -1"
+# A lock is live only while its pid is a CURL: a pid from a lock that outlived its
+# process (a restored disk, a reboot) may by now be any other process — adopting it
+# would wait forever, killing it could end ComfyUI.
+_ALIVE_FN = ('_alive() { [ -f "$1" ] && '
+             '[ "$(cat /proc/"$(head -n 1 -- "$1")"/comm 2>/dev/null)" = curl ]; }; ')
+# Ends every download of ours: the curl pids named by the lockfiles, TERM, up to 10 s
+# to exit, then KILL (a snapshot must not freeze a growing .part).
+_KILL_CMD = (": gw-kill ; cd ~ && pids=$(find ComfyUI/models hf-cache -type f "
+             "-name '*.part.lock' 2>/dev/null | while IFS= read -r f; do "
+             "p=$(head -n 1 -- \"$f\"); [ \"$(cat /proc/\"$p\"/comm 2>/dev/null)\" = curl ] "
+             "&& echo \"$p\"; done); for p in $pids; do kill \"$p\" 2>/dev/null; done; "
+             "i=0; while [ $i -lt 10 ]; do a=; for p in $pids; do [ -e /proc/\"$p\" ] && a=1; "
+             "done; [ -z \"$a\" ] && break; sleep 1; i=$((i+1)); done; "
+             "for p in $pids; do kill -9 \"$p\" 2>/dev/null; done; echo GW:KILLED")
+_PART_FIND = ("find ComfyUI/models hf-cache -type f \\( -name '*.part' -o -name '*.part.lock' "
+              "-o -name '*.part.log' \\) -delete 2>/dev/null")
+
+
+def _parts(rel: str) -> tuple[str, str, str, str, str]:
+    """(dir, base, part, lock, log) of a plan path on the instance."""
+    d, base = posixpath.split(remote_path(rel))
+    return d, base, base + ".part", base + ".part.lock", base + ".part.log"
+
+
+def _fetch_cmd(rel: str) -> str:
+    """Adopt a live download of `rel`, else start one — in ONE command, so no second
+    curl can start between the check and the start. curl reads its options (URL, and
+    for a Hugging Face host the token header) from stdin, never argv (`ps` shows argv
+    to everyone): the foreground reads stdin to the end first (`cfg=$(cat)`) so nothing
+    is lost when ssh closes, and `printf` is a builtin, so no process ever carries the
+    config on its command line. `< /dev/stdin` is explicit because a background job's
+    stdin is /dev/null otherwise. `setsid`: the curl outlives the ssh session; its pid
+    (`exec`) is what the lockfile holds."""
+    d, base, part, lock, log = _parts(rel)
+    q = sshrun.q
+    inner = f"echo $$ > {q(lock)}; exec curl -L --fail -sS -C - -o {q(part)} --config -"
+    return (f": gw-fetch {q(rel)} ; {_ALIVE_FN}cd ~ && mkdir -p -- {q(d)} && cd -- {q(d)} && "
+            f"if _alive {q(lock)}; then echo GW:ADOPT; else cfg=$(cat) && "
+            f"printf '%s\\n' \"$cfg\" | (setsid sh -c {q(inner)} < /dev/stdin > {q(log)} 2>&1 &) "
+            f"&& echo GW:STARTED; fi")
+
+
+def _poll_cmd(rel: str) -> str:
+    """→ `GW:RUN|GW:END`, the .part's size (-1 = none), then curl's stderr (-sS: empty
+    unless it failed)."""
+    d, base, part, lock, log = _parts(rel)
+    q = sshrun.q
+    return (f": gw-poll {q(rel)} ; {_ALIVE_FN}cd ~ && cd -- {q(d)} && {{ if _alive {q(lock)}; "
+            f"then echo GW:RUN; else echo GW:END; fi; stat -c %s -- {q(part)} 2>/dev/null "
+            f"|| echo -1; tail -c 2000 -- {q(log)} 2>/dev/null; }}")
+
+
+def _sha_cmd(rel: str) -> str:
+    part = remote_path(rel) + ".part"
+    return f": gw-sha {sshrun.q(rel)} ; cd ~ && sha256sum -- {sshrun.q(part)}"
+
+
+def _done_cmd(rel: str) -> str:
+    d, base, part, lock, log = _parts(rel)
+    q = sshrun.q
+    return (f": gw-done {q(rel)} ; cd ~ && cd -- {q(d)} && mv -f -- {q(part)} {q(base)} && "
+            f"rm -f -- {q(lock)} {q(log)} && stat -c %s -- {q(base)}")
+
+
+def _discard_cmd(rel: str) -> str:
+    d, base, part, lock, log = _parts(rel)
+    q = sshrun.q
+    return f": gw-discard {q(rel)} ; cd ~ && cd -- {q(d)} && rm -f -- {q(part)} {q(lock)} {q(log)}"
+
+
+def _prune_cmd(rels: list) -> str:
+    """Delete the plan's prune list (manifest files only) and every transfer artefact.
+    `GW:RM-OK` says the list is gone — only then does the manifest drop its entries."""
+    rm = ""
+    if rels:
+        files = " ".join(sshrun.q(remote_path(r)) for r in rels)
+        rm = f"rm -f -- {files} && echo GW:RM-OK ; "
+    return f": gw-prune ; cd ~ && {rm}{_PART_FIND} ; echo GW:PRUNED"
+
+
+def _delete_cmd(rels: list) -> str:
+    return (": gw-delete ; cd ~ && rm -f -- "
+            + " ".join(sshrun.q(remote_path(r)) for r in rels) + " && echo GW:DELETED")
+
+
+def parse_index(text: str) -> dict:
+    """`find -printf '%p\\t%s\\n'` (root-relative) → `{plan path: bytes}`. Paths outside
+    the roots or with a dot segment are skipped (the HF cache's `.locks`, a `.git`).
+    Without the end marker the listing was cut off — a RuntimeError, never a shorter
+    index: a file missing from it is downloaded again from zero."""
+    lines = (text or "").splitlines()
+    if "GW:END" not in lines:
+        raise RuntimeError("model index incomplete (no end marker)")
+    out: dict = {}
+    for ln in lines[:lines.index("GW:END")]:
+        path, sep, size = ln.rpartition("\t")
+        if not sep or not size.isdigit():
+            continue
+        key = plan_path(path)
+        if key is not None:
+            out[key] = int(size)
+    return out
+
+
+def parse_manifest(text: str) -> dict:
+    """The manifest file → `{path: entry}`, `aliases` always a list. Unreadable → `{}`:
+    its files then count as "unknown" (listed, never deleted) — the safe direction."""
+    try:
+        d = json.loads(text or "{}")
+    except ValueError:
+        return {}
+    return normalize_manifest(d)
+
+
+def normalize_manifest(d) -> dict:
+    """`{path: entry}` with dict entries only and `aliases` always a list (a string
+    there would otherwise be iterated letter by letter)."""
+    if not isinstance(d, dict):
+        return {}
+    out: dict = {}
+    for k, v in d.items():
+        if not isinstance(k, str) or not isinstance(v, dict):
+            continue
+        e = dict(v)
+        al = e.get("aliases")
+        e["aliases"] = [str(x) for x in al] if isinstance(al, (list, tuple)) else []
+        out[k] = e
+    return out
+
+
+def curl_config(url: str, token: str) -> str:
+    """curl's options on stdin (`--config -`): the URL and — only when the caller
+    decided the host is Hugging Face — the token header. Redirects stay on https;
+    `--location-trusted` is never set, so curl drops the header when a redirect leaves
+    the host (HF sends its files from a CDN). curl aborts a download that stalls."""
+    lines = [f'url = "{url}"', 'proto = "=https"', 'proto-redir = "=https"',
+             "speed-limit = 1", f"speed-time = {_STALL_S}"]
+    if token:
+        lines.append(f'header = "Authorization: Bearer {token}"')
+    return "\n".join(lines) + "\n"
+
+
+def _gb(n) -> str:
+    return f"{(n or 0) / 1024 ** 3:.1f}"
+
+
 class _PreCreate(Exception):
     """A start failed before any instance existed → `off`, not `failed`."""
 
@@ -503,6 +735,20 @@ class Controller:
         self._pending_misses = 0                       # watcher rounds without the pending row
         self._abort_note = ""                          # why an aborted create is uncertain
         self._nodes_text = ""                          # node list of the pending bootstrap
+        # model sync: `plan`/`ready_aliases` are written by sync_once() ONLY
+        self.plan: Optional[dict] = None
+        self.ready_aliases: set = set()
+        self._manifest: dict = {}                      # the manifest as last read/written
+        self._unsaved: dict = {}                       # manifest entries a write lost
+        self._sig: Optional[str] = None                # alias_signature the plan is for
+        self._sync_lock = asyncio.Lock()
+        self._manifest_lock = asyncio.Lock()
+        self._fetches: dict[str, asyncio.Task] = {}    # plan path → its transfer task
+        self._failed: dict[str, str] = {}              # plan path → why it gave up
+        self._kicker: Optional[asyncio.Task] = None    # re-plan after a finished transfer
+        self._dirty = False
+        self._sync_error = ""
+        self._last_try = 0.0
         self.state = State()
         try:
             loaded = deps.load_state(self.name)
@@ -583,6 +829,14 @@ class Controller:
         """Gateway shutdown: end the tunnel process and the HTTP client. The INSTANCE is
         not touched — it keeps running and `resume()` picks it up again."""
         await self._stop_tunnel()
+        # local tasks only: the curls on the instance run on and are adopted by the
+        # next gateway process through their lockfiles
+        tasks = [t for t in list(self._fetches.values()) + [self._kicker] if t is not None]
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._fetches.clear()
         if self._client is not None:
             try:
                 await self._client.aclose()
@@ -741,7 +995,9 @@ class Controller:
                 "uptime_s": uptime, "disk_gb": s.disk_gb, "cost_per_h": cph,
                 "session_cost": (cph * uptime / 3600) if (cph is not None and running) else None,
                 "snapshot": self._snapshot_view(), "log": list(s.log[-_LOG_MAX:]),
-                "transfers": dict(s.transfers), "persist_blocked": self._persist_blocked,
+                "transfers": [dict(v) for _, v in sorted(s.transfers.items())],
+                "plan": self._plan_view(), "ready_aliases": sorted(self.ready_aliases),
+                "sync_error": self._sync_error, "persist_blocked": self._persist_blocked,
                 "bootstrap_unknown": dict(s.bootstrap_unknown),
                 "bootstrap_template_nodes": list(s.bootstrap_template_nodes),
                 "bootstrap_incomplete": s.bootstrap_incomplete,
@@ -776,10 +1032,22 @@ class Controller:
         except (TypeError, ValueError):
             raise _PreCreate(f"thunder.{key} is not a number: {v!r}")
 
-    def _required_bytes_hint(self) -> int:
-        """Bytes the aliases' models need on the new disk. P1: 0 (no model sync); P2
-        returns the plan's total so the disk is sized before the create."""
-        return 0
+    def _required_bytes_hint(self, snapshot_id: str = "") -> int:
+        """Bytes the aliases' models need on the new disk (spec "Start" 2): a plan
+        against the source index, with the manifest of the snapshot the instance is
+        started from as the destination (its URL files carry their measured size). A
+        size nobody knows yet (a URL never downloaded) counts 0. Never raises: a broken
+        input sizes the disk by the other terms, it must not stop a start."""
+        try:
+            man = normalize_manifest(self.state.manifests.get(snapshot_id) or {})
+            dest = {k: v["size"] for k, v in man.items() if isinstance(v.get("size"), int)}
+            p = modelsync.plan(self.deps.alias_needs(self.name) or [],
+                               self.deps.source_index() or {}, dest, man,
+                               self.deps.url_catalog() or {})
+            return int(p["need_total"])
+        except Exception as e:
+            self._log(f"model size estimate unavailable: {_errtext(e)}")
+            return 0
 
     def _node_list(self) -> str:
         """The node list the bootstrap installs: the backend's own, else the default
@@ -1035,7 +1303,7 @@ class Controller:
                 self._op, self._op_task = None, None
 
     async def start(self) -> None:
-        """Spec "Start" 0–6 (P1: no model sync — `starting` → `ready`).
+        """Spec "Start" 0–6 (`starting` → `syncing` → first plan → `ready`).
 
         Refusals (unreconciled state, an instance already known, a bad commit, a
         start in flight) RAISE before anything happens. Everything else ends in the
@@ -1147,6 +1415,10 @@ class Controller:
             await self._ensure_ports_closed(await self._fresh_item())
             self._set_phase("starting")
             await self._start_comfy(_START_CMD)
+            # spec "Start" 6: the first plan before `ready`; aliases go live one by one
+            # as their files arrive (`ready_aliases`), `ready` is the INSTANCE's state
+            self._set_phase("syncing")
+            await self.sync_once()
             self._ready()
         except Exception as e:
             self._fail(_errtext(e))
@@ -1190,7 +1462,8 @@ class Controller:
             self._log(f"no /v2/specs entry for {cfg['gpu_type']} x{num_gpus} — disk "
                       "limits unknown, Thunder decides")
         disk_gb = thunder.choose_disk_gb(
-            required_bytes=self._required_bytes_hint(), base_bytes=s.base_bytes,
+            required_bytes=self._required_bytes_hint((snap or {}).get("id") or ""),
+            base_bytes=s.base_bytes,
             reserve_gb=self._cfg_int("reserve_gb", 20),
             snapshot_min_gb=(snap or {}).get("min_disk_gb") or 0,
             spec_min=int(storage.get("min") or 0), spec_max=int(storage.get("max") or 0),
@@ -1263,16 +1536,75 @@ class Controller:
     # ── stop (spec "Stop" 1–4) ──────────────────────────────────────────────
 
     async def _before_snapshot(self) -> None:
-        """Hook of the `pruning` step. P1: nothing to do. P2 (Task 11): end transfers,
-        delete the plan's prune list and stray `.part`s, write the manifest."""
+        """Hook of the `pruning` step (spec "Stop" 2) — the ONLY place synced files are
+        deleted: a file a removed alias no longer needs stays for the rest of the
+        session (the alias may come back in a minute). Ends every download (again: a
+        stop resumed after a gateway restart has no transfer tasks, but the curls may
+        still run), deletes the plan's `prune` list — manifest files only, never a
+        `held` or `unknown` one — and every `.part`/`.part.lock`/`.part.log`, then
+        writes the manifest the snapshot carries (`_current_manifest`). Failures are
+        logged, never raised: pruning saves money, it must not keep a billing instance
+        from being stopped."""
+        s = self.state
+        if not (s.ip and s.port):
+            self._log("model prune skipped: no ssh address known")
+            return
+        await self._kill_remote()
+        async with self._manifest_lock:
+            try:
+                plan, man = await self._compute_plan()
+            except Exception as e:
+                plan, man = None, None
+                self._log(f"model prune skipped ({_errtext(e)}) — only unfinished "
+                          "downloads are removed")
+            prune = list(plan["prune"]) if plan else []
+            try:
+                rc, out, err = await self._exec(_prune_cmd(prune), timeout=_PRUNE_TIMEOUT_S)
+            except Exception as e:
+                rc, out, err = -1, b"", _errtext(e).encode()
+            text = (out or b"").decode("utf-8", "replace")
+            removed = bool(prune) and rc == 0 and "GW:RM-OK" in text
+            if rc != 0 or "GW:PRUNED" not in text:
+                self._log(f"model prune failed (rc {rc}): " + " | ".join(_tail(err, 3)))
+            elif prune:
+                self._log(f"pruned {len(prune)} model file(s) no alias needs: "
+                          + ", ".join(prune[:10]) + (" …" if len(prune) > 10 else ""))
+            if man is None:
+                return
+            new = {k: v for k, v in man.items() if not (removed and k in prune)}
+            users: dict = {}
+            for a, row in plan["per_alias"].items():
+                for f in row["files"]:
+                    users.setdefault(f["path"], set()).add(a)
+            for k in new:
+                if k in users:                  # who needs it NOW (held files keep theirs)
+                    new[k] = dict(new[k], aliases=sorted(users[k]))
+            try:
+                await self._write_manifest(new)
+                self._unsaved.clear()
+                self._manifest = new
+            except Exception as e:
+                self._log(f"manifest not written: {_errtext(e)}")
+                self._manifest = man
 
     async def _stop_transfers(self) -> None:
         """Hook of the `draining` step (spec "Stop" 1: transfers end BEFORE the
-        snapshot, or it freezes growing `.part`s). P1: there are none."""
+        snapshot, or it freezes growing `.part`s): the local tasks, then the curls on
+        the instance (ended there, by pid — `_kill_remote`)."""
+        tasks = [t for t in list(self._fetches.values()) + [self._kicker] if t is not None]
+        self._dirty = False
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._fetches.clear()
+        self.state.transfers.clear()
+        await self._kill_remote()
 
     def _current_manifest(self) -> dict:
-        """The model manifest the snapshot carries (`manifests[sid]`). P1: `{}`."""
-        return {}
+        """The model manifest the snapshot carries (`manifests[sid]`): the one
+        `_before_snapshot` wrote (else the last one read)."""
+        return copy.deepcopy(self._manifest)
 
     async def stop(self) -> None:
         """Spec "Stop": draining → pruning → snapshotting → deleting → `off`.
@@ -1378,9 +1710,9 @@ class Controller:
         self._drain_waiting = None
 
     async def _prune(self) -> None:
-        """Step 2: the P2 hook, then `base_bytes` (everything but the model roots) —
-        what the next disk needs besides models. A failed measurement keeps the last
-        value: it sizes a disk, it must not stop a stop."""
+        """Step 2: the model prune (`_before_snapshot`), then `base_bytes` (everything
+        but the model roots) — what the next disk needs besides models. A failed
+        measurement keeps the last value: it sizes a disk, it must not stop a stop."""
         s = self.state
         self._set_phase("pruning")
         await self._before_snapshot()
@@ -1613,6 +1945,523 @@ class Controller:
             except Exception as e:
                 self._log(f"fault log unavailable: {e!r}")
 
+    # ── model sync (spec "Controller": URL transfer, triggers, disk growth) ─────
+
+    def is_alias_ready(self, alias: str) -> bool:
+        """May `alias` route to this backend? Only with a plan (none before the first
+        sync) that has every file of the alias present and nothing blocking it — and
+        only while the instance is `ready|syncing`: a plan is no promise about an
+        instance that is draining, restarting ComfyUI or gone."""
+        return (self.state.phase in _SYNC_PHASES and self.plan is not None
+                and alias in self.ready_aliases)
+
+    def alias_status(self, alias: str) -> str:
+        """Why (not) — the text a client's 503 carries."""
+        if self.state.phase not in _SYNC_PHASES:
+            return f"thunder instance is {self.state.phase}"
+        return modelsync.status_text(self.plan, alias, self.name)
+
+    def _lan_configured(self) -> bool:
+        """P2 has no LAN source (Task 15 adds it)."""
+        return False
+
+    async def _signature(self) -> str:
+        return str(await asyncio.to_thread(self.deps.alias_signature, self.name))
+
+    async def _sync_tick(self) -> None:
+        """One 5-s trigger round: re-plan when the aliases or the catalog changed (the
+        signature covers every store write, deletions and config aliases), else every
+        60 s while transfers run (progress, readiness) or after a failed sync."""
+        if self.state.phase not in _SYNC_PHASES or self._op is not None:
+            return
+        try:
+            sig = await self._signature()
+        except Exception as e:
+            self._sync_fail(f"alias signature unavailable: {_errtext(e)}")
+            return
+        due = self.deps.now() - self._last_try >= _SYNC_REFRESH_S
+        if sig != self._sig and (not self._sync_error or due):
+            await self.sync_once()
+        elif self._dirty and (self._kicker is None or self._kicker.done()):
+            self._dirty = False
+            await self.sync_once()
+        elif (self._fetches or self._sync_error) and due:
+            await self.sync_once()
+
+    def _sync_fail(self, msg: str) -> None:
+        self._last_try = self.deps.now()
+        if msg != self._sync_error:
+            self._log(f"model sync failed: {msg}")
+        self._sync_error = msg
+
+    async def _exec_ok(self, cmd: str, stdin: Optional[bytes] = None,
+                       timeout: float = 60) -> str:
+        """`_exec` that raises on a non-zero exit (with stderr's last line) → stdout."""
+        if not (self.state.ip and self.state.port):
+            raise RuntimeError("no ssh address known")
+        rc, out, err = await self._exec(cmd, stdin=stdin, timeout=timeout)
+        if rc != 0:
+            last = " | ".join(_tail(err, 2)) or f"rc {rc}"
+            raise RuntimeError(f"remote command failed (rc {rc}): {self._redact(last)}")
+        return (out or b"").decode("utf-8", "replace")
+
+    async def _dest_index(self) -> dict:
+        return parse_index(await self._exec_ok(_INDEX_CMD, timeout=300))
+
+    async def _read_manifest(self) -> dict:
+        return parse_manifest(await self._exec_ok(_MANIFEST_READ))
+
+    async def _write_manifest(self, man: dict) -> None:
+        await self._exec_ok(_MANIFEST_WRITE, stdin=json.dumps(
+            normalize_manifest(man), sort_keys=True, indent=1).encode("utf-8"))
+
+    async def _df(self) -> int:
+        text = (await self._exec_ok(_DF_CMD)).strip()
+        if not text.isdigit():
+            raise RuntimeError(f"df answered {text[:40]!r}")
+        return int(text)
+
+    async def _compute_plan(self) -> tuple[dict, dict]:
+        """(plan, manifest) from a fresh destination index (the manifest is never the
+        truth about which files exist, spec "Manifest"), the manifest (plus entries a
+        failed write lost) and the gateway's inputs."""
+        dest = await self._dest_index()
+        man = await self._read_manifest()
+        man.update(copy.deepcopy(self._unsaved))
+
+        def inputs():
+            return (self.deps.alias_needs(self.name) or [], self.deps.source_index() or {},
+                    self.deps.url_catalog() or {})
+        needs, src, urls = await asyncio.to_thread(inputs)
+        return modelsync.plan(needs, src, dest, man, urls), man
+
+    async def sync_once(self) -> None:
+        """Plan, readiness, disk, transfers (spec "Controller"). Serialised; a no-op
+        outside `syncing|ready`. The ONLY writer of `plan` and `ready_aliases`. A
+        failure keeps the last plan and is retried by `run_forever` after 60 s — it is
+        logged and shown, never raised (a start must not fail over a sync)."""
+        async with self._sync_lock:
+            if self.state.phase not in _SYNC_PHASES:
+                return
+            self._last_try = self.deps.now()
+            try:
+                sig = await self._signature()
+                if self._sig is not None and sig != self._sig and self._failed:
+                    self._log("aliases or catalog changed — failed transfers are tried again")
+                    self._failed.clear()
+                plan, man = await self._compute_plan()
+            except Exception as e:
+                self._sync_fail(_errtext(e))
+                return
+            self._manifest = man
+            try:
+                go, disk = await self._fit_disk(plan)
+            except Exception as e:
+                # df unreadable: go on — a full disk fails the curl, which is reported
+                self._log(f"free disk space unknown ({_errtext(e)}) — downloading anyway")
+                go, disk = self._fetchable(plan), {}
+            before = set(self.ready_aliases)
+            self.plan = self._annotate(plan, disk)
+            self.ready_aliases = {a for a in self.plan["per_alias"]
+                                  if modelsync.ready(self.plan, a)}
+            self._sig, self._sync_error = sig, ""
+            for a in sorted(self.ready_aliases - before):
+                self._log(f"models for {a} ready")
+            for a in sorted(before - self.ready_aliases):
+                self._log(f"models for {a} no longer ready")
+            if self.state.phase in _SYNC_PHASES:
+                self._start_fetches(go)
+
+    def _stuck_aliases(self, plan: dict) -> set:
+        """Aliases a URL download cannot make ready this session: a file only the LAN
+        has (P2: no LAN source), or a transfer that gave up."""
+        stuck: set = set()
+        for e in plan["fetch"]:
+            if (e["source"] != "url" and not self._lan_configured()) or e["path"] in self._failed:
+                stuck.update(e["aliases"])
+        return stuck
+
+    def _fetchable(self, plan: dict) -> list:
+        """The URL fetch entries worth transferring: not given up, and needed by at
+        least one alias the download can make ready (modelsync's rule for blocked
+        aliases, extended to the LAN-only and failed ones)."""
+        stuck = self._stuck_aliases(plan)
+        return [e for e in plan["fetch"] if e["source"] == "url"
+                and e["path"] not in self._failed and set(e["aliases"]) - stuck]
+
+    def _reserve_bytes(self) -> int:
+        try:
+            return int(self.cfg.get("reserve_gb") or 20) * 1024 ** 3
+        except (TypeError, ValueError):
+            return 20 * 1024 ** 3
+
+    async def _fit_disk(self, plan: dict) -> tuple[list, dict]:
+        """(entries to fetch, {alias: disk reason}). Free space below the known fetch
+        bytes + reserve → grow the disk (`_grow_disk`); still short → the aliases that
+        do not fit (smallest first, the plan's order) are blocked "disk". A URL file of
+        unknown size counts 0 — its download fails on a full disk and says so."""
+        entries = self._fetchable(plan)
+        todo = [e for e in entries if e["path"] not in self._fetches]
+        if not todo:
+            return entries, {}
+        need = sum(e["size"] or 0 for e in todo)
+        reserve = self._reserve_bytes()
+        avail = await self._df()
+        why = ""
+        if avail < need + reserve:
+            avail, why = await self._grow_disk(avail, need, reserve)
+        if avail >= need + reserve:
+            return entries, {}
+        budget, used, take, disk = avail - reserve, 0, set(), {}
+        order: list = []
+        for e in todo:
+            for a in e["aliases"]:
+                if a not in order:
+                    order.append(a)
+        for a in order:
+            mine = [e for e in todo if a in e["aliases"] and e["path"] not in take]
+            extra = sum(e["size"] or 0 for e in mine)
+            if used + extra <= budget:
+                used += extra
+                take.update(e["path"] for e in mine)
+            else:
+                disk[a] = (f"disk: {_gb(extra)} GB to fetch, {_gb(max(0, budget - used))} GB "
+                           f"free above the reserve{why}")
+        go = [e for e in entries if e["path"] in take or e["path"] in self._fetches]
+        return go, disk
+
+    async def _grow_disk(self, avail: int, need: int, reserve: int) -> tuple[int, str]:
+        """Grow the disk so the fetch fits (spec "Disk-Wachstum"): `choose_disk_gb` over
+        what is used now + the fetch, never below the current size, within the spec's
+        maximum. The instance is found by uuid in a FRESH list (Rulings 10/11). Thunder
+        grows the filesystem itself — `df` is re-read until the space appears. →
+        (free bytes now, "" or why it could not grow — for the disk block text)."""
+        s, cfg = self.state, self.cfg
+        try:
+            num_gpus = int(cfg.get("num_gpus") or 1)
+            spec = thunder.spec_for(await self.api.specs(), str(cfg.get("gpu_type") or ""),
+                                    num_gpus)
+            storage = (spec or {}).get("storageGB")
+            storage = storage if isinstance(storage, dict) else {}
+            used = max(0, int(s.disk_gb or 0) * 1024 ** 3 - avail)
+            new = thunder.choose_disk_gb(
+                required_bytes=used + need, base_bytes=0,
+                reserve_gb=math.ceil(reserve / 1024 ** 3), snapshot_min_gb=s.disk_gb,
+                spec_min=int(storage.get("min") or 0), spec_max=int(storage.get("max") or 0),
+                num_gpus=num_gpus)
+        except thunder.DiskTooSmall as e:
+            self._log(f"disk cannot grow enough: {e}")
+            return avail, f" (disk cannot grow: {e})"
+        except (thunder.ThunderError, TypeError, ValueError) as e:
+            self._log(f"disk growth unavailable: {_errtext(e)}")
+            return avail, f" (disk growth unavailable: {_errtext(e)})"
+        if new <= int(s.disk_gb or 0):
+            return avail, f" (disk is {s.disk_gb} GB)"
+        try:
+            item = await self._fresh_item()
+            await self.api.modify(item, {"disk_size_gb": new})
+        except thunder.ThunderError as e:
+            self._log(f"disk growth to {new} GB failed: {e}")
+            return avail, f" (disk growth to {new} GB failed)"
+        self._log(f"disk grown {s.disk_gb} → {new} GB: {_gb(need)} GB to fetch, "
+                  f"{_gb(avail)} GB free, reserve {_gb(reserve)} GB")
+        s.disk_gb = new
+        self._persist()
+        for i in range(_GROW_RECHECK):
+            if i:
+                await self.deps.sleep(_GROW_RECHECK_S)
+            try:
+                avail = await self._df()
+            except Exception as e:
+                self._log(f"free disk space unknown after growing: {_errtext(e)}")
+                continue
+            if avail >= need + reserve:
+                return avail, ""
+        return avail, f" (disk grown to {new} GB, the space has not appeared yet)"
+
+    def _annotate(self, plan: dict, disk: dict) -> dict:
+        """The controller's view of modelsync's plan (a copy): what only the controller
+        knows joins `blocked` — the LAN source is not configured (P2: modelsync's "not
+        in source" and every LAN fetch become "waiting for LAN source (not
+        configured)"), a transfer gave up, the disk is too small."""
+        p = copy.deepcopy(plan)
+        rows = p["per_alias"]
+        lan = self._lan_configured()
+        for row in rows.values():
+            row["blocked"] = [f"{_LAN_WAIT}: {b[len(_NOT_IN_SOURCE):]}"
+                              if not lan and b.startswith(_NOT_IN_SOURCE) else b
+                              for b in row["blocked"]]
+        for e in p["fetch"]:
+            extra = ""
+            if e["source"] != "url" and not lan:
+                extra = f"{_LAN_WAIT}: {e['path']}"
+            elif e["path"] in self._failed:
+                extra = f"transfer failed: {e['path']}: {self._failed[e['path']]}"
+            for a in e["aliases"] if extra else ():
+                rows[a]["blocked"].append(extra)
+        for a, why in disk.items():
+            rows[a]["blocked"].append(why)
+        for row in rows.values():
+            row["blocked"] = sorted(set(row["blocked"]))
+        return p
+
+    def _plan_view(self) -> Optional[dict]:
+        """The panel's plan summary (Task 13): per alias sizes, counts and texts, the
+        fetch/prune/held/unknown lists. No URL (a catalog URL may carry a query token)."""
+        p = self.plan
+        if p is None:
+            return None
+        held: dict = {}
+        for h in p["held"]:
+            held[h[2]] = held.get(h[2], 0) + 1
+        return {
+            "aliases": {a: {"ready": a in self.ready_aliases, "need_bytes": r["need_bytes"],
+                            "have_bytes": r["have_bytes"], "missing": len(r["missing"]),
+                            "blocked": list(r["blocked"]), "hints": list(r["hints"]),
+                            "held": held.get(a, 0), "selectable": list(r["selectable"]),
+                            "files": [dict(f) for f in r["files"]]}
+                        for a, r in p["per_alias"].items()},
+            "fetch": [{k: e[k] for k in ("path", "size", "source", "aliases")}
+                      for e in p["fetch"]],
+            "prune": list(p["prune"]), "held": [list(h) for h in p["held"]],
+            "unknown": [list(u) for u in p["unknown"]],
+            "need_total": p["need_total"], "have_total": p["have_total"]}
+
+    # URL transfers ─────────────────────────────────────────────────────────
+
+    def _start_fetches(self, entries: list) -> None:
+        for e in entries:
+            if len(self._fetches) >= _MAX_FETCH:
+                return
+            if e["path"] in self._fetches:
+                continue
+            self._fetches[e["path"]] = asyncio.ensure_future(self._fetch(dict(e)))
+
+    def _kick_sync(self) -> None:
+        """Re-plan soon (a transfer ended): readiness and the next download start
+        without waiting for the 60-s round. One kicker at a time; a kick while it runs
+        makes it plan once more. Outside `syncing|ready` (a ComfyUI restart) the kick
+        stays pending and `_sync_tick` runs it — dropped, the files still to fetch
+        would never start."""
+        self._dirty = True
+        if self.state.phase not in _SYNC_PHASES:
+            return
+        if self._kicker is None or self._kicker.done():
+            self._kicker = asyncio.ensure_future(self._kick_loop())
+
+    async def _kick_loop(self) -> None:
+        while self._dirty:
+            self._dirty = False
+            try:
+                await self.sync_once()
+            except Exception as e:           # sync_once logs its own failures
+                self._log(f"model sync failed: {_errtext(e)}")
+
+    def _hf_token_for(self, url: str) -> str:
+        """The token, only for a Hugging Face HOST — decided from the parsed hostname
+        before any config exists (`huggingface.co.evil.example` is not one) — and only
+        when a curl config line can carry it verbatim."""
+        host = (urlparse(url).hostname or "").lower()
+        if host not in _HF_HOSTS:
+            return ""
+        try:
+            tok = str(self.deps.hf_token() or "")
+        except Exception:
+            return ""
+        if any(ord(c) <= 32 or ord(c) == 127 or c in '"\\' for c in tok):
+            self._log("hf_token contains characters a curl config cannot carry — "
+                      "downloading without it")
+            return ""
+        return tok
+
+    def _redact(self, text: str) -> str:
+        """curl's stderr and remote errors go to the log, the panel and the fault log:
+        the Hugging Face token never does."""
+        try:
+            tok = str(self.deps.hf_token() or "")
+        except Exception:
+            tok = ""
+        return text.replace(tok, "***") if tok else text
+
+    async def _fetch(self, e: dict) -> None:
+        """One file's transfer task: up to `_FETCH_ATTEMPTS` attempts (curl resumes the
+        `.part`), then the file is given up: its aliases are blocked with the reason and
+        a fault is logged. Always re-plans at the end (the alias may be ready now)."""
+        path = e["path"]
+        me = asyncio.current_task()
+        why = ""
+        try:
+            for attempt in range(1, _FETCH_ATTEMPTS + 1):
+                why, final = await self._fetch_attempt(e, attempt)
+                if not why:
+                    break
+                self._log(f"download {path} attempt {attempt}/{_FETCH_ATTEMPTS} failed: {why}")
+                if final:
+                    break
+                if attempt < _FETCH_ATTEMPTS:
+                    await self.deps.sleep(_SYNC_POLL_S)
+            if why:
+                self._failed[path] = why
+                try:
+                    self.deps.note_fault(self.backend, "sync", "transfer", f"{path}: {why}")
+                except Exception as ex:
+                    self._log(f"fault log unavailable: {ex!r}")
+        finally:
+            if self._fetches.get(path) is me:
+                del self._fetches[path]
+            self.state.transfers.pop(path, None)
+        self._kick_sync()
+
+    async def _fetch_attempt(self, e: dict, attempt: int) -> tuple[str, bool]:
+        """Start (or adopt) the curl, poll it every 5 s, verify, move it in place and
+        record it in the manifest. → ("" | why it failed, whether retrying is pointless)."""
+        path, url = e["path"], str(e.get("url") or "")
+        errs = modelsync.validate_catalog([{"file": path, "url": url}])
+        if errs:
+            return "invalid source: " + "; ".join(errs), True
+        try:
+            cmd = _fetch_cmd(path)
+        except ValueError as ex:
+            return f"invalid path: {ex}", True
+        cfg = curl_config(url, self._hf_token_for(url))
+        try:
+            out = await self._exec_ok(cmd, stdin=cfg.encode("utf-8"))
+        except Exception as ex:
+            return f"start failed: {_errtext(ex)}", False
+        if "GW:ADOPT" in out:
+            self._log(f"download of {path} still running on the instance — adopted")
+        elif "GW:STARTED" in out:
+            self._log(f"downloading {path}" + (f" (attempt {attempt})" if attempt > 1 else ""))
+        else:
+            return "start failed: no answer from the instance", False
+        row = self.state.transfers[path] = {
+            "file": path, "source": "url", "bytes": 0, "total": e.get("size"),
+            "rate": None, "eta": None, "attempt": attempt}
+        prev = None
+        fails = 0
+        while True:
+            await self.deps.sleep(_SYNC_POLL_S)
+            try:
+                lines = (await self._exec_ok(_poll_cmd(path))).splitlines()
+                if len(lines) < 2 or lines[0] not in ("GW:RUN", "GW:END"):
+                    raise RuntimeError("unreadable poll answer")
+            except Exception as ex:
+                fails += 1
+                if fails == 1:
+                    self._log(f"download {path}: poll failed ({_errtext(ex)}) — retrying")
+                if fails >= _POLL_FAILS_MAX:
+                    return "the instance did not answer while downloading", False
+                continue
+            fails = 0
+            size = int(lines[1]) if lines[1].lstrip("-").isdigit() else -1
+            now = self.deps.now()
+            if size >= 0:
+                if prev is not None and now > prev[1]:
+                    row["rate"] = max(0.0, (size - prev[0]) / (now - prev[1]))
+                    total = row["total"]
+                    row["eta"] = ((total - size) / row["rate"]
+                                  if total and row["rate"] else None)
+                prev = (size, now)
+                row["bytes"] = size
+            if lines[0] == "GW:RUN":
+                continue
+            err = self._redact("\n".join(lines[2:]).strip())
+            if err:
+                return err.splitlines()[-1][:300], False
+            break
+        return await self._finish(e, row["bytes"])
+
+    async def _finish(self, e: dict, size: int) -> tuple[str, bool]:
+        """curl ended cleanly (with --fail and a Content-Length it refuses a short body
+        itself). Size against what the source says, the catalog's sha256 when it has
+        one; bytes that fail either are discarded, never resumed. Then `mv` into place
+        and the manifest entry."""
+        path, want = e["path"], e.get("size")
+        bad = ""
+        if size <= 0:
+            bad = "download is empty"
+        elif want is not None and size != want:
+            bad = f"size {size} ≠ {want} expected"
+        sha = str(e.get("sha256") or "").lower()
+        if not bad and sha:
+            try:
+                out = await self._exec_ok(_sha_cmd(path), timeout=_SHA_TIMEOUT_S)
+            except Exception as ex:
+                return f"sha256 check failed: {_errtext(ex)}", False
+            got = (out.split() or [""])[0].lower()
+            if got != sha:
+                bad = f"sha256 mismatch ({got[:12] or '?'}… ≠ {sha[:12]}…)"
+        if bad:
+            try:
+                await self._exec_ok(_discard_cmd(path))
+            except Exception as ex:
+                self._log(f"discarding {path}.part failed: {_errtext(ex)}")
+            return bad, False
+        try:
+            out = (await self._exec_ok(_done_cmd(path))).strip()
+        except Exception as ex:
+            return f"moving the download into place failed: {_errtext(ex)}", False
+        final = int(out) if out.isdigit() else size
+        await self._manifest_add(path, {"size": final, "sha256": sha or None, "source": "url",
+                                        "aliases": sorted(e.get("aliases") or []),
+                                        "ts": int(self.deps.now())})
+        self._log(f"downloaded {path} ({_gb(final)} GB)")
+        return "", False
+
+    async def _manifest_add(self, path: str, entry: dict) -> None:
+        """Record a finished file (read-modify-write, serialised). A failed write keeps
+        the entry in memory (`_unsaved`) — plans and the next write include it; without
+        it the file would count as not present and be downloaded again."""
+        async with self._manifest_lock:
+            self._unsaved[path] = entry
+            try:
+                man = await self._read_manifest()
+                man.update(copy.deepcopy(self._unsaved))
+                await self._write_manifest(man)
+            except Exception as ex:
+                self._log(f"manifest not written ({_errtext(ex)}) — kept in memory")
+                return
+            self._unsaved.clear()
+            self._manifest = man
+
+    async def _kill_remote(self) -> None:
+        """End every download of ours on the instance (by the lockfiles' curl pids)."""
+        s = self.state
+        if not (s.ip and s.port):
+            return
+        try:
+            rc, out, err = await self._exec(_KILL_CMD, timeout=120)
+        except Exception as e:
+            rc, out, err = -1, b"", _errtext(e).encode()
+        if rc != 0 or b"GW:KILLED" not in (out or b""):
+            self._log(f"ending the downloads on the instance failed (rc {rc}): "
+                      + " | ".join(_tail(err, 3)))
+
+    async def delete_unknown(self, paths: list) -> int:
+        """Delete files of the `unknown` list (neither synced by us nor needed — e.g. a
+        template's models) on the operator's request. Judged against a FRESH plan: a
+        file that became needed or was synced meanwhile is refused (ValueError), and so
+        is the whole request then — nothing is deleted by a stale button. → count."""
+        if self.state.phase not in _SYNC_PHASES:
+            raise RuntimeError(f"no running instance ({self.state.phase})")
+        paths = [str(p) for p in paths or []]
+        if not paths:
+            return 0
+        async with self._sync_lock:
+            plan, _ = await self._compute_plan()
+            unknown = {u[0] for u in plan["unknown"]}
+            bad = [p for p in paths if p not in unknown]
+            if bad:
+                raise ValueError("not in the unknown list (needed, synced or gone): "
+                                 + ", ".join(bad))
+            out = await self._exec_ok(_delete_cmd(paths), timeout=_PRUNE_TIMEOUT_S)
+            if "GW:DELETED" not in out:
+                raise RuntimeError("delete not confirmed by the instance")
+            self._log(f"deleted {len(paths)} unknown file(s): " + ", ".join(paths[:10])
+                      + (" …" if len(paths) > 10 else ""))
+        await self.sync_once()
+        return len(paths)
+
     # ── orphans ─────────────────────────────────────────────────────────────
 
     async def orphans(self) -> list[dict]:
@@ -1816,16 +2665,21 @@ class Controller:
     # ── background ──────────────────────────────────────────────────────────
 
     async def run_forever(self) -> None:
-        """Background loop (spawned by main next to resume()): every 60 s the snapshot
-        watcher while a snapshot is pending, and resume() again while it could not
-        reach the API. P2 adds the model sync here."""
+        """Background loop (spawned by main next to resume()): every 5 s the model-sync
+        trigger (`_sync_tick`); every 60 s the snapshot watcher while a snapshot is
+        pending, and resume() again while it could not reach the API."""
+        every = max(1, _WATCH_S // _SYNC_POLL_S)
+        tick = 0
         while True:
-            await self.deps.sleep(_WATCH_S)
+            await self.deps.sleep(_SYNC_POLL_S)
+            tick += 1
             try:
-                if self._resume_pending and self._op is None:
-                    await self.resume()
-                if self.state.pending_snapshot:
-                    await self.watch_snapshots()
+                if tick % every == 0:
+                    if self._resume_pending and self._op is None:
+                        await self.resume()
+                    if self.state.pending_snapshot:
+                        await self.watch_snapshots()
+                await self._sync_tick()
             except asyncio.CancelledError:
                 raise
             except Exception as e:

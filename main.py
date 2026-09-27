@@ -37,6 +37,7 @@ import os
 import socket
 import stats
 import store
+import modelsync
 import thunderctl
 from adapters import (AdapterContext, ComfyExecutorStuck, NormalizedRequest, image_params,
                       is_image_field, lora_counterpart, lora_groups,
@@ -5900,6 +5901,83 @@ def _thunder_default_nodes() -> str:
         return ""
 
 
+# ── model sync inputs (modelsync.py; the controller runs the plan) ────────────
+_MODELSYNC_CATALOG_KEY = "modelsync_catalog"
+_catalog_warned: list = []                  # the last unreadable catalog value warned about
+
+
+def _modelsync_catalog() -> list:
+    """The model-sync catalog: store setting `modelsync_catalog`, `DEFAULT_CATALOG`
+    while unset. A value that is no list is read as `[]` (warned once per value) —
+    falling back to the defaults would sync what the operator replaced; entries
+    `validate_catalog` refuses are dropped one by one inside modelsync."""
+    raw = store.get_setting(_MODELSYNC_CATALOG_KEY) if store.is_active() else None
+    if raw is None:
+        return copy.deepcopy(modelsync.DEFAULT_CATALOG)
+    if not isinstance(raw, list):
+        if _catalog_warned != [raw]:
+            _catalog_warned[:] = [raw]
+            logger.warning(f"{_MODELSYNC_CATALOG_KEY} is a {type(raw).__name__}, not a "
+                           "list — read as empty")
+        return []
+    return raw
+
+
+def _thunder_alias_cands(backend_name: str) -> list:
+    """(alias, candidate) of every generation alias with a ComfyUI candidate on this
+    backend — store aliases over same-named config ones, the order `_gen_routes` reads
+    them in. A cloud candidate of the same backend NAME is another backend (keyed
+    name+type) and never counts."""
+    merged = dict(image_models or {})
+    if store.is_active():
+        merged.update(store.list_aliases())
+    out = []
+    for alias in sorted(merged):
+        for cand in merged[alias] or []:
+            if (isinstance(cand, dict) and cand.get("backend") == backend_name
+                    and adapters.cand_kind(cand) == "comfyui"):
+                out.append((alias, cand))
+    return out
+
+
+def _mapping_fields(cand: dict) -> list:
+    """The `(node, field)` pairs the candidate's mapping lets a client set."""
+    m = cand.get("mapping") or {}
+    return [(str(b.get("node")), str(b.get("field"))) for b in m.values()
+            if isinstance(b, dict) and b.get("node") is not None and b.get("field")]
+
+
+def thunder_alias_needs(backend_name: str) -> list:
+    """`modelsync.AliasNeed` per alias candidate on this backend (built by
+    `modelsync.alias_need`, the only builder that fills `covered`). Blocking store
+    read — the controller calls it in a worker thread."""
+    catalog = _modelsync_catalog()
+    return [modelsync.alias_need(alias, modelsync.refs_for(
+                cand, adapters.cand_workflow(cand), _mapping_fields(cand)), catalog)
+            for alias, cand in _thunder_alias_cands(backend_name)]
+
+
+def thunder_alias_signature(backend_name: str) -> str:
+    """A stable hash of exactly what `thunder_alias_needs` reads: this backend's
+    candidates (a path workflow's CONTENT too — the file may change under the same
+    path) and the catalog. Polled every 5 s: any store write, deletion or config
+    change that matters to the sync shows up here, none that does not."""
+    parts = []
+    for alias, cand in _thunder_alias_cands(backend_name):
+        wf = None if "workflow_json" in cand else adapters.cand_workflow(cand)
+        parts.append([alias, cand, wf])
+    data = [parts, _modelsync_catalog()]
+    try:
+        blob = json.dumps(data, sort_keys=True, default=str)
+    except TypeError:                       # mixed key types (a YAML workflow's int ids)
+        blob = json.dumps(data, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _thunder_hf_token() -> str:
+    return str((store.get_setting("hf_token") if store.is_active() else "") or "")
+
+
 def _thunder_deps() -> "thunderctl.Deps":
     ops = _HERE / "ops"
     return thunderctl.Deps(
@@ -5917,7 +5995,13 @@ def _thunder_deps() -> "thunderctl.Deps":
         bootstrap_script=lambda: (ops / "thunder-bootstrap.sh").read_bytes(),
         log=logger.info,
         known_uuids=_thunder_known_uuids,
-        default_nodes=lambda: (ops / "thunder-nodes.default.txt").read_text("utf-8"))
+        default_nodes=lambda: (ops / "thunder-nodes.default.txt").read_text("utf-8"),
+        alias_needs=thunder_alias_needs, alias_signature=thunder_alias_signature,
+        # P2: no LAN source — files resolve through the URL catalog (and the manifest);
+        # Task 15 returns the LAN index here
+        source_index=lambda: {},
+        url_catalog=lambda: modelsync.url_catalog(_modelsync_catalog()),
+        hf_token=_thunder_hf_token)
 
 
 def _thunder_task_done(name: str, what: str, answered: Optional[set] = None):
