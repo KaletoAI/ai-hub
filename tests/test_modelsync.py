@@ -312,5 +312,322 @@ class Catalog(unittest.TestCase):
         self.assertEqual(ms.validate_catalog(ms.DEFAULT_CATALOG), [])
 
 
+
+# --- Task 10: the sync plan ------------------------------------------------------------
+
+GB = 10 ** 9
+SRC = {"models/diffusion_models/A.safetensors": 1000, "models/diffusion_models/A-Q8.gguf": 800,
+       "models/vae/v.safetensors": 100, "models/loras/L.safetensors": 50,
+       "models/vae/dup.safetensors": 1, "models/checkpoints/dup.safetensors": 2,
+       "models/microsoft/TRELLIS.2-4B/a.bin": 10, "models/microsoft/TRELLIS.2-4B/sub/b.bin": 20,
+       "hf-cache/token": 1}
+R_UNET = ms.Ref("1", "UNETLoader", "unet_name", "A.safetensors")
+R_GGUF = ms.Ref("2", "LoaderGGUF", "gguf_name", "A-Q8.gguf")
+R_VAE = ms.Ref("3", "VAELoader", "vae_name", "v.safetensors")
+R_LORA = ms.Ref("4", "LoraLoaderModelOnly", "lora_name", "L.safetensors")
+R_HUB = ms.Ref("8", "Trellis2LoadModel", "modelname", "microsoft/TRELLIS.2-4B")
+R_NAME = ms.Ref("5", "Trellis2LoadModel_GGUF", "modelname", "Pixal3D-GGUF")
+
+
+def need(alias, refs, catalog=(), explicit=False, covered=frozenset()):
+    return ms.AliasNeed(alias, list(refs), list(catalog), explicit, frozenset(covered))
+
+
+def mk(needs, src=None, dest=None, manifest=None, urls=None):
+    return ms.plan(needs, SRC if src is None else src, dest or {}, manifest or {}, urls or {})
+
+
+def fetched(p):
+    return [f["path"] for f in p["fetch"]]
+
+
+class Plan(unittest.TestCase):
+    def test_present_requires_same_size(self):
+        p = mk([need("x", [R_VAE])], dest={"models/vae/v.safetensors": 99})
+        a = p["per_alias"]["x"]
+        self.assertEqual(a["missing"], ["models/vae/v.safetensors"])
+        self.assertEqual(fetched(p), ["models/vae/v.safetensors"])
+        self.assertFalse(ms.ready(p, "x"))
+        p = mk([need("x", [R_VAE])], dest={"models/vae/v.safetensors": 100})
+        self.assertEqual(p["per_alias"]["x"]["missing"], [])
+        self.assertEqual(p["fetch"], [])
+        self.assertTrue(ms.ready(p, "x"))
+        self.assertEqual((p["need_total"], p["have_total"]), (100, 100))
+
+    def test_part_file_not_present(self):
+        dest = {"models/vae/v.safetensors.part": 100, "models/vae/v.safetensors.part.lock": 5,
+                "models/vae/v.safetensors.part.log": 7}
+        p = mk([need("x", [R_VAE])], dest=dest)
+        self.assertEqual(p["per_alias"]["x"]["missing"], ["models/vae/v.safetensors"])
+        self.assertEqual(p["unknown"], [])                 # transfer artefacts are no strangers
+        self.assertEqual(p["prune"], [])
+
+    def test_prune_only_manifest_files(self):
+        dest = {"models/vae/v.safetensors": 100, "models/vae/old.safetensors": 7,
+                "models/x/stranger.bin": 5}
+        manifest = {"models/vae/v.safetensors": {"size": 100}, "models/vae/old.safetensors": {"size": 7},
+                    "models/vae/gone.safetensors": {"size": 3}}
+        p = mk([need("x", [R_VAE])], dest=dest, manifest=manifest)
+        self.assertEqual(p["prune"], ["models/vae/gone.safetensors", "models/vae/old.safetensors"])
+
+    def test_unknown_never_in_prune(self):
+        dest = {"models/vae/v.safetensors": 100, "models/vae/old.safetensors": 7,
+                "models/x/stranger.bin": 5, "hf-cache/hub/models--o--r/blobs/abc": 9}
+        manifest = {"models/vae/old.safetensors": {"size": 7}}
+        p = mk([need("x", [R_VAE])], dest=dest, manifest=manifest)
+        self.assertEqual(p["unknown"], [["hf-cache/hub/models--o--r/blobs/abc", 9],
+                                        ["models/x/stranger.bin", 5]])
+        self.assertFalse({u for u, _ in p["unknown"]} & set(p["prune"]))
+        self.assertNotIn("models/vae/v.safetensors", {u for u, _ in p["unknown"]})   # needed
+
+    def test_empty_refs_blocked_unless_explicit(self):
+        p = mk([need("mesh-mia", []), need("mesh-shrink", [], explicit=True)])
+        self.assertEqual(p["per_alias"]["mesh-mia"]["blocked"], ["no model references known"])
+        self.assertFalse(ms.ready(p, "mesh-mia"))
+        self.assertEqual(p["per_alias"]["mesh-shrink"]["blocked"], [])
+        self.assertTrue(ms.ready(p, "mesh-shrink"))
+
+    def test_ambiguous_blocks_alias(self):
+        r = ms.Ref("9", "SomeCustomLoader", "file", "dup.safetensors")
+        p = mk([need("x", [r, R_VAE])])
+        a = p["per_alias"]["x"]
+        self.assertEqual(a["blocked"], ["ambiguous dup.safetensors: models/checkpoints/dup.safetensors, "
+                                        "models/vae/dup.safetensors"])
+        self.assertFalse(ms.ready(p, "x"))
+        self.assertNotIn("models/vae/dup.safetensors", fetched(p))       # never guessed
+
+    def test_url_source_preferred_over_lan(self):
+        urls = {"models/vae/v.safetensors": {"url": "https://e/v", "sha256": "a" * 64},
+                "models/upscale_models/u.pth": {"url": "https://e/u"}}
+        ru = ms.Ref("6", "UpscaleModelLoader", "model_name", "u.pth")
+        p = mk([need("x", [R_VAE, ru, R_LORA])], urls=urls)
+        by = {f["path"]: f for f in p["fetch"]}
+        self.assertEqual(by["models/vae/v.safetensors"],
+                         {"path": "models/vae/v.safetensors", "size": 100, "source": "url",
+                          "url": "https://e/v", "sha256": "a" * 64, "aliases": ["x"]})
+        # a URL-only file resolves too; its size is unknown until it was downloaded once
+        self.assertEqual(by["models/upscale_models/u.pth"],
+                         {"path": "models/upscale_models/u.pth", "size": None, "source": "url",
+                          "url": "https://e/u", "aliases": ["x"]})
+        self.assertEqual(by["models/loras/L.safetensors"]["source"], "lan")
+        self.assertNotIn("url", by["models/loras/L.safetensors"])
+        # once downloaded, the manifest's size is what "present" is measured against
+        p = mk([need("x", [ru])], urls=urls, dest={"models/upscale_models/u.pth": 64},
+               manifest={"models/upscale_models/u.pth": {"size": 64, "source": "url"}})
+        self.assertTrue(ms.ready(p, "x"))
+        p = mk([need("x", [ru])], urls=urls, dest={"models/upscale_models/u.pth": 63},
+               manifest={"models/upscale_models/u.pth": {"size": 64, "source": "url"}})
+        self.assertFalse(ms.ready(p, "x"))
+
+    def test_fetch_order_smallest_alias_first_and_dedup(self):
+        big = need("big", [R_UNET, R_VAE])           # 1100 missing
+        small = need("small", [R_VAE, R_LORA])        # 150 missing
+        p = mk([big, small])
+        self.assertEqual(fetched(p), ["models/vae/v.safetensors", "models/loras/L.safetensors",
+                                      "models/diffusion_models/A.safetensors"])
+        by = {f["path"]: f for f in p["fetch"]}
+        self.assertEqual(by["models/vae/v.safetensors"]["aliases"], ["small", "big"])
+        self.assertEqual(by["models/diffusion_models/A.safetensors"]["aliases"], ["big"])
+        self.assertEqual((p["need_total"], p["have_total"]), (1150, 0))   # v counted once
+
+    def test_ready_and_status_text(self):
+        src = {"models/diffusion_models/A.safetensors": int(18.7 * GB), "models/vae/v.safetensors": int(12.3 * GB)}
+        p = mk([need("img", [R_UNET, R_VAE]), need("rig", [])], src=src,
+               dest={"models/vae/v.safetensors": int(12.3 * GB)})
+        self.assertFalse(ms.ready(p, "img"))
+        self.assertEqual(ms.status_text(p, "img", "thunder-a6000"),
+                         "models for img are syncing on thunder-a6000 (12.3 of 31.0 GB)")
+        self.assertEqual(ms.status_text(p, "rig", "thunder-a6000"),
+                         "models for rig are blocked on thunder-a6000: no model references known")
+        p = mk([need("img", [R_UNET, R_VAE])], src=src,
+               dest={"models/vae/v.safetensors": int(12.3 * GB),
+                     "models/diffusion_models/A.safetensors": int(18.7 * GB)})
+        self.assertTrue(ms.ready(p, "img"))
+        self.assertEqual(ms.status_text(p, "img", "b"), "models for img are ready on b")
+        self.assertFalse(ms.ready(p, "nope"))
+        self.assertFalse(ms.ready(None, "img"))
+        self.assertIn("not planned", ms.status_text(p, "nope", "b"))
+        self.assertIn("not planned", ms.status_text(None, "img", "b"))
+
+    def test_dual_loader_both_needed_with_node_info(self):
+        wf = {"1": {"class_type": "UNETLoader", "inputs": {"unet_name": "A.safetensors", "weight_dtype": "default"}},
+              "2": {"class_type": "LoaderGGUF", "inputs": {"gguf_name": "A-Q8.gguf"}},
+              "3": {"class_type": "SwitchAny", "inputs": {"on_true": ["1", 0], "on_false": ["2", 0], "boolean": True}}}
+        p = mk([ms.alias_need("x", ms.refs_for({}, wf, set()), [])])
+        self.assertEqual(p["per_alias"]["x"]["files"], [
+            {"path": "models/diffusion_models/A-Q8.gguf", "size": 800, "node": "2", "cls": "LoaderGGUF", "present": False},
+            {"path": "models/diffusion_models/A.safetensors", "size": 1000, "node": "1", "cls": "UNETLoader", "present": False}])
+        # the bypass on this candidate is what drops the unused branch
+        p = mk([ms.alias_need("x", ms.refs_for({"bypass": ["2"]}, wf, set()), [])])
+        self.assertEqual([f["path"] for f in p["per_alias"]["x"]["files"]], ["models/diffusion_models/A.safetensors"])
+
+    # -- beyond the brief ------------------------------------------------------------
+
+    def test_missing_file_ref_blocks(self):
+        r = ms.Ref("3", "VAELoader", "vae_name", "nope.safetensors")
+        p = mk([need("x", [r, R_VAE])])
+        self.assertEqual(p["per_alias"]["x"]["blocked"], ["not in source: nope.safetensors"])
+        self.assertEqual(fetched(p), ["models/vae/v.safetensors"])   # the rest still syncs
+
+    def test_hub_ref_needs_a_catalog_entry(self):
+        """Ruling 2: an unmatched hub id blocks, a matched one syncs the entry's paths."""
+        p = mk([need("x", [R_HUB])])
+        self.assertEqual(p["per_alias"]["x"]["blocked"],
+                         ["unknown hub model microsoft/TRELLIS.2-4B — add a catalog entry"])
+        cat = [{"match": {"class": "Trellis2LoadModel", "value": "microsoft/TRELLIS.2-4B"},
+                "paths": ["models/microsoft/TRELLIS.2-4B/"]}]
+        n = ms.alias_need("x", [R_HUB], cat)
+        self.assertEqual(n.covered, frozenset({("8", "modelname")}))
+        p = mk([n])
+        a = p["per_alias"]["x"]
+        self.assertEqual(a["blocked"], [])
+        self.assertEqual([(f["path"], f["node"], f["cls"]) for f in a["files"]],
+                         [("models/microsoft/TRELLIS.2-4B/a.bin", None, None),
+                          ("models/microsoft/TRELLIS.2-4B/sub/b.bin", None, None)])
+        self.assertEqual(a["need_bytes"], 30)
+        # an alias entry is the operator saying what this alias needs: it covers hub ids too
+        p = mk([ms.alias_need("x", [R_HUB], [{"match": {"alias": "x"}, "paths": ["models/microsoft/TRELLIS.2-4B/"]}])])
+        self.assertEqual(p["per_alias"]["x"]["blocked"], [])
+
+    def test_name_ref_alone_is_nothing(self):
+        """Ruling 2: an unmatched bare name is ignored — an alias with nothing else is
+        'no model references known', never ready by accident."""
+        p = mk([need("x", [R_NAME]), need("y", [R_NAME, R_VAE])])
+        self.assertEqual(p["per_alias"]["x"]["blocked"], ["no model references known"])
+        self.assertEqual(p["per_alias"]["y"]["blocked"], [])
+
+    def test_catalog_path_not_in_source_blocks(self):
+        p = mk([need("x", [], catalog=["models/mia/"], explicit=True)])
+        self.assertEqual(p["per_alias"]["x"]["blocked"], ["not in source: models/mia/"])
+        self.assertFalse(ms.ready(p, "x"))
+
+    def test_token_and_unsafe_paths_never_in_the_plan(self):
+        dest = {"hf-cache/token": 1, "models/.cache/x": 2, "models/ok.bin": 3}
+        manifest = {"hf-cache/token": {"size": 1}, "../etc/passwd": {"size": 1}, "models/-rf": {"size": 1}}
+        p = mk([need("x", [ms.Ref("9", "X", "model", "token")], catalog=["hf-cache/", "hf-cache/token", "../x/"],
+                     explicit=True)], dest=dest, manifest=manifest)
+        flat = repr(p)
+        self.assertNotIn("hf-cache/token", flat.replace("path 'hf-cache/token'", ""))
+        self.assertEqual(p["prune"], ["models/-rf"])      # safe_rel guards only the first segment
+        self.assertEqual(p["unknown"], [["models/ok.bin", 3]])
+        self.assertEqual(len(p["per_alias"]["x"]["blocked"]), 3)       # each bad catalog path named
+        self.assertEqual(p["fetch"], [])
+
+    def test_manifest_verifies_a_file_the_source_no_longer_lists(self):
+        """Spec: present = same size as the source, 'or verified in the manifest'. A LAN
+        box that is down (empty source index) must not make every synced file an
+        unneeded one — the stop's prune would wipe the snapshot."""
+        man = {"models/vae/v.safetensors": {"size": 100, "source": "lan"},
+               "models/microsoft/TRELLIS.2-4B/a.bin": {"size": 10, "source": "lan"}}
+        dest = {"models/vae/v.safetensors": 100, "models/microsoft/TRELLIS.2-4B/a.bin": 10}
+        cat = [{"match": {"alias": "x"}, "paths": ["models/microsoft/TRELLIS.2-4B/"]}]
+        p = mk([ms.alias_need("x", [R_VAE], cat)], src={}, dest=dest, manifest=man)
+        self.assertTrue(ms.ready(p, "x"))
+        self.assertEqual(p["prune"], [])
+        # gone from the VM and from the source: nothing can fetch it
+        p = mk([need("x", [R_VAE])], src={}, dest={}, manifest=man)
+        a = p["per_alias"]["x"]
+        self.assertEqual(a["missing"], ["models/vae/v.safetensors"])
+        self.assertEqual(a["blocked"], ["not in source: models/vae/v.safetensors"])
+        self.assertEqual(p["fetch"], [])
+
+    def test_source_size_beats_manifest_size(self):
+        p = mk([need("x", [R_VAE])], dest={"models/vae/v.safetensors": 90},
+               manifest={"models/vae/v.safetensors": {"size": 90}})
+        self.assertFalse(ms.ready(p, "x"))                  # the source file changed
+        self.assertEqual(fetched(p), ["models/vae/v.safetensors"])
+
+    def test_blocked_alias_fetches_after_the_others(self):
+        amb = ms.Ref("9", "SomeCustomLoader", "file", "dup.safetensors")
+        p = mk([need("blocked", [amb, R_LORA]), need("fine", [R_UNET])])
+        self.assertEqual(fetched(p), ["models/diffusion_models/A.safetensors", "models/loras/L.safetensors"])
+
+    def test_selectable_and_have_bytes(self):
+        r = ms.Ref("3", "VAELoader", "vae_name", "v.safetensors", selectable=True)
+        p = mk([need("x", [r, R_LORA])], dest={"models/vae/v.safetensors": 100})
+        a = p["per_alias"]["x"]
+        self.assertEqual(a["selectable"], ["3.vae_name"])
+        self.assertEqual((a["need_bytes"], a["have_bytes"]), (150, 100))
+        self.assertEqual(a["missing"], ["models/loras/L.safetensors"])
+
+    def test_unknown_size_in_status_text(self):
+        urls = {"models/upscale_models/u.pth": {"url": "https://e/u"}}
+        ru = ms.Ref("6", "UpscaleModelLoader", "model_name", "u.pth")
+        p = mk([need("x", [ru, R_VAE])], urls=urls)
+        self.assertEqual(ms.status_text(p, "x", "b"),
+                         "models for x are syncing on b (0.0 of 0.0 GB + 1 file of unknown size)")
+
+    def test_deterministic_and_inputs_untouched(self):
+        needs = [need("b", [R_UNET, R_VAE]), need("a", [R_VAE, R_LORA])]
+        dest = {"models/x/s.bin": 1}
+        man = {"models/vae/old.safetensors": {"size": 1}}
+        before = (repr(needs), repr(dest), repr(man))
+        self.assertEqual(mk(needs, dest=dest, manifest=man), mk(needs, dest=dest, manifest=man))
+        self.assertEqual(before, (repr(needs), repr(dest), repr(man)))
+        self.assertEqual(list(mk(needs)["per_alias"]), ["a", "b"])
+
+    def test_url_catalog_helper(self):
+        cat = [{"file": "models/vae/v.safetensors", "url": "https://e/v", "sha256": "b" * 64},
+               {"file": "models/u.pth", "url": "https://e/u"},
+               {"file": "hf-cache/token", "url": "https://e/t"},              # refused
+               {"file": "models/w", "url": "http://e/w"},                    # refused
+               {"match": {"alias": "a"}, "paths": []}, "junk"]
+        self.assertEqual(ms.url_catalog(cat), {
+            "models/vae/v.safetensors": {"url": "https://e/v", "sha256": "b" * 64},
+            "models/u.pth": {"url": "https://e/u"}})
+        self.assertEqual(ms.url_catalog(None), {})
+
+
+class Hardening(unittest.TestCase):
+    """Ruling 14 — per-job assets never block, catalogs never expand a whole tree, and
+    the pin coercion cannot drift from the adapter's."""
+
+    def test_asset_values_are_no_model_files(self):
+        for v in ("x.glb", "out/3D/x.glb", "a.gltf", "a.obj", "a.fbx", "a.ply", "a.stl", "a.png",
+                  "a.JPG", "a.jpeg", "a.webp", "a.gif", "a.mp4", "a.webm", "a.wav", "a.mp3", "a.flac"):
+            self.assertEqual(ms.ref_kind(v), "name", v)
+
+    def test_hub_id_with_dot_stays_hub(self):
+        self.assertEqual(ms.ref_kind("org/repo.v2"), "hub")
+        self.assertEqual(ms.ref_kind("TencentARC/Pixal3D-T.v1"), "hub")
+        self.assertEqual(ms.ref_kind("org/repo/model.safetensors"), "file")
+        self.assertEqual(ms.ref_kind("org/repo/w.gguf"), "file")
+        self.assertEqual(ms.ref_kind("v1-inference.yaml"), "file")        # no slash: still a file
+
+    def test_load3d_is_an_input_loader(self):
+        wf = {"1": {"class_type": "Load3D", "inputs": {"model_file": "x.glb", "image": "i.png"}},
+              "2": {"class_type": "Load3DAnimation", "inputs": {"model_file": "org/y"}},
+              # a model loader whose name merely CONTAINS "3D" keeps working
+              "3": {"class_type": "Hy3D21VAELoader", "inputs": {"model_name": "hunyuan3d-vae-v2-1"}}}
+        refs = ms.refs_for({}, wf, set())
+        self.assertEqual([(r.node, r.value, r.kind) for r in refs], [("3", "hunyuan3d-vae-v2-1", "name")])
+        # and even on a node the loader rule catches, an asset value can never block
+        wf = {"1": {"class_type": "ModelLoaderX", "inputs": {"model_name": "out/3D/x.glb"}}}
+        p = ms.plan([ms.alias_need("x", ms.refs_for({}, wf, set()), [])], {}, {}, {}, {})
+        self.assertEqual(p["per_alias"]["x"]["blocked"], ["no model references known"])
+
+    def test_catalog_paths_never_expand_a_whole_tree(self):
+        refs = [R_HUB]
+        cat = [{"match": {"alias": "x"}, "paths": ["models/"]},
+               {"match": {"alias": "x"}, "paths": ["hf-cache/"]},
+               {"match": {"alias": "x"}, "paths": ["hf-cache/hub/"]},
+               {"match": {"alias": "x"}, "paths": ["models/ok/", "../evil/"]},     # one bad path spoils it
+               {"match": {"alias": "x", "value": 3}, "paths": ["models/v/"]},      # refused match value
+               {"match": {"alias": "x"}, "paths": ["models/good/"], "pathz": []},  # typo'd key
+               {"match": {"value": "microsoft/TRELLIS.2-4B"}, "paths": ["hf-cache/hub/models--m--t/"]}]
+        self.assertEqual(ms.catalog_paths(refs, "x", cat), (["hf-cache/hub/models--m--t/"], False))
+        self.assertTrue(ms.validate_catalog([{"match": {"alias": "x"}, "paths": ["hf-cache/hub/"]}]))
+
+    def test_coerce_matches_the_adapter(self):
+        import adapters
+        cases = [("true", False), ("0", True), ("on", False), (" Yes ", True), (1, False),
+                 ("7", 1), ("x", 1), (None, 1), ("2.5", 1), (3.0, 1),
+                 ("2.5", 1.0), ("x", 1.0), (None, 1.0), ("7", 0.0),
+                 ("abc", "s"), (5, "s"), ("v", None), ([1], None), ("1", True), ("1", 0)]
+        for value, current in cases:
+            a, m = adapters._coerce(value, current), ms._coerce(value, current)
+            self.assertEqual((type(a), a), (type(m), m), (value, current))
+
+
 if __name__ == "__main__":
     unittest.main()

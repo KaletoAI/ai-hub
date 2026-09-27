@@ -39,7 +39,17 @@ here guards a failure that looks like a working sync:
   an EMPTY reference set is otherwise not "complete", it is "unknown"), and
   `file`+`url` entries for a public download source. `validate_catalog` refuses it out
   loud: a typo'd key would otherwise be ignored, and the alias it was meant for stays
-  blocked with no hint why.
+  blocked with no hint why. `catalog_paths`/`url_catalog` drop every entry the
+  validator would refuse, so an unvalidated catalog can never expand a whole root.
+- **Per-job assets never block**: an asset extension (`.glb`, `.png`, `.mp4` …) is no
+  model file on any node, and core `Load3D` is an input loader — `Load3D.model_file =
+  "x.glb"` otherwise blocked the alias on a file the client uploads.
+- **The plan** (`plan`, `ready`, `status_text`): present = the destination holds the
+  file at the SOURCE's size (the manifest's, where the source does not list it), a
+  `.part` never is; `prune` is manifest files only (never a file we did not put there),
+  `unknown` everything else nobody needs — listed, never deleted automatically. An
+  alias is ready only with nothing missing and nothing blocking it; an empty reference
+  set without an explicit alias entry is blocked, never "complete".
 
 Pure: stdlib only (plus `sshrun.safe_rel`, itself pure), no `main`/`adapters` imports,
 no I/O, no module-level config. Covered by tests/test_modelsync.py.
@@ -58,18 +68,29 @@ MODEL_EXT = (".safetensors", ".gguf", ".ckpt", ".pt", ".pth", ".bin", ".onnx", "
 ROOTS = ("models/", "hf-cache/")
 # The source's Hugging Face token share: never a sync path, never a resolution.
 TOKEN_PATH = "hf-cache/token"
+# The Hugging Face cache's own tree: as a catalog directory it is every Hub model the
+# source ever downloaded — a whole root in all but name.
+_HF_HUB = "hf-cache/hub/"
 
 # Loader detection — the same three rules as scheduler.model_set_key, kept here (not
 # imported) because the "how" list below is deliberately WIDER than the scheduler's: a
 # missed "how" there costs one skipped VRAM free, here it blocks an alias forever.
 _LOADER_CLASS = re.compile(r"load", re.I)
-_INPUT_LOADER = re.compile(r"image|mask|mesh|path|video|audio", re.I)
+# `load_?\s*3d`: core `Load3D.model_file = "x.glb"` is a per-job asset, not a weight. Not a
+# bare `3d` — `Hy3D21VAELoader` is a model loader whose name merely contains it.
+_INPUT_LOADER = re.compile(r"image|mask|mesh|path|video|audio|load_?\s*3d", re.I)
 _WEIGHT_INPUT = re.compile(r"name|model|ckpt|unet|clip|vae|lora|gguf|weight", re.I)
 # `mode(?!l)`: `attention_mode` is a how, `model`/`modelname` are exactly what we want.
 _HOW_INPUT = re.compile(r"dtype|precision|device|backend|attn|format|quant|mode(?!l)|type|scheme", re.I)
 # A file ending on the LAST segment: a letter first, so a version (`Model2.5`,
 # `org/Model-2.5-VL`) is no extension.
 _FILE_ENDING = re.compile(r"\.[A-Za-z][A-Za-z0-9_]{0,7}$")
+
+# Per-job assets (a mesh, an image, a clip) that a loader-named node may take: never a
+# model file, whatever the field is called — `Load3D.model_file = "x.glb"` blocked an
+# alias with "not in source" for a file the CLIENT supplies.
+ASSET_EXT = (".glb", ".gltf", ".obj", ".fbx", ".ply", ".stl", ".png", ".jpg", ".jpeg", ".webp",
+             ".gif", ".mp4", ".webm", ".wav", ".mp3", ".flac")
 
 KINDS = ("file", "hub", "name")
 
@@ -109,13 +130,20 @@ DEFAULT_CATALOG: list[dict] = []
 
 
 def ref_kind(value: str) -> str:
-    """`file` | `hub` | `name` for a reference value (see the module docstring)."""
+    """`file` | `hub` | `name` for a reference value (see the module docstring). A model
+    extension is always a file; an asset extension never is (`name`: ignored unless a
+    catalog entry names it); with a `/` it is a hub id — `org/repo.v2` included — and
+    only without one does any other `.xxx` ending make a file."""
     v = str(value or "")
-    last = v.rsplit("/", 1)[-1]
-    if v.lower().endswith(MODEL_EXT) or _FILE_ENDING.search(last):
+    low = v.lower()
+    if low.endswith(MODEL_EXT):
         return "file"
+    if low.endswith(ASSET_EXT):
+        return "name"
     if "/" in v:
         return "hub"
+    if _FILE_ENDING.search(v):
+        return "file"
     return "name"
 
 
@@ -237,6 +265,21 @@ def refs_for(candidate: dict, workflow, mapping_fields) -> list[Ref]:
 _MATCH_KEYS = ("alias", "class", "value")
 
 
+def _match_entries(catalog):
+    """The catalog's VALID match+paths entries. Anything `validate_catalog` would refuse
+    is dropped whole — a catalog that reached us unvalidated (an old store row, a
+    hand-edited setting) must never expand `models/` or `hf-cache/hub/` into a sync of
+    the entire tree, billed per GB on a rented disk."""
+    for e in catalog if isinstance(catalog, list) else []:
+        if isinstance(e, dict) and "match" in e and not validate_catalog([e]):
+            yield e
+
+
+def _matched_refs(m: dict, refs) -> list[Ref]:
+    return [r for r in refs or () if ("class" not in m or r.cls == m["class"])
+            and ("value" not in m or r.value == m["value"])]
+
+
 def catalog_paths(refs, alias: str, catalog) -> tuple[list[str], bool]:
     """The catalog paths this alias needs beyond its resolved references, and whether an
     `alias` entry names it (`explicit_alias_entry` — with `paths: []` that is the
@@ -245,23 +288,28 @@ def catalog_paths(refs, alias: str, catalog) -> tuple[list[str], bool]:
     skipped here; `validate_catalog` is what reports them."""
     paths: list[str] = []
     explicit = False
-    for e in catalog if isinstance(catalog, list) else []:
-        if not isinstance(e, dict):
-            continue
-        m, ps = e.get("match"), e.get("paths")
-        if not isinstance(m, dict) or not m or set(m) - set(_MATCH_KEYS) or not isinstance(ps, list):
-            continue
+    for e in _match_entries(catalog):
+        m = e["match"]
         if "alias" in m and m["alias"] != alias:
             continue
-        if ("class" in m or "value" in m) and not any(
-                ("class" not in m or r.cls == m["class"]) and ("value" not in m or r.value == m["value"])
-                for r in refs or ()):
+        if ("class" in m or "value" in m) and not _matched_refs(m, refs):
             continue
         explicit = explicit or "alias" in m
-        for p in ps:
-            if isinstance(p, str) and p not in paths:
+        for p in e["paths"]:
+            if p not in paths:
                 paths.append(p)
     return paths, explicit
+
+
+def url_catalog(catalog) -> dict:
+    """`{path: {"url", "sha256"?}}` from the catalog's valid `file`+`url` entries — the
+    public download sources the plan prefers over the LAN (a later entry for the same
+    file wins, as a later line in the editor would be expected to)."""
+    out: dict = {}
+    for e in catalog if isinstance(catalog, list) else []:
+        if isinstance(e, dict) and "file" in e and not validate_catalog([e]):
+            out[e["file"]] = {"url": e["url"], **({"sha256": e["sha256"]} if "sha256" in e else {})}
+    return out
 
 
 def _root_path_error(p, want_dir) -> str:
@@ -275,7 +323,7 @@ def _root_path_error(p, want_dir) -> str:
         return str(e)
     if not p.startswith(ROOTS):
         return f"path {p!r} must start with models/ or hf-cache/"
-    if p in ROOTS:
+    if p in ROOTS or p == _HF_HUB:
         return f"path {p!r} is a whole root"
     if p == TOKEN_PATH or p.startswith(TOKEN_PATH + "/"):
         return f"path {p!r} is the token share"
@@ -415,3 +463,194 @@ def expand_dir(prefix: str, source_index: dict) -> dict:
     if prefix.endswith("/"):
         return {k: s for k, s in idx.items() if k.startswith(prefix) and _usable(k)}
     return {prefix: idx[prefix]} if prefix in idx and _usable(prefix) else {}
+
+
+
+# --- the plan ---------------------------------------------------------------------------
+
+# Transfer artefacts next to a target (`<path>.part` + its `.lock`/`.log`, see the
+# controller): never present, never "unknown" — a half-downloaded file is neither a
+# model nor a stranger to delete.
+_PART_SUFFIXES = (".part", ".part.lock", ".part.log")
+
+
+@dataclass
+class AliasNeed:
+    """What one alias needs on one backend: its candidate's refs, the catalog paths
+    (`catalog_paths`), whether an alias entry names it (`explicit`), and `covered` — the
+    `(node, field)` of refs a class/value catalog entry matched (their files come from
+    that entry, so an unresolved one blocks nothing). Build it with `alias_need`."""
+    alias: str
+    refs: list
+    catalog: list
+    explicit: bool
+    covered: frozenset = frozenset()
+
+
+def alias_need(alias: str, refs, catalog) -> AliasNeed:
+    """An `AliasNeed` from a candidate's refs and the whole catalog."""
+    refs = list(refs or ())
+    paths, explicit = catalog_paths(refs, alias, catalog)
+    covered = set()
+    for e in _match_entries(catalog):
+        m = e["match"]
+        if ("class" in m or "value" in m) and ("alias" not in m or m["alias"] == alias):
+            covered.update((r.node, r.field) for r in _matched_refs(m, refs))
+    return AliasNeed(alias, refs, paths, explicit, frozenset(covered))
+
+
+def _is_part(p: str) -> bool:
+    return p.endswith(_PART_SUFFIXES)
+
+
+def _msize(entry):
+    s = entry.get("size") if isinstance(entry, dict) else None
+    return s if isinstance(s, int) and not isinstance(s, bool) and s >= 0 else None
+
+
+def plan(needs, source_index: dict, dest_index: dict, manifest: dict, url_catalog: dict) -> dict:
+    """The sync plan of one backend (see the module docstring for the rules):
+
+    `per_alias[alias]` — `files` (`path`, `size`, `node`/`cls` of the ref that needs it,
+    None for a catalog path, `present`), `need_bytes`/`have_bytes` (known sizes),
+    `missing` (not present), `blocked` (why the alias cannot become ready by fetching),
+    `selectable` (`node.field` whose value a client may change — only the default syncs).
+    `fetch` — what to transfer, in order: aliases by missing bytes ascending (blocked ones
+    after the others), large files first within one, each file once with every alias that
+    needs it; `source` is `url` when the catalog has a public URL, else `lan`. `prune` —
+    manifest files no alias needs (only what WE synced is ever deleted). `unknown` —
+    destination files that are neither in the manifest nor needed, `[path, size]`.
+
+    Resolution runs over the source index plus the URL catalog and the manifest: a file
+    the manifest verified still counts when the source does not list it (spec: "bzw. im
+    Manifest verifiziert") — a LAN box that is down must not turn every synced file into
+    one the stop prunes. Its size is the source's, else the manifest's; a URL file never
+    downloaded has size None until the manifest records one. Deterministic; the inputs
+    are not modified."""
+    src = {k: v for k, v in (source_index or {}).items() if _usable(k) and not _is_part(k)}
+    urls = {k: v for k, v in (url_catalog or {}).items()
+            if _usable(k) and not _is_part(k) and isinstance(v, dict) and v.get("url")}
+    man = {k: v for k, v in (manifest or {}).items() if _usable(k) and not _is_part(k)}
+    dest = dest_index or {}
+    # the resolution index: every path we could name, the source's size where it has one
+    index = {k: None for k in list(urls) + list(man)}
+    index.update(src)
+
+    def size_of(p):
+        if p in src:
+            return src[p]
+        return _msize(man.get(p))
+
+    def present(p, size):
+        return size is not None and not _is_part(p) and dest.get(p) == size
+
+    def fetchable(p):
+        return p in urls or p in src
+
+    per_alias: dict = {}
+    wanted: dict = {}                       # alias -> [path] (resolved, not present)
+    needed: set = set()
+    for n in sorted(needs or (), key=lambda n: n.alias):
+        files: dict = {}
+        blocked: list = []
+        for r in n.refs or ():
+            got = resolve(r, index)
+            if isinstance(got, str):
+                files.setdefault(got, (r.node, r.cls))
+            elif isinstance(got, Ambiguous):
+                blocked.append(f"ambiguous {r.value}: {', '.join(got.options)}")
+            elif (r.node, r.field) in n.covered or r.kind == "name":
+                continue                    # its files come from the catalog / nothing to do
+            elif r.kind == "hub":
+                if not n.explicit:
+                    blocked.append(f"unknown hub model {r.value} — add a catalog entry")
+            else:
+                blocked.append(f"not in source: {r.value}")
+        for cp in n.catalog or ():
+            err = _root_path_error(cp, True)
+            if err:
+                blocked.append(f"invalid catalog path: {err}")
+                continue
+            got = expand_dir(cp, index)
+            if not got:
+                blocked.append(f"not in source: {cp}")
+            for p in got:
+                files.setdefault(p, (None, None))
+        rows = []
+        for p in sorted(files):
+            size = size_of(p)
+            rows.append({"path": p, "size": size, "node": files[p][0], "cls": files[p][1],
+                         "present": present(p, size)})
+        missing = [f["path"] for f in rows if not f["present"]]
+        for p in missing:
+            if not fetchable(p):
+                blocked.append(f"not in source: {p}")
+        if not rows and not blocked and not n.explicit:
+            blocked.append("no model references known")
+        needed.update(files)
+        wanted[n.alias] = [p for p in missing if fetchable(p)]
+        per_alias[n.alias] = {
+            "need_bytes": sum(f["size"] or 0 for f in rows),
+            "have_bytes": sum(f["size"] or 0 for f in rows if f["present"]),
+            "missing": missing,
+            "blocked": sorted(set(blocked)),
+            "selectable": sorted({f"{r.node}.{r.field}" for r in n.refs or () if r.selectable}),
+            "files": rows,
+        }
+
+    # fetch: aliases that can become ready first, the fewest missing bytes first; within
+    # one alias the large files first (unknown sizes last), each file once
+    order = sorted(wanted, key=lambda a: (bool(per_alias[a]["blocked"]),
+                                          sum(size_of(p) or 0 for p in wanted[a]), a))
+    fetch: list = []
+    by_path: dict = {}
+    for a in order:
+        for p in sorted(wanted[a], key=lambda p: (size_of(p) is None, -(size_of(p) or 0), p)):
+            if p in by_path:
+                by_path[p]["aliases"].append(a)
+                continue
+            e = {"path": p, "size": size_of(p), "source": "url" if p in urls else "lan"}
+            if p in urls:
+                e["url"] = urls[p]["url"]
+                if urls[p].get("sha256"):
+                    e["sha256"] = urls[p]["sha256"]
+            e["aliases"] = [a]
+            by_path[p] = e
+            fetch.append(e)
+
+    sizes = {p: size_of(p) for p in needed}
+    return {
+        "per_alias": per_alias,
+        "fetch": fetch,
+        "prune": sorted(p for p in man if p not in needed),
+        "unknown": sorted([p, s] for p, s in dest.items()
+                          if _usable(p) and not _is_part(p) and p not in man and p not in needed),
+        "need_total": sum(s or 0 for s in sizes.values()),
+        "have_total": sum(s or 0 for p, s in sizes.items() if present(p, s)),
+    }
+
+
+def ready(plan_: dict, alias: str) -> bool:
+    """The alias may route to this backend: it is in the plan, nothing blocks it and
+    every file it needs is present. No plan yet = not ready."""
+    a = (plan_ or {}).get("per_alias", {}).get(alias)
+    return bool(a) and not a["blocked"] and not a["missing"]
+
+
+def _gb(n: int) -> str:
+    return f"{n / 1e9:.1f}"
+
+
+def status_text(plan_: dict, alias: str, backend_name: str) -> str:
+    """One line for the 503 a client gets while this backend cannot serve the alias."""
+    a = (plan_ or {}).get("per_alias", {}).get(alias)
+    if not a:
+        return f"models for {alias} are not planned on {backend_name} yet"
+    if a["blocked"]:
+        return f"models for {alias} are blocked on {backend_name}: {'; '.join(a['blocked'])}"
+    if not a["missing"]:
+        return f"models for {alias} are ready on {backend_name}"
+    unsized = sum(1 for f in a["files"] if not f["present"] and f["size"] is None)
+    extra = f" + {unsized} file{'s' if unsized != 1 else ''} of unknown size" if unsized else ""
+    return (f"models for {alias} are syncing on {backend_name} "
+            f"({_gb(a['have_bytes'])} of {_gb(a['need_bytes'])} GB{extra})")
