@@ -2992,7 +2992,7 @@ def _gen_backend_for(name: str, cand: Optional[dict],
     return None
 
 
-def _gen_routes(alias: str) -> tuple[list, list]:
+def _gen_routes(alias: str, gated: Optional[list] = None) -> tuple[list, list]:
     """(ready, all) (backend, candidate) pairs for a generation alias, each ordered
     **unpaid before paid, then fastest first** (`gen_speed` EMA per alias+backend; an
     unmeasured backend sorts first, probe-once) and filtered to enabled + healthy
@@ -3004,6 +3004,11 @@ def _gen_routes(alias: str) -> tuple[list, list]:
     next. An optional per-alias `retries` caps how many backends are attempted (1 +
     retries); blank = try all eligible. Each list is capped independently — same
     result as the old per-include_busy filtering.
+
+    A candidate whose backend has not synced this alias's models (`modelsync_gate`, a
+    Thunder backend) leaves BOTH lists: a Thunder-only alias then 503s at once naming
+    the sync instead of parking for hours behind it. `gated`, when given, collects
+    (backend name, reason) of every such candidate — the 503's text.
 
     Reads from the writable store (UI source of truth) when active, falling back
     to the `image_models` config for aliases the store doesn't hold. Blocking
@@ -3020,6 +3025,11 @@ def _gen_routes(alias: str) -> tuple[list, list]:
     for cand in candidates:
         b = _gen_backend_for(cand.get("backend"), cand, gen)
         if b is None or not backend_healthy.get(backend_id(b)):
+            continue
+        why = modelsync_gate(b, alias)
+        if why:
+            if gated is not None:
+                gated.append((b.get("name"), why))
             continue
         allc.append((b, cand))
     allc = scheduler.order_ready(allc, _gen_speed_of(alias), lambda b: bool(b.get("paid")))
@@ -3953,6 +3963,25 @@ async def _wait_and_hold(backend: dict, job_id: str, label: str) -> bool:
     return True
 
 
+def _chain_successor_on(backend: dict, succ_alias: str) -> tuple:
+    """(successor candidate on `backend`, skip reason) for a chain's PATH relay, which
+    pins stage 2 to stage 1's backend. Store first, `image_models` config fallback — the
+    same order as _gen_routes. It reads the store directly, not through _gen_routes, so
+    the model-sync gate is applied here itself: a Thunder box ready for stage 1 must not
+    be handed a stage 2 whose weights are still downloading.
+    Blocking (store read) — call via asyncio.to_thread from async code."""
+    cands = store.get(succ_alias) if store.is_active() else None
+    if cands is None:
+        cands = image_models.get(succ_alias, [])
+    s2 = next((c for c in cands if c.get("backend") == backend["name"]), None)
+    if s2 is None:
+        return None, f"successor '{succ_alias}' is not configured for backend '{backend['name']}'"
+    why = modelsync_gate(backend, succ_alias)
+    if why:
+        return None, f"successor: {why}"
+    return s2, None
+
+
 async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
                      upload_images, upload_files, inputs: dict, params: dict,
                      force: str = "", eligible: Optional[set] = None) -> None:
@@ -4014,15 +4043,8 @@ async def _run_chain(job_id: str, alias: str, succ: dict, body: dict, request,
     prefix = f"gwchain_{job_id}"
 
     async def stage2_for(backend: dict) -> tuple:
-        """(successor candidate on `backend`, skip reason) for the path relay. Store
-        first, `image_models` config fallback — the same order as _gen_routes."""
-        cands = (await asyncio.to_thread(store.get, succ_alias)) if store.is_active() else None
-        if cands is None:
-            cands = image_models.get(succ_alias, [])
-        s2 = next((c for c in cands if c.get("backend") == backend["name"]), None)
-        if s2 is None:
-            return None, f"successor '{succ_alias}' is not configured for backend '{backend['name']}'"
-        return s2, None
+        """(successor candidate on `backend`, skip reason) for the path relay."""
+        return await asyncio.to_thread(_chain_successor_on, backend, succ_alias)
 
     async def usable(backend: dict) -> tuple:
         """(s2, outdir, skip reason) — whether this stage-1 candidate can run the
@@ -4691,11 +4713,17 @@ async def _gen_pick(alias: str, force: str, body: dict) -> tuple[list, bool, Opt
     """Resolve a generation request's candidates ONCE (a single store read):
     force-pin filter, LoRA eligibility, ready/busy split. Returns
     (routes, parked, eligible_names); raises 503 when nothing is eligible."""
-    ready, allc = await asyncio.to_thread(_gen_routes, alias)
+    gated: list = []
+    ready, allc = await asyncio.to_thread(_gen_routes, alias, gated)
     ready, allc = _force_filter(ready, force), _force_filter(allc, force)
     if not allc:
-        raise HTTPException(503, f"No healthy backend for generation model '{alias}'"
-                                 + (f" on backend '{force}'" if force else ""))
+        # A backend that is up but has not synced this alias's models is the reason worth
+        # naming — "no healthy backend" would send the caller looking at a box that is fine.
+        # A force pin filters these too: a pin elsewhere is not about the Thunder box.
+        why = [w for name, w in gated if not force or name == force]
+        raise HTTPException(503, "; ".join(why) if why else
+                            f"No healthy backend for generation model '{alias}'"
+                            + (f" on backend '{force}'" if force else ""))
     eligible = None if force else _lora_eligible_names(allc, body)   # a pin is never overridden
     if eligible is not None:
         ready = [r for r in ready if r[0].get("name") in eligible]
@@ -6130,6 +6158,20 @@ async def thunder_action(name: str, action: str) -> str:
 def thunder_view(name: str) -> Optional[dict]:
     c = thunder_controllers.get(name)
     return c.view() if c is not None else None
+
+
+def modelsync_gate(backend: dict, alias: str) -> Optional[str]:
+    """None = `alias` may route to `backend`; else why not (the text a client's 503
+    carries). Only a ComfyUI backend with a Thunder controller is ever gated — backends
+    are keyed (name, type), so a same-named LLM backend is not the box. Runs per request
+    and per waiter × backend inside a worker thread: it reads the controller's in-memory
+    plan only (`is_alias_ready`/`alias_status` do no I/O), never anything slower."""
+    if backend.get("type") != "comfyui":
+        return None
+    c = thunder_controllers.get(backend.get("name"))
+    if c is None or c.is_alias_ready(alias):
+        return None
+    return c.alias_status(alias)
 
 
 def _thunder_info(b: dict) -> dict:
