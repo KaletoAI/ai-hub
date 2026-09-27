@@ -119,6 +119,11 @@ _DU_TIMEOUT_S = 10 * 60         # `du` over the home directory (a venv has 100k 
 _DU_CMD = "du -sb --exclude=ComfyUI/models --exclude=hf-cache ~ | cut -f1"
 _WATCH_S = 60                   # snapshot watcher / resume retry interval
 _PENDING_MISSES = 3             # rounds a pending snapshot may be absent from the list
+# An instance counts as gone only when this many CONSECUTIVE fresh lists lack it:
+# `thunder.parse_instances` reads any odd 2xx body as `[]`, and one bad answer must not
+# make the controller forget (and stop deleting) an instance that bills.
+_ABSENT_CONFIRM = 2
+_ABSENT_RECHECK_S = 5
 _RESUME_PROBE_S = 30            # a freshly started tunnel needs a moment before ComfyUI answers
 _STOP_STEPS = ("draining", "pruning", "snapshotting", "deleting")
 # Phases before any bootstrap ran: the instance holds nothing a snapshot should keep (a
@@ -315,6 +320,9 @@ class State:
     # snapshot ids taken while `bootstrap_incomplete`: a start from one runs the
     # bootstrap again (kept apart from `manifests`, whose entries are model files)
     incomplete_snapshots: list = field(default_factory=list)
+    # uuids of unowned instances seen when the stored record was unreadable: one may be
+    # ours, so no start while any of them is still listed (or the operator forgets them)
+    unreconciled_uuids: list = field(default_factory=list)
     # what the last create asked for and when — the only way to recognise OUR instance
     # when create answered without a uuid (Ruling 10), also after a gateway restart
     created_template: str = ""
@@ -493,6 +501,7 @@ class Controller:
         self._orphans: list[dict] = []                 # last orphans() answer, for view()
         self._resume_pending = False                   # resume() could not reach the API
         self._pending_misses = 0                       # watcher rounds without the pending row
+        self._abort_note = ""                          # why an aborted create is uncertain
         self._nodes_text = ""                          # node list of the pending bootstrap
         self.state = State()
         try:
@@ -732,6 +741,7 @@ class Controller:
                 "bootstrap_template_nodes": list(s.bootstrap_template_nodes),
                 "bootstrap_incomplete": s.bootstrap_incomplete,
                 "op": self._op, "waiting_jobs": self._drain_waiting,
+                "unreconciled_uuids": list(s.unreconciled_uuids),
                 "orphans": [dict(x) for x in self._orphans]}
 
     # lifecycle
@@ -1037,7 +1047,43 @@ class Controller:
             raise RuntimeError(f"already {s.phase}"
                                + (f" (instance {s.uuid or s.index})" if s.uuid or s.index else ""))
         self._commit()
+        if s.unreconciled_uuids:
+            self._op = "starting"          # held across the await: no second start slips in
+            try:
+                await self._check_unreconciled()
+            finally:
+                self._op = None
+        self._abort_note = ""
         await self._run_op("starting", self._start())
+
+    async def _check_unreconciled(self) -> None:
+        """Refuse a start while an instance seen next to an unreadable state record is
+        still listed: it may be this backend's own, and a start would create a second
+        one (the risk `_load_failed` exists to prevent). Gone ones are forgotten."""
+        s = self.state
+        try:
+            items = await self.api.list_instances()
+        except thunder.ThunderError as e:
+            raise RuntimeError(f"cannot check the unreconciled instances "
+                               f"({', '.join(s.unreconciled_uuids)}): {e}") from e
+        listed = {it.get("uuid") for it in items
+                  if not thunder.is_gone_status(it.get("status"))}
+        still = [u for u in s.unreconciled_uuids if u in listed]
+        if still:
+            raise RuntimeError(f"instance(s) {', '.join(still)} seen while the stored state "
+                               "was unreadable are still running — one may be this "
+                               "backend's: delete them by hand or forget them first")
+        self._log("the unreconciled instances are gone — start allowed again")
+        s.unreconciled_uuids = []
+        self._persist()
+
+    def forget_unreconciled(self) -> None:
+        """Operator reset (panel): the listed unowned instances are not this backend's."""
+        if self.state.unreconciled_uuids:
+            self._log("unreconciled instances forgotten by the operator: "
+                      + ", ".join(self.state.unreconciled_uuids))
+            self.state.unreconciled_uuids = []
+            self._persist()
 
     def _enable(self) -> None:
         """Step 0. A backend that stays disabled is never polled or routed to — an
@@ -1159,7 +1205,11 @@ class Controller:
             try:
                 created = await fut
             except Exception as e:
-                self._log(f"create aborted; its answer: {_errtext(e)}")
+                note = f"create answered {_errtext(e)}"
+                if isinstance(e, thunder.ThunderError) and e.status is None:
+                    note += " (an instance may exist anyway — check the orphan list)"
+                self._abort_note = note
+                self._log(f"create aborted; {note}")
                 raise cancel
             self._created(created, disk_gb, snap, needs_bootstrap)
             raise cancel
@@ -1253,8 +1303,13 @@ class Controller:
             if not (s.uuid or s.index):
                 # no instance was ever created (or it is long forgotten): nothing bills
                 self._disable()
-                self._set_phase("off", "start aborted before an instance was created"
-                                if prev is not None and prev_op == "starting" else "")
+                msg = ""
+                if prev is not None and prev_op == "starting":
+                    msg = "start aborted before an instance was created"
+                    if self._abort_note:
+                        msg += f"; {self._abort_note}"
+                self._abort_note = ""
+                self._set_phase("off", msg)
                 return
             await self._stop_run()
         finally:
@@ -1296,10 +1351,13 @@ class Controller:
         how many are left."""
         self._set_phase("draining")
         try:
-            if not self.deps.begin_drain(self.bid):
-                self._log("drain: backend already offline")
+            started = self.deps.begin_drain(self.bid)
         except Exception as e:
-            self._log(f"drain could not start: {e!r}")
+            # routing would go on sending jobs, and the wait below could never end
+            # with nothing saying why
+            raise RuntimeError(f"drain could not start: {_errtext(e)}") from e
+        if not started:
+            self._log("drain: backend already offline")
         await self._stop_transfers()
         last = None
         while True:
@@ -1344,6 +1402,18 @@ class Controller:
             return None
         return it
 
+    async def _find_live(self) -> Optional[dict]:
+        """`_our_item`, but None only after `_ABSENT_CONFIRM` consecutive fresh lists
+        without the instance — a single empty answer never forgets one that bills."""
+        for i in range(_ABSENT_CONFIRM):
+            if i:
+                self._log("instance not listed — checking again")
+                await self.deps.sleep(_ABSENT_RECHECK_S)
+            it = await self._our_item()
+            if it is not None:
+                return it
+        return None
+
     def _record_pending(self, sid: str) -> None:
         s = self.state
         s.pending_snapshot = sid
@@ -1370,11 +1440,16 @@ class Controller:
         self._snaps = snaps
         row = next((x for x in snaps if x.get("name") == s.pending_snapshot_name
                     and x.get("id")), None)
+        if row is not None and row.get("status") == "FAILED":
+            # never "taken over": the instance would be deleted with no good snapshot
+            # of this session — take a new one under a new name
+            await self._failed_snapshot_row(row)
+            row = None
         if row is not None:
             self._log(f"snapshot {row['name']} exists already ({row['status']}) — not taken twice")
             self._record_pending(row["id"])
             return
-        item = await self._our_item()
+        item = await self._find_live()
         if item is None:
             raise _Vanished(f"instance {s.uuid or s.index} vanished before its snapshot "
                             "was taken — this session's changes are lost")
@@ -1382,27 +1457,46 @@ class Controller:
         self._log(f"snapshot {s.pending_snapshot_name} requested ({sid})")
         self._record_pending(sid)
 
+    async def _failed_snapshot_row(self, row: dict) -> None:
+        s = self.state
+        self._log(f"snapshot {row['name']} FAILED — taking a new one")
+        try:
+            self.deps.note_fault(self.backend, "lifecycle", "snapshot_failed", row["name"])
+        except Exception as e:
+            self._log(f"fault log unavailable: {e!r}")
+        if s.pending_snapshot == row["id"]:
+            s.pending_snapshot = ""
+        s.manifests.pop(row["id"], None)
+        old = s.pending_snapshot_name
+        for _ in range(3):                  # the name has 1-s resolution
+            s.pending_snapshot_name = thunder.snapshot_name(self.name, self.deps.now())
+            if s.pending_snapshot_name != old:
+                break
+            await self.deps.sleep(1)
+        self._persist()
+
     async def _delete(self) -> None:
         """Step 3b. Delete, then CONFIRM through fresh lists that the instance is gone;
         one that stays listed for 5 min is `failed(deleting)`, never `off` — it bills."""
         s = self.state
         self._set_phase("deleting")
         await self._stop_tunnel()
-        uuid_known = bool(s.uuid)
-        item = await self._our_item()
-        if item is None:
-            if uuid_known:
-                self._log("instance already gone")
-                await self._gone("")
-            else:
-                # Ruling 10: never delete by a stored index alone
-                await self._gone(f"instance at index {s.index} could not be identified as "
-                                 "ours — not deleted; if it runs it shows in the orphan list",
-                                 fault=True)
+        item = await self._find_live()
+        if item is None and not s.uuid:
+            # Ruling 10: never delete by a stored index alone
+            await self._gone(f"instance at index {s.index} could not be identified as "
+                             "ours — not deleted; if it runs it shows in the orphan list",
+                             fault=True)
             return
+        if item is None:
+            # not listed twice — still delete by UUID (it cannot name a stranger): a 404
+            # confirms it is gone, anything else means the lists were wrong
+            self._log(f"instance {s.uuid} not listed — deleting it by uuid anyway")
+            item = {"uuid": s.uuid}
         await self.api.delete(item)
         self._log(f"delete requested for {item.get('uuid') or item.get('index')}")
         deadline = self.deps.now() + _DELETE_WAIT_S
+        misses = 0
         while True:
             try:
                 still = await self._our_item()
@@ -1410,11 +1504,15 @@ class Controller:
                 still = item                     # unknown ≠ gone
                 self._log(f"instance list failed while deleting: {e}")
             if still is None:
-                break
-            if self.deps.now() >= deadline:
-                raise TimeoutError(f"instance {item.get('uuid')} still listed "
-                                   f"{_DELETE_WAIT_S // 60} min after its delete "
-                                   f"(status {still.get('status') or '?'})")
+                misses += 1
+                if misses >= _ABSENT_CONFIRM:
+                    break
+            else:
+                misses = 0
+                if self.deps.now() >= deadline:
+                    raise TimeoutError(f"instance {item.get('uuid')} still listed "
+                                       f"{_DELETE_WAIT_S // 60} min after its delete "
+                                       f"(status {still.get('status') or '?'})")
             await self.deps.sleep(_DELETE_POLL_S)
         self._log("instance deleted")
         await self._gone("")
@@ -1495,7 +1593,12 @@ class Controller:
         elif status in ("FAILED", "MISSING"):
             self._pending_misses = 0
             s.pending_snapshot, s.pending_snapshot_name = "", ""
-            self._forget_snapshot(pid)
+            if status == "FAILED":
+                self._forget_snapshot(pid)
+            else:
+                # not confirmed failed: should it reappear READY, its incomplete-bootstrap
+                # mark must still make a start from it bootstrap again
+                s.manifests.pop(pid, None)
             self._persist()
             why = "failed" if status == "FAILED" else "vanished from the snapshot list"
             self._log(f"snapshot {name} {why} — the last READY one ({s.snapshot_id or 'none'}) "
@@ -1556,15 +1659,28 @@ class Controller:
             self._log(f"resume: instance list unavailable ({e}) — retrying")
             self._resume_pending = True
             return
-        self._resume_pending = False
         it = self._find_ours(items)
         if it is not None and thunder.is_gone_status(it.get("status")):
             it = None
+        if it is None:
+            # one answer without it is not proof (see _ABSENT_CONFIRM)
+            await self.deps.sleep(_ABSENT_RECHECK_S)
+            try:
+                it = await self._our_item()
+            except thunder.ThunderError as e:
+                self._log(f"resume: instance list unavailable ({e}) — retrying")
+                self._resume_pending = True
+                return
+        self._resume_pending = False
         p = s.failed_phase if s.phase == "failed" else s.phase
+        if it is None and p == "deleting":
+            await self._stop_run()           # _delete finishes it (uuid-form delete)
+            await self.watch_snapshots()
+            return
         if it is None:
             if p == "snapshotting":
                 await self._adopt_pending_by_name()
-            if p in ("snapshotting", "deleting") and (s.pending_snapshot or p == "deleting"):
+            if p == "snapshotting" and s.pending_snapshot:
                 self._log("resume: instance gone — the stop had finished its snapshot")
                 await self._gone("")
             else:
@@ -1643,7 +1759,7 @@ class Controller:
             self._log(f"snapshot list unavailable ({e.status or 'transport'}): {e}")
             return
         row = next((x for x in snaps if x.get("name") == s.pending_snapshot_name
-                    and x.get("id")), None)
+                    and x.get("id") and x.get("status") != "FAILED"), None)
         if row is not None:
             self._log(f"snapshot {row['name']} found by name ({row['id']})")
             self._record_pending(row["id"])
@@ -1681,6 +1797,7 @@ class Controller:
         self._unblock_persist()
         s = self.state
         s.failed_phase = ""
+        s.unreconciled_uuids = [it["uuid"] for it in strangers if it.get("uuid")]
         if strangers:
             ids = ", ".join(it.get("uuid") or it.get("index") or "?" for it in strangers)
             self._set_phase("failed", f"stored state unreadable; unowned instance(s) listed "
