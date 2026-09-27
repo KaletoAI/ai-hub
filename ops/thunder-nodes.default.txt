@@ -1,0 +1,22 @@
+# Custom-node packs the Thunder VM installs (one per line). Derived 2026-09-27 from the
+# node classes of every k12-gpu image/3D/video workflow (their /object_info python_module),
+# pinned to the exact revision k12-gpu runs. Forms:
+#   <git-url>@<commit>        cloned, then checked out at <commit>
+#   registry:<id>@<version>   Comfy registry (api.comfy.org) zip at that version
+https://github.com/ltdrdata/ComfyUI-Manager.git@351d9c62c419bf49c0fdb6a5a378e94dc3481193
+https://github.com/crystian/ComfyUI-Crystools.git@2f18256c5b5063937106f29a8e0a7db3ae3869b7
+https://github.com/leejet/ComfyUI-GGUF@cee9bb157560e17708d93f2716e51a1a30d24f0b
+https://github.com/PozzettiAndrea/ComfyUI-GeometryPack@c67199de05705642258e727fa118f412877b4ebf
+https://github.com/visualbruno/ComfyUI-Hunyuan3d-2-1.git@e0ddbbb6986cc2bbd7e93bae8a75a11adf90eee2
+https://github.com/kijai/ComfyUI-KJNodes@e8e88f7c88e3f6205b122f5de87e69a09fbce5ac
+https://github.com/kijai/ComfyUI-StableXWrapper@04569f23fcb3500620ba1cd67937d614dc4c06f5
+https://github.com/Aero-Ex/ComfyUI-Trellis2-GGUF.git@6bd11ead7ab7976ec4b2c47db52701f4c76a54e2
+https://github.com/visualbruno/ComfyUI-Trellis2@438fe4e2a15bd29620a1cedad0a87c5afad6f81d
+https://github.com/rgthree/rgthree-comfy.git@27b4f4cdcf3b127c29d5d8135ac1536ecbd4c383
+registry:ComfyUI-Conditioning-Rebalance@1.4.2
+registry:comfyui-easy-use@1.3.6
+registry:comfyui-logicutils@1.7.2
+registry:gguf@2.9.8
+# Rigging (only if a rigging alias gets a Thunder candidate):
+# https://github.com/PozzettiAndrea/ComfyUI-UniRig@a4e46c58082c6d06a9f53671d4dac5eb44de951d
+# https://github.com/speige/ComfyUI_Make-It-Animatable@486409c0843b66bd548a787516f0f987effe9aa1
