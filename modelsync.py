@@ -47,8 +47,9 @@ here guards a failure that looks like a working sync:
 - **The plan** (`plan`, `ready`, `status_text`): present = the destination holds the
   file at the SOURCE's size (the manifest's, where the source does not list it), a
   `.part` never is; `prune` is manifest files only (never a file we did not put there),
-  `unknown` everything else nobody needs — listed, never deleted automatically. An
-  alias is ready only with nothing missing and nothing blocking it; an empty reference
+  `unknown` everything else nobody needs — listed, never deleted automatically. A
+  BLOCKED alias fetches nothing (it cannot become ready) but HOLDS the manifest files
+  recorded for it (`held`, never pruned) until the block is fixed. An alias is ready only with nothing missing and nothing blocking it; an empty reference
   set without an explicit alias entry is blocked, never "complete".
 
 Pure: stdlib only (plus `sshrun.safe_rel`, itself pure), no `main`/`adapters` imports,
@@ -508,18 +509,42 @@ def _msize(entry):
     return s if isinstance(s, int) and not isinstance(s, bool) and s >= 0 else None
 
 
+def _merge_needs(needs) -> list:
+    """One AliasNeed per alias name, sorted: the same alias twice (two candidates on this
+    backend, a caller bug) would otherwise overwrite its own per_alias row while both
+    counted into need_total."""
+    by: dict = {}
+    for n in needs or ():
+        m = by.get(n.alias)
+        if m is None:
+            by[n.alias] = AliasNeed(n.alias, list(n.refs or ()), list(n.catalog or ()),
+                                    bool(n.explicit), frozenset(n.covered or ()))
+            continue
+        m.refs.extend(n.refs or ())
+        m.catalog.extend(p for p in n.catalog or () if p not in m.catalog)
+        m.explicit = m.explicit or bool(n.explicit)
+        m.covered = m.covered | frozenset(n.covered or ())
+    return [by[a] for a in sorted(by)]
+
+
 def plan(needs, source_index: dict, dest_index: dict, manifest: dict, url_catalog: dict) -> dict:
     """The sync plan of one backend (see the module docstring for the rules):
 
     `per_alias[alias]` — `files` (`path`, `size`, `node`/`cls` of the ref that needs it,
     None for a catalog path, `present`), `need_bytes`/`have_bytes` (known sizes),
     `missing` (not present), `blocked` (why the alias cannot become ready by fetching),
-    `selectable` (`node.field` whose value a client may change — only the default syncs).
-    `fetch` — what to transfer, in order: aliases by missing bytes ascending (blocked ones
-    after the others), large files first within one, each file once with every alias that
-    needs it; `source` is `url` when the catalog has a public URL, else `lan`. `prune` —
-    manifest files no alias needs (only what WE synced is ever deleted). `unknown` —
-    destination files that are neither in the manifest nor needed, `[path, size]`.
+    `hints` (uncovered loader values beside real files: synced nothing, may need
+    weights), `selectable` (`node.field` whose value a client may change — only the
+    default syncs).
+    `fetch` — what to transfer, in order: UNBLOCKED aliases by missing bytes ascending,
+    large files first within one (unknown sizes last), each file once with every alias
+    it is fetched for; `source` is `url` when the catalog has a public URL, else `lan`.
+    A blocked alias fetches nothing — it cannot become ready, and its bytes cost disk.
+    `prune` — manifest files no alias needs (only what WE synced is ever deleted), minus
+    `held`: `[path, size, alias]` of manifest files recorded for an alias that is
+    selected but BLOCKED — a block (a new same-named copy in the source, a removed
+    catalog entry) must not make the stop delete what the alias already synced.
+    `unknown` — destination files neither in the manifest nor needed, `[path, size]`.
 
     Resolution runs over the source index plus the URL catalog and the manifest: a file
     the manifest verified still counts when the source does not list it (spec: "bzw. im
@@ -537,36 +562,34 @@ def plan(needs, source_index: dict, dest_index: dict, manifest: dict, url_catalo
     index.update(src)
 
     def size_of(p):
-        if p in src:
-            return src[p]
-        return _msize(man.get(p))
+        return src[p] if p in src else _msize(man.get(p))
 
     def present(p, size):
         return size is not None and not _is_part(p) and dest.get(p) == size
 
-    def fetchable(p):
-        return p in urls or p in src
-
     per_alias: dict = {}
-    wanted: dict = {}                       # alias -> [path] (resolved, not present)
+    wanted: dict = {}                       # unblocked alias -> [path] it must fetch
     needed: set = set()
-    for n in sorted(needs or (), key=lambda n: n.alias):
+    for n in _merge_needs(needs):
         files: dict = {}
         blocked: list = []
-        for r in n.refs or ():
+        loose: list = []                    # uncovered name refs: nothing synced for them
+        for r in n.refs:
             got = resolve(r, index)
             if isinstance(got, str):
                 files.setdefault(got, (r.node, r.cls))
             elif isinstance(got, Ambiguous):
                 blocked.append(f"ambiguous {r.value}: {', '.join(got.options)}")
-            elif (r.node, r.field) in n.covered or r.kind == "name":
-                continue                    # its files come from the catalog / nothing to do
+            elif (r.node, r.field) in n.covered:
+                continue                    # its files come from the matching catalog entry
+            elif r.kind == "name":
+                if not r.value.lower().endswith(ASSET_EXT):
+                    loose.append(r)         # an asset is a per-job input, not a weight
             elif r.kind == "hub":
-                if not n.explicit:
-                    blocked.append(f"unknown hub model {r.value} — add a catalog entry")
+                blocked.append(f"unknown hub model {r.value} — add a catalog entry")
             else:
                 blocked.append(f"not in source: {r.value}")
-        for cp in n.catalog or ():
+        for cp in n.catalog:
             err = _root_path_error(cp, True)
             if err:
                 blocked.append(f"invalid catalog path: {err}")
@@ -576,35 +599,39 @@ def plan(needs, source_index: dict, dest_index: dict, manifest: dict, url_catalo
                 blocked.append(f"not in source: {cp}")
             for p in got:
                 files.setdefault(p, (None, None))
-        rows = []
-        for p in sorted(files):
-            size = size_of(p)
-            rows.append({"path": p, "size": size, "node": files[p][0], "cls": files[p][1],
-                         "present": present(p, size)})
+        rows = [{"path": p, "size": size_of(p), "node": files[p][0], "cls": files[p][1],
+                 "present": present(p, size_of(p))} for p in sorted(files)]
         missing = [f["path"] for f in rows if not f["present"]]
-        for p in missing:
-            if not fetchable(p):
-                blocked.append(f"not in source: {p}")
+        blocked += [f"not in source: {p}" for p in missing if p not in urls and p not in src]
+        hints: list = []
         if not rows and not blocked and not n.explicit:
-            blocked.append("no model references known")
+            if loose:
+                vals = ", ".join(sorted({r.value for r in loose}))
+                blocked.append(f"no model files known (loader values: {vals} — add a catalog "
+                               f"class+value entry)")
+            else:
+                blocked.append("no model references known")
+        else:
+            hints = sorted({f"{r.cls}={r.value} is not synced — add a catalog entry if it "
+                            f"needs weights" for r in loose})
         needed.update(files)
-        wanted[n.alias] = [p for p in missing if fetchable(p)]
+        if not blocked:
+            wanted[n.alias] = missing
         per_alias[n.alias] = {
             "need_bytes": sum(f["size"] or 0 for f in rows),
             "have_bytes": sum(f["size"] or 0 for f in rows if f["present"]),
             "missing": missing,
             "blocked": sorted(set(blocked)),
-            "selectable": sorted({f"{r.node}.{r.field}" for r in n.refs or () if r.selectable}),
+            "hints": hints,
+            "selectable": sorted({f"{r.node}.{r.field}" for r in n.refs if r.selectable}),
             "files": rows,
         }
 
-    # fetch: aliases that can become ready first, the fewest missing bytes first; within
-    # one alias the large files first (unknown sizes last), each file once
-    order = sorted(wanted, key=lambda a: (bool(per_alias[a]["blocked"]),
-                                          sum(size_of(p) or 0 for p in wanted[a]), a))
+    # fetch: the fewest missing bytes first; within one alias the large files first
+    # (unknown sizes last), each file once
     fetch: list = []
     by_path: dict = {}
-    for a in order:
+    for a in sorted(wanted, key=lambda a: (sum(size_of(p) or 0 for p in wanted[a]), a)):
         for p in sorted(wanted[a], key=lambda p: (size_of(p) is None, -(size_of(p) or 0), p)):
             if p in by_path:
                 by_path[p]["aliases"].append(a)
@@ -618,11 +645,25 @@ def plan(needs, source_index: dict, dest_index: dict, manifest: dict, url_catalo
             by_path[p] = e
             fetch.append(e)
 
+    blocked_aliases = {a for a, v in per_alias.items() if v["blocked"]}
+    held, prune = [], []
+    for p in sorted(man):
+        if p in needed:
+            continue
+        rec = man[p].get("aliases") if isinstance(man[p], dict) else None
+        owners = sorted(blocked_aliases & {str(x) for x in rec or () if isinstance(x, str)})
+        if owners:
+            size = _msize(man[p])
+            held.append([p, size if size is not None else dest.get(p), owners[0]])
+        else:
+            prune.append(p)
+
     sizes = {p: size_of(p) for p in needed}
     return {
         "per_alias": per_alias,
         "fetch": fetch,
-        "prune": sorted(p for p in man if p not in needed),
+        "prune": prune,
+        "held": held,
         "unknown": sorted([p, s] for p, s in dest.items()
                           if _usable(p) and not _is_part(p) and p not in man and p not in needed),
         "need_total": sum(s or 0 for s in sizes.values()),

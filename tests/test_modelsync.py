@@ -467,7 +467,8 @@ class Plan(unittest.TestCase):
         r = ms.Ref("3", "VAELoader", "vae_name", "nope.safetensors")
         p = mk([need("x", [r, R_VAE])])
         self.assertEqual(p["per_alias"]["x"]["blocked"], ["not in source: nope.safetensors"])
-        self.assertEqual(fetched(p), ["models/vae/v.safetensors"])   # the rest still syncs
+        self.assertEqual(fetched(p), [])                 # Ruling 16: a blocked alias fetches nothing
+        self.assertEqual(p["per_alias"]["x"]["missing"], ["models/vae/v.safetensors"])
 
     def test_hub_ref_needs_a_catalog_entry(self):
         """Ruling 2: an unmatched hub id blocks, a matched one syncs the entry's paths."""
@@ -485,16 +486,39 @@ class Plan(unittest.TestCase):
                          [("models/microsoft/TRELLIS.2-4B/a.bin", None, None),
                           ("models/microsoft/TRELLIS.2-4B/sub/b.bin", None, None)])
         self.assertEqual(a["need_bytes"], 30)
-        # an alias entry is the operator saying what this alias needs: it covers hub ids too
-        p = mk([ms.alias_need("x", [R_HUB], [{"match": {"alias": "x"}, "paths": ["models/microsoft/TRELLIS.2-4B/"]}])])
-        self.assertEqual(p["per_alias"]["x"]["blocked"], [])
+        # Ruling 15: an ALIAS entry never covers a hub id — only class+value does
+        for paths in ([], ["models/microsoft/TRELLIS.2-4B/"]):
+            n = ms.alias_need("x", [R_HUB], [{"match": {"alias": "x"}, "paths": paths}])
+            self.assertEqual(n.covered, frozenset())
+            p = mk([n])
+            self.assertEqual(p["per_alias"]["x"]["blocked"],
+                             ["unknown hub model microsoft/TRELLIS.2-4B — add a catalog entry"], paths)
+            self.assertFalse(ms.ready(p, "x"))
 
     def test_name_ref_alone_is_nothing(self):
-        """Ruling 2: an unmatched bare name is ignored — an alias with nothing else is
-        'no model references known', never ready by accident."""
-        p = mk([need("x", [R_NAME]), need("y", [R_NAME, R_VAE])])
-        self.assertEqual(p["per_alias"]["x"]["blocked"], ["no model references known"])
+        """Ruling 2: an unmatched bare name syncs nothing — an alias with nothing else is
+        blocked (never ready by accident), and the text names the loader values a
+        class+value entry would need; beside real files it is a hint, not a block."""
+        r2 = ms.Ref("7", "DownloadAndLoadStableXModel", "model", "yoso-normal-v1-8-1")
+        p = mk([need("x", [R_NAME, r2, R_NAME]), need("y", [R_NAME, R_VAE])])
+        self.assertEqual(p["per_alias"]["x"]["blocked"],
+                         ["no model files known (loader values: Pixal3D-GGUF, yoso-normal-v1-8-1"
+                          " — add a catalog class+value entry)"])
+        self.assertEqual(p["per_alias"]["x"]["hints"], [])
         self.assertEqual(p["per_alias"]["y"]["blocked"], [])
+        self.assertTrue(ms.ready(p, "y") is False and p["per_alias"]["y"]["missing"])
+        self.assertEqual(p["per_alias"]["y"]["hints"],
+                         ["Trellis2LoadModel_GGUF=Pixal3D-GGUF is not synced — add a catalog entry "
+                          "if it needs weights"])
+        # a covered name ref is neither
+        n = ms.alias_need("y", [R_NAME, R_VAE],
+                          [{"match": {"class": "Trellis2LoadModel_GGUF", "value": "Pixal3D-GGUF"},
+                            "paths": ["models/vae/v.safetensors"]}])
+        self.assertEqual(mk([n])["per_alias"]["y"]["hints"], [])
+        # no refs at all keeps the plain text; an asset value is no "loader value"
+        self.assertEqual(mk([need("z", [])])["per_alias"]["z"]["blocked"], ["no model references known"])
+        self.assertEqual(mk([need("z", [ms.Ref("1", "ModelLoaderX", "model_name", "a.glb")])])
+                         ["per_alias"]["z"]["blocked"], ["no model references known"])
 
     def test_catalog_path_not_in_source_blocks(self):
         p = mk([need("x", [], catalog=["models/mia/"], explicit=True)])
@@ -537,10 +561,54 @@ class Plan(unittest.TestCase):
         self.assertFalse(ms.ready(p, "x"))                  # the source file changed
         self.assertEqual(fetched(p), ["models/vae/v.safetensors"])
 
-    def test_blocked_alias_fetches_after_the_others(self):
+    def test_blocked_alias_fetches_nothing(self):
+        """Ruling 16: a blocked alias cannot become ready, so its files are not pulled
+        onto the paid disk — a file another (unblocked) alias needs still is."""
         amb = ms.Ref("9", "SomeCustomLoader", "file", "dup.safetensors")
-        p = mk([need("blocked", [amb, R_LORA]), need("fine", [R_UNET])])
-        self.assertEqual(fetched(p), ["models/diffusion_models/A.safetensors", "models/loras/L.safetensors"])
+        p = mk([need("blocked", [amb, R_LORA, R_VAE]), need("fine", [R_UNET, R_VAE])])
+        self.assertEqual(fetched(p), ["models/diffusion_models/A.safetensors", "models/vae/v.safetensors"])
+        self.assertEqual({f["path"]: f["aliases"] for f in p["fetch"]}["models/vae/v.safetensors"], ["fine"])
+        self.assertEqual(p["per_alias"]["blocked"]["missing"],
+                         ["models/loras/L.safetensors", "models/vae/v.safetensors"])
+
+    def test_blocked_alias_holds_its_manifest_files(self):
+        """Ruling 16: a block (a new same-basename copy in the source, a removed catalog
+        entry, an emptied workflow) must not make the stop prune what the alias synced."""
+        man = {"models/vae/v.safetensors": {"size": 100, "aliases": ["A"]},
+               "models/loras/L.safetensors": {"size": 50, "aliases": ["A", "B"]},
+               "models/old.bin": {"size": 9, "aliases": ["gone"]}}
+        dest = {"models/vae/v.safetensors": 100, "models/loras/L.safetensors": 50, "models/old.bin": 9}
+        src = dict(SRC, **{"models/other/v.safetensors": 100})           # v is ambiguous now
+        amb = ms.Ref("9", "SomeCustomLoader", "file", "v.safetensors")
+        cases = {
+            "ambiguous": ([need("A", [amb])], src),
+            "catalog entry removed": ([need("A", [R_HUB])], SRC),
+            "empty ref set": ([need("A", [])], SRC),
+        }
+        for why, (needs, s) in cases.items():
+            p = mk(needs, src=s, dest=dest, manifest=man)
+            self.assertTrue(p["per_alias"]["A"]["blocked"], why)
+            self.assertEqual(p["prune"], ["models/old.bin"], why)
+            self.assertEqual(p["held"], [["models/loras/L.safetensors", 50, "A"],
+                                         ["models/vae/v.safetensors", 100, "A"]], why)
+            self.assertEqual(p["unknown"], [], why)
+        # once the alias is fine again nothing is held; an unselected alias holds nothing
+        p = mk([need("A", [R_VAE])], dest=dest, manifest=man)
+        self.assertEqual(p["held"], [])
+        self.assertEqual(p["prune"], ["models/loras/L.safetensors", "models/old.bin"])
+
+    def test_duplicate_alias_needs_merge(self):
+        cat_hub = [{"match": {"class": "Trellis2LoadModel", "value": "microsoft/TRELLIS.2-4B"},
+                    "paths": ["models/microsoft/TRELLIS.2-4B/"]}]
+        a1 = need("x", [R_VAE])
+        a2 = ms.alias_need("x", [R_HUB], cat_hub)
+        p = mk([a1, a2, need("x", [], explicit=True)])
+        self.assertEqual(list(p["per_alias"]), ["x"])
+        a = p["per_alias"]["x"]
+        self.assertEqual(a["blocked"], [])
+        self.assertEqual(a["need_bytes"], 130)
+        self.assertEqual(p["need_total"], a["need_bytes"])
+        self.assertEqual(len(a["files"]), 3)
 
     def test_selectable_and_have_bytes(self):
         r = ms.Ref("3", "VAELoader", "vae_name", "v.safetensors", selectable=True)
