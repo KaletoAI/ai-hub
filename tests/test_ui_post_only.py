@@ -59,7 +59,8 @@ _JOBS_WRITE = re.compile(r"^(create|complete|fail|set_|delete|prune|update|cance
 _MUTATING_CALLBACKS = {"_cancel_generation", "_drain_backend", "_cancel_drain", "_restart_comfy",
                        "_set_backend_enabled", "_voice_lib_save", "_voice_lib_delete",
                        "_voice_lib_ship", "_scan_start", "_apply_backends", "_apply_chat_aliases",
-                       "_apply_server_settings", "_apply_users", "_apply_reasoning", "_apply_hosts"}
+                       "_apply_server_settings", "_apply_users", "_apply_reasoning", "_apply_hosts",
+                       "_thunder_action"}
 # Views that may write despite being a GET: none. (The Users page's reverse-DNS names
 # used to be persisted from the render; they now stay in memory until the operator
 # presses "Save resolved names", a POST.)
@@ -128,6 +129,7 @@ class RouteInventory(unittest.TestCase):
         # Guard the guard: a walker that finds nothing would pass everything below.
         self.assertIn("store.delete_user", self._reach("users_del"))
         self.assertIn("_drain_backend", self._reach("backend_drain"))
+        self.assertIn("_thunder_action", self._reach("thunder_stop"))
         self.assertIn("store.upsert", self._reach("cand_add"))
         self.assertTrue(len(self.routes) > 50)
 

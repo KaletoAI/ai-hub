@@ -186,6 +186,9 @@ _backend_loras: Callable[[], dict] = lambda: {}
 _thunder_names: Callable[[], list] = lambda: []
 _thunder_view: Callable[[str], Optional[dict]] = lambda name: None
 _thunder_action: Callable = None
+# The default custom-node list (ops/thunder-nodes.default.txt) — what a NEW Thunder
+# block's nodes textarea is pre-filled with.
+_thunder_default_nodes: Callable[[], str] = lambda: ""
 
 
 def bind(**overrides) -> None:
@@ -376,6 +379,13 @@ details.optblock{border:1px solid var(--line);border-radius:8px;padding:6px 10px
 details.optblock>summary{cursor:pointer;user-select:none;font-size:12px;color:var(--dim-2);padding:2px 0}
 details.optblock>summary:hover{color:var(--text-2)}
 details.optblock[open]>summary{margin-bottom:8px;border-bottom:1px solid #1c2129;padding-bottom:6px}
+/* Thunder Compute: the backend form's optional block and the Backends-tab lifecycle card */
+fieldset.tblock{border:1px solid var(--line);border-radius:8px;padding:6px 10px;margin:14px 0 12px}
+fieldset.tblock>legend{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--dim-2);font-weight:600;padding:0 4px}
+.tcard{background:var(--row);border:1px solid var(--line);border-radius:10px;padding:10px 14px;margin:8px 0 12px}
+.tcard .tfacts{color:var(--dim);font-size:13px;margin:4px 0}
+.tcard .tacts{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 4px}
+.tcard pre.tlog{white-space:pre-wrap;word-break:break-word;background:var(--input);border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin:6px 0;max-height:320px;overflow:auto;font:12px/1.45 ui-monospace,monospace}
 /* Phone / narrow window. Desktop keeps <main> as the scroll container (the fixed
    header + subnav never scroll, see _SCROLL_JS); below 800 px the whole PAGE scrolls
    instead, the master-detail columns stack, a field's label sits above its control,
@@ -866,6 +876,7 @@ def _field(label: str, control: str, short: bool = False, wide: bool = False,
 _POST_ACTIONS = frozenset((
     "/ui/backends/delete", "/ui/backends/drain", "/ui/backends/undrain",
     "/ui/backends/restart", "/ui/backends/enable",
+    "/ui/thunder/start", "/ui/thunder/stop", "/ui/thunder/restart", "/ui/thunder/forget",
     "/ui/chat/badd", "/ui/chat/bdel", "/ui/chat/delete",
     "/ui/mapping/field-add", "/ui/mapping/field-map", "/ui/mapping/field-clear",
     "/ui/mapping/field-del", "/ui/mapping/cand-add", "/ui/mapping/cand-del",
@@ -969,12 +980,15 @@ def _task_select(current: str = "text2img", onchange: str = "") -> str:
     return f'<select name="task"{oc}>{body}</select>'
 
 
-def _inp(name: str, value="", placeholder: str = "", typ: str = "text", step: str = "") -> str:
+def _inp(name: str, value="", placeholder: str = "", typ: str = "text", step: str = "",
+         readonly: bool = False) -> str:
     # `step` only matters for type=number: without step="any" a browser rejects
-    # decimals like 0.85 (the implicit step is 1).
+    # decimals like 0.85 (the implicit step is 1). `readonly`, never `disabled`: a
+    # disabled input is not submitted, and backend_save reads absent as cleared.
     st = f' step="{_esc(step)}"' if step else ""
+    ro = " readonly" if readonly else ""
     return (f'<input type="{typ}" name="{_esc(name)}" value="{_esc(value)}" '
-            f'placeholder="{_esc(placeholder)}"{st}>')
+            f'placeholder="{_esc(placeholder)}"{st}{ro}>')
 
 
 def _textarea(name: str, value="", rows: int = 3, placeholder: str = "") -> str:
@@ -1645,6 +1659,79 @@ def _btype_block(types: str, cur_type: str, inner: str) -> str:
     return f'<div data-btype="{types}"{style}>{inner}</div>'
 
 
+# Thunder Compute (thunderctl.py): the optional block of a ComfyUI backend. The GPU and
+# template lists are what the form offers; a stored value outside them (config.yaml) is
+# kept as an extra option so an edit never silently switches it.
+_THUNDER_GPUS = ("a6000", "l40", "a100xl", "h100")
+_THUNDER_TEMPLATES = ("comfy-ui", "base")
+# The ComfyUI revision the bootstrap pins (the k12-gpu build). A FULL sha only: the
+# bootstrap's fetch-by-sha fallback needs it and exits 2 on anything else — after the
+# instance was already created and billed.
+_THUNDER_COMMIT_DEFAULT = "1d61dcc35c35541388c0001bacc7703db14e8bea"
+_THUNDER_PORT_DEFAULT = 18188
+_THUNDER_DIRS = {"comfy_output_dir": "/home/ubuntu/ComfyUI/output",
+                 "comfy_input_dir": "/home/ubuntu/ComfyUI/input"}
+_HEX40 = re.compile(r"[0-9a-fA-F]{40}")
+
+
+def _thunder_fieldset(src: dict) -> str:
+    """The "Thunder Compute (optional)" block of the ComfyUI pane. Ticked, it makes the
+    backend an on-demand Thunder instance behind an ssh tunnel: backend_save derives
+    url/host from it and the Backends tab shows its lifecycle card. A NEW block (none
+    stored) is pre-filled with the defaults, the node list from ops/ included."""
+    t = src.get("thunder") if isinstance(src.get("thunder"), dict) else None
+    new = t is None
+    t = t or {}
+    gv = lambda k, d="": str(t.get(k) if t.get(k) not in (None, "") else d)
+    gpu = gv("gpu_type", "a6000")
+    tpl = gv("bootstrap_template", "comfy-ui")
+    gpus = list(_THUNDER_GPUS) + ([gpu] if gpu not in _THUNDER_GPUS else [])
+    tpls = list(_THUNDER_TEMPLATES) + ([tpl] if tpl not in _THUNDER_TEMPLATES else [])
+    nodes = t.get("nodes")
+    if new:
+        nodes_txt = str(_thunder_default_nodes() or "")
+    elif isinstance(nodes, list):
+        nodes_txt = "\n".join(str(x) for x in nodes)
+    else:
+        nodes_txt = str(nodes or "")
+    return ('<fieldset class="tblock"><legend>Thunder Compute (optional)</legend>'
+            + _field("thunder", _checkbox("thunder_on", not new, "on-demand Thunder instance",
+                                          "start/stop a Thunder Compute GPU instance for this "
+                                          "backend (snapshot-based)"))
+            + "<p class='hint' style='margin:-4px 0 10px'>The Thunder <b>API token</b> is the "
+              "<b>API key</b> field (General tab). Ticked, <b>url</b> and <b>host</b> are derived "
+              "(<code>http://127.0.0.1:&lt;local port&gt;</code> — the ssh tunnel — and "
+              "<code>thunder-&lt;name&gt;</code>), and blank ComfyUI dirs become "
+              "<code>/home/ubuntu/ComfyUI/output|input</code>. Start and stop it on the "
+              "Backends list.</p>"
+            + _field("gpu", _select("thunder_gpu", gpus, gpu))
+            + _field("gpus", _inp("thunder_num_gpus", gv("num_gpus", "1"), placeholder="1",
+                                  typ="number"), short=True)
+            + _field("vcpus", _inp("thunder_vcpus", gv("vcpus", "8" if new else ""),
+                                   placeholder="8", typ="number"), short=True)
+            + _field("template", _select("thunder_template", tpls, tpl))
+            + _field("disk reserve GB", _inp("thunder_reserve_gb", gv("reserve_gb", "20"),
+                                             placeholder="20", typ="number"), short=True)
+            + _field("local port", _inp("thunder_local_port",
+                                        gv("local_port", str(_THUNDER_PORT_DEFAULT)),
+                                        placeholder=str(_THUNDER_PORT_DEFAULT), typ="number"),
+                     short=True)
+            + _field("ComfyUI commit", _inp("thunder_comfy_commit",
+                                            gv("comfy_commit", _THUNDER_COMMIT_DEFAULT if new else ""),
+                                            placeholder=_THUNDER_COMMIT_DEFAULT))
+            + "<p class='hint' style='margin:-4px 0 10px'><b>ComfyUI commit</b>: a full 40-hex "
+              "sha (blank = the default pin). <b>local port</b>: the tunnel's port on this "
+              "gateway — unique per Thunder backend.</p>"
+            + _field("custom nodes", _textarea("thunder_nodes", nodes_txt, rows=6,
+                                               placeholder="https://github.com/…/Pack.git@<commit>\n"
+                                                           "registry:<id>@<version>"), wide=True)
+            + "<p class='hint' style='margin:-4px 0 10px'>One node pack per line: "
+              "<code>&lt;git-url&gt;@&lt;commit&gt;</code> or "
+              "<code>registry:&lt;id&gt;@&lt;version&gt;</code>; <code>#</code> comments and blank "
+              "lines are ignored. Empty = the default list at bootstrap time.</p>"
+            + "</fieldset>")
+
+
 def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None,
                   orig_id: Optional[str] = None, err: str = "", raw: Optional[dict] = None) -> str:
     # A scan finding arrives as `prefill` (name/type/url; `local` ticked for an openai
@@ -1695,7 +1782,10 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
               "generation + Mixamo-spec rigging (image / multi-image → 3D), billed per task — always "
               "<b>paid</b>. <b>anthropic</b> = api.anthropic.com for "
               "Claude Code, reachable through <code>/v1/messages</code> only.</p>"
-            + _field("url", _inp("url", g("url"), placeholder="http://host:8080"))
+            # A Thunder backend's url is DERIVED (the tunnel port) — readonly, never
+            # disabled: a disabled input is not submitted, and absent reads as cleared.
+            + _field("url", _inp("url", g("url"), placeholder="http://host:8080",
+                                 readonly=isinstance(src.get("thunder"), dict) and bool(src.get("thunder"))))
             + _field("host", host_inp)
             + "<p class='hint' style='margin:-4px 0 10px'>The physical box this backend runs on — backends "
               "on one host share its GPU/VRAM (basis for host policies). Blank = derived from the URL "
@@ -1872,6 +1962,7 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
               "this same backend <b>self retries</b> times first — that field sits in the "
               "<b>Behavior</b> tab.</p>"
             + "</div>"
+            + _btype_block("comfyui", cur_type, _thunder_fieldset(src))
             # Cloud-only options (Meshy, Tripo) — a cloud task API: no dirs, no watchdog,
             # no self-retry. The fields are named cloud_* because #comfyopts already
             # renders max_wait / poll_interval, and one form may carry each name only once.
@@ -2060,6 +2151,9 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200) ->
     """The Backends tab; `detail` replaces the right column (a refused Save, re-rendered
     — then never live: the page's URL is the POST action, which a GET poll cannot fetch)."""
     edit_id = qp.get("edit", "")
+    # Captured NOW: every branch below assigns `detail`, so testing it at the end made
+    # the tab never live — drain, scan and a running Thunder instance all froze.
+    refused = detail is not None
     binfo = _gateway_info().get("backends", [])
     # editable from either source: store (full dict incl. api_key) or the live summary (config)
     editing = None
@@ -2151,10 +2245,18 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200) ->
             items += f'<div class="grouphdr">{label}</div>' + "".join(render(b) for b in group)
     items = items or "<p class='muted'>No backends.</p>"
     scan_st = _scan_status()
+    tviews = _thunder_views()
+    # what a console action answered (the Thunder buttons redirect here with it) — a
+    # refusal raised before the op's first await only ever shows up here
+    msg = (qp.get("msg", "") or "")[:600]
+    msg_html = (f'<p class="hint" role="status" data-k="backends-msg"><b>{_esc(msg)}</b></p>'
+                if msg else "")
     list_html = (f'<div class="bar"><h2>Backends</h2>{_btn("+ New", "/ui/backends?new=1")}'
                  f'<form action="/ui/backends/scan" method="post" style="display:inline">'
                  f'{_btn("Scan network", kind="secondary", submit=True)}</form></div>'
-                 f"<p class='hint'>Edit a backend to manage it here (editing a config one creates an "
+                 + msg_html
+                 + _thunder_panel(tviews, binfo)
+                 + f"<p class='hint'>Edit a backend to manage it here (editing a config one creates an "
                  f"editable copy that overrides it).</p>{items}"
                  + _hosts_panel(binfo, qp.get("host", ""))
                  + _scan_panel(scan_st))
@@ -2174,8 +2276,11 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200) ->
     body = (f'<div class="cols"><div class="col">{list_html}</div>'
             f'<div class="col">{detail}</div></div>')
     draining_now = any(b.get("draining") for b in binfo)      # watch the count drain → offline
-    live = 4 if draining_now else (2 if scan_st.get("running") else None)
-    return HTMLResponse(_page("Backends", body, "backends", refresh=live if detail is None else None),
+    # a Thunder instance that is not off (or an op in flight — a start is still `off`
+    # until its create) changes phase on its own: the card must follow it
+    thunder_busy = any(v.get("phase") != "off" or v.get("op") for _n, v in tviews)
+    live = 4 if draining_now else (2 if scan_st.get("running") else (3 if thunder_busy else None))
+    return HTMLResponse(_page("Backends", body, "backends", refresh=None if refused else live),
                         status_code=status)
 
 
@@ -2504,6 +2609,18 @@ async def backend_save(request: Request):
     url = (f.get("url", "") or "").strip().rstrip("/")
     new_type = (f.get("type", "openai") or "openai").strip()
     url = _cloud_url_for(new_type, url)      # pure rule, tested in test_cloud_editor.py
+    # A Thunder backend (ComfyUI + the optional block ticked) is reached through the ssh
+    # tunnel the gateway supervises: its url is DERIVED from the tunnel's local port,
+    # whatever the (readonly) field still holds — a typed url would point discovery at
+    # a port nothing serves.
+    thunder_on = new_type == "comfyui" and bool(f.get("thunder_on"))
+    th_port, th_port_err = _int_field(f.get("thunder_local_port"), "thunder local port",
+                                      f"{_THUNDER_PORT_DEFAULT}", minimum=1)
+    if not th_port_err and th_port is not None and th_port > 65535:
+        th_port_err = f"thunder local port: '{th_port}' is not a port (1–65535)"
+    th_port = th_port or _THUNDER_PORT_DEFAULT
+    if thunder_on:
+        url = f"http://127.0.0.1:{th_port}"
     # Every refusal is collected and answered BEFORE the store is touched, with the form
     # shown again as typed (400) — see _refuse_backend below.
     problems = [] if (name and url) else ["name and url are required"]
@@ -2544,6 +2661,78 @@ async def backend_save(request: Request):
         b["comfy_input_dir"] = cid
     else:
         b.pop("comfy_input_dir", None)         # blank = derive from the output dir
+    # ── Thunder Compute block (thunderctl.py reads it; the api key is its token) ──
+    if thunder_on:
+        th_nodes = [ln.rstrip() for ln in (f.get("thunder_nodes", "") or "").splitlines()]
+        while th_nodes and not th_nodes[-1].strip():
+            th_nodes.pop()                      # a textarea's trailing newline is no line
+        th_typed = {"gpu_type": (f.get("thunder_gpu", "") or "").strip(),
+                    "num_gpus": (f.get("thunder_num_gpus", "") or "").strip(),
+                    "vcpus": (f.get("thunder_vcpus", "") or "").strip(),
+                    "bootstrap_template": (f.get("thunder_template", "") or "").strip(),
+                    "reserve_gb": (f.get("thunder_reserve_gb", "") or "").strip(),
+                    "local_port": (f.get("thunder_local_port", "") or "").strip(),
+                    "comfy_commit": (f.get("thunder_comfy_commit", "") or "").strip(),
+                    "nodes": th_nodes}
+        th_problems = [th_port_err] if th_port_err else []
+        # gpu_type and vcpus have no default: thunder.create_body needs both, and a
+        # missing one would only surface once a start is already under way
+        if not th_typed["gpu_type"]:
+            th_problems.append("thunder gpu is required")
+        vcpus, e = _int_field(th_typed["vcpus"], "thunder vcpus", "required", minimum=1)
+        if e or vcpus is None:
+            th_problems.append(e or "thunder vcpus is required (a whole number ≥ 1)")
+        ngpu, e = _int_field(th_typed["num_gpus"], "thunder gpus", "1", minimum=1)
+        if e:
+            th_problems.append(e)
+        reserve, e = _int_field(th_typed["reserve_gb"], "thunder disk reserve GB", "20")
+        if e:
+            th_problems.append(e)
+        commit = th_typed["comfy_commit"] or _THUNDER_COMMIT_DEFAULT
+        if not _HEX40.fullmatch(commit):
+            # the bootstrap exits 2 on anything but a full sha — after the create
+            th_problems.append(f"thunder ComfyUI commit: '{commit}' is not a full 40-hex "
+                               "commit sha (blank = the default pin)")
+        # Two Thunder backends on one local port: the second tunnel cannot bind, and its
+        # probe then reaches the FIRST backend's ComfyUI — healthy, routed, wrong box.
+        # Store entries override config ones of the same identity; this backend's own
+        # identities (before and after a rename) are not "another" backend.
+        others = {}
+        for x in _gateway_info().get("backends", []):
+            others[(x.get("name"), x.get("type", "openai"))] = x.get("thunder")
+        for x in store.list_backends():
+            others[(x.get("name"), x.get("type", "openai"))] = x.get("thunder")
+        for own in ((oname, otype), (name, new_type)):
+            others.pop(own, None)
+
+        def _port_of(t):
+            try:
+                return int(t.get("local_port") or _THUNDER_PORT_DEFAULT)
+            except (TypeError, ValueError):
+                return None
+        clash = sorted(str(n) for (n, _t), t in others.items()
+                       if isinstance(t, dict) and t and _port_of(t) == th_port)
+        if clash and not th_port_err:
+            th_problems.append(f"thunder local port {th_port} is already used by Thunder "
+                               f"backend {', '.join(clash)} — pick another port")
+        if th_problems:
+            problems.extend(th_problems)
+            b["thunder"] = th_typed             # shown again exactly as typed
+        else:
+            b["thunder"] = {"gpu_type": th_typed["gpu_type"], "num_gpus": ngpu or 1,
+                            "vcpus": vcpus, "bootstrap_template":
+                                th_typed["bootstrap_template"] or "comfy-ui",
+                            "reserve_gb": 20 if reserve is None else reserve,
+                            "local_port": th_port, "comfy_commit": commit,
+                            "nodes": th_nodes}
+        # host = the instance, never 127.0.0.1 (host coordination would otherwise group
+        # every Thunder backend with this gateway box); the dirs only where left blank
+        b["host"] = f"thunder-{name}"
+        for dk, dv in _THUNDER_DIRS.items():
+            if not b.get(dk):
+                b[dk] = dv
+    else:
+        b.pop("thunder", None)                  # unticked (or not ComfyUI) = no block
     ak = (f.get("api_key", "") or "").strip()
     if ak:
         b["api_key"] = ak
@@ -2788,6 +2977,192 @@ async def backend_enable(request: Request):
     if _set_backend_enabled and bid:
         _set_backend_enabled(bid, True)
     return RedirectResponse("/ui/backends", status_code=303)
+
+
+# ── Thunder Compute: lifecycle panel + actions ──────────────────────────────────
+
+_THUNDER_LOG_LINES = 50
+_THUNDER_PHASE_KIND = {"off": "muted", "ready": "ok", "failed": "bad", "draining": "warn",
+                       "pruning": "warn", "snapshotting": "warn", "deleting": "warn"}
+
+
+def _thunder_views() -> list:
+    """[(name, view)] of every Thunder controller main holds — a controller whose
+    backend row is gone still shows (its instance may still bill). A view that raises
+    is skipped rather than taking the whole Backends tab down."""
+    out = []
+    for n in sorted(_thunder_names() or [], key=lambda x: str(x).lower()):
+        try:
+            v = _thunder_view(n)
+        except Exception as e:                          # noqa: BLE001 — a card, not the tab
+            logger.warning(f"ui: thunder view {n!r} failed: {type(e).__name__}: {e}")
+            continue
+        if isinstance(v, dict):
+            out.append((n, v))
+    return out
+
+
+def _money(v, digits: int = 2) -> str:
+    try:
+        return f"${float(v):.{digits}f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _hms(s) -> str:
+    s = max(0, int(s or 0))
+    return f"{s // 3600}h {s % 3600 // 60:02d}m" if s >= 3600 else f"{s // 60}m {s % 60:02d}s"
+
+
+def _thunder_card(name: str, v: dict, cfg: Optional[dict]) -> str:
+    """One Thunder backend's lifecycle card. Every row carries a `data-k` (the live
+    morph matches by key), and nothing here needs a script."""
+    k = f"thunder-{name}"
+    phase, op = str(v.get("phase") or "off"), v.get("op")
+    head = (f"<b>{_esc(name)}</b> "
+            + _badge(phase + (f" ({v['failed_phase']})" if phase == "failed" and v.get("failed_phase")
+                              else ""), _THUNDER_PHASE_KIND.get(phase, "warn"))
+            + (" " + _badge(f"⏳ {op}", "warn", "operation in flight") if op else ""))
+    rows = [f'<div class="item-title" data-k="{_esc(k)}-head">{head}</div>']
+    if v.get("error"):
+        rows.append(f'<p class="bad" data-k="{_esc(k)}-err">{_esc(v["error"])}</p>')
+    if v.get("persist_blocked"):
+        rows.append(f'<p class="bad" data-k="{_esc(k)}-blocked">State record unreadable — '
+                    "start/stop are refused until it is reconciled (see the log).</p>")
+    if v.get("waiting_jobs") is not None and (phase == "draining" or op):
+        n = int(v.get("waiting_jobs") or 0)
+        rows.append(f'<p class="hint" data-k="{_esc(k)}-drain">Draining — waiting for '
+                    f"{n} job{'s' if n != 1 else ''} to finish before the snapshot.</p>")
+    t = cfg or {}
+    gpu = f"{_esc(t.get('gpu_type') or '?')} ×{_esc(t.get('num_gpus') or 1)}"
+    facts = [f"GPU {gpu}", f"{_esc(t.get('vcpus') or '?')} vCPU"]
+    if v.get("disk_gb"):
+        facts.append(f"disk {_esc(v['disk_gb'])} GB")
+    if v.get("uptime_s"):
+        facts.append(f"up {_hms(v['uptime_s'])}")
+    facts.append(f"{_money(v.get('cost_per_h'))}/h")
+    if v.get("session_cost") is not None:
+        facts.append(f"session {_money(v['session_cost'])}")
+    if v.get("ip"):
+        facts.append(f"{_esc(v['ip'])}:{_esc(v.get('port') or '')}")
+    rows.append(f'<div class="tfacts" data-k="{_esc(k)}-facts">{" · ".join(facts)}</div>')
+    sn = v.get("snapshot") or {}
+    if sn.get("id") or sn.get("pending") or sn.get("name"):
+        sp = [f"snapshot <code>{_esc(sn.get('name') or sn.get('id'))}</code>"]
+        if sn.get("status"):
+            sp.append(_esc(sn["status"]))
+        if sn.get("gb"):
+            sp.append(f"≤ {_esc(sn['gb'])} GB")
+        if sn.get("monthly") is not None:
+            sp.append(f"{_money(sn['monthly'])}/month")
+        if sn.get("pending"):
+            sp.append(f"pending <code>{_esc(sn.get('pending_name') or sn['pending'])}</code>")
+        rows.append(f'<div class="tfacts" data-k="{_esc(k)}-snap">{" · ".join(sp)}</div>')
+    else:
+        rows.append(f'<div class="tfacts" data-k="{_esc(k)}-snap">no snapshot yet — the '
+                    "first start bootstraps from the template</div>")
+    if v.get("bootstrap_incomplete"):
+        rows.append(f'<p class="bad" data-k="{_esc(k)}-bsinc">The last bootstrap did not '
+                    "finish — a snapshot of this instance is not a known-good template.</p>")
+    uu = [str(x) for x in (v.get("unreconciled_uuids") or [])]
+    if uu:
+        rows.append(f'<p class="bad" data-k="{_esc(k)}-unrec">Instances seen while the stored '
+                    f"state was unreadable: <code>{_esc(', '.join(uu))}</code> — one may be this "
+                    "backend's. Delete them at Thunder by hand, or forget them if they are "
+                    "not.</p>")
+    orph = [o for o in (v.get("orphans") or []) if isinstance(o, dict)]
+    if orph:
+        orows = "".join(
+            f'<tr data-k="{_esc(k)}-orphan-{_esc(o.get("uuid") or o.get("index") or i)}">'
+            f"<td><code>{_esc(o.get('uuid') or '—')}</code></td><td>{_esc(o.get('index') or '')}</td>"
+            f"<td>{_esc(o.get('status') or '')}</td><td>{_esc(o.get('template') or '')}</td>"
+            f"<td>{_esc(o.get('created_at') or '')}</td></tr>"
+            for i, o in enumerate(orph))
+        rows.append(f'<div data-k="{_esc(k)}-orphans"><p class="bad">Instances on this Thunder '
+                    "account that no backend owns — they bill; never deleted automatically:</p>"
+                    "<table><tr><th>uuid</th><th>index</th><th>status</th><th>template</th>"
+                    f"<th>created</th></tr>{orows}</table></div>")
+    unk = v.get("bootstrap_unknown") or {}
+    if unk:
+        urows = "".join(
+            f'<tr data-k="{_esc(k)}-unk-{_esc(p)}"><td><code>{_esc(p)}</code></td>'
+            f'<td data-sv="{int(n or 0)}">{(int(n or 0)) / 1024 ** 3:.1f} GB</td></tr>'
+            for p, n in sorted(unk.items()))
+        rows.append(f'<details data-k="{_esc(k)}-unknown"><summary>Models the template brought '
+                    f"along ({len(unk)})</summary><table><tr><th>file</th><th>size</th></tr>"
+                    f"{urows}</table></details>")
+    tn = [str(x) for x in (v.get("bootstrap_template_nodes") or [])]
+    if tn:
+        rows.append(f'<div class="tfacts" data-k="{_esc(k)}-tnodes">Node packs the template '
+                    f"brought along: {_esc(', '.join(tn))}</div>")
+    q = _q(name)
+    acts = ""
+    if (phase == "off" and not op) or (phase == "failed" and not v.get("uuid") and not v.get("index")):
+        acts += _btn("Start", f"/ui/thunder/start?name={q}", sm=True,
+                     title="Create the instance (from the last snapshot) — it bills from now on")
+    if phase != "off" or op:
+        acts += _btn("Stop", f"/ui/thunder/stop?name={q}", "danger", sm=True,
+                     confirm=f"Stop {name}? Running jobs finish first, then the instance is "
+                             "snapshotted and deleted.",
+                     title="Drain, snapshot and delete the instance")
+    if phase in ("ready", "failed") and not op:
+        acts += _btn("Restart ComfyUI", f"/ui/thunder/restart?name={q}", "secondary", sm=True,
+                     title="Restart ComfyUI on the running instance")
+    if uu:
+        acts += _btn("Forget unreconciled", f"/ui/thunder/forget?name={q}", "secondary", sm=True,
+                     confirm=f"Forget {', '.join(uu)}? Only if none of them is {name}'s instance "
+                             "— a forgotten one of ours bills on unseen.",
+                     title="These instances are not this backend's")
+    rows.append(f'<div class="tacts" data-k="{_esc(k)}-acts">{acts}</div>')
+    log = [str(x) for x in (v.get("log") or [])][-_THUNDER_LOG_LINES:]
+    rows.append(f'<details data-k="{_esc(k)}-log"><summary>log (last {len(log)} lines)</summary>'
+                f'<pre class="tlog">{_esc(chr(10).join(log)) or "—"}</pre></details>')
+    return f'<div class="tcard" data-k="{_esc(k)}">{"".join(rows)}</div>'
+
+
+def _thunder_panel(views: list, binfo: list) -> str:
+    """The Thunder lifecycle cards above the backend list — empty without Thunder."""
+    if not views:
+        return ""
+    cfg = {b.get("name"): b.get("thunder") for b in binfo
+           if b.get("type") == "comfyui" and isinstance(b.get("thunder"), dict)}
+    cards = "".join(_thunder_card(n, v, cfg.get(n)) for n, v in views)
+    return f'<div data-sk="thunder"><div class="grouphdr">Thunder Compute</div>{cards}</div>'
+
+
+async def _thunder_post(request: Request, action: str):
+    """A Thunder panel action: the backend name as form field `name` (or in the query,
+    which is how the buttons on the page's action form carry it); the controller's
+    answer comes back to the Backends tab as `?msg=`."""
+    f = await _form(request)
+    name = (f.get("name") or request.query_params.get("name") or "").strip()
+    if not name:
+        msg = "no Thunder backend named"
+    elif _thunder_action is None:
+        msg = "Thunder actions are not available"
+    else:
+        try:
+            msg = f"{name}: {await _thunder_action(name, action)}"
+        except Exception as e:                          # noqa: BLE001 — say it, don't 500
+            msg = f"{name}: {action} failed: {type(e).__name__}: {e}"
+    logger.info(f"ui: thunder {action} {name!r} → {msg}")
+    return RedirectResponse("/ui/backends?msg=" + _q(msg[:600]), status_code=303)
+
+
+async def thunder_start(request: Request):
+    return await _thunder_post(request, "start")
+
+
+async def thunder_stop(request: Request):
+    return await _thunder_post(request, "stop")
+
+
+async def thunder_restart(request: Request):
+    return await _thunder_post(request, "restart")
+
+
+async def thunder_forget(request: Request):
+    return await _thunder_post(request, "forget_unreconciled")
 
 
 # ── Tab: Input ──────────────────────────────────────────────────────────────────
@@ -6700,13 +7075,17 @@ _FAULT_KIND = {
     "max_wait": "⏱ max_wait expired", "no_credits": "💳 no credits",
     "vendor_failed": "⚠ vendor failed the task", "restart": "⟳ restarted",
     "restart_failed": "✖ restart failed", "error": "⚠ error",
+    "snapshot_failed": "✖ snapshot failed", "instance_vanished": "⚠ instance vanished",
 }
 _FAULT_SOURCE = {"health": ("health poll", "the discovery poll failed — the backend went DOWN"),
                  "call": ("LLM call", "a chat/completions dispatch failed on this backend "
                                       "(failed over, or a 5xx the client received)"),
                  "job": ("media job", "a generation attempt failed on this backend "
                                       "(the job may still have succeeded after a retry or failover)"),
-                 "watchdog": ("watchdog", "a ComfyUI service restart")}
+                 "watchdog": ("watchdog", "a ComfyUI service restart"),
+                 "lifecycle": ("Thunder lifecycle",
+                               "start/stop/snapshot of a Thunder instance failed"),
+                 "sync": ("model sync", "a model transfer to a Thunder instance failed")}
 
 
 def _fault_kind_label(kind: str) -> str:
@@ -8208,6 +8587,10 @@ def register(app) -> None:
     app.add_api_route("/ui/backends/undrain", backend_undrain, methods=["POST"])
     app.add_api_route("/ui/backends/restart", backend_restart, methods=["POST"])
     app.add_api_route("/ui/backends/enable", backend_enable, methods=["POST"])
+    app.add_api_route("/ui/thunder/start", thunder_start, methods=["POST"])
+    app.add_api_route("/ui/thunder/stop", thunder_stop, methods=["POST"])
+    app.add_api_route("/ui/thunder/restart", thunder_restart, methods=["POST"])
+    app.add_api_route("/ui/thunder/forget", thunder_forget, methods=["POST"])
     app.add_api_route("/ui/input", input_page, methods=["GET"])
     app.add_api_route("/ui/routing", routing_page, methods=["GET"])
     app.add_api_route("/ui/chat/create", chat_create, methods=["POST"])

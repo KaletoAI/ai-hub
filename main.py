@@ -5730,6 +5730,10 @@ def gateway_info() -> dict:
             "host": backend_hosts.get(backend_id(b), ""),
             "host_explicit": bool((b.get("host") or "").strip()),
             "source": "config" if backend_id(b) in config_ids else "ui",
+            # The Thunder block (a COPY — nothing secret in it; its token is api_key): the
+            # editor pre-fills a config-defined backend from this summary, and a block it
+            # did not see would be dropped by the next Save. The panel reads GPU/vCPU here.
+            **({"thunder": copy.deepcopy(b["thunder"])} if _is_thunder(b) else {}),
             **_comfy_watch_info(b), **_cloud_info(b), **_model_filter_info(b), **_loaded_info(b),
         } for b in backends],
         "virtual_models": list(virtual_models.keys()),
@@ -5882,6 +5886,17 @@ async def _thunder_probe(url: str) -> bool:
             return r.status_code == 200
     except httpx.HTTPError:
         return False
+
+
+def _thunder_default_nodes() -> str:
+    """ops/thunder-nodes.default.txt — the console pre-fills a new Thunder block with it,
+    and the controller bootstraps with it when a backend's own list is empty. "" when
+    the file is unreadable (the form then starts empty, the controller refuses)."""
+    try:
+        return (_HERE / "ops" / "thunder-nodes.default.txt").read_text("utf-8")
+    except OSError as e:
+        logger.warning(f"thunder: default node list unreadable: {e}")
+        return ""
 
 
 def _thunder_deps() -> "thunderctl.Deps":
@@ -6237,6 +6252,7 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
            apply_hosts=apply_hosts,
            thunder_view=thunder_view, thunder_action=thunder_action,
            thunder_names=lambda: list(thunder_controllers),
+           thunder_default_nodes=_thunder_default_nodes,
            backend_loras=lambda: {b["name"]: sorted(backend_loras.get(backend_id(b), set()))
                                   for b in backends if b.get("type") == "comfyui"})
 
