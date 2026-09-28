@@ -6032,19 +6032,16 @@ def hf_token_set() -> bool:
     return bool(_thunder_hf_token())
 
 
-# What an HF token may hold: it goes into an `Authorization: Bearer` header on the
-# instance — a space or a line break there splits or injects a header.
-_HF_TOKEN_RE = re.compile(r"[\x21-\x7e]{1,512}")
-
-
 def save_hf_token(token: str) -> str:
     """The console's HF-token Save: "" removes the token, anything else replaces it
     (encrypted at rest — `hf_token` is in `store._SECRET_SETTINGS`). → the refusal, ""
     = saved. The refusal never repeats the value: it is a secret."""
     token = str(token or "")
-    if token and not _HF_TOKEN_RE.fullmatch(token):
-        return ("the HF token may hold only printable characters without spaces "
-                "(at most 512) — not saved")
+    # the transfer's own rule (thunderctl.hf_token_ok): a token it would withhold must
+    # not be saveable — every gated download would then go without it, silently
+    if token and not thunderctl.hf_token_ok(token):
+        return ("the HF token may hold only printable ASCII without spaces, quotes or "
+                "backslashes (at most 512 characters) — not saved")
     if not store.is_active():
         return "the store is not active — not saved"
     store.set_settings({"hf_token": token})
@@ -6372,6 +6369,22 @@ def _thunder_only_aliases(aliases) -> set:
     return out
 
 
+def thunder_longrun() -> list:
+    """[(name, view)] of the controllers whose instance is up for more than 24 h — for
+    the Dashboard's cost banner, polled every 4 s: `Controller.view()` alone (in memory),
+    never `thunder_view`, whose alias-gate note reads the store per alias."""
+    out = []
+    for name, c in sorted(thunder_controllers.items(), key=lambda kv: str(kv[0]).lower()):
+        try:
+            v = c.view()
+        except Exception as e:              # a banner, never the Dashboard
+            logger.warning(f"[thunder {name}] view failed: {type(e).__name__}: {e}")
+            continue
+        if isinstance(v, dict) and v.get("long_running"):
+            out.append((name, v))
+    return out
+
+
 def thunder_view(name: str) -> Optional[dict]:
     """A controller's view for the panel, plus `gated_only` per planned alias (see
     `_thunder_only_aliases`)."""
@@ -6614,7 +6627,7 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
            thunder_modelsrc_view=modelsrc_view, thunder_modelsrc_scan=modelsrc_scan,
            thunder_modelsrc_pin=modelsrc_pin, save_modelsrc_host=save_modelsrc_host,
            save_hf_token=save_hf_token, hf_token_set=hf_token_set,
-           thunder_orphan_snapshots=thunder_orphan_snapshots,
+           thunder_orphan_snapshots=thunder_orphan_snapshots, thunder_longrun=thunder_longrun,
            modelsync_catalog=_modelsync_catalog, save_modelsync_catalog=save_modelsync_catalog,
            backend_loras=lambda: {b["name"]: sorted(backend_loras.get(backend_id(b), set()))
                                   for b in backends if b.get("type") == "comfyui"})

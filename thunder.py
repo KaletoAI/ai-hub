@@ -101,6 +101,11 @@ def parse_instances(obj) -> list[dict]:
             "storage": _int(it.get("storage")),
             "template": str(it.get("template") or ""),
             "created_at": str(it.get("createdAt") or ""),
+            # what an instance costs (OpenAPI InstanceListItem; counts come as strings) —
+            # a foreign instance is priced from these, never from our own backend's form
+            "gpu_type": str(it.get("gpuType") or ""),
+            "num_gpus": _int(it.get("numGpus")),
+            "cpu_cores": _int(it.get("cpuCores")),
         })
     return out
 

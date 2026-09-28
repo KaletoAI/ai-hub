@@ -20,6 +20,13 @@ class Instances(unittest.TestCase):
         self.assertEqual(items[0]["status"], "RUNNING")
         self.assertEqual(items[0]["port"], 30022)
         self.assertEqual(items[0]["http_ports"], [8188])
+        # what prices a foreign instance (OpenAPI InstanceListItem: counts are strings)
+        self.assertEqual((items[0]["gpu_type"], items[0]["num_gpus"], items[0]["cpu_cores"]),
+                         ("", 1, 8))
+        it = thunder.parse_instances([{"id": "1", "gpuType": "a6000", "numGpus": "2",
+                                       "cpuCores": "12", "storage": 300}])[0]
+        self.assertEqual((it["gpu_type"], it["num_gpus"], it["cpu_cores"], it["storage"]),
+                         ("a6000", 2, 12, 300))
 
     def test_list_shape_and_missing_fields(self):
         items = thunder.parse_instances([{"id": "3", "uuid": "u3"}])

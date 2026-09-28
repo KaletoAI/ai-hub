@@ -883,6 +883,15 @@ def parse_keyscan(text: str, hostname: str) -> Optional[str]:
     return None
 
 
+def hf_token_ok(tok: str) -> bool:
+    """Can a curl config line (`header = "Authorization: Bearer <tok>"`) carry this HF
+    token verbatim? The ONE rule: the console refuses a token failing it at Save
+    (main.save_hf_token) and the transfer withholds one (`_hf_token_for`) — two rules
+    would let a token be saved that every download then silently goes without."""
+    tok = str(tok or "")
+    return 0 < len(tok) <= 512 and all(33 <= ord(c) <= 126 and c not in '"\\' for c in tok)
+
+
 class LanSource:
     """The LAN model share behind `ops/modelsrc-serve.sh` (spec "Quell-Runner (LAN)"),
     ONE per gateway — every Thunder controller reads the same share. It holds what
@@ -924,6 +933,7 @@ class LanSource:
         self._sha: dict = {}
         self._scanned: Optional[tuple] = None   # (host, known_hosts line, fingerprint)
         self._for_host: Optional[str] = None    # the modelsrc_host everything above is for
+        self._pin_cache: Optional[tuple] = None  # ((ino, mtime_ns, size), known_hosts fields)
 
     def _log(self, msg: str) -> None:
         try:
@@ -939,23 +949,34 @@ class LanSource:
     def known_hosts_path(self) -> str:
         return os.path.join(self.datadir, "modelsrc-known_hosts")
 
-    def raw_host(self) -> str:
+    def _look(self) -> str:
+        """Read the `modelsrc_host` setting ONCE for this entry point (a store read in
+        main) and follow a change; every helper below takes the value it returned. A
+        FAILED read is no change: the last known host stands — treating a transient
+        store error as "" would drop the listing and the sha256 cache for nothing."""
         try:
-            return str(self._host_fn() or "").strip()
+            raw = str(self._host_fn() or "").strip()
         except Exception:
-            return ""
+            return self._for_host or ""
+        self._follow_host(raw)
+        return raw
+
+    def raw_host(self) -> str:
+        return self._look()
+
+    @staticmethod
+    def _plain(raw: str) -> str:
+        return raw if _SRC_HOST_RE.match(raw) else ""
 
     def host(self) -> str:
         """The `[user@]host`, or "" when the setting is not a plain one."""
-        h = self.raw_host()
-        return h if _SRC_HOST_RE.match(h) else ""
+        return self._plain(self._look())
 
-    def _follow_host(self) -> None:
+    def _follow_host(self, raw: str) -> None:
         """A changed `modelsrc_host` (the console's field) makes the listing, the sha256
         cache and a fetched-but-unconfirmed key describe ANOTHER share: dropped here, on
         the first look after the change, however the setting was changed. Without it the
         new host would be planned from the old share's index until the TTL ran out."""
-        raw = self.raw_host()
         if self._for_host is None:
             self._for_host = raw
             return
@@ -969,48 +990,58 @@ class LanSource:
         self._scanned = None
         self._gen += 1
 
-    def _pinned_name(self) -> str:
-        """The host name the pinned key line names ("" when nothing is pinned)."""
+    def _pin_parts(self) -> list:
+        """The pinned key line's fields ([] when nothing is pinned) — re-read only when
+        the file's mtime/size changed: `problem()` runs every few seconds per controller,
+        and a file open per look added up."""
         try:
-            with open(self.known_hosts_path, encoding="utf-8") as f:
-                parts = f.readline().split()
+            st = os.stat(self.known_hosts_path)
         except OSError:
-            return ""
-        return parts[0] if parts else ""
+            self._pin_cache = None
+            return []
+        key = (st.st_ino, st.st_mtime_ns, st.st_size)   # pin() replaces the file: new inode
+        if self._pin_cache is None or self._pin_cache[0] != key:
+            parts: list = []
+            if st.st_size > 0:
+                try:
+                    with open(self.known_hosts_path, encoding="utf-8") as f:
+                        parts = f.readline().split()
+                except OSError:
+                    parts = []
+            self._pin_cache = (key, parts)
+        return self._pin_cache[1]
 
-    def _stale_pin(self) -> str:
+    def _stale_pin(self, raw: str) -> str:
         """The host a pin is for when it is NOT the configured one ("" otherwise): with
         StrictHostKeyChecking=yes every connect would fail as "unreachable", which
         points the operator at the network instead of the missing pin."""
-        host = self.host()
-        pn = self._pinned_name()
+        host = self._plain(raw)
+        parts = self._pin_parts()
+        pn = parts[0] if parts else ""
         name = host.rsplit("@", 1)[-1] if host else ""
         return pn if (pn and name and pn != name) else ""
 
+    def _pinned(self, raw: str) -> bool:
+        return bool(self._pin_parts()) and not self._stale_pin(raw)
+
     def pinned(self) -> bool:
         """A key is pinned FOR THE CONFIGURED HOST (a pin for the previous host is none)."""
-        try:
-            if os.path.getsize(self.known_hosts_path) <= 0:
-                return False
-        except OSError:
-            return False
-        return not self._stale_pin()
+        return self._pinned(self._look())
+
+    def _configured(self, raw: str) -> bool:
+        return bool(self._plain(raw)) and self._pinned(raw)
 
     def configured(self) -> bool:
-        return bool(self.host()) and self.pinned()
+        return self._configured(self._look())
 
-    def problem(self) -> str:
-        """Why LAN transfers wait ("" = they may run) — the text inside "waiting for LAN
-        source (…)"."""
-        self._follow_host()
-        raw = self.raw_host()
-        if raw and not self.host():
+    def _problem(self, raw: str) -> str:
+        host = self._plain(raw)
+        if raw and not host:
             return f"not configured: modelsrc_host {raw!r} is not a plain [user@]host"
-        old = self._stale_pin()
+        old = self._stale_pin(raw)
         if old:
-            return (f"pinned for {old}, not {self.host().rsplit('@', 1)[-1]} — "
-                    "fetch its key")
-        if not self.host() or not self.pinned():
+            return f"pinned for {old}, not {host.rsplit('@', 1)[-1]} — fetch its key"
+        if not host or not self._pinned(raw):
             return "not configured"
         if self._error:
             return self._error
@@ -1018,34 +1049,43 @@ class LanSource:
             return "not listed yet"
         return ""
 
+    def problem(self) -> str:
+        """Why LAN transfers wait ("" = they may run) — the text inside "waiting for LAN
+        source (…)"."""
+        return self._problem(self._look())
+
     def usable(self) -> bool:
         return self.problem() == ""
 
     @property
     def generation(self) -> int:
-        self._follow_host()
+        self._look()
         return self._gen
 
     def cached(self) -> dict:
         """The last good listing (a copy) — {} while not configured."""
-        self._follow_host()
-        return dict(self._index or {}) if self.configured() else {}
+        raw = self._look()
+        return dict(self._index or {}) if self._configured(raw) else {}
 
     def invalidate(self) -> None:
         self._tried_at = 0.0
 
-    def stale(self) -> bool:
-        if not self.configured():
+    def _stale(self, raw: str) -> bool:
+        if not self._configured(raw):
             return False
         if not self._tried_at:
             return True
         age = self._now() - self._tried_at
         return age >= (_SRC_RETRY_S if self._error else _SRC_TTL_S)
 
+    def stale(self) -> bool:
+        return self._stale(self._look())
+
     def _argv(self, *words) -> list[str]:
-        host = self.host()
+        raw = self._look()
+        host = self._plain(raw)
         if not host:
-            raise ValueError(f"LAN source {self.problem()}")
+            raise ValueError(f"LAN source {self._problem(raw)}")
         return sshrun.ssh_base(self.key_path, self.known_hosts_path, strict="yes") + [
             "--", host, " ".join(sshrun.q(w) for w in words)]
 
@@ -1063,14 +1103,14 @@ class LanSource:
     async def refresh(self, force: bool = False) -> None:
         """List the share when the cache is stale (or `force`). Never raises: a failure
         is `problem()`, and the last good listing stays."""
-        self._follow_host()
-        if not self.configured() or (not force and not self.stale()):
+        raw = self._look()
+        if not self._configured(raw) or (not force and not self._stale(raw)):
             return
         async with self._lock:
-            if not force and not self.stale():
+            listed_for = self._look()
+            if not force and not self._stale(listed_for):
                 return                          # another controller just listed
             before = (self._error, self._index)
-            listed_for = self.raw_host()
             self._tried_at = self._now()
             try:
                 if not self._key_ready:
@@ -1078,7 +1118,7 @@ class LanSource:
                 rc, out, err = await self._ssh(self._argv("list"), timeout=_SRC_LIST_TIMEOUT_S)
             except Exception as e:
                 rc, out, err = -1, b"", _errtext(e).encode()
-            if self.raw_host() != listed_for:
+            if self._look() != listed_for:
                 return                          # the host changed meanwhile: another share's answer
             if rc == 0:
                 self._index = parse_source_list((out or b"").decode("utf-8", "replace"))
@@ -1098,7 +1138,7 @@ class LanSource:
                 self._gen += 1
 
     async def sha256(self, path: str, size: int) -> str:
-        self._follow_host()
+        self._look()
         key = (path, size)
         if key in self._sha:
             return self._sha[key]
@@ -1121,9 +1161,10 @@ class LanSource:
     async def scan(self) -> str:
         """`ssh-keyscan -t ed25519` the host → its fingerprint. The key line is kept in
         memory only; nothing trusts it until `pin` is given the same fingerprint."""
-        host = self.host()
+        raw = self._look()
+        host = self._plain(raw)
         if not host:
-            raise ValueError(f"LAN source {self.problem()}")
+            raise ValueError(f"LAN source {self._problem(raw)}")
         name = host.rsplit("@", 1)[-1]
         rc, out, err = await self._ssh(["ssh-keyscan", "-t", "ed25519", "--", name],
                                        timeout=_KEYSCAN_TIMEOUT_S)
@@ -1136,10 +1177,12 @@ class LanSource:
         self._log(f"host key of {name} fetched: {fp} (not trusted until confirmed)")
         return fp
 
-    def scanned_fingerprint(self) -> str:
-        self._follow_host()
+    def _scanned_fp(self, raw: str) -> str:
         sc = self._scanned
-        return sc[2] if sc is not None and sc[0] == self.host() else ""
+        return sc[2] if sc is not None and sc[0] == self._plain(raw) else ""
+
+    def scanned_fingerprint(self) -> str:
+        return self._scanned_fp(self._look())
 
     def pin(self, fingerprint: str) -> str:
         """Trust the scanned key: write its line to `modelsrc-known_hosts` (0600,
@@ -1161,6 +1204,7 @@ class LanSource:
         finally:
             os.close(fd)
         os.replace(tmp, path)
+        self._pin_cache = None
         self._scanned = None
         self._error = ""
         self.invalidate()
@@ -1169,11 +1213,10 @@ class LanSource:
         return sc[2]
 
     def pinned_fingerprint(self) -> str:
+        parts = self._pin_parts()
         try:
-            with open(self.known_hosts_path, encoding="utf-8") as f:
-                parts = f.readline().split()
             return host_key_fingerprint(parts[2]) if len(parts) >= 3 else ""
-        except (OSError, ValueError):
+        except ValueError:
             return ""
 
     def public_key(self) -> str:
@@ -1184,14 +1227,16 @@ class LanSource:
             return ""
 
     def view(self) -> dict:
-        """The console's LAN block (no I/O beyond two small file reads)."""
-        self._follow_host()
+        """The console's LAN block: ONE read of the host setting, the pin from its
+        mtime-keyed cache, and the small public-key file."""
+        raw = self._look()
+        pinned = self._pinned(raw)
         idx = self._index or {}
         links = sum(1 for v in idx.values() if modelsync.link_of(v) is not None)
-        return {"host": self.raw_host(), "host_ok": bool(self.host()), "pinned": self.pinned(),
-                "pinned_fp": self.pinned_fingerprint() if self.pinned() else "",
-                "scanned_fp": self.scanned_fingerprint(), "public_key": self.public_key(),
-                "problem": self.problem(), "files": len(idx) - links, "links": links,
+        return {"host": raw, "host_ok": bool(self._plain(raw)), "pinned": pinned,
+                "pinned_fp": self.pinned_fingerprint() if pinned else "",
+                "scanned_fp": self._scanned_fp(raw), "public_key": self.public_key(),
+                "problem": self._problem(raw), "files": len(idx) - links, "links": links,
                 "listed_at": self._listed_at, "error": self._error}
 
 
@@ -1459,7 +1504,11 @@ class Controller:
             return
         await self.refresh_prices()
         await self.refresh_snapshots()
-        await self.orphans()
+        # not while an op runs (a start between create and the persisted uuid would list
+        # our own instance as foreign) nor on an unreconciled state (resume() owns the
+        # orphan list then — it names them as possibly ours)
+        if self._op is None and not self._persist_blocked and not self._resume_pending:
+            await self.orphans()
 
     def snapshots(self) -> list[dict]:
         """The last `/snapshots/list` answer (a copy; [] before the first)."""
@@ -1472,6 +1521,20 @@ class Controller:
         if not isinstance(pricing, dict):
             return None
         return pricing.get("pricing") if isinstance(pricing.get("pricing"), dict) else pricing
+
+    def _orphan_view(self, o: dict) -> dict:
+        """A foreign instance with its $/h from ITS OWN configuration (the list's
+        gpuType/numGpus/cpuCores/storage) — None when the price list lacks it."""
+        out = dict(o)
+        gpu, n = str(o.get("gpu_type") or ""), int(o.get("num_gpus") or 1)
+        table = self.pricing_table()
+        api = self._api
+        specs = api.cached("specs") if api is not None else None
+        out["cost_per_h"] = (thunder.hourly_cost(table, gpu, n, int(o.get("cpu_cores") or 0),
+                                                 int(o.get("storage") or 0),
+                                                 thunder.spec_for(specs, gpu, n))
+                             if (gpu and table is not None) else None)
+        return out
 
     def cost_per_h(self) -> Optional[float]:
         api = self._api
@@ -1521,7 +1584,7 @@ class Controller:
                 "bootstrap_incomplete": s.bootstrap_incomplete,
                 "op": self._op, "waiting_jobs": self._drain_waiting,
                 "unreconciled_uuids": list(s.unreconciled_uuids),
-                "orphans": [dict(x) for x in self._orphans]}
+                "orphans": [self._orphan_view(x) for x in self._orphans]}
 
     # lifecycle
     def _refuse_if_unreconciled(self) -> None:
@@ -2981,10 +3044,10 @@ class Controller:
             tok = str(self.deps.hf_token() or "")
         except Exception:
             return ""
-        if any(ord(c) <= 32 or ord(c) == 127 or c in '"\\' for c in tok):
-            self._log("hf_token withheld: it contains a quote, a backslash, whitespace or "
-                      "a control character a curl config line cannot carry — "
-                      "requesting without it")
+        if tok and not hf_token_ok(tok):
+            self._log("hf_token withheld: it is longer than 512 characters or contains a "
+                      "quote, a backslash, whitespace, a control or non-ASCII character a "
+                      "curl config line cannot carry — requesting without it")
             return ""
         return tok
 
@@ -3480,7 +3543,12 @@ class Controller:
                     now = self.deps.now()
                     if self._account_at is None or now - self._account_at >= _ACCOUNT_S:
                         self._account_at = now
-                        await self.refresh_account()
+                        try:
+                            await self.refresh_account()
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as e:  # display only: never costs the sync tick
+                            self._log(f"account refresh failed: {_errtext(e)}")
                 await self._sync_tick()
             except asyncio.CancelledError:
                 raise

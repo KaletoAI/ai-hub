@@ -1052,6 +1052,14 @@ class HfToken(Actions):
         self.assertNotIn("hf_bad value", r.text)
         self.assertNotIn("X-Injected", r.text)
         self.assertEqual(main._thunder_hf_token(), "hf_Good1")      # nothing written
+        # what the transfer would withhold is not saveable either (one rule, both ends)
+        import thunderctl
+        for bad in ('hf_a"b', "hf_a\\b", "hf_ä", "h" * 513):
+            with self.subTest(bad=bad):
+                self.assertFalse(thunderctl.hf_token_ok(bad))
+                self.post(status=400, hf_token=bad)
+                self.assertEqual(main._thunder_hf_token(), "hf_Good1")
+        self.assertTrue(thunderctl.hf_token_ok("hf_Good1"))
         self.assertRegex(r.text, r'<details class="optblock" data-k="thunder-catalog" open>')
 
 
@@ -1113,6 +1121,12 @@ class ModelsrcHostField(Actions):
                 self.assertIn(f'name="modelsrc_host" value="{admin._esc(bad)}"', r.text)
                 self.assertEqual(store.get_setting("modelsrc_host"), "src@10.0.0.2")
 
+    def test_refused_host_shows_its_reason_without_controllers(self):
+        self.views = {}
+        r = self.post(status=400, modelsrc_host="a;b")
+        self.assertIn("not saved", r.text)
+        self.assertIn('name="modelsrc_host" value="a;b"', r.text)
+
     def test_changed_host_names_the_stale_pin(self):
         lan = main.modelsrc()
         with open(lan.known_hosts_path, "w") as f:
@@ -1135,8 +1149,14 @@ class CostBanner(_Base):
         return _view(**v)
 
     def dash(self) -> str:
+        def longrun():
+            return [(n, v) for n, v in self.views.items() if v.get("long_running")]
+
+        def heavy(name):
+            raise AssertionError("the Dashboard must not build the full panel view")
         for k, v in {"_dashboard_snapshot": lambda: {"backends": []},
-                     "_faults_info": lambda: {"backends": [], "bundles": [], "total": 0}}.items():
+                     "_faults_info": lambda: {"backends": [], "bundles": [], "total": 0},
+                     "_thunder_longrun": longrun, "_thunder_view": heavy}.items():
             self.addCleanup(setattr, admin, k, getattr(admin, k))
             setattr(admin, k, v)
         r = asyncio.run(admin.dashboard_page(_Req({})))
@@ -1167,6 +1187,35 @@ class CostBanner(_Base):
         self.views = {"tc": _view(phase="ready", started_at=1.0, uptime_s=3600)}
         self.assertNotIn("dash-longrun", self.dash())
 
+    def test_dashboard_banner_reads_no_store(self):
+        """main.thunder_longrun is what the Dashboard polls every 4 s: Controller.view()
+        only — thunder_view's alias-gate note would read the store per not-ready alias."""
+        class Ctl:
+            def __init__(self, long):
+                self.long = long
+
+            def view(self):
+                return {"phase": "ready", "long_running": self.long, "uptime_s": 90000,
+                        "session_cost": 1.5,
+                        "plan": {"aliases": {"a": {"ready": False}, "b": {"ready": False}}}}
+        saved = dict(main.thunder_controllers)
+        self.addCleanup(lambda: (main.thunder_controllers.clear(),
+                                 main.thunder_controllers.update(saved)))
+        main.thunder_controllers.clear()
+        main.thunder_controllers.update({"tc": Ctl(True), "k2": Ctl(False)})
+
+        def boom(*a, **k):
+            raise AssertionError("store read on the Dashboard path")
+        for fn in ("get", "list_aliases", "get_setting", "get_settings"):
+            self.addCleanup(setattr, store, fn, getattr(store, fn))
+            setattr(store, fn, boom)
+        self.assertIs(admin._thunder_longrun, main.thunder_longrun)
+        self.assertEqual([n for n, _ in main.thunder_longrun()], ["tc"])
+        html = admin._dash_thunder()
+        self.assertIn('data-k="dash-longrun-tc"', html)
+        self.assertIn("Thunder tc running for 25 h (≈ $1.50)", html)
+        self.assertNotIn("k2", html)
+
 
 class OrphanSnapshots(_Base):
     """Task 16: `aihub-` snapshots no current Thunder backend owns bill $/month unseen
@@ -1192,6 +1241,21 @@ class OrphanSnapshots(_Base):
         self.assertNotIn("<button", m.group(0))              # display only, no delete
         self.orph = []
         self.assertNotIn("thunder-orphan-snaps", self.page())
+
+    def test_orphan_instances_priced_on_the_card(self):
+        self.orph = []
+        self.views = {"tc": _view(orphans=[
+            {"uuid": "x", "index": "4", "status": "RUNNING", "gpu_type": "a6000",
+             "num_gpus": 1, "cost_per_h": 0.42},
+            {"uuid": "y", "index": "5", "status": "RUNNING", "gpu_type": "h200",
+             "num_gpus": 2, "cost_per_h": None}])}
+        page = self.page()
+        x = re.search(r'<tr data-k="thunder-tc-orphan-x">.*?</tr>', page).group(0)
+        self.assertIn("$0.42/h", x)
+        self.assertIn("a6000 ×1", x)
+        y = re.search(r'<tr data-k="thunder-tc-orphan-y">.*?</tr>', page).group(0)
+        self.assertIn("<td>—</td>", y)                      # no price: no made-up figure
+        self.assertIn("h200 ×2", y)
 
     def test_main_uses_the_controllers_caches(self):
         class Ctl:

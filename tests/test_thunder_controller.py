@@ -2267,6 +2267,9 @@ class CostGuard(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(c.view()["long_running"])
         c.state.phase = "failed"                           # a failed instance still bills
         self.assertTrue(c.view()["long_running"])
+        for ph in ("draining", "pruning", "snapshotting", "deleting", "starting"):
+            c.state.phase = ph                             # a stop in flight still bills
+            self.assertTrue(c.view()["long_running"], ph)
 
 
 class AccountRefresh(unittest.IsolatedAsyncioTestCase):
@@ -2293,6 +2296,66 @@ class AccountRefresh(unittest.IsolatedAsyncioTestCase):
         c.h.clock[0] += 600
         await _one_round(c)
         self.assertGreater(len(fake.calls), n)
+
+    async def test_price_list_fetched_once_per_hour(self):
+        fake = FakeThunder()
+        c, _, _, _ = make(fake, state={"phase": "off"})
+        pricing = lambda: sum(1 for m, p, _ in fake.calls if p == "/v2/pricing")  # noqa: E731
+        c.api._clock = lambda: c.h.clock[0]                # the cache's TTL on the test clock
+        await _one_round(c)
+        self.assertEqual(pricing(), 1)
+        for _ in range(4):                                 # 4 more refreshes within the hour
+            c.h.clock[0] += 600
+            await _one_round(c)
+        self.assertEqual(pricing(), 1)
+        self.assertEqual(sum(1 for m, p, _ in fake.calls if p == "/snapshots/list"), 5)
+        c.h.clock[0] += 3600
+        await _one_round(c)
+        self.assertEqual(pricing(), 2)
+
+    async def test_no_foreign_instance_check_during_an_op_or_unreconciled(self):
+        fake = FakeThunder()
+        _inst(fake, idx="4", uuid="ours-not-yet-persisted")
+        c, _, _, _ = make(fake, state={"phase": "off"})
+        c._op = "start"
+        await c.refresh_account()
+        self.assertEqual(c.view()["orphans"], [])
+        self.assertNotIn("/instances/list", {p for m, p, _ in fake.calls})
+        c._op, c._persist_blocked = None, True
+        await c.refresh_account()
+        self.assertNotIn("/instances/list", {p for m, p, _ in fake.calls})
+        c._persist_blocked = False
+        await c.refresh_account()
+        self.assertEqual(len(c.view()["orphans"]), 1)
+
+    async def test_a_failing_refresh_never_costs_the_sync_tick(self):
+        fake = FakeThunder()
+        c, _, _, _ = make(fake, state={"phase": "off"})
+        ticks = []
+
+        async def boom():
+            raise KeyError("bug")
+
+        async def tick():
+            ticks.append(1)
+        c.refresh_account, c._sync_tick = boom, tick
+        await _one_round(c)
+        self.assertEqual(len(ticks), thunderctl._WATCH_S // thunderctl._SYNC_POLL_S)
+        self.assertTrue([ln for ln in c.state.log if "account refresh failed" in ln])
+
+    async def test_foreign_instances_priced_from_their_own_config(self):
+        fake = FakeThunder()
+        _inst(fake, idx="4", uuid="x", gpuType="a6000", numGpus="1", cpuCores="8",
+              storage=300)
+        _inst(fake, idx="5", uuid="y", gpuType="h200", numGpus="1")    # no price for it
+        c, _, _, _ = make(fake, state={"phase": "off"})
+        await c.refresh_account()
+        o = {x["uuid"]: x for x in c.view()["orphans"]}
+        want = thunder.hourly_cost({"a6000_x1": 0.35, "additional_vcpus": 0.04,
+                                    "disk_gb": 0.0003}, "a6000", 1, 8, 300,
+                                   {"vcpuOptions": [6, 8]})
+        self.assertAlmostEqual(o["x"]["cost_per_h"], want)
+        self.assertIsNone(o["y"]["cost_per_h"])
 
     async def test_no_token_no_calls(self):
         fake = FakeThunder()
@@ -4401,6 +4464,62 @@ class LanSourceUnit(unittest.IsolatedAsyncioTestCase):
         n = len(sh.calls)
         await lan.sha256("models/vae/a.st", 3)             # sha cache dropped with it
         self.assertEqual(len(sh.calls), n + 1)
+
+    def test_one_host_read_per_view_and_the_pin_file_cached(self):
+        """`problem()` runs every 5 s per controller and `view()` per page tick: the host
+        setting is a store read in main and the pin a file open."""
+        from unittest import mock
+        reads = [0]
+
+        def host():
+            reads[0] += 1
+            return "modelsrc@192.168.8.24"
+        lan = thunderctl.LanSource(self.d, host=host, ssh=FakeShare().ssh,
+                                   keygen=_fake_keygen, now=lambda: self.clock[0])
+        with open(lan.known_hosts_path, "w") as f:
+            f.write(f"192.168.8.24 ssh-ed25519 {_ED_B64}\n")
+        lan.view()
+        reads[0] = 0
+        opened = []
+        real_open = open
+
+        def spy(path, *a, **k):
+            opened.append(str(path))
+            return real_open(path, *a, **k)
+        with mock.patch("builtins.open", spy):
+            v = lan.view()
+            lan.problem()
+            lan.usable()
+        self.assertEqual(reads[0], 3)                      # one per public entry point
+        self.assertTrue(v["pinned"])
+        self.assertNotIn(lan.known_hosts_path, opened)     # cached by inode/mtime/size
+        # a changed file is read again
+        with open(lan.known_hosts_path, "w") as f:
+            f.write(f"10.1.1.1 ssh-ed25519 {_ED_B64}\n")
+        self.assertEqual(lan.problem(),
+                         "pinned for 10.1.1.1, not 192.168.8.24 — fetch its key")
+
+    async def test_a_failed_host_read_is_no_host_change(self):
+        sh = FakeShare()
+        sh.files["vae/a.st"] = b"xyz"
+        state = {"fail": False}
+
+        def host():
+            if state["fail"]:
+                raise RuntimeError("database is locked")
+            return _SRCHOST
+        lan = thunderctl.LanSource(self.d, host=host, ssh=sh.ssh, keygen=_fake_keygen,
+                                   now=lambda: self.clock[0])
+        with open(lan.known_hosts_path, "w") as f:
+            f.write(f"192.168.8.24 ssh-ed25519 {_ED_B64}\n")
+        await lan.refresh()
+        gen = lan.generation
+        state["fail"] = True
+        self.assertEqual(lan.cached(), {"models/vae/a.st": 3})
+        self.assertEqual(lan.generation, gen)
+        state["fail"] = False
+        self.assertEqual(lan.cached(), {"models/vae/a.st": 3})
+        self.assertEqual(lan.generation, gen)
 
     async def test_sha_cached_per_path_and_size(self):
         sh = FakeShare()

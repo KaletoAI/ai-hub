@@ -210,6 +210,9 @@ _save_modelsrc_host: Callable = None
 _save_hf_token: Callable = None
 _hf_token_set: Callable[[], bool] = lambda: False
 _thunder_orphan_snapshots: Callable[[], list] = lambda: []
+# [(name, view)] of Thunder controllers up for more than 24 h — in memory only (the
+# Dashboard polls it every 4 s; main.thunder_view would read the store per alias).
+_thunder_longrun: Callable[[], list] = lambda: []
 
 
 def bind(**overrides) -> None:
@@ -3319,12 +3322,14 @@ def _thunder_card(name: str, v: dict, cfg: Optional[dict]) -> str:
             f'<tr data-k="{_esc(k)}-orphan-{_esc(o.get("uuid") or o.get("index") or i)}">'
             f"<td><code>{_esc(o.get('uuid') or '—')}</code></td><td>{_esc(o.get('index') or '')}</td>"
             f"<td>{_esc(o.get('status') or '')}</td><td>{_esc(o.get('template') or '')}</td>"
+            f"<td>{_esc(o.get('gpu_type') or '?')} ×{_esc(o.get('num_gpus') or 1)}</td>"
+            f"<td>{(_money(o['cost_per_h']) + '/h') if o.get('cost_per_h') is not None else '—'}</td>"
             f"<td>{_esc(o.get('created_at') or '')}</td></tr>"
             for i, o in enumerate(orph))
         rows.append(f'<div data-k="{_esc(k)}-orphans"><p class="bad">Instances on this Thunder '
                     "account that no backend owns — they bill; never deleted automatically:</p>"
                     "<table><tr><th>uuid</th><th>index</th><th>status</th><th>template</th>"
-                    f"<th>created</th></tr>{orows}</table></div>")
+                    f"<th>GPU</th><th>cost</th><th>created</th></tr>{orows}</table></div>")
     unk = v.get("bootstrap_unknown") or {}
     if unk:
         urows = "".join(
@@ -3554,12 +3559,13 @@ def _thunder_panel(views: list, binfo: list, catalog_refused: Optional[tuple] = 
     """The Thunder lifecycle cards above the backend list, the orphaned snapshots, the
     LAN model source and the model-sync catalog + HF token — empty without Thunder
     (unless a refused catalog/token Save must be shown)."""
-    if not views and catalog_refused is None and hf_refused is None:
+    if (not views and catalog_refused is None and hf_refused is None
+            and modelsrc_refused is None):
         return ""
     cfg = {b.get("name"): b.get("thunder") for b in binfo
            if b.get("type") == "comfyui" and isinstance(b.get("thunder"), dict)}
     cards = "".join(_thunder_card(n, v, cfg.get(n)) for n, v in views)
-    lan = _modelsrc_block(modelsrc_refused) if views else ""
+    lan = _modelsrc_block(modelsrc_refused) if (views or modelsrc_refused is not None) else ""
     osnaps = _orphan_snaps_block() if views else ""
     return (f'<div data-sk="thunder"><div class="grouphdr">Thunder Compute</div>{cards}'
             f"{osnaps}{lan}{_catalog_editor(catalog_refused, hf_refused)}</div>")
@@ -7707,10 +7713,15 @@ def _dash_thunder() -> str:
     """The cost guard on the Dashboard (spec "Kosten-Wächter"): one keyed line per Thunder
     instance up for more than 24 h — the page an operator looks at daily, unlike the
     Backends tab. Nothing when none is (and the wrapper then goes, keyed by `data-sk`)."""
+    try:
+        views = list(_thunder_longrun() or [])
+    except Exception as e:                              # noqa: BLE001 — a banner, not the page
+        logger.warning(f"ui: thunder long-run check failed: {type(e).__name__}: {e}")
+        views = []
     rows = "".join(
         f'<p class="bad" data-k="dash-longrun-{_esc(n)}">⚠ {_esc(_thunder_longrun_text(n, v))}'
         ' — see <a href="/ui/backends">Backends</a></p>'
-        for n, v in _thunder_views() if v.get("long_running"))
+        for n, v in views if isinstance(v, dict) and v.get("long_running"))
     return f'<div data-sk="dash-thunder">{rows}</div>' if rows else ""
 
 
