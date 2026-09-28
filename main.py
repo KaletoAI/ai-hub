@@ -5827,8 +5827,12 @@ def _config_backend_entry(b: dict) -> dict:
     live dict is `paid`, and it is kept: for a cloud type it is forced True on every
     rebuild anyway, for the rest it is `bool(paid)` — exactly what the config meant.
     `api_key` stays plaintext here; store.upsert_backend encrypts it like any store entry."""
-    return {k: copy.deepcopy(v) for k, v in b.items()
-            if k != "enabled" and not str(k).startswith("_")}
+    # JSON-safe: the store writes it as JSON, and a YAML config can hold what JSON
+    # cannot (an unquoted `2026-09-28` is a datetime.date) — json.dumps then raised on
+    # every enable/disable, a Thunder start or stop included
+    return json.loads(json.dumps({k: v for k, v in b.items()
+                                  if k != "enabled" and not str(k).startswith("_")},
+                                 default=str))
 
 
 def set_backend_enabled(bid: str, on: bool) -> bool:
@@ -6235,13 +6239,19 @@ def sync_thunder_controllers() -> None:
             c.backend = b
     for name in [n for n in thunder_controllers if n not in want]:
         c = thunder_controllers[name]
-        if c.state.phase == "off" and c.op is None:
+        # an `off` controller whose snapshot is still CREATING is not idle: its watcher
+        # still has to rotate the old snapshot out (and mark or drop the new one) —
+        # retired, both would sit at Thunder and bill per GB-month, unseen
+        if c.state.phase == "off" and c.op is None and not c.state.pending_snapshot:
             _thunder_warned.discard(name)
             _thunder_retire(name)
         elif name not in _thunder_warned:   # once per controller, not per rebuild
             _thunder_warned.add(name)
-            logger.warning(f"[thunder {name}] backend config removed while instance runs "
-                           f"({c.state.phase}) — controller kept; stop it from the console")
+            what = (f"instance runs ({c.state.phase})" if c.state.phase != "off" or c.op
+                    else f"snapshot {c.state.pending_snapshot} is still being taken")
+            logger.warning(f"[thunder {name}] backend config removed while {what} — "
+                           "controller kept" + ("" if c.state.phase == "off" and not c.op
+                                                else "; stop it from the console"))
 
 
 def _thunder_boot() -> None:

@@ -3109,6 +3109,11 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
                                                 "HTTP/2 403\r\ncontent-length: 7\r\n"))
         self.assertIsNone(thunderctl.parse_head(""))
         self.assertIsNone(thunderctl.parse_head("HTTP/2 200\r\ncontent-length: -1\r\n"))
+        # a 2xx naming length 0 is unknown, not an empty model file: taken as the size,
+        # every download would fail its size check and block the file's aliases
+        self.assertIsNone(thunderctl.parse_head("HTTP/2 200\r\ncontent-length: 0\r\n"))
+        self.assertIsNone(thunderctl.parse_head("HTTP/1.1 302 Found\r\nContent-Length: 9\r\n"
+                                                "\r\nHTTP/2 200\r\ncontent-length: 0\r\n"))
 
     async def test_unknown_files_listed_never_pruned(self):
         stranger, old = "models/checkpoints/stranger.safetensors", "models/loras/old.safetensors"
@@ -3377,6 +3382,7 @@ case " $* " in *" -sIL "*)
   printf 'HTTP/1.1 302 Found\r\nContent-Length: 0\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\n'
   exit 0;;
 esac
+[ -n "$STUB_BECOME" ] && exec sleep "$STUB_BECOME"   # the pid lives on, as no curl
 out=
 while [ $# -gt 0 ]; do [ "$1" = -o ] && out=$2; shift; done
 printf '%s' "$cfg" > "$HOME/cfg-seen"
@@ -3494,6 +3500,48 @@ class RemoteShell(unittest.TestCase):
         self.assertEqual(os.listdir(os.path.dirname(keep)), ["keep.safetensors"])
         rc, out, err = self.sh(thunderctl._prune_cmd([]))
         self.assertEqual(out.split(), ["GW:PRUNED"])
+
+    def test_started_only_once_the_lock_names_the_curl(self):
+        # GW:STARTED used to be echoed before the child had written its pid and exec'd
+        # curl: a kill in that window found no curl and the download ran on. Now the
+        # lock names a running curl whenever GW:STARTED arrives — every time.
+        rel = "models/loras/r.safetensors"
+        lock = os.path.join(self.home, "ComfyUI", "models", "loras", "r.safetensors.part.lock")
+        cfg = thunderctl.curl_config("https://example.com/r", "")
+        for _ in range(5):
+            rc, out, err = self.sh(thunderctl._fetch_cmd(rel), cfg.encode(), STUB_SLEEP="20")
+            self.assertEqual((rc, out.strip()), (0, "GW:STARTED"), err)
+            with open(lock) as f:
+                pid = f.read().strip()
+            with open(f"/proc/{pid}/comm") as f:
+                self.assertEqual(f.read().strip(), "curl")
+            self.assertEqual(self.sh(thunderctl._KILL_CMD)[1].strip(), "GW:KILLED")
+            self.assertEqual(self.sh(thunderctl._poll_cmd(rel))[1].splitlines()[0], "GW:END")
+
+    def test_a_stale_lock_of_a_dead_pid_does_not_count_as_started(self):
+        # the lock a dead curl left behind must not pass for the new child's: removed
+        # before the spawn, so what appears is the child's own pid
+        rel = "models/vae/d.safetensors"
+        d = os.path.join(self.home, "ComfyUI", "models", "vae")
+        os.makedirs(d)
+        with open(os.path.join(d, "d.safetensors.part.lock"), "w") as f:
+            f.write("999999999\n")                        # no such process
+        cfg = thunderctl.curl_config("https://example.com/d", "")
+        rc, out, err = self.sh(thunderctl._fetch_cmd(rel), cfg.encode(), STUB_SLEEP="20")
+        self.assertEqual(out.strip(), "GW:STARTED", err)
+        with open(os.path.join(d, "d.safetensors.part.lock")) as f:
+            self.assertNotEqual(f.read().strip(), "999999999")
+        self.sh(thunderctl._KILL_CMD)
+
+    def test_curl_that_never_comes_up_is_a_start_failure(self):
+        # the lock's pid lives on but never as a curl: no GW:STARTED — the controller
+        # counts a failed attempt instead of polling a download a kill could not end
+        rel = "models/vae/nc.safetensors"
+        cfg = thunderctl.curl_config("https://example.com/nc", "")
+        rc, out, err = self.sh(thunderctl._fetch_cmd(rel), cfg.encode(), STUB_BECOME="5")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out.splitlines()[0], "GW:START-FAIL")
+        self.assertNotIn("GW:STARTED", out)
 
     def test_head_reports_the_final_content_length(self):
         rel = "models/vae/v.safetensors"
@@ -3733,6 +3781,34 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         fc.op = None
         m.sync_thunder_controllers()
         self.assertEqual(m.thunder_controllers, {})
+
+    def test_off_controller_with_a_pending_snapshot_is_not_retired(self):
+        # the stop is done, but the watcher still has to rotate the old snapshot out —
+        # retired now, both snapshots would bill per GB-month with nobody watching
+        m = self.m
+        fc = _FakeCtl("tc")
+        fc.state.pending_snapshot = "s7"
+        m.thunder_controllers = {"tc": fc}
+        m.backends = []
+        with self.assertLogs("main", "WARNING") as cm:
+            m.sync_thunder_controllers()
+        self.assertIs(m.thunder_controllers.get("tc"), fc)
+        self.assertIn("s7", "\n".join(cm.output))
+        fc.state.pending_snapshot = ""
+        m.sync_thunder_controllers()
+        self.assertEqual(m.thunder_controllers, {})
+
+    def test_config_backend_entry_is_json_safe(self):
+        # an unquoted YAML date is a datetime.date: the store's json.dumps raised on
+        # every enable/disable — a Thunder start and stop included
+        import datetime
+        m = self.m
+        b = {"name": "n", "type": "comfyui", "note": datetime.date(2026, 9, 28),
+             "thunder": {"since": datetime.datetime(2026, 9, 28, 12, 0)}}
+        e = m._config_backend_entry(b)
+        self.assertEqual(e["note"], "2026-09-28")
+        self.assertEqual(e["thunder"]["since"], "2026-09-28 12:00:00")
+        json.dumps(e)
 
     async def test_real_controller_refusal_comes_back_as_text(self):
         # pins the contract thunder_action relies on: Controller.stop() refuses BEFORE
@@ -4562,3 +4638,255 @@ class LanSourceUnit(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FinalReviewFixes(unittest.IsolatedAsyncioTestCase):
+    """The final whole-branch review's findings: each test fails without its fix."""
+
+    async def _settle(self, n=20):
+        for _ in range(n):
+            await asyncio.sleep(0)
+
+    @staticmethod
+    def _gated_lists(fake, answers):
+        """A handler whose /instances/list answers come from `answers` (callables on the
+        fake, consumed in order, the last one sticks) — to script list sequences."""
+        n = [0]
+
+        def handler(req):
+            if req.url.path == "/instances/list":
+                fn = answers[min(n[0], len(answers) - 1)]
+                n[0] += 1
+                fake.calls.append(("GET", "/instances/list", None))
+                return fn()
+            return fake.handler(req)
+        return handler, n
+
+    # I1 ─ a stop during start's unreconciled check
+    async def test_stop_during_the_unreconciled_check_means_no_create(self):
+        fake = FakeThunder()
+        _inst(fake, idx="4", uuid="u4")
+        c, saved, _, _ = make(fake, state="garbage")
+        await c.resume()
+        self.assertEqual(c.state.unreconciled_uuids, ["u4"])
+        del fake.instances["4"]                        # the check would let the start on
+        fake.status_script = ["PROVISIONING", "RUNNING"]
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def handler(req):
+            if req.url.path == "/instances/list" and not release.is_set():
+                entered.set()
+                await release.wait()
+            return fake.handler(req)
+        c.deps.client_factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        c._api = c._client = None
+        start = asyncio.ensure_future(c.start())
+        await entered.wait()
+        stopped = None
+        try:
+            await c.stop()
+            stopped = True
+        except RuntimeError:
+            stopped = False
+        release.set()
+        await self._settle(50)
+        try:
+            await start
+        except RuntimeError:
+            pass
+        await self._settle(50)
+        # never both: a stop that answered "done" and an instance created after it
+        self.assertFalse(stopped and _creates(fake), (stopped, _creates(fake)))
+        self.assertEqual(_creates(fake), [])
+        self.assertEqual(c.state.phase, "off")
+        self.assertIsNone(c._op)
+
+    async def test_stop_refuses_an_abortable_op_without_a_task(self):
+        fake = FakeThunder()
+        c, _, _, _ = make(fake)
+        c._op, c._op_task = "starting", None
+        with self.assertRaises(RuntimeError) as cm:
+            await c.stop()
+        self.assertIn("retry in a moment", str(cm.exception))
+        self.assertEqual(c._op, "starting")            # the op is left alone
+
+    # I2 ─ absence must hold over consecutive fresh lists
+    async def test_unreconciled_check_needs_two_lists_without_the_instance(self):
+        fake = FakeThunder()
+        _inst(fake, idx="4", uuid="u4")
+        c, saved, _, _ = make(fake, state="garbage")
+        await c.resume()
+        self.assertEqual(c.state.unreconciled_uuids, ["u4"])
+        handler, n = self._gated_lists(fake, [lambda: httpx.Response(200, json={}),
+                                              lambda: httpx.Response(200, json=fake.instances)])
+        c.deps.client_factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        c._api = c._client = None
+        with self.assertRaises(RuntimeError) as cm:
+            await c.start()
+        self.assertIn("u4", str(cm.exception))
+        self.assertEqual(n[0], 2)
+        self.assertEqual(_creates(fake), [])
+        self.assertEqual(c.state.unreconciled_uuids, ["u4"])
+        self.assertEqual(saved["thunder"]["unreconciled_uuids"], ["u4"])
+
+    async def test_unreadable_state_not_reconciled_as_off_on_one_empty_list(self):
+        fake = FakeThunder()
+        _inst(fake, idx="4", uuid="u4")
+        c, saved, _, _ = make(fake, state="garbage")
+        handler, n = self._gated_lists(fake, [lambda: httpx.Response(200, json={}),
+                                              lambda: httpx.Response(200, json=fake.instances)])
+        c.deps.client_factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        await c.resume()
+        self.assertEqual(n[0], 2)
+        self.assertEqual(c.state.phase, "failed")
+        self.assertEqual(c.state.unreconciled_uuids, ["u4"])
+        self.assertIn("u4", c.state.error)
+
+    # I3 ─ a failed save is visible and stops a create
+    async def test_failed_save_before_the_post_refuses_the_create(self):
+        fake = FakeThunder()
+        c, saved, enabled, _ = make(fake)
+        good = c.deps.save_state
+
+        def boom(n, d):
+            raise OSError("disk full")
+        c.deps.save_state = boom
+        await c.start()
+        self.assertEqual(_creates(fake), [])
+        self.assertEqual(c.state.phase, "off")
+        self.assertIn("could not be saved", c.state.error)
+        self.assertIs(enabled["comfyui:thunder"], False)
+        self.assertIn("disk full", c.view()["persist_error"])
+        c.deps.save_state = good
+        c._persist()
+        self.assertEqual(c.view()["persist_error"], "")
+
+    # I5 ─ a transient HEAD failure can be retried
+    async def test_sync_now_forgets_unknown_and_failed_head_sizes(self):
+        fake = FakeThunder()
+        c, _, _, _ = make(fake, state=_persisted())
+        c._head_sizes = {"https://x/unknown": None, "https://x/good": 5, "https://x/failed": 7}
+        c._failed = {"models/vae/f.safetensors": "size mismatch"}
+        c._plan_inputs = ([], {}, {}, {}, {"models/vae/f.safetensors": {"url": "https://x/failed"}})
+
+        async def nothing():
+            return None
+        c.sync_once = nothing
+        await c.sync_now()
+        self.assertEqual(c._head_sizes, {"https://x/good": 5})
+        self.assertEqual(c._failed, {})
+
+    async def test_fetch_start_failure_is_a_failed_attempt(self):
+        fake = FakeThunder()
+        c, _, _, _ = make(fake, state=_persisted(),
+                          ssh_script={"gw-fetch": (0, b"GW:START-FAIL\ncurl: (6) no host\n", b"")})
+        why, final = await c._fetch_attempt(
+            {"path": "models/vae/v.safetensors", "url": "https://example.com/v", "size": None}, 1)
+        self.assertEqual((why, final), ("curl did not start on the instance: curl: (6) no host",
+                                        False))
+        self.assertNotIn("models/vae/v.safetensors", c.state.transfers)
+
+    # M1 ─ our instance vanishing at Thunder is noticed, the phase is not touched
+    async def test_own_instance_absent_twice_is_a_fault_not_a_phase_change(self):
+        fake = FakeThunder()
+        fake.status_script = []
+        c, _, _, _ = make(fake, state=_persisted())
+        vanished = lambda: [f for f in c.h.faults if f[2] == "instance_vanished"]  # noqa: E731
+        await c.refresh_account()
+        self.assertEqual(vanished(), [])                   # one list is no proof
+        await c.refresh_account()
+        self.assertEqual(len(vanished()), 1)
+        self.assertEqual(vanished()[0][1], "lifecycle")
+        self.assertIn("u0", vanished()[0][3])
+        await c.refresh_account()
+        self.assertEqual(len(vanished()), 1)               # once per disappearance
+        self.assertEqual((c.state.phase, c.state.uuid), ("ready", "u0"))
+        self.assertTrue([ln for ln in c.state.log if "no longer listed" in ln])
+        _inst(fake)                                        # listed again: reset
+        await c.refresh_account()
+        self.assertEqual(c._own_absent, 0)
+
+    async def test_own_instance_listed_is_no_fault(self):
+        fake = FakeThunder()
+        _inst(fake)
+        c, _, _, _ = make(fake, state=_persisted())
+        for _ in range(3):
+            await c.refresh_account()
+        self.assertEqual([f for f in c.h.faults if f[2] == "instance_vanished"], [])
+
+    # M4 ─ a 2xx body in an error is redacted
+    async def test_create_errors_redact_an_echoed_token(self):
+        secret = "sekrit-thunder-token"
+
+        def handler(req):
+            return httpx.Response(200, json={"echo": req.headers.get("authorization")})
+        api = thunderctl.ThunderApi(
+            httpx.AsyncClient(transport=httpx.MockTransport(handler)), secret)
+        for call in (lambda: api.create({}),
+                     lambda: api.create_snapshot({"index": "1"}, "aihub-x")):
+            with self.assertRaises(thunder.ThunderError) as cm:
+                await call()
+            self.assertNotIn(secret, str(cm.exception))
+            self.assertIn("***", str(cm.exception))
+
+    # M7 ─ a Start without a token
+    async def test_start_without_token_is_refused_before_any_call(self):
+        fake = FakeThunder()
+        c, _, enabled, _ = make(fake)
+        c.backend = dict(c.backend, api_key="")
+        with self.assertRaises(RuntimeError) as cm:
+            await c.start()
+        self.assertIn("no Thunder API token set", str(cm.exception))
+        self.assertIn("API key field", str(cm.exception))
+        self.assertEqual(fake.calls, [])
+        self.assertEqual(enabled, {})
+        self.assertEqual(c.state.phase, "off")
+        self.assertIsNone(c._op)
+
+
+class DepsContract(unittest.TestCase):
+    """The main↔thunderctl seam: every field `thunderctl.Deps` declares is provided by
+    `main._thunder_deps()` with a callable that accepts the arguments thunderctl calls
+    it with. A renamed or re-shaped dependency fails only at run time otherwise — in
+    the middle of a start, after the instance was paid for."""
+
+    # how thunderctl calls each callable field (positional arity); None = not a callable
+    ARITY = {"client_factory": 0, "load_state": 1, "save_state": 2, "set_enabled": 2,
+             "begin_drain": 1, "inflight": 1, "is_draining": 1, "note_fault": 4,
+             "datadir": None, "probe_comfy": 1, "bootstrap_script": 0, "log": 1, "now": 0,
+             "sleep": 1, "ssh": 1, "spawn": None, "known_uuids": 0, "keygen": 1,
+             "default_nodes": 0, "alias_needs": 1, "alias_signature": 1, "source_index": 0,
+             "url_catalog": 0, "hf_token": 0, "lan": None, "pipe": 3}
+    KWARGS = {"ssh": ("stdin", "timeout"), "pipe": ("timeout_idle",)}
+
+    def test_every_field_provided_with_the_called_arity(self):
+        import dataclasses
+        import inspect
+        m = _main()
+        d = m._thunder_deps()
+        names = [f.name for f in dataclasses.fields(thunderctl.Deps)]
+        self.assertEqual(sorted(names), sorted(self.ARITY), "Deps grew or lost a field — "
+                         "add it to ARITY with the arity thunderctl calls it with")
+        for name in names:
+            v = getattr(d, name)
+            arity = self.ARITY[name]
+            if name == "datadir":
+                self.assertIsInstance(v, str)
+                self.assertTrue(v)
+                continue
+            if name == "lan":
+                self.assertIsInstance(v, thunderctl.LanSource)
+                continue
+            if name == "spawn":
+                self.assertTrue(v is None or callable(v))
+                continue
+            self.assertTrue(callable(v), name)
+            try:
+                sig = inspect.signature(v)
+            except ValueError:                  # a builtin (time.time): nothing to read
+                continue
+            try:
+                sig.bind(*([None] * arity),
+                                          **{k: None for k in self.KWARGS.get(name, ())})
+            except TypeError as e:
+                self.fail(f"Deps.{name}: {e}")

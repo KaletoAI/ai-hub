@@ -149,7 +149,9 @@ _DU_TIMEOUT_S = 10 * 60         # `du` over the home directory (a venv has 100k 
 # Everything under ~ except the two model roots: what the NEXT disk needs besides models.
 _DU_CMD = "du -sb --exclude=ComfyUI/models --exclude=hf-cache ~ | cut -f1"
 _WATCH_S = 60                   # snapshot watcher / resume retry interval
-_ACCOUNT_S = 600                # price list, snapshot list and foreign instances re-read
+_ACCOUNT_S = 600                # account view re-read: snapshot list and foreign instances
+                                # every 10 min; the price list inside it only hourly
+                                # (`ThunderApi._cached`, `_PRICE_TTL_S`)
 _LONG_RUN_S = 24 * 3600         # phase != off for longer → the cost banner (spec)
 _PENDING_MISSES = 3             # rounds a pending snapshot may be absent from the list
 # An instance counts as gone only when this many CONSECUTIVE fresh lists lack it:
@@ -158,6 +160,8 @@ _PENDING_MISSES = 3             # rounds a pending snapshot may be absent from t
 _ABSENT_CONFIRM = 2
 _ABSENT_RECHECK_S = 5
 _RESUME_PROBE_S = 30            # a freshly started tunnel needs a moment before ComfyUI answers
+# a Start without a token is refused before any call (each would be Thunder's 401)
+_NO_TOKEN = "no Thunder API token set — put it into the backend's API key field"
 _STOP_STEPS = ("draining", "pruning", "snapshotting", "deleting")
 # Phases before any bootstrap ran: the instance holds nothing a snapshot should keep (a
 # template, or an unchanged copy of the snapshot it was restored from).
@@ -168,6 +172,7 @@ _ABORTABLE = ("starting", "restarting ComfyUI", "resuming")
 
 # model sync (spec "Controller": URL transfer, triggers, disk growth; "Stop" 1–2)
 _SYNC_PHASES = ("syncing", "ready")   # the phases a plan is made (and trusted) in
+_LIVE_PHASES = ("starting", "syncing", "ready")   # our instance must be listed then
 _SYNC_POLL_S = 5                # signature check / transfer poll interval
 _SYNC_REFRESH_S = 60            # a re-plan while transfers run, or after a failed sync
 _MAX_FETCH = 3                  # URL transfers at once
@@ -291,8 +296,9 @@ class ThunderApi:
         out = {"index": "" if ident is None else str(ident), "uuid": str(uuid or "")}
         if not out["index"] and not out["uuid"]:
             # the instance may exist and bill anyway — the orphan list is where it shows
-            raise thunder.ThunderError(f"create answered without identifier/uuid: {d}"
-                                       [:_ERR_MAX], None)
+            # the body goes into the log and the fault log: an echoed token must not
+            raise thunder.ThunderError(
+                self._redact(f"create answered without identifier/uuid: {d}")[:_ERR_MAX], None)
         return out
 
     async def delete(self, item: dict) -> None:
@@ -320,8 +326,8 @@ class ThunderApi:
         d = await self._call("POST", "/snapshots/create", {"instanceId": inst, "name": name})
         sid = str((d or {}).get("id") or "") if isinstance(d, dict) else ""
         if not sid:
-            raise thunder.ThunderError(f"snapshot create answered without id: {d}"[:_ERR_MAX],
-                                       None)
+            raise thunder.ThunderError(
+                self._redact(f"snapshot create answered without id: {d}")[:_ERR_MAX], None)
         return sid
 
     async def delete_snapshot(self, sid: str) -> None:
@@ -603,6 +609,14 @@ _DF_CMD = ": gw-df ; df -B1 --output=avail ~ | tail -1"
 # would wait forever, killing it could end ComfyUI.
 _ALIVE_FN = ('_alive() { [ -f "$1" ] && '
              '[ "$(cat /proc/"$(head -n 1 -- "$1")"/comm 2>/dev/null)" = curl ]; }; ')
+# After a fetch spawned its curl: has it got that far? The lock names a CURL (the child
+# wrote its pid and exec'd), or a pid that is already gone (curl ran and ended — the
+# poll reads how). A lock still naming the pre-exec `sh`, an empty lock or none: not
+# yet — a kill in that window would miss the curl (`_KILL_CMD` kills curls only).
+_STARTED_FN = ('_started() { p=$(head -n 1 -- "$1" 2>/dev/null); [ -n "$p" ] || return 1; '
+               '[ -e /proc/"$p" ] || return 0; '
+               '[ "$(cat /proc/"$p"/comm 2>/dev/null)" = curl ]; }; ')
+_START_WAIT = 30                # × 0.1 s: how long a fetch waits for its curl to be up
 # Ends every download of ours: the curl pids named by the lockfiles, TERM, up to 10 s
 # to exit, then KILL (a snapshot must not freeze a growing .part).
 _KILL_CMD = (": gw-kill ; cd ~ && pids=$(find ComfyUI/models hf-cache -type f "
@@ -630,14 +644,23 @@ def _fetch_cmd(rel: str) -> str:
     is lost when ssh closes, and `printf` is a builtin, so no process ever carries the
     config on its command line. `< /dev/stdin` is explicit because a background job's
     stdin is /dev/null otherwise. `setsid`: the curl outlives the ssh session; its pid
-    (`exec`) is what the lockfile holds."""
+    (`exec`) is what the lockfile holds.
+
+    `GW:STARTED` only once the lock names the curl (`_started`): echoed right after the
+    spawn, a stop's `_KILL_CMD` landing before the child wrote its pid and exec'd found
+    no curl to kill, and the download ran on into the snapshot. A stale lock is removed
+    first (`_alive` just said nobody holds it), so the lock that appears is this
+    child's. Not up within ~3 s → `GW:START-FAIL` plus the log tail: a failed attempt."""
     d, base, part, lock, log = _parts(rel)
     q = sshrun.q
     inner = f"echo $$ > {q(lock)}; exec curl -L --fail -sS -C - -o {q(part)} --config -"
-    return (f": gw-fetch {q(rel)} ; {_ALIVE_FN}cd ~ && mkdir -p -- {q(d)} && cd -- {q(d)} && "
-            f"if _alive {q(lock)}; then echo GW:ADOPT; else cfg=$(cat) && "
+    return (f": gw-fetch {q(rel)} ; {_ALIVE_FN}{_STARTED_FN}cd ~ && mkdir -p -- {q(d)} && "
+            f"cd -- {q(d)} && "
+            f"if _alive {q(lock)}; then echo GW:ADOPT; else cfg=$(cat) && rm -f -- {q(lock)} && "
             f"printf '%s\\n' \"$cfg\" | (setsid sh -c {q(inner)} < /dev/stdin > {q(log)} 2>&1 &) "
-            f"&& echo GW:STARTED; fi")
+            f"&& i=0 && while [ $i -lt {_START_WAIT} ] && ! _started {q(lock)}; do sleep 0.1; "
+            f"i=$((i+1)); done; if _started {q(lock)}; then echo GW:STARTED; else "
+            f"echo GW:START-FAIL; tail -c 2000 -- {q(log)} 2>/dev/null; fi; fi")
 
 
 def _poll_cmd(rel: str) -> str:
@@ -719,7 +742,10 @@ _LINK_CMD = (": gw-link ; cd ~ && while IFS= read -r p && IFS= read -r t; do "
 
 def parse_head(text: str) -> Optional[int]:
     """The FINAL response's Content-Length of `curl -sIL` output (one header block per
-    hop), None when that response is no 2xx or names no length."""
+    hop), None when that response is no 2xx or names no length. A 2xx naming length 0
+    is unknown too: no model file is empty, and servers answer a HEAD they do not
+    really serve that way — taken as the size, every download of the file would then
+    fail its size check and its aliases would end up blocked."""
     blocks, cur = [], None
     for ln in (text or "").splitlines():
         ln = ln.strip()
@@ -735,7 +761,7 @@ def parse_head(text: str) -> Optional[int]:
     parts = last["status"].split()
     if len(parts) < 2 or not parts[1].startswith("2"):
         return None
-    return last["len"]
+    return last["len"] or None
 
 
 def parse_index(text: str) -> dict:
@@ -1266,6 +1292,7 @@ class Controller:
         self._tunnel = None
         self._snaps: Optional[list[dict]] = None      # last /snapshots/list, for view()
         self._persist_blocked = False
+        self._persist_error = ""                       # the last failed save ("" = saved)
         self._op: Optional[str] = None                 # start/restart/stop/resume in flight
         self._op_task: Optional[asyncio.Task] = None   # the abortable op's task (Ruling 13)
         self._aborted: Optional[asyncio.Task] = None   # the op task stop() cancelled
@@ -1295,6 +1322,7 @@ class Controller:
         self._sync_error = ""
         self._last_try = 0.0
         self._account_at: Optional[float] = None       # last account refresh (run_forever)
+        self._own_absent = 0                           # account refreshes without our uuid
         self.state = State()
         try:
             loaded = deps.load_state(self.name)
@@ -1386,11 +1414,16 @@ class Controller:
             self._client, self._api = None, None
 
     # persistence / log
-    def _persist(self) -> None:
+    def _persist(self) -> bool:
+        """Save the state. → whether it was saved. A failure is remembered in
+        `_persist_error` (independent of the state, so it survives a state swap and is
+        cleared only by the next good save) and shown on the card: a record that stopped
+        being written is invisible otherwise — until a gateway restart forgets a billing
+        instance."""
         if self._persist_blocked:
             # never overwrite a record we could not read (see _load_failed)
             self._log("state not saved: stored record unread, waiting for reconcile")
-            return
+            return False
         d = asdict(self.state)
         for k in _VOLATILE:
             d.pop(k, None)
@@ -1399,7 +1432,14 @@ class Controller:
         except Exception as e:
             # logged, not raised: a store hiccup must not abort a create half-way and
             # leave the instance running with nobody following it up
+            stamp = time.strftime("%H:%M:%S", time.localtime(self.deps.now()))
+            self._persist_error = f"{stamp} {e!r}"
             self._log(f"state save failed: {e!r}")
+            return False
+        if self._persist_error:
+            self._log("state saved again")
+        self._persist_error = ""
+        return True
 
     def _log(self, msg: str) -> None:
         stamp = time.strftime("%H:%M:%S", time.localtime(self.deps.now()))
@@ -1500,15 +1540,47 @@ class Controller:
         """The account view the console renders from caches only: the price list (1 h
         cache), the snapshot list and the foreign instances. Every call is display only
         and logs its own failure. No token → nothing (a 401 every 10 min says nothing)."""
-        if not str(self.backend.get("api_key") or ""):
+        if not self._token():
             return
         await self.refresh_prices()
         await self.refresh_snapshots()
         # not while an op runs (a start between create and the persisted uuid would list
         # our own instance as foreign) nor on an unreconciled state (resume() owns the
         # orphan list then — it names them as possibly ours)
-        if self._op is None and not self._persist_blocked and not self._resume_pending:
-            await self.orphans()
+        foreign = self._op is None and not self._persist_blocked and not self._resume_pending
+        live = self.state.phase in _LIVE_PHASES and bool(self.state.uuid)
+        items = None
+        if live or foreign:
+            try:
+                items = await self.api.list_instances()
+            except thunder.ThunderError as e:
+                self._log(f"instance list unavailable ({e.status or 'transport'}): {e}")
+        if live and items is not None:
+            self._check_own_listed(items)
+        elif not live:
+            self._own_absent = 0
+        if foreign and items is not None:           # a failed list keeps the last answer
+            await self.orphans(items)
+
+    def _check_own_listed(self, items: list[dict]) -> None:
+        """Our instance must be in the account's list while we think it runs. Absent
+        from `_ABSENT_CONFIRM` consecutive refreshes → logged and a fault, once per
+        disappearance — the phase stays: ending it (snapshot? delete?) is the stop
+        path's call, and one odd list must never make a billing instance look gone."""
+        uuid = self.state.uuid
+        if any(it.get("uuid") == uuid and not thunder.is_gone_status(it.get("status"))
+               for it in items):
+            self._own_absent = 0
+            return
+        self._own_absent += 1
+        if self._own_absent == _ABSENT_CONFIRM:
+            msg = (f"instance {uuid} is no longer listed at Thunder (phase "
+                   f"{self.state.phase}) — deleted outside the gateway? Stop clears it")
+            self._log(msg)
+            try:
+                self.deps.note_fault(self.backend, "lifecycle", "instance_vanished", msg)
+            except Exception as e:
+                self._log(f"fault log unavailable: {e!r}")
 
     def snapshots(self) -> list[dict]:
         """The last `/snapshots/list` answer (a copy; [] before the first)."""
@@ -1579,6 +1651,7 @@ class Controller:
                 "transfers": [dict(v) for _, v in sorted(s.transfers.items())],
                 "plan": self._plan_view(), "ready_aliases": sorted(self.ready_aliases),
                 "sync_error": self._sync_error, "persist_blocked": self._persist_blocked,
+                "persist_error": self._persist_error,
                 "bootstrap_unknown": dict(s.bootstrap_unknown),
                 "bootstrap_template_nodes": list(s.bootstrap_template_nodes),
                 "bootstrap_incomplete": s.bootstrap_incomplete,
@@ -1903,32 +1976,53 @@ class Controller:
             raise RuntimeError(f"already {s.phase}"
                                + (f" (instance {s.uuid or s.index})" if s.uuid or s.index else ""))
         self._commit()
-        if s.unreconciled_uuids:
-            self._op = "starting"          # held across the await: no second start slips in
+        if not self._token():
+            # every Thunder call would be a 401; say what to do instead of showing it
+            raise RuntimeError(_NO_TOKEN)
+        self._abort_note = ""
+        await self._run_op("starting", self._checked_start())
+
+    def _token(self) -> str:
+        return str(self.backend.get("api_key") or "")
+
+    async def _checked_start(self) -> None:
+        """The start op: the unreconciled check INSIDE it, so the op's task exists from
+        the first await on — a stop() landing during the check aborts exactly this task
+        (and nothing is created) instead of finding an op without a task, answering
+        "stop done" and letting the start go on to create an instance. A refusal of the
+        check raises out of start() like the other refusals (and is logged: it arrives
+        after the console already answered "start requested")."""
+        if self.state.unreconciled_uuids:
             try:
                 await self._check_unreconciled()
-            finally:
-                self._op = None
-        self._abort_note = ""
-        await self._run_op("starting", self._start())
+            except RuntimeError as e:
+                self._log(f"start refused: {e}")
+                raise
+        await self._start()
 
     async def _check_unreconciled(self) -> None:
         """Refuse a start while an instance seen next to an unreadable state record is
         still listed: it may be this backend's own, and a start would create a second
-        one (the risk `_load_failed` exists to prevent). Gone ones are forgotten."""
+        one (the risk `_load_failed` exists to prevent). Gone ones are forgotten — but
+        only once `_ABSENT_CONFIRM` consecutive fresh lists all lack them (the
+        `_find_live` rule): one empty answer is not proof, and forgetting on it would
+        let the start create a second instance next to a billing one."""
         s = self.state
-        try:
-            items = await self.api.list_instances()
-        except thunder.ThunderError as e:
-            raise RuntimeError(f"cannot check the unreconciled instances "
-                               f"({', '.join(s.unreconciled_uuids)}): {e}") from e
-        listed = {it.get("uuid") for it in items
-                  if not thunder.is_gone_status(it.get("status"))}
-        still = [u for u in s.unreconciled_uuids if u in listed]
-        if still:
-            raise RuntimeError(f"instance(s) {', '.join(still)} seen while the stored state "
-                               "was unreadable are still running — one may be this "
-                               "backend's: delete them by hand or forget them first")
+        for i in range(_ABSENT_CONFIRM):
+            if i:
+                await self.deps.sleep(_ABSENT_RECHECK_S)
+            try:
+                items = await self.api.list_instances()
+            except thunder.ThunderError as e:
+                raise RuntimeError(f"cannot check the unreconciled instances "
+                                   f"({', '.join(s.unreconciled_uuids)}): {e}") from e
+            listed = {it.get("uuid") for it in items
+                      if not thunder.is_gone_status(it.get("status"))}
+            still = [u for u in s.unreconciled_uuids if u in listed]
+            if still:
+                raise RuntimeError(f"instance(s) {', '.join(still)} seen while the stored "
+                                   "state was unreadable are still running — one may be "
+                                   "this backend's: delete them by hand or forget them first")
         self._log("the unreconciled instances are gone — start allowed again")
         s.unreconciled_uuids = []
         self._persist()
@@ -2056,7 +2150,11 @@ class Controller:
         self._log(f"creating instance: template {template}, disk {disk_gb} GB"
                   + ("" if snap else " (first start: bootstrap follows)"))
         s.created_template, s.create_requested_at = template, self.deps.now()
-        self._persist()
+        if not self._persist():
+            # the POST would make an instance whose record the store never got: a
+            # gateway restart could not find (nor stop) it while it bills
+            raise _PreCreate(f"state could not be saved ({self._persist_error or 'blocked'}) "
+                             "— not creating an instance nobody could find after a restart")
         fut = asyncio.ensure_future(
             self.api.create(thunder.create_body(cfg, template, disk_gb, pub)))
         try:
@@ -2218,6 +2316,10 @@ class Controller:
         if self._op == "stopping":
             raise RuntimeError("already stopping")
         prev_op = self._op
+        if prev_op in _ABORTABLE and self._op_task is None:
+            # an abortable op with no task to cancel: cancelling nothing and answering
+            # "stop done" would let it go on (a start would still create) — refuse
+            raise RuntimeError(f"{prev_op} is checking Thunder — retry in a moment")
         prev = self._op_task if prev_op in _ABORTABLE else None
         if prev is not None and prev.done():
             prev = None
@@ -2720,6 +2822,13 @@ class Controller:
         Refused (RuntimeError, before the first await) without a running instance."""
         if not self._syncing():
             raise RuntimeError(f"no running instance ({self.state.phase})")
+        # a HEAD that failed or named no length is asked again, and so is every URL of a
+        # file that gave up (its size may be what was wrong): once per session otherwise
+        urls = (self._plan_inputs or (None,) * 5)[4] or {}
+        drop = {e.get("url") for p, e in urls.items()
+                if p in self._failed and isinstance(e, dict)}
+        self._head_sizes = {u: n for u, n in self._head_sizes.items()
+                            if n is not None and u not in drop}
         if self._failed:
             self._log(f"sync requested — {len(self._failed)} failed transfer(s) are tried again")
             self._failed.clear()
@@ -3104,6 +3213,10 @@ class Controller:
             return f"start failed: {_errtext(ex)}", False
         if "GW:ADOPT" in out:
             self._log(f"download of {path} still running on the instance — adopted")
+        elif "GW:START-FAIL" in out:
+            tail = _redact(out.split("GW:START-FAIL", 1)[1], token).strip()
+            return ("curl did not start on the instance"
+                    + (f": {tail.splitlines()[-1][:300]}" if tail else "")), False
         elif "GW:STARTED" in out:
             self._log(f"downloading {path}" + (f" (attempt {attempt})" if attempt > 1 else ""))
         else:
@@ -3324,15 +3437,17 @@ class Controller:
 
     # ── orphans ─────────────────────────────────────────────────────────────
 
-    async def orphans(self) -> list[dict]:
+    async def orphans(self, items: Optional[list] = None) -> list[dict]:
         """Instances of this account no controller owns (`deps.known_uuids()`, plus our
         own) — shown with their cost, NEVER deleted: a stranger's instance cannot be
-        told from a lost one of ours. A list error keeps the last answer."""
-        try:
-            items = await self.api.list_instances()
-        except thunder.ThunderError as e:
-            self._log(f"orphan check: instance list unavailable: {e}")
-            return list(self._orphans)
+        told from a lost one of ours. A list error keeps the last answer. `items`: a
+        list the caller has just fetched (None = fetch one)."""
+        if items is None:
+            try:
+                items = await self.api.list_instances()
+            except thunder.ThunderError as e:
+                self._log(f"orphan check: instance list unavailable: {e}")
+                return list(self._orphans)
         known = self._known_uuids()
         if self.state.uuid:
             known.add(self.state.uuid)
@@ -3497,16 +3612,29 @@ class Controller:
             self._unblock_persist()
             self._log("stored state re-read")
             return True
-        try:
-            items = await self.api.list_instances()
-        except thunder.ThunderError as e:
-            self._log(f"resume: instance list unavailable ({e}) — state stays unreconciled")
-            self._resume_pending = True
-            return False
-        self._resume_pending = False
+        # `off` needs "no stranger" to hold over `_ABSENT_CONFIRM` consecutive fresh lists
+        # (the `_find_live` rule): one empty answer reconciled as off would let the next
+        # start create a second instance next to a billing one of ours
         known = self._known_uuids()
-        strangers = [it for it in items if it.get("uuid") not in known
-                     and not thunder.is_gone_status(it.get("status"))]
+        found: dict = {}
+        for i in range(_ABSENT_CONFIRM):
+            if i:
+                self._log("no unowned instance listed — checking again")
+                await self.deps.sleep(_ABSENT_RECHECK_S)
+            try:
+                items = await self.api.list_instances()
+            except thunder.ThunderError as e:
+                self._log(f"resume: instance list unavailable ({e}) — state stays "
+                          "unreconciled")
+                self._resume_pending = True
+                return False
+            for it in items:
+                if it.get("uuid") not in known and not thunder.is_gone_status(it.get("status")):
+                    found.setdefault(str(it.get("uuid") or it.get("index") or len(found)), it)
+            if found:
+                break
+        self._resume_pending = False
+        strangers = list(found.values())
         self._orphans = strangers
         self._unblock_persist()
         s = self.state

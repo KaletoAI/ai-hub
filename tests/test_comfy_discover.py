@@ -16,6 +16,7 @@ import os
 import sys
 import threading
 import unittest
+import unittest.mock
 
 import httpx
 
@@ -71,6 +72,90 @@ class Discover(unittest.TestCase):
         a._stuck_since -= 1000                                       # …long ago
         with self.assertRaises(adapters.ComfyExecutorStuck):
             asyncio.run(a.discover(client))
+
+
+class NoCredentialsToComfy(unittest.TestCase):
+    """A Thunder backend carries the Thunder API TOKEN in its `api_key` (it pays for the
+    instance). ComfyUI behind the tunnel needs no credential — and a token sent there
+    would sit in any log or proxy on the way. Pinned: no request the ComfyUI adapter
+    makes carries `Authorization`/`x-api-key`, even with an `auth_headers` service that
+    would hand one out (the OpenAI adapters' path)."""
+
+    SECRET = "thunder-api-token-sekrit"
+
+    def test_no_request_carries_the_backend_key(self):
+        seen = []
+
+        def handler(request):
+            seen.append((request.method, request.url.path, dict(request.headers)))
+            p = request.url.path
+            if p == "/object_info":
+                return httpx.Response(200, content=json.dumps(_OBJECT_INFO).encode())
+            if p == "/queue":
+                return httpx.Response(200, json={"queue_running": [[0, "p1", {}, {}]],
+                                                 "queue_pending": []})
+            if p == "/prompt":
+                return httpx.Response(200, json={"prompt_id": "p1", "number": 1})
+            if p.startswith("/history/"):
+                return httpx.Response(200, json={})
+            if p == "/upload/image":
+                return httpx.Response(200, json={"name": "m.glb", "subfolder": ""})
+            if p == "/view":
+                return httpx.Response(200, content=b"x")
+            return httpx.Response(200, json={})
+
+        def client():
+            return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        shared = client()
+        ctx = adapters.AdapterContext(
+            auth_headers=lambda b: ({"authorization": f"Bearer {b['api_key']}"}
+                                    if b.get("api_key") else {}),
+            inflight_inc=lambda b: None, inflight_dec=lambda b: None,
+            cost_usd=lambda *a: 0.0, source_of=lambda r: "", record_call=lambda **k: None,
+            log_enabled=lambda: False, http_client=lambda: shared)
+        a = adapters.ComfyUIAdapter(
+            {"name": "tc", "type": "comfyui", "url": "http://127.0.0.1:18188",
+             "api_key": self.SECRET, "poll_interval": 0.01,
+             "thunder": {"gpu_type": "a6000"}}, ctx)
+        req = adapters.NormalizedRequest(
+            alias="a", job_id="job1", upload_prefix="gw_job1",
+            workflow_json={"9": {"class_type": "SaveImage", "inputs": {"images": ["8", 0]}}},
+            node_mapping={"prompt": {"node": "9", "field": "filename_prefix"}})
+        real = httpx.AsyncClient
+
+        async def go():
+            async with client() as c:
+                await a.discover(c)
+                await a._stop_prompt(c, "http://127.0.0.1:18188", "p1")
+            await a.fetch_output("x.png")
+            await a.fetch_output("x.png", want_bytes=False)
+            await a.upload_input(b"glTF", "m.glb")
+            t = asyncio.create_task(a.generate(req))
+            for _ in range(500):
+                await asyncio.sleep(0.01)
+                if any(p.startswith("/history/") for _, p, _ in seen):
+                    break
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+            await shared.aclose()
+
+        with unittest.mock.patch.object(
+                adapters.httpx, "AsyncClient",
+                lambda *a_, **kw: real(transport=httpx.MockTransport(handler),
+                                       **{k: v for k, v in kw.items() if k != "transport"})):
+            asyncio.run(go())
+        paths = {p for _, p, _ in seen}
+        for want in ("/object_info", "/queue", "/interrupt", "/view", "/upload/image",
+                     "/prompt"):
+            self.assertIn(want, paths)
+        self.assertTrue(any(p.startswith("/history/") for p in paths), paths)
+        for method, path, headers in seen:
+            self.assertNotIn("authorization", headers, (method, path))
+            self.assertNotIn("x-api-key", headers, (method, path))
+            self.assertNotIn(self.SECRET, json.dumps(headers), (method, path))
 
 
 if __name__ == "__main__":
