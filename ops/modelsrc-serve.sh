@@ -6,7 +6,7 @@
 # Install (operator, on the share host):
 #   install -m 0755 ops/modelsrc-serve.sh /usr/local/bin/modelsrc-serve
 #   user `modelsrc`, read access to the share (group/ACL); its login shell must be a
-#   real shell (/bin/sh) — sshd runs a forced command THROUGH it, nologin runs nothing.
+#   real shell (/bin/bash) — sshd runs a forced command THROUGH it, nologin runs nothing.
 #   ~modelsrc/.ssh/authorized_keys:
 #     command="/usr/local/bin/modelsrc-serve",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ssh-ed25519 AAAA… ai-hub
 #   Share root: env MODELSRC_ROOT (default /mnt/xfs/shared/comfyui-models); the HF

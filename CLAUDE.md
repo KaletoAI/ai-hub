@@ -1271,8 +1271,9 @@ via injected callables, staying hot-reload-safe.
   FAILED snapshot is never what a start restores. `resume()` after a gateway restart
   reconciles with the list (an interrupted stop runs on, a live instance gets its tunnel
   back, a vanished one is `off` + `instance_vanished`); foreign instances are shown with
-  $/h and NEVER adopted or deleted. `refresh_account()` re-reads prices, snapshots and
-  foreign instances every 10 min; `view()["long_running"]` (> 24 h) drives the card and
+  $/h and NEVER adopted or deleted. `refresh_account()` re-reads snapshots and foreign
+  instances every 10 min (`_ACCOUNT_S`) and the price list hourly (`ThunderApi._cached`,
+  `_PRICE_TTL_S`); `view()["long_running"]` (> 24 h) drives the card and
   Dashboard banner.
   **Model sync** (`sync_once`): the destination index is rebuilt by `find` over both
   roots on EVERY plan (the manifest `~/.gw-modelsync.json` records where a file CAME
