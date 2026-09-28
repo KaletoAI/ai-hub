@@ -52,6 +52,7 @@ try:
     import main
     import admin
     import store
+    import thunderctl
 finally:
     os.chdir(_prev)
     _tmp.cleanup()
@@ -359,6 +360,35 @@ class Panel(_Base):
             self.assertIsNotNone(m, p)
             self.assertIn("data-confirm=", m.group(0), p)
 
+    def test_start_asks_first_and_names_the_bill(self):
+        # a Start rents a GPU by the hour: one stray click must not do that
+        self.views = {"tc": _view(phase="off")}
+        html = self.page()
+        m = re.search(r'<button[^>]*formaction="/ui/thunder/start[^"]*"[^>]*>', html)
+        self.assertIsNotNone(m)
+        conf = re.search(r'data-confirm="([^"]*)"', m.group(0))
+        self.assertIsNotNone(conf, m.group(0))
+        self.assertIn("Start the Thunder instance tc?", conf.group(1))
+        self.assertIn("bills per hour until you stop it", conf.group(1))
+
+    def test_persist_error_is_on_the_card(self):
+        self.views = {"tc": _view(phase="ready", uuid="u1",
+                                  persist_error="12:00:00 OSError('disk <full>')")}
+        html = self.page()
+        self.assertIn('data-k="thunder-tc-persist"', html)
+        self.assertIn("State not saved", html)
+        self.assertIn("disk &lt;full&gt;", html)
+        self.views = {"tc": _view(phase="ready", uuid="u1", persist_error="")}
+        self.assertNotIn("State not saved", self.page())
+
+    def test_infinite_numbers_do_not_break_the_tab(self):
+        # int(inf) is an OverflowError, not a ValueError
+        self.assertEqual(admin._nbytes(float("inf")), 0)
+        self.assertEqual(admin._hms(float("inf")), "0m 00s")
+        self.views = {"tc": _view(phase="ready", uuid="u1", uptime_s=float("inf"),
+                                  bootstrap_unknown={"a.bin": float("inf")})}
+        self.assertIn("a.bin", self.page())
+
     def test_forget_only_with_unreconciled_uuids(self):
         self.views = {"tc": _view(phase="off")}
         self.assertNotIn("/ui/thunder/forget", self.page())
@@ -444,9 +474,17 @@ class Panel(_Base):
         self.assertIn("ComfyUI-Manager", html)
         self.assertIn("orph-1", html)
         self.assertIn("line 119", html)
-        self.assertIn("line 70", html)
-        self.assertNotIn("line 69\n", html)             # last 50 lines only
+        self.assertIn("line 0\n", html)                 # the whole ring (200 lines)
         self.assertRegex(html, r"<details[^>]*>\s*<summary>[^<]*log")
+
+    def test_card_log_shows_the_whole_ring(self):
+        log = [f"line {i}" for i in range(thunderctl._LOG_MAX + 30)]
+        self.views = {"tc": _view(log=log)}
+        html = self.page()
+        self.assertEqual(admin._THUNDER_LOG_LINES, thunderctl._LOG_MAX)
+        self.assertIn(f"log (last {thunderctl._LOG_MAX} lines)", html)
+        self.assertIn("line 30\n", html)
+        self.assertNotIn("line 29\n", html)
 
     def test_card_rows_are_keyed_and_add_no_script(self):
         self.views = {"tc": _view(phase="ready", orphans=[{"uuid": "o1", "status": "RUNNING"}],

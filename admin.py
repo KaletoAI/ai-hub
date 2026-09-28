@@ -3036,7 +3036,7 @@ async def backend_enable(request: Request):
 
 # ── Thunder Compute: lifecycle panel + actions ──────────────────────────────────
 
-_THUNDER_LOG_LINES = 50
+_THUNDER_LOG_LINES = 200                     # = thunderctl._LOG_MAX: the whole ring
 _THUNDER_PHASE_KIND = {"off": "muted", "ready": "ok", "failed": "bad", "draining": "warn",
                        "pruning": "warn", "snapshotting": "warn", "deleting": "warn"}
 
@@ -3068,7 +3068,7 @@ def _nbytes(v) -> int:
     """A byte count from the controller's report — 0 for anything that is not one."""
     try:
         return max(0, int(v or 0))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):     # OverflowError: int(inf)
         return 0
 
 
@@ -3275,6 +3275,10 @@ def _thunder_card(name: str, v: dict, cfg: Optional[dict]) -> str:
     if v.get("persist_blocked"):
         rows.append(f'<p class="bad" data-k="{_esc(k)}-blocked">State record unreadable — '
                     "start/stop are refused until it is reconciled (see the log).</p>")
+    if v.get("persist_error"):
+        rows.append(f'<p class="bad" data-k="{_esc(k)}-persist">State not saved: '
+                    f"{_esc(v['persist_error'])} — a gateway restart would not know this "
+                    "instance; a Start stops before the create while saving fails.</p>")
     if v.get("waiting_jobs") is not None and (phase == "draining" or op):
         n = _nbytes(v.get("waiting_jobs"))
         rows.append(f'<p class="hint" data-k="{_esc(k)}-drain">Draining — waiting for '
@@ -3353,6 +3357,8 @@ def _thunder_card(name: str, v: dict, cfg: Optional[dict]) -> str:
     if not op and (phase == "off" or (phase == "failed" and not v.get("uuid")
                                       and not v.get("index"))):
         acts += _btn("Start", f"/ui/thunder/start?name={q}", sm=True,
+                     confirm=f"Start the Thunder instance {name}? It bills per hour until "
+                             "you stop it.",
                      title="Create the instance (from the last snapshot) — it bills from now on")
     if phase != "off" or op:
         acts += _btn("Stop", f"/ui/thunder/stop?name={q}", "danger", sm=True,
