@@ -44,17 +44,23 @@ The model sync (`sync_once`, spec "Controller"): the destination index is rebuil
 where a file CAME from, never that it exists), `modelsync.plan` decides, and
 `plan`/`ready_aliases` are written there and nowhere else — routing (Task 12) asks
 `is_alias_ready`, which is False before the first plan and outside `syncing|ready`. What
-only the controller knows joins an alias's `blocked` list: no LAN source yet ("waiting
-for LAN source (not configured)"), a transfer that gave up after three attempts with
+only the controller knows joins an alias's `blocked` list: a LAN source that is not
+usable ("waiting for LAN source (not configured)" without a pinned host key, "(unreachable:
+…)" when its last `list` failed), a transfer that gave up after three attempts with
 backoff (also a fault), a disk that cannot grow enough. A HEAD learns a URL file's size
 first (disk sizing, the size check). URL files download ON the instance (≤ 3 curls,
 `setsid`, a lockfile holding the curl's pid, options incl. the Hugging Face token — only
 for a Hugging Face host — on stdin, never argv), and a live lockfile is ADOPTED after a
-gateway restart, never answered with a second curl on the same `.part`. Files leave the
-disk only at stop (`_before_snapshot`): the plan's `prune` list, never `held` or
-`unknown` ones — those go only by the operator's `delete_unknown`. Triggers: the start
-path, a 5-s signature poll in `run_forever`, a re-plan when a transfer ends and every 60 s
-while transfers run. A stop cancels and awaits every sync task (`_cancel_sync_tasks`) and
+gateway restart, never answered with a second curl on the same `.part`. LAN files
+(`LanSource`, the share behind `ops/modelsrc-serve.sh`, pinned host key) stream THROUGH the
+gateway — exactly one stream per backend (`deps.pipe`: the share's `cat <rel> <offset>`
+into `cat >> <rel>.part` on the instance), resumed from the `.part`'s size, verified by
+sha256 on both sides; the HF cache's snapshot symlinks are recreated (`_make_links`) and
+recorded like files. Files leave the disk only at stop (`_before_snapshot`): the plan's
+`prune` list, never `held` or `unknown` ones — those go only by the operator's
+`delete_unknown`. Triggers: the start path, a 5-s signature poll in `run_forever` (plus
+a changed LAN source: a pin, a new listing, a source gone or back), a re-plan when a
+transfer ends and every 60 s while transfers run. A stop cancels and awaits every sync task (`_cancel_sync_tasks`) and
 a sync re-checks the phase after planning: a plan about an instance on its way out never
 grows its disk or replaces the manifest the snapshot records.
 
@@ -70,8 +76,10 @@ uuid cannot) — to verify live. Covered by test_thunder_controller.py.
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 import dataclasses
+import hashlib
 import json
 import math
 import os
@@ -176,6 +184,18 @@ _MANIFEST = ".gw-modelsync.json"
 _ROOT_MAP = (("models/", "ComfyUI/models/"), ("hf-cache/", "hf-cache/"))
 _LAN_WAIT = "waiting for LAN source (not configured)"
 _NOT_IN_SOURCE = "not in source: "
+# the LAN model share (spec "Quell-Runner (LAN)", "Übertragung LAN")
+MODELSRC_HOST_DEFAULT = "modelsrc@192.168.8.24"
+# = main._VOICE_HOST_RE (pinned by a test): `[user@]host` of plain characters — no
+# leading `-`, no spaces or quotes; it reaches an ssh argv (after `--`, but still)
+_SRC_HOST_RE = re.compile(r"^(?:[A-Za-z0-9_][A-Za-z0-9._-]*@)?[A-Za-z0-9_][A-Za-z0-9._-]*$")
+_SRC_TTL_S = 600                # the source index is re-listed after 10 min …
+_SRC_RETRY_S = 60               # … a failed list after one
+_SRC_LIST_TIMEOUT_S = 300       # one `find` pass over ~1 TB of models
+_SRC_SHA_TIMEOUT_S = 30 * 60    # sha256 of a 20 GB file on the share
+_KEYSCAN_TIMEOUT_S = 30
+_LAN_IDLE_S = 120               # a LAN stream moving no byte this long is ended
+_FLOCK_BUSY = 75                # rc of `flock -n -E 75`: another stream still appends
 
 
 # ── Thunder REST client ──────────────────────────────────────────────────────
@@ -452,6 +472,10 @@ class Deps:
     source_index: Callable[[], dict] = field(default=lambda: {})
     url_catalog: Callable[[], dict] = field(default=lambda: {})
     hf_token: Callable[[], str] = field(default=lambda: "")
+    # the LAN model share (P3): `LanSource` (main: one per gateway; its `cached` is
+    # `source_index`) and the stream runner. None = no LAN source.
+    lan: Optional[Any] = None
+    pipe: Callable[..., Awaitable[tuple]] = sshrun.pipe
 
 
 # ── bootstrap output ─────────────────────────────────────────────────────────
@@ -562,8 +586,11 @@ def plan_path(remote: str) -> Optional[str]:
     return None
 
 
+# files as `<path>\t<size>`, symlinks as `L\t<path>\t<target text>`: the HF cache's
+# snapshots/ are links, and a present one must not be re-created (or look missing)
 _INDEX_CMD = (": gw-index ; cd ~ && find ComfyUI/models hf-cache -type f "
-              "-printf '%p\\t%s\\n' 2>/dev/null ; echo GW:END")
+              "-printf '%p\\t%s\\n' -o -type l -printf 'L\\t%p\\t%l\\n' 2>/dev/null ; "
+              "echo GW:END")
 _MANIFEST_READ = f": gw-manifest ; cat ~/{_MANIFEST} 2>/dev/null || echo {{}}"
 # atomic: a dropped connection leaves the old manifest, never half a new one
 _MANIFEST_WRITE = (f": gw-manifest-write ; cd ~ && cat > {_MANIFEST}.tmp && "
@@ -662,6 +689,32 @@ def _head_cmd(rel: str) -> str:
             "curl -sIL --config -")
 
 
+def _part_size_cmd(rel: str) -> str:
+    """The size of `rel`'s `.part` (0 when there is none): where a LAN stream resumes."""
+    part = remote_path(rel) + ".part"
+    return (f": gw-part {sshrun.q(rel)} ; cd ~ && stat -c %s -- {sshrun.q(part)} "
+            "2>/dev/null || echo 0")
+
+
+def _lan_recv_cmd(rel: str) -> str:
+    """The instance end of a LAN stream: append stdin to `rel`'s `.part`. `flock -n` on
+    the `.part.lock`: a second appender (a stream an earlier gateway process left
+    running) would interleave bytes — this one exits 75 instead, having written
+    nothing. The lock holds no pid, so the URL path's `_alive` never adopts it."""
+    d, base, part, lock, log = _parts(rel)
+    q = sshrun.q
+    return (f": gw-lan-recv {q(rel)} ; cd ~ && mkdir -p -- {q(d)} && cd -- {q(d)} && "
+            f"exec flock -n -E {_FLOCK_BUSY} -- {q(lock)} cat >> {q(part)}")
+
+
+# Symlinks (the HF cache's snapshots/) from stdin, two lines each: the path under the
+# home, then the target text — on stdin, not argv: a repo has hundreds of them and one
+# argument is capped at 128 KiB. Neither can hold a newline (safe_rel / modelsync).
+_LINK_CMD = (": gw-link ; cd ~ && while IFS= read -r p && IFS= read -r t; do "
+             "mkdir -p -- \"${p%/*}\" && ln -sfn -- \"$t\" \"$p\" || exit 1; done; "
+             "echo GW:LINKED")
+
+
 def parse_head(text: str) -> Optional[int]:
     """The FINAL response's Content-Length of `curl -sIL` output (one header block per
     hop), None when that response is no 2xx or names no length."""
@@ -684,15 +737,22 @@ def parse_head(text: str) -> Optional[int]:
 
 
 def parse_index(text: str) -> dict:
-    """`find -printf '%p\\t%s\\n'` (root-relative) → `{plan path: bytes}`. Paths outside
-    the roots or with a dot segment are skipped (the HF cache's `.locks`, a `.git`).
-    Without the end marker the listing was cut off — a RuntimeError, never a shorter
-    index: a file missing from it is downloaded again from zero."""
+    """`find -printf '%p\\t%s\\n'` (root-relative) → `{plan path: bytes}`, and a symlink
+    line `L\\t<path>\\t<target>` → `{plan path: {"link": target}}` (modelsync's form).
+    Paths outside the roots or with a dot segment are skipped (the HF cache's `.locks`, a
+    `.git`). Without the end marker the listing was cut off — a RuntimeError, never a
+    shorter index: a file missing from it is downloaded again from zero."""
     lines = (text or "").splitlines()
     if "GW:END" not in lines:
         raise RuntimeError("model index incomplete (no end marker)")
     out: dict = {}
     for ln in lines[:lines.index("GW:END")]:
+        f = ln.split("\t")
+        if len(f) == 3 and f[0] == "L":
+            key = plan_path(f[1])
+            if key is not None and f[2]:
+                out[key] = {"link": f[2]}
+            continue
         path, sep, size = ln.rpartition("\t")
         if not sep or not size.isdigit():
             continue
@@ -741,6 +801,343 @@ def curl_config(url: str, token: str, head: bool = False) -> str:
     return "\n".join(lines) + "\n"
 
 
+# ── the LAN model share ──────────────────────────────────────────────────────
+# Mapping (ledger note for Tasks 14/15): the share root IS the models tree, with the
+# Hugging Face cache as `hf-cache/` inside it. Plan `models/<x>` ↔ share `<x>` for every
+# `<x>` not under `hf-cache/`; plan `hf-cache/<y>` ↔ share `hf-cache/<y>`.
+
+def share_rel(path: str) -> str:
+    """A plan path → its path on the model share (ValueError outside the mapping —
+    `models/hf-cache/…` would name the share's HF cache, which is `hf-cache/…`)."""
+    path = sshrun.safe_rel(path)
+    if path.endswith("/"):
+        raise ValueError(f"directory, not a file: {path!r}")
+    if path.startswith("hf-cache/") and len(path) > len("hf-cache/"):
+        return path
+    if path.startswith("models/"):
+        x = path[len("models/"):]
+        if x and x != "hf-cache" and not x.startswith("hf-cache/"):
+            return x
+    raise ValueError(f"no model-share path for {path!r}")
+
+
+def plan_of_share(rel: str) -> Optional[str]:
+    """The inverse of `share_rel` (None for anything unsafe or unmapped)."""
+    try:
+        rel = sshrun.safe_rel(rel)
+    except ValueError:
+        return None
+    if rel.endswith("/") or rel == "hf-cache":
+        return None
+    return rel if rel.startswith("hf-cache/") else "models/" + rel
+
+
+def parse_source_list(text: str) -> dict:
+    """`modelsrc-serve list` (`F\t<rel>\t<size>` / `L\t<rel>\t<target>`, share paths) →
+    the plan-path index modelsync reads: `{path: size}` and `{path: {"link": target}}`.
+    A link whose target leaves its root is dropped HERE, in share space: a share link
+    `vae/x → ../hf-cache/hub/…` looks like a `models/` path once mapped, but its target
+    sits in the other root, which is not beside it on the instance. Unparseable lines
+    are skipped (the script never writes one; the caller judges completeness by rc)."""
+    out: dict = {}
+    for ln in (text or "").split("\n"):
+        f = ln.split("\t")
+        if len(f) != 3:
+            continue
+        kind, rel, val = f
+        key = plan_of_share(rel)
+        if key is None:
+            continue
+        if kind == "F" and re.fullmatch(r"[0-9]{1,18}", val):
+            out[key] = int(val)
+        elif kind == "L":
+            tgt = modelsync.resolve_link(rel, val)
+            if (tgt is None or plan_of_share(tgt) is None
+                    or tgt.startswith("hf-cache/") != rel.startswith("hf-cache/")):
+                continue
+            out[key] = {"link": val}
+    return out
+
+
+def host_key_fingerprint(b64: str) -> str:
+    """OpenSSH's `SHA256:…` fingerprint of a public key blob (what `ssh-keygen -lf` and
+    the first-connect prompt print), so the operator can compare it on the share host."""
+    blob = base64.b64decode(b64, validate=True)
+    return "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
+
+
+def parse_keyscan(text: str, hostname: str) -> Optional[str]:
+    """The `<host> ssh-ed25519 <key>` line of `ssh-keyscan` output for `hostname` (a
+    known_hosts line as-is), None when there is none or its key is no valid base64."""
+    for ln in (text or "").splitlines():
+        parts = ln.split()
+        if len(parts) < 3 or parts[0] != hostname or parts[1] != "ssh-ed25519":
+            continue
+        try:
+            host_key_fingerprint(parts[2])
+        except ValueError:
+            continue
+        return f"{parts[0]} ssh-ed25519 {parts[2]}"
+    return None
+
+
+class LanSource:
+    """The LAN model share behind `ops/modelsrc-serve.sh` (spec "Quell-Runner (LAN)"),
+    ONE per gateway — every Thunder controller reads the same share. It holds what
+    guards the transfers from it:
+
+    - **the host key is pinned.** `StrictHostKeyChecking=yes` against
+      `<datadir>/modelsrc-known_hosts`, which exists only after the operator compared
+      the fingerprint `scan()` fetched and confirmed it (`pin`). Without it there is no
+      LAN source at all (`configured()` False): an accept-new first connect would trust
+      whatever answers on the LAN and hand it nothing less than the model traffic.
+    - **a failed `list` is no empty source.** Exit status 1 is "list incomplete", 255
+      an ssh failure — judged by rc, never by stderr (the share host's setlocale noise).
+      The last good listing is KEPT and the failure becomes `problem()`: LAN transfers
+      wait, files already synced stay verified.
+    - **the index is cached** (10 min, a failed list is retried after 1), `invalidate()`d
+      by every instance start and by "Sync now"; `generation` changes whenever the index
+      or the problem does, which is how a controller notices a re-plan is due.
+    - **sha256 is cached per (path, size)** — a 20 GB file is hashed on the share once.
+
+    `ssh`/`keygen`/`now` are injected (tests); nothing here imports `main`."""
+
+    def __init__(self, datadir: str, host: Callable[[], str], ssh=sshrun.run,
+                 keygen=sshrun.keygen, now: Callable[[], float] = time.time,
+                 log: Callable[[str], None] = _default_log):
+        self.datadir = datadir
+        self._host_fn = host
+        self._ssh = ssh
+        self._keygen = keygen
+        self._now = now
+        self._logf = log
+        self._index: Optional[dict] = None     # last GOOD listing (plan paths)
+        self._listed_at = 0.0
+        self._tried_at = 0.0
+        self._error = ""
+        self._gen = 0
+        self._lock = asyncio.Lock()
+        self._key_lock = asyncio.Lock()
+        self._key_ready = False
+        self._sha: dict = {}
+        self._scanned: Optional[tuple] = None   # (host, known_hosts line, fingerprint)
+
+    def _log(self, msg: str) -> None:
+        try:
+            self._logf(f"[modelsrc] {msg}")
+        except Exception:
+            pass
+
+    @property
+    def key_path(self) -> str:
+        return os.path.join(self.datadir, "modelsrc.key")
+
+    @property
+    def known_hosts_path(self) -> str:
+        return os.path.join(self.datadir, "modelsrc-known_hosts")
+
+    def raw_host(self) -> str:
+        try:
+            return str(self._host_fn() or "").strip()
+        except Exception:
+            return ""
+
+    def host(self) -> str:
+        """The `[user@]host`, or "" when the setting is not a plain one."""
+        h = self.raw_host()
+        return h if _SRC_HOST_RE.match(h) else ""
+
+    def pinned(self) -> bool:
+        try:
+            return os.path.getsize(self.known_hosts_path) > 0
+        except OSError:
+            return False
+
+    def configured(self) -> bool:
+        return bool(self.host()) and self.pinned()
+
+    def problem(self) -> str:
+        """Why LAN transfers wait ("" = they may run) — the text inside "waiting for LAN
+        source (…)"."""
+        raw = self.raw_host()
+        if raw and not self.host():
+            return f"not configured: modelsrc_host {raw!r} is not a plain [user@]host"
+        if not self.host() or not self.pinned():
+            return "not configured"
+        if self._error:
+            return self._error
+        if self._index is None:
+            return "not listed yet"
+        return ""
+
+    def usable(self) -> bool:
+        return self.problem() == ""
+
+    @property
+    def generation(self) -> int:
+        return self._gen
+
+    def cached(self) -> dict:
+        """The last good listing (a copy) — {} while not configured."""
+        return dict(self._index or {}) if self.configured() else {}
+
+    def invalidate(self) -> None:
+        self._tried_at = 0.0
+
+    def stale(self) -> bool:
+        if not self.configured():
+            return False
+        if not self._tried_at:
+            return True
+        age = self._now() - self._tried_at
+        return age >= (_SRC_RETRY_S if self._error else _SRC_TTL_S)
+
+    def _argv(self, *words) -> list[str]:
+        host = self.host()
+        if not host:
+            raise ValueError(f"LAN source {self.problem()}")
+        return sshrun.ssh_base(self.key_path, self.known_hosts_path, strict="yes") + [
+            "--", host, " ".join(sshrun.q(w) for w in words)]
+
+    def cat_argv(self, path: str, offset: int) -> list[str]:
+        return self._argv("cat", share_rel(path), str(int(offset)))
+
+    async def ensure_key(self) -> str:
+        """The public key of `modelsrc.key`, generated at first need (serialised: two
+        controllers booting at once must not race two ssh-keygens onto one file)."""
+        async with self._key_lock:
+            pub = await self._keygen(self.key_path)
+            self._key_ready = True
+            return pub
+
+    async def refresh(self, force: bool = False) -> None:
+        """List the share when the cache is stale (or `force`). Never raises: a failure
+        is `problem()`, and the last good listing stays."""
+        if not self.configured() or (not force and not self.stale()):
+            return
+        async with self._lock:
+            if not force and not self.stale():
+                return                          # another controller just listed
+            before = (self._error, self._index)
+            self._tried_at = self._now()
+            try:
+                if not self._key_ready:
+                    await self.ensure_key()
+                rc, out, err = await self._ssh(self._argv("list"), timeout=_SRC_LIST_TIMEOUT_S)
+            except Exception as e:
+                rc, out, err = -1, b"", _errtext(e).encode()
+            if rc == 0:
+                self._index = parse_source_list((out or b"").decode("utf-8", "replace"))
+                self._listed_at = self._tried_at
+                if self._error:
+                    self._log("reachable again")
+                self._error = ""
+            else:
+                last = " | ".join(_tail(err, 2)) or f"rc {rc}"
+                what = ("unreachable" if rc in (255, 124, -1)
+                        else "list incomplete" if rc == 1 else f"list failed (rc {rc})")
+                err_text = f"{what}: {last}"[:300]
+                if err_text != self._error:
+                    self._log(f"list failed (rc {rc}) — keeping the last good listing: {last}")
+                self._error = err_text
+            if (self._error, self._index) != before:
+                self._gen += 1
+
+    async def sha256(self, path: str, size: int) -> str:
+        key = (path, size)
+        if key in self._sha:
+            return self._sha[key]
+        rc, out, err = await self._ssh(self._argv("sha256", share_rel(path)),
+                                       timeout=_SRC_SHA_TIMEOUT_S)
+        if rc != 0:
+            raise RuntimeError(f"source sha256 failed (rc {rc}): "
+                               + (" | ".join(_tail(err, 2)) or "no message"))
+        hexd = (out or b"").decode("utf-8", "replace").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", hexd):
+            raise RuntimeError(f"source sha256 answered {hexd[:40]!r}")
+        self._sha[key] = hexd
+        return hexd
+
+    def forget_sha(self, path: str, size: int) -> None:
+        """A mismatch: the share's file may have changed at the same size."""
+        self._sha.pop((path, size), None)
+
+    # host-key pin (the console's "Fetch host key" / "Confirm fingerprint")
+    async def scan(self) -> str:
+        """`ssh-keyscan -t ed25519` the host → its fingerprint. The key line is kept in
+        memory only; nothing trusts it until `pin` is given the same fingerprint."""
+        host = self.host()
+        if not host:
+            raise ValueError(f"LAN source {self.problem()}")
+        name = host.rsplit("@", 1)[-1]
+        rc, out, err = await self._ssh(["ssh-keyscan", "-t", "ed25519", "--", name],
+                                       timeout=_KEYSCAN_TIMEOUT_S)
+        line = parse_keyscan((out or b"").decode("utf-8", "replace"), name) if rc == 0 else None
+        if line is None:
+            raise RuntimeError(f"no ed25519 host key from {name} (rc {rc})"
+                               + (": " + " | ".join(_tail(err, 2)) if err else ""))
+        fp = host_key_fingerprint(line.split()[2])
+        self._scanned = (host, line, fp)
+        self._log(f"host key of {name} fetched: {fp} (not trusted until confirmed)")
+        return fp
+
+    def scanned_fingerprint(self) -> str:
+        sc = self._scanned
+        return sc[2] if sc is not None and sc[0] == self.host() else ""
+
+    def pin(self, fingerprint: str) -> str:
+        """Trust the scanned key: write its line to `modelsrc-known_hosts` (0600,
+        atomically). `fingerprint` is the one the operator confirmed — a key scanned
+        again in between (a different answer) is refused, never pinned unseen."""
+        host = self.host()
+        sc = self._scanned
+        if not host or sc is None or sc[0] != host:
+            raise ValueError(f"no host key fetched for {host or '?'} — fetch it first")
+        if fingerprint != sc[2]:
+            raise ValueError("the fetched host key is not the one confirmed — fetch it again "
+                             "and compare")
+        path = self.known_hosts_path
+        tmp = path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, (sc[1] + "\n").encode())
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+        self._scanned = None
+        self._error = ""
+        self.invalidate()
+        self._gen += 1
+        self._log(f"host key of {host} pinned: {sc[2]}")
+        return sc[2]
+
+    def pinned_fingerprint(self) -> str:
+        try:
+            with open(self.known_hosts_path, encoding="utf-8") as f:
+                parts = f.readline().split()
+            return host_key_fingerprint(parts[2]) if len(parts) >= 3 else ""
+        except (OSError, ValueError):
+            return ""
+
+    def public_key(self) -> str:
+        try:
+            with open(self.key_path + ".pub", encoding="utf-8") as f:
+                return f.read().strip()
+        except OSError:
+            return ""
+
+    def view(self) -> dict:
+        """The console's LAN block (no I/O beyond two small file reads)."""
+        idx = self._index or {}
+        links = sum(1 for v in idx.values() if modelsync.link_of(v) is not None)
+        return {"host": self.raw_host(), "host_ok": bool(self.host()), "pinned": self.pinned(),
+                "pinned_fp": self.pinned_fingerprint() if self.pinned() else "",
+                "scanned_fp": self.scanned_fingerprint(), "public_key": self.public_key(),
+                "problem": self.problem(), "files": len(idx) - links, "links": links,
+                "listed_at": self._listed_at, "error": self._error}
+
+
 def _gb(n) -> str:
     return f"{(n or 0) / 1024 ** 3:.1f}"
 
@@ -785,6 +1182,8 @@ class Controller:
         self._sync_lock = asyncio.Lock()
         self._manifest_lock = asyncio.Lock()
         self._fetches: dict[str, asyncio.Task] = {}    # plan path → its transfer task
+        self._lan_path: Optional[str] = None           # the ONE LAN stream's plan path
+        self._lan_gen: Optional[int] = None            # LanSource.generation the plan saw
         self._failed: dict[str, str] = {}              # plan path → why it gave up
         self._kicker: Optional[asyncio.Task] = None    # re-plan after a finished transfer
         self._syncs: set = set()                       # running sync_once bodies (stop cancels)
@@ -1459,6 +1858,7 @@ class Controller:
             # spec "Start" 6: the first plan before `ready`; aliases go live one by one
             # as their files arrive (`ready_aliases`), `ready` is the INSTANCE's state
             self._set_phase("syncing")
+            self._invalidate_source()           # every start lists the share afresh
             await self.sync_once()
             self._ready()
         except Exception as e:
@@ -1650,6 +2050,7 @@ class Controller:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._fetches.clear()
+        self._lan_path = None
 
     def _current_manifest(self) -> dict:
         """The model manifest the snapshot carries (`manifests[sid]`): the one
@@ -2011,9 +2412,20 @@ class Controller:
             return f"thunder instance is {self.state.phase}"
         return modelsync.status_text(self.plan, alias, self.name)
 
-    def _lan_configured(self) -> bool:
-        """P2 has no LAN source (Task 15 adds it)."""
-        return False
+    def _lan_ok(self) -> bool:
+        """LAN transfers may run: a pinned, reachable source with a good listing."""
+        lan = self.deps.lan
+        return lan is not None and lan.usable()
+
+    def _lan_wait(self) -> str:
+        """"waiting for LAN source (<why>)" — not configured, unreachable, …"""
+        lan = self.deps.lan
+        why = lan.problem() if lan is not None else ""
+        return f"waiting for LAN source ({why or 'not configured'})"
+
+    def _invalidate_source(self) -> None:
+        if self.deps.lan is not None:
+            self.deps.lan.invalidate()
 
     async def _signature(self) -> str:
         return str(await asyncio.to_thread(self.deps.alias_signature, self.name))
@@ -2030,7 +2442,12 @@ class Controller:
             self._sync_fail(f"alias signature unavailable: {_errtext(e)}")
             return
         due = self.deps.now() - self._last_try >= _SYNC_REFRESH_S
-        if sig != self._sig and (not self._sync_error or due):
+        lan = self.deps.lan
+        if lan is not None and lan.stale():
+            await lan.refresh()             # at most every 10 min (1 after a failure)
+        # a pin, a new listing or a source that went away/came back changes what waits
+        lan_moved = lan is not None and lan.generation != self._lan_gen
+        if (sig != self._sig or lan_moved) and (not self._sync_error or due):
             await self.sync_once()
         elif self._dirty and (self._kicker is None or self._kicker.done()):
             self._dirty = False
@@ -2110,7 +2527,7 @@ class Controller:
         and session; a HEAD that fails or names no length stays unknown), then re-plan
         with what was learned — without a second index/manifest read."""
         todo = [e for e in self._fetchable(plan)
-                if e["size"] is None and e["url"] not in self._head_sizes
+                if e["source"] == "url" and e["size"] is None and e["url"] not in self._head_sizes
                 and e["path"] not in self._fetches]
         if not todo:
             return plan
@@ -2163,6 +2580,7 @@ class Controller:
         if self._failed:
             self._log(f"sync requested — {len(self._failed)} failed transfer(s) are tried again")
             self._failed.clear()
+        self._invalidate_source()           # the share is listed again, now
         await self.sync_once()
 
     def _syncing(self) -> bool:
@@ -2178,6 +2596,10 @@ class Controller:
                 if self._sig is not None and sig != self._sig and self._failed:
                     self._log("aliases or catalog changed — failed transfers are tried again")
                     self._failed.clear()
+                lan = self.deps.lan
+                if lan is not None:
+                    await lan.refresh()
+                    self._lan_gen = lan.generation
                 plan, man = await self._compute_plan()
                 if self._syncing():
                     plan = await self._learn_sizes(plan)
@@ -2189,6 +2611,7 @@ class Controller:
                 # instance on its way out — it must not touch the manifest or the disk
                 return
             self._manifest = man
+            plan = await self._make_links(plan)
             try:
                 go, disk = await self._fit_disk(plan)
             except Exception as e:
@@ -2208,20 +2631,24 @@ class Controller:
                 self._start_fetches(go)
 
     def _stuck_aliases(self, plan: dict) -> set:
-        """Aliases a URL download cannot make ready this session: a file only the LAN
-        has (P2: no LAN source), or a transfer that gave up."""
+        """Aliases a transfer cannot make ready now: a file only the LAN has while the
+        LAN source is not usable (not pinned, unreachable), or a transfer that gave up.
+        Once the source is usable, a LAN file no longer withholds its alias's URL files
+        (Ruling 18)."""
+        lan_ok = self._lan_ok()
         stuck: set = set()
         for e in plan["fetch"]:
-            if (e["source"] != "url" and not self._lan_configured()) or e["path"] in self._failed:
+            if (e["source"] == "lan" and not lan_ok) or e["path"] in self._failed:
                 stuck.update(e["aliases"])
         return stuck
 
     def _fetchable(self, plan: dict) -> list:
-        """The URL fetch entries worth transferring: not given up, and needed by at
-        least one alias the download can make ready (modelsync's rule for blocked
-        aliases, extended to the LAN-only and failed ones)."""
+        """The URL and LAN fetch entries worth transferring: not given up, and needed by
+        at least one alias a transfer can make ready (modelsync's rule for blocked
+        aliases, extended to the LAN-waiting and failed ones). Links are no transfer —
+        `_make_links` creates them."""
         stuck = self._stuck_aliases(plan)
-        return [e for e in plan["fetch"] if e["source"] == "url"
+        return [e for e in plan["fetch"] if e["source"] in ("url", "lan")
                 and e["path"] not in self._failed and set(e["aliases"]) - stuck]
 
     def _reserve_bytes(self) -> int:
@@ -2325,15 +2752,16 @@ class Controller:
         configured)"), a transfer gave up, the disk is too small."""
         p = copy.deepcopy(plan)
         rows = p["per_alias"]
-        lan = self._lan_configured()
+        lan = self._lan_ok()
+        wait = self._lan_wait()
         for row in rows.values():
-            row["blocked"] = [f"{_LAN_WAIT}: {b[len(_NOT_IN_SOURCE):]}"
+            row["blocked"] = [f"{wait}: {b[len(_NOT_IN_SOURCE):]}"
                               if not lan and b.startswith(_NOT_IN_SOURCE) else b
                               for b in row["blocked"]]
         for e in p["fetch"]:
             extra = ""
-            if e["source"] != "url" and not lan:
-                extra = f"{_LAN_WAIT}: {e['path']}"
+            if e["source"] == "lan" and not lan:
+                extra = f"{wait}: {e['path']}"
             elif e["path"] in self._failed:
                 extra = f"transfer failed: {e['path']}: {self._failed[e['path']]}"
             for a in e["aliases"] if extra else ():
@@ -2378,15 +2806,69 @@ class Controller:
             "unknown": [list(u) for u in p["unknown"]],
             "need_total": p["need_total"], "have_total": p["have_total"]}
 
+    async def _make_links(self, plan: dict) -> dict:
+        """Create the plan's missing symlinks (the HF cache's snapshots/, modelsync
+        `source: "link"`) in ONE command, record them in the manifest (a link is pruned
+        like a file) and re-plan with them present. Only for aliases a transfer can make
+        ready — without a LAN source an HF repo's links would just dangle. A failure is
+        logged and retried with the next plan; the plan is returned unchanged."""
+        stuck = self._stuck_aliases(plan)
+        todo = [e for e in plan["fetch"] if e["source"] == "link" and set(e["aliases"]) - stuck]
+        lines, entries = [], {}
+        now = int(self.deps.now())
+        for e in todo:
+            path, t = e["path"], e.get("target")
+            try:
+                rp = remote_path(path)
+            except ValueError as ex:
+                self._log(f"link {path} skipped: {ex}")
+                continue
+            if modelsync.link_target(path, t) is None:
+                self._log(f"link {path} skipped: target {t!r} leaves its root")
+                continue
+            lines.append(f"{rp}\n{t}\n")
+            entries[path] = {"size": 0, "source": "link", "target": t,
+                             "aliases": sorted(e["aliases"]), "ts": now}
+        if not entries:
+            return plan
+        # recorded BEFORE the ln (the `_finish` rule): a cancel between the links and the
+        # manifest write must not leave them unrecorded ("unknown" next session)
+        self._unsaved.update(entries)
+        try:
+            out = await self._exec_ok(_LINK_CMD, stdin="".join(lines).encode("utf-8"),
+                                      timeout=120)
+            if "GW:LINKED" not in out:
+                raise RuntimeError("links not confirmed by the instance")
+        except Exception as ex:
+            for path, ent in entries.items():
+                if self._unsaved.get(path) is ent:
+                    del self._unsaved[path]
+            self._log(f"creating {len(entries)} model link(s) failed: {_errtext(ex)}")
+            return plan
+        await self._manifest_add_many(entries)
+        self._log(f"linked {len(entries)} model file link(s)")
+        needs, src, dest, man, urls = self._plan_inputs
+        dest = dict(dest, **{p: {"link": e["target"]} for p, e in entries.items()})
+        man = dict(man, **copy.deepcopy(entries))
+        self._plan_inputs = (needs, src, dest, man, urls)
+        return modelsync.plan(needs, self._with_head_sizes(src, urls), dest, man, urls)
+
     # URL transfers ─────────────────────────────────────────────────────────
 
     def _start_fetches(self, entries: list) -> None:
+        """Up to `_MAX_FETCH` URL downloads (they run ON the instance) and exactly ONE LAN
+        stream (it runs through the gateway, and the uplink is the bottleneck)."""
         for e in entries:
-            if len(self._fetches) >= _MAX_FETCH:
-                return
-            if e["path"] in self._fetches:
+            path = e["path"]
+            if path in self._fetches:
                 continue
-            self._fetches[e["path"]] = asyncio.ensure_future(self._fetch(dict(e)))
+            if e["source"] == "lan":
+                if self._lan_path is not None and self._lan_path in self._fetches:
+                    continue
+                self._lan_path = path
+            elif sum(1 for p in self._fetches if p != self._lan_path) >= _MAX_FETCH:
+                continue
+            self._fetches[path] = asyncio.ensure_future(self._fetch(dict(e)))
 
     def _kick_sync(self) -> None:
         """Re-plan soon (a transfer ended): readiness and the next download start
@@ -2432,13 +2914,16 @@ class Controller:
         a fault is logged. Always re-plans at the end (the alias may be ready now)."""
         path = e["path"]
         me = asyncio.current_task()
+        lan = e.get("source") == "lan"
+        attempt_fn, what = ((self._lan_attempt, "LAN transfer") if lan
+                            else (self._fetch_attempt, "download"))
         why = ""
         try:
             for attempt in range(1, _FETCH_ATTEMPTS + 1):
-                why, final = await self._fetch_attempt(e, attempt)
+                why, final = await attempt_fn(e, attempt)
                 if not why:
                     break
-                self._log(f"download {path} attempt {attempt}/{_FETCH_ATTEMPTS} failed: {why}")
+                self._log(f"{what} {path} attempt {attempt}/{_FETCH_ATTEMPTS} failed: {why}")
                 if final:
                     break
                 if attempt < _FETCH_ATTEMPTS:
@@ -2452,6 +2937,8 @@ class Controller:
         finally:
             if self._fetches.get(path) is me:
                 del self._fetches[path]
+            if self._lan_path == path:
+                self._lan_path = None
             self.state.transfers.pop(path, None)
         self._kick_sync()
 
@@ -2541,7 +3028,7 @@ class Controller:
             except Exception as ex:
                 self._log(f"discarding {path}.part failed: {_errtext(ex)}")
             return bad, False
-        entry = {"size": size, "sha256": sha or None, "source": "url",
+        entry = {"size": size, "sha256": sha or None, "source": e.get("source") or "url",
                  "aliases": sorted(e.get("aliases") or []), "ts": int(self.deps.now())}
         # recorded BEFORE the mv: a cancel (stop) between the mv and the manifest write
         # would otherwise leave a finished file without its entry — "unknown" next
@@ -2555,15 +3042,93 @@ class Controller:
             return f"moving the download into place failed: {_errtext(ex)}", False
         final = int(out) if out.isdigit() else size
         await self._manifest_add(path, dict(entry, size=final))
-        self._log(f"downloaded {path} ({_gb(final)} GB)")
+        self._log(f"{'transferred' if entry['source'] == 'lan' else 'downloaded'} {path} "
+                  f"({_gb(final)} GB)")
         return "", False
 
+    async def _lan_attempt(self, e: dict, attempt: int) -> tuple[str, bool]:
+        """One LAN transfer attempt (spec "Übertragung LAN"): resume at the size of the
+        instance's `.part`, stream the share's `cat <rel> <offset>` into `cat >> .part`
+        through the gateway (`deps.pipe`: two ssh processes, nothing stored on the
+        gateway), then sha256 on BOTH sides — the source's cached per (path, size) —
+        before `_finish` moves it in place. A short `.part` is kept (the next attempt
+        resumes it), a long one or a sha mismatch is discarded. → ("" | why, final)."""
+        path, want = e["path"], e.get("size")
+        lan = self.deps.lan
+        if lan is None or not lan.usable():
+            return f"LAN source unavailable ({lan.problem() if lan else 'not configured'})", False
+        try:
+            _parts(path)
+            lan.cat_argv(path, 0)
+        except ValueError as ex:
+            return f"invalid path: {ex}", True
+        try:
+            out = (await self._exec_ok(_part_size_cmd(path))).strip()
+        except Exception as ex:
+            return f"resume offset unknown: {_errtext(ex)}", False
+        offset = int(out) if re.fullmatch(r"[0-9]{1,18}", out) else 0
+        if want is not None and offset > want:
+            self._log(f"{path}.part is larger than the source file — starting over")
+            try:
+                await self._exec_ok(_discard_cmd(path))
+            except Exception as ex:
+                return f"discarding an oversized .part failed: {_errtext(ex)}", False
+            offset = 0
+        row = self.state.transfers[path] = {
+            "file": path, "source": "lan", "bytes": offset, "total": want,
+            "rate": None, "eta": None, "attempt": attempt}
+        if want is None or offset < want:
+            self._log(f"LAN transfer {path}" + (f" from byte {offset}" if offset else "")
+                      + (f" (attempt {attempt})" if attempt > 1 else ""))
+            t0, moved = self.deps.now(), [0]
+
+            def on_bytes(n: int) -> None:
+                moved[0] += n
+                row["bytes"] = offset + moved[0]
+                dt = self.deps.now() - t0
+                if dt > 0:
+                    row["rate"] = moved[0] / dt
+                    row["eta"] = ((want - row["bytes"]) / row["rate"]
+                                  if want and row["rate"] else None)
+            rc_s, rc_d, tail = await self.deps.pipe(
+                lan.cat_argv(path, offset), self._ssh_argv(_lan_recv_cmd(path)), on_bytes,
+                timeout_idle=_LAN_IDLE_S)
+            if rc_s != 0 or rc_d != 0:
+                why = ("another stream still appends to the .part" if rc_d == _FLOCK_BUSY
+                       else f"stream failed (source rc {rc_s}, instance rc {rc_d})")
+                return why + (f": {tail[-300:]}" if tail else ""), False
+        try:
+            out = (await self._exec_ok(_part_size_cmd(path))).strip()
+        except Exception as ex:
+            return f"size check failed: {_errtext(ex)}", False
+        size = int(out) if re.fullmatch(r"[0-9]{1,18}", out) else 0
+        row["bytes"] = size
+        if want is not None and size < want:
+            return f"stream ended at {size} of {want} bytes", False     # resumed next attempt
+        if want is not None and size > want:
+            try:
+                await self._exec_ok(_discard_cmd(path))
+            except Exception as ex:
+                self._log(f"discarding {path}.part failed: {_errtext(ex)}")
+            return f"size {size} ≠ {want} expected", False
+        try:
+            src_sha = await lan.sha256(path, size)
+        except Exception as ex:
+            return f"source sha256 unavailable: {_errtext(ex)}", False
+        why, final = await self._finish(dict(e, sha256=src_sha), size)
+        if why.startswith("sha256 mismatch"):
+            lan.forget_sha(path, size)      # the share's file may have changed in place
+        return why, final
+
     async def _manifest_add(self, path: str, entry: dict) -> None:
-        """Record a finished file (read-modify-write, serialised). A failed write keeps
-        the entry in memory (`_unsaved`) — plans and the next write include it; without
-        it the file would count as not present and be downloaded again."""
+        await self._manifest_add_many({path: entry})
+
+    async def _manifest_add_many(self, entries: dict) -> None:
+        """Record finished files/links (read-modify-write, serialised). A failed write
+        keeps the entries in memory (`_unsaved`) — plans and the next write include them;
+        without them a file would count as not present and be transferred again."""
         async with self._manifest_lock:
-            self._unsaved[path] = entry
+            self._unsaved.update(entries)
             try:
                 man = await self._read_manifest()
                 man.update(copy.deepcopy(self._unsaved))

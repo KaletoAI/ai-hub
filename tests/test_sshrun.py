@@ -235,6 +235,85 @@ class Run(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.01)
         self.fail("condition not reached")
 
+    # ── pipe (the LAN stream: source `cat` → instance `cat >> .part`) ──────────
+
+    def _spawner(self, procs):
+        async def spawn(*argv, **kw):
+            p = await asyncio.create_subprocess_exec(*argv, **kw)
+            procs.append(p)
+            return p
+        return spawn
+
+    def _assert_reaped(self, procs):
+        self.assertEqual(len(procs), 2)
+        for p in procs:
+            self.assertIsNotNone(p.returncode)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(p.pid, 0)
+
+    async def test_pipe_copies_and_counts(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = os.path.join(d, "out")
+            seen = []
+            rc_s, rc_d, tail = await sshrun.pipe(["sh", "-c", "printf abc"],
+                                                 ["sh", "-c", f"cat >> {f}"], seen.append)
+            self.assertEqual((rc_s, rc_d, tail), (0, 0, ""))
+            with open(f, "rb") as fh:
+                self.assertEqual(fh.read(), b"abc")
+            self.assertEqual(sum(seen), 3)
+
+    async def test_pipe_big_stream_in_chunks(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = os.path.join(d, "out")
+            seen = []
+            rc_s, rc_d, _ = await sshrun.pipe(
+                ["sh", "-c", "head -c 3000000 /dev/zero"], ["sh", "-c", f"cat > {f}"],
+                seen.append)
+            self.assertEqual((rc_s, rc_d), (0, 0))
+            self.assertEqual(os.path.getsize(f), 3_000_000)
+            self.assertEqual(sum(seen), 3_000_000)
+            self.assertTrue(all(n <= 1 << 20 for n in seen))
+
+    async def test_pipe_idle_timeout_kills_both(self):
+        procs = []
+        rc_s, rc_d, tail = await sshrun.pipe(["sleep", "30"], ["sh", "-c", "cat > /dev/null"],
+                                             lambda n: None, timeout_idle=0.2,
+                                             spawn=self._spawner(procs))
+        self.assertEqual((rc_s, rc_d), (124, 124))
+        self.assertIn("no data", tail)
+        self._assert_reaped(procs)
+
+    async def test_pipe_cancel_leaves_no_orphans(self):
+        procs, seen = [], []
+        t = asyncio.ensure_future(sshrun.pipe(
+            ["sh", "-c", "printf a; exec sleep 30"], ["sh", "-c", "exec cat > /dev/null"],
+            seen.append, spawn=self._spawner(procs)))
+        await self._until(lambda: seen)
+        t.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await t
+        self._assert_reaped(procs)
+
+    async def test_pipe_destination_dying_ends_the_source(self):
+        # the instance side failed (mkdir, a full disk): the source must not be left
+        # writing into a pipe nobody reads
+        procs = []
+        rc_s, rc_d, tail = await asyncio.wait_for(sshrun.pipe(
+            ["yes"], ["sh", "-c", "echo nope >&2; exit 3"], lambda n: None,
+            spawn=self._spawner(procs)), 10)
+        self.assertEqual(rc_d, 3)
+        self.assertNotEqual(rc_s, 0)
+        self.assertIn("nope", tail)
+        self._assert_reaped(procs)
+
+    async def test_pipe_source_failure_and_stderr_tail(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = os.path.join(d, "out")
+            rc_s, rc_d, tail = await sshrun.pipe(["sh", "-c", "echo boom >&2; exit 2"],
+                                                 ["sh", "-c", f"cat >> {f}"], lambda n: None)
+        self.assertEqual((rc_s, rc_d), (2, 0))
+        self.assertIn("source: boom", tail)
+
     async def test_keygen(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "k.key")

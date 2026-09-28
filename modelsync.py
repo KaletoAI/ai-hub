@@ -51,6 +51,10 @@ here guards a failure that looks like a working sync:
   BLOCKED alias fetches nothing (it cannot become ready) but HOLDS the manifest files
   recorded for it (`held`, never pruned) until the block is fixed. An alias is ready only with nothing missing and nothing blocking it; an empty reference
   set without an explicit alias entry is blocked, never "complete".
+- **Symlinks are part of the plan** (the Hugging Face cache's `snapshots/` — see
+  `resolve_link`): a catalog directory syncs its links with its files, but only a link
+  that stays in its root and points at a file the same alias syncs — one that would
+  dangle on the instance is dropped, never "present".
 
 Pure: stdlib only (plus `sshrun.safe_rel`, itself pure), no `main`/`adapters` imports,
 no I/O, no module-level config. Covered by tests/test_modelsync.py.
@@ -509,6 +513,73 @@ def expand_dir(prefix: str, source_index: dict) -> dict:
     return {prefix: idx[prefix]} if prefix in idx and _usable(prefix) else {}
 
 
+# --- symlinks (the Hugging Face cache) ----------------------------------------------------
+# An HF cache repo is `blobs/<sha>` FILES plus `snapshots/<rev>/<name>` SYMLINKS onto them
+# (and `refs/<branch>` files). The loader opens the snapshot path: a synced repo without
+# its links is a cache it cannot read — it downloads again or fails, while the plan said
+# "ready". Links are therefore part of the plan: an index value `{"link": "<target>"}`
+# (the source's `L` lines, the destination's `find -type l`) is a link, every other value
+# a file size. A link is synced only where it cannot dangle or leave its root: its target
+# text is `../`* then plain segments, it resolves inside the SAME root (`models/…` and
+# `hf-cache/…` do not sit side by side on the instance), and the target is a file the
+# same alias syncs. It is recreated with its stored text, recorded in the manifest
+# (`source: "link"`, `target`), and pruned like a file.
+
+
+def link_of(value):
+    """The target text of an index value that is a link (`{"link": …}`), else None."""
+    if isinstance(value, dict) and isinstance(value.get("link"), str):
+        return value["link"]
+    return None
+
+
+def resolve_link(path: str, target: str):
+    """The path a relative link at `path` names, lexically: `target` must be `../`*
+    followed by plain segments (no leading `/`, no `.`/`..` after a plain segment, no
+    dot segments, no empty segments — the grammar the model share's `list` guarantees)
+    and must not climb above the tree `path` is relative to. None otherwise."""
+    if not isinstance(target, str) or not target or not isinstance(path, str):
+        return None
+    if target.startswith("/") or "\\" in target or any(ord(c) < 32 or ord(c) == 127 for c in target):
+        return None
+    segs = target.split("/")
+    up = 0
+    while up < len(segs) and segs[up] == "..":
+        up += 1
+    rest = segs[up:]
+    if not rest or any(s == "" or s.startswith(".") for s in rest):
+        return None
+    base = path.split("/")[:-1]
+    if up > len(base):
+        return None
+    return "/".join(base[:len(base) - up] + rest)
+
+
+def _root_of(p: str) -> str:
+    return next((r for r in ROOTS if p.startswith(r)), "")
+
+
+def link_target(path: str, target: str):
+    """The plan path a syncable link points at (both usable, same root), else None."""
+    if not _usable(path):
+        return None
+    got = resolve_link(path, target)
+    if got is None or not _usable(got) or _root_of(got) != _root_of(path):
+        return None
+    return got
+
+
+def expand_links(prefix: str, links: dict) -> dict:
+    """`expand_dir` for the links of an index (`{path: target}`)."""
+    try:
+        safe_rel(prefix)
+    except ValueError:
+        return {}
+    if prefix.endswith("/"):
+        return {k: t for k, t in links.items() if k.startswith(prefix) and _usable(k)}
+    return {prefix: links[prefix]} if prefix in links and _usable(prefix) else {}
+
+
 
 # --- the plan ---------------------------------------------------------------------------
 
@@ -600,14 +671,26 @@ def plan(needs, source_index: dict, dest_index: dict, manifest: dict, url_catalo
     one the stop prunes. Its size is the source's, else the manifest's; a URL file never
     downloaded has size None until the manifest records one. Deterministic; the inputs
     are not modified."""
-    src = {k: v for k, v in (source_index or {}).items() if _usable(k) and not _is_part(k)}
+    src_all = {k: v for k, v in (source_index or {}).items() if _usable(k) and not _is_part(k)}
+    src = {k: v for k, v in src_all.items() if link_of(v) is None}
     urls = {k: v for k, v in (url_catalog or {}).items()
             if _usable(k) and not _is_part(k) and isinstance(v, dict) and v.get("url")}
     man = {k: v for k, v in (manifest or {}).items() if _usable(k) and not _is_part(k)}
-    dest = dest_index or {}
-    # the resolution index: every path we could name, the source's size where it has one
-    index = {k: None for k in list(urls) + list(man)}
+    man_links = {k: v["target"] for k, v in man.items() if isinstance(v, dict)
+                 and v.get("source") == "link" and isinstance(v.get("target"), str)}
+    # links: the manifest's (verified while the source is down), then the source's; a
+    # path the source lists as a FILE is a file
+    links = {k: t for k, t in man_links.items() if k not in src}
+    links.update({k: link_of(v) for k, v in src_all.items() if link_of(v) is not None})
+    links = {k: t for k, t in links.items() if link_target(k, t) is not None}
+    dest_all = dest_index or {}
+    dest = {k: v for k, v in dest_all.items() if link_of(v) is None}
+    dest_links = {k: link_of(v) for k, v in dest_all.items() if link_of(v) is not None}
+    # the resolution index: every FILE we could name, the source's size where it has one
+    index = {k: None for k in list(urls) + [k for k in man if k not in man_links]}
     index.update(src)
+    for k in links:
+        index.pop(k, None)
 
     def size_of(p):
         return src[p] if p in src else _msize(man.get(p))
@@ -618,6 +701,7 @@ def plan(needs, source_index: dict, dest_index: dict, manifest: dict, url_catalo
     per_alias: dict = {}
     wanted: dict = {}                       # unblocked alias -> [path] it must fetch
     needed: set = set()
+    link_to: dict = {}                      # link path -> target text (every alias's)
     for n in _merge_needs(needs):
         files: dict = {}
         blocked: list = []
@@ -637,20 +721,34 @@ def plan(needs, source_index: dict, dest_index: dict, manifest: dict, url_catalo
                 blocked.append(f"unknown hub model {r.value} — add a catalog entry")
             else:
                 blocked.append(f"not in source: {r.value}")
+        cand_links: dict = {}
         for cp in n.catalog:
             err = _root_path_error(cp, True)
             if err:
                 blocked.append(f"invalid catalog path: {err}")
                 continue
             got = expand_dir(cp, index)
-            if not got:
+            lk = expand_links(cp, links)
+            if not got and not lk:
                 blocked.append(f"not in source: {cp}")
             for p in got:
                 files.setdefault(p, (None, None))
+            if cp in lk:                    # one file named by a link: its target too
+                tgt = link_target(cp, lk[cp])
+                if tgt in index:
+                    files.setdefault(tgt, (None, None))
+            cand_links.update(lk)
+        # a link only where it cannot dangle: onto a file THIS alias syncs
+        mine = {p: t for p, t in cand_links.items() if link_target(p, t) in files}
         rows = [{"path": p, "size": size_of(p), "node": files[p][0], "cls": files[p][1],
                  "present": present(p, size_of(p))} for p in sorted(files)]
+        rows += [{"path": p, "size": 0, "node": None, "cls": None,
+                  "present": dest_links.get(p) == t, "link": t} for p, t in sorted(mine.items())]
+        rows.sort(key=lambda f: f["path"])
+        link_to.update(mine)
         missing = [f["path"] for f in rows if not f["present"]]
-        blocked += [f"not in source: {p}" for p in missing if p not in urls and p not in src]
+        blocked += [f"not in source: {p}" for p in missing
+                    if p not in urls and p not in src and p not in mine]
         hints: list = []
         if not rows and not blocked and not n.explicit:
             if loose:
@@ -663,6 +761,7 @@ def plan(needs, source_index: dict, dest_index: dict, manifest: dict, url_catalo
             hints = sorted({f"{r.cls}={r.value} is not synced — add a catalog entry if it "
                             f"needs weights" for r in loose})
         needed.update(files)
+        needed.update(mine)
         if not blocked:
             wanted[n.alias] = missing
         per_alias[n.alias] = {
@@ -683,6 +782,11 @@ def plan(needs, source_index: dict, dest_index: dict, manifest: dict, url_catalo
         for p in sorted(wanted[a], key=lambda p: (size_of(p) is None, -(size_of(p) or 0), p)):
             if p in by_path:
                 by_path[p]["aliases"].append(a)
+                continue
+            if p in link_to:
+                e = {"path": p, "size": 0, "source": "link", "target": link_to[p], "aliases": [a]}
+                by_path[p] = e
+                fetch.append(e)
                 continue
             e = {"path": p, "size": size_of(p), "source": "url" if p in urls else "lan"}
             if p in urls:
@@ -709,14 +813,17 @@ def plan(needs, source_index: dict, dest_index: dict, manifest: dict, url_catalo
         else:
             prune.append(p)
 
-    sizes = {p: size_of(p) for p in needed}
+    sizes = {p: size_of(p) for p in needed if p not in link_to}
+    unknown = [[p, s] for p, s in dest.items()
+               if _usable(p) and not _is_part(p) and p not in man and p not in needed]
+    unknown += [[p, 0] for p in dest_links
+                if _usable(p) and p not in man and p not in needed and p not in dest]
     return {
         "per_alias": per_alias,
         "fetch": fetch,
         "prune": prune,
         "held": held,
-        "unknown": sorted([p, s] for p, s in dest.items()
-                          if _usable(p) and not _is_part(p) and p not in man and p not in needed),
+        "unknown": sorted(unknown),
         "need_total": sum(s or 0 for s in sizes.values()),
         "have_total": sum(s or 0 for p, s in sizes.items() if present(p, s)),
     }

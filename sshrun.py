@@ -1,5 +1,6 @@
 """System-`ssh` plumbing for the Thunder Compute backend: argv builders, the remote
-path guard, a one-shot async runner, the supervised tunnel and the key generator.
+path guard, a one-shot async runner, a two-process stream, the supervised tunnel and the
+key generator.
 
 Why system `ssh` and not asyncssh/paramiko: no new dependency, and OpenSSH already
 does everything the controller needs (a `-L` forward that dies loudly with
@@ -21,9 +22,14 @@ per instance). What this module guards is the part that fails SILENTLY or danger
   on `stop()` ends and REAPS its process: an orphaned `ssh -N` keeps the local port
   bound, and the next tunnel then exits at once on `ExitOnForwardFailure`.
 
+- **the LAN stream.** `pipe` copies one process's stdout into another's stdin (the
+  share's `cat` into the instance's `cat >> .part`) chunk by chunk, and ends BOTH on an
+  idle timeout, on a destination that died, and on cancellation — a source left writing
+  into a pipe nobody reads hangs forever, and an ssh left behind keeps its session.
+
 The builders, `safe_rel`, `q` and `next_backoff` are pure (no `main`/`adapters`
-imports, no I/O at import, no module-level config); `run`, `Supervisor` and `keygen`
-spawn processes and are injected into the controller. Covered by test_sshrun.py.
+imports, no I/O at import, no module-level config); `run`, `pipe`, `Supervisor` and
+`keygen` spawn processes and are injected into the controller. Covered by test_sshrun.py.
 """
 from __future__ import annotations
 
@@ -37,6 +43,7 @@ from typing import Callable, Optional
 STABLE_S = 60                   # a tunnel that lived this long resets the backoff
 _STDERR_TAIL = 2048             # bytes of a dead tunnel's stderr kept for the log
 _TERM_GRACE_S = 5               # terminate → kill after this many seconds
+_PIPE_CHUNK = 1 << 20           # bytes per read of a LAN stream (one chunk in memory)
 
 
 # ── argv builders (pure) ─────────────────────────────────────────────────────
@@ -171,6 +178,126 @@ async def run(argv: list[str], stdin: Optional[bytes] = None,
         await p.wait()
         raise
     return p.returncode, out, err
+
+
+async def _kill(p) -> None:
+    """SIGKILL `p` by pid and reap it (None = never spawned). Its stdin is closed too: a
+    child of `p` that inherited it would otherwise wait for input forever. asyncio's
+    `wait()` also waits for the process's PIPES to close, which such a child can hold
+    open — so the wait is bounded; the process itself is dead and its rc is known."""
+    if p is None:
+        return
+    _signal(p, signal.SIGKILL)
+    if p.stdin is not None:
+        try:
+            p.stdin.close()
+        except Exception:
+            pass
+    try:
+        await asyncio.wait_for(p.wait(), _TERM_GRACE_S)
+    except asyncio.TimeoutError:
+        pass
+
+
+async def pipe(src_argv: list[str], dst_argv: list[str], on_bytes: Callable[[int], None],
+               timeout_idle: float = 120, spawn=None) -> tuple[int, int, str]:
+    """Stream `src`'s stdout into `dst`'s stdin in chunks of at most `_PIPE_CHUNK` bytes,
+    calling `on_bytes(n)` per chunk — the LAN transfer (source `cat` → instance
+    `cat >> .part`), with nothing buffered on the gateway beyond one chunk. → (rc src,
+    rc dst, stderr tail of both).
+
+    Three ends, and every one leaves no process behind:
+    - `timeout_idle` seconds without a byte moving (a read OR a write stalled): both are
+      killed, rc (124, 124) — timeout(1)'s code, as in `run`;
+    - the destination dies early (it cannot write the `.part`): the source is killed
+      rather than left blocking on a pipe nobody reads, which would hang forever;
+    - the caller is cancelled (a stop): both are killed and reaped, then the cancel
+      propagates.
+    Processes are ended by pid (`_signal`), never `p.kill()` — see `_signal`."""
+    spawn = spawn or asyncio.create_subprocess_exec
+    tails = [b"", b""]
+    src = dst = None
+    readers: list = []
+
+    async def drain_err(i, p):
+        # read stderr continuously: a full stderr pipe would stall ssh itself
+        while True:
+            chunk = await p.stderr.read(4096)
+            if not chunk:
+                return
+            tails[i] = (tails[i] + chunk)[-_STDERR_TAIL:]
+
+    def tail(extra: str = "") -> str:
+        parts = [f"{who}: {t.decode('utf-8', 'replace').strip()}"
+                 for who, t in (("source", tails[0]), ("destination", tails[1])) if t.strip()]
+        return " | ".join(parts + ([extra] if extra else []))
+
+    async def settle_readers():
+        if readers:
+            await asyncio.wait(readers, timeout=_TERM_GRACE_S)
+            for r in readers:
+                r.cancel()
+            await asyncio.gather(*readers, return_exceptions=True)
+
+    try:
+        src = await spawn(*src_argv, stdin=asyncio.subprocess.DEVNULL,
+                          stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        dst = await spawn(*dst_argv, stdin=asyncio.subprocess.PIPE,
+                          stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+        readers = [asyncio.ensure_future(drain_err(0, src)),
+                   asyncio.ensure_future(drain_err(1, dst))]
+        idle = broken = False
+        while True:
+            try:
+                chunk = await asyncio.wait_for(src.stdout.read(_PIPE_CHUNK), timeout_idle)
+            except asyncio.TimeoutError:
+                idle = True
+                break
+            if not chunk:
+                break
+            if dst.stdin.is_closing():
+                broken = True
+                break
+            try:
+                dst.stdin.write(chunk)
+                await asyncio.wait_for(dst.stdin.drain(), timeout_idle)
+            except asyncio.TimeoutError:
+                idle = True
+                break
+            except ConnectionError:         # BrokenPipe / reset: the destination is gone
+                broken = True
+                break
+            try:
+                on_bytes(len(chunk))
+            except Exception:
+                pass                        # a broken counter must not break the stream
+        if idle:
+            await _kill(src)
+            await _kill(dst)
+            await settle_readers()
+            return 124, 124, tail(f"no data for {timeout_idle:g}s")
+        if broken:
+            await _kill(src)                # it would block on a pipe nobody reads
+        else:
+            try:
+                dst.stdin.close()
+            except Exception:
+                pass
+        rcs = []
+        for p in (src, dst):
+            try:
+                rcs.append(await asyncio.wait_for(p.wait(), timeout_idle))
+            except asyncio.TimeoutError:
+                await _kill(p)
+                rcs.append(124)
+        await settle_readers()
+        return rcs[0], rcs[1], tail()
+    except BaseException:
+        await _kill(src)
+        await _kill(dst)
+        for r in readers:
+            r.cancel()
+        raise
 
 
 class _Run:

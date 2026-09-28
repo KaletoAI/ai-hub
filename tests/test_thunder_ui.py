@@ -21,7 +21,10 @@ Every one of these fails SILENTLY:
     hold, a catalog the validator refuses is a 400 with the text as typed and nothing
     saved (a partial save drops the refused entry silently), the seed is copied into
     the setting once and never again, and a Thunder-only alias says why its schema is
-    empty.
+    empty;
+  · the LAN source (Task 15): its host key is pinned only by a POST that carries the
+    fingerprint the operator saw (a GET, or a key fetched again in between, pins
+    nothing), and the install command gives the share user a real login shell.
 
 Run: python -m unittest tests.test_thunder_ui -v
 """
@@ -844,6 +847,126 @@ class FaultSources(unittest.TestCase):
     def test_lifecycle_and_sync_are_named(self):
         self.assertIn("lifecycle", admin._FAULT_SOURCE)
         self.assertIn("sync", admin._FAULT_SOURCE)
+
+
+
+_ED_B64 = "AAAAC3NzaC1lZDI1NTE5AAAAIHm4E0tb6VPU5qn5zKm6c1tJ4HQ1Pdu6Wf7k6o7V3tJ2"
+
+
+class LanSourcePanel(Actions):
+    """Task 15: the LAN model source's block and its host-key pin. A pin written by a GET
+    (a prefetch), or one that trusts a key the operator never saw, is a man in the
+    middle of every model transfer; an install command with a nologin shell runs
+    nothing on the share host and every list then fails as "unreachable"."""
+
+    def setUp(self):
+        super().setUp()
+        import thunderctl
+        self.live = [{"name": "tc", "type": "comfyui", "url": "http://127.0.0.1:18188",
+                      "enabled": True, "healthy": True, "models": 0, "source": "ui",
+                      "thunder": {"gpu_type": "a6000"}}]
+        self.views = {"tc": _view(phase="ready", uuid="u1")}
+        self.d = tempfile.TemporaryDirectory()
+        self.addCleanup(self.d.cleanup)
+        self.scans = []
+
+        async def ssh(argv, stdin=None, timeout=60):
+            self.scans.append(list(argv))
+            return (0, f"192.168.8.24 ssh-ed25519 {_ED_B64}\n".encode(), b"")
+        self.lan = thunderctl.LanSource(self.d.name, host=lambda: "modelsrc@192.168.8.24",
+                                        ssh=ssh)
+        with open(self.lan.key_path + ".pub", "w") as f:
+            f.write("ssh-ed25519 AAAAgatewaykey ai-hub\n")
+        saved = (main.jobs_cfg, main._modelsrc_obj)
+        self.addCleanup(lambda: (setattr(main, "jobs_cfg", saved[0]),
+                                 setattr(main, "_modelsrc_obj", saved[1])))
+        main.jobs_cfg = dict(main.jobs_cfg, store_path=os.path.join(self.d.name, "store.db"))
+        main._modelsrc_obj = self.lan
+        for k, v in {"_thunder_modelsrc_view": main.modelsrc_view,
+                     "_thunder_modelsrc_scan": main.modelsrc_scan,
+                     "_thunder_modelsrc_pin": main.modelsrc_pin}.items():
+            self.addCleanup(setattr, admin, k, getattr(admin, k))
+            setattr(admin, k, v)
+        self.fp = thunderctl.host_key_fingerprint(_ED_B64)
+
+    def block(self) -> str:
+        m = re.search(r'<div class="tcard" data-k="thunder-modelsrc">.*?</div></div>',
+                      self.page(), re.S)
+        self.assertIsNotNone(m)
+        return m.group(0)
+
+    def post(self, path, **data):
+        r = self.c.post(path, data=data, headers=SAME, follow_redirects=False)
+        self.assertEqual(r.status_code, 303)
+        return parse_qs(urlparse(r.headers["location"]).query)["msg"][0]
+
+    def test_not_set_up_shows_key_and_install_command(self):
+        b = self.block()
+        self.assertIn("LAN source: not set up", b)
+        self.assertIn("ssh-ed25519 AAAAgatewaykey ai-hub", b)
+        self.assertIn("--shell /bin/bash modelsrc", b)
+        self.assertNotIn("nologin", b)
+        self.assertIn("command=&quot;/usr/local/bin/modelsrc-serve&quot;,no-port-forwarding,"
+                      "no-X11-forwarding,no-agent-forwarding,no-pty ssh-ed25519 AAAAgatewaykey", b)
+        self.assertRegex(b, r'formaction="/ui/thunder/modelsrc-scan"')
+        self.assertNotIn("modelsrc-pin", b)               # nothing fetched: nothing to confirm
+        self.assertNotRegex(b, r'<a[^>]*href="/ui/thunder/')
+
+    def test_pin_flow_is_post_and_writes_known_hosts(self):
+        for p in ("/ui/thunder/modelsrc-scan", "/ui/thunder/modelsrc-pin"):
+            self.assertIn(p, admin._POST_ACTIONS)
+            r = self.c.get(p + "?fp=" + self.fp, headers=SAME, follow_redirects=False)
+            self.assertEqual(r.status_code, 405, p)
+        self.assertEqual(self.scans, [])
+        msg = self.post("/ui/thunder/modelsrc-scan")
+        self.assertIn(self.fp, msg)
+        self.assertEqual(self.scans, [["ssh-keyscan", "-t", "ed25519", "--", "192.168.8.24"]])
+        self.assertFalse(os.path.exists(self.lan.known_hosts_path))     # not trusted yet
+        b = self.block()
+        self.assertIn(self.fp, b)
+        btn = re.search(r'<button[^>]*formaction="/ui/thunder/modelsrc-pin\?fp=([^"]+)"[^>]*>',
+                        b)
+        self.assertIsNotNone(btn)
+        self.assertIn(f"data-confirm=\"Pin modelsrc@192.168.8.24&#x27;s host key {self.fp}?",
+                      btn.group(0))
+        # a confirmation of another key pins nothing
+        self.assertIn("not pinned", self.post("/ui/thunder/modelsrc-pin", fp="SHA256:other"))
+        self.assertFalse(os.path.exists(self.lan.known_hosts_path))
+        from urllib.parse import unquote
+        msg = self.post("/ui/thunder/modelsrc-pin", fp=unquote(btn.group(1)))
+        self.assertIn("pinned", msg)
+        with open(self.lan.known_hosts_path) as f:
+            self.assertEqual(f.read(), f"192.168.8.24 ssh-ed25519 {_ED_B64}\n")
+        self.assertEqual(os.stat(self.lan.known_hosts_path).st_mode & 0o777, 0o600)
+        b = self.block()
+        self.assertNotIn("not set up", b)
+        self.assertIn(f"host key <code>{self.fp}</code> pinned", b)
+
+    def test_no_lan_block_without_thunder_backends(self):
+        self.views = {}
+        self.assertNotIn("thunder-modelsrc", self.page())
+
+
+class LanSourceWiring(CatalogWiring):
+    def test_bound_and_deps(self):
+        import thunderctl
+        self.assertIs(admin._thunder_modelsrc_view, main.modelsrc_view)
+        self.assertIs(admin._thunder_modelsrc_scan, main.modelsrc_scan)
+        self.assertIs(admin._thunder_modelsrc_pin, main.modelsrc_pin)
+        # the host rule is main's ship-target rule (plain [user@]host characters)
+        self.assertEqual(thunderctl._SRC_HOST_RE.pattern, main._VOICE_HOST_RE.pattern)
+        self.assertEqual(main._modelsrc_host(), "modelsrc@192.168.8.24")
+        store.set_settings({"modelsrc_host": "src@10.0.0.2"})
+        self.assertEqual(main._modelsrc_host(), "src@10.0.0.2")
+        saved = main.jobs_cfg
+        self.addCleanup(setattr, main, "jobs_cfg", saved)
+        main.jobs_cfg = dict(saved, store_path=os.path.join(self.tmp.name, "store.db"))
+        deps = main._thunder_deps()
+        self.assertIs(deps.lan, main.modelsrc())
+        self.assertEqual(deps.lan.datadir, self.tmp.name)
+        self.assertEqual(deps.lan.host(), "src@10.0.0.2")
+        self.assertEqual(deps.source_index(), {})          # not pinned: no source
+        self.assertEqual(deps.lan.problem(), "not configured")
 
 
 if __name__ == "__main__":

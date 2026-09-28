@@ -195,6 +195,12 @@ _thunder_default_nodes: Callable[[], str] = lambda: ""
 _thunder_sync_now: Callable = None
 _thunder_delete_unknown: Callable = None
 _modelsync_catalog: Callable[[], list] = lambda: []
+# The LAN model source (Task 15, main.modelsrc*): its view (thunderctl.LanSource.view —
+# no network), "Fetch host key" (async → message) and "Confirm fingerprint" (async
+# (fingerprint) → message).
+_thunder_modelsrc_view: Callable[[], Optional[dict]] = lambda: None
+_thunder_modelsrc_scan: Callable = None
+_thunder_modelsrc_pin: Callable = None
 _save_modelsync_catalog: Callable[[list], list] = lambda cat: ["catalog store not available"]
 
 
@@ -898,6 +904,7 @@ _POST_ACTIONS = frozenset((
     "/ui/backends/restart", "/ui/backends/enable",
     "/ui/thunder/start", "/ui/thunder/stop", "/ui/thunder/restart", "/ui/thunder/forget",
     "/ui/thunder/sync", "/ui/thunder/delete-unknown", "/ui/thunder/catalog",
+    "/ui/thunder/modelsrc-scan", "/ui/thunder/modelsrc-pin",
     "/ui/chat/badd", "/ui/chat/bdel", "/ui/chat/delete",
     "/ui/mapping/field-add", "/ui/mapping/field-map", "/ui/mapping/field-clear",
     "/ui/mapping/field-del", "/ui/mapping/cand-add", "/ui/mapping/cand-del",
@@ -3113,7 +3120,9 @@ def _sync_files_row(alias: str, files) -> str:
                 if f.get("node") is not None else "catalog")
         rows += (f'<tr data-k="f-{_esc(f.get("path"))}"><td><code>{_esc(f.get("path"))}</code></td>'
                  f'<td data-sv="{_nbytes(size)}">'
-                 f'{f"{_gb1(size)} GB" if size is not None else "size unknown"}</td>'
+                 + (f"link → <code>{_esc(f['link'])}</code>" if f.get("link")
+                    else f"{_gb1(size)} GB" if size is not None else "size unknown")
+                 + "</td>"
                  f"<td>{node}</td><td>{'✓ present' if f.get('present') else 'missing'}</td></tr>")
     return (f'<tr data-k="ms-{_esc(alias)}-files"><td colspan="6"><details><summary>'
             f"{len(fs)} file{'s' if len(fs) != 1 else ''}</summary><table><tr><th>file</th>"
@@ -3366,16 +3375,97 @@ def _catalog_editor(refused: Optional[tuple] = None) -> str:
             "</form></details>")
 
 
+# What the operator runs on the share host (ops/modelsrc-serve.sh's header, Task 14):
+# the user needs a REAL login shell — sshd runs the forced command through it, and
+# /usr/sbin/nologin would run nothing (every list then fails as "unreachable").
+_MODELSRC_INSTALL = (
+    "install -m 0755 ops/modelsrc-serve.sh /usr/local/bin/modelsrc-serve\n"
+    "useradd --system --home /var/lib/modelsrc --shell /bin/bash modelsrc\n"
+    "setfacl -R -m u:modelsrc:rX /mnt/xfs/shared/comfyui-models\n"
+    "setfacl -R -d -m u:modelsrc:rX /mnt/xfs/shared/comfyui-models\n"
+    "install -d -m 0700 -o modelsrc /var/lib/modelsrc/.ssh\n"
+    "echo 'command=\"/usr/local/bin/modelsrc-serve\",no-port-forwarding,no-X11-forwarding,"
+    "no-agent-forwarding,no-pty {pub}' > /var/lib/modelsrc/.ssh/authorized_keys\n"
+    "chown modelsrc /var/lib/modelsrc/.ssh/authorized_keys && "
+    "chmod 600 /var/lib/modelsrc/.ssh/authorized_keys")
+
+
+def _modelsrc_block() -> str:
+    """The LAN model source (one for every Thunder backend): not set up → the public key
+    and the install command; the host-key pin as two POSTs — "Fetch host key" shows the
+    fingerprint (kept in memory only), "Confirm fingerprint" asks with that fingerprint
+    and pins it; pinned → the listing's state. Never takes the tab down."""
+    try:
+        mv = _thunder_modelsrc_view()
+    except Exception as e:                              # noqa: BLE001 — a card, not the tab
+        logger.warning(f"ui: LAN source view failed: {type(e).__name__}: {e}")
+        return ""
+    if not isinstance(mv, dict):
+        return ""
+    k = "thunder-modelsrc"
+    host = str(mv.get("host") or "")
+    problem = str(mv.get("problem") or "")
+    pub = str(mv.get("public_key") or "")
+    pinned = bool(mv.get("pinned"))
+    badge = (_badge("ready", "ok") if not problem
+             else _badge("not set up", "warn") if not pinned
+             else _badge(problem[:80], "bad" if mv.get("error") else "warn", problem))
+    rows = [f'<div class="item-title" data-k="{k}-head"><b>LAN model source</b> '
+            f"<code>{_esc(host)}</code> {badge}</div>"]
+    key_html = (f'<pre class="tlog" data-k="{k}-pub">{_esc(pub)}</pre>' if pub else
+                f'<p class="hint" data-k="{k}-nopub">The key <code>modelsrc.key</code> is '
+                "generated when the gateway starts a Thunder controller — reload shortly.</p>")
+    install = (f'<pre class="tlog" data-k="{k}-install">'
+               f'{_esc(_MODELSRC_INSTALL.format(pub=pub or "<public key above>"))}</pre>')
+    if not pinned:
+        rows.append(f'<p class="hint" data-k="{k}-setup">LAN source: not set up — model files '
+                    "only the LAN share has wait until its host key is pinned. This "
+                    "gateway's public key for the share host:</p>" + key_html
+                    + f'<p class="hint" data-k="{k}-howto">Install on the share host (as root; '
+                    "the <code>modelsrc</code> user needs a real login shell, sshd runs the "
+                    "forced command through it):</p>" + install)
+    else:
+        facts = [f"host key <code>{_esc(mv.get('pinned_fp') or '?')}</code> pinned"]
+        if mv.get("listed_at"):
+            facts.append(f"{_nbytes(mv.get('files'))} files, {_nbytes(mv.get('links'))} links "
+                         "listed at " + _esc(time.strftime("%H:%M:%S",
+                                                           time.localtime(mv["listed_at"]))))
+        if problem:
+            facts.append(f'<span class="bad">{_esc(problem)}</span>')
+        rows.append(f'<div class="tfacts" data-k="{k}-facts">{" · ".join(facts)}</div>')
+        rows.append(f'<details data-k="{k}-keys"><summary>public key and install command'
+                    f"</summary>{key_html}{install}</details>")
+    fp = str(mv.get("scanned_fp") or "")
+    if fp:
+        rows.append(f'<p class="hint" data-k="{k}-scanned">Fetched host key of '
+                    f"<code>{_esc(host)}</code>: <code>{_esc(fp)}</code> — compare it with "
+                    "<code>ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub</code> on the share "
+                    "host before confirming.</p>")
+    acts = _btn("Fetch host key", "/ui/thunder/modelsrc-scan", "secondary", sm=True,
+                title="ssh-keyscan the share host and show its fingerprint (nothing is "
+                      "trusted yet)")
+    if fp:
+        acts += _btn("Confirm fingerprint", f"/ui/thunder/modelsrc-pin?fp={_q(fp)}", sm=True,
+                     confirm=f"Pin {host}'s host key {fp}? Only if the share host shows exactly "
+                             "this fingerprint — the gateway then trusts it for every model "
+                             "transfer.",
+                     title="Trust this host key for the LAN source")
+    rows.append(f'<div class="tacts" data-k="{k}-acts">{acts}</div>')
+    return f'<div class="tcard" data-k="{k}">{"".join(rows)}</div>'
+
+
 def _thunder_panel(views: list, binfo: list, catalog_refused: Optional[tuple] = None) -> str:
-    """The Thunder lifecycle cards above the backend list, and the model-sync catalog
-    — empty without Thunder (unless a refused catalog Save must be shown as typed)."""
+    """The Thunder lifecycle cards above the backend list, the LAN model source and the
+    model-sync catalog — empty without Thunder (unless a refused catalog Save must be
+    shown as typed)."""
     if not views and catalog_refused is None:
         return ""
     cfg = {b.get("name"): b.get("thunder") for b in binfo
            if b.get("type") == "comfyui" and isinstance(b.get("thunder"), dict)}
     cards = "".join(_thunder_card(n, v, cfg.get(n)) for n, v in views)
+    lan = _modelsrc_block() if views else ""
     return (f'<div data-sk="thunder"><div class="grouphdr">Thunder Compute</div>{cards}'
-            f"{_catalog_editor(catalog_refused)}</div>")
+            f"{lan}{_catalog_editor(catalog_refused)}</div>")
 
 
 async def _thunder_post(request: Request, action: str):
@@ -3449,6 +3539,38 @@ async def thunder_delete_unknown(request: Request):
         except Exception as e:                          # noqa: BLE001
             msg = f"{name}: delete failed: {type(e).__name__}: {e}"
     logger.info(f"ui: thunder delete-unknown {name!r} ({len(paths)} path(s)) → {msg}")
+    return _thunder_msg(msg)
+
+
+async def thunder_modelsrc_scan(request: Request):
+    """"Fetch host key": ssh-keyscan the LAN source; the fingerprint comes back as the
+    message and stays in memory until "Confirm fingerprint"."""
+    if _thunder_modelsrc_scan is None:
+        msg = "LAN source is not available"
+    else:
+        try:
+            msg = str(await _thunder_modelsrc_scan())
+        except Exception as e:                          # noqa: BLE001 — say it, don't 500
+            msg = f"host key not fetched: {type(e).__name__}: {e}"
+    logger.info(f"ui: LAN source host-key scan → {msg}")
+    return _thunder_msg(msg)
+
+
+async def thunder_modelsrc_pin(request: Request):
+    """"Confirm fingerprint": pin the fetched key — only if it is still the one whose
+    fingerprint the button carried (the operator's confirmation was about THAT key)."""
+    f = await _form(request)
+    fp = (f.get("fp") or request.query_params.get("fp") or "").strip()
+    if _thunder_modelsrc_pin is None:
+        msg = "LAN source is not available"
+    elif not fp:
+        msg = "no fingerprint confirmed — nothing pinned"
+    else:
+        try:
+            msg = str(await _thunder_modelsrc_pin(fp))
+        except Exception as e:                          # noqa: BLE001
+            msg = f"host key not pinned: {type(e).__name__}: {e}"
+    logger.info(f"ui: LAN source host-key pin → {msg}")
     return _thunder_msg(msg)
 
 
@@ -8902,6 +9024,8 @@ def register(app) -> None:
     app.add_api_route("/ui/thunder/forget", thunder_forget, methods=["POST"])
     app.add_api_route("/ui/thunder/sync", thunder_sync, methods=["POST"])
     app.add_api_route("/ui/thunder/delete-unknown", thunder_delete_unknown, methods=["POST"])
+    app.add_api_route("/ui/thunder/modelsrc-scan", thunder_modelsrc_scan, methods=["POST"])
+    app.add_api_route("/ui/thunder/modelsrc-pin", thunder_modelsrc_pin, methods=["POST"])
     app.add_api_route("/ui/thunder/catalog", thunder_catalog_save, methods=["POST"])
     app.add_api_route("/ui/input", input_page, methods=["GET"])
     app.add_api_route("/ui/routing", routing_page, methods=["GET"])

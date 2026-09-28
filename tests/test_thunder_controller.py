@@ -1,6 +1,7 @@
 """Thunder lifecycle controller against a stubbed Thunder API and a fake ssh.
 run: venv/bin/python -m unittest tests.test_thunder_controller -v"""
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -2303,6 +2304,8 @@ class FakeVM:
         self.heads = []           # (plan path, curl config) per HEAD
         self.head_len = {}        # url -> Content-Length a HEAD reports instead of sizes[url]
         self.no_length = set()    # urls whose HEAD names no Content-Length
+        self.content = {}         # plan path -> bytes of its LAN-streamed .part
+        self.links = {}           # plan path -> symlink target text
         fake.on_modify = lambda old, new: setattr(self, "avail", self.avail + (new - old) * _GiB)
 
     def wrap(self, c):
@@ -2373,7 +2376,15 @@ class FakeVM:
         out = ""
         if verb == "gw-index":
             out = "".join(f"{self.remote(p)}\t{n}\n" for p, n in sorted(self.files.items()))
+            out += "".join(f"L\t{self.remote(p)}\t{t}\n" for p, t in sorted(self.links.items()))
             out += "GW:END\n"
+        elif verb == "gw-part":
+            out = f"{self.files.get(path + '.part', 0)}\n"
+        elif verb == "gw-link":
+            ls = text.split("\n")
+            for i in range(0, len(ls) - 1, 2):
+                self.links[self.plan_of(ls[i])] = ls[i + 1]
+            out = "GW:LINKED\n"
         elif verb == "gw-manifest":
             out = self.manifest if self.manifest is not None else "{}\n"
         elif verb == "gw-manifest-write":
@@ -2401,7 +2412,10 @@ class FakeVM:
             out = ("HTTP/2 302\r\nlocation: https://cdn.example/x\r\ncontent-length: 0\r\n"
                    f"\r\nHTTP/2 200\r\n{length}\r\n")
         elif verb == "gw-sha":
-            out = f"{self.sha.get(self.part_url.get(path), '0' * 64)}  x\n"
+            if path in self.content:
+                out = f"{hashlib.sha256(self.content[path]).hexdigest()}  x\n"
+            else:
+                out = f"{self.sha.get(self.part_url.get(path), '0' * 64)}  x\n"
         elif verb == "gw-done":
             n = self.files.pop(path + ".part")
             self.files[path] = n
@@ -2413,6 +2427,7 @@ class FakeVM:
             for suf in (".part", ".part.lock", ".part.log"):
                 self.files.pop(path + suf, None)
             self.lockpid.pop(path, None)
+            self.content.pop(path, None)
         elif verb == "gw-kill":
             for p, pid in list(self.lockpid.items()):
                 if pid in self.procs:
@@ -2423,6 +2438,7 @@ class FakeVM:
             if "rm" in toks:
                 for p in self._rm_args(toks):
                     self.files.pop(p, None)
+                    self.links.pop(p, None)
                 out += "GW:RM-OK\n"
             for p in [p for p in self.files if p.endswith((".part", ".part.lock", ".part.log"))]:
                 del self.files[p]
@@ -3842,6 +3858,497 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
             self.assertIn(n, gi, ".gitignore")
             self.assertRegex(rs, r"--exclude='%s/?'" % n.replace(".", r"\."), "rsync")
             self.assertRegex(tr, r"--exclude='\./%s/?'" % n.replace(".", r"\."), "tar")
+
+
+
+# ── the LAN model source (Task 15: pinned host key, index, resumable stream) ──────────
+
+_SRCHOST = "modelsrc@192.168.8.24"
+_ED_B64 = "AAAAC3NzaC1lZDI1NTE5AAAAIHm4E0tb6VPU5qn5zKm6c1tJ4HQ1Pdu6Wf7k6o7V3tJ2"
+
+
+class FakeShare:
+    """The model share behind `ops/modelsrc-serve.sh`, answering LanSource's ssh by
+    the forced command's verbs (`list`, `sha256 <rel>`) and `ssh-keyscan`. `files` are
+    SHARE paths → bytes, `links` share path → target text."""
+
+    def __init__(self):
+        self.files, self.links = {}, {}
+        self.calls = []
+        self.list_rc, self.list_err = 0, b""
+        self.sha_answers = []          # reported before the real digests (a mismatch)
+        self.keyscan = (0, f"# 192.168.8.24:22 SSH-2.0-OpenSSH_9.6\n"
+                           f"192.168.8.24 ssh-ed25519 {_ED_B64}\n".encode(), b"")
+
+    def lists(self):
+        return [a for a in self.calls if a[0] == "ssh" and a[-1] == "list"]
+
+    async def ssh(self, argv, stdin=None, timeout=60):
+        self.calls.append(list(argv))
+        await asyncio.sleep(0)
+        if argv[0] == "ssh-keyscan":
+            return self.keyscan
+        w = shlex.split(argv[-1])
+        if w[0] == "list":
+            if self.list_rc:
+                return (self.list_rc, b"F\tpartial\t1\n", self.list_err)
+            out = "".join(f"F\t{r}\t{len(b)}\n" for r, b in sorted(self.files.items()))
+            out += "".join(f"L\t{r}\t{t}\n" for r, t in sorted(self.links.items()))
+            return (0, out.encode(), b"")
+        if w[0] == "sha256" and w[1] in self.files:
+            if self.sha_answers:
+                return (0, (self.sha_answers.pop(0) + "\n").encode(), b"")
+            return (0, (hashlib.sha256(self.files[w[1]]).hexdigest() + "\n").encode(), b"")
+        return (2, b"", b"modelsrc-serve: refused: nope")
+
+
+async def _fake_keygen(path):
+    return "ssh-ed25519 AAAAlan ai-hub"
+
+
+def _lan(share, datadir, clock, pinned=True, host=_SRCHOST):
+    lan = thunderctl.LanSource(datadir, host=lambda: host, ssh=share.ssh,
+                               keygen=_fake_keygen, now=lambda: clock[0])
+    if pinned:
+        with open(lan.known_hosts_path, "w") as f:
+            f.write(f"192.168.8.24 ssh-ed25519 {_ED_B64}\n")
+    return lan
+
+
+class LanPipe:
+    """`deps.pipe` for the tests: moves the share file's bytes from the offset the
+    source argv names into the FakeVM `.part` the destination command names. `gate`
+    (an Event) holds every stream until set; `active`/`peak` count concurrent streams."""
+
+    def __init__(self, vm, share):
+        self.vm, self.share = vm, share
+        self.log = []
+        self.gate = None
+        self.active = self.peak = 0
+        self.cancelled = 0
+
+    async def __call__(self, src_argv, dst_argv, on_bytes, timeout_idle=120):
+        self.log.append((list(src_argv), list(dst_argv)))
+        w = shlex.split(src_argv[-1])
+        rel, off = w[1], int(w[2])
+        path = shlex.split(dst_argv[-1])[2]
+        self.active += 1
+        self.peak = max(self.peak, self.active)
+        try:
+            if self.gate is not None:
+                await self.gate.wait()
+            await asyncio.sleep(0)
+            data = self.share.files[rel][off:]
+            self.vm.content[path] = self.vm.content.get(path, b"") + data
+            self.vm.files[path + ".part"] = len(self.vm.content[path])
+            on_bytes(len(data))
+            return (0, 0, "")
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            raise
+        finally:
+            self.active -= 1
+
+
+def _lan_make(aliases, share, pinned=True, catalog=None, **kw):
+    fake, vm, c, box, saved = _sync_make(aliases=aliases, catalog=catalog, **kw)
+    lan = _lan(share, c.deps.datadir, c.h.clock, pinned=pinned)
+    c.deps.lan = lan
+    c.deps.source_index = lan.cached
+    pipe = c.deps.pipe = LanPipe(vm, share)
+    c.h.box = box
+    return fake, vm, c, lan, pipe
+
+
+class LanTransfer(unittest.IsolatedAsyncioTestCase):
+    """Spec "Übertragung LAN": one stream at a time, resumed from the `.part`, verified by
+    sha256 on both sides — and nothing at all without a pinned host key."""
+
+    def share(self, **files):
+        sh = FakeShare()
+        for name, data in files.items():
+            sh.files[f"diffusion_models/{name}.safetensors"] = data
+        return sh
+
+    async def test_lan_resume_from_part_offset(self):
+        sh = self.share(a=b"0123456789")
+        fake, vm, c, lan, pipe = _lan_make({"img": _cand("a.safetensors")}, sh)
+        path = _dm("a.safetensors")
+        vm.content[path] = b"012"
+        vm.files[path + ".part"] = 3
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")),
+                        c.state.log[-8:])
+        src, dst = pipe.log[0]
+        self.assertTrue(src[-1].endswith(" 3"), src)
+        self.assertEqual(shlex.split(src[-1]), ["cat", "diffusion_models/a.safetensors", "3"])
+        self.assertIn("StrictHostKeyChecking=yes", src)
+        self.assertIn(f"UserKnownHostsFile={lan.known_hosts_path}", src)
+        self.assertEqual(src[src.index("--") + 1], _SRCHOST)
+        self.assertIn("cat >> ", dst[-1])
+        self.assertIn("flock -n", dst[-1])
+        self.assertEqual(vm.files[path], 10)
+        man = json.loads(vm.manifest)[path]
+        self.assertEqual((man["source"], man["size"]),  ("lan", 10))
+        self.assertEqual(man["sha256"], hashlib.sha256(b"0123456789").hexdigest())
+        self.assertEqual(len(pipe.log), 1)
+
+    async def test_sha_mismatch_restarts_and_counts(self):
+        sh = self.share(a=b"abcdef")
+        sh.sha_answers = ["f" * 64]
+        fake, vm, c, lan, pipe = _lan_make({"img": _cand("a.safetensors")}, sh)
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")),
+                        c.state.log[-8:])
+        # attempt 1 streamed everything, the digests differed: .part discarded, attempt 2
+        # starts from byte 0 (not resumed onto bad bytes), then verifies
+        self.assertEqual([shlex.split(s[-1])[2] for s, _ in pipe.log], ["0", "0"])
+        self.assertTrue(any("LAN transfer models/diffusion_models/a.safetensors attempt 1/3 "
+                            "failed: sha256 mismatch" in ln for ln in c.state.log), c.state.log)
+        self.assertEqual(c.h.faults, [])
+        # the source digest was asked again after the mismatch (not the cached bad one)
+        self.assertEqual(len([a for a in sh.calls if a[-1].startswith("sha256 ")]), 2)
+
+    async def test_three_mismatches_block_the_alias_and_log_a_fault(self):
+        sh = self.share(a=b"abcdef")
+        sh.sha_answers = ["f" * 64] * 3
+        fake, vm, c, lan, pipe = _lan_make({"img": _cand("a.safetensors")}, sh)
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and "transfer failed"
+                                     in c.alias_status("img")), c.state.log[-8:])
+        self.assertEqual(len(pipe.log), 3)
+        self.assertEqual(c.h.faults[-1][1:3], ("sync", "transfer"))
+        self.assertNotIn(_dm("a.safetensors") + ".part", vm.files)
+
+    async def test_short_stream_is_resumed_not_discarded(self):
+        sh = self.share(a=b"0123456789")
+        fake, vm, c, lan, pipe = _lan_make({"img": _cand("a.safetensors")}, sh)
+        real = LanPipe.__call__
+        calls = []
+
+        async def short_once(src, dst, on_bytes, timeout_idle=120):
+            calls.append(1)
+            if len(calls) == 1:           # the connection dropped after 4 bytes
+                path = shlex.split(dst[-1])[2]
+                vm.content[path] = b"0123"
+                vm.files[path + ".part"] = 4
+                return (255, 0, "source: Connection reset")
+            return await real(pipe, src, dst, on_bytes, timeout_idle)
+        c.deps.pipe = short_once
+        pipe.log = []
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")),
+                        c.state.log[-8:])
+        self.assertEqual(shlex.split(pipe.log[0][0][-1])[2], "4")
+        self.assertTrue(any("stream failed (source rc 255, instance rc 0)" in ln
+                            for ln in c.state.log))
+
+    async def test_no_pin_no_lan_transfer(self):
+        sh = self.share(a=b"abc")
+        fake, vm, c, lan, pipe = _lan_make({"img": _cand("a.safetensors")}, sh, pinned=False)
+        await c.start()
+        await _until(lambda: _idle(c))
+        self.assertEqual(pipe.log, [])
+        self.assertEqual(sh.calls, [])            # not even a `list`
+        self.assertIn("waiting for LAN source (not configured)", c.alias_status("img"))
+        self.assertFalse(c.is_alias_ready("img"))
+
+    async def test_hostile_host_setting_never_reaches_ssh(self):
+        sh = self.share(a=b"abc")
+        fake, vm, c, lan, pipe = _lan_make({"img": _cand("a.safetensors")}, sh)
+        for bad in ("-oProxyCommand=touch /tmp/x", "a b@host", "user@ho'st", ""):
+            lan._host_fn = lambda bad=bad: bad
+            self.assertFalse(lan.configured(), bad)
+            with self.assertRaises(ValueError):
+                lan.cat_argv(_dm("a.safetensors"), 0)
+        await c.start()
+        await _until(lambda: _idle(c))
+        self.assertEqual((sh.calls, pipe.log), ([], []))
+        self.assertIn("waiting for LAN source (not configured", c.alias_status("img"))
+
+    async def test_one_lan_stream_at_a_time(self):
+        sh = self.share(a=b"a" * 5, b=b"b" * 7, c=b"c" * 9)
+        fake, vm, c, lan, pipe = _lan_make(
+            {"img": _cand("a.safetensors", "b.safetensors", "c.safetensors")}, sh)
+        pipe.gate = asyncio.Event()
+        await c.start()
+        self.assertTrue(await _until(lambda: pipe.active == 1))
+        for _ in range(50):
+            await asyncio.sleep(0)
+        self.assertEqual(pipe.active, 1)
+        self.assertEqual([t["source"] for t in c.view()["transfers"]], ["lan"])
+        pipe.gate.set()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")),
+                        c.state.log[-8:])
+        self.assertEqual((pipe.peak, len(pipe.log)), (1, 3))
+
+    async def test_lan_and_url_run_side_by_side_and_url_not_withheld(self):
+        # Ruling 18: with the source usable, an alias's URL files are no longer held back
+        # for its LAN files (and the URL curls do not wait for the one LAN stream)
+        sh = self.share(a=b"lan-bytes")
+        fake, vm, c, lan, pipe = _lan_make({"img": _cand("a.safetensors", "u.safetensors")},
+                                           sh, catalog=[_url("u.safetensors")])
+        vm.sizes["https://example.com/u.safetensors"] = 4
+        pipe.gate = asyncio.Event()
+        await c.start()
+        self.assertTrue(await _until(lambda: vm.started and pipe.active == 1))
+        pipe.gate.set()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")),
+                        c.state.log[-8:])
+        # and without the pin, the URL file of that alias is withheld as before
+        sh2 = self.share(a=b"lan-bytes")
+        fake, vm2, c2, lan2, pipe2 = _lan_make({"img": _cand("a.safetensors", "u.safetensors")},
+                                               sh2, pinned=False,
+                                               catalog=[_url("u.safetensors")])
+        vm2.sizes["https://example.com/u.safetensors"] = 4
+        await c2.start()
+        await _until(lambda: _idle(c2))
+        self.assertEqual((vm2.started, pipe2.log), ([], []))
+
+    async def test_unreachable_source_waits_and_keeps_the_last_listing(self):
+        sh = self.share(a=b"abc")
+        sh.list_rc, sh.list_err = 255, b"ssh: connect to host 192.168.8.24 port 22: No route"
+        fake, vm, c, lan, pipe = _lan_make({"img": _cand("a.safetensors")}, sh)
+        await c.start()
+        await _until(lambda: _idle(c))
+        st = c.alias_status("img")
+        self.assertIn("waiting for LAN source (unreachable: ssh: connect to host", st)
+        self.assertEqual(pipe.log, [])
+        # a good listing, then an incomplete one (rc 1): the good one stays, transfers wait
+        sh.list_rc = 0
+        await lan.refresh(force=True)
+        good = lan.cached()
+        self.assertEqual(good, {_dm("a.safetensors"): 3})
+        sh.list_rc, sh.list_err = 1, b"modelsrc-serve: list incomplete (find exit 1)"
+        gen = lan.generation
+        await lan.refresh(force=True)
+        self.assertEqual(lan.cached(), good)             # never "the source is empty"
+        self.assertFalse(lan.usable())
+        self.assertIn("list incomplete", lan.problem())
+        self.assertGreater(lan.generation, gen)
+
+    async def test_index_cached_and_invalidated_by_start_and_sync_now(self):
+        sh = self.share(a=b"abc")
+        fake, vm, c, lan, pipe = _lan_make({"img": _cand("a.safetensors")}, sh)
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+        n = len(sh.lists())
+        self.assertEqual(n, 1)
+        c.h.clock[0] += 300
+        await c._sync_tick()
+        self.assertEqual(len(sh.lists()), n)             # within 10 min: cached
+        c.h.clock[0] += 301
+        await c._sync_tick()
+        self.assertEqual(len(sh.lists()), n + 1)         # stale: listed again
+        await c.sync_now()
+        self.assertEqual(len(sh.lists()), n + 2)         # the button lists at once
+
+    async def test_pin_makes_waiting_aliases_sync(self):
+        sh = self.share(a=b"abc")
+        fake, vm, c, lan, pipe = _lan_make({"img": _cand("a.safetensors")}, sh, pinned=False)
+        await c.start()
+        await _until(lambda: _idle(c))
+        self.assertIn("waiting for LAN source (not configured)", c.alias_status("img"))
+        fp = await lan.scan()
+        lan.pin(fp)
+        await c._sync_tick()                              # the pin alone triggers a plan
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")),
+                        c.state.log[-8:])
+
+    async def test_stop_ends_the_lan_stream(self):
+        sh = self.share(a=b"abc")
+        fake, vm, c, lan, pipe = _lan_make({"img": _cand("a.safetensors")}, sh)
+        pipe.gate = asyncio.Event()                        # never set: a stream in flight
+        await c.start()
+        self.assertTrue(await _until(lambda: pipe.active == 1))
+        await c._stop_transfers()
+        self.assertEqual((pipe.active, pipe.cancelled), (0, 1))
+        self.assertEqual(c.view()["transfers"], [])
+        self.assertIsNone(c._lan_path)
+
+    async def test_hf_links_created_recorded_and_not_recreated(self):
+        sh = FakeShare()
+        repo = "hf-cache/hub/models--o--n/"
+        sh.files = {repo + "blobs/abc": b"weights", repo + "refs/main": b"r1"}
+        sh.links = {repo + "snapshots/r1/model.safetensors": "../../blobs/abc",
+                    # crosses into the other root: never recreated
+                    "vae/x.safetensors": "../hf-cache/hub/models--o--n/blobs/abc"}
+        cat = [{"match": {"alias": "hf"}, "paths": [repo]}]
+        fake, vm, c, lan, pipe = _lan_make({"hf": {"backend": "thunder", "workflow_json": {}}},
+                                           sh, catalog=cat)
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("hf")),
+                        c.state.log[-8:])
+        self.assertIn(repo + "blobs/abc", lan.cached())
+        self.assertNotIn("models/vae/x.safetensors", lan.cached())
+        snap = repo + "snapshots/r1/model.safetensors"
+        self.assertEqual(vm.links, {snap: "../../blobs/abc"})
+        linked = [st for m, cmd, st in fake.calls if m == "SSH" and cmd.startswith(": gw-link ")]
+        self.assertEqual(linked, [f"{snap}\n../../blobs/abc\n".encode()])
+        man = json.loads(vm.manifest)
+        self.assertEqual({k: man[snap][k] for k in ("source", "target", "size", "aliases")},
+                         {"source": "link", "target": "../../blobs/abc", "size": 0,
+                          "aliases": ["hf"]})
+        await c.sync_once()
+        linked = [cmd for m, cmd, _ in fake.calls if m == "SSH" and cmd.startswith(": gw-link ")]
+        self.assertEqual(len(linked), 1)                  # present links are not re-made
+        self.assertTrue(c.is_alias_ready("hf"))
+        # the alias goes: the stop prunes the link with the files it belongs to
+        c.h.box["aliases"].clear()
+        await c._before_snapshot()
+        self.assertEqual(vm.links, {})
+        self.assertNotIn(repo + "blobs/abc", vm.files)
+        self.assertEqual(json.loads(vm.manifest), {})
+
+    async def test_links_wait_while_the_lan_source_waits(self):
+        sh = FakeShare()
+        repo = "hf-cache/hub/models--o--n/"
+        sh.files = {repo + "blobs/abc": b"weights"}
+        sh.links = {repo + "snapshots/r1/m.bin": "../../blobs/abc"}
+        fake, vm, c, lan, pipe = _lan_make(
+            {"hf": {"backend": "thunder", "workflow_json": {}}}, sh, pinned=False,
+            catalog=[{"match": {"alias": "hf"}, "paths": [repo]}])
+        # unpinned: no index at all, so the catalog dir is "waiting", and nothing is linked
+        await c.start()
+        await _until(lambda: _idle(c))
+        self.assertEqual(vm.links, {})
+        self.assertIn("waiting for LAN source (not configured)", c.alias_status("hf"))
+
+
+class LanSourceUnit(unittest.IsolatedAsyncioTestCase):
+    """The pure half and the pin: mapping share ↔ plan paths, the list parser, argv
+    shape, fingerprint, scan → pin."""
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="lan-test-")
+        self.addCleanup(shutil.rmtree, self.d, True)
+        self.clock = [1000.0]
+
+    def test_share_mapping(self):
+        self.assertEqual(thunderctl.share_rel("models/vae/a.st"), "vae/a.st")
+        self.assertEqual(thunderctl.share_rel("hf-cache/hub/m/blobs/x"), "hf-cache/hub/m/blobs/x")
+        for bad in ("models/hf-cache/hub/x", "models/hf-cache", "other/x", "models/",
+                    "models/../x", "hf-cache/", "models/a/"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                thunderctl.share_rel(bad)
+        self.assertEqual(thunderctl.plan_of_share("vae/a.st"), "models/vae/a.st")
+        self.assertEqual(thunderctl.plan_of_share("hf-cache/hub/x"), "hf-cache/hub/x")
+        for bad in ("hf-cache", "../x", ".hidden/x", "-x/y", "a//b"):
+            self.assertIsNone(thunderctl.plan_of_share(bad), bad)
+
+    def test_parse_source_list(self):
+        text = ("F\tvae/a.st\t12\nF\thf-cache/hub/m/blobs/b\t7\n"
+                "F\tbad size\tx\nF\t../x\t1\ngarbage\n"
+                "L\thf-cache/hub/m/snapshots/r/w.st\t../../blobs/b\n"
+                "L\tvae/cross.st\t../hf-cache/hub/m/blobs/b\n"      # other root: dropped
+                "L\thf-cache/hub/m/snapshots/r/up.st\t../../../../../x\n"   # escapes
+                "L\tvae/abs.st\t/etc/passwd\n"
+                "L\tvae/same.st\ta.st\n")
+        self.assertEqual(thunderctl.parse_source_list(text), {
+            "models/vae/a.st": 12, "hf-cache/hub/m/blobs/b": 7,
+            "hf-cache/hub/m/snapshots/r/w.st": {"link": "../../blobs/b"},
+            "models/vae/same.st": {"link": "a.st"}})
+
+    def test_parse_index_reads_links(self):
+        idx = thunderctl.parse_index("ComfyUI/models/vae/a.st\t5\n"
+                                     "L\thf-cache/hub/m/snapshots/r/x\t../../blobs/b\n"
+                                     "L\t.hidden/l\tx\nGW:END\n")
+        self.assertEqual(idx, {"models/vae/a.st": 5,
+                               "hf-cache/hub/m/snapshots/r/x": {"link": "../../blobs/b"}})
+        self.assertIn("-type l -printf 'L", thunderctl._INDEX_CMD)
+
+    def test_argv_pinned_and_quoted(self):
+        sh = FakeShare()
+        lan = _lan(sh, self.d, self.clock)
+        a = lan.cat_argv("models/loras/my 'odd' lora.safetensors", 17)
+        self.assertEqual(a[:3], ["ssh", "-i", os.path.join(self.d, "modelsrc.key")])
+        self.assertIn("StrictHostKeyChecking=yes", a)
+        self.assertIn(f"UserKnownHostsFile={os.path.join(self.d, 'modelsrc-known_hosts')}", a)
+        self.assertEqual(a[-3:-1], ["--", _SRCHOST])
+        self.assertEqual(shlex.split(a[-1]), ["cat", "loras/my 'odd' lora.safetensors", "17"])
+        with self.assertRaises(ValueError):
+            lan.cat_argv("models/hf-cache/hub/x", 0)
+
+    def test_fingerprint_is_openssh_s(self):
+        import subprocess
+        k = os.path.join(self.d, "k")
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", k], check=True)
+        with open(k + ".pub") as f:
+            b64 = f.read().split()[1]
+        want = subprocess.run(["ssh-keygen", "-lf", k + ".pub"], check=True,
+                              capture_output=True, text=True).stdout.split()[1]
+        self.assertEqual(thunderctl.host_key_fingerprint(b64), want)
+
+    async def test_scan_then_pin_writes_known_hosts(self):
+        sh = FakeShare()
+        lan = _lan(sh, self.d, self.clock, pinned=False)
+        self.assertFalse(lan.configured())
+        with self.assertRaises(ValueError):
+            lan.pin("SHA256:x")                           # nothing scanned
+        fp = await lan.scan()
+        self.assertEqual(sh.calls[-1], ["ssh-keyscan", "-t", "ed25519", "--", "192.168.8.24"])
+        self.assertEqual(fp, thunderctl.host_key_fingerprint(_ED_B64))
+        self.assertFalse(os.path.exists(lan.known_hosts_path))    # memory only
+        with self.assertRaises(ValueError):
+            lan.pin("SHA256:someone-else")               # not the confirmed one
+        gen = lan.generation
+        lan.pin(fp)
+        with open(lan.known_hosts_path) as f:
+            self.assertEqual(f.read(), f"192.168.8.24 ssh-ed25519 {_ED_B64}\n")
+        self.assertEqual(os.stat(lan.known_hosts_path).st_mode & 0o777, 0o600)
+        self.assertTrue(lan.configured())
+        self.assertEqual(lan.pinned_fingerprint(), fp)
+        self.assertGreater(lan.generation, gen)
+
+    async def test_scan_refuses_what_is_no_ed25519_key_of_that_host(self):
+        sh = FakeShare()
+        lan = _lan(sh, self.d, self.clock, pinned=False)
+        for ans in ((0, b"# comment only\n", b""),
+                    (0, f"10.0.0.9 ssh-ed25519 {_ED_B64}\n".encode(), b""),
+                    (0, b"192.168.8.24 ssh-ed25519 not*base64\n", b""),
+                    (1, b"", b"getaddrinfo: no such host")):
+            sh.keyscan = ans
+            with self.subTest(ans=ans), self.assertRaises(RuntimeError):
+                await lan.scan()
+        self.assertEqual(lan.scanned_fingerprint(), "")
+
+    async def test_sha_cached_per_path_and_size(self):
+        sh = FakeShare()
+        sh.files["vae/a.st"] = b"xyz"
+        lan = _lan(sh, self.d, self.clock)
+        h = await lan.sha256("models/vae/a.st", 3)
+        self.assertEqual(h, hashlib.sha256(b"xyz").hexdigest())
+        await lan.sha256("models/vae/a.st", 3)
+        self.assertEqual(len(sh.calls), 1)
+        await lan.sha256("models/vae/a.st", 4)            # another size: asked again
+        self.assertEqual(len(sh.calls), 2)
+        lan.forget_sha("models/vae/a.st", 3)
+        await lan.sha256("models/vae/a.st", 3)
+        self.assertEqual(len(sh.calls), 3)
+        with self.assertRaises(RuntimeError):
+            await lan.sha256("models/vae/missing.st", 3)  # refused (rc 2)
+
+    async def test_refresh_is_cached_and_failures_retry_sooner(self):
+        sh = FakeShare()
+        sh.files["vae/a.st"] = b"x"
+        lan = _lan(sh, self.d, self.clock)
+        self.assertEqual(lan.problem(), "not listed yet")
+        await lan.refresh()
+        await lan.refresh()
+        self.assertEqual(len(sh.lists()), 1)
+        self.assertTrue(lan.usable())
+        self.clock[0] += 599
+        await lan.refresh()
+        self.assertEqual(len(sh.lists()), 1)
+        self.clock[0] += 2
+        sh.list_rc, sh.list_err = 255, b"Host key verification failed."
+        await lan.refresh()
+        self.assertEqual(lan.problem(), "unreachable: Host key verification failed.")
+        self.clock[0] += 61                               # a failure retries after 1 min
+        sh.list_rc = 0
+        await lan.refresh()
+        self.assertEqual(len(sh.lists()), 3)
+        self.assertTrue(lan.usable())
 
 
 if __name__ == "__main__":

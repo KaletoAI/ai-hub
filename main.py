@@ -6026,8 +6026,84 @@ def _thunder_hf_token() -> str:
     return str((store.get_setting("hf_token") if store.is_active() else "") or "")
 
 
+def _thunder_datadir() -> str:
+    """thunder.key, modelsrc.key and the known_hosts files sit next to store.db (and
+    secret.key)."""
+    return os.path.dirname(os.path.abspath(jobs_cfg.get("store_path", "store.db")))
+
+
+# ── the LAN model source (thunderctl.LanSource, ops/modelsrc-serve.sh on the share) ──
+# ONE per gateway: every Thunder controller reads the same share, so the index cache,
+# the sha256 cache and the pinned host key are shared. Rebuilt only when the data dir
+# moves (a test, a store_path change).
+_modelsrc_obj: Optional["thunderctl.LanSource"] = None
+_modelsrc_key_task: Optional[asyncio.Task] = None
+
+
+def _modelsrc_host() -> str:
+    """Store setting `modelsrc_host` (default modelsrc@192.168.8.24). Returned raw: the
+    LanSource holds it to plain characters (the `_VOICE_HOST_RE` rule) before any argv."""
+    v = store.get_setting("modelsrc_host") if store.is_active() else None
+    v = str(v or "").strip()
+    return v or thunderctl.MODELSRC_HOST_DEFAULT
+
+
+def modelsrc() -> "thunderctl.LanSource":
+    global _modelsrc_obj
+    d = _thunder_datadir()
+    if _modelsrc_obj is None or _modelsrc_obj.datadir != d:
+        _modelsrc_obj = thunderctl.LanSource(d, host=_modelsrc_host, log=logger.info)
+    return _modelsrc_obj
+
+
+def _modelsrc_prepare() -> None:
+    """modelsrc.key exists before the console shows it: its public half is what the
+    operator installs on the share host FIRST. Generated in the background at boot (and
+    for a Thunder backend added later), never by a page view."""
+    global _modelsrc_key_task
+    if not thunder_controllers or os.path.exists(modelsrc().key_path + ".pub"):
+        return
+    if _modelsrc_key_task is not None and not _modelsrc_key_task.done():
+        return
+
+    async def gen():
+        try:
+            await modelsrc().ensure_key()
+        except Exception as e:              # the panel then shows no key; logged
+            logger.warning(f"[modelsrc] key generation failed: {type(e).__name__}: {e}")
+    _modelsrc_key_task = _bg(gen())
+
+
+def modelsrc_view() -> dict:
+    """The console's LAN-source block (LanSource.view: no network)."""
+    return modelsrc().view()
+
+
+async def modelsrc_scan() -> str:
+    """The console's "Fetch host key": ssh-keyscan → the fingerprint to compare. Nothing
+    is trusted yet."""
+    lan = modelsrc()
+    try:
+        fp = await lan.scan()
+    except (RuntimeError, ValueError) as e:
+        return f"host key not fetched: {e}"
+    return (f"host key of {lan.host()}: {fp} — compare it with the share host's "
+            "(ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub) before confirming")
+
+
+async def modelsrc_pin(fingerprint: str) -> str:
+    """The console's "Confirm fingerprint": pins the key fetched before (refused when it
+    is not the one `fingerprint` names), then the share is listed at the next sync."""
+    try:
+        fp = modelsrc().pin(str(fingerprint or "").strip())
+    except (ValueError, OSError) as e:
+        return f"host key not pinned: {e}"
+    return f"host key {fp} pinned — the LAN source is listed with the next model sync"
+
+
 def _thunder_deps() -> "thunderctl.Deps":
     ops = _HERE / "ops"
+    lan = modelsrc()
     return thunderctl.Deps(
         # own client per controller (closed by Controller.aclose): Thunder calls must not
         # compete with proxied traffic for the shared pool, nor outlive a closed one
@@ -6037,17 +6113,16 @@ def _thunder_deps() -> "thunderctl.Deps":
         inflight=lambda bid: backend_inflight.get(bid, 0),
         is_draining=lambda bid: bid in _draining,
         note_fault=_note_fault,
-        # thunder.key / thunder-known_hosts/ sit next to store.db (and secret.key)
-        datadir=os.path.dirname(os.path.abspath(jobs_cfg.get("store_path", "store.db"))),
+        datadir=_thunder_datadir(),
         probe_comfy=_thunder_probe,
         bootstrap_script=lambda: (ops / "thunder-bootstrap.sh").read_bytes(),
         log=logger.info,
         known_uuids=_thunder_known_uuids,
         default_nodes=lambda: (ops / "thunder-nodes.default.txt").read_text("utf-8"),
         alias_needs=thunder_alias_needs, alias_signature=thunder_alias_signature,
-        # P2: no LAN source — files resolve through the URL catalog (and the manifest);
-        # Task 15 returns the LAN index here
-        source_index=lambda: {},
+        # the LAN share's last good listing ({} until pinned and listed), and the share
+        # itself for its refresh, the stream and the sha256
+        source_index=lan.cached, lan=lan,
         url_catalog=lambda: modelsync.url_catalog(_modelsync_catalog()),
         hf_token=_thunder_hf_token)
 
@@ -6102,6 +6177,7 @@ def sync_thunder_controllers() -> None:
             c = thunder_controllers[name] = thunderctl.Controller(b, _thunder_deps())
             if _thunder_booted:
                 _thunder_run(name, c)
+                _modelsrc_prepare()
         else:
             c.backend = b
     for name in [n for n in thunder_controllers if n not in want]:
@@ -6121,6 +6197,7 @@ def _thunder_boot() -> None:
     _thunder_booted = True
     for name, c in list(thunder_controllers.items()):
         _thunder_run(name, c)
+    _modelsrc_prepare()
 
 
 async def _thunder_shutdown() -> None:
@@ -6129,6 +6206,8 @@ async def _thunder_shutdown() -> None:
     global _thunder_booted
     _thunder_booted = False
     tasks = [t for ts in _thunder_tasks.values() for t in ts if not t.done()]
+    if _modelsrc_key_task is not None and not _modelsrc_key_task.done():
+        tasks.append(_modelsrc_key_task)
     for t in tasks:
         t.cancel()
     if tasks:
@@ -6476,6 +6555,8 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
            thunder_names=lambda: list(thunder_controllers),
            thunder_default_nodes=_thunder_default_nodes,
            thunder_sync_now=thunder_sync_now, thunder_delete_unknown=thunder_delete_unknown,
+           thunder_modelsrc_view=modelsrc_view, thunder_modelsrc_scan=modelsrc_scan,
+           thunder_modelsrc_pin=modelsrc_pin,
            modelsync_catalog=_modelsync_catalog, save_modelsync_catalog=save_modelsync_catalog,
            backend_loras=lambda: {b["name"]: sorted(backend_loras.get(backend_id(b), set()))
                                   for b in backends if b.get("type") == "comfyui"})

@@ -775,5 +775,107 @@ class DefaultCatalog(unittest.TestCase):
         self.assertTrue(ms.ready(p, "t"), p["per_alias"]["t"])
 
 
+
+# --- Hugging Face cache symlinks (Task 15) -------------------------------------------------
+_HF = "hf-cache/hub/models--o--n/"
+_BLOB = _HF + "blobs/abc123"
+_SNAP = _HF + "snapshots/r1/model.safetensors"
+_REF = _HF + "refs/main"
+
+
+class Links(unittest.TestCase):
+    """An HF cache repo is blobs/<sha> FILES + snapshots/<rev>/<name> SYMLINKS + refs/.
+    Syncing only the files leaves a cache the HF loader cannot read (it opens the
+    snapshot path) — it re-downloads or fails, while the plan said "ready"."""
+
+    def hf(self, extra_src=None, dest=None, manifest=None):
+        src = {_BLOB: 50, _REF: 1, _SNAP: {"link": "../../blobs/abc123"}}
+        src.update(extra_src or {})
+        n = need("hf", [], [_HF])
+        return ms.plan([n], src, dest or {}, manifest or {}, {})
+
+    def test_resolve_link_grammar(self):
+        self.assertEqual(ms.resolve_link(_SNAP, "../../blobs/abc123"), _BLOB)
+        for bad in ("/abs/x", "../../.hidden/x", "../../blobs/../x", "", "a\\b",
+                    "../../../../../../x", "x/", "a//b", "./x"):
+            with self.subTest(bad=bad):
+                self.assertIsNone(ms.resolve_link(_SNAP, bad))
+
+    def test_catalog_dir_syncs_its_links(self):
+        p = self.hf()
+        row = p["per_alias"]["hf"]
+        self.assertEqual(row["blocked"], [])
+        links = [f for f in row["files"] if f.get("link")]
+        self.assertEqual([(f["path"], f["link"], f["size"]) for f in links],
+                         [(_SNAP, "../../blobs/abc123", 0)])
+        e = next(e for e in p["fetch"] if e["path"] == _SNAP)
+        self.assertEqual((e["source"], e["target"], e["size"]), ("link", "../../blobs/abc123", 0))
+        self.assertIn(_SNAP, row["missing"])
+        self.assertFalse(ms.ready(p, "hf"))
+
+    def test_present_link_is_not_fetched_again_and_counts_ready(self):
+        dest = {_BLOB: 50, _REF: 1, _SNAP: {"link": "../../blobs/abc123"}}
+        p = self.hf(dest=dest)
+        self.assertEqual(p["fetch"], [])
+        self.assertTrue(ms.ready(p, "hf"))
+        self.assertEqual(p["unknown"], [])
+        # the same path with another target text is not the link the source has
+        p = self.hf(dest=dict(dest, **{_SNAP: {"link": "../../blobs/zzz"}}))
+        self.assertEqual(fetched(p), [_SNAP])
+
+    def test_link_to_a_file_the_alias_does_not_sync_is_dropped(self):
+        # the target is outside the catalog dir: syncing the link would dangle
+        src = {_BLOB: 50, _REF: 1, "hf-cache/hub/models--x--y/snapshots/r/w.bin":
+               {"link": "../../../models--o--n/blobs/abc123"}}
+        n = need("hf", [], ["hf-cache/hub/models--x--y/", _HF])
+        p = ms.plan([n], src, {}, {}, {})
+        self.assertEqual([f["path"] for f in p["per_alias"]["hf"]["files"] if f.get("link")],
+                         ["hf-cache/hub/models--x--y/snapshots/r/w.bin"])
+        n = need("hf", [], ["hf-cache/hub/models--x--y/"])
+        p = ms.plan([n], dict(src, **{"hf-cache/hub/models--x--y/f.bin": 1}), {}, {}, {})
+        self.assertFalse([f for f in p["per_alias"]["hf"]["files"] if f.get("link")])
+
+    def test_cross_root_link_is_dropped(self):
+        # models/… and hf-cache/… do not sit side by side on the instance
+        src = {"models/vae/a.safetensors": 5,
+               "models/vae/l.safetensors": {"link": "../../hf-cache/hub/x"},
+               "hf-cache/hub/x": 3}
+        p = ms.plan([need("v", [], ["models/vae/"])], src, {}, {}, {})
+        self.assertEqual([f["path"] for f in p["per_alias"]["v"]["files"]],
+                         ["models/vae/a.safetensors"])
+
+    def test_single_file_catalog_path_that_is_a_link_brings_its_target(self):
+        p = ms.plan([need("s", [], [_SNAP])], {_BLOB: 50, _SNAP: {"link": "../../blobs/abc123"}},
+                    {}, {}, {})
+        self.assertEqual(sorted(f["path"] for f in p["per_alias"]["s"]["files"]), [_BLOB, _SNAP])
+        self.assertEqual(p["per_alias"]["s"]["blocked"], [])
+
+    def test_manifest_link_is_pruned_with_its_dir_and_verifies_while_source_down(self):
+        man = {_BLOB: {"size": 50, "aliases": ["hf"]}, _REF: {"size": 1, "aliases": ["hf"]},
+               _SNAP: {"size": 0, "source": "link", "target": "../../blobs/abc123",
+                       "aliases": ["hf"]}}
+        dest = {_BLOB: 50, _REF: 1, _SNAP: {"link": "../../blobs/abc123"}}
+        # the LAN box is down (empty index): the manifest still verifies files AND link
+        p = ms.plan([need("hf", [], [_HF])], {}, dest, man, {})
+        self.assertTrue(ms.ready(p, "hf"), p["per_alias"]["hf"])
+        self.assertEqual(p["prune"], [])
+        # the alias is gone: the link is pruned with the files it belongs to
+        p = ms.plan([], {}, dest, man, {})
+        self.assertEqual(sorted(p["prune"]), sorted([_BLOB, _REF, _SNAP]))
+        self.assertEqual(p["unknown"], [])
+
+    def test_dest_links_nobody_synced_are_unknown(self):
+        p = ms.plan([], {}, {"hf-cache/hub/m/snapshots/r/x": {"link": "../../blobs/b"}}, {}, {})
+        self.assertEqual(p["unknown"], [["hf-cache/hub/m/snapshots/r/x", 0]])
+
+    def test_a_file_in_the_source_beats_a_manifest_link(self):
+        man = {_SNAP: {"size": 0, "source": "link", "target": "../../blobs/abc123",
+                       "aliases": ["hf"]}}
+        p = ms.plan([need("hf", [], [_HF])], {_BLOB: 50, _SNAP: 7}, {}, man, {})
+        rows = {f["path"]: f for f in p["per_alias"]["hf"]["files"]}
+        self.assertEqual(rows[_SNAP]["size"], 7)
+        self.assertNotIn("link", rows[_SNAP])
+
+
 if __name__ == "__main__":
     unittest.main()
