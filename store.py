@@ -399,9 +399,11 @@ def delete_backend_references(name: str) -> dict:
 
 
 # ── Server settings (UI-managed overrides of config.yaml) ────────────────────────
-# Secret-valued keys (api_key) are encrypted at rest like backend keys.
+# Secret-valued keys (api_key, the Thunder model sync's hf_token) are encrypted at rest
+# like backend keys; a row written before a key joined this set stays readable through
+# decrypt_secret's legacy-plaintext passthrough and is encrypted on its next save.
 
-_SECRET_SETTINGS = {"api_key"}
+_SECRET_SETTINGS = {"api_key", "hf_token"}
 
 
 def save_backend_models(bid: str, models) -> None:

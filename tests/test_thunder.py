@@ -144,6 +144,32 @@ class Cost(unittest.TestCase):
         self.assertAlmostEqual(thunder.snapshot_monthly(PRICING, 100), 100 * 0.00006849 * 730)
 
 
+class ForeignSnapshots(unittest.TestCase):
+    """A snapshot named like ours (`aihub-`) that no current Thunder backend owns keeps
+    billing $/month unseen — a renamed backend leaves every old one behind, and rotation
+    only ever looks at the CURRENT name's snapshots."""
+
+    def _s(self, name, sid, gb=120, status="READY"):
+        return {"id": sid, "name": name, "status": status, "min_disk_gb": gb, "created_at": 1}
+
+    def test_orphan_snapshot_warning(self):
+        snaps = [self._s("aihub-thunder-20260926t120000z", "s1"),             # owned
+                 self._s("aihub-thunder-a6000-20260926t120000z", "s2", 200),  # renamed away
+                 self._s("aihub-thunder-manual", "s3", 0),                    # hand-made
+                 self._s("my-own-snapshot", "s4")]                            # not ours
+        out = thunder.foreign_snapshots(snaps, ["thunder"], PRICING)
+        self.assertEqual([o["id"] for o in out], ["s2", "s3"])
+        self.assertAlmostEqual(out[0]["monthly"], thunder.snapshot_monthly(PRICING, 200))
+        self.assertEqual(out[0]["gb"], 200)
+        self.assertIsNone(out[1]["monthly"])            # no size → no made-up price
+        # a backend of that name owns it again
+        self.assertEqual([o["id"] for o in thunder.foreign_snapshots(
+            snaps, ["thunder", "thunder-a6000"], PRICING)], ["s3"])
+        # no price list: sizes still shown, no $/month
+        self.assertIsNone(thunder.foreign_snapshots(snaps, [], None)[0]["monthly"])
+        self.assertEqual(thunder.foreign_snapshots(None, ["x"], PRICING), [])
+
+
 class Body(unittest.TestCase):
     def test_create_body(self):
         b = thunder.create_body({"gpu_type": "a6000", "num_gpus": 1, "vcpus": 8}, "comfy-ui", 220, "ssh-ed25519 AAA")

@@ -2248,6 +2248,62 @@ class Orphans(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([m for m, _ in _paths(fake)], ["GET"])
 
 
+class CostGuard(unittest.IsolatedAsyncioTestCase):
+    """Spec "Fehlerbehandlung": phase != off for more than 24 h → a warning banner. An
+    instance forgotten over a weekend bills ~60 h unseen; the flag is what the panel and
+    the Dashboard key the banner on, judged on the controller's own clock."""
+
+    def test_long_running_after_24h(self):
+        fake = FakeThunder()
+        c, _, _, _ = make(fake, state=_persisted())
+        now = c.h.clock[0]
+        c.state.started_at = now - 25 * 3600
+        self.assertTrue(c.view()["long_running"])
+        c.state.started_at = now - 23 * 3600
+        self.assertFalse(c.view()["long_running"])
+        c.state.started_at = 0.0                           # no session: never a banner
+        self.assertFalse(c.view()["long_running"])
+        c.state.started_at, c.state.phase = now - 30 * 3600, "off"
+        self.assertFalse(c.view()["long_running"])
+        c.state.phase = "failed"                           # a failed instance still bills
+        self.assertTrue(c.view()["long_running"])
+
+
+class AccountRefresh(unittest.IsolatedAsyncioTestCase):
+    """run_forever keeps the account view current (price list, snapshot list, foreign
+    instances) every 10 min — the console only ever renders caches, so without this the
+    orphan warnings and the $/h figure would show only what a start/stop happened to
+    fetch (the instance orphans: never)."""
+
+    async def test_refreshed_every_10_min_not_per_round(self):
+        fake = FakeThunder()
+        _inst(fake, idx="4", uuid="stranger")
+        fake.snaps.append({"id": "x1", "name": "aihub-old-20260920t120000z", "status": "READY",
+                           "minimumDiskSizeGb": 80, "createdAt": 1})
+        c, _, _, _ = make(fake, state={"phase": "off"})
+        await _one_round(c)
+        got = {p for m, p, _ in fake.calls}
+        self.assertTrue({"/instances/list", "/snapshots/list", "/v2/pricing"} <= got, got)
+        self.assertEqual([o["uuid"] for o in c.view()["orphans"]], ["stranger"])
+        self.assertEqual([s["id"] for s in c.snapshots()], ["x1"])
+        self.assertAlmostEqual(c.pricing_table()["snapshot_gb"], 0.00006849)
+        n = len(fake.calls)
+        await _one_round(c)                                 # 60 s later: cached
+        self.assertEqual(len(fake.calls), n)
+        c.h.clock[0] += 600
+        await _one_round(c)
+        self.assertGreater(len(fake.calls), n)
+
+    async def test_no_token_no_calls(self):
+        fake = FakeThunder()
+        c, _, _, _ = make(fake, state={"phase": "off"})
+        c.backend = dict(c.backend, api_key="")
+        await _one_round(c)
+        self.assertEqual(fake.calls, [])
+        self.assertEqual(c.snapshots(), [])
+        self.assertIsNone(c.pricing_table())
+
+
 class BootstrapParse(unittest.TestCase):
     def test_prefix_not_position(self):
         r = thunderctl.parse_bootstrap(
@@ -4311,6 +4367,40 @@ class LanSourceUnit(unittest.IsolatedAsyncioTestCase):
             with self.subTest(ans=ans), self.assertRaises(RuntimeError):
                 await lan.scan()
         self.assertEqual(lan.scanned_fingerprint(), "")
+
+    async def test_host_change_drops_the_index_and_names_the_stale_pin(self):
+        """Task 15 review: after `modelsrc_host` changes, the old listing belongs to
+        ANOTHER share and the pin to another host — neither may be used, and the reason
+        must say what to do instead of a bare "unreachable"."""
+        sh = FakeShare()
+        sh.files["vae/a.st"] = b"xyz"
+        host = ["modelsrc@192.168.8.24"]
+        lan = thunderctl.LanSource(self.d, host=lambda: host[0], ssh=sh.ssh,
+                                   keygen=_fake_keygen, now=lambda: self.clock[0])
+        with open(lan.known_hosts_path, "w") as f:
+            f.write(f"192.168.8.24 ssh-ed25519 {_ED_B64}\n")
+        await lan.refresh()
+        await lan.sha256("models/vae/a.st", 3)
+        self.assertEqual(lan.cached(), {"models/vae/a.st": 3})
+        await lan.scan()
+        gen = lan.generation
+        host[0] = "src@10.0.0.9"
+        self.assertEqual(lan.problem(),
+                         "pinned for 192.168.8.24, not 10.0.0.9 — fetch its key")
+        self.assertFalse(lan.configured())
+        self.assertEqual(lan.cached(), {})
+        self.assertGreater(lan.generation, gen)
+        self.assertEqual(lan.scanned_fingerprint(), "")
+        v = lan.view()
+        self.assertFalse(v["pinned"])
+        self.assertEqual(v["files"], 0)
+        # back to the pinned host: pinned again, but the old listing is gone for good
+        host[0] = "modelsrc@192.168.8.24"
+        self.assertTrue(lan.configured())
+        self.assertEqual(lan.problem(), "not listed yet")
+        n = len(sh.calls)
+        await lan.sha256("models/vae/a.st", 3)             # sha cache dropped with it
+        self.assertEqual(len(sh.calls), n + 1)
 
     async def test_sha_cached_per_path_and_size(self):
         sh = FakeShare()

@@ -151,8 +151,11 @@ def parse_snapshots(obj) -> list[dict]:
     return out
 
 
+SNAPSHOT_FAMILY = "aihub-"            # every snapshot this gateway writes starts so
+
+
 def snapshot_prefix(backend_name: str) -> str:
-    return f"aihub-{_slug(backend_name)}-"
+    return f"{SNAPSHOT_FAMILY}{_slug(backend_name)}-"
 
 
 def snapshot_name(backend_name: str, now: float) -> str:
@@ -167,6 +170,29 @@ def _owned(snap: dict, backend_name: str) -> bool:
     `snapshot_name` writes."""
     name, prefix = snap.get("name") or "", snapshot_prefix(backend_name)
     return name.startswith(prefix) and _STAMP_RE.fullmatch(name[len(prefix):]) is not None
+
+
+def foreign_snapshots(snaps, backend_names, pricing: Optional[dict] = None) -> list[dict]:
+    """Snapshots named like this gateway's (`aihub-…`) that NO current Thunder backend
+    owns (`_owned` against every name) — `{id, name, status, gb, monthly}`, by name.
+    Rotation only ever looks at the current name's snapshots, so a renamed or deleted
+    backend leaves its old ones billing $/month unseen. Display only: a hand-made
+    `aihub-…` snapshot lands here too, which is why nothing ever deletes from this list.
+    `gb` is Thunder's minimum restore disk (it reports no size), `monthly` None without a
+    price list or a size — never a made-up figure."""
+    names = [str(n) for n in (backend_names or [])]
+    out = []
+    for s in snaps or []:
+        if not isinstance(s, dict):
+            continue
+        name = str(s.get("name") or "")
+        if not name.startswith(SNAPSHOT_FAMILY) or any(_owned(s, n) for n in names):
+            continue
+        gb = _int(s.get("min_disk_gb")) or None
+        out.append({"id": str(s.get("id") or ""), "name": name,
+                    "status": str(s.get("status") or ""), "gb": gb,
+                    "monthly": snapshot_monthly(pricing, gb) if (gb and pricing) else None})
+    return sorted(out, key=lambda x: (x["name"], x["id"]))
 
 
 def newest_ready(snaps: list[dict], backend_name: str) -> Optional[dict]:

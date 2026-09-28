@@ -202,6 +202,14 @@ _thunder_modelsrc_view: Callable[[], Optional[dict]] = lambda: None
 _thunder_modelsrc_scan: Callable = None
 _thunder_modelsrc_pin: Callable = None
 _save_modelsync_catalog: Callable[[list], list] = lambda cat: ["catalog store not available"]
+# Task 16: the LAN share's host (save → refusal text, "" = saved), the HF token (save →
+# refusal, "" = saved; "" as the value removes it — the console never shows it, only
+# whether one is set) and the `aihub-` snapshots no Thunder backend owns (from the
+# controllers' caches — no API call per render).
+_save_modelsrc_host: Callable = None
+_save_hf_token: Callable = None
+_hf_token_set: Callable[[], bool] = lambda: False
+_thunder_orphan_snapshots: Callable[[], list] = lambda: []
 
 
 def bind(**overrides) -> None:
@@ -904,7 +912,8 @@ _POST_ACTIONS = frozenset((
     "/ui/backends/restart", "/ui/backends/enable",
     "/ui/thunder/start", "/ui/thunder/stop", "/ui/thunder/restart", "/ui/thunder/forget",
     "/ui/thunder/sync", "/ui/thunder/delete-unknown", "/ui/thunder/catalog",
-    "/ui/thunder/modelsrc-scan", "/ui/thunder/modelsrc-pin",
+    "/ui/thunder/modelsrc-scan", "/ui/thunder/modelsrc-pin", "/ui/thunder/modelsrc-host",
+    "/ui/thunder/hf-token",
     "/ui/chat/badd", "/ui/chat/bdel", "/ui/chat/delete",
     "/ui/mapping/field-add", "/ui/mapping/field-map", "/ui/mapping/field-clear",
     "/ui/mapping/field-del", "/ui/mapping/cand-add", "/ui/mapping/cand-del",
@@ -2179,10 +2188,14 @@ async def backends_page(request: Request):
 
 
 async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
-                         catalog_refused: Optional[tuple] = None) -> HTMLResponse:
+                         catalog_refused: Optional[tuple] = None,
+                         hf_refused: Optional[str] = None,
+                         modelsrc_refused: Optional[tuple] = None) -> HTMLResponse:
     """The Backends tab; `detail` replaces the right column (a refused Save, re-rendered
     — then never live: the page's URL is the POST action, which a GET poll cannot fetch).
-    `catalog_refused` = (text, reasons) of a refused model-sync catalog Save, likewise."""
+    `catalog_refused` = (text, reasons) of a refused model-sync catalog Save, likewise;
+    `hf_refused` = the reason an HF-token Save was refused (the value is never shown),
+    `modelsrc_refused` = (host as typed, reason) of a refused `modelsrc_host` Save."""
     edit_id = qp.get("edit", "")
     # Captured NOW: every branch below assigns `detail`, so testing it at the end made
     # the tab never live — drain, scan and a running Thunder instance all froze.
@@ -2190,6 +2203,7 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
     # stays static — the morph's attribute sync would reset every visibility the type
     # select's handler set (switch to comfyui, and 3 s later its panes vanish).
     static = (detail is not None or catalog_refused is not None or bool(edit_id)
+              or hf_refused is not None or modelsrc_refused is not None
               or bool(qp.get("new")) or bool(qp.get("host")))
     binfo = _gateway_info().get("backends", [])
     # editable from either source: store (full dict incl. api_key) or the live summary (config)
@@ -2292,7 +2306,8 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
                  f'<form action="/ui/backends/scan" method="post" style="display:inline">'
                  f'{_btn("Scan network", kind="secondary", submit=True)}</form></div>'
                  + msg_html
-                 + _thunder_panel(tviews, binfo, catalog_refused)
+                 + _thunder_panel(tviews, binfo, catalog_refused, hf_refused,
+                                  modelsrc_refused)
                  + f"<p class='hint'>Edit a backend to manage it here (editing a config one creates an "
                  f"editable copy that overrides it).</p>{items}"
                  + _hosts_panel(binfo, qp.get("host", ""))
@@ -3228,6 +3243,17 @@ def _thunder_sync(k: str, name: str, v: dict) -> str:
     return "".join(out)
 
 
+def _thunder_longrun_text(name: str, v: dict) -> str:
+    """The cost guard's words (spec "Kosten-Wächter"), one text for the card and the
+    Dashboard: whole hours up and the session's cost so far — "cost unknown" before the
+    price list arrived, never a made-up figure."""
+    h = _nbytes(v.get("uptime_s")) // 3600
+    cost = v.get("session_cost")
+    tail = (f"(≈ {_money(cost)})" if cost is not None
+            else "(cost unknown — no price list yet)")
+    return f"Thunder {name} running for {h} h {tail}"
+
+
 def _thunder_card(name: str, v: dict, cfg: Optional[dict]) -> str:
     """One Thunder backend's lifecycle card. Every row carries a `data-k` (the live
     morph matches by key), and nothing here needs a script."""
@@ -3238,6 +3264,9 @@ def _thunder_card(name: str, v: dict, cfg: Optional[dict]) -> str:
                               else ""), _THUNDER_PHASE_KIND.get(phase, "warn"))
             + (" " + _badge(f"⏳ {op}", "warn", "operation in flight") if op else ""))
     rows = [f'<div class="item-title" data-k="{_esc(k)}-head">{head}</div>']
+    if v.get("long_running"):
+        rows.append(f'<p class="bad" data-k="{_esc(k)}-longrun">⚠ '
+                    f"{_esc(_thunder_longrun_text(name, v))} — stop it if nothing needs it.</p>")
     if v.get("error"):
         rows.append(f'<p class="bad" data-k="{_esc(k)}-err">{_esc(v["error"])}</p>')
     if v.get("persist_blocked"):
@@ -3343,10 +3372,32 @@ def _thunder_card(name: str, v: dict, cfg: Optional[dict]) -> str:
     return f'<div class="tcard" data-k="{_esc(k)}">{"".join(rows)}</div>'
 
 
-def _catalog_editor(refused: Optional[tuple] = None) -> str:
+def _hf_token_form(refused: Optional[str] = None) -> str:
+    """The HF token (setting `hf_token`, encrypted at rest) for gated Hugging Face
+    downloads — the backend-key pattern: never rendered back, blank keeps it, the box
+    removes it. A refused Save shows why, never the value."""
+    try:
+        is_set = bool(_hf_token_set())
+    except Exception as e:                              # noqa: BLE001 — a form, not the tab
+        logger.warning(f"ui: HF token state unreadable: {type(e).__name__}: {e}")
+        is_set = False
+    return ('<form method="post" action="/ui/thunder/hf-token" data-k="thunder-hftoken" '
+            'data-guard>' + (_form_err(refused) if refused else "")
+            + _field("HF token", _inp("hf_token", "", typ="password",
+                                      placeholder=("•••• set — blank keeps it" if is_set
+                                                   else "not set — needed for gated repos"))
+                     + _checkbox("hf_token_clear", False, "clear",
+                                 "remove the stored token on Save"),
+                     hint="Sent as the bearer token of Hugging Face catalog downloads on the "
+                          "instance; stored encrypted, never shown again.")
+            + f'<div class="tacts">{_btn("Save token", submit=True, sm=True)}</div></form>')
+
+
+def _catalog_editor(refused: Optional[tuple] = None, hf_refused: Optional[str] = None) -> str:
     """The model-sync catalog (setting `modelsync_catalog`, one for every Thunder
-    backend) as a JSON textarea. `refused` = (text as typed, [reasons]): a Save the
-    validator turned down comes back open, with the text exactly as typed."""
+    backend) as a JSON textarea, and the HF token below it. `refused` = (text as typed,
+    [reasons]): a Save the validator turned down comes back open, with the text exactly
+    as typed; `hf_refused` (a refused token Save) opens it too."""
     if refused is not None:
         text, errs = refused
         n = "?"
@@ -3359,8 +3410,9 @@ def _catalog_editor(refused: Optional[tuple] = None) -> str:
         text, errs = json.dumps(cat, indent=1, ensure_ascii=False), []
         n = str(len(cat)) if isinstance(cat, list) else "?"
     err = "".join(_form_err(e) for e in errs[:30])
-    return (f'<details class="optblock" data-k="thunder-catalog"{" open" if refused else ""}>'
-            f"<summary>Model-sync catalog ({n} entries)</summary>"
+    opened = refused is not None or hf_refused is not None
+    return (f'<details class="optblock" data-k="thunder-catalog"{" open" if opened else ""}>'
+            f"<summary>Model-sync catalog ({n} entries) and HF token</summary>"
             '<form method="post" action="/ui/thunder/catalog" data-guard>' + err
             + "<p class='hint'>What no workflow names, for every Thunder backend. Entries: "
             "<code>{\"match\": {\"class\": …, \"value\": …}, \"paths\": […]}</code> "
@@ -3372,7 +3424,7 @@ def _catalog_editor(refused: Optional[tuple] = None) -> str:
             "<code>hf-cache/</code>; a trailing <code>/</code> is a whole directory.</p>"
             + _textarea("catalog", text, rows=16)
             + f'<div class="tacts">{_btn("Save catalog", submit=True, sm=True)}</div>'
-            "</form></details>")
+            "</form>" + _hf_token_form(hf_refused) + "</details>")
 
 
 # What the operator runs on the share host (ops/modelsrc-serve.sh's header, Task 14):
@@ -3390,7 +3442,7 @@ _MODELSRC_INSTALL = (
     "chmod 600 /var/lib/modelsrc/.ssh/authorized_keys")
 
 
-def _modelsrc_block() -> str:
+def _modelsrc_block(refused: Optional[tuple] = None) -> str:
     """The LAN model source (one for every Thunder backend): not set up → the public key
     and the install command; the host-key pin as two POSTs — "Fetch host key" shows the
     fingerprint (kept in memory only), "Confirm fingerprint" asks with that fingerprint
@@ -3408,7 +3460,7 @@ def _modelsrc_block() -> str:
     pub = str(mv.get("public_key") or "")
     pinned = bool(mv.get("pinned"))
     badge = (_badge("ready", "ok") if not problem
-             else _badge("not set up", "warn") if not pinned
+             else _badge("not set up", "warn") if (not pinned and problem == "not configured")
              else _badge(problem[:80], "bad" if mv.get("error") else "warn", problem))
     rows = [f'<div class="item-title" data-k="{k}-head"><b>LAN model source</b> '
             f"<code>{_esc(host)}</code> {badge}</div>"]
@@ -3417,6 +3469,10 @@ def _modelsrc_block() -> str:
                 "generated when the gateway starts a Thunder controller — reload shortly.</p>")
     install = (f'<pre class="tlog" data-k="{k}-install">'
                f'{_esc(_MODELSRC_INSTALL.format(pub=pub or "<public key above>"))}</pre>')
+    if not pinned and problem and problem != "not configured":
+        # a pin for the PREVIOUS host, or a host that is no plain [user@]host: say so,
+        # or every list fails as "unreachable" and points at the network
+        rows.append(f'<p class="bad" data-k="{k}-problem">{_esc(problem)}</p>')
     if not pinned:
         rows.append(f'<p class="hint" data-k="{k}-setup">LAN source: not set up — model files '
                     "only the LAN share has wait until its host key is pinned. This "
@@ -3451,21 +3507,62 @@ def _modelsrc_block() -> str:
                              "transfer.",
                      title="Trust this host key for the LAN source")
     rows.append(f'<div class="tacts" data-k="{k}-acts">{acts}</div>')
+    typed = refused[0] if refused is not None else host
+    rows.append(f'<form method="post" action="/ui/thunder/modelsrc-host" data-k="{k}-hostform" '
+                "data-guard>" + (_form_err(refused[1]) if refused is not None else "")
+                + _field("share host", _inp("modelsrc_host", typed,
+                                            placeholder="modelsrc@192.168.8.24"),
+                         hint="<code>[user@]host</code> of the LAN model share (blank = the "
+                              "default). A new host needs its key fetched and confirmed "
+                              "again; the old listing is dropped at once.")
+                + f'<div class="tacts">{_btn("Save host", submit=True, sm=True)}</div></form>')
     return f'<div class="tcard" data-k="{k}">{"".join(rows)}</div>'
 
 
-def _thunder_panel(views: list, binfo: list, catalog_refused: Optional[tuple] = None) -> str:
-    """The Thunder lifecycle cards above the backend list, the LAN model source and the
-    model-sync catalog — empty without Thunder (unless a refused catalog Save must be
-    shown as typed)."""
-    if not views and catalog_refused is None:
+def _orphan_snaps_block() -> str:
+    """`aihub-` snapshots no Thunder backend owns (main.thunder_orphan_snapshots, from the
+    controllers' caches) — display only: a hand-made `aihub-…` snapshot lands here too,
+    so nothing on this page can delete one."""
+    try:
+        orph = [o for o in (_thunder_orphan_snapshots() or []) if isinstance(o, dict)]
+    except Exception as e:                              # noqa: BLE001 — a card, not the tab
+        logger.warning(f"ui: orphan snapshots unavailable: {type(e).__name__}: {e}")
+        return ""
+    if not orph:
+        return ""
+    known = [o["monthly"] for o in orph if o.get("monthly") is not None]
+    total = (f"{_money(sum(known))}/month" + (" and more" if len(known) < len(orph) else "")
+             if known else "an unknown amount per month")
+    trs = "".join(
+        f'<tr data-k="thunder-osnap-{_esc(o.get("id") or o.get("name") or i)}">'
+        f"<td><code>{_esc(o.get('name') or '')}</code></td><td>{_esc(o.get('status') or '')}</td>"
+        f"<td>{('≤ ' + _esc(o['gb']) + ' GB') if o.get('gb') else '?'}</td>"
+        f"<td>{(_money(o['monthly']) + '/month') if o.get('monthly') is not None else '—'}</td>"
+        "</tr>"
+        for i, o in enumerate(orph))
+    return (f'<div data-k="thunder-orphan-snaps"><p class="bad">Snapshots named like this '
+            "gateway's (<code>aihub-…</code>) that no Thunder backend owns — a renamed or "
+            f"deleted backend leaves them behind. They bill {total}; nothing deletes them "
+            "automatically (delete them at Thunder by hand):</p>"
+            "<table><tr><th>snapshot</th><th>status</th><th>size</th><th>cost</th></tr>"
+            f"{trs}</table></div>")
+
+
+def _thunder_panel(views: list, binfo: list, catalog_refused: Optional[tuple] = None,
+                   hf_refused: Optional[str] = None,
+                   modelsrc_refused: Optional[tuple] = None) -> str:
+    """The Thunder lifecycle cards above the backend list, the orphaned snapshots, the
+    LAN model source and the model-sync catalog + HF token — empty without Thunder
+    (unless a refused catalog/token Save must be shown)."""
+    if not views and catalog_refused is None and hf_refused is None:
         return ""
     cfg = {b.get("name"): b.get("thunder") for b in binfo
            if b.get("type") == "comfyui" and isinstance(b.get("thunder"), dict)}
     cards = "".join(_thunder_card(n, v, cfg.get(n)) for n, v in views)
-    lan = _modelsrc_block() if views else ""
+    lan = _modelsrc_block(modelsrc_refused) if views else ""
+    osnaps = _orphan_snaps_block() if views else ""
     return (f'<div data-sk="thunder"><div class="grouphdr">Thunder Compute</div>{cards}'
-            f"{lan}{_catalog_editor(catalog_refused)}</div>")
+            f"{osnaps}{lan}{_catalog_editor(catalog_refused, hf_refused)}</div>")
 
 
 async def _thunder_post(request: Request, action: str):
@@ -3594,6 +3691,45 @@ async def thunder_catalog_save(request: Request):
                                     status=400)
     logger.info(f"ui: model-sync catalog saved ({len(cat)} entries)")
     return _thunder_msg(f"model-sync catalog saved ({len(cat)} entries)")
+
+
+async def thunder_hf_token(request: Request):
+    """Save the HF token: a typed value replaces it, blank keeps it, the box removes it
+    (the backend-key rule). A refused value is a 400 naming why — never the value."""
+    f = await _form(request)
+    tok = (f.get("hf_token") or "").strip()
+    if _save_hf_token is None:
+        return _thunder_msg("the HF token cannot be saved here")
+    if not tok and not f.get("hf_token_clear"):
+        return _thunder_msg("HF token unchanged (blank keeps it)")
+    try:
+        err = str(_save_hf_token(tok) or "")
+    except Exception as e:                              # noqa: BLE001 — refused, not a 500
+        err = f"HF token not saved: {type(e).__name__}"
+    if err:
+        return await _backends_view(request.query_params, hf_refused=err, status=400)
+    msg = "HF token saved (encrypted)" if tok else "HF token removed"
+    logger.info(f"ui: {msg}")
+    return _thunder_msg(msg)
+
+
+async def thunder_modelsrc_host(request: Request):
+    """Save `modelsrc_host`. Anything but a plain `[user@]host` is a 400 with the field
+    as typed — it would end up in an ssh argv."""
+    f = await _form(request)
+    v = (f.get("modelsrc_host") or "")
+    if _save_modelsrc_host is None:
+        return _thunder_msg("modelsrc_host cannot be saved here")
+    try:
+        err = str(_save_modelsrc_host(v) or "")
+    except Exception as e:                              # noqa: BLE001 — refused, not a 500
+        err = f"modelsrc_host not saved: {type(e).__name__}: {e}"
+    if err:
+        return await _backends_view(request.query_params, modelsrc_refused=(v, err), status=400)
+    msg = (f"modelsrc_host saved: {v.strip()}" if v.strip()
+           else "modelsrc_host reset to the default")
+    logger.info(f"ui: {msg}")
+    return _thunder_msg(msg + " — the LAN source is listed again with the next model sync")
 
 
 # ── Tab: Input ──────────────────────────────────────────────────────────────────
@@ -7567,6 +7703,17 @@ def _fault_backend_table(f: dict, sk: str) -> str:
             f"<th>last error</th><th>last</th></tr>{rows}</table>")
 
 
+def _dash_thunder() -> str:
+    """The cost guard on the Dashboard (spec "Kosten-Wächter"): one keyed line per Thunder
+    instance up for more than 24 h — the page an operator looks at daily, unlike the
+    Backends tab. Nothing when none is (and the wrapper then goes, keyed by `data-sk`)."""
+    rows = "".join(
+        f'<p class="bad" data-k="dash-longrun-{_esc(n)}">⚠ {_esc(_thunder_longrun_text(n, v))}'
+        ' — see <a href="/ui/backends">Backends</a></p>'
+        for n, v in _thunder_views() if v.get("long_running"))
+    return f'<div data-sk="dash-thunder">{rows}</div>' if rows else ""
+
+
 def _dash_faults(f: dict) -> str:
     """Dashboard panel: which backends failed in the last 24h — shown even once they
     are healthy again, which is exactly when the live status column stops saying so."""
@@ -7742,7 +7889,7 @@ async def dashboard_page(request: Request):
     f = await asyncio.to_thread(_faults_info)
     aliases = await asyncio.to_thread(store.get_ip_aliases)
     fmap = {s.get("bid"): s for s in f.get("backends") or []}
-    body = ("<h2>Dashboard</h2>"
+    body = ("<h2>Dashboard</h2>" + _dash_thunder()
             + _dash_cards(d, bes, f) + _dash_backends(bes, offline, fmap) + _dash_faults(f)
             + _dash_parked(d) + _dash_llm(d, now, aliases) + _dash_jobs(d, now) + _JOB_TICK)
     return HTMLResponse(_page("Dashboard", body, "dashboard", refresh=4))
@@ -9027,6 +9174,8 @@ def register(app) -> None:
     app.add_api_route("/ui/thunder/modelsrc-scan", thunder_modelsrc_scan, methods=["POST"])
     app.add_api_route("/ui/thunder/modelsrc-pin", thunder_modelsrc_pin, methods=["POST"])
     app.add_api_route("/ui/thunder/catalog", thunder_catalog_save, methods=["POST"])
+    app.add_api_route("/ui/thunder/modelsrc-host", thunder_modelsrc_host, methods=["POST"])
+    app.add_api_route("/ui/thunder/hf-token", thunder_hf_token, methods=["POST"])
     app.add_api_route("/ui/input", input_page, methods=["GET"])
     app.add_api_route("/ui/routing", routing_page, methods=["GET"])
     app.add_api_route("/ui/chat/create", chat_create, methods=["POST"])

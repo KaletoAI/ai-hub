@@ -149,6 +149,8 @@ _DU_TIMEOUT_S = 10 * 60         # `du` over the home directory (a venv has 100k 
 # Everything under ~ except the two model roots: what the NEXT disk needs besides models.
 _DU_CMD = "du -sb --exclude=ComfyUI/models --exclude=hf-cache ~ | cut -f1"
 _WATCH_S = 60                   # snapshot watcher / resume retry interval
+_ACCOUNT_S = 600                # price list, snapshot list and foreign instances re-read
+_LONG_RUN_S = 24 * 3600         # phase != off for longer → the cost banner (spec)
 _PENDING_MISSES = 3             # rounds a pending snapshot may be absent from the list
 # An instance counts as gone only when this many CONSECUTIVE fresh lists lack it:
 # `thunder.parse_instances` reads any odd 2xx body as `[]`, and one bad answer must not
@@ -921,6 +923,7 @@ class LanSource:
         self._key_ready = False
         self._sha: dict = {}
         self._scanned: Optional[tuple] = None   # (host, known_hosts line, fingerprint)
+        self._for_host: Optional[str] = None    # the modelsrc_host everything above is for
 
     def _log(self, msg: str) -> None:
         try:
@@ -947,11 +950,51 @@ class LanSource:
         h = self.raw_host()
         return h if _SRC_HOST_RE.match(h) else ""
 
-    def pinned(self) -> bool:
+    def _follow_host(self) -> None:
+        """A changed `modelsrc_host` (the console's field) makes the listing, the sha256
+        cache and a fetched-but-unconfirmed key describe ANOTHER share: dropped here, on
+        the first look after the change, however the setting was changed. Without it the
+        new host would be planned from the old share's index until the TTL ran out."""
+        raw = self.raw_host()
+        if self._for_host is None:
+            self._for_host = raw
+            return
+        if raw == self._for_host:
+            return
+        self._log(f"modelsrc_host changed ({self._for_host or '-'} → {raw or '-'}) — "
+                  "listing dropped")
+        self._for_host = raw
+        self._index, self._listed_at, self._tried_at, self._error = None, 0.0, 0.0, ""
+        self._sha.clear()
+        self._scanned = None
+        self._gen += 1
+
+    def _pinned_name(self) -> str:
+        """The host name the pinned key line names ("" when nothing is pinned)."""
         try:
-            return os.path.getsize(self.known_hosts_path) > 0
+            with open(self.known_hosts_path, encoding="utf-8") as f:
+                parts = f.readline().split()
+        except OSError:
+            return ""
+        return parts[0] if parts else ""
+
+    def _stale_pin(self) -> str:
+        """The host a pin is for when it is NOT the configured one ("" otherwise): with
+        StrictHostKeyChecking=yes every connect would fail as "unreachable", which
+        points the operator at the network instead of the missing pin."""
+        host = self.host()
+        pn = self._pinned_name()
+        name = host.rsplit("@", 1)[-1] if host else ""
+        return pn if (pn and name and pn != name) else ""
+
+    def pinned(self) -> bool:
+        """A key is pinned FOR THE CONFIGURED HOST (a pin for the previous host is none)."""
+        try:
+            if os.path.getsize(self.known_hosts_path) <= 0:
+                return False
         except OSError:
             return False
+        return not self._stale_pin()
 
     def configured(self) -> bool:
         return bool(self.host()) and self.pinned()
@@ -959,9 +1002,14 @@ class LanSource:
     def problem(self) -> str:
         """Why LAN transfers wait ("" = they may run) — the text inside "waiting for LAN
         source (…)"."""
+        self._follow_host()
         raw = self.raw_host()
         if raw and not self.host():
             return f"not configured: modelsrc_host {raw!r} is not a plain [user@]host"
+        old = self._stale_pin()
+        if old:
+            return (f"pinned for {old}, not {self.host().rsplit('@', 1)[-1]} — "
+                    "fetch its key")
         if not self.host() or not self.pinned():
             return "not configured"
         if self._error:
@@ -975,10 +1023,12 @@ class LanSource:
 
     @property
     def generation(self) -> int:
+        self._follow_host()
         return self._gen
 
     def cached(self) -> dict:
         """The last good listing (a copy) — {} while not configured."""
+        self._follow_host()
         return dict(self._index or {}) if self.configured() else {}
 
     def invalidate(self) -> None:
@@ -1013,12 +1063,14 @@ class LanSource:
     async def refresh(self, force: bool = False) -> None:
         """List the share when the cache is stale (or `force`). Never raises: a failure
         is `problem()`, and the last good listing stays."""
+        self._follow_host()
         if not self.configured() or (not force and not self.stale()):
             return
         async with self._lock:
             if not force and not self.stale():
                 return                          # another controller just listed
             before = (self._error, self._index)
+            listed_for = self.raw_host()
             self._tried_at = self._now()
             try:
                 if not self._key_ready:
@@ -1026,6 +1078,8 @@ class LanSource:
                 rc, out, err = await self._ssh(self._argv("list"), timeout=_SRC_LIST_TIMEOUT_S)
             except Exception as e:
                 rc, out, err = -1, b"", _errtext(e).encode()
+            if self.raw_host() != listed_for:
+                return                          # the host changed meanwhile: another share's answer
             if rc == 0:
                 self._index = parse_source_list((out or b"").decode("utf-8", "replace"))
                 self._listed_at = self._tried_at
@@ -1044,6 +1098,7 @@ class LanSource:
                 self._gen += 1
 
     async def sha256(self, path: str, size: int) -> str:
+        self._follow_host()
         key = (path, size)
         if key in self._sha:
             return self._sha[key]
@@ -1082,6 +1137,7 @@ class LanSource:
         return fp
 
     def scanned_fingerprint(self) -> str:
+        self._follow_host()
         sc = self._scanned
         return sc[2] if sc is not None and sc[0] == self.host() else ""
 
@@ -1129,6 +1185,7 @@ class LanSource:
 
     def view(self) -> dict:
         """The console's LAN block (no I/O beyond two small file reads)."""
+        self._follow_host()
         idx = self._index or {}
         links = sum(1 for v in idx.values() if modelsync.link_of(v) is not None)
         return {"host": self.raw_host(), "host_ok": bool(self.host()), "pinned": self.pinned(),
@@ -1192,6 +1249,7 @@ class Controller:
         self._dirty = False
         self._sync_error = ""
         self._last_try = 0.0
+        self._account_at: Optional[float] = None       # last account refresh (run_forever)
         self.state = State()
         try:
             loaded = deps.load_state(self.name)
@@ -1393,13 +1451,34 @@ class Controller:
             self._log(f"snapshot list unavailable ({e.status or 'transport'}): {e}")
         return self._snaps
 
-    def cost_per_h(self) -> Optional[float]:
+    async def refresh_account(self) -> None:
+        """The account view the console renders from caches only: the price list (1 h
+        cache), the snapshot list and the foreign instances. Every call is display only
+        and logs its own failure. No token → nothing (a 401 every 10 min says nothing)."""
+        if not str(self.backend.get("api_key") or ""):
+            return
+        await self.refresh_prices()
+        await self.refresh_snapshots()
+        await self.orphans()
+
+    def snapshots(self) -> list[dict]:
+        """The last `/snapshots/list` answer (a copy; [] before the first)."""
+        return [dict(x) for x in (self._snaps or [])]
+
+    def pricing_table(self) -> Optional[dict]:
+        """The cached `/v2/pricing` table (any age), None before the first fetch."""
         api = self._api
         pricing = api.cached("pricing") if api is not None else None
-        specs = api.cached("specs") if api is not None else None
         if not isinstance(pricing, dict):
             return None
-        table = pricing.get("pricing") if isinstance(pricing.get("pricing"), dict) else pricing
+        return pricing.get("pricing") if isinstance(pricing.get("pricing"), dict) else pricing
+
+    def cost_per_h(self) -> Optional[float]:
+        api = self._api
+        specs = api.cached("specs") if api is not None else None
+        table = self.pricing_table()
+        if table is None:
+            return None
         cfg = self.cfg
         gpu, n = str(cfg.get("gpu_type") or ""), int(cfg.get("num_gpus") or 1)
         return thunder.hourly_cost(table, gpu, n, int(cfg.get("vcpus") or 0),
@@ -1410,10 +1489,8 @@ class Controller:
         row = next((x for x in (self._snaps or []) if x.get("id") == s.snapshot_id), None)
         gb = (row or {}).get("min_disk_gb") or None
         monthly = None
-        api = self._api
-        pricing = api.cached("pricing") if api is not None else None
-        if gb and isinstance(pricing, dict):
-            table = pricing.get("pricing") if isinstance(pricing.get("pricing"), dict) else pricing
+        table = self.pricing_table()
+        if gb and table is not None:
             monthly = thunder.snapshot_monthly(table, gb)
         return {"id": s.snapshot_id, "pending": s.pending_snapshot,
                 "pending_name": s.pending_snapshot_name,
@@ -1427,10 +1504,13 @@ class Controller:
         running = s.phase != "off" and s.started_at > 0
         uptime = max(0, int(self.deps.now() - s.started_at)) if running else 0
         cph = self.cost_per_h()
+        # spec "Kosten-Wächter": an instance up for more than a day is almost always one
+        # somebody forgot — the panel and the Dashboard key their banner on this
         return {"name": self.name, "phase": s.phase, "error": s.error,
                 "failed_phase": s.failed_phase, "index": s.index, "uuid": s.uuid,
                 "ip": s.ip, "port": s.port, "started_at": s.started_at,
-                "uptime_s": uptime, "disk_gb": s.disk_gb, "cost_per_h": cph,
+                "uptime_s": uptime, "long_running": running and uptime > _LONG_RUN_S,
+                "disk_gb": s.disk_gb, "cost_per_h": cph,
                 "session_cost": (cph * uptime / 3600) if (cph is not None and running) else None,
                 "snapshot": self._snapshot_view(), "log": list(s.log[-_LOG_MAX:]),
                 "transfers": [dict(v) for _, v in sorted(s.transfers.items())],
@@ -3384,7 +3464,8 @@ class Controller:
     async def run_forever(self) -> None:
         """Background loop (spawned by main next to resume()): every 5 s the model-sync
         trigger (`_sync_tick`); every 60 s the snapshot watcher while a snapshot is
-        pending, and resume() again while it could not reach the API."""
+        pending, and resume() again while it could not reach the API; every 10 min the
+        account view (`refresh_account` — prices, snapshots, foreign instances)."""
         every = max(1, _WATCH_S // _SYNC_POLL_S)
         tick = 0
         while True:
@@ -3396,6 +3477,10 @@ class Controller:
                         await self.resume()
                     if self.state.pending_snapshot:
                         await self.watch_snapshots()
+                    now = self.deps.now()
+                    if self._account_at is None or now - self._account_at >= _ACCOUNT_S:
+                        self._account_at = now
+                        await self.refresh_account()
                 await self._sync_tick()
             except asyncio.CancelledError:
                 raise

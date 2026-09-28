@@ -39,6 +39,7 @@ import stats
 import store
 import modelsync
 import thunderctl
+import thunder
 from adapters import (AdapterContext, ComfyExecutorStuck, NormalizedRequest, image_params,
                       is_image_field, lora_counterpart, lora_groups,
                       make_adapter, normalize_delivery, validate_delivery)
@@ -6026,6 +6027,30 @@ def _thunder_hf_token() -> str:
     return str((store.get_setting("hf_token") if store.is_active() else "") or "")
 
 
+def hf_token_set() -> bool:
+    """Is an HF token stored? (The console says so; it never shows the value.)"""
+    return bool(_thunder_hf_token())
+
+
+# What an HF token may hold: it goes into an `Authorization: Bearer` header on the
+# instance — a space or a line break there splits or injects a header.
+_HF_TOKEN_RE = re.compile(r"[\x21-\x7e]{1,512}")
+
+
+def save_hf_token(token: str) -> str:
+    """The console's HF-token Save: "" removes the token, anything else replaces it
+    (encrypted at rest — `hf_token` is in `store._SECRET_SETTINGS`). → the refusal, ""
+    = saved. The refusal never repeats the value: it is a secret."""
+    token = str(token or "")
+    if token and not _HF_TOKEN_RE.fullmatch(token):
+        return ("the HF token may hold only printable characters without spaces "
+                "(at most 512) — not saved")
+    if not store.is_active():
+        return "the store is not active — not saved"
+    store.set_settings({"hf_token": token})
+    return ""
+
+
 def _thunder_datadir() -> str:
     """thunder.key, modelsrc.key and the known_hosts files sit next to store.db (and
     secret.key)."""
@@ -6046,6 +6071,37 @@ def _modelsrc_host() -> str:
     v = store.get_setting("modelsrc_host") if store.is_active() else None
     v = str(v or "").strip()
     return v or thunderctl.MODELSRC_HOST_DEFAULT
+
+
+def save_modelsrc_host(value: str) -> str:
+    """The console's `modelsrc_host` Save → the refusal ("" = saved). Blank stores ""
+    (= the default); anything else must be a plain `[user@]host` (`_VOICE_HOST_RE`, the
+    rule LanSource holds it to before any ssh argv). The LanSource notices the change on
+    its next look and drops the old share's listing (`LanSource._follow_host`)."""
+    v = str(value or "").strip()
+    if v and not _VOICE_HOST_RE.match(v):
+        return f"modelsrc_host {v!r} is not a plain [user@]host — not saved"
+    if not store.is_active():
+        return "the store is not active — not saved"
+    store.set_settings({"modelsrc_host": v})
+    return ""
+
+
+def thunder_orphan_snapshots() -> list:
+    """`aihub-` snapshots no Thunder backend owns (`thunder.foreign_snapshots`) over
+    every controller's CACHED snapshot list (deduplicated by id — two backends of one
+    account list the same snapshots) and the first cached price list. No API call: the
+    controllers refresh both in their background loop."""
+    snaps, seen, table = [], set(), None
+    for c in list(thunder_controllers.values()):
+        for sn in c.snapshots() or []:
+            sid = sn.get("id") or sn.get("name")
+            if sid not in seen:
+                seen.add(sid)
+                snaps.append(sn)
+        if table is None:
+            table = c.pricing_table()
+    return thunder.foreign_snapshots(snaps, list(thunder_controllers), table)
 
 
 def modelsrc() -> "thunderctl.LanSource":
@@ -6556,7 +6612,9 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
            thunder_default_nodes=_thunder_default_nodes,
            thunder_sync_now=thunder_sync_now, thunder_delete_unknown=thunder_delete_unknown,
            thunder_modelsrc_view=modelsrc_view, thunder_modelsrc_scan=modelsrc_scan,
-           thunder_modelsrc_pin=modelsrc_pin,
+           thunder_modelsrc_pin=modelsrc_pin, save_modelsrc_host=save_modelsrc_host,
+           save_hf_token=save_hf_token, hf_token_set=hf_token_set,
+           thunder_orphan_snapshots=thunder_orphan_snapshots,
            modelsync_catalog=_modelsync_catalog, save_modelsync_catalog=save_modelsync_catalog,
            backend_loras=lambda: {b["name"]: sorted(backend_loras.get(backend_id(b), set()))
                                   for b in backends if b.get("type") == "comfyui"})

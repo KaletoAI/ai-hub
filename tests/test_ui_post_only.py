@@ -62,7 +62,7 @@ _MUTATING_CALLBACKS = {"_cancel_generation", "_drain_backend", "_cancel_drain", 
                        "_apply_server_settings", "_apply_users", "_apply_reasoning", "_apply_hosts",
                        "_thunder_action", "_thunder_sync_now", "_thunder_delete_unknown",
                        "_save_modelsync_catalog", "_thunder_modelsrc_scan",
-                       "_thunder_modelsrc_pin"}
+                       "_thunder_modelsrc_pin", "_save_modelsrc_host", "_save_hf_token"}
 # Views that may write despite being a GET: none. (The Users page's reverse-DNS names
 # used to be persisted from the render; they now stay in memory until the operator
 # presses "Save resolved names", a POST.)

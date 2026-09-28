@@ -24,7 +24,11 @@ Every one of these fails SILENTLY:
     empty;
   · the LAN source (Task 15): its host key is pinned only by a POST that carries the
     fingerprint the operator saw (a GET, or a key fetched again in between, pins
-    nothing), and the install command gives the share user a real login shell.
+    nothing), and the install command gives the share user a real login shell;
+  · Task 16: the HF token is encrypted at rest and never rendered (blank keeps, the box
+    clears), `modelsrc_host` is refused unless plain and a changed host names the stale
+    pin, an instance up > 24 h puts a banner on its card AND the Dashboard, and `aihub-`
+    snapshots no backend owns are listed with $/month (never deleted).
 
 Run: python -m unittest tests.test_thunder_ui -v
 """
@@ -967,6 +971,258 @@ class LanSourceWiring(CatalogWiring):
         self.assertEqual(deps.lan.host(), "src@10.0.0.2")
         self.assertEqual(deps.source_index(), {})          # not pinned: no source
         self.assertEqual(deps.lan.problem(), "not configured")
+
+
+
+class HfToken(Actions):
+    """Task 16: the HF token is a cloud secret like a backend key — encrypted at rest,
+    never rendered back, blank keeps it and only the box clears it. Rendered, it sits in
+    every Backends page a shoulder or a screenshot sees; a blank Save that CLEARED it
+    silently turns every gated HF download into a 401 at the next sync."""
+
+    def setUp(self):
+        super().setUp()
+        for k, v in {"_save_hf_token": main.save_hf_token,
+                     "_hf_token_set": main.hf_token_set}.items():
+            self.addCleanup(setattr, admin, k, getattr(admin, k))
+            setattr(admin, k, v)
+        self.views = {"tc": _view()}
+
+    def post(self, status=303, **data):
+        r = self.c.post("/ui/thunder/hf-token", data=data, headers=SAME, follow_redirects=False)
+        self.assertEqual(r.status_code, status, r.text[:300])
+        return r
+
+    def raw(self):
+        import sqlite3
+        with sqlite3.connect(store._DB_PATH) as c:
+            row = c.execute("SELECT value_json FROM settings WHERE key='hf_token'").fetchone()
+        return None if row is None else json.loads(row[0])
+
+    def test_bound(self):
+        self.assertIs(admin._save_hf_token, main.save_hf_token)
+        self.assertIs(admin._hf_token_set, main.hf_token_set)
+        self.assertIn("/ui/thunder/hf-token", admin._POST_ACTIONS)
+        r = self.c.get("/ui/thunder/hf-token", headers=SAME, follow_redirects=False)
+        self.assertEqual(r.status_code, 405)
+
+    def test_hf_token_encrypted_at_rest(self):
+        self.assertIn("hf_token", store._SECRET_SETTINGS)
+        self.post(hf_token="hf_SecretValue123")
+        self.assertTrue(self.raw().startswith("enc:"), self.raw())
+        self.assertNotIn("SecretValue", self.raw())
+        self.assertEqual(store.get_setting("hf_token"), "hf_SecretValue123")
+        self.assertEqual(main._thunder_hf_token(), "hf_SecretValue123")   # what Deps reads
+        # a row written before the setting became a secret stays readable (passthrough)
+        import sqlite3
+        with sqlite3.connect(store._DB_PATH) as c:
+            c.execute("UPDATE settings SET value_json=? WHERE key='hf_token'",
+                      (json.dumps("hf_legacyPlain"),))
+        self.assertEqual(main._thunder_hf_token(), "hf_legacyPlain")
+
+    def test_hf_token_never_rendered(self):
+        page = self.page()
+        self.assertIn('name="hf_token"', page)
+        self.assertRegex(page, r'<input type="password" name="hf_token" value=""')
+        self.assertIn('name="hf_token_clear"', page)
+        self.assertIn("not set", page)
+        self.post(hf_token="hf_SecretValue123")
+        page = self.page()
+        self.assertNotIn("hf_SecretValue123", page)
+        self.assertNotIn(self.raw(), page)                  # nor its ciphertext
+        self.assertRegex(page, r'<input type="password" name="hf_token" value=""')
+        self.assertIn("set — blank keeps it", page)
+        # blank keeps it
+        r = self.post(hf_token="")
+        self.assertIn("unchanged", parse_qs(urlparse(r.headers["location"]).query)["msg"][0])
+        self.assertEqual(main._thunder_hf_token(), "hf_SecretValue123")
+        # a new value replaces it
+        self.post(hf_token="hf_Other456")
+        self.assertEqual(main._thunder_hf_token(), "hf_Other456")
+        # clear removes it (a typed value next to a ticked box: the value wins, as for keys)
+        r = self.post(hf_token="", hf_token_clear="1")
+        self.assertIn("removed", parse_qs(urlparse(r.headers["location"]).query)["msg"][0])
+        self.assertEqual(main._thunder_hf_token(), "")
+        self.assertFalse(main.hf_token_set())
+
+    def test_refused_token_is_400_and_never_echoed(self):
+        self.post(hf_token="hf_Good1")
+        r = self.post(status=400, hf_token="hf_bad value\nX-Injected: 1")
+        self.assertIn("not saved", r.text)
+        self.assertNotIn("hf_bad value", r.text)
+        self.assertNotIn("X-Injected", r.text)
+        self.assertEqual(main._thunder_hf_token(), "hf_Good1")      # nothing written
+        self.assertRegex(r.text, r'<details class="optblock" data-k="thunder-catalog" open>')
+
+
+class ModelsrcHostField(Actions):
+    """Task 16: `modelsrc_host` is set in the console, next to the LAN block. A value
+    that is no plain [user@]host is refused with the form as typed (it would reach an ssh
+    argv); a changed host drops the old share's listing and says the pin is for the old
+    host — otherwise every list fails as "unreachable" and points at the network."""
+
+    def setUp(self):
+        super().setUp()
+        self.live = [{"name": "tc", "type": "comfyui", "url": "http://127.0.0.1:18188",
+                      "enabled": True, "healthy": True, "models": 0, "source": "ui",
+                      "thunder": {"gpu_type": "a6000"}}]
+        self.views = {"tc": _view(phase="ready", uuid="u1")}
+        saved = (main.jobs_cfg, main._modelsrc_obj)
+        self.addCleanup(lambda: (setattr(main, "jobs_cfg", saved[0]),
+                                 setattr(main, "_modelsrc_obj", saved[1])))
+        main.jobs_cfg = dict(main.jobs_cfg, store_path=os.path.join(self.tmp.name, "store.db"))
+        main._modelsrc_obj = None
+        for k, v in {"_thunder_modelsrc_view": main.modelsrc_view,
+                     "_save_modelsrc_host": main.save_modelsrc_host}.items():
+            self.addCleanup(setattr, admin, k, getattr(admin, k))
+            setattr(admin, k, v)
+
+    def post(self, status=303, **data):
+        r = self.c.post("/ui/thunder/modelsrc-host", data=data, headers=SAME,
+                        follow_redirects=False)
+        self.assertEqual(r.status_code, status, r.text[:300])
+        return r
+
+    def test_bound_and_post_only(self):
+        self.assertIs(admin._save_modelsrc_host, main.save_modelsrc_host)
+        self.assertIn("/ui/thunder/modelsrc-host", admin._POST_ACTIONS)
+        r = self.c.get("/ui/thunder/modelsrc-host?modelsrc_host=x", headers=SAME,
+                       follow_redirects=False)
+        self.assertEqual(r.status_code, 405)
+
+    def test_field_shows_the_current_host(self):
+        page = self.page()
+        self.assertRegex(page, r'<form method="post" action="/ui/thunder/modelsrc-host"')
+        self.assertRegex(page, r'name="modelsrc_host" value="modelsrc@192.168.8.24"')
+
+    def test_valid_host_saved(self):
+        r = self.post(modelsrc_host=" src@10.0.0.2 ")
+        self.assertIn("src@10.0.0.2", parse_qs(urlparse(r.headers["location"]).query)["msg"][0])
+        self.assertEqual(store.get_setting("modelsrc_host"), "src@10.0.0.2")
+        self.assertEqual(main.modelsrc().host(), "src@10.0.0.2")
+        self.assertRegex(self.page(), r'name="modelsrc_host" value="src@10.0.0.2"')
+        self.post(modelsrc_host="")                             # blank = the default
+        self.assertEqual(main._modelsrc_host(), "modelsrc@192.168.8.24")
+
+    def test_invalid_host_is_400_with_the_form_as_typed(self):
+        store.set_settings({"modelsrc_host": "src@10.0.0.2"})
+        for bad in ("a;touch /tmp/x", "-oProxyCommand=x", "user@host:22", "a b"):
+            with self.subTest(bad=bad):
+                r = self.post(status=400, modelsrc_host=bad)
+                self.assertIn("not saved", r.text)
+                self.assertIn(f'name="modelsrc_host" value="{admin._esc(bad)}"', r.text)
+                self.assertEqual(store.get_setting("modelsrc_host"), "src@10.0.0.2")
+
+    def test_changed_host_names_the_stale_pin(self):
+        lan = main.modelsrc()
+        with open(lan.known_hosts_path, "w") as f:
+            f.write(f"192.168.8.24 ssh-ed25519 {_ED_B64}\n")
+        self.assertEqual(lan.problem(), "not listed yet")
+        self.post(modelsrc_host="modelsrc@10.0.0.9")
+        m = re.search(r'<div class="tcard" data-k="thunder-modelsrc">.*?</div></div>',
+                      self.page(), re.S)
+        self.assertIn("pinned for 192.168.8.24, not 10.0.0.9 — fetch its key", m.group(0))
+
+
+class CostBanner(_Base):
+    """Task 16, spec "Kosten-Wächter": an instance up for more than 24 h gets a banner on
+    its card AND on the Dashboard — the page an operator actually looks at every day."""
+
+    def long_view(self, **over):
+        v = dict(phase="ready", uuid="u1", started_at=1.0, uptime_s=26 * 3600 + 120,
+                 cost_per_h=0.5, session_cost=13.02, long_running=True)
+        v.update(over)
+        return _view(**v)
+
+    def dash(self) -> str:
+        for k, v in {"_dashboard_snapshot": lambda: {"backends": []},
+                     "_faults_info": lambda: {"backends": [], "bundles": [], "total": 0}}.items():
+            self.addCleanup(setattr, admin, k, getattr(admin, k))
+            setattr(admin, k, v)
+        r = asyncio.run(admin.dashboard_page(_Req({})))
+        return r.body.decode()
+
+    def test_card_banner(self):
+        self.views = {"tc": self.long_view()}
+        page = self.page()
+        self.assertRegex(page, r'data-k="thunder-tc-longrun"')
+        self.assertIn("Thunder tc running for 26 h (≈ $13.02)", page)
+        self.views = {"tc": _view(phase="ready", uuid="u1", started_at=1.0,
+                                  uptime_s=3600, long_running=False)}
+        self.assertNotIn("longrun", self.page())
+
+    def test_dashboard_banner_after_24h(self):
+        self.views = {"tc": self.long_view(), "b": _view(name="b")}
+        html = self.dash()
+        m = re.search(r'<p class="bad" data-k="dash-longrun-tc">.*?</p>', html, re.S)
+        self.assertIsNotNone(m, html[:2000])
+        self.assertIn("Thunder tc running for 26 h (≈ $13.02)", m.group(0))
+        self.assertIn('href="/ui/backends"', m.group(0))
+        self.assertNotIn("dash-longrun-b", html)
+        self.assertIn('data-live="4"', html)                 # the Dashboard stays live
+        # no price list yet: still the banner, no made-up figure
+        self.views = {"tc": self.long_view(session_cost=None, cost_per_h=None)}
+        self.assertIn("Thunder tc running for 26 h (cost unknown", self.dash())
+        # under 24 h, or nothing running: no banner at all
+        self.views = {"tc": _view(phase="ready", started_at=1.0, uptime_s=3600)}
+        self.assertNotIn("dash-longrun", self.dash())
+
+
+class OrphanSnapshots(_Base):
+    """Task 16: `aihub-` snapshots no current Thunder backend owns bill $/month unseen
+    (a renamed backend leaves every old one behind) — shown on the Backends tab, never
+    deleted, rendered from the controllers' caches only."""
+
+    def setUp(self):
+        super().setUp()
+        self.orph = [{"id": "s2", "name": "aihub-old-20260926t120000z", "status": "READY",
+                      "gb": 200, "monthly": 1.0}]
+        self.addCleanup(setattr, admin, "_thunder_orphan_snapshots",
+                        admin._thunder_orphan_snapshots)
+        admin._thunder_orphan_snapshots = lambda: self.orph
+
+    def test_orphan_snapshot_warning(self):
+        self.views = {"tc": _view()}
+        page = self.page()
+        m = re.search(r'<div data-k="thunder-orphan-snaps">.*?</table></div>', page, re.S)
+        self.assertIsNotNone(m)
+        self.assertIn("aihub-old-20260926t120000z", m.group(0))
+        self.assertIn("$1.00/month", m.group(0))
+        self.assertIn('data-k="thunder-osnap-s2"', m.group(0))
+        self.assertNotIn("<button", m.group(0))              # display only, no delete
+        self.orph = []
+        self.assertNotIn("thunder-orphan-snaps", self.page())
+
+    def test_main_uses_the_controllers_caches(self):
+        class Ctl:
+            def __init__(self, snaps, table):
+                self._s, self._t = snaps, table
+
+            def snapshots(self):
+                return self._s
+
+            def pricing_table(self):
+                return self._t
+
+        snap = lambda n, i, gb=100: {"id": i, "name": n, "status": "READY",   # noqa: E731
+                                     "min_disk_gb": gb, "created_at": 1}
+        saved = dict(main.thunder_controllers)
+        self.addCleanup(lambda: (main.thunder_controllers.clear(),
+                                 main.thunder_controllers.update(saved)))
+        main.thunder_controllers.clear()
+        main.thunder_controllers["tc"] = Ctl([snap("aihub-tc-20260926t120000z", "a"),
+                                              snap("aihub-gone-20260926t120000z", "b")], None)
+        main.thunder_controllers["k2"] = Ctl([snap("aihub-gone-20260926t120000z", "b"),
+                                              snap("aihub-k2-20260926t120000z", "c")],
+                                             {"snapshot_gb": 0.001})
+        out = main.thunder_orphan_snapshots()
+        self.assertEqual([o["id"] for o in out], ["b"])      # once, though both list it
+        self.assertAlmostEqual(out[0]["monthly"], 100 * 0.001 * 730)
+
+
+class Task16Wiring(unittest.TestCase):
+    def test_bound(self):
+        self.assertIs(admin._thunder_orphan_snapshots, main.thunder_orphan_snapshots)
 
 
 if __name__ == "__main__":
