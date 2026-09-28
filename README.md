@@ -836,8 +836,8 @@ live while an instance runs):
   install + the reserve (never below the snapshot's minimum or 100 GB per GPU; Thunder
   disks only grow). A restore from a snapshot takes up to **~8 min per 100 GB**
   (Thunder's figure). Then: port check, tunnel, ComfyUI, model sync, `ready`.
-  Without an API token a Start fails at the first API call and the card shows Thunder's
-  own `401` message (`Authentication required`) — the backend is back to `off`.
+  Without an API token a Start is refused before any API call ("no Thunder API token
+  set — put it into the backend's API key field") and the backend stays `off`.
   A failure before the instance exists ends in `off`; after it in `failed (<phase>)`
   with the instance **kept** for diagnosis — it bills until you press Stop. A node pack
   that failed to install or a failed smoke test is `failed (bootstrapping)`.
@@ -944,8 +944,8 @@ served read-only by the SSH forced command `ops/modelsrc-serve.sh` (verbs `list`
 else is refused). The
 share root defaults to `/mnt/xfs/shared/comfyui-models` (env `MODELSRC_ROOT`); share
 path `<x>` is `models/<x>`, and the Hugging Face cache must be a **real directory**
-`hf-cache/` inside the share (a symlinked one is not followed — the HF half of the
-share would be missing). The share host is set in `modelsrc_host` (field at the end of the LAN card;
+`hf-cache/` inside the share (a symlinked one makes `list` fail with exit 1 — it
+would otherwise silently lack the HF half of the share). The share host is set in `modelsrc_host` (field at the end of the LAN card;
 default `modelsrc@192.168.8.24`). Install on your model-share host — the example below
 uses a Proxmox host `pveK12` sharing `/mnt/xfs/shared/comfyui-models`; adjust the path
 to yours. Copy the script over first (`scp ops/modelsrc-serve.sh root@<share-host>:/tmp/`),

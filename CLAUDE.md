@@ -1219,14 +1219,16 @@ via injected callables, staying hot-reload-safe.
   `set_backend_enabled`, `begin_drain`, the fault log, the ComfyUI probe, runners); main
   wires it in `_thunder_deps()`/`sync_thunder_controllers()` (called by
   `rebuild_backends`: a new block gets a controller, an existing one keeps its INSTANCE
-  and gets the new dict, a removed one is retired only when `off` and idle — a running
-  one is kept with a warning). `ThunderApi`: Bearer token, `httpx.Timeout(30,
+  and gets the new dict, a removed one is retired only when `off`, idle and without a
+  pending snapshot — a running one is kept with a warning). `ThunderApi`: Bearer token, `httpx.Timeout(30,
   connect=10)`, any 2xx is success (`create` 201, `/snapshots/create` 202), error bodies
   clipped; the by-id calls (`delete`/`modify`/`ports`) try the UUID first and the index
   only on a 404 (Ruling 11 — the docs contradict each other; a reused index can name a
   stranger, a uuid cannot). The state is persisted on EVERY phase change (store setting
   `thunder_state`, one entry per backend name): an instance bills whether or not the
-  gateway remembers it. An unreadable record makes the controller `failed(load)` with
+  gateway remembers it; a failed save is kept in `persist_error` (card + `view()`), and
+  one right before the create POST ends the start in `off` instead of creating an
+  instance no restart could find. An unreadable record makes the controller `failed(load)` with
   saving SUPPRESSED and start refused (it may name a billing instance); the log ring and
   the transfer table are not persisted (a stale "40 %" after a restart would lie). The
   rules everything else rests on:
@@ -1255,7 +1257,10 @@ via injected callables, staying hot-reload-safe.
   reboot exits the process and expects a wrapper) → sync → `ready`. Before the create a
   failure is `off`, after it `failed(<phase>)` with the instance KEPT for diagnosis. A
   start is refused while `unreconciled_uuids` (instances seen next to an unreadable
-  record) are still listed — *Forget unreconciled* is the operator's reset.
+  record) are still listed — gone only after `_ABSENT_CONFIRM` lists without them, and
+  checked INSIDE the start op, so a stop during the check aborts it instead of answering
+  "done" while the start creates on — *Forget unreconciled* is the operator's reset. A
+  Start without an API token is refused before any call.
   **Stop aborts start** (Ruling 13): `stop()` cancels a start/restart in flight and stops
   from the phase it reached — before any bootstrap (`creating|restoring|connecting`) the
   instance holds nothing worth a snapshot and is deleted straight away. Otherwise
@@ -1273,7 +1278,8 @@ via injected callables, staying hot-reload-safe.
   back, a vanished one is `off` + `instance_vanished`); foreign instances are shown with
   $/h and NEVER adopted or deleted. `refresh_account()` re-reads snapshots and foreign
   instances every 10 min (`_ACCOUNT_S`) and the price list hourly (`ThunderApi._cached`,
-  `_PRICE_TTL_S`); `view()["long_running"]` (> 24 h) drives the card and
+  `_PRICE_TTL_S`), and books fault `lifecycle`/`instance_vanished` (phase untouched —
+  that is the stop path's call) when our uuid is missing from two refreshes in a row; `view()["long_running"]` (> 24 h) drives the card and
   Dashboard banner.
   **Model sync** (`sync_once`): the destination index is rebuilt by `find` over both
   roots on EVERY plan (the manifest `~/.gw-modelsync.json` records where a file CAME
@@ -1287,8 +1293,11 @@ via injected callables, staying hot-reload-safe.
   session goes onto the paid disk. URL files: HEAD for the size, ≤ 3 `curl`s ON the
   instance (`setsid`, a lockfile holding the pid, `--config -` so the options — the HF
   token included, and only for a `huggingface.co`/`hf.co` host, checked before the
-  command is built — travel on STDIN, never argv), and a live lockfile is ADOPTED after
-  a gateway restart, never answered with a second curl on the same `.part`. LAN files:
+  command is built — travel on STDIN, never argv; `GW:STARTED` only once the lockfile
+  names the running curl, else `GW:START-FAIL` = a failed attempt — a stop's kill in
+  that window missed the curl), and a live lockfile is ADOPTED after a gateway restart,
+  never answered with a second curl on the same `.part`. A 2xx HEAD naming length 0 is
+  an unknown size; Sync now re-asks unknown and failed HEADs. LAN files:
   `LanSource` (ONE per gateway, `main.modelsrc()`: `modelsrc.key`, the host key pinned in
   `modelsrc-known_hosts` with `StrictHostKeyChecking=yes` — pinned only by a POST
   carrying the fingerprint `scan()` showed; `modelsrc_host` held to `_VOICE_HOST_RE`
@@ -1352,7 +1361,9 @@ via injected callables, staying hot-reload-safe.
   `L\t<rel>\t<target>` for in-tree links to listed files), `cat <rel> <offset>` and
   `sha256 <rel>`, refuses (exit 2) absolute paths, `..`, dot segments, `*.log`, anything
   in the HF cache but `hf-cache/hub/…`, and any path whose `realpath -e` is not itself;
-  exit 1 = "list incomplete" (discard the listing). Its user needs a REAL login shell
+  cat/sha256 then read ONLY from fd 3, re-verified via `/proc/self/fd/3` (no swap after
+  the check can redirect the read); L lines never cross `models/`↔`hf-cache/`;
+  exit 1 = "list incomplete" (discard the listing) or a symlinked `hf-cache/`. Its user needs a REAL login shell
   (`/bin/bash`: sshd runs the forced command through it, `nologin` runs nothing) and
   `hf-cache/` must be a real directory in the share. `test_modelsrc_serve.py`,
   `test_thunder_scripts.py`.
