@@ -277,6 +277,76 @@ class Refusals(Share):
         self.assertFalse(marker.exists())
 
 
+class Hardening(Share):
+    """The three hardenings of the final review: a read that cannot be redirected after
+    the check, no L line across the models/ ↔ hf-cache/ split, and no silently
+    half listing when hf-cache/ is a symlink."""
+
+    def _swap_before(self, tool, rel):
+        """A `<tool>` shim on PATH that swaps `rel` for a symlink out of the share and
+        then runs the real tool: the TOCTOU window between the script's check and a
+        read BY NAME, made deterministic. A read from the descriptor opened (and
+        re-verified) before the swap is not affected by it."""
+        real = shutil.which(tool)
+        bindir = self.tmp / "bin"
+        bindir.mkdir(exist_ok=True)
+        target = self.root / rel
+        shim = bindir / tool
+        shim.write_text(
+            "#!/bin/bash\n"
+            f"touch {shlex.quote(str(self.tmp / 'swapped'))}\n"
+            f"rm -f -- {shlex.quote(str(target))}\n"
+            f"ln -s {shlex.quote(str(self.outside))} {shlex.quote(str(target))}\n"
+            f"exec {shlex.quote(real)} \"$@\"\n")
+        shim.chmod(0o755)
+        return str(bindir) + os.pathsep + os.environ["PATH"]
+
+    def _run(self, cmd, path):
+        env = {"MODELSRC_ROOT": str(self.root), "PATH": path, "SSH_ORIGINAL_COMMAND": cmd}
+        return subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True,
+                              timeout=30)
+
+    def test_cat_reads_the_checked_file_even_if_swapped_after_the_check(self):
+        path = self._swap_before("tail", "vae/a.bin")
+        p = self._run("cat vae/a.bin 2", path)
+        self.assertTrue((self.tmp / "swapped").exists())   # the swap really happened
+        self.assertNotIn(b"secret outside", p.stdout)
+        self.assertEqual((p.returncode, p.stdout), (0, b"23456789"), p.stderr)
+
+    def test_reads_go_through_the_reverified_descriptor(self):
+        # the sha256 path has no external step between check and read to hook; pin
+        # the shape instead: opened once on fd 3, re-verified through it, read from it
+        src = SCRIPT.read_text()
+        self.assertIn('exec 3<"$ROOT_REAL/$rel"', src)
+        self.assertIn("realpath -e /proc/self/fd/3", src)
+        self.assertIn("-f /dev/fd/3", src)
+        self.assertIn("sha256sum <&3", src)
+        self.assertRegex(src, r'exec tail -c "\+\$\(\(10#\$off \+ 1\)\)" <&3')
+        self.assertNotIn('-- "$ROOT_REAL/$rel"\n', src.split("case $verb in\n    list)")[1])
+
+    def test_no_link_across_the_models_hf_cache_split(self):
+        snap = self.root / HUB / "snapshots" / "rev1"
+        os.symlink("../../../../../vae/a.bin", snap / "to-models")
+        os.symlink(f"../{HUB}/blobs/{SHA}", self.root / "vae" / "to-hf")
+        p = run("list", self.root)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        out = p.stdout.decode()
+        self.assertNotIn("to-models", out)
+        self.assertNotIn("to-hf", out)
+        # the same-side links are still there
+        self.assertIn(f"L\t{HUB}/snapshots/rev1/model.safetensors\t", out)
+        self.assertIn("L\tcheckpoints/vae-link\t", out)
+
+    def test_symlinked_hf_cache_fails_the_list(self):
+        real = self.tmp / "real-hf"
+        shutil.move(str(self.root / "hf-cache"), str(real))
+        os.symlink(real, self.root / "hf-cache")
+        p = run("list", self.root)
+        self.assertEqual(p.returncode, 1)
+        self.assertEqual(p.stdout, b"")
+        self.assertIn(b"hf-cache is a symlink", p.stderr)
+
+
 class Static(unittest.TestCase):
     def test_parses(self):
         subprocess.run(["bash", "-n", str(SCRIPT)], check=True)

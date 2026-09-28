@@ -45,7 +45,11 @@
 # under `hf-cache/` only `hf-cache/hub/…` (token files, xet/modules/download caches
 # are not model data). cat/sha256 additionally require `realpath -e` of the path to be
 # the path itself — i.e. no symlink anywhere on it, a link inside the tree included:
-# the gateway recreates links from `list` and never fetches through one.
+# the gateway recreates links from `list` and never fetches through one. The file is
+# then opened once and checked again through the open descriptor, and only that
+# descriptor is read (a swap after the check cannot redirect the read). An L line's
+# link and target are both under `hf-cache/` or both outside it. `list` fails (1) when
+# `hf-cache` itself is a symlink — it would otherwise silently lack the HF cache.
 #
 # Exit status: 0 ok; 2 refused (one short line on stderr, nothing on stdout);
 # 1 failure — e.g. the share root is missing, or `list` could not read part of the
@@ -156,6 +160,14 @@ emit_link() {
     t=""
     for seg in "${parts[@]}"; do t+=${t:+/}$seg; done
     path_ok "$t" || return 0
+    # link and target on the same side of the models/ ↔ hf-cache/ split: the gateway
+    # maps the two halves to two different roots on the VM, where a crossing link
+    # would point at a place that file never lands
+    if [[ $rel == hf-cache/* ]]; then
+        [[ $t == hf-cache/* ]] || return 0
+    else
+        [[ $t != hf-cache/* ]] || return 0
+    fi
     # no symlink on the way down to the target, and the target a regular file: the
     # kernel then resolves exactly what the text says, and it is an F line
     cur=$ROOT_REAL
@@ -173,6 +185,9 @@ do_list() {
     LIST_TMP=$(mktemp) || fail "cannot create a temp file"
     trap 'rm -f -- "$LIST_TMP"' EXIT
     cd -- "$ROOT_REAL" || fail "cannot enter the share root"
+    # find -P never enters a symlinked hf-cache/: the listing would silently lack the
+    # whole HF cache and read as complete
+    [[ ! -L hf-cache ]] || fail "hf-cache is a symlink; listing would omit the HF cache"
     # ONE pass: files go straight to stdout; links go NUL-separated to $LIST_TMP for the
     # bash check above. -P: never follow a link. Pruned: dot entries, names find
     # could not print on one line (control chars) or that the path rules refuse
@@ -221,14 +236,26 @@ ROOT=${MODELSRC_ROOT:-$ROOT_DEFAULT}
 ROOT_REAL=$(realpath -e -- "$ROOT" 2>/dev/null) || fail "share root missing: $ROOT"
 [[ -d $ROOT_REAL ]] || fail "share root is not a directory: $ROOT"
 
+# The checked file, opened ONCE on fd 3 and re-verified through the open descriptor:
+# between `plain_file` and a later open by name, the path could be swapped for a
+# symlink out of the share (TOCTOU) — reading from fd 3 reads exactly what was checked.
+open_checked() {
+    local real
+    plain_file "$rel" || refuse "not a regular file inside the share"
+    exec 3<"$ROOT_REAL/$rel" || fail "cannot open $rel"
+    real=$(realpath -e /proc/self/fd/3 2>/dev/null) || refuse "file changed while opening"
+    [[ $real == "$ROOT_REAL/$rel" && -f /dev/fd/3 ]] \
+        || refuse "file changed while opening"
+}
+
 case $verb in
     list)
         do_list ;;
     cat)
-        plain_file "$rel" || refuse "not a regular file inside the share"
-        exec tail -c "+$((10#$off + 1))" -- "$ROOT_REAL/$rel" ;;
+        open_checked
+        exec tail -c "+$((10#$off + 1))" <&3 ;;
     sha256)
-        plain_file "$rel" || refuse "not a regular file inside the share"
-        sum=$(sha256sum <"$ROOT_REAL/$rel") || fail "cannot read $rel"
+        open_checked
+        sum=$(sha256sum <&3) || fail "cannot read $rel"
         printf '%s\n' "${sum%% *}" ;;
 esac
