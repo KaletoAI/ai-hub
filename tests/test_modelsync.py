@@ -697,5 +697,83 @@ class Hardening(unittest.TestCase):
             self.assertEqual((type(a), a), (type(m), m), (value, current))
 
 
+
+class Ruling17(unittest.TestCase):
+    """Task 13 hardening: a hub id is covered only by an entry naming BOTH its class and
+    its value (a class-only entry would cover every hub id the loader might ever be
+    set to — including one whose weights the entry does not sync), and a manifest whose
+    `aliases` is not a list never iterates a string character by character."""
+
+    def test_class_only_or_value_only_entry_never_covers_a_hub_ref(self):
+        for m in ({"class": "Trellis2LoadModel"}, {"value": "microsoft/TRELLIS.2-4B"},
+                  {"class": "Trellis2LoadModel", "alias": "x"}):
+            cat = [{"match": m, "paths": ["models/microsoft/TRELLIS.2-4B/"]}]
+            n = ms.alias_need("x", [R_HUB], cat)
+            self.assertEqual(n.covered, frozenset(), m)
+            p = mk([n])
+            self.assertIn("unknown hub model microsoft/TRELLIS.2-4B — add a catalog entry",
+                          p["per_alias"]["x"]["blocked"], m)
+            self.assertFalse(ms.ready(p, "x"), m)
+        cat = [{"match": {"class": "Trellis2LoadModel", "value": "microsoft/TRELLIS.2-4B"},
+                "paths": ["models/microsoft/TRELLIS.2-4B/"]}]
+        self.assertEqual(ms.alias_need("x", [R_HUB], cat).covered, frozenset({("8", "modelname")}))
+
+    def test_class_only_entry_still_covers_a_name_ref(self):
+        # a bare name is catalog material by nature (Ruling 2) — only hub ids got stricter
+        cat = [{"match": {"class": "Trellis2LoadModel_GGUF"}, "paths": ["models/microsoft/TRELLIS.2-4B/"]}]
+        self.assertEqual(ms.alias_need("x", [R_NAME], cat).covered, frozenset({("5", "modelname")}))
+
+    def test_manifest_aliases_not_a_list_is_empty(self):
+        dest = {"models/vae/v.safetensors": 100, "models/old.bin": 9}
+        for rec in ("A", "AB", 5, {"A": 1}, None):
+            man = {"models/vae/v.safetensors": {"size": 100, "aliases": rec},
+                   "models/old.bin": {"size": 9, "aliases": rec}}
+            # alias "A" is blocked (empty ref set): a string "A" must not make it an owner
+            p = mk([need("A", [])], dest=dest, manifest=man)
+            self.assertEqual(p["held"], [], rec)
+            self.assertEqual(p["prune"], ["models/old.bin", "models/vae/v.safetensors"], rec)
+        man = {"models/old.bin": {"size": 9, "aliases": ("A",)}}
+        p = mk([need("A", [])], dest=dest, manifest=man)
+        self.assertEqual(p["held"], [["models/old.bin", 9, "A"]])
+
+
+class DefaultCatalog(unittest.TestCase):
+    """The seed a fresh install starts with (Task 13): public hub/base models only —
+    the repo is public, so a private model or LoRA name must never land in it."""
+
+    def test_default_catalog_validates(self):
+        self.assertEqual(ms.validate_catalog(ms.DEFAULT_CATALOG), [])
+        self.assertTrue(ms.DEFAULT_CATALOG)
+
+    def test_default_catalog_has_no_lora_or_private_names(self):
+        import json
+        blob = json.dumps(ms.DEFAULT_CATALOG).lower()
+        self.assertNotIn("lora", blob)
+        for e in ms.DEFAULT_CATALOG:
+            for p in list(e.get("paths") or ()) + [e.get("file") or "", e["match"].get("value", "")]:
+                self.assertFalse(p.lower().endswith(".safetensors"), p)
+            self.assertEqual(set(e["match"]) - {"class", "value"}, set(), e)   # no alias names
+
+    def test_default_catalog_covers_the_k12_loaders(self):
+        want = {("Trellis2LoadModel", "microsoft/TRELLIS.2-4B"),
+                ("Trellis2LoadModel", "TencentARC/Pixal3D-T"),
+                ("Trellis2LoadModel_GGUF", "Pixal3D-GGUF"),
+                ("DownloadAndLoadStableXModel", "yoso-normal-v1-8-1")}
+        have = {(e["match"].get("class"), e["match"].get("value")) for e in ms.DEFAULT_CATALOG}
+        self.assertLessEqual(want, have)
+        # every hub id of the seed is class+value (Ruling 17) and so actually covers
+        for e in ms.DEFAULT_CATALOG:
+            self.assertIn("class", e["match"])
+            self.assertIn("value", e["match"])
+
+    def test_trellis_alias_ready_from_the_seed(self):
+        refs = ms.refs_for({}, {"8": WF["8"]}, set())
+        n = ms.alias_need("t", refs, ms.DEFAULT_CATALOG)
+        self.assertEqual(n.covered, frozenset({("8", "modelname")}))
+        src = {p.rstrip("/") + "/f.bin" if p.endswith("/") else p: 5 for p in n.catalog}
+        p = ms.plan([n], src, dict(src), {}, {})
+        self.assertTrue(ms.ready(p, "t"), p["per_alias"]["t"])
+
+
 if __name__ == "__main__":
     unittest.main()

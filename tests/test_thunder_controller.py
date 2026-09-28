@@ -3017,6 +3017,40 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(c.plan["unknown"], [])
         self.assertIn(_dm("x.safetensors"), vm.files)
 
+    async def test_sync_now_retries_failed_transfers(self):
+        """Task 13: "Sync now" — without it a transfer that gave up is retried only when
+        the aliases or the catalog change, however the operator fixed the cause."""
+        url = "https://example.com/x.safetensors"
+        fake, vm, c, box, _ = _sync_make(aliases={"img": _cand("x.safetensors")},
+                                         catalog=[_url("x.safetensors")])
+        with self.assertRaises(RuntimeError):
+            await c.sync_now()                          # no instance: refused at once
+        vm.sizes[url] = 4
+        vm.fail[url] = "curl: (7) Failed to connect\n"
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.plan["per_alias"]["img"]["blocked"]))
+        n = len(vm.started)
+        await c.sync_once()                             # a plain re-plan keeps it given up
+        self.assertEqual(len(vm.started), n)
+        del vm.fail[url]
+        await c.sync_now()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+        self.assertGreater(len(vm.started), n)
+        self.assertTrue(any("tried again" in ln for ln in c.state.log))
+
+    async def test_plan_view_sizes_the_prune_preview(self):
+        old = "models/checkpoints/old.safetensors"
+        fake, vm, c, box, _ = _sync_make(aliases={"img": _cand("x.safetensors")},
+                                         catalog=[_url("x.safetensors")])
+        vm.sizes["https://example.com/x.safetensors"] = 3
+        vm.files = {old: 7}
+        vm.manifest = json.dumps({old: {"size": 7, "aliases": ["gone"], "source": "url"}})
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+        pv = c.view()["plan"]
+        self.assertEqual(pv["prune"], [old])
+        self.assertEqual(pv["prune_sizes"], [[old, 7]])
+
     async def test_lan_files_wait_for_the_lan_source(self):
         lanf = _dm("lan.safetensors")
         # "img": in no source at all; "known": in a (P3-style) source index but no URL

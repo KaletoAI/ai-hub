@@ -2153,6 +2153,18 @@ class Controller:
         finally:
             self._syncs.discard(t)
 
+    async def sync_now(self) -> None:
+        """The panel's "Sync now": a sync at once, and the transfers that gave up are
+        tried again — otherwise only a change of the aliases or the catalog retries them,
+        and an operator who fixed the cause (a URL, the disk) has no way to say so.
+        Refused (RuntimeError, before the first await) without a running instance."""
+        if not self._syncing():
+            raise RuntimeError(f"no running instance ({self.state.phase})")
+        if self._failed:
+            self._log(f"sync requested — {len(self._failed)} failed transfer(s) are tried again")
+            self._failed.clear()
+        await self.sync_once()
+
     def _syncing(self) -> bool:
         return self.state.phase in _SYNC_PHASES
 
@@ -2341,6 +2353,16 @@ class Controller:
         held: dict = {}
         for h in p["held"]:
             held[h[2]] = held.get(h[2], 0) + 1
+        # what the stop will delete, with sizes for the preview ("N files, X GB"): the
+        # destination's size, else the manifest's; None when neither knows
+        dest = (self._plan_inputs or (None, None, {}))[2] or {}
+        man = self._manifest if isinstance(self._manifest, dict) else {}
+
+        def prune_size(path):
+            n = dest.get(path)
+            if n is None and isinstance(man.get(path), dict):
+                n = man[path].get("size")
+            return n if isinstance(n, int) and not isinstance(n, bool) else None
         return {
             "aliases": {a: {"ready": a in self.ready_aliases, "need_bytes": r["need_bytes"],
                             "have_bytes": r["have_bytes"], "missing": len(r["missing"]),
@@ -2350,7 +2372,9 @@ class Controller:
                         for a, r in p["per_alias"].items()},
             "fetch": [{k: e[k] for k in ("path", "size", "source", "aliases")}
                       for e in p["fetch"]],
-            "prune": list(p["prune"]), "held": [list(h) for h in p["held"]],
+            "prune": list(p["prune"]),
+            "prune_sizes": [[x, prune_size(x)] for x in p["prune"]],
+            "held": [list(h) for h in p["held"]],
             "unknown": [list(u) for u in p["unknown"]],
             "need_total": p["need_total"], "have_total": p["have_total"]}
 

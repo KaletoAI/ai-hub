@@ -5935,13 +5935,20 @@ _catalog_warned: list = []                  # the last unreadable catalog value 
 
 
 def _modelsync_catalog() -> list:
-    """The model-sync catalog: store setting `modelsync_catalog`, `DEFAULT_CATALOG`
-    while unset. A value that is no list is read as `[]` (warned once per value) —
-    falling back to the defaults would sync what the operator replaced; entries
-    `validate_catalog` refuses are dropped one by one inside modelsync."""
-    raw = store.get_setting(_MODELSYNC_CATALOG_KEY) if store.is_active() else None
-    if raw is None:
+    """The model-sync catalog: store setting `modelsync_catalog`. While it is absent,
+    the first read copies `DEFAULT_CATALOG` into it — from then on the setting is
+    authoritative (an operator who empties it gets an empty catalog, not the seed back,
+    and a later release's seed never rewrites a catalog someone edited). A value that is
+    no list is read as `[]` (warned once per value) — falling back to the defaults would
+    sync what the operator replaced; entries `validate_catalog` refuses are dropped one
+    by one inside modelsync."""
+    if not store.is_active():
         return copy.deepcopy(modelsync.DEFAULT_CATALOG)
+    raw = store.get_setting(_MODELSYNC_CATALOG_KEY)
+    if raw is None:
+        raw = store.setdefault_setting(_MODELSYNC_CATALOG_KEY,
+                                       copy.deepcopy(modelsync.DEFAULT_CATALOG))
+        logger.info(f"{_MODELSYNC_CATALOG_KEY}: seeded with the default catalog")
     if not isinstance(raw, list):
         if _catalog_warned != [raw]:
             _catalog_warned[:] = [raw]
@@ -5949,6 +5956,19 @@ def _modelsync_catalog() -> list:
                            "list — read as empty")
         return []
     return raw
+
+
+def save_modelsync_catalog(cat) -> list:
+    """The console's catalog Save: `validate_catalog`'s refusals ([] = saved). Nothing is
+    written unless the WHOLE catalog is valid — a partial save would drop the refused
+    entry silently and leave the alias it was meant for blocked without a word."""
+    errs = modelsync.validate_catalog(cat)
+    if errs:
+        return errs
+    if not store.is_active():
+        return ["the store is not active — the catalog cannot be saved"]
+    store.set_settings({_MODELSYNC_CATALOG_KEY: cat})
+    return []
 
 
 def _thunder_alias_cands(backend_name: str) -> list:
@@ -6121,7 +6141,10 @@ async def _thunder_shutdown() -> None:
 
 
 _THUNDER_OPS = {"start": ("start", "start"), "stop": ("stop", "stop"),
-                "restart": ("restart_comfy", "ComfyUI restart")}
+                "restart": ("restart_comfy", "ComfyUI restart"), "sync": ("sync_now", "sync")}
+# How long a console "delete unknown files" waits for its answer before it says
+# "still running" (the controller plans first — an ssh index of the whole disk).
+_THUNDER_ANSWER_S = 30
 
 
 async def thunder_action(name: str, action: str) -> str:
@@ -6155,9 +6178,81 @@ async def thunder_action(name: str, action: str) -> str:
     return f"{label} requested"
 
 
-def thunder_view(name: str) -> Optional[dict]:
+async def thunder_sync_now(name: str) -> str:
+    """The panel's "Sync now" (Controller.sync_now, refused without a running instance)."""
+    return await thunder_action(name, "sync")
+
+
+async def thunder_delete_unknown(name: str, paths: list) -> str:
+    """The panel's "delete unknown files": the controller re-plans and refuses the whole
+    request when one path is no longer unknown (needed or synced meanwhile). The answer
+    is awaited up to `_THUNDER_ANSWER_S` — the refusal is what the operator must see — and
+    a delete still running then goes on as a held task whose failure is logged."""
     c = thunder_controllers.get(name)
-    return c.view() if c is not None else None
+    if c is None:
+        return f"unknown Thunder backend {name!r}"
+    paths = [str(p) for p in paths or [] if p]
+    if not paths:
+        return "no file selected — nothing deleted"
+    answered: set = set()
+    t = _thunder_spawn(name, "delete unknown files", c.delete_unknown(paths), answered)
+    answered.add(t)                         # the answer below reports it, not the log
+    done, _ = await asyncio.wait({t}, timeout=_THUNDER_ANSWER_S)
+    if t not in done:
+        answered.discard(t)                 # finishing later: a failure goes to the log
+        return f"deleting {len(paths)} file(s) — still running, see the log"
+    if t.cancelled():
+        return "delete cancelled"
+    e = t.exception()
+    if isinstance(e, (RuntimeError, ValueError)):
+        return f"delete refused: {e}"
+    if e is not None:
+        return f"delete failed: {type(e).__name__}: {e}"
+    n = t.result()
+    return f"deleted {n} unknown file{'s' if n != 1 else ''}"
+
+
+def _thunder_only_aliases(aliases) -> set:
+    """Aliases of this backend's plan that no candidate can serve right now outside the
+    model-sync gate — every candidate sits on a Thunder backend that has not synced it.
+    Their schema, image slots and LoRA list read EMPTY until the sync finishes (the gate
+    empties the candidate set), which the panel says instead of leaving it a mystery.
+    Blocking (store read)."""
+    out = set()
+    for alias in aliases:
+        cands = store.get(alias) if store.is_active() else None
+        if cands is None:
+            cands = image_models.get(alias, [])
+        open_ = False
+        for cand in cands or []:
+            if not isinstance(cand, dict):
+                continue
+            bc = thunder_controllers.get(cand.get("backend"))
+            if not (adapters.cand_kind(cand) == "comfyui" and bc is not None
+                    and not bc.is_alias_ready(alias)):
+                open_ = True
+                break
+        if not open_:
+            out.add(alias)
+    return out
+
+
+def thunder_view(name: str) -> Optional[dict]:
+    """A controller's view for the panel, plus `gated_only` per planned alias (see
+    `_thunder_only_aliases`)."""
+    c = thunder_controllers.get(name)
+    if c is None:
+        return None
+    v = c.view()
+    rows = (v.get("plan") or {}).get("aliases") or {}
+    try:
+        only = _thunder_only_aliases([a for a, r in rows.items() if not r.get("ready")])
+    except Exception as e:                  # the panel note is a courtesy, never an error
+        logger.warning(f"[thunder {name}] alias gate note unavailable: {e!r}")
+        only = set()
+    for a, r in rows.items():
+        r["gated_only"] = a in only
+    return v
 
 
 def modelsync_gate(backend: dict, alias: str) -> Optional[str]:
@@ -6380,6 +6475,8 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
            thunder_view=thunder_view, thunder_action=thunder_action,
            thunder_names=lambda: list(thunder_controllers),
            thunder_default_nodes=_thunder_default_nodes,
+           thunder_sync_now=thunder_sync_now, thunder_delete_unknown=thunder_delete_unknown,
+           modelsync_catalog=_modelsync_catalog, save_modelsync_catalog=save_modelsync_catalog,
            backend_loras=lambda: {b["name"]: sorted(backend_loras.get(backend_id(b), set()))
                                   for b in backends if b.get("type") == "comfyui"})
 

@@ -476,6 +476,18 @@ def set_settings(values: dict) -> None:
             )
 
 
+def setdefault_setting(key: str, value):
+    """Store `value` under `key` only if the key is absent, and return what is stored
+    now — one INSERT … DO NOTHING, so a seed written on first read can never overwrite
+    a value an operator saved in the same instant. Not for secret settings."""
+    if key in _SECRET_SETTINGS:
+        raise ValueError(f"{key} is a secret setting")
+    with _conn() as c:
+        c.execute("INSERT INTO settings (key, value_json, updated) VALUES (?,?,?) "
+                  "ON CONFLICT(key) DO NOTHING", (key, json.dumps(value), int(time.time())))
+    return get_setting(key)
+
+
 # ── IP aliases (friendly names for caller IPs in stats; auto reverse-DNS) ────────
 # Stored as a single settings dict {ip: name}. An empty name means "auto-resolve
 # was attempted but found no hostname" — kept so we don't retry every page load.

@@ -124,10 +124,53 @@ FOLDERS: dict[str, tuple[str, ...]] = {
 }
 _LORA_FOLDERS = ("loras",)
 
-# Pre-filled catalog for a fresh install. Empty in P2 on purpose: its entries (base and
-# hub models only — never private model/LoRA names, the repo is public) come with the
-# catalog editor (Task 13). Must always pass validate_catalog (pinned by a test).
-DEFAULT_CATALOG: list[dict] = []
+# Pre-filled catalog for a fresh install — copied into the `modelsync_catalog` setting on
+# first read, after which the setting is authoritative (edited in the Backends tab). Base
+# and hub models ONLY: the repo is public, a private model or LoRA name never goes here.
+# Derived from the 3D node packs' own loaders (read 2026-09-28 on the LAN model box, which
+# holds the tree these paths name): what each loader value makes its node read at run
+# time, beside the one directory the value names. Every entry is class+value — a hub id is
+# covered by nothing less (Ruling 17). Directories end in `/` (recursive; `.cache` and
+# other dot segments never sync). Must always pass validate_catalog (pinned by a test).
+#
+# ComfyUI-Trellis2-vb `Trellis2LoadModel`: refuses to run without DINOv3 under
+# models/facebook/, always fetches TRELLIS-image-large's sparse-structure decoder into
+# models/microsoft/TRELLIS-image-large/ckpts/, and copies reconviagen_pipeline.json INTO
+# models/microsoft/TRELLIS.2-4B/ whatever model is chosen (that directory must exist);
+# Pixal3D models also load MoGe (models/Ruicheng/moge-2-vitl/) for the camera estimate.
+_DINOV3 = "models/facebook/dinov3-vitl16-pretrain-lvd1689m/"
+_MOGE = "models/Ruicheng/moge-2-vitl/"
+_TRELLIS1_SS_DEC = "models/microsoft/TRELLIS-image-large/ckpts/"
+# ComfyUI-Trellis2-GGUF `Trellis2LoadModel_GGUF` = "Pixal3D-GGUF": models/Pixal3D-GGUF/
+# holds every quantisation; the aliases pin `GGUF Q4_K_M`, so only that one syncs (the
+# other two are ~9 GB more). A different model_format needs its files added here.
+_PIXAL_GGUF = "models/Pixal3D-GGUF/"
+_PIXAL_GGUF_Q4 = [_PIXAL_GGUF + f"{d}/{n}{x}"
+                  for d, n in (("Sparse", "ss_flow_img_dit_1_3B_64_bf16"),
+                               ("shape", "slat_flow_img2shape_dit_1_3B_512_bf16"),
+                               ("shape", "slat_flow_img2shape_dit_1_3B_1024_bf16"),
+                               ("texture", "slat_flow_imgshape2tex_dit_1_3B_1024_bf16"))
+                  for x in (".json", "_Q4_K_M.gguf")]
+DEFAULT_CATALOG: list[dict] = [
+    {"match": {"class": "Trellis2LoadModel", "value": "microsoft/TRELLIS.2-4B"},
+     "paths": ["models/microsoft/TRELLIS.2-4B/", _TRELLIS1_SS_DEC, _DINOV3]},
+    {"match": {"class": "Trellis2LoadModel", "value": "TencentARC/Pixal3D-T"},
+     "paths": ["models/TencentARC/Pixal3D-T/", _TRELLIS1_SS_DEC, _DINOV3, _MOGE,
+               "models/microsoft/TRELLIS.2-4B/reconviagen_pipeline.json"]},
+    {"match": {"class": "Trellis2LoadModel_GGUF", "value": "Pixal3D-GGUF"},
+     "paths": [_PIXAL_GGUF + "pipeline.json", _PIXAL_GGUF + "decoder/",
+               _PIXAL_GGUF + "encoders/", *_PIXAL_GGUF_Q4, _DINOV3, _MOGE]},
+    # ComfyUI-StableXWrapper: models/diffusers/<value>/ (snapshot of Stable-X/<value>)
+    {"match": {"class": "DownloadAndLoadStableXModel", "value": "yoso-normal-v1-8-1"},
+     "paths": ["models/diffusers/yoso-normal-v1-8-1/"]},
+    # ComfyUI-Hunyuan3d-2-1: the texture stage (Hy3DMultiViewsGenerator, no loader input
+    # of its own) loads tencent/Hunyuan3D-2.1's paint model and facebook/dinov2-giant from
+    # the Hugging Face cache (HF_HOME) — anchored on the shape model every such workflow
+    # names. Whole repo dirs: blobs + snapshots + refs are what the HF loader reads.
+    {"match": {"class": "Hy3D21MeshGenerator", "value": "hunyuan3D-dit-v2-1-fp16.ckpt"},
+     "paths": ["hf-cache/hub/models--tencent--Hunyuan3D-2.1/",
+               "hf-cache/hub/models--facebook--dinov2-giant/"]},
+]
 
 
 def ref_kind(value: str) -> str:
@@ -496,7 +539,12 @@ def alias_need(alias: str, refs, catalog) -> AliasNeed:
     for e in _match_entries(catalog):
         m = e["match"]
         if ("class" in m or "value" in m) and ("alias" not in m or m["alias"] == alias):
-            covered.update((r.node, r.field) for r in _matched_refs(m, refs))
+            # A hub id is covered only by an entry naming its class AND its value: a
+            # class-only entry would also "cover" a hub id the loader is later switched
+            # to, whose weights that entry does not sync — ready, and wrong (Ruling 17).
+            full = "class" in m and "value" in m
+            covered.update((r.node, r.field) for r in _matched_refs(m, refs)
+                           if full or r.kind != "hub")
     return AliasNeed(alias, refs, paths, explicit, frozenset(covered))
 
 
@@ -651,7 +699,10 @@ def plan(needs, source_index: dict, dest_index: dict, manifest: dict, url_catalo
         if p in needed:
             continue
         rec = man[p].get("aliases") if isinstance(man[p], dict) else None
-        owners = sorted(blocked_aliases & {str(x) for x in rec or () if isinstance(x, str)})
+        # only a list names owners: a string would be iterated character by character
+        # (`"AB"` → owners A and B), anything else is no record at all
+        rec = rec if isinstance(rec, (list, tuple)) else ()
+        owners = sorted(blocked_aliases & {x for x in rec if isinstance(x, str)})
         if owners:
             size = _msize(man[p])
             held.append([p, size if size is not None else dest.get(p), owners[0]])

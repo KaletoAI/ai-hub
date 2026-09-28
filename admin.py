@@ -189,6 +189,13 @@ _thunder_action: Callable = None
 # The default custom-node list (ops/thunder-nodes.default.txt) — what a NEW Thunder
 # block's nodes textarea is pre-filled with.
 _thunder_default_nodes: Callable[[], str] = lambda: ""
+# Model sync (Task 13): "Sync now" and "delete unknown files" — async (name[, paths]) →
+# the message the Backends tab shows — and the catalog setting: the current list, and a
+# save that answers the validator's refusals ([] = saved).
+_thunder_sync_now: Callable = None
+_thunder_delete_unknown: Callable = None
+_modelsync_catalog: Callable[[], list] = lambda: []
+_save_modelsync_catalog: Callable[[list], list] = lambda cat: ["catalog store not available"]
 
 
 def bind(**overrides) -> None:
@@ -385,6 +392,8 @@ fieldset.tblock>legend{font-size:11px;text-transform:uppercase;letter-spacing:.6
 .tcard{background:var(--row);border:1px solid var(--line);border-radius:10px;padding:10px 14px;margin:8px 0 12px}
 .tcard .tfacts{color:var(--dim);font-size:13px;margin:4px 0}
 .tcard .tacts{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 4px}
+.tcard .tsync{margin:8px 0;font-size:13px}
+.tcard .tsync details{margin:6px 0}
 .tcard pre.tlog{white-space:pre-wrap;word-break:break-word;background:var(--input);border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin:6px 0;max-height:320px;overflow:auto;font:12px/1.45 ui-monospace,monospace}
 /* Phone / narrow window. Desktop keeps <main> as the scroll container (the fixed
    header + subnav never scroll, see _SCROLL_JS); below 800 px the whole PAGE scrolls
@@ -752,10 +761,21 @@ _LIVE_JS = ("<script>(function(){"
 # One delegated handler for every `data-confirm` (see _btn). Capture phase on document,
 # so it also covers links the live morph inserts later, and runs before any other click
 # handler on the element.
+# `data-confirm-sum` (a submit button of a checkbox list): the text is recomputed from the
+# TICKED boxes at click time — `{n}` = how many, `{gb}` = the sum of their `data-bytes` —
+# so "delete 3 files, 4.2 GB" names what will really go, not what was listed. Nothing
+# ticked submits nothing. Here, in the one handler every page emits, because a live page
+# never gains a <script> later (see _LIVE_JS).
 _CONFIRM_JS = ("<script>document.addEventListener('click',function(e){"
                "var a=e.target&&e.target.closest?e.target.closest('[data-confirm]'):null;"
-               "if(a&&!window.confirm(a.getAttribute('data-confirm'))){"
-               "e.preventDefault();e.stopPropagation();}},true);</script>")
+               "if(!a)return;var m=a.getAttribute('data-confirm'),"
+               "t=a.getAttribute('data-confirm-sum'),f=a.form;"
+               "if(t&&f){var n=0,b=0,xs=f.querySelectorAll('input[type=checkbox][data-bytes]');"
+               "for(var i=0;i<xs.length;i++){if(xs[i].checked){n++;"
+               "b+=Number(xs[i].getAttribute('data-bytes'))||0;}}"
+               "if(!n){window.alert('Nothing selected.');e.preventDefault();e.stopPropagation();"
+               "return;}m=t.split('{n}').join(String(n)).split('{gb}').join((b/1e9).toFixed(1));}"
+               "if(!window.confirm(m)){e.preventDefault();e.stopPropagation();}},true);</script>")
 
 # Every state-changing console action is a POST (see _POST_ACTIONS). Its button needs a
 # form, and a button may sit INSIDE another form (the editors' ✕/∅ buttons) where a
@@ -877,6 +897,7 @@ _POST_ACTIONS = frozenset((
     "/ui/backends/delete", "/ui/backends/drain", "/ui/backends/undrain",
     "/ui/backends/restart", "/ui/backends/enable",
     "/ui/thunder/start", "/ui/thunder/stop", "/ui/thunder/restart", "/ui/thunder/forget",
+    "/ui/thunder/sync", "/ui/thunder/delete-unknown", "/ui/thunder/catalog",
     "/ui/chat/badd", "/ui/chat/bdel", "/ui/chat/delete",
     "/ui/mapping/field-add", "/ui/mapping/field-map", "/ui/mapping/field-clear",
     "/ui/mapping/field-del", "/ui/mapping/cand-add", "/ui/mapping/cand-del",
@@ -2150,17 +2171,19 @@ async def backends_page(request: Request):
     return await _backends_view(request.query_params)
 
 
-async def _backends_view(qp, detail: Optional[str] = None, status: int = 200) -> HTMLResponse:
+async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
+                         catalog_refused: Optional[tuple] = None) -> HTMLResponse:
     """The Backends tab; `detail` replaces the right column (a refused Save, re-rendered
-    — then never live: the page's URL is the POST action, which a GET poll cannot fetch)."""
+    — then never live: the page's URL is the POST action, which a GET poll cannot fetch).
+    `catalog_refused` = (text, reasons) of a refused model-sync catalog Save, likewise."""
     edit_id = qp.get("edit", "")
     # Captured NOW: every branch below assigns `detail`, so testing it at the end made
     # the tab never live — drain, scan and a running Thunder instance all froze.
     # Live only on the plain list: an open editor (edit/new/host form) or a refused Save
     # stays static — the morph's attribute sync would reset every visibility the type
     # select's handler set (switch to comfyui, and 3 s later its panes vanish).
-    static = (detail is not None or bool(edit_id) or bool(qp.get("new"))
-              or bool(qp.get("host")))
+    static = (detail is not None or catalog_refused is not None or bool(edit_id)
+              or bool(qp.get("new")) or bool(qp.get("host")))
     binfo = _gateway_info().get("backends", [])
     # editable from either source: store (full dict incl. api_key) or the live summary (config)
     editing = None
@@ -2262,7 +2285,7 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200) ->
                  f'<form action="/ui/backends/scan" method="post" style="display:inline">'
                  f'{_btn("Scan network", kind="secondary", submit=True)}</form></div>'
                  + msg_html
-                 + _thunder_panel(tviews, binfo)
+                 + _thunder_panel(tviews, binfo, catalog_refused)
                  + f"<p class='hint'>Edit a backend to manage it here (editing a config one creates an "
                  f"editable copy that overrides it).</p>{items}"
                  + _hosts_panel(binfo, qp.get("host", ""))
@@ -3029,6 +3052,173 @@ def _hms(s) -> str:
     return f"{s // 3600}h {s % 3600 // 60:02d}m" if s >= 3600 else f"{s // 60}m {s % 60:02d}s"
 
 
+# ── Thunder: the model-sync half of the card (thunderctl.Controller._plan_view) ──
+# The view is the controller's in-memory report; every reader below tolerates a missing
+# or odd field (the card must never take the Backends tab down). Sizes are decimal GB,
+# the unit of the 503 texts (modelsync.status_text), so both say the same number.
+_SYNC_PHASES = ("syncing", "ready")          # thunderctl._SYNC_PHASES: a plan is made there
+_LAN_WAIT_PREFIX = "waiting for LAN source"  # thunderctl._LAN_WAIT
+
+
+def _gb1(n) -> str:
+    return f"{_nbytes(n) / 1e9:.1f}"
+
+
+def _rows(x) -> list:
+    """The list items of a view field that are themselves lists (`held`, `unknown`, …)."""
+    return [r for r in (x if isinstance(x, list) else []) if isinstance(r, (list, tuple)) and r]
+
+
+def _sync_status(r: dict) -> str:
+    """ready / syncing x % / blocked: reason / waiting for LAN source — one cell."""
+    if r.get("ready"):
+        return _badge("ready", "ok")
+    blocked = [str(b) for b in (r.get("blocked") or []) if b]
+    other = [b for b in blocked if not b.startswith(_LAN_WAIT_PREFIX)]
+    if other:
+        return f'<span class="bad">blocked: {_esc("; ".join(other))}</span>'
+    if blocked:
+        return _badge("waiting for LAN source", "warn", "; ".join(blocked))
+    need, have = _nbytes(r.get("need_bytes")), _nbytes(r.get("have_bytes"))
+    pct = min(100, have * 100 // need) if need else 0
+    return _badge(f"syncing {pct} %", "warn")
+
+
+def _sync_notes(r: dict) -> str:
+    notes = [_esc(h) for h in (r.get("hints") or []) if h]
+    sel = [str(x) for x in (r.get("selectable") or []) if x]
+    if sel:
+        notes.append(f"client-selectable: <code>{_esc(', '.join(sel))}</code> — only the "
+                     "default is synced")
+    held = _nbytes(r.get("held"))
+    if held:
+        notes.append(f"{held} synced file{'s' if held != 1 else ''} held while blocked")
+    if r.get("gated_only") and not r.get("ready"):
+        notes.append("no other backend serves this alias: its schema and image slots stay "
+                     "empty until this sync finishes")
+    return "<br>".join(notes)
+
+
+def _sync_files_row(alias: str, files) -> str:
+    """The expandable per-file rows of one alias: path · size · node <id> (<cls>) ·
+    present. `node` names the loader that needs the file — the one to `bypass` on this
+    candidate when a switch leaves it unused (spec "Doppelte Loader-Zweige")."""
+    fs = [f for f in (files if isinstance(files, list) else []) if isinstance(f, dict)]
+    if not fs:
+        return ""
+    rows = ""
+    for f in fs:
+        size = f.get("size")
+        node = (f"node {_esc(f.get('node'))} ({_esc(f.get('cls') or '?')})"
+                if f.get("node") is not None else "catalog")
+        rows += (f'<tr data-k="f-{_esc(f.get("path"))}"><td><code>{_esc(f.get("path"))}</code></td>'
+                 f'<td data-sv="{_nbytes(size)}">'
+                 f'{f"{_gb1(size)} GB" if size is not None else "size unknown"}</td>'
+                 f"<td>{node}</td><td>{'✓ present' if f.get('present') else 'missing'}</td></tr>")
+    return (f'<tr data-k="ms-{_esc(alias)}-files"><td colspan="6"><details><summary>'
+            f"{len(fs)} file{'s' if len(fs) != 1 else ''}</summary><table><tr><th>file</th>"
+            f"<th>size</th><th>needed by</th><th></th></tr>{rows}</table></details></td></tr>")
+
+
+def _thunder_sync(k: str, name: str, v: dict) -> str:
+    """Model sync of one Thunder backend: per alias need/have/missing and status, the
+    transfers, what the stop will delete, the held and the unknown files."""
+    p = v.get("plan") if isinstance(v.get("plan"), dict) else None
+    phase = str(v.get("phase") or "off")
+    running = phase in _SYNC_PHASES
+    out = []
+    if v.get("sync_error"):
+        out.append(f'<p class="bad" data-k="{_esc(k)}-syncerr">sync: {_esc(v["sync_error"])}</p>')
+    if p is None:
+        if running:
+            out.append(f'<p class="hint" data-k="{_esc(k)}-noplan">Planning the model sync …</p>')
+        return "".join(out)
+    aliases = p.get("aliases") if isinstance(p.get("aliases"), dict) else {}
+    ready = sum(1 for r in aliases.values() if isinstance(r, dict) and r.get("ready"))
+    out.append(f'<div class="tfacts" data-k="{_esc(k)}-synctot">models {_gb1(p.get("have_total"))}'
+               f' of {_gb1(p.get("need_total"))} GB present · {ready} of {len(aliases)} '
+               f"alias{'es' if len(aliases) != 1 else ''} ready"
+               + ("" if running else f" · last plan (instance is {_esc(phase)})") + "</div>")
+    if aliases:
+        rows = ""
+        for a in sorted(aliases, key=lambda x: str(x).lower()):
+            r = aliases[a] if isinstance(aliases[a], dict) else {}
+            need, have = _nbytes(r.get("need_bytes")), _nbytes(r.get("have_bytes"))
+            rows += (f'<tr data-k="ms-{_esc(a)}"><td>{_esc(a)}</td>'
+                     f'<td data-sv="{need}">{_gb1(need)}</td><td data-sv="{have}">{_gb1(have)}</td>'
+                     f'<td data-sv="{max(0, need - have)}">{_gb1(max(0, need - have))}</td>'
+                     f"<td>{_sync_status(r)}</td><td>{_sync_notes(r)}</td></tr>"
+                     + _sync_files_row(a, r.get("files")))
+        out.append(f'<table data-k="{_esc(k)}-aliases"><tr><th>alias</th><th>need GB</th>'
+                   "<th>have GB</th><th>missing GB</th><th>status</th><th>notes</th></tr>"
+                   f"{rows}</table>")
+    tx = v.get("transfers")
+    tx = list(tx.values()) if isinstance(tx, dict) else (tx if isinstance(tx, list) else [])
+    tx = [t for t in tx if isinstance(t, dict) and t.get("file")]
+    if tx:
+        trs = ""
+        for t in tx:
+            done, total = _nbytes(t.get("bytes")), t.get("total")
+            prog = (f"{_gb1(done)} of {_gb1(total)} GB" if total else f"{_gb1(done)} GB")
+            try:
+                rate = f"{float(t.get('rate')) / 1e6:.1f} MB/s" if t.get("rate") is not None else "—"
+            except (TypeError, ValueError):
+                rate = "—"
+            eta = _hms(t["eta"]) if t.get("eta") is not None else "—"
+            trs += (f'<tr data-k="tx-{_esc(t["file"])}"><td><code>{_esc(t["file"])}</code></td>'
+                    f"<td>{_esc(t.get('source') or '')}</td><td>{prog}</td><td>{rate}</td>"
+                    f"<td>{eta}</td></tr>")
+        out.append(f'<table data-k="{_esc(k)}-tx"><tr><th>transfer</th><th>source</th>'
+                   f"<th>progress</th><th>rate</th><th>ETA</th></tr>{trs}</table>")
+    held = _rows(p.get("held"))
+    if held:
+        hb = sum(_nbytes(h[1]) for h in held if len(h) > 1)
+        hr = "".join(f'<tr data-k="h-{_esc(h[0])}"><td><code>{_esc(h[0])}</code></td>'
+                     f'<td>{_gb1(h[1]) if len(h) > 1 else "?"} GB</td>'
+                     f"<td>{_esc(h[2]) if len(h) > 2 else ''}</td></tr>" for h in held)
+        out.append(f'<details data-k="{_esc(k)}-held"><summary>held (alias blocked): {len(held)} '
+                   f"file{'s' if len(held) != 1 else ''}, {_gb1(hb)} GB — kept at stop until the "
+                   "block is fixed</summary><table><tr><th>file</th><th>size</th><th>alias</th>"
+                   f"</tr>{hr}</table></details>")
+    prune = _rows(p.get("prune_sizes")) or [[x, None] for x in (p.get("prune") or [])
+                                             if isinstance(x, str)]
+    if prune:
+        pb = sum(_nbytes(x[1]) for x in prune if len(x) > 1)
+        unsized = sum(1 for x in prune if len(x) < 2 or x[1] is None)
+        pr = "".join(f'<tr data-k="p-{_esc(x[0])}"><td><code>{_esc(x[0])}</code></td>'
+                     f'<td>{f"{_gb1(x[1])} GB" if len(x) > 1 and x[1] is not None else "?"}</td></tr>'
+                     for x in prune)
+        out.append(f'<details data-k="{_esc(k)}-prune"><summary>deleted at stop: {len(prune)} '
+                   f"file{'s' if len(prune) != 1 else ''}, {_gb1(pb)} GB"
+                   + (f" (+ {unsized} of unknown size)" if unsized else "")
+                   + " — synced by us, no alias needs them any more</summary><table><tr><th>file"
+                   f"</th><th>size</th></tr>{pr}</table></details>")
+    unk = [u for u in _rows(p.get("unknown")) if isinstance(u[0], str)]
+    if unk and running:
+        ub = sum(_nbytes(u[1]) for u in unk if len(u) > 1)
+        n = len(unk)
+        ur = "".join(
+            f'<tr data-k="uk-{_esc(u[0])}"><td><label class="ckbox"><input type="checkbox" '
+            f'name="path" value="{_esc(u[0])}" data-bytes="{_nbytes(u[1] if len(u) > 1 else 0)}" '
+            f"checked> <code>{_esc(u[0])}</code></label></td>"
+            f"<td>{_gb1(u[1] if len(u) > 1 else 0)} GB</td></tr>" for u in unk)
+        what = f"on {name}? Nothing synced them and no alias needs them — they are gone for good."
+        # the text for the default state (every box ticked); _CONFIRM_JS recomputes it
+        # from `data-confirm-sum` for the boxes actually ticked at click time
+        confirm = f"Delete {n} unknown file{'s' if n != 1 else ''} ({_gb1(ub)} GB) {what}"
+        out.append(
+            f'<details data-k="{_esc(k)}-unknown-sync"><summary>unknown files on the instance: {n}, '
+            f"{_gb1(ub)} GB (never deleted automatically)</summary>"
+            '<form method="post" action="/ui/thunder/delete-unknown">'
+            f'<input type="hidden" name="name" value="{_esc(name)}">'
+            f"<table><tr><th>file</th><th>size</th></tr>{ur}</table>"
+            f'<button type="submit" class="btn danger sm" '
+            f'data-confirm="{_esc(confirm)}" '
+            f'data-confirm-sum="{_esc("Delete {n} unknown file(s) ({gb} GB) " + what)}">'
+            "Delete ticked files</button></form></details>")
+    return "".join(out)
+
+
 def _thunder_card(name: str, v: dict, cfg: Optional[dict]) -> str:
     """One Thunder backend's lifecycle card. Every row carries a `data-k` (the live
     morph matches by key), and nothing here needs a script."""
@@ -3110,6 +3300,9 @@ def _thunder_card(name: str, v: dict, cfg: Optional[dict]) -> str:
     if tn:
         rows.append(f'<div class="tfacts" data-k="{_esc(k)}-tnodes">Node packs the template '
                     f"brought along: {_esc(', '.join(tn))}</div>")
+    sync = _thunder_sync(k, name, v)
+    if sync:
+        rows.append(f'<div class="tsync" data-k="{_esc(k)}-sync">{sync}</div>')
     q = _q(name)
     acts = ""
     # mirrors the controller's refusals: an op in flight refuses Start and Restart;
@@ -3126,6 +3319,9 @@ def _thunder_card(name: str, v: dict, cfg: Optional[dict]) -> str:
     if phase in ("ready", "failed") and not op and v.get("uuid"):
         acts += _btn("Restart ComfyUI", f"/ui/thunder/restart?name={q}", "secondary", sm=True,
                      title="Restart ComfyUI on the running instance")
+    if phase in _SYNC_PHASES:
+        acts += _btn("Sync now", f"/ui/thunder/sync?name={q}", "secondary", sm=True,
+                     title="Re-plan the model sync now and retry transfers that gave up")
     if uu:
         acts += _btn("Forget unreconciled", f"/ui/thunder/forget?name={q}", "secondary", sm=True,
                      confirm=f"Forget {', '.join(uu)}? Only if none of them is {name}'s instance "
@@ -3138,14 +3334,48 @@ def _thunder_card(name: str, v: dict, cfg: Optional[dict]) -> str:
     return f'<div class="tcard" data-k="{_esc(k)}">{"".join(rows)}</div>'
 
 
-def _thunder_panel(views: list, binfo: list) -> str:
-    """The Thunder lifecycle cards above the backend list — empty without Thunder."""
-    if not views:
+def _catalog_editor(refused: Optional[tuple] = None) -> str:
+    """The model-sync catalog (setting `modelsync_catalog`, one for every Thunder
+    backend) as a JSON textarea. `refused` = (text as typed, [reasons]): a Save the
+    validator turned down comes back open, with the text exactly as typed."""
+    if refused is not None:
+        text, errs = refused
+        n = "?"
+    else:
+        try:
+            cat = _modelsync_catalog()
+        except Exception as e:                          # noqa: BLE001 — a panel, not the tab
+            logger.warning(f"ui: model-sync catalog unreadable: {type(e).__name__}: {e}")
+            cat = []
+        text, errs = json.dumps(cat, indent=1, ensure_ascii=False), []
+        n = str(len(cat)) if isinstance(cat, list) else "?"
+    err = "".join(_form_err(e) for e in errs[:30])
+    return (f'<details class="optblock" data-k="thunder-catalog"{" open" if refused else ""}>'
+            f"<summary>Model-sync catalog ({n} entries)</summary>"
+            '<form method="post" action="/ui/thunder/catalog" data-guard>' + err
+            + "<p class='hint'>What no workflow names, for every Thunder backend. Entries: "
+            "<code>{\"match\": {\"class\": …, \"value\": …}, \"paths\": […]}</code> "
+            "(a node that loads its own model — a hub id needs class AND value), "
+            "<code>{\"match\": {\"alias\": …}, \"paths\": []}</code> (an alias without "
+            "loader references; <code>[]</code> = needs nothing), "
+            "<code>{\"file\": …, \"url\": \"https://…\", \"sha256\": …}</code> (a "
+            "public download source). Paths start with <code>models/</code> or "
+            "<code>hf-cache/</code>; a trailing <code>/</code> is a whole directory.</p>"
+            + _textarea("catalog", text, rows=16)
+            + f'<div class="tacts">{_btn("Save catalog", submit=True, sm=True)}</div>'
+            "</form></details>")
+
+
+def _thunder_panel(views: list, binfo: list, catalog_refused: Optional[tuple] = None) -> str:
+    """The Thunder lifecycle cards above the backend list, and the model-sync catalog
+    — empty without Thunder (unless a refused catalog Save must be shown as typed)."""
+    if not views and catalog_refused is None:
         return ""
     cfg = {b.get("name"): b.get("thunder") for b in binfo
            if b.get("type") == "comfyui" and isinstance(b.get("thunder"), dict)}
     cards = "".join(_thunder_card(n, v, cfg.get(n)) for n, v in views)
-    return f'<div data-sk="thunder"><div class="grouphdr">Thunder Compute</div>{cards}</div>'
+    return (f'<div data-sk="thunder"><div class="grouphdr">Thunder Compute</div>{cards}'
+            f"{_catalog_editor(catalog_refused)}</div>")
 
 
 async def _thunder_post(request: Request, action: str):
@@ -3181,6 +3411,67 @@ async def thunder_restart(request: Request):
 
 async def thunder_forget(request: Request):
     return await _thunder_post(request, "forget_unreconciled")
+
+
+def _thunder_msg(msg: str) -> RedirectResponse:
+    return RedirectResponse("/ui/backends?msg=" + _q(msg[:600]), status_code=303)
+
+
+async def thunder_sync(request: Request):
+    """"Sync now": re-plan at once and retry the transfers that gave up."""
+    f = await _form(request)
+    name = (f.get("name") or request.query_params.get("name") or "").strip()
+    if not name or _thunder_sync_now is None:
+        msg = "no Thunder backend named" if not name else "model sync is not available"
+    else:
+        try:
+            msg = f"{name}: {await _thunder_sync_now(name)}"
+        except Exception as e:                          # noqa: BLE001 — say it, don't 500
+            msg = f"{name}: sync failed: {type(e).__name__}: {e}"
+    logger.info(f"ui: thunder sync {name!r} → {msg}")
+    return _thunder_msg(msg)
+
+
+async def thunder_delete_unknown(request: Request):
+    """Delete the ticked files of a Thunder instance's `unknown` list. The controller
+    judges them against a FRESH plan and refuses the whole request if one became
+    needed meanwhile — a stale page can never delete a file an alias now uses."""
+    f = await _form_multi(request)
+    name = ((f.get("name") or [""])[-1] or request.query_params.get("name") or "").strip()
+    paths = [p for p in f.get("path") or [] if p]
+    if not name or _thunder_delete_unknown is None:
+        msg = "no Thunder backend named" if not name else "model sync is not available"
+    elif not paths:
+        msg = f"{name}: no file ticked — nothing deleted"
+    else:
+        try:
+            msg = f"{name}: {await _thunder_delete_unknown(name, paths)}"
+        except Exception as e:                          # noqa: BLE001
+            msg = f"{name}: delete failed: {type(e).__name__}: {e}"
+    logger.info(f"ui: thunder delete-unknown {name!r} ({len(paths)} path(s)) → {msg}")
+    return _thunder_msg(msg)
+
+
+async def thunder_catalog_save(request: Request):
+    """Save the model-sync catalog. JSON the parser or `modelsync.validate_catalog`
+    refuses is a 400 with the textarea exactly as typed — never a partial save: a
+    typo'd key would otherwise be dropped silently and its alias stay blocked."""
+    f = await _form(request)
+    text = f.get("catalog", "")
+    try:
+        cat = json.loads(text)
+    except ValueError as e:
+        errs = [f"catalog is not valid JSON: {e}"]
+    else:
+        try:
+            errs = list(_save_modelsync_catalog(cat) or [])
+        except Exception as e:                          # noqa: BLE001 — refused, not a 500
+            errs = [f"catalog not saved: {type(e).__name__}: {e}"]
+    if errs:
+        return await _backends_view(request.query_params, catalog_refused=(text, errs),
+                                    status=400)
+    logger.info(f"ui: model-sync catalog saved ({len(cat)} entries)")
+    return _thunder_msg(f"model-sync catalog saved ({len(cat)} entries)")
 
 
 # ── Tab: Input ──────────────────────────────────────────────────────────────────
@@ -8609,6 +8900,9 @@ def register(app) -> None:
     app.add_api_route("/ui/thunder/stop", thunder_stop, methods=["POST"])
     app.add_api_route("/ui/thunder/restart", thunder_restart, methods=["POST"])
     app.add_api_route("/ui/thunder/forget", thunder_forget, methods=["POST"])
+    app.add_api_route("/ui/thunder/sync", thunder_sync, methods=["POST"])
+    app.add_api_route("/ui/thunder/delete-unknown", thunder_delete_unknown, methods=["POST"])
+    app.add_api_route("/ui/thunder/catalog", thunder_catalog_save, methods=["POST"])
     app.add_api_route("/ui/input", input_page, methods=["GET"])
     app.add_api_route("/ui/routing", routing_page, methods=["GET"])
     app.add_api_route("/ui/chat/create", chat_create, methods=["POST"])
