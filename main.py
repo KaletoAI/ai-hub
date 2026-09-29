@@ -5765,12 +5765,6 @@ def gateway_info() -> dict:
             "host": backend_hosts.get(backend_id(b), ""),
             "host_explicit": bool((b.get("host") or "").strip()),
             "source": "config" if backend_id(b) in config_ids else "ui",
-            # The old Thunder block, for the backend form's Thunder fieldset only (a COPY
-            # of what a Save would otherwise drop). Nothing else reads it since managed
-            # hosts replaced it; Task 8 removes the fieldset and this key.
-            **({"thunder": copy.deepcopy(b["thunder"])}
-               if b.get("type") == "comfyui" and isinstance(b.get("thunder"), dict)
-               and b["thunder"] else {}),
             **_comfy_watch_info(b), **_cloud_info(b), **_model_filter_info(b), **_loaded_info(b),
         } for b in backends],
         "virtual_models": list(virtual_models.keys()),
@@ -5926,29 +5920,32 @@ def _lport_ok(v) -> bool:
             and LOCAL_PORT_MIN <= v <= LOCAL_PORT_MAX)
 
 
-def _pick_local_port(bid: str, cur, host: str, rows: list) -> int:
+def _pick_local_port(bid: str, cur, host: str, rows: list, own: tuple = ()) -> int:
     """`cur` when it is in the range and nobody else holds it, else the lowest free
     port. Held = any OTHER backend's `local_port` (store rows and the live list), and a
     port another host's controller still forwards for a backend that no longer exists
     (a host deleted while running keeps its forwards). The backend's OWN host's old
-    service list is not counted: after a rename its old entry is replaced by this one."""
+    service list is not counted: after a rename its old entry is replaced by this one.
+    `own` = further ids that ARE this backend (the identity a console rename comes
+    from, whose row and live entry still exist until the Save writes)."""
+    mine = {bid, *own}
     used = set()
     for b in list(rows) + list(backends):
-        if backend_id(b) != bid and _lport_ok(b.get("local_port")):
+        if backend_id(b) not in mine and _lport_ok(b.get("local_port")):
             used.add(b["local_port"])
     live = {backend_id(b) for b in backends}
     # a port a controller FORWARDS for this very backend (its service list of the last
     # sync) is its, whoever else's row claims it: resolving the clash by list order
     # could move a RUNNING service's forward (and URL) for a hand-edited row
     if _lport_ok(cur) and any(
-            hostctl.service_bid(x) == bid and x.get("local_port") == cur
+            hostctl.service_bid(x) in mine and x.get("local_port") == cur
             for c in host_controllers.values() for x in getattr(c, "services", []) or []):
         return cur
     for hn, c in host_controllers.items():
         if hn == host:
             continue
         for x in getattr(c, "services", []) or []:
-            if (hostctl.service_bid(x) not in live and hostctl.service_bid(x) != bid
+            if (hostctl.service_bid(x) not in live and hostctl.service_bid(x) not in mine
                     and _lport_ok(x.get("local_port"))):
                 used.add(x["local_port"])
     if _lport_ok(cur) and cur not in used:
@@ -5959,17 +5956,25 @@ def _pick_local_port(bid: str, cur, host: str, rows: list) -> int:
     raise RuntimeError(f"no free local port in {LOCAL_PORT_MIN}–{LOCAL_PORT_MAX}")
 
 
-def assign_local_port(backend_name: str, btype: str = "openai") -> int:
+def assign_local_port(backend_name: str, btype: str = "openai",
+                      prev: Optional[tuple] = None) -> int:
     """The local port of backend `(backend_name, btype)` on a managed host: the one its
     store row carries when that is still valid and unique, else the lowest free one in
     18100–18999. Stable across Saves AND renames because it is read from the row (a
-    Save — and a rename — builds the new row from the old one). Returns, never writes:
-    the console's Save stores it with the row (Task 8); `sync_host_controllers` assigns
-    lazily for rows that have none yet. RuntimeError when the range is exhausted."""
+    Save — and a rename — builds the new row from the old one). `prev` = the (name,
+    type) the console's Save is renaming FROM: its row is still in the store and its
+    backend still live, so without it the backend's own old port would count as
+    another's and a rename would move the URL. Returns, never writes: the console's
+    Save stores it with the row; `sync_host_controllers` assigns lazily for rows that
+    have none yet. RuntimeError when the range is exhausted."""
     bid = f"{btype}:{backend_name}"
+    pbid = f"{prev[1]}:{prev[0]}" if prev else bid
     rows = store.list_backends() if store.is_active() else []
-    row = next((b for b in rows if backend_id(b) == bid), None) or _live_backend(bid) or {}
-    return _pick_local_port(bid, row.get("local_port"), str(row.get("host") or ""), rows)
+    row = (next((b for b in rows if backend_id(b) == bid), None) or _live_backend(bid)
+           or next((b for b in rows if backend_id(b) == pbid), None) or _live_backend(pbid)
+           or {})
+    return _pick_local_port(bid, row.get("local_port"), str(row.get("host") or ""), rows,
+                            own=(pbid,))
 
 
 def _attach_fields(b: dict, rows: list) -> None:
@@ -7082,6 +7087,7 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
            # managed hosts: the Backends tab's host cards, form and actions
            host_names=host_names, host_view=host_view, host_action=host_action,
            host_longrun=host_longrun, save_managed_host=save_managed_host,
+           assign_local_port=assign_local_port,
            delete_managed_host=delete_managed_host,
            managed_host_delete_refusal=managed_host_delete_refusal,
            thunder_default_nodes=_thunder_default_nodes,

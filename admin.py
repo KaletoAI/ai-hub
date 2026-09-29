@@ -36,6 +36,7 @@ import hostapi
 import jobs
 import scheduler
 import reasoning
+import services
 import stats
 import store
 
@@ -191,6 +192,9 @@ _host_names: Callable[[], list] = lambda: []
 _host_view: Callable[[str], Optional[dict]] = lambda name: None
 _host_action: Callable = None
 _save_managed_host: Callable = None                 # (name, entry, new) → refusal
+# (name, type, prev (name, type) of a rename | None) → the tunnel's local port of a
+# backend on a managed host (main.assign_local_port; stable over saves and renames).
+_assign_local_port: Callable = None
 _delete_managed_host: Callable = None               # (name) → refusal
 _managed_host_delete_refusal: Callable[[str], Optional[str]] = \
     lambda name: "managed hosts are not available"
@@ -408,7 +412,7 @@ details.optblock{border:1px solid var(--line);border-radius:8px;padding:6px 10px
 details.optblock>summary{cursor:pointer;user-select:none;font-size:12px;color:var(--dim-2);padding:2px 0}
 details.optblock>summary:hover{color:var(--text-2)}
 details.optblock[open]>summary{margin-bottom:8px;border-bottom:1px solid #1c2129;padding-bottom:6px}
-/* Managed hosts: the Backends-tab lifecycle card (and, until the backend form drops it, the old Thunder block) */
+/* Managed hosts: the Backends-tab lifecycle card and the backend form's service block */
 fieldset.tblock{border:1px solid var(--line);border-radius:8px;padding:6px 10px;margin:14px 0 12px}
 fieldset.tblock>legend{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--dim-2);font-weight:600;padding:0 4px}
 .tcard{background:var(--row);border:1px solid var(--line);border-radius:10px;padding:10px 14px;margin:8px 0 12px}
@@ -853,7 +857,10 @@ def _page(title: str, body: str, active: str = "", refresh: Optional[int] = None
             f"{_CONFIRM_JS}{_SCROLL_JS}{_SORT_JS}{_TABS_JS}{_LIVE_JS}</body></html>")
 
 
-_CTRL_TAG = re.compile(r"<(input|select|textarea)\b([^>]*)>", re.I)
+# Quoted attribute values are skipped whole: an inline handler may hold a `>`
+# (`indexOf(…)>=0`), and a tag that ended there got its label id written INTO the
+# handler — whose `"` then cut the attribute short and broke the handler silently.
+_CTRL_TAG = re.compile(r"""<(input|select|textarea)\b((?:[^>"']|"[^"]*"|'[^']*')*)>""", re.I)
 _ATTR = lambda name: re.compile(r"""\b%s\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""" % name, re.I)
 _ID_ATTR, _NAME_ATTR, _TYPE_ATTR = _ATTR("id"), _ATTR("name"), _ATTR("type")
 
@@ -1708,77 +1715,80 @@ def _btype_block(types: str, cur_type: str, inner: str) -> str:
     return f'<div data-btype="{types}"{style}>{inner}</div>'
 
 
-# Thunder Compute (hostctl.py): the optional block of a ComfyUI backend. The GPU and
-# template lists are what the form offers; a stored value outside them (config.yaml) is
-# kept as an extra option so an edit never silently switches it.
-_THUNDER_GPUS = ("a6000", "l40", "a100xl", "h100")
-_THUNDER_TEMPLATES = ("comfy-ui", "base")
-# The ComfyUI revision the bootstrap pins (the k12-gpu build). A FULL sha only: the
-# bootstrap's fetch-by-sha fallback needs it and exits 2 on anything else — after the
-# instance was already created and billed.
-_THUNDER_COMMIT_DEFAULT = "1d61dcc35c35541388c0001bacc7703db14e8bea"
-_THUNDER_PORT_DEFAULT = 18188
-_THUNDER_DIRS = {"comfy_output_dir": "/home/ubuntu/ComfyUI/output",
-                 "comfy_input_dir": "/home/ubuntu/ComfyUI/input"}
-_HEX40 = re.compile(r"[0-9a-fA-F]{40}")
+# A ComfyUI backend on a managed host: the dirs the ComfyUI bootstrap lays out on the
+# VM (ops/thunder-bootstrap.sh), filled in where the form left them blank — chains read
+# and write meshes there by full path.
+_MANAGED_COMFY_DIRS = {"comfy_output_dir": "/home/ubuntu/ComfyUI/output",
+                       "comfy_input_dir": "/home/ubuntu/ComfyUI/input"}
 
 
-def _thunder_fieldset(src: dict) -> str:
-    """The "Thunder Compute (optional)" block of the ComfyUI pane. Ticked, it makes the
-    backend an on-demand Thunder instance behind an ssh tunnel: backend_save derives
-    url/host from it and the Backends tab shows its lifecycle card. A NEW block (none
-    stored) is pre-filled with the defaults, the node list from ops/ included."""
-    t = src.get("thunder") if isinstance(src.get("thunder"), dict) else None
-    new = t is None
-    t = t or {}
-    gv = lambda k, d="": str(t.get(k) if t.get(k) not in (None, "") else d)
-    gpu = gv("gpu_type", "a6000")
-    tpl = gv("bootstrap_template", "comfy-ui")
-    gpus = list(_THUNDER_GPUS) + ([gpu] if gpu not in _THUNDER_GPUS else [])
-    tpls = list(_THUNDER_TEMPLATES) + ([tpl] if tpl not in _THUNDER_TEMPLATES else [])
-    nodes = t.get("nodes")
-    if new:
-        nodes_txt = str(_thunder_default_nodes() or "")
-    elif isinstance(nodes, list):
-        nodes_txt = "\n".join(str(x) for x in nodes)
-    else:
-        nodes_txt = str(nodes or "")
-    return ('<fieldset class="tblock"><legend>Thunder Compute (optional)</legend>'
-            + _field("thunder", _checkbox("thunder_on", not new, "on-demand Thunder instance",
-                                          "start/stop a Thunder Compute GPU instance for this "
-                                          "backend (snapshot-based)"))
-            + "<p class='hint' style='margin:-4px 0 10px'>The Thunder <b>API token</b> is the "
-              "<b>API key</b> field (General tab). Ticked, <b>url</b> and <b>host</b> are derived "
-              "(<code>http://127.0.0.1:&lt;local port&gt;</code> — the ssh tunnel — and "
-              "<code>thunder-&lt;name&gt;</code>), and blank ComfyUI dirs become "
-              "<code>/home/ubuntu/ComfyUI/output|input</code>. Start and stop it on the "
-              "Backends list.</p>"
-            + _field("gpu", _select("thunder_gpu", gpus, gpu))
-            + _field("gpus", _inp("thunder_num_gpus", gv("num_gpus", "1"), placeholder="1",
-                                  typ="number"), short=True)
-            + _field("vcpus", _inp("thunder_vcpus", gv("vcpus", "8" if new else ""),
-                                   placeholder="8", typ="number"), short=True)
-            + _field("template", _select("thunder_template", tpls, tpl))
-            + _field("disk reserve GB", _inp("thunder_reserve_gb", gv("reserve_gb", "20"),
-                                             placeholder="20", typ="number"), short=True)
-            + _field("local port", _inp("thunder_local_port",
-                                        gv("local_port", str(_THUNDER_PORT_DEFAULT)),
-                                        placeholder=str(_THUNDER_PORT_DEFAULT), typ="number"),
-                     short=True)
-            + _field("ComfyUI commit", _inp("thunder_comfy_commit",
-                                            gv("comfy_commit", _THUNDER_COMMIT_DEFAULT if new else ""),
-                                            placeholder=_THUNDER_COMMIT_DEFAULT))
-            + "<p class='hint' style='margin:-4px 0 10px'><b>ComfyUI commit</b>: a full 40-hex "
-              "sha (blank = the default pin). <b>local port</b>: the tunnel's port on this "
-              "gateway — unique per Thunder backend.</p>"
-            + _field("custom nodes", _textarea("thunder_nodes", nodes_txt, rows=6,
-                                               placeholder="https://github.com/…/Pack.git@<commit>\n"
-                                                           "registry:<id>@<version>"), wide=True)
-            + "<p class='hint' style='margin:-4px 0 10px'>One node pack per line: "
-              "<code>&lt;git-url&gt;@&lt;commit&gt;</code> or "
-              "<code>registry:&lt;id&gt;@&lt;version&gt;</code>; <code>#</code> comments and blank "
-              "lines are ignored. Empty = the default list at bootstrap time.</p>"
+def _managed_host_entries() -> Optional[dict]:
+    """The managed hosts a backend may attach to — the STORE entries (a controller kept
+    past its deleted entry runs nothing new). None when the store cannot say: a Save
+    must then refuse rather than guess whether the chosen host exists."""
+    if not store.is_active():
+        return {}
+    try:
+        return store.get_managed_hosts()
+    except Exception as e:
+        logger.warning(f"ui: managed hosts unreadable: {type(e).__name__}")
+        return None
+
+
+def _managed_fieldset(src: dict, cur_type: str, managed: bool) -> str:
+    """The service fields of a backend on a managed host (spec "Konsole"): the port the
+    service listens on inside the VM and — for an OpenAI-compatible server — how to set
+    it up and start it. Rendered for EVERY backend (only `display` follows the host
+    select and, inside, the type select): a field that is not submitted reads as cleared."""
+    g = lambda k, d="": str(src.get(k) if src.get(k) not in (None, "") else d)
+    prof = services.profile_for({"type": cur_type})
+    rp_default = str(prof.default_port) if prof else ""
+    style = "" if managed else ' style="display:none"'
+    return (f'<fieldset class="tblock" data-mhost{style}><legend>Service on the managed host</legend>'
+            + _field("remote port", _inp("remote_port", g("remote_port", rp_default),
+                                         placeholder=rp_default or "8000", typ="number"),
+                     short=True,
+                     hint="The port the service listens on <b>inside the VM</b>, on "
+                          "<code>127.0.0.1</code> — unique per host (ComfyUI 8188, an "
+                          "OpenAI-compatible server 8000 by default). The gateway reaches it "
+                          "through its ssh tunnel; the <b>url</b> above is that tunnel's end "
+                          "and is derived on Save.")
+            + _btype_block("comfyui", cur_type,
+                           "<p class='hint'>ComfyUI is installed and started by the host's "
+                           "ComfyUI bootstrap (one ComfyUI per host). Blank ComfyUI dirs (ComfyUI "
+                           "tab) become <code>/home/ubuntu/ComfyUI/output|input</code>.</p>")
+            + _btype_block("openai", cur_type,
+                           _field("setup script", _textarea("svc_setup", g("svc_setup"), rows=5,
+                                                            placeholder="pip install -U vllm"),
+                                  wide=True,
+                                  hint="Optional shell script, run once per host snapshot (again "
+                                       "whenever it changes). <b>No tokens here</b> — it is stored "
+                                       "in plain text; the HF token belongs in the <b>HF-token "
+                                       "setting</b>. A command that reads stdin consumes the rest "
+                                       "of the script: use <code>-y</code> or "
+                                       "<code>&lt;/dev/null</code>.")
+                           + _field("start command", _textarea("svc_start", g("svc_start"), rows=3,
+                                                               placeholder="vllm serve <model> "
+                                                               "--host 127.0.0.1 --port 8000"),
+                                    wide=True,
+                                    hint="Required. Runs in a restart loop with its own "
+                                         "<code>HF_HOME</code>; it must listen on "
+                                         "<code>127.0.0.1:&lt;remote port&gt;</code>. <b>No tokens "
+                                         "here</b> — stored in plain text; the HF token belongs in "
+                                         "the <b>HF-token setting</b>.")
+                           + _field("health path", _inp("svc_health", g("svc_health"),
+                                                        placeholder=services.HEALTH_DEFAULT),
+                                    hint="Probed through the tunnel; 200, 401 or 403 = up. "
+                                         f"Blank = <code>{services.HEALTH_DEFAULT}</code>."))
             + "</fieldset>")
+
+
+# The host select's handler: shows the service block and makes the url readonly while
+# a managed host is chosen (its url is derived on Save). ES5; no values interpolated.
+_MHOST_JS = ("var f=this.form,on=!!this.value;"
+             "Array.prototype.forEach.call(f.querySelectorAll('[data-mhost]'),"
+             "function(e){e.style.display=on?'':'none'});"
+             "if(f.url){f.url.readOnly=on}")
 
 
 def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None,
@@ -1801,15 +1811,23 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
     oid = (_bid(b) if b else "") if orig_id is None else orig_id
     title = "Edit Backend" if oid else "Add Backend"
     orig = f'<input type="hidden" name="orig" value="{_esc(oid)}">' if oid else ""
-    hlist = "".join(f'<option value="{_esc(h)}">' for h in hosts)
+    # The host is EITHER a managed host (select) or free text (IP/hostname) — two
+    # fields, one `host` stored: backend_save takes the managed one when chosen.
+    mnames = sorted(_managed_host_entries() or {}, key=lambda n: str(n).lower())
+    cur_host = g("host")
+    managed = bool(cur_host) and cur_host in mnames
+    hlist = "".join(f'<option value="{_esc(h)}">' for h in hosts if h not in mnames)
     # The cloud option block is rendered for EVERY cloud kind at once (one hint each,
     # only the current type's visible) — the type select toggles them client-side, so
     # switching type must not need a round trip.
     cur_type = g("type", "openai")
-    th_on = isinstance(src.get("thunder"), dict) and bool(src.get("thunder"))
     cmod = adapters.cloud_module(cur_type) if cur_type in adapters.CLOUD_TYPES else None
     num = lambda x: str(int(x)) if float(x) == int(x) else str(x)   # 5.0 → "5" (a placeholder)
-    host_inp = (f'<input name="host" value="{_esc(g("host"))}" list="hostlist" '
+    mopts = "".join(f'<option value="{_esc(v)}"{" selected" if (v == cur_host if managed else not v) else ""}>'
+                    f"{_esc(lbl)}</option>"
+                    for v, lbl in [("", "(none / free text)")] + [(n, n) for n in mnames])
+    host_sel = f'<select name="host_managed" onchange="{_esc(_MHOST_JS)}">{mopts}</select>'
+    host_inp = (f'<input name="host" value="{_esc("" if managed else cur_host)}" list="hostlist" '
                 f'placeholder="auto: URL host/IP" autocomplete="off">'
                 f'<datalist id="hostlist">{hlist}</datalist>')
     pane = lambda key: (f'<div class="bpane" data-btab="{key}"'
@@ -1832,16 +1850,23 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
               "generation + Mixamo-spec rigging (image / multi-image → 3D), billed per task — always "
               "<b>paid</b>. <b>anthropic</b> = api.anthropic.com for "
               "Claude Code, reachable through <code>/v1/messages</code> only.</p>"
-            # A Thunder backend's url is DERIVED (the tunnel port) — readonly, never
-            # disabled: a disabled input is not submitted, and absent reads as cleared.
+            # A managed host's backend has a DERIVED url (its tunnel port) — readonly,
+            # never disabled: a disabled input is not submitted, and absent reads as cleared.
             + _field("url", _inp("url", g("url"), placeholder="http://host:8080",
-                                 readonly=th_on),
-                     hint=("derived from the Thunder block (the tunnel port) — to use a real URL, "
-                           "untick Thunder (ComfyUI tab) and save, then set it here" if th_on else ""))
+                                 readonly=managed),
+                     hint=("derived on Save from the managed host's tunnel "
+                           "(<code>http://127.0.0.1:&lt;local port&gt;</code>) — to use a real URL, "
+                           "choose <b>(none / free text)</b> as host and type it here"
+                           if managed else ""))
+            + _field("managed host", host_sel)
             + _field("host", host_inp)
-            + "<p class='hint' style='margin:-4px 0 10px'>The physical box this backend runs on — backends "
-              "on one host share its GPU/VRAM (basis for host policies). Blank = derived from the URL "
-              "host/IP, which groups correctly for most setups.</p>"
+            + "<p class='hint' style='margin:-4px 0 10px'><b>managed host</b>: a VM the gateway starts "
+              "and stops (Hosts section below) — the backend then runs as a service on it, reached "
+              "through an ssh tunnel. <b>host</b> (with <b>(none / free text)</b>): the physical box "
+              "this backend runs on — backends on one host share its GPU/VRAM (basis for host "
+              "policies). Blank = derived from the URL host/IP, which groups correctly for most "
+              "setups.</p>"
+            + _managed_fieldset(src, cur_type, managed)
             # A cloud backend (Meshy, Tripo) bills per task, so `paid` is not a choice
             # there: shown checked + disabled (a disabled box is NOT submitted —
             # backend_save forces it too).
@@ -2014,7 +2039,6 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
               "this same backend <b>self retries</b> times first — that field sits in the "
               "<b>Behavior</b> tab.</p>"
             + "</div>"
-            + _btype_block("comfyui", cur_type, _thunder_fieldset(src))
             # Cloud-only options (Meshy, Tripo) — a cloud task API: no dirs, no watchdog,
             # no self-retry. The fields are named cloud_* because #comfyopts already
             # renders max_wait / poll_interval, and one form may carry each name only once.
@@ -2212,7 +2236,7 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
     `notice` = why a POST action was refused (a managed-host delete), shown on top."""
     edit_id = qp.get("edit", "")
     # Captured NOW: every branch below assigns `detail`, so testing it at the end made
-    # the tab never live — drain, scan and a running Thunder instance all froze.
+    # the tab never live — drain, scan and a running managed host all froze.
     # Live only on the plain list: an open editor (edit/new/host form) or a refused Save
     # stays static — the morph's attribute sync would reset every visibility the type
     # select's handler set (switch to comfyui, and 3 s later its panes vanish).
@@ -2698,23 +2722,41 @@ async def backend_save(request: Request):
     url = (f.get("url", "") or "").strip().rstrip("/")
     new_type = (f.get("type", "openai") or "openai").strip()
     url = _cloud_url_for(new_type, url)      # pure rule, tested in test_cloud_editor.py
-    # A Thunder backend (ComfyUI + the optional block ticked) is reached through the ssh
-    # tunnel the gateway supervises: its url is DERIVED from the tunnel's local port,
-    # whatever the (readonly) field still holds — a typed url would point discovery at
-    # a port nothing serves.
-    thunder_on = new_type == "comfyui" and bool(f.get("thunder_on"))
-    th_port, th_port_err = _int_field(f.get("thunder_local_port"), "thunder local port",
-                                      f"{_THUNDER_PORT_DEFAULT}", minimum=1)
-    if not th_port_err and th_port is not None and th_port > 65535:
-        th_port_err = f"thunder local port: '{th_port}' is not a port (1–65535)"
-    th_port = th_port or _THUNDER_PORT_DEFAULT
-    if thunder_on:
-        url = f"http://127.0.0.1:{th_port}"
-    # Every refusal is collected and answered BEFORE the store is touched, with the form
-    # shown again as typed (400) — see _refuse_backend below.
-    problems = [] if (name and url) else ["name and url are required"]
     orig = (f.get("orig", "") or "").strip()
     oname, otype = _parse_bid(orig) if orig else (name, new_type)
+    # start from the existing store backend (by old identity) so fields we don't render
+    # (e.g. enabled, local_port) survive an edit; merge the form values over it.
+    old = dict(store.get_backend(oname, otype) or store.get_backend(name, new_type) or {})
+    b = dict(old)
+    b.pop("thunder", None)       # the pre-managed-hosts Thunder block: nothing reads it
+    # ── the host: a managed host (select) or free text — one `host` stored ──
+    # A managed host's backend is a SERVICE on its VM, reached through the gateway's ssh
+    # tunnel: its url is DERIVED from the tunnel's local port on Save, whatever the
+    # (readonly) field still holds — a typed url would point discovery at a box the
+    # gateway never forwards to.
+    mhost = (f.get("host_managed", "") or "").strip()
+    host_txt = (f.get("host", "") or "").strip()
+    rp_typed = (f.get("remote_port", "") or "").strip()
+    rp, _e = _int_field(rp_typed, "remote port", "required", minimum=1)
+    if rp is not None and not _e and rp > 65535:
+        _e = "not a port"
+    problems = []
+    if mhost:
+        problems += _managed_host_problems(mhost, name, new_type, (oname, otype),
+                                           None if _e else rp, rp_typed)
+    else:
+        # Detached (or never attached): the tunnel URL goes with the host — a backend left
+        # on a 127.0.0.1 port nothing forwards any more looks configured and is dead, so
+        # the real URL must be typed.
+        olp = old.get("local_port")
+        if olp is not None and url == f"http://127.0.0.1:{olp}":
+            url = ""
+    # Every refusal is collected and answered BEFORE the store is touched, with the form
+    # shown again as typed (400) — see _refuse_backend below.
+    if not name or not (url or mhost):
+        problems.insert(0, "name and url are required"
+                        + (" — the tunnel URL goes with the managed host; type the backend's "
+                           "real URL" if old.get("local_port") is not None and not mhost else ""))
     if name and (not orig or (name, new_type) != (oname, otype)) and (
             store.get_backend(name, new_type)
             or any(_bid(x) == f"{new_type}:{name}" for x in _gateway_info().get("backends", []))):
@@ -2723,9 +2765,6 @@ async def backend_save(request: Request):
         # created an override of it.
         problems.append(f"a {new_type} backend named '{name}' already exists — pick another "
                         "name, or edit that one")
-    # start from the existing store backend (by old identity) so fields we don't render
-    # (e.g. enabled) survive an edit; merge the form values over it.
-    b = dict(store.get_backend(oname, otype) or store.get_backend(name, new_type) or {})
     b.update({"name": name, "type": new_type, "url": url,
               "paid": bool(f.get("paid"))})       # unchecked box = absent from the form = False
     mc, mc_err = _int_field(f.get("max_concurrent"), "max_concurrent", "unlimited")
@@ -2735,7 +2774,7 @@ async def backend_save(request: Request):
         b["max_concurrent"] = mc
     else:
         b.pop("max_concurrent", None)
-    host = (f.get("host", "") or "").strip()
+    host = mhost or host_txt
     if host:
         b["host"] = host
     else:
@@ -2750,78 +2789,41 @@ async def backend_save(request: Request):
         b["comfy_input_dir"] = cid
     else:
         b.pop("comfy_input_dir", None)         # blank = derive from the output dir
-    # ── Thunder Compute block (hostctl.py reads it; the api key is its token) ──
-    if thunder_on:
-        th_nodes = [ln.rstrip() for ln in (f.get("thunder_nodes", "") or "").splitlines()]
-        while th_nodes and not th_nodes[-1].strip():
-            th_nodes.pop()                      # a textarea's trailing newline is no line
-        th_typed = {"gpu_type": (f.get("thunder_gpu", "") or "").strip(),
-                    "num_gpus": (f.get("thunder_num_gpus", "") or "").strip(),
-                    "vcpus": (f.get("thunder_vcpus", "") or "").strip(),
-                    "bootstrap_template": (f.get("thunder_template", "") or "").strip(),
-                    "reserve_gb": (f.get("thunder_reserve_gb", "") or "").strip(),
-                    "local_port": (f.get("thunder_local_port", "") or "").strip(),
-                    "comfy_commit": (f.get("thunder_comfy_commit", "") or "").strip(),
-                    "nodes": th_nodes}
-        th_problems = [th_port_err] if th_port_err else []
-        # gpu_type and vcpus have no default: thunder.create_body needs both, and a
-        # missing one would only surface once a start is already under way
-        if not th_typed["gpu_type"]:
-            th_problems.append("thunder gpu is required")
-        vcpus, e = _int_field(th_typed["vcpus"], "thunder vcpus", "required", minimum=1)
-        if e or vcpus is None:
-            th_problems.append(e or "thunder vcpus is required (a whole number ≥ 1)")
-        ngpu, e = _int_field(th_typed["num_gpus"], "thunder gpus", "1", minimum=1)
-        if e:
-            th_problems.append(e)
-        reserve, e = _int_field(th_typed["reserve_gb"], "thunder disk reserve GB", "20")
-        if e:
-            th_problems.append(e)
-        commit = th_typed["comfy_commit"] or _THUNDER_COMMIT_DEFAULT
-        if not _HEX40.fullmatch(commit):
-            # the bootstrap exits 2 on anything but a full sha — after the create
-            th_problems.append(f"thunder ComfyUI commit: '{commit}' is not a full 40-hex "
-                               "commit sha (blank = the default pin)")
-        # Two Thunder backends on one local port: the second tunnel cannot bind, and its
-        # probe then reaches the FIRST backend's ComfyUI — healthy, routed, wrong box.
-        # Store entries override config ones of the same identity; this backend's own
-        # identities (before and after a rename) are not "another" backend.
-        others = {}
-        for x in _gateway_info().get("backends", []):
-            others[(x.get("name"), x.get("type", "openai"))] = x.get("thunder")
-        for x in store.list_backends():
-            others[(x.get("name"), x.get("type", "openai"))] = x.get("thunder")
-        for own in ((oname, otype), (name, new_type)):
-            others.pop(own, None)
-
-        def _port_of(t):
-            try:
-                return int(t.get("local_port") or _THUNDER_PORT_DEFAULT)
-            except (TypeError, ValueError):
-                return None
-        clash = sorted(str(n) for (n, _t), t in others.items()
-                       if isinstance(t, dict) and t and _port_of(t) == th_port)
-        if clash and not th_port_err:
-            th_problems.append(f"thunder local port {th_port} is already used by Thunder "
-                               f"backend {', '.join(clash)} — pick another port")
-        if th_problems:
-            problems.extend(th_problems)
-            b["thunder"] = th_typed             # shown again exactly as typed
+    # ── the service on a managed host (hostctl runs it; services.py profiles) ──
+    # The command service's text is kept as typed (a script's whitespace is its own);
+    # only a blank one is "unset". Kept for an openai backend whatever its host, so a
+    # detach does not throw away a setup script someone wrote.
+    for sk in ("svc_setup", "svc_start"):
+        sv = f.get(sk, "") or ""
+        if new_type == "openai" and sv.strip():
+            b[sk] = sv
         else:
-            b["thunder"] = {"gpu_type": th_typed["gpu_type"], "num_gpus": ngpu or 1,
-                            "vcpus": vcpus, "bootstrap_template":
-                                th_typed["bootstrap_template"] or "comfy-ui",
-                            "reserve_gb": 20 if reserve is None else reserve,
-                            "local_port": th_port, "comfy_commit": commit,
-                            "nodes": th_nodes}
-        # host = the instance, never 127.0.0.1 (host coordination would otherwise group
-        # every Thunder backend with this gateway box); the dirs only where left blank
-        b["host"] = f"thunder-{name}"
-        for dk, dv in _THUNDER_DIRS.items():
-            if not b.get(dk):
-                b[dk] = dv
+            b.pop(sk, None)
+    sh = (f.get("svc_health", "") or "").strip()
+    if new_type == "openai" and sh:
+        b["svc_health"] = sh
     else:
-        b.pop("thunder", None)                  # unticked (or not ComfyUI) = no block
+        b.pop("svc_health", None)               # blank = services.HEALTH_DEFAULT
+    if mhost:
+        b["remote_port"] = rp if (rp is not None and not _e) else rp_typed
+        for dk, dv in _MANAGED_COMFY_DIRS.items():
+            if new_type == "comfyui" and not b.get(dk):
+                b[dk] = dv
+        prof = services.profile_for(b)
+        if prof is not None and not problems:
+            problems += prof.validate(b)       # fixed texts — never the admin's own
+        if not problems:
+            try:
+                lp = _assign_local_port(name, new_type,
+                                        (oname, otype) if orig else None)
+            except Exception as e:              # the range is exhausted
+                problems.append(f"no local port for the tunnel: {e}")
+            else:
+                b["local_port"] = lp
+                b["url"] = url = f"http://127.0.0.1:{lp}"
+    else:
+        b.pop("remote_port", None)
+        b.pop("local_port", None)
     ak = (f.get("api_key", "") or "").strip()
     if ak:
         b["api_key"] = ak
@@ -2929,6 +2931,56 @@ async def backend_save(request: Request):
     return RedirectResponse("/ui/backends", status_code=303)
 
 
+def _managed_host_problems(mhost: str, name: str, btype: str, prev: tuple,
+                           rp: Optional[int], rp_typed: str) -> list:
+    """Why backend `(name, btype)` cannot be a service on managed host `mhost` — the
+    rules the host's controller would otherwise only find at runtime (it then shows the
+    service `down` and never starts it): the host exists, the type has a service
+    profile, a config-defined backend is never attached (R-K3 — its store copy would be
+    rewritten on every start/stop and override config wholesale), a remote port that is
+    a port and free on that host (the probe would find the OTHER service), one ComfyUI
+    per host, and no two command services with one file-name slug (R-W8). The texts are
+    fixed and name only backends/ports, never an admin's script."""
+    entries = _managed_host_entries()
+    if entries is None:
+        return ["managed hosts are unreadable right now — nothing saved, try again"]
+    if mhost not in entries:
+        return [f"managed host '{mhost}' does not exist"]
+    if services.profile_for({"type": btype}) is None:
+        return [f"type {btype} cannot run on a managed host (only comfyui and openai "
+                "services can)"]
+    bid, pbid = f"{btype}:{name}", f"{prev[1]}:{prev[0]}"
+    config = {_bid(x) for x in _gateway_info().get("backends", [])
+              if x.get("source") == "config"}
+    if bid in config:
+        return [f"'{name}' is a config-defined backend — it cannot be attached to a managed "
+                "host; create it in the console instead"]
+    if rp is None:
+        return [f"remote port: '{rp_typed}' is not a port — a whole number 1–65535 is "
+                "required" if rp_typed else "remote port is required (1–65535)"]
+    out = []
+    for x in store.list_backends():
+        xb = _bid(x)
+        if (xb in (bid, pbid) or xb in config
+                or str(x.get("host") or "").strip() != mhost):
+            continue
+        xprof = services.profile_for(x)
+        if xprof is None:
+            continue                            # never runs there — holds nothing
+        xrp = x.get("remote_port") or xprof.default_port
+        if xrp == rp:
+            out.append(f"remote port {rp} is already used by {x.get('name')} on {mhost} "
+                       "— pick another port")
+        if btype == "comfyui" and xprof is services.COMFY:
+            out.append(f"a second ComfyUI on one host is not supported ({x.get('name')} "
+                       f"runs on {mhost})")
+        if (btype == "openai" and xprof is services.COMMAND
+                and services.slug(x.get("name")) == services.slug(name)):
+            out.append(f"name slug '{services.slug(name)}' collides with {x.get('name')} on "
+                       f"{mhost} (the service's files on the VM) — pick another name")
+    return out
+
+
 async def _refuse_backend(msg: str, b: dict, f: dict, orig: str) -> HTMLResponse:
     """A refused backend Save: the Backends tab with the form as TYPED and the reason,
     status 400. It used to be a bare error page whose "← Back" opened an empty form."""
@@ -2936,6 +2988,7 @@ async def _refuse_backend(msg: str, b: dict, f: dict, orig: str) -> HTMLResponse
     cloud = b.get("type") in adapters.CLOUD_TYPES
     for key, src in (("max_concurrent", "max_concurrent"), ("restart_cooldown_s", "restart_cooldown_s"),
                      ("stuck_after_s", "stuck_after_s"), ("self_retries", "self_retries"),
+                     ("remote_port", "remote_port"),
                      ("max_wait", "cloud_max_wait" if cloud else "max_wait"),
                      ("poll_interval", "cloud_poll_interval" if cloud else "poll_interval")):
         typed = (f.get(src, "") or "").strip()

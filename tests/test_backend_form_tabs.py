@@ -62,6 +62,9 @@ FULL = {
     "restart_cooldown_s": 600, "stuck_after_s": 90, "self_retries": 1,
     "max_wait": 600, "poll_interval": 1.5, "auth_mode": "api_key",
     "models": ["claude-sonnet-5"], "sampling_defaults": {"temperature": 0.85},
+    # a managed host's service fields (rendered for every type, shown only with one)
+    "remote_port": 8001, "local_port": 18100, "svc_setup": "pip install -y x",
+    "svc_start": "serve --port 8001", "svc_health": "/health",
 }
 
 # The id-based type blocks that predate `data-btype` — same meaning, different marker.
@@ -169,12 +172,16 @@ class FormKeysAreDerivable(unittest.TestCase):
 
     def test_extraction_finds_both_shapes(self):
         for k in ("name", "url", "api_key",           # literal f.get / f[...]
+                  "host", "host_managed", "remote_port",   # the host select + its port
+                  "svc_setup", "svc_start", "svc_health",
                   "chat_only", "auto_restart",        # the boolean-flag loop
                   "stuck_after_s", "max_wait",        # the numeric loop
                   "cloud_max_wait", "cloud_poll_interval",   # the (src, dst, cast) loop
                   "models_allow", "models_deny"):
             self.assertIn(k, SAVE_KEYS, f"{k} not derived from backend_save")
         self.assertNotIn("k", SAVE_KEYS)              # loop vars are not keys
+        # the old Thunder block is gone: no field of it is read any more
+        self.assertEqual([k for k in SAVE_KEYS if k.startswith("thunder")], [])
         self.assertGreater(len(SAVE_KEYS), 20)
 
 
@@ -388,6 +395,28 @@ class TabScript(unittest.TestCase):
         html = _render("comfyui", True)
         for m in re.finditer(r"<button[^>]*class=\"btab[^\"]*\"[^>]*>", html):
             self.assertIn('type="button"', m.group(0))
+
+    def test_label_id_never_lands_inside_a_handler(self):
+        # `_field` adds id="fld-<name>" to the control's start tag. The type select's
+        # onchange holds a `>` (`indexOf(…)>=0`), and a tag regex that stopped at the
+        # first `>` wrote the id INTO the handler — its `"` ended the attribute there,
+        # so switching the type toggled nothing (no block, no tab) and said nothing.
+        class _Sel(HTMLParser):
+            def __init__(self, html):
+                super().__init__(convert_charrefs=True)
+                self.attrs = {}
+                self.feed(html)
+
+            def handle_starttag(self, tag, attrs):
+                a = dict(attrs)
+                if tag == "select" and a.get("name") in ("type", "host_managed"):
+                    self.attrs[a["name"]] = a
+        sel = _Sel(_render("comfyui", True)).attrs
+        self.assertEqual(sel["type"].get("id"), "fld-type")
+        self.assertIn("gwBackendTab", sel["type"]["onchange"])   # the handler's tail
+        self.assertNotIn("fld-type", sel["type"]["onchange"])
+        self.assertEqual(sel["host_managed"].get("id"), "fld-host_managed")
+        self.assertIn("readOnly", sel["host_managed"]["onchange"])
 
     def test_type_select_drives_blocks_and_the_type_tab(self):
         js = admin._type_select("comfyui")

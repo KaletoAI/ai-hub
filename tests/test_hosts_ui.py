@@ -1,6 +1,6 @@
 """The console half of a managed host: the host form and its save/delete, the host card
 with its service table, the model-sync/LAN-source/catalog blocks, the Dashboard banner —
-and, until Task 8 removes it, the backend form's old Thunder block.
+and the backend form's managed-host attachment.
 
 Every one of these fails SILENTLY:
   · the host form: the API token is never rendered (blank keeps it, the box clears it),
@@ -18,9 +18,16 @@ Every one of these fails SILENTLY:
     snapshot; the service table's Restart / Re-run setup carry the BACKEND id, or the
     wrong service restarts;
   · every managed host is listed in the Hosts panel, also one without ComfyUI;
-  · `backend_save` must derive `url`/`host` from the (old) Thunder block, the URL input
-    must be `readonly`, never `disabled`, and a bad block is refused up front (until
-    Task 8 replaces the block);
+  · the backend form attaches a backend to a managed host: `backend_save` derives `url`
+    and `local_port` (stable over Saves, renames and a move to another host — a port
+    that moves takes the URL from under running jobs), the URL input is `readonly`,
+    never `disabled` (a disabled input is not submitted, and absent reads as cleared),
+    and whatever the host could not run is refused up front with the form as typed: a
+    type without a service profile, a remote port that is none or already taken on that
+    host, a second ComfyUI, a file-name slug another command service uses (R-W8), a
+    config-defined backend (R-K3). Detaching drops the tunnel URL — a backend left on a
+    127.0.0.1 port nothing forwards any more is healthy-looking and dead. The old
+    Thunder block is gone from form, save and summary;
   · the model-sync panel: rows keyed (the morph would otherwise rewrite every row per
     tick), "delete unknown" a POST whose confirm names what the TICKED boxes hold, a
     catalog the validator refuses is a 400 with the text as typed and nothing saved,
@@ -76,12 +83,11 @@ class _Req:
         yield self._body
 
 
-def _thunder_form(name="tc", **over) -> dict:
-    f = {"name": name, "type": "comfyui", "url": "", "thunder_on": "1",
-         "thunder_gpu": "a6000", "thunder_num_gpus": "1", "thunder_vcpus": "8",
-         "thunder_template": "comfy-ui", "thunder_reserve_gb": "20",
-         "thunder_local_port": "18188", "thunder_comfy_commit": SHA,
-         "thunder_nodes": "# comment\nhttps://github.com/a/b.git@" + "a" * 40 + "\n"}
+def _mform(name="vllm", **over) -> dict:
+    """A backend form attaching an OpenAI-compatible service to managed host vm1."""
+    f = {"name": name, "type": "openai", "url": "", "host_managed": "vm1", "host": "",
+         "remote_port": "8000", "svc_start": "vllm serve m --port 8000", "svc_setup": "",
+         "svc_health": ""}
     f.update(over)
     return f
 
@@ -190,167 +196,264 @@ class _Base(unittest.TestCase):
         return r.body.decode()
 
 
-class Save(_Base):
-    def test_save_derives_url_and_host(self):
-        r = self.save(_thunder_form(thunder_local_port="18190"))
+class ManagedSave(_Base):
+    """backend_save with a managed host: url/local_port derived, the type and port rules
+    refused up front (400, the form as typed, nothing stored)."""
+
+    def setUp(self):
+        super().setUp()
+        for n in ("vm1", "vm2"):
+            store.set_managed_host(n, {"provider": "thunder", "options": {}, "api_key": "tok"})
+
+    def row(self, name="vllm", t="openai"):
+        return store.get_backend(name, t)
+
+    def refused(self, form, *needles):
+        r = self.save(form)
+        self.assertEqual(r.status_code, 400, form)
+        html = r.body.decode()
+        for n in needles:
+            self.assertIn(n, html)
+        self.assertNotIn("<main data-live", html)
+        return html
+
+    def test_save_derives_url_and_local_port(self):
+        r = self.save(_mform(url="http://10.0.0.5:9999", host="gpu9"))
         self.assertEqual(r.status_code, 303)
-        b = store.get_backend("tc", "comfyui")
-        self.assertEqual(b["url"], "http://127.0.0.1:18190")
-        self.assertEqual(b["host"], "thunder-tc")
+        b = self.row()
+        lp = b["local_port"]
+        self.assertTrue(main.LOCAL_PORT_MIN <= lp <= main.LOCAL_PORT_MAX, lp)
+        self.assertEqual(b["url"], f"http://127.0.0.1:{lp}")      # the typed url is ignored
+        self.assertEqual(b["host"], "vm1")                        # the managed one wins
+        self.assertEqual(b["remote_port"], 8000)
+        self.assertEqual(b["svc_start"], "vllm serve m --port 8000")
+        self.assertNotIn("svc_setup", b)                          # blank = no setup
+        self.assertNotIn("svc_health", b)                         # blank = the default
+        self.assertNotIn("thunder", b)
+
+    def test_local_port_stable_across_resaves_and_a_rename(self):
+        self.assertEqual(self.save(_mform()).status_code, 303)
+        lp = self.row()["local_port"]
+        self.assertEqual(self.save(_mform("other", remote_port="8001")).status_code, 303)
+        self.assertNotEqual(self.row("other")["local_port"], lp)   # unique over hosts
+        self.assertEqual(self.save(_mform(orig="openai:vllm")).status_code, 303)
+        self.assertEqual(self.row()["local_port"], lp)
+        # a rename keeps it: the old row (still in the store until the Save writes)
+        # is this backend, not another one holding the port
+        self.assertEqual(self.save(_mform("vllm2", orig="openai:vllm")).status_code, 303)
+        self.assertIsNone(self.row("vllm"))
+        self.assertEqual(self.row("vllm2")["local_port"], lp)
+        self.assertEqual(self.row("vllm2")["url"], f"http://127.0.0.1:{lp}")
+        # moving to another managed host keeps it too (unique over ALL hosts)
+        self.assertEqual(self.save(_mform("vllm2", orig="openai:vllm2", host_managed="vm2"))
+                         .status_code, 303)
+        self.assertEqual(self.row("vllm2")["local_port"], lp)
+
+    def test_comfy_dirs_default_when_blank(self):
+        self.save(_mform("c", type="comfyui", remote_port="8188", svc_start=""))
+        b = self.row("c", "comfyui")
         self.assertEqual(b["comfy_output_dir"], "/home/ubuntu/ComfyUI/output")
         self.assertEqual(b["comfy_input_dir"], "/home/ubuntu/ComfyUI/input")
-        t = b["thunder"]
-        self.assertEqual(t["gpu_type"], "a6000")
-        self.assertEqual(t["num_gpus"], 1)
-        self.assertEqual(t["vcpus"], 8)
-        self.assertEqual(t["bootstrap_template"], "comfy-ui")
-        self.assertEqual(t["reserve_gb"], 20)
-        self.assertEqual(t["local_port"], 18190)
-        self.assertEqual(t["comfy_commit"], SHA)
-        # lines verbatim, comments included (the bootstrap ignores them)
-        self.assertEqual(t["nodes"], ["# comment", "https://github.com/a/b.git@" + "a" * 40])
+        self.assertEqual(b["remote_port"], 8188)
+        for k in ("svc_start", "svc_setup", "svc_health"):
+            self.assertNotIn(k, b)                   # command fields belong to openai only
+        self.save(_mform("c", type="comfyui", remote_port="8188", orig="comfyui:c",
+                         comfy_output_dir="/x/out", comfy_input_dir="/x/in"))
+        b = self.row("c", "comfyui")
+        self.assertEqual((b["comfy_output_dir"], b["comfy_input_dir"]), ("/x/out", "/x/in"))
 
-    def test_typed_url_and_host_are_overridden_but_comfy_dirs_kept(self):
-        self.save(_thunder_form(url="http://10.0.0.5:8188", host="gpu9",
-                                comfy_output_dir="/x/out", comfy_input_dir="/x/in"))
-        b = store.get_backend("tc", "comfyui")
-        self.assertEqual(b["url"], "http://127.0.0.1:18188")
-        self.assertEqual(b["host"], "thunder-tc")
-        self.assertEqual(b["comfy_output_dir"], "/x/out")
-        self.assertEqual(b["comfy_input_dir"], "/x/in")
+    def test_type_without_a_profile_is_refused(self):
+        for t in ("meshy", "tripo", "anthropic"):
+            self.refused(_mform(f"x-{t}", type=t), "cannot run on a managed host")
+            self.assertIsNone(self.row(f"x-{t}", t), t)
 
-    def test_unticked_removes_the_block(self):
-        self.save(_thunder_form())
-        f = _thunder_form(orig="comfyui:tc", url="http://127.0.0.1:18188")
-        del f["thunder_on"]
-        self.assertEqual(self.save(f).status_code, 303)
-        self.assertNotIn("thunder", store.get_backend("tc", "comfyui"))
+    def test_unknown_managed_host_is_refused(self):
+        self.refused(_mform(host_managed="nope"), "nope")
+        self.assertIsNone(self.row())
 
-    def test_block_only_for_comfyui(self):
-        f = _thunder_form(type="openai", url="http://h:1")
-        self.assertEqual(self.save(f).status_code, 303)
-        b = store.get_backend("tc", "openai")
-        self.assertNotIn("thunder", b)
-        self.assertEqual(b["url"], "http://h:1")
+    def test_remote_port_required_and_a_port(self):
+        for bad in ("", "0", "70000", "8.5", "x", "-1"):
+            self.refused(_mform(remote_port=bad), "remote port")
+            self.assertIsNone(self.row(), bad)
 
-    def test_blank_commit_is_the_default_bad_commit_refused(self):
-        self.save(_thunder_form(thunder_comfy_commit=""))
-        self.assertEqual(store.get_backend("tc", "comfyui")["thunder"]["comfy_commit"], SHA)
-        for bad in ("1d61dcc", "master", "g" * 40, SHA + "0"):
-            r = self.save(_thunder_form(name="t2", thunder_comfy_commit=bad,
-                                        thunder_local_port="18200"))
-            self.assertEqual(r.status_code, 400, bad)
-            self.assertIn("40-hex", r.body.decode())
-            self.assertIsNone(store.get_backend("t2", "comfyui"), bad)
+    def test_remote_port_unique_per_host(self):
+        self.assertEqual(self.save(_mform("a")).status_code, 303)
+        self.refused(_mform("b"), "8000", "a")
+        self.assertIsNone(self.row("b"))
+        self.assertEqual(self.save(_mform("b", host_managed="vm2")).status_code, 303)
+        self.assertEqual(self.save(_mform("a", orig="openai:a")).status_code, 303)  # itself
 
-    def test_gpu_and_vcpus_required(self):
-        for over in ({"thunder_gpu": ""}, {"thunder_vcpus": ""}, {"thunder_vcpus": "0"},
-                     {"thunder_vcpus": "8.5"}, {"thunder_num_gpus": "0"},
-                     {"thunder_local_port": "70000"}, {"thunder_reserve_gb": "-1"}):
-            r = self.save(_thunder_form(**over))
-            self.assertEqual(r.status_code, 400, over)
-            self.assertIsNone(store.get_backend("tc", "comfyui"), over)
-
-    def test_refused_form_is_shown_as_typed(self):
-        r = self.save(_thunder_form(thunder_vcpus="lots"))
-        html = r.body.decode()
-        self.assertEqual(r.status_code, 400)
-        self.assertIn('value="lots"', html)
-        self.assertRegex(html, r'name="thunder_on" value="1" checked')
-
-    def test_port_collision_refused(self):
-        self.assertEqual(self.save(_thunder_form(name="one")).status_code, 303)
-        r = self.save(_thunder_form(name="two"))
-        self.assertEqual(r.status_code, 400)
-        self.assertIn("18188", r.body.decode())
-        self.assertIsNone(store.get_backend("two", "comfyui"))
-        # a config-defined Thunder backend (live summary only) counts as well
-        self.live = [{"name": "cfg", "type": "comfyui", "url": "http://127.0.0.1:18300",
-                      "enabled": True, "healthy": True, "models": 0, "source": "config",
-                      "thunder": {"local_port": 18300}}]
-        r = self.save(_thunder_form(name="three", thunder_local_port="18300"))
-        self.assertEqual(r.status_code, 400)
-        # re-saving the SAME backend on its own port is no collision
-        f = _thunder_form(name="one", orig="comfyui:one")
-        self.assertEqual(self.save(f).status_code, 303)
-        self.assertEqual(self.save(_thunder_form(name="two", thunder_local_port="18189"))
+    def test_second_comfyui_on_a_host_is_refused(self):
+        c = dict(type="comfyui", svc_start="")
+        self.assertEqual(self.save(_mform("c1", remote_port="8188", **c)).status_code, 303)
+        self.refused(_mform("c2", remote_port="8189", **c), "second ComfyUI", "c1")
+        self.assertIsNone(self.row("c2", "comfyui"))
+        self.assertEqual(self.save(_mform("c2", remote_port="8188", host_managed="vm2", **c))
                          .status_code, 303)
 
-    def test_api_key_stays_the_token(self):
-        self.save(_thunder_form(api_key="th-SECRET"))
-        self.assertEqual(store.get_backend("tc", "comfyui")["api_key"], "th-SECRET")
+    def test_slug_collision_is_refused(self):
+        self.assertEqual(self.save(_mform("My.Svc")).status_code, 303)
+        self.refused(_mform("my-svc", remote_port="8001"), "slug", "my-svc")
+        self.assertIsNone(self.row("my-svc"))
+        # a ComfyUI service names no files by slug — no clash with it
+        self.assertEqual(self.save(_mform("my-svc", type="comfyui", remote_port="8188"))
+                         .status_code, 303)
+
+    def test_command_fields_validated(self):
+        self.refused(_mform(svc_start="  "), "start command")
+        self.refused(_mform(svc_health="no slash"), "health path")
+        self.assertIsNone(self.row())
+        self.save(_mform(svc_health="/health", svc_setup="pip install -y x\n"))
+        b = self.row()
+        self.assertEqual(b["svc_health"], "/health")
+        self.assertEqual(b["svc_setup"], "pip install -y x\n")
+
+    def test_config_backend_cannot_be_attached(self):
+        self.live = [{"name": "vllm", "type": "openai", "url": "http://h:1", "enabled": True,
+                      "healthy": True, "models": 0, "source": "config"}]
+        self.refused(_mform(orig="openai:vllm"), "config-defined")
+        self.assertIsNone(self.row())
+        # unattached, the same config backend's copy saves as before
+        r = self.save(_mform(orig="openai:vllm", host_managed="", url="http://h:1"))
+        self.assertEqual(r.status_code, 303)
+
+    def test_refused_form_is_shown_as_typed(self):
+        html = self.refused(_mform(remote_port="lots", svc_setup="echo SETUP-TEXT"),
+                            'value="lots"', "echo SETUP-TEXT", "vllm serve m --port 8000")
+        self.assertRegex(html, r'<option value="vm1" selected>')
+
+    def test_detach_clears_the_derived_url_and_ports(self):
+        self.save(_mform())
+        lp = self.row()["local_port"]
+        derived = f"http://127.0.0.1:{lp}"
+        # the readonly field still carries the tunnel URL: it goes with the host
+        self.refused(_mform(orig="openai:vllm", host_managed="", url=derived), "url")
+        self.assertEqual(self.row()["host"], "vm1")               # nothing written
+        r = self.save(_mform(orig="openai:vllm", host_managed="", url="http://10.0.0.5:8000",
+                             host="gpu9"))
+        self.assertEqual(r.status_code, 303)
+        b = self.row()
+        self.assertEqual(b["url"], "http://10.0.0.5:8000")
+        self.assertEqual(b["host"], "gpu9")
+        self.assertNotIn("local_port", b)
+        self.assertNotIn("remote_port", b)
+
+    def test_old_thunder_block_dropped_on_save(self):
+        store.upsert_backend({"name": "tc", "type": "comfyui", "url": "http://x:1",
+                              "thunder": {"gpu_type": "a6000"}})
+        r = self.save({"name": "tc", "type": "comfyui", "url": "http://x:1", "orig": "comfyui:tc"})
+        self.assertEqual(r.status_code, 303)
+        self.assertNotIn("thunder", store.get_backend("tc", "comfyui"))
+
+    def test_plain_backend_unchanged(self):
+        r = self.save({"name": "p", "type": "openai", "url": "http://h:1", "host": "gpu1",
+                       "remote_port": "8000", "svc_start": "x"})
+        self.assertEqual(r.status_code, 303)
+        b = self.row("p")
+        self.assertEqual((b["url"], b["host"]), ("http://h:1", "gpu1"))
+        self.assertNotIn("remote_port", b)
+        self.assertNotIn("local_port", b)
+
+    def test_api_key_unaffected(self):
+        self.save(_mform(api_key="K-SECRET"))
+        self.assertEqual(self.row()["api_key"], "K-SECRET")
 
 
-class Form(_Base):
+class ManagedForm(_Base):
+    def setUp(self):
+        super().setUp()
+        for n in ("vm1", "vm2"):
+            store.set_managed_host(n, {"provider": "thunder", "options": {}, "api_key": "tok"})
+
     def _b(self, **over):
-        b = {"name": "tc", "type": "comfyui", "url": "http://127.0.0.1:18188",
-             "api_key": "th-SECRET-TOKEN",
-             "thunder": {"gpu_type": "h100", "num_gpus": 2, "vcpus": 16,
-                         "bootstrap_template": "base", "reserve_gb": 30, "local_port": 18188,
-                         "comfy_commit": SHA, "nodes": ["# c", "registry:y@2"]}}
+        b = {"name": "vllm", "type": "openai", "url": "http://127.0.0.1:18100", "host": "vm1",
+             "local_port": 18100, "remote_port": 8001, "svc_start": "serve",
+             "api_key": "SECRET-TOKEN"}
         b.update(over)
         return b
 
-    def test_url_hint_says_how_to_get_a_real_url_back(self):
-        html = admin._backend_form(self._b(), [])
-        self.assertIn("derived from the Thunder block", html)
-        plain = admin._backend_form({"name": "c", "type": "comfyui", "url": "http://x:1"}, [])
-        self.assertNotIn("derived from the Thunder block", plain)
-
-    def test_url_readonly_not_disabled(self):
-        html = admin._backend_form(self._b(), [])
-        m = re.search(r'<input[^>]*name="url"[^>]*>', html)
+    def test_host_select_lists_every_managed_host(self):
+        html = admin._backend_form(self._b(), ["gpu1"])
+        m = re.search(r'<select name="host_managed"[^>]*>(.*?)</select>', html, re.S)
         self.assertIsNotNone(m)
-        self.assertIn("readonly", m.group(0))
-        self.assertNotIn("disabled", m.group(0))
+        opts = re.findall(r'<option value="([^"]*)"', m.group(1))
+        self.assertEqual(opts, ["", "vm1", "vm2"])
+        self.assertIn("(none / free text)", m.group(1))
+        self.assertRegex(m.group(1), r'<option value="vm1" selected>')
+        self.assertIn('name="host"', html)                      # the free text stays
+        plain = admin._backend_form({"name": "p", "type": "openai", "url": "http://h:1",
+                                     "host": "gpu1"}, ["gpu1"])
+        self.assertRegex(plain, r'<option value="" selected>')
+        self.assertIn('name="host" value="gpu1"', plain)
+
+    def test_url_readonly_not_disabled_with_a_hint(self):
+        html = admin._backend_form(self._b(), [])
+        tag = re.search(r'<input[^>]*name="url"[^>]*>', html).group(0)
+        self.assertIn("readonly", tag)
+        self.assertNotIn("disabled", tag)
+        self.assertIn("derived", html)
         plain = admin._backend_form({"name": "c", "type": "comfyui", "url": "http://x:1"}, [])
         self.assertNotIn("readonly", re.search(r'<input[^>]*name="url"[^>]*>', plain).group(0))
 
-    def test_stored_block_is_rendered(self):
-        html = admin._backend_form(self._b(), [])
-        self.assertRegex(html, r'name="thunder_on" value="1" checked')
-        self.assertRegex(html, r'<option value="h100" selected>')
-        self.assertRegex(html, r'<option value="base" selected>')
-        for v in ('value="2"', 'value="16"', 'value="30"', f'value="{SHA}"'):
-            self.assertIn(v, html)
-        self.assertIn("# c\nregistry:y@2</textarea>", html)
-        self.assertIn("API key", html)                  # the hint names the token field
+    def test_managed_block_shown_only_with_a_managed_host(self):
+        block = r'<fieldset[^>]*data-mhost[^>]*>'
+        self.assertNotIn("display:none", re.search(block, admin._backend_form(self._b(), []))
+                         .group(0))
+        plain = admin._backend_form({"name": "p", "type": "openai", "url": "http://h:1"}, [])
+        self.assertIn("display:none", re.search(block, plain).group(0))
+        for k in ("remote_port", "svc_setup", "svc_start", "svc_health"):
+            self.assertIn(f'name="{k}"', plain)                 # rendered, only hidden
 
-    def test_new_block_is_prefilled_with_the_default_nodes(self):
-        html = admin._backend_form({"name": "c", "type": "comfyui", "url": "http://x:1"}, [])
-        self.assertNotRegex(html, r'name="thunder_on" value="1" checked')
-        self.assertIn("# defaults\nregistry:x@1.0\n</textarea>", html)
-        self.assertIn(f'value="{SHA}"', html)
-        # an existing block with an empty list is NOT refilled: empty = the default list
-        # at bootstrap time (Ruling 12), and the operator chose that
-        html = admin._backend_form(self._b(thunder={"gpu_type": "a6000", "vcpus": 8,
-                                                     "nodes": []}), [])
-        self.assertNotIn("# defaults", html)
+    def test_remote_port_prefilled_from_the_profile(self):
+        new = admin._backend_form(None, [])
+        self.assertIn('name="remote_port" value="8000"', new)
+        comfy = admin._backend_form({"name": "c", "type": "comfyui", "url": "http://x:1"}, [])
+        self.assertIn('name="remote_port" value="8188"', comfy)
+        self.assertIn('name="remote_port" value="8001"', admin._backend_form(self._b(), []))
+
+    def test_command_fields_and_hints(self):
+        html = admin._backend_form(self._b(svc_setup="apt-get install -y x",
+                                           svc_health="/health"), [])
+        self.assertIn("apt-get install -y x</textarea>", html)
+        self.assertIn("serve</textarea>", html)
+        self.assertIn('name="svc_health" value="/health"', html)
+        self.assertIn("no tokens here", html.lower())
+        self.assertIn("plain text", html)
+        self.assertIn("HF-token setting", html)
+        self.assertIn("-y", html)
+        self.assertIn("&lt;/dev/null", html)                    # stdin eats the script
+        self.assertIn("127.0.0.1", html)                        # where it must listen
+        # the command fields sit in an openai-only block
+        m = re.search(r'<div data-btype="openai"[^>]*>(?:(?!</fieldset>).)*name="svc_start"',
+                      html, re.S)
+        self.assertIsNotNone(m)
 
     def test_token_never_rendered(self):
-        html = admin._backend_form(self._b(), [])
-        self.assertNotIn("th-SECRET-TOKEN", html)
-        store.upsert_backend(self._b())
-        self.live = [dict(self._b(), api_key_set=True, enabled=True, healthy=True, models=0,
-                          source="ui")]
-        self.live[0].pop("api_key")
-        self.views = {"tc": _view(phase="ready")}
-        page = self.page({"edit": "comfyui:tc"})
-        self.assertNotIn("th-SECRET-TOKEN", page)
+        self.assertNotIn("SECRET-TOKEN", admin._backend_form(self._b(), []))
 
-    def test_config_summary_carries_the_block(self):
-        # The editor falls back to the live summary for a config backend; without the
-        # block there, the first Save of a config Thunder backend would drop it.
-        cfg = self._b()
+    def test_thunder_fields_are_gone(self):
+        for t in ("openai", "comfyui", "meshy", "tripo", "anthropic"):
+            html = admin._backend_form({"name": "x", "type": t, "url": "http://x:1",
+                                        "thunder": {"gpu_type": "h100"}}, [])
+            self.assertNotIn('name="thunder_', html, t)
+            self.assertNotIn("Thunder Compute", html, t)
+        for gone in ("_THUNDER_GPUS", "_THUNDER_TEMPLATES", "_THUNDER_COMMIT_DEFAULT",
+                     "_THUNDER_PORT_DEFAULT", "_THUNDER_DIRS", "_thunder_fieldset"):
+            self.assertFalse(hasattr(admin, gone), gone)
+
+    def test_gateway_info_carries_no_thunder_block_nor_token(self):
+        cfg = {"name": "tc", "type": "comfyui", "url": "http://x:1", "api_key": "TOK-123",
+               "thunder": {"gpu_type": "h100", "api_key": "TOK-456"}}
         saved = (main.backends, main.config_backends)
         self.addCleanup(lambda: (setattr(main, "backends", saved[0]),
                                  setattr(main, "config_backends", saved[1])))
         main.backends = main.config_backends = [cfg]
         s = next(b for b in main.gateway_info()["backends"] if b["name"] == "tc")
-        self.assertEqual(s["thunder"]["gpu_type"], "h100")
-        self.assertNotIn("api_key", s)
-        s["thunder"]["gpu_type"] = "x"                  # a copy, not the live dict
-        self.assertEqual(cfg["thunder"]["gpu_type"], "h100")
+        self.assertNotIn("thunder", s)
+        self.assertNotIn("TOK-", json.dumps(s))
+
+    def test_local_port_assigner_is_bound(self):
+        self.assertIs(admin._assign_local_port, main.assign_local_port)
 
 
 class Panel(_Base):
@@ -445,9 +548,9 @@ class Panel(_Base):
         # The morph would reset the visibility the type select's JS set (switch "+ New"
         # to comfyui and 3 s later its panes vanish) — only the plain list is live.
         self.views = {"tc": _view(phase="ready")}
-        store.upsert_backend({"name": "tc", "type": "comfyui", "url": "http://127.0.0.1:18188",
-                              "thunder": {"gpu_type": "a6000", "vcpus": 8}})
-        for qp in ({"edit": "comfyui:tc"}, {"new": "1"}, {"host": "thunder-tc"},
+        store.upsert_backend({"name": "tc", "type": "comfyui", "url": "http://127.0.0.1:18100",
+                              "host": "tc", "local_port": 18100, "remote_port": 8188})
+        for qp in ({"edit": "comfyui:tc"}, {"new": "1"}, {"host": "gpu1"},
                    {"mhost": "tc"}, {"mhost_new": "1"}):
             html = self.page(qp)
             self.assertIn("<main>", html, qp)
@@ -456,7 +559,8 @@ class Panel(_Base):
 
     def test_refused_save_is_never_live(self):
         self.views = {"tc": _view(phase="ready")}
-        r = self.save(_thunder_form(name="x", thunder_vcpus=""))
+        store.set_managed_host("tc", {"provider": "thunder", "options": {}, "api_key": "t"})
+        r = self.save(_mform("x", host_managed="tc", remote_port=""))
         self.assertEqual(r.status_code, 400)
         self.assertNotIn("<main data-live", r.body.decode())
 

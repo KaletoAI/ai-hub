@@ -409,14 +409,6 @@ class OptionFields(unittest.TestCase):
         self.assertEqual(len(thunder.options_of({"opt__num_gpus": object()})[1]), 1)
         self.assertEqual(len(thunder.options_of({"opt__vcpus": [8]})[1]), 1)
 
-    def test_lists_match_the_console_until_it_switches(self):
-        # admin.py still renders its own copies; a drift means the form offers (or
-        # re-saves) a value options_of refuses, or hides one it accepts
-        import admin
-        self.assertEqual(self._fields()["comfy_commit"]["default"], admin._THUNDER_COMMIT_DEFAULT)
-        self.assertEqual(tuple(thunder.GPU_TYPES), tuple(admin._THUNDER_GPUS))
-        self.assertEqual(tuple(thunder.TEMPLATES), tuple(admin._THUNDER_TEMPLATES))
-
 
 if __name__ == "__main__":
     unittest.main()
