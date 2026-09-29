@@ -6691,30 +6691,6 @@ async def host_action(name: str, action: str, bid: Optional[str] = None,
     return await _host_op(name, getattr(c, meth)(), label)
 
 
-# The Thunder card's binds (admin `_thunder_*`), mapped onto managed hosts: the card
-# name IS the host name now. Task 7 replaces the card and removes these three.
-async def thunder_action(name: str, action: str) -> str:
-    """The card's start/stop/restart/forget: "restart" = the host's ComfyUI service."""
-    if action == "restart":
-        c = host_controllers.get(name)
-        comfy = next((x for x in (c.services if c is not None else [])
-                      if x.get("type") == "comfyui"), None)
-        if c is None or comfy is None:
-            return await host_action(name, "restart_service")
-        return await _host_op(name, c.restart_service(hostctl.service_bid(comfy)),
-                              "ComfyUI restart")
-    return await host_action(name, action)
-
-
-async def thunder_sync_now(name: str) -> str:
-    """The panel's "Sync now" (Controller.sync_now, refused without a running instance)."""
-    return await host_action(name, "sync")
-
-
-async def thunder_delete_unknown(name: str, paths: list) -> str:
-    return await host_action(name, "delete_unknown", paths=paths)
-
-
 def _gated_only_aliases(aliases) -> set:
     """Aliases of a host's plan that no candidate can serve right now outside the
     model-sync gate — every candidate sits on a managed host's ComfyUI service that has
@@ -7103,15 +7079,16 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
            voice_lib_ship=ship_voice_ref, voice_ship_config=voice_ship_config,
            parse_voice_target=parse_voice_target, voice_dir_ok=_voice_dir_ok,
            apply_hosts=apply_hosts,
-           # the Thunder card's binds, now keyed by managed host (Task 7 renames them)
-           thunder_view=host_view, thunder_action=thunder_action,
-           thunder_names=host_names,
+           # managed hosts: the Backends tab's host cards, form and actions
+           host_names=host_names, host_view=host_view, host_action=host_action,
+           host_longrun=host_longrun, save_managed_host=save_managed_host,
+           delete_managed_host=delete_managed_host,
+           managed_host_delete_refusal=managed_host_delete_refusal,
            thunder_default_nodes=_thunder_default_nodes,
-           thunder_sync_now=thunder_sync_now, thunder_delete_unknown=thunder_delete_unknown,
-           thunder_modelsrc_view=modelsrc_view, thunder_modelsrc_scan=modelsrc_scan,
-           thunder_modelsrc_pin=modelsrc_pin, save_modelsrc_host=save_modelsrc_host,
+           modelsrc_view=modelsrc_view, modelsrc_scan=modelsrc_scan,
+           modelsrc_pin=modelsrc_pin, save_modelsrc_host=save_modelsrc_host,
            save_hf_token=save_hf_token, hf_token_set=hf_token_set,
-           thunder_orphan_snapshots=thunder_orphan_snapshots, thunder_longrun=host_longrun,
+           thunder_orphan_snapshots=thunder_orphan_snapshots,
            modelsync_catalog=_modelsync_catalog, save_modelsync_catalog=save_modelsync_catalog,
            backend_loras=lambda: {b["name"]: sorted(backend_loras.get(backend_id(b), set()))
                                   for b in backends if b.get("type") == "comfyui"})

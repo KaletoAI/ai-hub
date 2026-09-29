@@ -1,36 +1,39 @@
-"""The console half of a Thunder Compute backend: the form block, its save, the panel.
+"""The console half of a managed host: the host form and its save/delete, the host card
+with its service table, the model-sync/LAN-source/catalog blocks, the Dashboard banner —
+and, until Task 8 removes it, the backend form's old Thunder block.
 
 Every one of these fails SILENTLY:
-  · `backend_save` must derive `url`/`host` from the Thunder block — a URL typed by hand
-    (or left over from before the block) points discovery at a port the tunnel does not
-    serve, and a host derived from `127.0.0.1` groups every Thunder backend AND the
-    gateway box into one "host" for the VRAM/LLM policies;
-  · the URL input must be `readonly`, never `disabled` — a disabled input is not
-    submitted, and `backend_save` reads an absent field as cleared;
-  · two Thunder backends on one local port: the second tunnel cannot bind, and its
-    ComfyUI probe then talks to the FIRST backend's instance — healthy, routed, wrong;
-  · a bad `comfy_commit` or a missing GPU/vCPU count is only noticed after an instance
-    was created and billed (the bootstrap exits 2 / `create_body` raises), so the form
-    refuses them up front;
-  · the panel's actions must be POSTs (a GET link fires on any prefetch — here it would
-    start a billing GPU), stop/forget ask first, and the page must stay live while an
-    instance runs or an op is in flight, or the phase shown is a stale snapshot;
-  · the API token (the backend's `api_key`) is never rendered;
-  · the model-sync panel (Task 13): rows keyed (the morph would otherwise rewrite every
-    row per tick), "delete unknown" a POST whose confirm names what the TICKED boxes
-    hold, a catalog the validator refuses is a 400 with the text as typed and nothing
-    saved (a partial save drops the refused entry silently), the seed is copied into
-    the setting once and never again, and a Thunder-only alias says why its schema is
-    empty;
-  · the LAN source (Task 15): its host key is pinned only by a POST that carries the
-    fingerprint the operator saw (a GET, or a key fetched again in between, pins
-    nothing), and the install command gives the share user a real login shell;
-  · Task 16: the HF token is encrypted at rest and never rendered (blank keeps, the box
-    clears), `modelsrc_host` is refused unless plain and a changed host names the stale
-    pin, an instance up > 24 h puts a banner on its card AND the Dashboard, and `aihub-`
-    snapshots no backend owns are listed with $/month (never deleted).
+  · the host form: the API token is never rendered (blank keeps it, the box clears it),
+    each provider option comes from the provider's OWN `OPTION_FIELDS` (a hand-kept
+    copy drifts: a GPU the provider knows but the form does not is unreachable, one the
+    form offers but the provider refuses is only noticed at the start), a refused Save
+    is a 400 with the form as typed and nothing stored, and a new host's name may not
+    collide with a Hosts-map key or any backend's host — an URL hostname included
+    (R-W6) — or the coordination policies of that box silently apply to both;
+  · a host is deleted only while off and unnamed by any backend (R-W5): its instance
+    and snapshots would otherwise bill with nobody to stop them;
+  · the card's actions must be POSTs (a GET link fires on any prefetch — here it would
+    start a billing GPU), start/stop/delete/forget ask first, and the page must stay
+    live while an instance runs or an op is in flight, or the phase shown is a stale
+    snapshot; the service table's Restart / Re-run setup carry the BACKEND id, or the
+    wrong service restarts;
+  · every managed host is listed in the Hosts panel, also one without ComfyUI;
+  · `backend_save` must derive `url`/`host` from the (old) Thunder block, the URL input
+    must be `readonly`, never `disabled`, and a bad block is refused up front (until
+    Task 8 replaces the block);
+  · the model-sync panel: rows keyed (the morph would otherwise rewrite every row per
+    tick), "delete unknown" a POST whose confirm names what the TICKED boxes hold, a
+    catalog the validator refuses is a 400 with the text as typed and nothing saved,
+    the seed is copied into the setting once and never again, and a host-only alias
+    says why its schema is empty;
+  · the LAN source: its host key is pinned only by a POST that carries the fingerprint
+    the operator saw, and the install command gives the share user a real login shell;
+  · the HF token is encrypted at rest and never rendered, `modelsrc_host` is refused
+    unless plain and a changed host names the stale pin, an instance up > 24 h puts a
+    banner on its card AND the Dashboard, and `aihub-` snapshots no host owns are
+    listed with $/month (never deleted).
 
-Run: python -m unittest tests.test_thunder_ui -v
+Run: python -m unittest tests.test_hosts_ui -v
 """
 import asyncio
 import json
@@ -83,15 +86,30 @@ def _thunder_form(name="tc", **over) -> dict:
     return f
 
 
+def _svcs(**over) -> dict:
+    """A view's `services`: the ComfyUI backend `tc` (+ `over`)."""
+    d = {"comfyui:tc": {"name": "tc", "type": "comfyui", "local_port": 18100,
+                        "remote_port": 8188, "status": "up", "error": ""}}
+    d.update(over)
+    return d
+
+
 def _view(**over) -> dict:
-    v = {"name": "tc", "phase": "off", "error": "", "failed_phase": "", "index": None,
+    """A host view (main.host_view): the controller's view plus the host's options,
+    `api_key_set`, `managed` and `not_attachable`."""
+    v = {"name": "tc", "provider": "thunder", "phase": "off", "error": "", "failed_phase": "", "index": None,
          "uuid": "", "ip": "", "port": 0, "started_at": 0, "uptime_s": 0, "disk_gb": 0,
          "cost_per_h": None, "session_cost": None,
          "snapshot": {"id": "", "pending": "", "pending_name": "", "name": "", "status": "",
                       "gb": None, "monthly": None},
          "log": [], "transfers": {}, "persist_blocked": False, "bootstrap_unknown": {},
          "bootstrap_template_nodes": [], "bootstrap_incomplete": False, "op": None,
-         "waiting_jobs": None, "unreconciled_uuids": [], "orphans": []}
+         "waiting_jobs": None, "unreconciled_uuids": [], "orphans": [],
+         "services": {}, "tunnel_error": "", "not_attachable": [], "host_error": "",
+         "managed": True, "api_key_set": False,
+         "options": {"gpu_type": "a6000", "num_gpus": 1, "vcpus": 8,
+                     "bootstrap_template": "", "reserve_gb": 20, "comfy_commit": SHA,
+                     "nodes": []}}
     v.update(over)
     return v
 
@@ -110,14 +128,14 @@ class _Base(unittest.TestCase):
         self.live = []                 # what _gateway_info reports (config + store view)
         self.views = {}
         self.actions = []
-
-        async def act(name, action):
-            self.actions.append((name, action))
-            return f"{action} requested"
         self.catalog = [{"match": {"class": "C", "value": "v"}, "paths": ["models/c/"]}]
         self.saved_catalogs = []
         self.synced = []
         self.deleted = []
+        self.delete_refusals = {}      # host → why Delete is refused (absent = allowed)
+        self.saved_hosts = []          # (name, entry, new) main.save_managed_host got
+        self.save_refusal = ""
+        self.deleted_hosts = []
 
         def save_cat(cat):
             errs = __import__("modelsync").validate_catalog(cat)
@@ -126,22 +144,39 @@ class _Base(unittest.TestCase):
                 self.catalog = cat
             return errs
 
-        async def sync_now(name):
-            self.synced.append(name)
-            return "sync requested"
+        async def act(name, action, bid=None, paths=None):
+            # main.host_action's contract: always text, a refusal included
+            self.actions.append((name, action) if bid is None else (name, action, bid))
+            if action == "sync":
+                self.synced.append(name)
+                return "sync requested"
+            if action == "delete_unknown":
+                self.deleted.append((name, list(paths or [])))
+                return f"deleted {len(paths or [])} unknown file(s)"
+            return f"{action} requested"
 
-        async def delete_unknown(name, paths):
-            self.deleted.append((name, list(paths)))
-            return f"deleted {len(paths)} unknown file(s)"
+        def save_host(name, entry, new):
+            if self.save_refusal:
+                return self.save_refusal
+            self.saved_hosts.append((name, entry, new))
+            return ""
+
+        def delete_host(name):
+            why = self.delete_refusals.get(name)
+            if why:
+                return why
+            self.deleted_hosts.append(name)
+            return ""
         stubs = {"_apply_backends": lambda: None,
                  "_modelsync_catalog": lambda: self.catalog,
                  "_save_modelsync_catalog": save_cat,
-                 "_thunder_sync_now": sync_now,
-                 "_thunder_delete_unknown": delete_unknown,
                  "_gateway_info": lambda: {"backends": self.live, "virtual_models": []},
-                 "_thunder_names": lambda: list(self.views),
-                 "_thunder_view": lambda n: self.views.get(n),
-                 "_thunder_action": act,
+                 "_host_names": lambda: list(self.views),
+                 "_host_view": lambda n: self.views.get(n),
+                 "_host_action": act,
+                 "_save_managed_host": save_host,
+                 "_delete_managed_host": delete_host,
+                 "_managed_host_delete_refusal": lambda n: self.delete_refusals.get(n),
                  "_thunder_default_nodes": lambda: "# defaults\nregistry:x@1.0\n"}
         for k, v in stubs.items():
             self.addCleanup(setattr, admin, k, getattr(admin, k))
@@ -321,42 +356,47 @@ class Form(_Base):
 class Panel(_Base):
     def setUp(self):
         super().setUp()
-        self.live = [{"name": "tc", "type": "comfyui", "url": "http://127.0.0.1:18188",
-                      "enabled": False, "healthy": False, "models": 0, "source": "ui",
-                      "thunder": {"gpu_type": "a6000", "num_gpus": 1, "vcpus": 8,
-                                  "local_port": 18188}}]
+        self.live = [{"name": "tc", "type": "comfyui", "url": "http://127.0.0.1:18100",
+                      "host": "tc", "enabled": False, "healthy": False, "models": 0,
+                      "source": "ui"}]
 
     def test_panel_buttons_are_post_actions(self):
-        for p in ("/ui/thunder/start", "/ui/thunder/stop", "/ui/thunder/restart",
-                  "/ui/thunder/forget"):
+        for p in ("/ui/hosts/managed/start", "/ui/hosts/managed/stop",
+                  "/ui/hosts/managed/restart-service", "/ui/hosts/managed/resetup",
+                  "/ui/hosts/managed/forget", "/ui/hosts/managed/delete",
+                  "/ui/hosts/managed/save"):
             self.assertIn(p, admin._POST_ACTIONS)
-        self.views = {"tc": _view(phase="ready", uuid="u1", unreconciled_uuids=["u-9"])}
+        self.views = {"tc": _view(phase="ready", uuid="u1", unreconciled_uuids=["u-9"],
+                                  services=_svcs())}
         html = self.page()
-        self.assertNotRegex(html, r'<a[^>]*href="/ui/thunder/')
-        for p in ("stop", "restart", "forget"):
-            self.assertRegex(html, rf'formaction="/ui/thunder/{p}\?name=tc"')
-        self.assertNotIn("/ui/thunder/start", html)     # running: nothing to start
+        self.assertNotRegex(html, r'<a[^>]*href="/ui/hosts/managed/')
+        for p in ("stop", "forget"):
+            self.assertRegex(html, rf'formaction="/ui/hosts/managed/{p}\?host=tc"')
+        for p in ("restart-service", "resetup"):
+            self.assertRegex(html, rf'formaction="/ui/hosts/managed/{p}\?host=tc&amp;'
+                                   r'bid=comfyui%3Atc"')
+        self.assertNotIn("/ui/hosts/managed/start", html)     # running: nothing to start
         self.views = {"tc": _view(phase="off")}
         html = self.page()
-        self.assertNotRegex(html, r'<a[^>]*href="/ui/thunder/')
-        self.assertRegex(html, r'formaction="/ui/thunder/start\?name=tc"')
-        self.assertNotIn("/ui/thunder/stop", html)
+        self.assertNotRegex(html, r'<a[^>]*href="/ui/hosts/managed/')
+        self.assertRegex(html, r'formaction="/ui/hosts/managed/start\?host=tc"')
+        self.assertNotIn("/ui/hosts/managed/stop", html)
         # a start in flight is still `off` until the create: Stop must be there to abort it
         self.views = {"tc": _view(phase="off", op="starting")}
         html = self.page()
-        self.assertRegex(html, r'formaction="/ui/thunder/stop\?name=tc"')
-        self.assertNotIn("/ui/thunder/start", html)
+        self.assertRegex(html, r'formaction="/ui/hosts/managed/stop\?host=tc"')
+        self.assertNotIn("/ui/hosts/managed/start", html)
         # failed after the create: the instance bills — Stop stays, Start does not come back
         self.views = {"tc": _view(phase="failed", uuid="u1", failed_phase="bootstrapping")}
         html = self.page()
-        self.assertRegex(html, r'formaction="/ui/thunder/stop\?name=tc"')
-        self.assertNotIn("/ui/thunder/start", html)
+        self.assertRegex(html, r'formaction="/ui/hosts/managed/stop\?host=tc"')
+        self.assertNotIn("/ui/hosts/managed/start", html)
 
     def test_stop_and_forget_ask_first(self):
         self.views = {"tc": _view(phase="ready", uuid="u1", unreconciled_uuids=["u-9"])}
         html = self.page()
         for p in ("stop", "forget"):
-            m = re.search(rf'<button[^>]*formaction="/ui/thunder/{p}[^"]*"[^>]*>', html)
+            m = re.search(rf'<button[^>]*formaction="/ui/hosts/managed/{p}\?[^"]*"[^>]*>', html)
             self.assertIsNotNone(m, p)
             self.assertIn("data-confirm=", m.group(0), p)
 
@@ -364,18 +404,18 @@ class Panel(_Base):
         # a Start rents a GPU by the hour: one stray click must not do that
         self.views = {"tc": _view(phase="off")}
         html = self.page()
-        m = re.search(r'<button[^>]*formaction="/ui/thunder/start[^"]*"[^>]*>', html)
+        m = re.search(r'<button[^>]*formaction="/ui/hosts/managed/start[^"]*"[^>]*>', html)
         self.assertIsNotNone(m)
         conf = re.search(r'data-confirm="([^"]*)"', m.group(0))
         self.assertIsNotNone(conf, m.group(0))
-        self.assertIn("Start the Thunder instance tc?", conf.group(1))
+        self.assertIn("Start the Thunder Compute host tc?", conf.group(1))
         self.assertIn("bills per hour until you stop it", conf.group(1))
 
     def test_persist_error_is_on_the_card(self):
         self.views = {"tc": _view(phase="ready", uuid="u1",
                                   persist_error="12:00:00 OSError('disk <full>')")}
         html = self.page()
-        self.assertIn('data-k="thunder-tc-persist"', html)
+        self.assertIn('data-k="host-tc-persist"', html)
         self.assertIn("State not saved", html)
         self.assertIn("disk &lt;full&gt;", html)
         self.views = {"tc": _view(phase="ready", uuid="u1", persist_error="")}
@@ -391,7 +431,7 @@ class Panel(_Base):
 
     def test_forget_only_with_unreconciled_uuids(self):
         self.views = {"tc": _view(phase="off")}
-        self.assertNotIn("/ui/thunder/forget", self.page())
+        self.assertNotIn("/ui/hosts/managed/forget", self.page())
 
     def test_backends_tab_live_while_instance_runs(self):
         self.views = {"tc": _view(phase="ready")}
@@ -407,7 +447,8 @@ class Panel(_Base):
         self.views = {"tc": _view(phase="ready")}
         store.upsert_backend({"name": "tc", "type": "comfyui", "url": "http://127.0.0.1:18188",
                               "thunder": {"gpu_type": "a6000", "vcpus": 8}})
-        for qp in ({"edit": "comfyui:tc"}, {"new": "1"}, {"host": "thunder-tc"}):
+        for qp in ({"edit": "comfyui:tc"}, {"new": "1"}, {"host": "thunder-tc"},
+                   {"mhost": "tc"}, {"mhost_new": "1"}):
             html = self.page(qp)
             self.assertIn("<main>", html, qp)
             self.assertNotIn("<main data-live", html, qp)
@@ -421,18 +462,28 @@ class Panel(_Base):
 
     def test_buttons_follow_the_controller_refusals(self):
         # op in flight: no Start, no Restart (the controller answers "already …")
-        self.views = {"tc": _view(phase="failed", op="stopping")}
+        self.views = {"tc": _view(phase="failed", op="stopping", uuid="u1", services=_svcs())}
         html = self.page()
-        self.assertNotIn("/ui/thunder/start", html)
-        self.assertNotIn("/ui/thunder/restart", html)
-        self.assertIn("/ui/thunder/stop", html)
+        self.assertNotIn("/ui/hosts/managed/start", html)
+        self.assertNotIn("/ui/hosts/managed/restart-service", html)
+        self.assertNotIn("/ui/hosts/managed/resetup", html)
+        self.assertIn("/ui/hosts/managed/stop", html)
         # failed before the create (no instance): Start yes, Restart no (needs the uuid)
-        self.views = {"tc": _view(phase="failed", failed_phase="creating")}
+        self.views = {"tc": _view(phase="failed", failed_phase="creating", services=_svcs())}
         html = self.page()
-        self.assertIn("/ui/thunder/start", html)
-        self.assertNotIn("/ui/thunder/restart", html)
-        self.views = {"tc": _view(phase="ready", uuid="u1")}
-        self.assertIn("/ui/thunder/restart", self.page())
+        self.assertIn("/ui/hosts/managed/start", html)
+        self.assertNotIn("/ui/hosts/managed/restart-service", html)
+        # a service is restarted only on a running host (the controller refuses otherwise)
+        self.views = {"tc": _view(phase="failed", uuid="u1", services=_svcs())}
+        self.assertNotIn("/ui/hosts/managed/restart-service", self.page())
+        self.views = {"tc": _view(phase="ready", uuid="u1", services=_svcs())}
+        self.assertIn("/ui/hosts/managed/restart-service", self.page())
+        # a host that is not driven (unknown provider, broken entry) has nothing to start
+        self.views = {"tc": _view(phase="off", host_error="unknown provider 'runpod'",
+                                  error="unknown provider 'runpod'")}
+        html = self.page()
+        self.assertNotIn("/ui/hosts/managed/start", html)
+        self.assertIn("unknown provider &#x27;runpod&#x27;", html)
 
     def test_odd_numbers_in_the_view_do_not_break_the_tab(self):
         self.views = {"tc": _view(phase="draining", waiting_jobs="?", uptime_s="x",
@@ -453,13 +504,13 @@ class Panel(_Base):
                                   waiting_jobs={"openai:vllm": 1, "comfyui:tc": 2},
                                   tunnel_error="control socket in use, left in place: '/x'")}
         html = self.page()
-        drain = re.search(r'<p class="hint" data-k="thunder-tc-drain">.*?</p>', html).group(0)
+        drain = re.search(r'<p class="hint" data-k="host-tc-drain">.*?</p>', html).group(0)
         self.assertIn("2 jobs on comfyui:tc", drain)
         self.assertIn("1 job on openai:vllm", drain)
-        tun = re.search(r'<p class="bad" data-k="thunder-tc-tunnel">.*?</p>', html).group(0)
+        tun = re.search(r'<p class="bad" data-k="host-tc-tunnel">.*?</p>', html).group(0)
         self.assertIn("Tunnel will not come up: control socket in use", tun)
         self.views = {"tc": _view(phase="ready")}
-        self.assertNotIn("thunder-tc-tunnel", self.page())
+        self.assertNotIn("host-tc-tunnel", self.page())
 
     def test_card_shows_the_truth(self):
         log = [f"line {i}" for i in range(120)]
@@ -474,7 +525,7 @@ class Panel(_Base):
             orphans=[{"uuid": "orph-1", "status": "RUNNING", "template": "base",
                       "index": "3", "created_at": "2026-09-27"}])}
         html = self.page()
-        self.assertIn('data-k="thunder-tc"', html)
+        self.assertIn('data-k="host-tc"', html)
         self.assertIn('<span class="badge bad">failed (bootstrapping)</span>', html)
         self.assertIn("smoke &lt;failed&gt;", html)
         self.assertNotIn("smoke <failed>", html)
@@ -497,7 +548,7 @@ class Panel(_Base):
         log = [f"line {i}" for i in range(hostctl._LOG_MAX + 30)]
         self.views = {"tc": _view(log=log)}
         html = self.page()
-        self.assertEqual(admin._THUNDER_LOG_LINES, hostctl._LOG_MAX)
+        self.assertEqual(admin._HOST_LOG_LINES, hostctl._LOG_MAX)
         self.assertIn(f"log (last {hostctl._LOG_MAX} lines)", html)
         self.assertIn("line 30\n", html)
         self.assertNotIn("line 29\n", html)
@@ -508,7 +559,7 @@ class Panel(_Base):
         html = self.page()
         m = re.search(r'<main[^>]*>(.*)</main>', html, re.S)
         self.assertNotIn("<script", m.group(1))
-        self.assertIn('data-k="thunder-tc-orphan-o1"', html)
+        self.assertIn('data-k="host-tc-orphan-o1"', html)
 
     def test_message_is_shown_escaped(self):
         self.views = {"tc": _view()}
@@ -527,9 +578,9 @@ class Actions(_Base):
         self.c = TestClient(main.app)
 
     def test_each_action_calls_the_controller_and_says_what_happened(self):
-        for path, action in (("start", "start"), ("stop", "stop"), ("restart", "restart"),
+        for path, action in (("start", "start"), ("stop", "stop"),
                              ("forget", "forget_unreconciled")):
-            r = self.c.post(f"/ui/thunder/{path}?name=a%26b", headers=SAME,
+            r = self.c.post(f"/ui/hosts/managed/{path}?host=a%26b", headers=SAME,
                             follow_redirects=False)
             self.assertEqual(r.status_code, 303, path)
             loc = urlparse(r.headers["location"])
@@ -537,16 +588,47 @@ class Actions(_Base):
             self.assertIn(f"{action} requested", parse_qs(loc.query)["msg"][0])
             self.assertEqual(self.actions[-1], ("a&b", action))
 
-    def test_name_as_form_field(self):
-        r = self.c.post("/ui/thunder/start", data={"name": "tc"}, headers=SAME,
+    def test_service_actions_carry_the_backend_id(self):
+        # the host alone is not enough: Restart must reach THIS service, not "the" one
+        for path, action in (("restart-service", "restart_service"), ("resetup", "resetup")):
+            r = self.c.post(f"/ui/hosts/managed/{path}?host=tc&bid=openai%3Av%26x",
+                            headers=SAME, follow_redirects=False)
+            self.assertEqual(r.status_code, 303, path)
+            self.assertIn(f"{action} requested",
+                          parse_qs(urlparse(r.headers["location"]).query)["msg"][0])
+            self.assertEqual(self.actions[-1], ("tc", action, "openai:v&x"))
+        # as form fields too
+        r = self.c.post("/ui/hosts/managed/resetup", data={"host": "tc", "bid": "comfyui:tc"},
+                        headers=SAME, follow_redirects=False)
+        self.assertEqual(r.status_code, 303)
+        self.assertEqual(self.actions[-1], ("tc", "resetup", "comfyui:tc"))
+
+    def test_host_as_form_field(self):
+        r = self.c.post("/ui/hosts/managed/start", data={"host": "tc"}, headers=SAME,
                         follow_redirects=False)
         self.assertEqual(r.status_code, 303)
         self.assertEqual(self.actions[-1], ("tc", "start"))
 
-    def test_get_runs_nothing(self):
-        r = self.c.get("/ui/thunder/start?name=tc", headers=SAME, follow_redirects=False)
-        self.assertEqual(r.status_code, 405)
+    def test_no_host_named_runs_nothing(self):
+        r = self.c.post("/ui/hosts/managed/start", headers=SAME, follow_redirects=False)
+        self.assertEqual(r.status_code, 303)
+        self.assertIn("no managed host named",
+                      parse_qs(urlparse(r.headers["location"]).query)["msg"][0])
         self.assertEqual(self.actions, [])
+
+    def test_get_runs_nothing(self):
+        for p in ("start?host=tc", "stop?host=tc", "restart-service?host=tc&bid=comfyui:tc",
+                  "resetup?host=tc&bid=comfyui:tc", "forget?host=tc", "delete?host=tc",
+                  "save?host=tc&new=1&provider=thunder"):
+            r = self.c.get(f"/ui/hosts/managed/{p}", headers=SAME, follow_redirects=False)
+            self.assertEqual(r.status_code, 405, p)
+            self.assertIn("/ui/backends", r.text, p)        # the 405 page leads back
+        self.assertEqual((self.actions, self.saved_hosts, self.deleted_hosts), ([], [], []))
+
+    def test_old_thunder_routes_are_gone(self):
+        paths = {r.path for r in main.app.routes}
+        self.assertFalse([p for p in paths if p.startswith("/ui/thunder")])
+        self.assertFalse([p for p in admin._POST_ACTIONS if p.startswith("/ui/thunder")])
 
 
 GiB = 10 ** 9
@@ -589,13 +671,13 @@ def _tx(path, done, total, rate, eta, source="url"):
 
 
 class SyncPanel(_Base):
-    """Task 13: the model-sync half of the Thunder card, its actions and the catalog."""
+    """Task 13: the model-sync half of the host card, its actions and the catalog."""
 
     def setUp(self):
         super().setUp()
-        self.live = [{"name": "tc", "type": "comfyui", "url": "http://127.0.0.1:18188",
-                      "enabled": True, "healthy": True, "models": 0, "source": "ui",
-                      "thunder": {"gpu_type": "a6000", "num_gpus": 1, "vcpus": 8}}]
+        self.live = [{"name": "tc", "type": "comfyui", "url": "http://127.0.0.1:18100",
+                      "host": "tc", "enabled": True, "healthy": True, "models": 0,
+                      "source": "ui"}]
         self.views = {"tc": _view(phase="ready", uuid="u1", plan=_plan(), transfers=[
             _tx("models/diffusion_models/u.gguf", 3 * GiB, 6 * GiB, 50e6, 60)])}
 
@@ -645,22 +727,22 @@ class SyncPanel(_Base):
         for plan in (None, {}, _plan(aliases={"x": {"files": "junk"}}, unknown="junk",
                                      held=[["only-path"]], prune_sizes=None)):
             self.views = {"tc": _view(phase="ready", plan=plan, transfers={"a": 1})}
-            self.assertIn('data-k="thunder-tc"', self.page())
+            self.assertIn('data-k="host-tc"', self.page())
 
     def test_sync_button_is_a_post_and_only_while_running(self):
-        self.assertIn("/ui/thunder/sync", admin._POST_ACTIONS)
+        self.assertIn("/ui/hosts/managed/sync", admin._POST_ACTIONS)
         html = self.page()
-        self.assertRegex(html, r'formaction="/ui/thunder/sync\?name=tc"')
+        self.assertRegex(html, r'formaction="/ui/hosts/managed/sync\?host=tc"')
         self.views = {"tc": _view(phase="off", plan=_plan())}
-        self.assertNotIn("/ui/thunder/sync", self.page())
+        self.assertNotIn("/ui/hosts/managed/sync", self.page())
 
     def test_delete_unknown_is_post_with_confirm(self):
-        self.assertIn("/ui/thunder/delete-unknown", admin._POST_ACTIONS)
+        self.assertIn("/ui/hosts/managed/delete-unknown", admin._POST_ACTIONS)
         html = self.main_html()
-        form = re.search(r'<form[^>]*action="/ui/thunder/delete-unknown"[^>]*>.*?</form>',
+        form = re.search(r'<form[^>]*action="/ui/hosts/managed/delete-unknown"[^>]*>.*?</form>',
                          html, re.S).group(0)
         self.assertIn('method="post"', form)
-        self.assertIn('name="name" value="tc"', form)
+        self.assertIn('name="host" value="tc"', form)
         self.assertIn('name="path" value="models/checkpoints/stray.ckpt"', form)
         self.assertIn('value="models/u/&lt;odd&gt;&amp;.bin"', form)
         btn = re.search(r"<button[^>]*data-confirm=\"([^\"]*)\"[^>]*>", form)
@@ -669,9 +751,9 @@ class SyncPanel(_Base):
         self.assertIn("6.0 GB", btn.group(1))
         # nothing unknown → no form; not running → no form (the controller refuses)
         self.views = {"tc": _view(phase="ready", plan=_plan(unknown=[]))}
-        self.assertNotIn("/ui/thunder/delete-unknown", self.page())
+        self.assertNotIn("/ui/hosts/managed/delete-unknown", self.page())
         self.views = {"tc": _view(phase="off", plan=_plan())}
-        self.assertNotIn("/ui/thunder/delete-unknown", self.page())
+        self.assertNotIn("/ui/hosts/managed/delete-unknown", self.page())
 
     def test_confirm_js_counts_the_selection(self):
         # the confirm text follows the ticked boxes (data-confirm-sum), in the ONE
@@ -715,9 +797,9 @@ class SyncPanel(_Base):
 
     def test_catalog_editor_in_details_with_the_stored_catalog(self):
         html = self.main_html()
-        det = re.search(r'<details[^>]*data-k="thunder-catalog"[^>]*>.*?</details>', html, re.S)
+        det = re.search(r'<details[^>]*data-k="hosts-catalog"[^>]*>.*?</details>', html, re.S)
         self.assertIsNotNone(det)
-        self.assertIn('action="/ui/thunder/catalog"', det.group(0))
+        self.assertIn('action="/ui/hosts/managed/catalog"', det.group(0))
         self.assertIn('name="catalog"', det.group(0))
         self.assertIn("models/c/", det.group(0))
 
@@ -726,48 +808,48 @@ class SyncActions(Actions):
     def setUp(self):
         super().setUp()
         self.views = {"tc": _view(phase="ready", uuid="u1", plan=_plan())}
-        self.live = [{"name": "tc", "type": "comfyui", "url": "http://127.0.0.1:18188",
-                      "enabled": True, "healthy": True, "models": 0, "source": "ui",
-                      "thunder": {"gpu_type": "a6000"}}]
+        self.live = [{"name": "tc", "type": "comfyui", "url": "http://127.0.0.1:18100",
+                      "host": "tc", "enabled": True, "healthy": True, "models": 0,
+                      "source": "ui"}]
 
     def test_sync_calls_the_controller(self):
-        r = self.c.post("/ui/thunder/sync?name=tc", headers=SAME, follow_redirects=False)
+        r = self.c.post("/ui/hosts/managed/sync?host=tc", headers=SAME, follow_redirects=False)
         self.assertEqual(r.status_code, 303)
         self.assertEqual(self.synced, ["tc"])
         self.assertIn("sync requested", parse_qs(urlparse(r.headers["location"]).query)["msg"][0])
 
     def test_delete_unknown_posts_every_ticked_path(self):
-        r = self.c.post("/ui/thunder/delete-unknown", headers=SAME, follow_redirects=False,
-                        data={"name": "tc", "path": ["models/a.bin", "models/b&c.bin"]})
+        r = self.c.post("/ui/hosts/managed/delete-unknown", headers=SAME, follow_redirects=False,
+                        data={"host": "tc", "path": ["models/a.bin", "models/b&c.bin"]})
         self.assertEqual(r.status_code, 303)
         self.assertEqual(self.deleted, [("tc", ["models/a.bin", "models/b&c.bin"])])
         self.assertIn("deleted 2", parse_qs(urlparse(r.headers["location"]).query)["msg"][0])
 
     def test_delete_unknown_without_selection_deletes_nothing(self):
-        r = self.c.post("/ui/thunder/delete-unknown", headers=SAME, follow_redirects=False,
-                        data={"name": "tc"})
+        r = self.c.post("/ui/hosts/managed/delete-unknown", headers=SAME, follow_redirects=False,
+                        data={"host": "tc"})
         self.assertEqual(r.status_code, 303)
         self.assertEqual(self.deleted, [])
 
     def test_get_runs_nothing(self):
-        for p in ("sync?name=tc", "delete-unknown?name=tc&path=models/a.bin", "catalog"):
-            r = self.c.get(f"/ui/thunder/{p}", headers=SAME, follow_redirects=False)
+        for p in ("sync?host=tc", "delete-unknown?host=tc&path=models/a.bin", "catalog"):
+            r = self.c.get(f"/ui/hosts/managed/{p}", headers=SAME, follow_redirects=False)
             self.assertEqual(r.status_code, 405, p)
         self.assertEqual((self.synced, self.deleted, self.saved_catalogs), ([], [], []))
 
     def test_catalog_invalid_json_is_400_and_not_saved(self):
         typed = '[{"match": {"class": "X"}, "paths": ["models/<x>/"]'
-        r = self.c.post("/ui/thunder/catalog", headers=SAME, data={"catalog": typed})
+        r = self.c.post("/ui/hosts/managed/catalog", headers=SAME, data={"catalog": typed})
         self.assertEqual(r.status_code, 400)
         body = r.text
         self.assertIn("models/&lt;x&gt;/", body)      # the textarea as typed …
         self.assertIn("not valid JSON", body)         # … and why
         self.assertNotIn("<main data-live", body)     # a refused form is never live
-        self.assertRegex(body, r'<details[^>]*data-k="thunder-catalog"[^>]*\bopen\b')
+        self.assertRegex(body, r'<details[^>]*data-k="hosts-catalog"[^>]*\bopen\b')
         self.assertEqual(self.saved_catalogs, [])
         # valid JSON the validator refuses: every line of its answer, nothing saved
         typed = json.dumps([{"match": {"alias": "a"}, "paths": ["models/"]}, "junk"])
-        r = self.c.post("/ui/thunder/catalog", headers=SAME, data={"catalog": typed})
+        r = self.c.post("/ui/hosts/managed/catalog", headers=SAME, data={"catalog": typed})
         self.assertEqual(r.status_code, 400)
         self.assertIn("is a whole root", r.text)
         self.assertIn("entry 2: not an object", r.text)
@@ -776,7 +858,7 @@ class SyncActions(Actions):
     def test_catalog_saved_and_rendered(self):
         cat = [{"match": {"class": "Trellis2LoadModel", "value": "org/repo"},
                 "paths": ["models/org/repo/"]}]
-        r = self.c.post("/ui/thunder/catalog", headers=SAME, follow_redirects=False,
+        r = self.c.post("/ui/hosts/managed/catalog", headers=SAME, follow_redirects=False,
                         data={"catalog": json.dumps(cat)})
         self.assertEqual(r.status_code, 303)
         self.assertEqual(self.saved_catalogs, [cat])
@@ -811,8 +893,19 @@ class CatalogWiring(unittest.TestCase):
     def test_bound(self):
         self.assertIs(admin._modelsync_catalog, main._modelsync_catalog)
         self.assertIs(admin._save_modelsync_catalog, main.save_modelsync_catalog)
-        self.assertIs(admin._thunder_delete_unknown, main.thunder_delete_unknown)
-        self.assertIs(admin._thunder_sync_now, main.thunder_sync_now)
+        # the card's actions go through main.host_action — the Thunder wrappers are gone
+        self.assertIs(admin._host_action, main.host_action)
+        self.assertIs(admin._host_names, main.host_names)
+        self.assertIs(admin._host_view, main.host_view)
+        self.assertIs(admin._save_managed_host, main.save_managed_host)
+        self.assertIs(admin._delete_managed_host, main.delete_managed_host)
+        self.assertIs(admin._managed_host_delete_refusal, main.managed_host_delete_refusal)
+        for gone in ("thunder_action", "thunder_sync_now", "thunder_delete_unknown"):
+            self.assertFalse(hasattr(main, gone), gone)
+        for gone in ("_thunder_action", "_thunder_sync_now", "_thunder_delete_unknown",
+                     "_thunder_names", "_thunder_view", "_thunder_longrun",
+                     "_thunder_panel", "_thunder_card"):
+            self.assertFalse(hasattr(admin, gone), gone)
 
     def test_seed_copied_on_first_read_then_the_setting_rules(self):
         import modelsync
@@ -887,6 +980,10 @@ class MainSyncWiring(CatalogWiring):
                                {"backend": "k12", "workflow_json": {}}])
         store.upsert("done", [{"backend": "tc", "workflow_json": {}}])
 
+    @staticmethod
+    def delete(paths, name="tc"):
+        return main.host_action(name, "delete_unknown", paths=paths)
+
     def test_gated_only_names_aliases_no_other_backend_serves(self):
         rows = main.host_view("tc")["plan"]["aliases"]
         self.assertEqual({a: r["gated_only"] for a, r in rows.items()},
@@ -898,20 +995,20 @@ class MainSyncWiring(CatalogWiring):
 
     def test_delete_unknown_answers(self):
         self.assertIn("deleted 2 unknown files",
-                      asyncio.run(main.thunder_delete_unknown("tc", ["models/a", "models/b"])))
+                      asyncio.run(self.delete(["models/a", "models/b"])))
         self.assertEqual(self.ctl.deleted, [["models/a", "models/b"]])
         self.ctl.unknown_ok = False
         self.assertIn("delete refused: not in the unknown list",
-                      asyncio.run(main.thunder_delete_unknown("tc", ["models/a"])))
-        self.assertIn("nothing deleted", asyncio.run(main.thunder_delete_unknown("tc", [])))
+                      asyncio.run(self.delete(["models/a"])))
+        self.assertIn("nothing deleted", asyncio.run(self.delete([])))
         self.assertIn("unknown managed host",
-                      asyncio.run(main.thunder_delete_unknown("x", ["models/a"])))
+                      asyncio.run(self.delete(["models/a"], name="x")))
 
     def test_sync_now_answers(self):
-        self.assertIn("sync", asyncio.run(main.thunder_sync_now("tc")))
+        self.assertIn("sync", asyncio.run(main.host_action("tc", "sync")))
         self.ctl.phase = "off"
         self.assertIn("sync refused: no running instance (off)",
-                      asyncio.run(main.thunder_sync_now("tc")))
+                      asyncio.run(main.host_action("tc", "sync")))
 
 
 class FaultSources(unittest.TestCase):
@@ -933,9 +1030,9 @@ class LanSourcePanel(Actions):
     def setUp(self):
         super().setUp()
         import hostctl
-        self.live = [{"name": "tc", "type": "comfyui", "url": "http://127.0.0.1:18188",
-                      "enabled": True, "healthy": True, "models": 0, "source": "ui",
-                      "thunder": {"gpu_type": "a6000"}}]
+        self.live = [{"name": "tc", "type": "comfyui", "url": "http://127.0.0.1:18100",
+                      "host": "tc", "enabled": True, "healthy": True, "models": 0,
+                      "source": "ui"}]
         self.views = {"tc": _view(phase="ready", uuid="u1")}
         self.d = tempfile.TemporaryDirectory()
         self.addCleanup(self.d.cleanup)
@@ -953,15 +1050,15 @@ class LanSourcePanel(Actions):
                                  setattr(main, "_modelsrc_obj", saved[1])))
         main.jobs_cfg = dict(main.jobs_cfg, store_path=os.path.join(self.d.name, "store.db"))
         main._modelsrc_obj = self.lan
-        for k, v in {"_thunder_modelsrc_view": main.modelsrc_view,
-                     "_thunder_modelsrc_scan": main.modelsrc_scan,
-                     "_thunder_modelsrc_pin": main.modelsrc_pin}.items():
+        for k, v in {"_modelsrc_view": main.modelsrc_view,
+                     "_modelsrc_scan": main.modelsrc_scan,
+                     "_modelsrc_pin": main.modelsrc_pin}.items():
             self.addCleanup(setattr, admin, k, getattr(admin, k))
             setattr(admin, k, v)
         self.fp = hostctl.host_key_fingerprint(_ED_B64)
 
     def block(self) -> str:
-        m = re.search(r'<div class="tcard" data-k="thunder-modelsrc">.*?</div></div>',
+        m = re.search(r'<div class="tcard" data-k="hosts-modelsrc">.*?</div></div>',
                       self.page(), re.S)
         self.assertIsNotNone(m)
         return m.group(0)
@@ -979,32 +1076,32 @@ class LanSourcePanel(Actions):
         self.assertNotIn("nologin", b)
         self.assertIn("command=&quot;/usr/local/bin/modelsrc-serve&quot;,no-port-forwarding,"
                       "no-X11-forwarding,no-agent-forwarding,no-pty ssh-ed25519 AAAAgatewaykey", b)
-        self.assertRegex(b, r'formaction="/ui/thunder/modelsrc-scan"')
+        self.assertRegex(b, r'formaction="/ui/hosts/managed/modelsrc-scan"')
         self.assertNotIn("modelsrc-pin", b)               # nothing fetched: nothing to confirm
-        self.assertNotRegex(b, r'<a[^>]*href="/ui/thunder/')
+        self.assertNotRegex(b, r'<a[^>]*href="/ui/hosts/managed/')
 
     def test_pin_flow_is_post_and_writes_known_hosts(self):
-        for p in ("/ui/thunder/modelsrc-scan", "/ui/thunder/modelsrc-pin"):
+        for p in ("/ui/hosts/managed/modelsrc-scan", "/ui/hosts/managed/modelsrc-pin"):
             self.assertIn(p, admin._POST_ACTIONS)
             r = self.c.get(p + "?fp=" + self.fp, headers=SAME, follow_redirects=False)
             self.assertEqual(r.status_code, 405, p)
         self.assertEqual(self.scans, [])
-        msg = self.post("/ui/thunder/modelsrc-scan")
+        msg = self.post("/ui/hosts/managed/modelsrc-scan")
         self.assertIn(self.fp, msg)
         self.assertEqual(self.scans, [["ssh-keyscan", "-t", "ed25519", "--", "192.168.8.24"]])
         self.assertFalse(os.path.exists(self.lan.known_hosts_path))     # not trusted yet
         b = self.block()
         self.assertIn(self.fp, b)
-        btn = re.search(r'<button[^>]*formaction="/ui/thunder/modelsrc-pin\?fp=([^"]+)"[^>]*>',
+        btn = re.search(r'<button[^>]*formaction="/ui/hosts/managed/modelsrc-pin\?fp=([^"]+)"[^>]*>',
                         b)
         self.assertIsNotNone(btn)
         self.assertIn(f"data-confirm=\"Pin modelsrc@192.168.8.24&#x27;s host key {self.fp}?",
                       btn.group(0))
         # a confirmation of another key pins nothing
-        self.assertIn("not pinned", self.post("/ui/thunder/modelsrc-pin", fp="SHA256:other"))
+        self.assertIn("not pinned", self.post("/ui/hosts/managed/modelsrc-pin", fp="SHA256:other"))
         self.assertFalse(os.path.exists(self.lan.known_hosts_path))
         from urllib.parse import unquote
-        msg = self.post("/ui/thunder/modelsrc-pin", fp=unquote(btn.group(1)))
+        msg = self.post("/ui/hosts/managed/modelsrc-pin", fp=unquote(btn.group(1)))
         self.assertIn("pinned", msg)
         with open(self.lan.known_hosts_path) as f:
             self.assertEqual(f.read(), f"192.168.8.24 ssh-ed25519 {_ED_B64}\n")
@@ -1015,15 +1112,15 @@ class LanSourcePanel(Actions):
 
     def test_no_lan_block_without_thunder_backends(self):
         self.views = {}
-        self.assertNotIn("thunder-modelsrc", self.page())
+        self.assertNotIn("hosts-modelsrc", self.page())
 
 
 class LanSourceWiring(CatalogWiring):
     def test_bound_and_deps(self):
         import hostctl
-        self.assertIs(admin._thunder_modelsrc_view, main.modelsrc_view)
-        self.assertIs(admin._thunder_modelsrc_scan, main.modelsrc_scan)
-        self.assertIs(admin._thunder_modelsrc_pin, main.modelsrc_pin)
+        self.assertIs(admin._modelsrc_view, main.modelsrc_view)
+        self.assertIs(admin._modelsrc_scan, main.modelsrc_scan)
+        self.assertIs(admin._modelsrc_pin, main.modelsrc_pin)
         # the host rule is main's ship-target rule (plain [user@]host characters)
         self.assertEqual(hostctl._SRC_HOST_RE.pattern, main._VOICE_HOST_RE.pattern)
         self.assertEqual(main._modelsrc_host(), "modelsrc@192.168.8.24")
@@ -1056,7 +1153,7 @@ class HfToken(Actions):
         self.views = {"tc": _view()}
 
     def post(self, status=303, **data):
-        r = self.c.post("/ui/thunder/hf-token", data=data, headers=SAME, follow_redirects=False)
+        r = self.c.post("/ui/hosts/managed/hf-token", data=data, headers=SAME, follow_redirects=False)
         self.assertEqual(r.status_code, status, r.text[:300])
         return r
 
@@ -1069,8 +1166,8 @@ class HfToken(Actions):
     def test_bound(self):
         self.assertIs(admin._save_hf_token, main.save_hf_token)
         self.assertIs(admin._hf_token_set, main.hf_token_set)
-        self.assertIn("/ui/thunder/hf-token", admin._POST_ACTIONS)
-        r = self.c.get("/ui/thunder/hf-token", headers=SAME, follow_redirects=False)
+        self.assertIn("/ui/hosts/managed/hf-token", admin._POST_ACTIONS)
+        r = self.c.get("/ui/hosts/managed/hf-token", headers=SAME, follow_redirects=False)
         self.assertEqual(r.status_code, 405)
 
     def test_hf_token_encrypted_at_rest(self):
@@ -1127,7 +1224,7 @@ class HfToken(Actions):
                 self.post(status=400, hf_token=bad)
                 self.assertEqual(main._thunder_hf_token(), "hf_Good1")
         self.assertTrue(hostctl.hf_token_ok("hf_Good1"))
-        self.assertRegex(r.text, r'<details class="optblock" data-k="thunder-catalog" open>')
+        self.assertRegex(r.text, r'<details class="optblock" data-k="hosts-catalog" open>')
 
 
 class ModelsrcHostField(Actions):
@@ -1138,36 +1235,36 @@ class ModelsrcHostField(Actions):
 
     def setUp(self):
         super().setUp()
-        self.live = [{"name": "tc", "type": "comfyui", "url": "http://127.0.0.1:18188",
-                      "enabled": True, "healthy": True, "models": 0, "source": "ui",
-                      "thunder": {"gpu_type": "a6000"}}]
+        self.live = [{"name": "tc", "type": "comfyui", "url": "http://127.0.0.1:18100",
+                      "host": "tc", "enabled": True, "healthy": True, "models": 0,
+                      "source": "ui"}]
         self.views = {"tc": _view(phase="ready", uuid="u1")}
         saved = (main.jobs_cfg, main._modelsrc_obj)
         self.addCleanup(lambda: (setattr(main, "jobs_cfg", saved[0]),
                                  setattr(main, "_modelsrc_obj", saved[1])))
         main.jobs_cfg = dict(main.jobs_cfg, store_path=os.path.join(self.tmp.name, "store.db"))
         main._modelsrc_obj = None
-        for k, v in {"_thunder_modelsrc_view": main.modelsrc_view,
+        for k, v in {"_modelsrc_view": main.modelsrc_view,
                      "_save_modelsrc_host": main.save_modelsrc_host}.items():
             self.addCleanup(setattr, admin, k, getattr(admin, k))
             setattr(admin, k, v)
 
     def post(self, status=303, **data):
-        r = self.c.post("/ui/thunder/modelsrc-host", data=data, headers=SAME,
+        r = self.c.post("/ui/hosts/managed/modelsrc-host", data=data, headers=SAME,
                         follow_redirects=False)
         self.assertEqual(r.status_code, status, r.text[:300])
         return r
 
     def test_bound_and_post_only(self):
         self.assertIs(admin._save_modelsrc_host, main.save_modelsrc_host)
-        self.assertIn("/ui/thunder/modelsrc-host", admin._POST_ACTIONS)
-        r = self.c.get("/ui/thunder/modelsrc-host?modelsrc_host=x", headers=SAME,
+        self.assertIn("/ui/hosts/managed/modelsrc-host", admin._POST_ACTIONS)
+        r = self.c.get("/ui/hosts/managed/modelsrc-host?modelsrc_host=x", headers=SAME,
                        follow_redirects=False)
         self.assertEqual(r.status_code, 405)
 
     def test_field_shows_the_current_host(self):
         page = self.page()
-        self.assertRegex(page, r'<form method="post" action="/ui/thunder/modelsrc-host"')
+        self.assertRegex(page, r'<form method="post" action="/ui/hosts/managed/modelsrc-host"')
         self.assertRegex(page, r'name="modelsrc_host" value="modelsrc@192.168.8.24"')
 
     def test_valid_host_saved(self):
@@ -1200,7 +1297,7 @@ class ModelsrcHostField(Actions):
             f.write(f"192.168.8.24 ssh-ed25519 {_ED_B64}\n")
         self.assertEqual(lan.problem(), "not listed yet")
         self.post(modelsrc_host="modelsrc@10.0.0.9")
-        m = re.search(r'<div class="tcard" data-k="thunder-modelsrc">.*?</div></div>',
+        m = re.search(r'<div class="tcard" data-k="hosts-modelsrc">.*?</div></div>',
                       self.page(), re.S)
         self.assertIn("pinned for 192.168.8.24, not 10.0.0.9 — fetch its key", m.group(0))
 
@@ -1223,7 +1320,7 @@ class CostBanner(_Base):
             raise AssertionError("the Dashboard must not build the full panel view")
         for k, v in {"_dashboard_snapshot": lambda: {"backends": []},
                      "_faults_info": lambda: {"backends": [], "bundles": [], "total": 0},
-                     "_thunder_longrun": longrun, "_thunder_view": heavy}.items():
+                     "_host_longrun": longrun, "_host_view": heavy}.items():
             self.addCleanup(setattr, admin, k, getattr(admin, k))
             setattr(admin, k, v)
         r = asyncio.run(admin.dashboard_page(_Req({})))
@@ -1232,8 +1329,8 @@ class CostBanner(_Base):
     def test_card_banner(self):
         self.views = {"tc": self.long_view()}
         page = self.page()
-        self.assertRegex(page, r'data-k="thunder-tc-longrun"')
-        self.assertIn("Thunder tc running for 26 h (≈ $13.02)", page)
+        self.assertRegex(page, r'data-k="host-tc-longrun"')
+        self.assertIn("Thunder Compute host tc running for 26 h (≈ $13.02)", page)
         self.views = {"tc": _view(phase="ready", uuid="u1", started_at=1.0,
                                   uptime_s=3600, long_running=False)}
         self.assertNotIn("longrun", self.page())
@@ -1243,13 +1340,13 @@ class CostBanner(_Base):
         html = self.dash()
         m = re.search(r'<p class="bad" data-k="dash-longrun-tc">.*?</p>', html, re.S)
         self.assertIsNotNone(m, html[:2000])
-        self.assertIn("Thunder tc running for 26 h (≈ $13.02)", m.group(0))
+        self.assertIn("Thunder Compute host tc running for 26 h (≈ $13.02)", m.group(0))
         self.assertIn('href="/ui/backends"', m.group(0))
         self.assertNotIn("dash-longrun-b", html)
         self.assertIn('data-live="4"', html)                 # the Dashboard stays live
         # no price list yet: still the banner, no made-up figure
         self.views = {"tc": self.long_view(session_cost=None, cost_per_h=None)}
-        self.assertIn("Thunder tc running for 26 h (cost unknown", self.dash())
+        self.assertIn("Thunder Compute host tc running for 26 h (cost unknown", self.dash())
         # under 24 h, or nothing running: no banner at all
         self.views = {"tc": _view(phase="ready", started_at=1.0, uptime_s=3600)}
         self.assertNotIn("dash-longrun", self.dash())
@@ -1266,8 +1363,8 @@ class CostBanner(_Base):
                 return bid == f"comfyui:{self.services[0]['name']}"
 
             def view(self):
-                return {"phase": "ready", "long_running": self.long, "uptime_s": 90000,
-                        "session_cost": 1.5,
+                return {"phase": "ready", "provider": "thunder", "long_running": self.long,
+                        "uptime_s": 90000, "session_cost": 1.5,
                         "plan": {"aliases": {"a": {"ready": False}, "b": {"ready": False}}}}
         saved = dict(main.host_controllers)
         self.addCleanup(lambda: (main.host_controllers.clear(),
@@ -1280,17 +1377,17 @@ class CostBanner(_Base):
         for fn in ("get", "list_aliases", "get_setting", "get_settings"):
             self.addCleanup(setattr, store, fn, getattr(store, fn))
             setattr(store, fn, boom)
-        self.assertIs(admin._thunder_longrun, main.host_longrun)
+        self.assertIs(admin._host_longrun, main.host_longrun)
         self.assertEqual([n for n, _ in main.host_longrun()], ["tc"])
-        html = admin._dash_thunder()
+        html = admin._dash_hosts()
         self.assertIn('data-k="dash-longrun-tc"', html)
-        self.assertIn("Thunder tc running for 25 h (≈ $1.50)", html)
+        self.assertIn("Thunder Compute host tc running for 25 h (≈ $1.50)", html)
         self.assertNotIn("k2", html)
 
 
 class OrphanSnapshots(_Base):
-    """Task 16: `aihub-` snapshots no current Thunder backend owns bill $/month unseen
-    (a renamed backend leaves every old one behind) — shown on the Backends tab, never
+    """Task 16: `aihub-` snapshots no current managed host owns bill $/month unseen
+    (a deleted host leaves every old one behind) — shown on the Backends tab, never
     deleted, rendered from the controllers' caches only."""
 
     def setUp(self):
@@ -1304,14 +1401,14 @@ class OrphanSnapshots(_Base):
     def test_orphan_snapshot_warning(self):
         self.views = {"tc": _view()}
         page = self.page()
-        m = re.search(r'<div data-k="thunder-orphan-snaps">.*?</table></div>', page, re.S)
+        m = re.search(r'<div data-k="hosts-orphan-snaps">.*?</table></div>', page, re.S)
         self.assertIsNotNone(m)
         self.assertIn("aihub-old-20260926t120000z", m.group(0))
         self.assertIn("$1.00/month", m.group(0))
-        self.assertIn('data-k="thunder-osnap-s2"', m.group(0))
+        self.assertIn('data-k="hosts-osnap-s2"', m.group(0))
         self.assertNotIn("<button", m.group(0))              # display only, no delete
         self.orph = []
-        self.assertNotIn("thunder-orphan-snaps", self.page())
+        self.assertNotIn("hosts-orphan-snaps", self.page())
 
     def test_orphan_instances_priced_on_the_card(self):
         self.orph = []
@@ -1321,10 +1418,10 @@ class OrphanSnapshots(_Base):
             {"uuid": "y", "index": "5", "status": "RUNNING", "gpu_type": "h200",
              "num_gpus": 2, "cost_per_h": None}])}
         page = self.page()
-        x = re.search(r'<tr data-k="thunder-tc-orphan-x">.*?</tr>', page).group(0)
+        x = re.search(r'<tr data-k="host-tc-orphan-x">.*?</tr>', page).group(0)
         self.assertIn("$0.42/h", x)
         self.assertIn("a6000 ×1", x)
-        y = re.search(r'<tr data-k="thunder-tc-orphan-y">.*?</tr>', page).group(0)
+        y = re.search(r'<tr data-k="host-tc-orphan-y">.*?</tr>', page).group(0)
         self.assertIn("<td>—</td>", y)                      # no price: no made-up figure
         self.assertIn("h200 ×2", y)
 
@@ -1360,6 +1457,384 @@ class OrphanSnapshots(_Base):
 class Task16Wiring(unittest.TestCase):
     def test_bound(self):
         self.assertIs(admin._thunder_orphan_snapshots, main.thunder_orphan_snapshots)
+
+
+# ── the managed-host form, its save and delete (Task 7) ──────────────────────────────
+
+def _host_form(name="gpu-a", new=True, **over) -> dict:
+    f = {"host": name, "provider": "thunder", "opt__gpu_type": "h100", "opt__num_gpus": "2",
+         "opt__vcpus": "16", "opt__bootstrap_template": "", "opt__reserve_gb": "30",
+         "opt__comfy_commit": "", "opt__nodes": "registry:y@2\n", "api_key": ""}
+    if new:
+        f["new"] = "1"
+    f.update(over)
+    return f
+
+
+class HostForm(_Base):
+    """The "+ Managed host" form: every provider option comes from the provider's own
+    OPTION_FIELDS, each field exactly once, the token never rendered."""
+
+    def form(self, qp) -> str:
+        html = self.page(qp)
+        m = re.search(r'<form action="/ui/hosts/managed/save" method="post"[^>]*>.*?</form>',
+                      html, re.S)
+        self.assertIsNotNone(m, html[-3000:])
+        return m.group(0)
+
+    def names(self, form) -> list:
+        return re.findall(r'<(?:input|select|textarea)[^>]*\bname="([^"]+)"', form)
+
+    def test_add_button_in_the_hosts_area(self):
+        html = self.page()
+        self.assertIn('href="/ui/backends?mhost_new=1"', html)
+        self.assertIn("+ Managed host", html)
+        # the button is there with no managed host at all (how else to make the first)
+        self.views = {}
+        self.assertIn('href="/ui/backends?mhost_new=1"', self.page())
+
+    def test_new_form_renders_the_providers_option_fields(self):
+        import hostapi
+        import thunder
+        f = self.form({"mhost_new": "1"})
+        names = self.names(f)
+        want = (["new", "host", "provider"] + [f"opt__{x['key']}" for x in thunder.OPTION_FIELDS]
+                + ["api_key", "api_key_clear"])
+        self.assertEqual(sorted(names), sorted(want))             # each field exactly once
+        self.assertEqual(len(names), len(set(names)))
+        # "Steuerung": the providers of hostapi.PROVIDERS, by their display NAME
+        sel = re.search(r'<select name="provider"[^>]*>.*?</select>', f, re.S).group(0)
+        for kind, (mod, _api) in hostapi.PROVIDERS.items():
+            self.assertIn(f'<option value="{kind}" selected>{mod.NAME}</option>', sel)
+        # every select offers exactly the provider's choices
+        for fld in thunder.OPTION_FIELDS:
+            if fld["type"] != "select":
+                continue
+            s = re.search(rf'<select name="opt__{fld["key"]}"[^>]*>(.*?)</select>', f, re.S)
+            self.assertEqual(re.findall(r'<option value="([^"]*)"', s.group(1)),
+                             [str(c) for c in fld["choices"]], fld["key"])
+        # the textareas and ints carry the defaults, the nodes the default node list
+        self.assertIn(f'name="opt__comfy_commit" value="{SHA}"', f)
+        self.assertIn('name="opt__vcpus" value="8"', f)
+        self.assertIn("# defaults\nregistry:x@1.0\n</textarea>", f)
+        self.assertIn("40-hex", f)                               # the provider's hints
+
+    def test_template_select_offers_auto_first_and_stores_blank(self):
+        # Ruling M5: "auto" first, the stored value "" — a fixed comfy-ui default gave
+        # every vLLM-only host the template's ComfyUI and its models
+        f = self.form({"mhost_new": "1"})
+        s = re.search(r'<select name="opt__bootstrap_template"[^>]*>(.*?)</select>', f, re.S)
+        opts = re.findall(r'<option value="([^"]*)"( selected)?>([^<]*)</option>', s.group(1))
+        self.assertEqual(opts[0], ("", " selected", "auto"))
+        self.assertEqual([o[0] for o in opts], ["", "comfy-ui", "base"])
+
+    def test_edit_form_shows_the_stored_options_and_no_rename(self):
+        self.views = {"tc": _view(api_key_set=True, options={
+            "gpu_type": "h100", "num_gpus": 2, "vcpus": 16, "bootstrap_template": "base",
+            "reserve_gb": 30, "comfy_commit": SHA, "nodes": ["# c", "registry:y@2"]})}
+        f = self.form({"mhost": "tc"})
+        self.assertRegex(f, r'<option value="h100" selected>')
+        self.assertRegex(f, r'<option value="base" selected>')
+        for v in ('name="opt__num_gpus" value="2"', 'name="opt__vcpus" value="16"',
+                  'name="opt__reserve_gb" value="30"'):
+            self.assertIn(v, f)
+        self.assertIn("# c\nregistry:y@2</textarea>", f)
+        self.assertNotIn("# defaults", f)                   # stored [] or list: never refilled
+        # no rename (R-W5): the name travels hidden, the provider cannot change
+        self.assertIn('<input type="hidden" name="host" value="tc">', f)
+        self.assertIn('<input type="hidden" name="provider" value="thunder">', f)
+        self.assertNotIn('name="new"', f)
+        self.assertNotRegex(f, r'<select name="provider"')
+        self.assertIn("set — blank keeps it", f)
+
+    def test_token_never_rendered(self):
+        store.set_managed_host("tc", {"provider": "thunder", "options": {},
+                                      "api_key": "th-SECRET-TOKEN"})
+        self.views = {"tc": _view(api_key_set=True)}
+        for qp in ({}, {"mhost": "tc"}, {"mhost_new": "1"}):
+            page = self.page(qp)
+            self.assertNotIn("th-SECRET-TOKEN", page, qp)
+        f = self.form({"mhost": "tc"})
+        self.assertRegex(f, r'<input type="password" name="api_key" value=""')
+
+    def test_unknown_host_says_so(self):
+        self.assertIn("no managed host named", self.page({"mhost": "nope"}))
+
+
+class _HostSaveBase(Actions):
+    def post(self, form, status=303):
+        r = self.c.post("/ui/hosts/managed/save", data=form, headers=SAME,
+                        follow_redirects=False)
+        self.assertEqual(r.status_code, status, r.text[-1500:])
+        return r
+
+
+class HostSave(_HostSaveBase):
+    def test_create_hands_main_the_typed_options_and_token(self):
+        r = self.post(_host_form(api_key="th-TOKEN-1"))
+        self.assertIn("saved", parse_qs(urlparse(r.headers["location"]).query)["msg"][0])
+        name, entry, new = self.saved_hosts[-1]
+        self.assertEqual((name, new), ("gpu-a", True))
+        self.assertEqual(entry["provider"], "thunder")
+        self.assertEqual(entry["api_key"], "th-TOKEN-1")
+        self.assertEqual(entry["options"]["gpu_type"], "h100")
+        self.assertEqual(entry["options"]["vcpus"], "16")    # main normalizes (options_of)
+
+    def test_blank_token_keeps_the_stored_one_and_the_box_clears_it(self):
+        store.set_managed_host("gpu-a", {"provider": "thunder", "options": {},
+                                         "api_key": "th-OLD"})
+        self.post(_host_form(new=False))
+        self.assertEqual(self.saved_hosts[-1][1]["api_key"], "th-OLD")
+        self.post(_host_form(new=False, api_key="th-NEW"))
+        self.assertEqual(self.saved_hosts[-1][1]["api_key"], "th-NEW")
+        self.post(_host_form(new=False, api_key_clear="1"))
+        self.assertEqual(self.saved_hosts[-1][1]["api_key"], "")
+        # a typed value next to a ticked box: the value wins (the backend-key rule)
+        self.post(_host_form(new=False, api_key="th-X", api_key_clear="1"))
+        self.assertEqual(self.saved_hosts[-1][1]["api_key"], "th-X")
+        self.assertEqual({x[2] for x in self.saved_hosts}, {False})
+
+    def test_refused_save_is_400_with_the_form_as_typed(self):
+        self.save_refusal = "vcpus: 'lots' is not a whole number ≥ 1"
+        r = self.post(_host_form(opt__vcpus="lots", opt__bootstrap_template="auto",
+                                 api_key="th-TYPED-SECRET"), status=400)
+        body = r.text
+        self.assertIn("is not a whole number", body)
+        self.assertIn('name="opt__vcpus" value="lots"', body)
+        self.assertIn('name="host" value="gpu-a"', body)
+        self.assertRegex(body, r'<option value="h100" selected>')
+        self.assertRegex(body, r'<option value="" selected>auto</option>')
+        self.assertNotIn("th-TYPED-SECRET", body)                # never echoed
+        self.assertNotIn("<main data-live", body)               # a refused form is static
+        self.assertEqual(self.saved_hosts, [])
+
+
+class HostSaveMain(_HostSaveBase):
+    """The same form against main's real save (store + refusal rules)."""
+
+    def setUp(self):
+        super().setUp()
+        saved = (main.backends, main.hosts_meta, dict(main.managed_hosts))
+        self.addCleanup(lambda: (setattr(main, "backends", saved[0]),
+                                 setattr(main, "hosts_meta", saved[1]),
+                                 main.managed_hosts.clear(),
+                                 main.managed_hosts.update(saved[2])))
+        applied = []
+        self.addCleanup(setattr, main, "apply_managed_hosts", main.apply_managed_hosts)
+        main.apply_managed_hosts = lambda: applied.append(1)
+        for k, v in {"_save_managed_host": main.save_managed_host,
+                     "_delete_managed_host": main.delete_managed_host,
+                     "_managed_host_delete_refusal": main.managed_host_delete_refusal}.items():
+            self.addCleanup(setattr, admin, k, getattr(admin, k))
+            setattr(admin, k, v)
+        main.backends = [{"name": "k12box", "type": "comfyui", "url": "http://k12:8188"}]
+
+    def raw(self):
+        import sqlite3
+        with sqlite3.connect(store._DB_PATH) as c:
+            row = c.execute("SELECT value_json FROM settings WHERE key='managed_hosts'").fetchone()
+        return "" if row is None else row[0]
+
+    def test_create_stores_normalized_options_and_an_encrypted_token(self):
+        self.post(_host_form(opt__bootstrap_template="auto", api_key="th-SECRET-9"))
+        e = store.get_managed_hosts()["gpu-a"]
+        self.assertEqual(e["provider"], "thunder")
+        self.assertEqual(e["api_key"], "th-SECRET-9")
+        self.assertEqual((e["options"]["vcpus"], e["options"]["bootstrap_template"]), (16, ""))
+        self.assertEqual(e["options"]["nodes"], ["registry:y@2"])
+        self.assertNotIn("th-SECRET-9", self.raw())              # R-W10: encrypted at rest
+
+    def test_collisions_are_refused_as_typed(self):
+        # R-W6: an URL hostname without a dot names a host too
+        r = self.post(_host_form(name="k12"), status=400)
+        self.assertIn("already runs on a host named", r.text)
+        self.assertIn('name="host" value="k12"', r.text)
+        store.set_host("box7", {"label": "Box 7"})
+        r = self.post(_host_form(name="box7"), status=400)
+        self.assertIn("already a host in the Hosts list", r.text)
+        self.post(_host_form(name="gpu-a"))
+        r = self.post(_host_form(name="gpu-a"), status=400)
+        self.assertIn("already exists", r.text)
+        r = self.post(_host_form(name="Bad_Name"), status=400)
+        self.assertIn("a-z, 0-9", r.text)
+        r = self.post(_host_form(name="gpu-b", opt__comfy_commit="master"), status=400)
+        self.assertIn("40-hex", r.text)
+        self.assertIn('name="opt__comfy_commit" value="master"', r.text)
+        r = self.post(_host_form(name="gpu-c", provider="runpod"), status=400)
+        self.assertIn("unknown provider", r.text)
+        self.assertEqual(sorted(store.get_managed_hosts()), ["gpu-a"])
+
+    def test_provider_cannot_change(self):
+        self.post(_host_form())
+        r = self.post(_host_form(new=False, provider="runpod"), status=400)
+        self.assertIn("unknown provider", r.text)
+        self.assertEqual(store.get_managed_hosts()["gpu-a"]["provider"], "thunder")
+
+    def test_blank_token_keeps_the_stored_one(self):
+        self.post(_host_form(api_key="th-OLD"))
+        self.post(_host_form(new=False, opt__vcpus="32"))
+        e = store.get_managed_hosts()["gpu-a"]
+        self.assertEqual((e["api_key"], e["options"]["vcpus"]), ("th-OLD", 32))
+        self.post(_host_form(new=False, api_key_clear="1"))
+        self.assertEqual(store.get_managed_hosts()["gpu-a"]["api_key"], "")
+
+
+class HostDelete(Actions):
+    def delete(self, name, status=303):
+        r = self.c.post(f"/ui/hosts/managed/delete?host={name}", headers=SAME,
+                        follow_redirects=False)
+        self.assertEqual(r.status_code, status, r.text[-800:])
+        return r
+
+    def test_delete_only_when_main_allows_it(self):
+        self.views = {"tc": _view(phase="off")}
+        html = self.page()
+        m = re.search(r'<button[^>]*formaction="/ui/hosts/managed/delete\?host=tc"[^>]*>', html)
+        self.assertIsNotNone(m)
+        self.assertIn("data-confirm=", m.group(0))
+        r = self.delete("tc")
+        self.assertIn("deleted", parse_qs(urlparse(r.headers["location"]).query)["msg"][0])
+        self.assertEqual(self.deleted_hosts, ["tc"])
+        # refused (running, a backend still names it …): no button, and a POST is a 400
+        # naming the reason — nothing deleted
+        self.delete_refusals["tc"] = "tc is ready — stop it first; only an off host can be deleted"
+        self.views = {"tc": _view(phase="ready", uuid="u1")}
+        self.assertNotIn("/ui/hosts/managed/delete?", self.page())
+        r = self.delete("tc", status=400)
+        self.assertIn("stop it first", r.text)
+        self.assertNotIn("<main data-live", r.text)
+        self.assertEqual(self.deleted_hosts, ["tc"])
+
+    def test_off_host_says_why_it_cannot_be_deleted(self):
+        self.delete_refusals["tc"] = ("backends still name tc as their host (comfyui:tc) — "
+                                      "move or delete them first")
+        self.views = {"tc": _view(phase="off")}
+        self.assertIn("move or delete them first", self.page())
+
+
+class HostDeleteMain(HostDelete):
+    """main's real rule behind the button (R-W5), incl. the undriven host."""
+
+    def setUp(self):
+        super().setUp()
+        saved = (main.backends, dict(main.managed_hosts), dict(main.host_controllers))
+        self.addCleanup(lambda: (setattr(main, "backends", saved[0]),
+                                 main.managed_hosts.clear(), main.managed_hosts.update(saved[1]),
+                                 main.host_controllers.clear(),
+                                 main.host_controllers.update(saved[2])))
+        self.addCleanup(setattr, main, "apply_managed_hosts", main.apply_managed_hosts)
+        main.apply_managed_hosts = lambda: None
+        main.backends = []
+        main.host_controllers.clear()
+        for k, v in {"_delete_managed_host": main.delete_managed_host,
+                     "_managed_host_delete_refusal": main.managed_host_delete_refusal}.items():
+            self.addCleanup(setattr, admin, k, getattr(admin, k))
+            setattr(admin, k, v)
+
+    def test_delete_only_when_main_allows_it(self):
+        store.set_managed_host("tc", {"provider": "thunder", "options": {}, "api_key": ""})
+        main.backends = [{"name": "tc", "type": "comfyui", "url": "http://127.0.0.1:18100",
+                          "host": "tc"}]
+        self.views = {"tc": _view(phase="off")}
+        self.assertNotIn("/ui/hosts/managed/delete?", self.page())
+        r = self.delete("tc", status=400)
+        self.assertIn("move or delete them first", r.text)
+        main.backends = []
+        self.assertIn("/ui/hosts/managed/delete?host=tc", self.page())
+        self.delete("tc")
+        self.assertNotIn("tc", store.get_managed_hosts())
+
+    def test_undriven_host_with_a_live_record_is_kept(self):
+        # an unknown provider (never driven): its stored record is the only pointer to
+        # an instance that may still bill
+        store.set_managed_host("pod", {"provider": "runpod", "options": {}, "api_key": ""})
+        store.set_settings({"host_state": {"pod": {"phase": "ready", "uuid": "u-1"}}})
+        self.views = {"pod": _view(name="pod", provider="runpod", phase="off",
+                                   error="unknown provider 'runpod'")}
+        self.assertNotIn("/ui/hosts/managed/delete?", self.page())
+        r = self.delete("pod", status=400)
+        self.assertIn("not driven", r.text)
+        self.assertIn("pod", store.get_managed_hosts())
+        store.set_settings({"host_state": {"pod": {"phase": "off"}}})
+        self.delete("pod")
+        self.assertNotIn("pod", store.get_managed_hosts())
+
+    def test_off_host_says_why_it_cannot_be_deleted(self):
+        store.set_managed_host("tc", {"provider": "thunder", "options": {}, "api_key": ""})
+        main.backends = [{"name": "tc", "type": "comfyui", "host": "tc"}]
+        self.views = {"tc": _view(phase="off")}
+        self.assertIn("move or delete them first", self.page())
+
+
+class ServiceTable(_Base):
+    """The card's service table: every attached backend with its ports, status and
+    error, Restart / Re-run setup per SERVICE (POST with the backend id)."""
+
+    def row(self, html, bid):
+        m = re.search(rf'<tr data-k="host-tc-svc-{re.escape(bid)}">(.*?)</tr>', html, re.S)
+        self.assertIsNotNone(m, bid)
+        return m.group(1)
+
+    def test_rows_with_ports_status_error_and_buttons(self):
+        self.views = {"tc": _view(phase="ready", uuid="u1", services=_svcs(**{
+            "openai:vllm": {"name": "vllm", "type": "openai", "local_port": 18101,
+                            "remote_port": 8000, "status": "setup failed",
+                            "error": "setup rc 1: <pip> died"}}))}
+        html = self.page()
+        c = self.row(html, "comfyui:tc")
+        self.assertIn("8188", c)
+        self.assertIn("18100", c)
+        self.assertIn('<span class="badge ok">up</span>', c)
+        v = self.row(html, "openai:vllm")
+        self.assertIn("8000", v)
+        self.assertIn("18101", v)
+        self.assertIn("setup failed", v)
+        self.assertIn("setup rc 1: &lt;pip&gt; died", v)
+        self.assertNotIn("<pip>", html)
+        for p in ("restart-service", "resetup"):
+            self.assertRegex(v, rf'formaction="/ui/hosts/managed/{p}\?host=tc&amp;'
+                                r'bid=openai%3Avllm"')
+        m = re.search(r'<main[^>]*>(.*)</main>', html, re.S)
+        self.assertNotIn("<script", m.group(1))
+
+    def test_no_buttons_without_a_running_instance(self):
+        self.views = {"tc": _view(phase="off", services=_svcs())}
+        html = self.page()
+        self.row(html, "comfyui:tc")
+        self.assertNotIn("restart-service", html)
+        self.assertNotIn("/ui/hosts/managed/resetup", html)
+
+    def test_drain_per_service_and_not_attachable(self):
+        self.views = {"tc": _view(
+            phase="draining", op="stopping", uuid="u1", services=_svcs(),
+            waiting_jobs={"comfyui:tc": 3},
+            not_attachable=[{"bid": "openai:cfg",
+                             "reason": "config-defined backend — create it in the console"}])}
+        html = self.page()
+        self.assertIn("3 jobs waiting", self.row(html, "comfyui:tc"))
+        na = re.search(r'<p[^>]*data-k="host-tc-na-openai:cfg">.*?</p>', html, re.S).group(0)
+        self.assertIn("not attachable", na)
+        self.assertIn("create it in the console", na)
+
+    def test_host_without_services_says_how_to_attach(self):
+        self.views = {"tc": _view()}
+        self.assertIn("No backend attached", self.page())
+
+
+class HostsPanel(_Base):
+    def test_every_managed_host_is_listed_also_without_comfyui(self):
+        # spec: "_hosts_panel zeigt jeden gesteuerten Host, auch ohne ComfyUI-Dienst"
+        self.live = [{"name": "vllm", "type": "openai", "url": "http://127.0.0.1:18101",
+                      "host": "vm2", "enabled": True, "healthy": True, "models": 1,
+                      "source": "ui"}]
+        self.views = {"vm2": _view(name="vm2"), "vm3": _view(name="vm3")}
+        html = self.page()
+        panel = html[html.index("Hosts · GPU policy"):]
+        self.assertIn("vm2", panel)
+        self.assertIn("vllm (openai)", panel)
+        self.assertIn("vm3", panel)
+        self.assertIn("no backend attached", panel)
+        self.assertIn('href="/ui/backends?mhost=vm2"', panel)
 
 
 if __name__ == "__main__":

@@ -32,6 +32,7 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Resp
 
 import adapters
 import cloudtask
+import hostapi
 import jobs
 import scheduler
 import reasoning
@@ -181,38 +182,42 @@ _voice_dir_ok: Callable[[str], bool] = lambda d: True
 _apply_hosts: Callable[[], None] = lambda: None           # refresh main's hosts_meta cache
 # ComfyUI backend name → sorted installed LoRA filenames (discovery, verbatim).
 _backend_loras: Callable[[], dict] = lambda: {}
-# Thunder Compute backends (main.host_controllers via the Thunder shim): names, a controller's view()
-# (None = no such controller) and the async console action (name, action) → message.
-_thunder_names: Callable[[], list] = lambda: []
-_thunder_view: Callable[[str], Optional[dict]] = lambda name: None
-_thunder_action: Callable = None
+# Managed hosts (main.host_*): the names the console shows, a host's view (the
+# controller's view + options/api_key_set/managed/not_attachable; None = no such host)
+# and the async console action (name, action, bid=None, paths=None) → message — always
+# text, a refusal included. Save/delete answer the refusal ("" = done); the delete
+# refusal alone decides whether the card offers Delete.
+_host_names: Callable[[], list] = lambda: []
+_host_view: Callable[[str], Optional[dict]] = lambda name: None
+_host_action: Callable = None
+_save_managed_host: Callable = None                 # (name, entry, new) → refusal
+_delete_managed_host: Callable = None               # (name) → refusal
+_managed_host_delete_refusal: Callable[[str], Optional[str]] = \
+    lambda name: "managed hosts are not available"
+# [(name, view)] of hosts up for more than 24 h — in memory only (the Dashboard polls
+# it every 4 s; main.host_view would read the store per alias).
+_host_longrun: Callable[[], list] = lambda: []
 # The default custom-node list (ops/thunder-nodes.default.txt) — what a NEW Thunder
-# block's nodes textarea is pre-filled with.
+# host's nodes textarea is pre-filled with.
 _thunder_default_nodes: Callable[[], str] = lambda: ""
-# Model sync (Task 13): "Sync now" and "delete unknown files" — async (name[, paths]) →
-# the message the Backends tab shows — and the catalog setting: the current list, and a
-# save that answers the validator's refusals ([] = saved).
-_thunder_sync_now: Callable = None
-_thunder_delete_unknown: Callable = None
+# The model-sync catalog setting: the current list, and a save that answers the
+# validator's refusals ([] = saved).
 _modelsync_catalog: Callable[[], list] = lambda: []
-# The LAN model source (Task 15, main.modelsrc*): its view (hostctl.LanSource.view —
-# no network), "Fetch host key" (async → message) and "Confirm fingerprint" (async
-# (fingerprint) → message).
-_thunder_modelsrc_view: Callable[[], Optional[dict]] = lambda: None
-_thunder_modelsrc_scan: Callable = None
-_thunder_modelsrc_pin: Callable = None
 _save_modelsync_catalog: Callable[[list], list] = lambda cat: ["catalog store not available"]
-# Task 16: the LAN share's host (save → refusal text, "" = saved), the HF token (save →
+# The LAN model source (main.modelsrc*): its view (hostctl.LanSource.view — no
+# network), "Fetch host key" (async → message) and "Confirm fingerprint" (async
+# (fingerprint) → message).
+_modelsrc_view: Callable[[], Optional[dict]] = lambda: None
+_modelsrc_scan: Callable = None
+_modelsrc_pin: Callable = None
+# The LAN share's host (save → refusal text, "" = saved), the HF token (save →
 # refusal, "" = saved; "" as the value removes it — the console never shows it, only
-# whether one is set) and the `aihub-` snapshots no Thunder backend owns (from the
+# whether one is set) and the `aihub-` snapshots no managed host owns (from the
 # controllers' caches — no API call per render).
 _save_modelsrc_host: Callable = None
 _save_hf_token: Callable = None
 _hf_token_set: Callable[[], bool] = lambda: False
 _thunder_orphan_snapshots: Callable[[], list] = lambda: []
-# [(name, view)] of Thunder controllers up for more than 24 h — in memory only (the
-# Dashboard polls it every 4 s; main.thunder_view would read the store per alias).
-_thunder_longrun: Callable[[], list] = lambda: []
 
 
 def bind(**overrides) -> None:
@@ -403,7 +408,7 @@ details.optblock{border:1px solid var(--line);border-radius:8px;padding:6px 10px
 details.optblock>summary{cursor:pointer;user-select:none;font-size:12px;color:var(--dim-2);padding:2px 0}
 details.optblock>summary:hover{color:var(--text-2)}
 details.optblock[open]>summary{margin-bottom:8px;border-bottom:1px solid #1c2129;padding-bottom:6px}
-/* Thunder Compute: the backend form's optional block and the Backends-tab lifecycle card */
+/* Managed hosts: the Backends-tab lifecycle card (and, until the backend form drops it, the old Thunder block) */
 fieldset.tblock{border:1px solid var(--line);border-radius:8px;padding:6px 10px;margin:14px 0 12px}
 fieldset.tblock>legend{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--dim-2);font-weight:600;padding:0 4px}
 .tcard{background:var(--row);border:1px solid var(--line);border-radius:10px;padding:10px 14px;margin:8px 0 12px}
@@ -913,10 +918,14 @@ def _field(label: str, control: str, short: bool = False, wide: bool = False,
 _POST_ACTIONS = frozenset((
     "/ui/backends/delete", "/ui/backends/drain", "/ui/backends/undrain",
     "/ui/backends/restart", "/ui/backends/enable",
-    "/ui/thunder/start", "/ui/thunder/stop", "/ui/thunder/restart", "/ui/thunder/forget",
-    "/ui/thunder/sync", "/ui/thunder/delete-unknown", "/ui/thunder/catalog",
-    "/ui/thunder/modelsrc-scan", "/ui/thunder/modelsrc-pin", "/ui/thunder/modelsrc-host",
-    "/ui/thunder/hf-token",
+    # managed hosts (Ruling M1: one prefix, the host as field `host`, a service as `bid`)
+    "/ui/hosts/managed/save", "/ui/hosts/managed/delete",
+    "/ui/hosts/managed/start", "/ui/hosts/managed/stop", "/ui/hosts/managed/forget",
+    "/ui/hosts/managed/restart-service", "/ui/hosts/managed/resetup",
+    "/ui/hosts/managed/sync", "/ui/hosts/managed/delete-unknown",
+    "/ui/hosts/managed/catalog", "/ui/hosts/managed/hf-token",
+    "/ui/hosts/managed/modelsrc-scan", "/ui/hosts/managed/modelsrc-pin",
+    "/ui/hosts/managed/modelsrc-host",
     "/ui/chat/badd", "/ui/chat/bdel", "/ui/chat/delete",
     "/ui/mapping/field-add", "/ui/mapping/field-map", "/ui/mapping/field-clear",
     "/ui/mapping/field-del", "/ui/mapping/cand-add", "/ui/mapping/cand-del",
@@ -2193,12 +2202,14 @@ async def backends_page(request: Request):
 async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
                          catalog_refused: Optional[tuple] = None,
                          hf_refused: Optional[str] = None,
-                         modelsrc_refused: Optional[tuple] = None) -> HTMLResponse:
+                         modelsrc_refused: Optional[tuple] = None,
+                         notice: Optional[str] = None) -> HTMLResponse:
     """The Backends tab; `detail` replaces the right column (a refused Save, re-rendered
     — then never live: the page's URL is the POST action, which a GET poll cannot fetch).
     `catalog_refused` = (text, reasons) of a refused model-sync catalog Save, likewise;
     `hf_refused` = the reason an HF-token Save was refused (the value is never shown),
-    `modelsrc_refused` = (host as typed, reason) of a refused `modelsrc_host` Save."""
+    `modelsrc_refused` = (host as typed, reason) of a refused `modelsrc_host` Save,
+    `notice` = why a POST action was refused (a managed-host delete), shown on top."""
     edit_id = qp.get("edit", "")
     # Captured NOW: every branch below assigns `detail`, so testing it at the end made
     # the tab never live — drain, scan and a running Thunder instance all froze.
@@ -2207,7 +2218,8 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
     # select's handler set (switch to comfyui, and 3 s later its panes vanish).
     static = (detail is not None or catalog_refused is not None or bool(edit_id)
               or hf_refused is not None or modelsrc_refused is not None
-              or bool(qp.get("new")) or bool(qp.get("host")))
+              or notice is not None or bool(qp.get("new")) or bool(qp.get("host"))
+              or bool(qp.get("mhost")) or bool(qp.get("mhost_new")))
     binfo = _gateway_info().get("backends", [])
     # editable from either source: store (full dict incl. api_key) or the live summary (config)
     editing = None
@@ -2299,21 +2311,23 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
             items += f'<div class="grouphdr">{label}</div>' + "".join(render(b) for b in group)
     items = items or "<p class='muted'>No backends.</p>"
     scan_st = _scan_status()
-    tviews = _thunder_views()
-    # what a console action answered (the Thunder buttons redirect here with it) — a
+    tviews = _host_views()
+    # what a console action answered (the host buttons redirect here with it) — a
     # refusal raised before the op's first await only ever shows up here
     msg = (qp.get("msg", "") or "")[:600]
     msg_html = (f'<p class="hint" role="status" data-k="backends-msg"><b>{_esc(msg)}</b></p>'
                 if msg else "")
+    if notice:
+        msg_html += f'<p class="bad" role="alert" data-k="backends-notice">{_esc(notice[:600])}</p>'
     list_html = (f'<div class="bar"><h2>Backends</h2>{_btn("+ New", "/ui/backends?new=1")}'
                  f'<form action="/ui/backends/scan" method="post" style="display:inline">'
                  f'{_btn("Scan network", kind="secondary", submit=True)}</form></div>'
                  + msg_html
-                 + _thunder_panel(tviews, binfo, catalog_refused, hf_refused,
-                                  modelsrc_refused)
                  + f"<p class='hint'>Edit a backend to manage it here (editing a config one creates an "
                  f"editable copy that overrides it).</p>{items}"
-                 + _hosts_panel(binfo, qp.get("host", ""))
+                 + _managed_hosts_section(tviews, catalog_refused, hf_refused,
+                                          modelsrc_refused)
+                 + _hosts_panel(binfo, qp.get("host", ""), tviews)
                  + _scan_panel(scan_st))
     hosts = sorted({b["host"] for b in binfo if b.get("host")})
     edit_host = qp.get("host", "")
@@ -2323,6 +2337,10 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
         prefill = ({"name": qp.get("name", ""), "type": qp.get("type", "openai"), "url": qp.get("url", "")}
                    if (not editing and qp.get("url")) else None)
         detail = _backend_form(editing, hosts, prefill=prefill)
+    elif qp.get("mhost_new"):
+        detail = _managed_host_form(new=True, provider=qp.get("provider", ""))
+    elif qp.get("mhost"):
+        detail = _managed_host_form(qp.get("mhost", ""), new=False)
     elif edit_host:
         detail = _host_form(edit_host, shared=_host_is_shared([b for b in binfo if b.get("host") == edit_host]))
     else:
@@ -2331,10 +2349,10 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
     body = (f'<div class="cols"><div class="col">{list_html}</div>'
             f'<div class="col">{detail}</div></div>')
     draining_now = any(b.get("draining") for b in binfo)      # watch the count drain → offline
-    # a Thunder instance that is not off (or an op in flight — a start is still `off`
-    # until its create) changes phase on its own: the card must follow it
-    thunder_busy = any(v.get("phase") != "off" or v.get("op") for _n, v in tviews)
-    live = 4 if draining_now else (2 if scan_st.get("running") else (3 if thunder_busy else None))
+    # a managed host that is not off (or an op in flight — a start is still `off` until
+    # its create) changes phase on its own: the card must follow it
+    host_busy = any(v.get("phase") != "off" or v.get("op") for _n, v in tviews)
+    live = 4 if draining_now else (2 if scan_st.get("running") else (3 if host_busy else None))
     return HTMLResponse(_page("Backends", body, "backends", refresh=None if static else live),
                         status_code=status)
 
@@ -2398,9 +2416,11 @@ async def backend_scan(request: Request):
     return RedirectResponse("/ui/backends", status_code=303)
 
 
-def _hosts_panel(binfo: list, sel_host: str) -> str:
+def _hosts_panel(binfo: list, sel_host: str, managed: Optional[list] = None) -> str:
     """Physical-box grouping under the backend list: one row per host that has a
-    ComfyUI backend, with its member backends. Membership is edited on the backend
+    ComfyUI backend, and one per MANAGED host (`managed` = [(name, view)]) whatever it
+    carries — also a vLLM-only one, or one with nothing attached yet —, with its member
+    backends. Membership is edited on the backend
     (its `host` field or the URL IP); this panel edits the per-host extras — a label
     and the GPU policy flags (docs/host-coordination-plan.md).
 
@@ -2417,16 +2437,26 @@ def _hosts_panel(binfo: list, sel_host: str) -> str:
 
     def has_comfy(members: list) -> bool:
         return any(b.get("type") == "comfyui" for b in members)
-    listed = [h for h, members in by_host.items() if has_comfy(members) or meta.get(h)]
+    mviews = {n: v for n, v in (managed or []) if isinstance(v, dict)}
+    listed = {h for h, members in by_host.items() if has_comfy(members) or meta.get(h)}
+    listed |= set(mviews)
     if not listed:
         return ""
     rows = ""
     for h in sorted(listed):
         hm = meta.get(h) or {}
         label = hm.get("label", "")
-        members = " · ".join(f"{b['name']} ({b['type']})" for b in by_host[h])
-        shared = _host_is_shared(by_host[h])
+        mem = by_host.get(h, [])
+        members = (" · ".join(f"{b['name']} ({b['type']})" for b in mem)
+                   or "no backend attached")
+        shared = _host_is_shared(mem)
         tag = _badge("shared", "warn", "an LLM and a ComfyUI backend share this box (and its GPU/VRAM)") if shared else ""
+        mv = mviews.get(h)
+        if mv is not None:
+            ph = str(mv.get("phase") or "off")
+            tag = (_badge(f"managed · {_provider_name(mv.get('provider'))}", "muted",
+                          "a managed host — its card is above")
+                   + " " + _badge(ph, _HOST_PHASE_KIND.get(ph, "warn")) + (" " + tag if tag else ""))
         # badges mark EXPLICIT non-default values only — the defaults come from the
         # same table the request path reads (scheduler.HOST_FLAGS)
         def non_default(key: str) -> bool:
@@ -2444,13 +2474,17 @@ def _hosts_panel(binfo: list, sel_host: str) -> str:
         if non_default("llm_unload_before_media"):
             tag += " " + _badge("unload-llm", "warn",
                                 "this host's LLMs are unloaded before each media job")
-        acts = _icon_acts(("✎", f"/ui/backends?host={quote(h)}", "secondary", "Edit host"))
+        specs = [("✎", f"/ui/backends?host={quote(h)}", "secondary", "Edit host")]
+        if mv is not None:
+            specs.append(("⚙", f"/ui/backends?mhost={_q(h)}", "secondary",
+                          "Managed host settings (provider options, API token)"))
+        acts = _icon_acts(*specs)
         title = f"{_esc(h)}{(' — ' + _esc(label)) if label else ''} {tag}"
         rows += _item(title, members, acts, sel=(h == sel_host))
     return ('<div class="grouphdr" style="margin-top:18px">Hosts · GPU policy</div>'
-            "<p class='hint' style='margin:2px 0 6px'>Every box with a ComfyUI backend: who may use "
-            "its VRAM and when it is freed. The LLM policies matter only where an LLM shares the "
-            f"same GPU (badge <b>shared</b>).</p>{rows}")
+            "<p class='hint' style='margin:2px 0 6px'>Every box with a ComfyUI backend, and every "
+            "managed host: who may use its VRAM and when it is freed. The LLM policies matter "
+            f"only where an LLM shares the same GPU (badge <b>shared</b>).</p>{rows}")
 
 
 def _host_is_shared(members: list) -> bool:
@@ -3034,23 +3068,31 @@ async def backend_enable(request: Request):
     return RedirectResponse("/ui/backends", status_code=303)
 
 
-# ── Thunder Compute: lifecycle panel + actions ──────────────────────────────────
+# ── Managed hosts: form, lifecycle card with its service table, actions ─────────
 
-_THUNDER_LOG_LINES = 200                     # = hostctl._LOG_MAX: the whole ring
-_THUNDER_PHASE_KIND = {"off": "muted", "ready": "ok", "failed": "bad", "draining": "warn",
-                       "pruning": "warn", "snapshotting": "warn", "deleting": "warn"}
+_HOST_LOG_LINES = 200                        # = hostctl._LOG_MAX: the whole ring
+_HOST_PHASE_KIND = {"off": "muted", "ready": "ok", "failed": "bad", "draining": "warn",
+                    "pruning": "warn", "snapshotting": "warn", "deleting": "warn"}
+_SVC_STATUS_KIND = {"up": "ok", "starting": "warn", "setup failed": "bad"}
 
 
-def _thunder_views() -> list:
-    """[(name, view)] of every Thunder controller main holds — a controller whose
-    backend row is gone still shows (its instance may still bill). A view that raises
-    is skipped rather than taking the whole Backends tab down."""
+def _provider_name(kind) -> str:
+    """The display NAME of a provider kind (hostapi.PROVIDERS), else the kind itself —
+    an unknown provider is shown as what the entry says, never hidden."""
+    p = hostapi.provider(kind)
+    return str(getattr(p[0], "NAME", kind)) if p else str(kind or "?")
+
+
+def _host_views() -> list:
+    """[(name, view)] of every managed host main knows — a controller whose entry is
+    gone still shows (its instance may still bill). A view that raises is skipped
+    rather than taking the whole Backends tab down."""
     out = []
-    for n in sorted(_thunder_names() or [], key=lambda x: str(x).lower()):
+    for n in sorted(_host_names() or [], key=lambda x: str(x).lower()):
         try:
-            v = _thunder_view(n)
+            v = _host_view(n)
         except Exception as e:                          # noqa: BLE001 — a card, not the tab
-            logger.warning(f"ui: thunder view {n!r} failed: {type(e).__name__}: {e}")
+            logger.warning(f"ui: host view {n!r} failed: {type(e).__name__}: {e}")
             continue
         if isinstance(v, dict):
             out.append((n, v))
@@ -3077,7 +3119,7 @@ def _hms(s) -> str:
     return f"{s // 3600}h {s % 3600 // 60:02d}m" if s >= 3600 else f"{s // 60}m {s % 60:02d}s"
 
 
-# ── Thunder: the model-sync half of the card (hostctl.Controller._plan_view) ──
+# ── the model-sync half of the card (hostctl.Controller._plan_view) ──────────
 # The view is the controller's in-memory report; every reader below tolerates a missing
 # or odd field (the card must never take the Backends tab down). Sizes are decimal GB,
 # the unit of the 503 texts (modelsync.status_text), so both say the same number.
@@ -3147,8 +3189,8 @@ def _sync_files_row(alias: str, files) -> str:
             f"<th>size</th><th>needed by</th><th></th></tr>{rows}</table></details></td></tr>")
 
 
-def _thunder_sync(k: str, name: str, v: dict) -> str:
-    """Model sync of one Thunder backend: per alias need/have/missing and status, the
+def _host_sync(k: str, name: str, v: dict) -> str:
+    """Model sync of one managed host's ComfyUI: per alias need/have/missing and status, the
     transfers, what the stop will delete, the held and the unknown files."""
     p = v.get("plan") if isinstance(v.get("plan"), dict) else None
     phase = str(v.get("phase") or "off")
@@ -3236,8 +3278,8 @@ def _thunder_sync(k: str, name: str, v: dict) -> str:
         out.append(
             f'<details data-k="{_esc(k)}-unknown-sync"><summary>unknown files on the instance: {n}, '
             f"{_gb1(ub)} GB (never deleted automatically)</summary>"
-            '<form method="post" action="/ui/thunder/delete-unknown">'
-            f'<input type="hidden" name="name" value="{_esc(name)}">'
+            '<form method="post" action="/ui/hosts/managed/delete-unknown">'
+            f'<input type="hidden" name="host" value="{_esc(name)}">'
             f"<table><tr><th>file</th><th>size</th></tr>{ur}</table>"
             f'<button type="submit" class="btn danger sm" '
             f'data-confirm="{_esc(confirm)}" '
@@ -3246,30 +3288,79 @@ def _thunder_sync(k: str, name: str, v: dict) -> str:
     return "".join(out)
 
 
-def _thunder_longrun_text(name: str, v: dict) -> str:
+def _host_longrun_text(name: str, v: dict) -> str:
     """The cost guard's words (spec "Kosten-Wächter"), one text for the card and the
-    Dashboard: whole hours up and the session's cost so far — "cost unknown" before the
-    price list arrived, never a made-up figure."""
+    Dashboard: the provider (where the bill comes from), whole hours up and the
+    session's cost so far — "cost unknown" before the price list arrived, never a
+    made-up figure."""
     h = _nbytes(v.get("uptime_s")) // 3600
     cost = v.get("session_cost")
     tail = (f"(≈ {_money(cost)})" if cost is not None
             else "(cost unknown — no price list yet)")
-    return f"Thunder {name} running for {h} h {tail}"
+    return f"{_provider_name(v.get('provider'))} host {name} running for {h} h {tail}"
 
 
-def _thunder_card(name: str, v: dict, cfg: Optional[dict]) -> str:
-    """One Thunder backend's lifecycle card. Every row carries a `data-k` (the live
-    morph matches by key), and nothing here needs a script."""
-    k = f"thunder-{name}"
+def _svc_table(k: str, name: str, v: dict) -> str:
+    """The card's service table: one row per attached backend — ports (VM / local end of
+    the tunnel), status, last error, and Restart / Re-run setup, which carry the BACKEND
+    id (a host runs several services; the host alone names none of them). The buttons
+    mirror the controller's refusals: only on a running instance with no op in flight.
+    While a stop drains, each row says how many jobs it still waits for."""
+    svcs = v.get("services") if isinstance(v.get("services"), dict) else {}
     phase, op = str(v.get("phase") or "off"), v.get("op")
-    head = (f"<b>{_esc(name)}</b> "
-            + _badge(phase + (f" ({v['failed_phase']})" if phase == "failed" and v.get("failed_phase")
-                              else ""), _THUNDER_PHASE_KIND.get(phase, "warn"))
+    running = phase in _SYNC_PHASES and not op and bool(v.get("uuid"))
+    wj = v.get("waiting_jobs") if isinstance(v.get("waiting_jobs"), dict) else {}
+    rows = ""
+    for bid in sorted(svcs, key=lambda x: str(x).lower()):
+        s = svcs[bid] if isinstance(svcs[bid], dict) else {}
+        st = str(s.get("status") or "down")
+        kind = _SVC_STATUS_KIND.get(st, "bad" if phase in _SYNC_PHASES else "muted")
+        status = _badge(st, kind)
+        if bid in wj:
+            n = _nbytes(wj[bid])
+            status += f" ⏳ {n} job{'s' if n != 1 else ''} waiting"
+        rp, lp = s.get("remote_port"), s.get("local_port")
+        ports = (f"VM :{_esc(rp) if rp is not None else '?'} → "
+                 f"local :{_esc(lp) if lp is not None else '?'}")
+        acts = ""
+        if running:
+            qs = f"host={_q(name)}&bid={_q(bid)}"
+            acts = (_btn("Restart", f"/ui/hosts/managed/restart-service?{qs}", "secondary",
+                         sm=True, title=f"Restart {bid} on the running instance")
+                    + _btn("Re-run setup", f"/ui/hosts/managed/resetup?{qs}", "secondary",
+                           sm=True, title="Run this service's setup again (whatever its hash "
+                                          "says), then restart it"))
+        rows += (f'<tr data-k="{_esc(k)}-svc-{_esc(bid)}"><td>{_esc(s.get("name") or bid)}</td>'
+                 f"<td>{_type_badge(s.get('type') or 'openai')}</td><td>{ports}</td>"
+                 f"<td>{status}</td><td>{_esc(s.get('error') or '')}</td><td>{acts}</td></tr>")
+    if not rows:
+        return (f'<p class="hint" data-k="{_esc(k)}-nosvc">No backend attached — set a '
+                f"backend's <b>host</b> to <code>{_esc(name)}</code> to run it here.</p>")
+    return (f'<table data-k="{_esc(k)}-svcs"><tr><th>backend</th><th>type</th>'
+            "<th>port VM → local</th><th>status</th><th>error</th><th></th></tr>"
+            f"{rows}</table>")
+
+
+def _host_card(name: str, v: dict) -> str:
+    """One managed host's lifecycle card: phase, cost, snapshot, the service table, the
+    model sync, the log. Every row carries a `data-k` (the live morph matches by key),
+    and nothing here needs a script."""
+    k = f"host-{name}"
+    phase, op = str(v.get("phase") or "off"), v.get("op")
+    prov = _provider_name(v.get("provider"))
+    head = (f"<b>{_esc(name)}</b> " + _badge(prov, "muted", "managed host — its provider")
+            + " " + _badge(phase + (f" ({v['failed_phase']})" if phase == "failed"
+                                    and v.get("failed_phase") else ""),
+                           _HOST_PHASE_KIND.get(phase, "warn"))
             + (" " + _badge(f"⏳ {op}", "warn", "operation in flight") if op else ""))
     rows = [f'<div class="item-title" data-k="{_esc(k)}-head">{head}</div>']
     if v.get("long_running"):
         rows.append(f'<p class="bad" data-k="{_esc(k)}-longrun">⚠ '
-                    f"{_esc(_thunder_longrun_text(name, v))} — stop it if nothing needs it.</p>")
+                    f"{_esc(_host_longrun_text(name, v))} — stop it if nothing needs it.</p>")
+    if v.get("managed") is False:
+        rows.append(f'<p class="bad" data-k="{_esc(k)}-unmanaged">The entry of this host was '
+                    "removed while its instance was not off — the controller is kept until it "
+                    "is stopped.</p>")
     if v.get("error"):
         rows.append(f'<p class="bad" data-k="{_esc(k)}-err">{_esc(v["error"])}</p>')
     if v.get("persist_blocked"):
@@ -3296,7 +3387,7 @@ def _thunder_card(name: str, v: dict, cfg: Optional[dict]) -> str:
             n = _nbytes(wj)
             rows.append(f'<p class="hint" data-k="{_esc(k)}-drain">Draining — waiting for '
                         f"{n} job{'s' if n != 1 else ''} to finish before the snapshot.</p>")
-    t = cfg or {}
+    t = v.get("options") if isinstance(v.get("options"), dict) else {}
     gpu = f"{_esc(t.get('gpu_type') or '?')} ×{_esc(t.get('num_gpus') or 1)}"
     facts = [f"GPU {gpu}", f"{_esc(t.get('vcpus') or '?')} vCPU"]
     if v.get("disk_gb"):
@@ -3308,6 +3399,8 @@ def _thunder_card(name: str, v: dict, cfg: Optional[dict]) -> str:
         facts.append(f"session {_money(v['session_cost'])}")
     if v.get("ip"):
         facts.append(f"{_esc(v['ip'])}:{_esc(v.get('port') or '')}")
+    if not v.get("api_key_set"):
+        facts.append('<span class="bad">no API token</span>')
     rows.append(f'<div class="tfacts" data-k="{_esc(k)}-facts">{" · ".join(facts)}</div>')
     sn = v.get("snapshot") or {}
     if sn.get("id") or sn.get("pending") or sn.get("name"):
@@ -3331,7 +3424,7 @@ def _thunder_card(name: str, v: dict, cfg: Optional[dict]) -> str:
     if uu:
         rows.append(f'<p class="bad" data-k="{_esc(k)}-unrec">Instances seen while the stored '
                     f"state was unreadable: <code>{_esc(', '.join(uu))}</code> — one may be this "
-                    "backend's. Delete them at Thunder by hand, or forget them if they are "
+                    f"host's. Delete them at {_esc(prov)} by hand, or forget them if they are "
                     "not.</p>")
     orph = [o for o in (v.get("orphans") or []) if isinstance(o, dict)]
     if orph:
@@ -3343,8 +3436,9 @@ def _thunder_card(name: str, v: dict, cfg: Optional[dict]) -> str:
             f"<td>{(_money(o['cost_per_h']) + '/h') if o.get('cost_per_h') is not None else '—'}</td>"
             f"<td>{_esc(o.get('created_at') or '')}</td></tr>"
             for i, o in enumerate(orph))
-        rows.append(f'<div data-k="{_esc(k)}-orphans"><p class="bad">Instances on this Thunder '
-                    "account that no backend owns — they bill; never deleted automatically:</p>"
+        rows.append(f'<div data-k="{_esc(k)}-orphans"><p class="bad">Instances on this '
+                    f"{_esc(prov)} account that no host owns — they bill; never deleted "
+                    "automatically:</p>"
                     "<table><tr><th>uuid</th><th>index</th><th>status</th><th>template</th>"
                     f"<th>GPU</th><th>cost</th><th>created</th></tr>{orows}</table></div>")
     unk = v.get("bootstrap_unknown") or {}
@@ -3360,37 +3454,61 @@ def _thunder_card(name: str, v: dict, cfg: Optional[dict]) -> str:
     if tn:
         rows.append(f'<div class="tfacts" data-k="{_esc(k)}-tnodes">Node packs the template '
                     f"brought along: {_esc(', '.join(tn))}</div>")
-    sync = _thunder_sync(k, name, v)
+    rows.append(f'<div data-k="{_esc(k)}-svcblock">{_svc_table(k, name, v)}</div>')
+    for na in (v.get("not_attachable") or []):
+        if not isinstance(na, dict) or not na.get("bid"):
+            continue
+        rows.append(f'<p class="bad" data-k="{_esc(k)}-na-{_esc(na["bid"])}">'
+                    f"<code>{_esc(na['bid'])}</code> names this host but is not attachable "
+                    f"({_esc(na.get('reason') or '')}).</p>")
+    sync = _host_sync(k, name, v)
     if sync:
         rows.append(f'<div class="tsync" data-k="{_esc(k)}-sync">{sync}</div>')
     q = _q(name)
     acts = ""
-    # mirrors the controller's refusals: an op in flight refuses Start and Restart;
-    # `failed` with an instance (uuid or index) refuses Start; Restart needs the uuid
-    if not op and (phase == "off" or (phase == "failed" and not v.get("uuid")
-                                      and not v.get("index"))):
-        acts += _btn("Start", f"/ui/thunder/start?name={q}", sm=True,
-                     confirm=f"Start the Thunder instance {name}? It bills per hour until "
+    # mirrors the controller's refusals: an op in flight refuses Start; `failed` with an
+    # instance (uuid or index) refuses Start; a host that is not driven (an unknown
+    # provider, a broken entry) has no controller to start anything
+    if (not op and not v.get("host_error")
+            and (phase == "off" or (phase == "failed" and not v.get("uuid")
+                                    and not v.get("index")))):
+        acts += _btn("Start", f"/ui/hosts/managed/start?host={q}", sm=True,
+                     confirm=f"Start the {prov} host {name}? It bills per hour until "
                              "you stop it.",
                      title="Create the instance (from the last snapshot) — it bills from now on")
     if phase != "off" or op:
-        acts += _btn("Stop", f"/ui/thunder/stop?name={q}", "danger", sm=True,
+        acts += _btn("Stop", f"/ui/hosts/managed/stop?host={q}", "danger", sm=True,
                      confirm=f"Stop {name}? Running jobs finish first, then the instance is "
                              "snapshotted and deleted.",
-                     title="Drain, snapshot and delete the instance")
-    if phase in ("ready", "failed") and not op and v.get("uuid"):
-        acts += _btn("Restart ComfyUI", f"/ui/thunder/restart?name={q}", "secondary", sm=True,
-                     title="Restart ComfyUI on the running instance")
+                     title="Drain every attached backend, snapshot and delete the instance")
     if phase in _SYNC_PHASES:
-        acts += _btn("Sync now", f"/ui/thunder/sync?name={q}", "secondary", sm=True,
+        acts += _btn("Sync now", f"/ui/hosts/managed/sync?host={q}", "secondary", sm=True,
                      title="Re-plan the model sync now and retry transfers that gave up")
     if uu:
-        acts += _btn("Forget unreconciled", f"/ui/thunder/forget?name={q}", "secondary", sm=True,
+        acts += _btn("Forget unreconciled", f"/ui/hosts/managed/forget?host={q}", "secondary",
+                     sm=True,
                      confirm=f"Forget {', '.join(uu)}? Only if none of them is {name}'s instance "
                              "— a forgotten one of ours bills on unseen.",
-                     title="These instances are not this backend's")
-    rows.append(f'<div class="tacts" data-k="{_esc(k)}-acts">{acts}</div>')
-    log = [str(x) for x in (v.get("log") or [])][-_THUNDER_LOG_LINES:]
+                     title="These instances are not this host's")
+    acts += _btn("Settings", f"/ui/backends?mhost={q}", "secondary", sm=True,
+                 title="Provider options and API token of this host")
+    del_note = ""
+    if phase == "off" and not op:
+        try:
+            why = _managed_host_delete_refusal(name)
+        except Exception as e:                          # noqa: BLE001 — a button, not the tab
+            why = f"delete check failed: {type(e).__name__}"
+        if why:
+            del_note = (f'<p class="hint" data-k="{_esc(k)}-nodel">Delete: '
+                        f"{_esc(why)}</p>")
+        else:
+            acts += _btn("Delete", f"/ui/hosts/managed/delete?host={q}", "danger", sm=True,
+                         confirm=f"Delete the managed host {name}? Its state goes; snapshots "
+                                 "it left behind are listed as foreign and bill on until "
+                                 f"deleted at {prov}.",
+                         title="Remove this host (only while off and no backend names it)")
+    rows.append(f'<div class="tacts" data-k="{_esc(k)}-acts">{acts}</div>{del_note}')
+    log = [str(x) for x in (v.get("log") or [])][-_HOST_LOG_LINES:]
     rows.append(f'<details data-k="{_esc(k)}-log"><summary>log (last {len(log)} lines)</summary>'
                 f'<pre class="tlog">{_esc(chr(10).join(log)) or "—"}</pre></details>')
     return f'<div class="tcard" data-k="{_esc(k)}">{"".join(rows)}</div>'
@@ -3405,7 +3523,7 @@ def _hf_token_form(refused: Optional[str] = None) -> str:
     except Exception as e:                              # noqa: BLE001 — a form, not the tab
         logger.warning(f"ui: HF token state unreadable: {type(e).__name__}: {e}")
         is_set = False
-    return ('<form method="post" action="/ui/thunder/hf-token" data-k="thunder-hftoken" '
+    return ('<form method="post" action="/ui/hosts/managed/hf-token" data-k="hosts-hftoken" '
             'data-guard>' + (_form_err(refused) if refused else "")
             + _field("HF token", _inp("hf_token", "", typ="password",
                                       placeholder=("•••• set — blank keeps it" if is_set
@@ -3418,8 +3536,8 @@ def _hf_token_form(refused: Optional[str] = None) -> str:
 
 
 def _catalog_editor(refused: Optional[tuple] = None, hf_refused: Optional[str] = None) -> str:
-    """The model-sync catalog (setting `modelsync_catalog`, one for every Thunder
-    backend) as a JSON textarea, and the HF token below it. `refused` = (text as typed,
+    """The model-sync catalog (setting `modelsync_catalog`, one for every managed host's
+    ComfyUI) as a JSON textarea, and the HF token below it. `refused` = (text as typed,
     [reasons]): a Save the validator turned down comes back open, with the text exactly
     as typed; `hf_refused` (a refused token Save) opens it too."""
     if refused is not None:
@@ -3435,10 +3553,11 @@ def _catalog_editor(refused: Optional[tuple] = None, hf_refused: Optional[str] =
         n = str(len(cat)) if isinstance(cat, list) else "?"
     err = "".join(_form_err(e) for e in errs[:30])
     opened = refused is not None or hf_refused is not None
-    return (f'<details class="optblock" data-k="thunder-catalog"{" open" if opened else ""}>'
+    return (f'<details class="optblock" data-k="hosts-catalog"{" open" if opened else ""}>'
             f"<summary>Model-sync catalog ({n} entries) and HF token</summary>"
-            '<form method="post" action="/ui/thunder/catalog" data-guard>' + err
-            + "<p class='hint'>What no workflow names, for every Thunder backend. Entries: "
+            '<form method="post" action="/ui/hosts/managed/catalog" data-guard>' + err
+            + "<p class='hint'>What no workflow names, for every managed host's ComfyUI. "
+            "Entries: "
             "<code>{\"match\": {\"class\": …, \"value\": …}, \"paths\": […]}</code> "
             "(a node that loads its own model — a hub id needs class AND value), "
             "<code>{\"match\": {\"alias\": …}, \"paths\": []}</code> (an alias without "
@@ -3467,18 +3586,18 @@ _MODELSRC_INSTALL = (
 
 
 def _modelsrc_block(refused: Optional[tuple] = None) -> str:
-    """The LAN model source (one for every Thunder backend): not set up → the public key
+    """The LAN model source (one for every managed host): not set up → the public key
     and the install command; the host-key pin as two POSTs — "Fetch host key" shows the
     fingerprint (kept in memory only), "Confirm fingerprint" asks with that fingerprint
     and pins it; pinned → the listing's state. Never takes the tab down."""
     try:
-        mv = _thunder_modelsrc_view()
+        mv = _modelsrc_view()
     except Exception as e:                              # noqa: BLE001 — a card, not the tab
         logger.warning(f"ui: LAN source view failed: {type(e).__name__}: {e}")
         return ""
     if not isinstance(mv, dict):
         return ""
-    k = "thunder-modelsrc"
+    k = "hosts-modelsrc"
     host = str(mv.get("host") or "")
     problem = str(mv.get("problem") or "")
     pub = str(mv.get("public_key") or "")
@@ -3490,7 +3609,7 @@ def _modelsrc_block(refused: Optional[tuple] = None) -> str:
             f"<code>{_esc(host)}</code> {badge}</div>"]
     key_html = (f'<pre class="tlog" data-k="{k}-pub">{_esc(pub)}</pre>' if pub else
                 f'<p class="hint" data-k="{k}-nopub">The key <code>modelsrc.key</code> is '
-                "generated when the gateway starts a Thunder controller — reload shortly.</p>")
+                "generated when the gateway starts a host controller — reload shortly.</p>")
     install = (f'<pre class="tlog" data-k="{k}-install">'
                f'{_esc(_MODELSRC_INSTALL.format(pub=pub or "<public key above>"))}</pre>')
     if not pinned and problem and problem != "not configured":
@@ -3521,18 +3640,18 @@ def _modelsrc_block(refused: Optional[tuple] = None) -> str:
                     f"<code>{_esc(host)}</code>: <code>{_esc(fp)}</code> — compare it with "
                     "<code>ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub</code> on the share "
                     "host before confirming.</p>")
-    acts = _btn("Fetch host key", "/ui/thunder/modelsrc-scan", "secondary", sm=True,
+    acts = _btn("Fetch host key", "/ui/hosts/managed/modelsrc-scan", "secondary", sm=True,
                 title="ssh-keyscan the share host and show its fingerprint (nothing is "
                       "trusted yet)")
     if fp:
-        acts += _btn("Confirm fingerprint", f"/ui/thunder/modelsrc-pin?fp={_q(fp)}", sm=True,
+        acts += _btn("Confirm fingerprint", f"/ui/hosts/managed/modelsrc-pin?fp={_q(fp)}", sm=True,
                      confirm=f"Pin {host}'s host key {fp}? Only if the share host shows exactly "
                              "this fingerprint — the gateway then trusts it for every model "
                              "transfer.",
                      title="Trust this host key for the LAN source")
     rows.append(f'<div class="tacts" data-k="{k}-acts">{acts}</div>')
     typed = refused[0] if refused is not None else host
-    rows.append(f'<form method="post" action="/ui/thunder/modelsrc-host" data-k="{k}-hostform" '
+    rows.append(f'<form method="post" action="/ui/hosts/managed/modelsrc-host" data-k="{k}-hostform" '
                 "data-guard>" + (_form_err(refused[1]) if refused is not None else "")
                 + _field("share host", _inp("modelsrc_host", typed,
                                             placeholder="modelsrc@192.168.8.24"),
@@ -3544,7 +3663,7 @@ def _modelsrc_block(refused: Optional[tuple] = None) -> str:
 
 
 def _orphan_snaps_block() -> str:
-    """`aihub-` snapshots no Thunder backend owns (main.thunder_orphan_snapshots, from the
+    """`aihub-` snapshots no managed host owns (main.thunder_orphan_snapshots, from the
     controllers' caches) — display only: a hand-made `aihub-…` snapshot lands here too,
     so nothing on this page can delete one."""
     try:
@@ -3558,148 +3677,299 @@ def _orphan_snaps_block() -> str:
     total = (f"{_money(sum(known))}/month" + (" and more" if len(known) < len(orph) else "")
              if known else "an unknown amount per month")
     trs = "".join(
-        f'<tr data-k="thunder-osnap-{_esc(o.get("id") or o.get("name") or i)}">'
+        f'<tr data-k="hosts-osnap-{_esc(o.get("id") or o.get("name") or i)}">'
         f"<td><code>{_esc(o.get('name') or '')}</code></td><td>{_esc(o.get('status') or '')}</td>"
         f"<td>{('≤ ' + _esc(o['gb']) + ' GB') if o.get('gb') else '?'}</td>"
         f"<td>{(_money(o['monthly']) + '/month') if o.get('monthly') is not None else '—'}</td>"
         "</tr>"
         for i, o in enumerate(orph))
-    return (f'<div data-k="thunder-orphan-snaps"><p class="bad">Snapshots named like this '
-            "gateway's (<code>aihub-…</code>) that no Thunder backend owns — a renamed or "
-            f"deleted backend leaves them behind. They bill {total}; nothing deletes them "
-            "automatically (delete them at Thunder by hand):</p>"
+    return (f'<div data-k="hosts-orphan-snaps"><p class="bad">Snapshots named like this '
+            "gateway's (<code>aihub-…</code>) that no managed host owns — a deleted host "
+            f"leaves them behind. They bill {total}; nothing deletes them "
+            "automatically (delete them at the provider by hand):</p>"
             "<table><tr><th>snapshot</th><th>status</th><th>size</th><th>cost</th></tr>"
             f"{trs}</table></div>")
 
 
-def _thunder_panel(views: list, binfo: list, catalog_refused: Optional[tuple] = None,
-                   hf_refused: Optional[str] = None,
-                   modelsrc_refused: Optional[tuple] = None) -> str:
-    """The Thunder lifecycle cards above the backend list, the orphaned snapshots, the
-    LAN model source and the model-sync catalog + HF token — empty without Thunder
-    (unless a refused catalog/token Save must be shown)."""
-    if (not views and catalog_refused is None and hf_refused is None
-            and modelsrc_refused is None):
-        return ""
-    cfg = {b.get("name"): b.get("thunder") for b in binfo
-           if b.get("type") == "comfyui" and isinstance(b.get("thunder"), dict)}
-    # a card is a MANAGED HOST now (main.host_names): its GPU/vCPU come from the host's
-    # options in its view; the backend-keyed block is the pre-host fallback (Task 7
-    # replaces the card)
-    cards = "".join(_thunder_card(n, v, cfg.get(n) or v.get("options")) for n, v in views)
-    lan = _modelsrc_block(modelsrc_refused) if (views or modelsrc_refused is not None) else ""
-    osnaps = _orphan_snaps_block() if views else ""
-    return (f'<div data-sk="thunder"><div class="grouphdr">Thunder Compute</div>{cards}'
-            f"{osnaps}{lan}{_catalog_editor(catalog_refused, hf_refused)}</div>")
+def _managed_hosts_section(views: list, catalog_refused: Optional[tuple] = None,
+                           hf_refused: Optional[str] = None,
+                           modelsrc_refused: Optional[tuple] = None) -> str:
+    """The Hosts area's managed hosts: "+ Managed host", one lifecycle card per host,
+    then (with at least one host, or a refused Save to show) the orphaned snapshots, the
+    LAN model source and the model-sync catalog + HF token."""
+    cards = "".join(_host_card(n, v) for n, v in views)
+    intro = ("" if views else
+             "<p class='hint'>A managed host is a rented GPU machine the gateway starts and "
+             "stops for you (its <b>Steuerung</b>: a provider such as Thunder Compute). "
+             "Backends run on it by naming it as their host.</p>")
+    extra = ""
+    if views or modelsrc_refused is not None:
+        extra += _orphan_snaps_block() if views else ""
+        extra += _modelsrc_block(modelsrc_refused)
+    if views or catalog_refused is not None or hf_refused is not None:
+        extra += _catalog_editor(catalog_refused, hf_refused)
+    # not `.bar`: that one is sticky, and a second sticky bar would slide over the list's
+    return ('<div data-sk="mhosts"><div style="display:flex;align-items:center;gap:14px;'
+            'margin-top:18px"><div class="grouphdr" style="flex:1">Managed hosts</div>'
+            f'{_btn("+ Managed host", "/ui/backends?mhost_new=1", sm=True)}</div>'
+            f"{intro}{cards}{extra}</div>")
 
 
-async def _thunder_post(request: Request, action: str):
-    """A Thunder panel action: the backend name as form field `name` (or in the query,
-    which is how the buttons on the page's action form carry it); the controller's
-    answer comes back to the Backends tab as `?msg=`."""
+# A new host's textarea pre-filled from a file (provider kind, option key) → text: the
+# default node list is what an empty field means at bootstrap time (Ruling 12) — shown,
+# so the operator edits the list instead of guessing it.
+_OPTION_PREFILL = {("thunder", "nodes"): lambda: _thunder_default_nodes()}
+
+
+def _option_control(fld: dict, value) -> str:
+    """One provider option (`OPTION_FIELDS` entry) as its form control `opt__<key>`."""
+    name, t = f"opt__{fld['key']}", fld.get("type")
+    if isinstance(value, (list, tuple)):
+        value = "\n".join(str(x) for x in value)
+    value = "" if value is None else str(value)
+    if t == "select":
+        # a typed alias ("auto") selects the value it stands for ("")
+        value = (fld.get("aliases") or {}).get(value, value)
+        labels = fld.get("choice_labels") or {}
+        return _select(name, [(c, labels.get(c, c)) for c in fld.get("choices") or []], value)
+    if t == "textarea":
+        return _textarea(name, value, rows=6)
+    return _inp(name, value, placeholder=str(fld.get("default", "")))    # int / text
+
+
+def _managed_host_form(name: str = "", new: bool = True, provider: str = "",
+                       typed: Optional[dict] = None, err: str = "") -> str:
+    """The managed-host form. New: name, **Steuerung** (a provider of hostapi.PROVIDERS)
+    and its options; an existing host has neither a name field (R-W5: the name is the
+    identity of its state and snapshots) nor a provider choice (its state belongs to the
+    provider). Options are the provider's OWN `OPTION_FIELDS` as `opt__<key>` — `typed`
+    (as the form sent them) wins, then the stored options, then the field default. The
+    API token is never rendered: blank keeps it, the box clears it."""
+    typed = typed or {}
+    v = None if new else _host_view(name)
+    if not new and v is None:
+        return (f"<h2>Managed host</h2>{_form_err(err)}<p class='bad'>There is no managed "
+                f"host named <code>{_esc(name)}</code>.</p>")
+    kinds = list(hostapi.PROVIDERS)
+    kind = provider or (v or {}).get("provider") or (kinds[0] if kinds else "")
+    prov = hostapi.provider(kind)
+    stored = (v or {}).get("options") if isinstance((v or {}).get("options"), dict) else {}
+    head = ("New managed host" if new else f"Managed host {name}")
+    out = ('<form action="/ui/hosts/managed/save" method="post" data-guard>'
+           + ('<input type="hidden" name="new" value="1">' if new else
+              f'<input type="hidden" name="host" value="{_esc(name)}">')
+           + f'<div class="formbar"><h2>{_esc(head)}</h2>'
+           f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/backends", "secondary")}</div>'
+           + _form_err(err))
+    if new:
+        out += (_field("name", _inp("host", name, placeholder="e.g. gpu-a"),
+                       hint="a-z, 0-9 and <code>-</code>. It names the host's snapshots and "
+                            "state, so it cannot be changed later; backends run here by "
+                            "naming it as their <b>host</b>.")
+                + _field("Steuerung", _select("provider",
+                                              [(k, _provider_name(k)) for k in kinds], kind),
+                         hint="The provider that creates, stops and bills the machine."))
+    else:
+        out += (f'<input type="hidden" name="provider" value="{_esc(kind)}">'
+                + _field("Steuerung", f"<span>{_esc(_provider_name(kind))}</span>",
+                         hint="Fixed: the host's state and snapshots belong to it."))
+    if prov is None:
+        out += _form_err(f"unknown provider {kind!r} — this host cannot be driven; delete "
+                         "it once it is off")
+    else:
+        for fld in prov[0].OPTION_FIELDS:
+            key = fld["key"]
+            if key in typed:
+                val = typed[key]
+            elif key in stored:
+                val = stored[key]
+            elif new and (kind, key) in _OPTION_PREFILL:
+                try:
+                    val = _OPTION_PREFILL[(kind, key)]()
+                except Exception as e:                  # noqa: BLE001 — a prefill, not the form
+                    logger.warning(f"ui: option prefill {kind}/{key} failed: {e!r}")
+                    val = fld.get("default")
+            else:
+                val = fld.get("default")
+            out += _field(fld.get("label") or key, _option_control(fld, val),
+                          hint=fld.get("hint") or "")
+    is_set = bool((v or {}).get("api_key_set"))
+    out += _field("API token", _inp("api_key", "", typ="password",
+                                    placeholder=("•••• set — blank keeps it" if is_set
+                                                 else "the provider's API token"))
+                  + _checkbox("api_key_clear", False, "clear", "remove the stored token on Save"),
+                  hint="Stored encrypted and never shown again. Without it the host cannot "
+                       "be started.")
+    out += ("<p class='hint'>Label and GPU policy of this box: its row in "
+            "<b>Hosts · GPU policy</b>.</p></form>")
+    return out
+
+
+async def managed_host_save(request: Request):
+    """Create or update a managed host through `main.save_managed_host` (its refusal
+    rules: the name, R-W6 collisions, the provider, `options_of`). What the form typed
+    goes over as typed — main validates and stores the normalized options — and a
+    refusal is a 400 with the form exactly as typed (never the token)."""
     f = await _form(request)
-    name = (f.get("name") or request.query_params.get("name") or "").strip()
-    if not name:
-        msg = "no Thunder backend named"
-    elif _thunder_action is None:
-        msg = "Thunder actions are not available"
+    new = bool(f.get("new"))
+    name = (f.get("host") or "").strip()
+    kind = (f.get("provider") or "").strip()
+    cur = {}
+    if not new and store.is_active():
+        try:
+            cur = store.get_managed_hosts().get(name) or {}
+        except Exception as e:                          # noqa: BLE001 — refused, not a 500
+            logger.warning(f"ui: managed hosts unreadable: {type(e).__name__}: {e}")
+    opts = {k[len("opt__"):]: v for k, v in f.items() if k.startswith("opt__")}
+    tok = (f.get("api_key") or "").strip()
+    if tok:
+        api_key = tok
+    elif f.get("api_key_clear"):
+        api_key = ""
+    else:
+        api_key = str(cur.get("api_key") or "")
+    entry = {"provider": kind, "options": opts, "api_key": api_key}
+    if _save_managed_host is None:
+        why = "managed hosts cannot be saved here"
     else:
         try:
-            msg = f"{name}: {await _thunder_action(name, action)}"
+            why = str(_save_managed_host(name, entry, new) or "")
+        except Exception as e:                          # noqa: BLE001 — refused, not a 500
+            why = f"not saved: {type(e).__name__}: {e}"
+    if why:
+        form = _managed_host_form(name, new=new, provider=kind, typed=opts, err=why)
+        return await _backends_view(request.query_params, detail=form, status=400)
+    logger.info(f"ui: managed host {name!r} {'created' if new else 'saved'} "
+                f"(provider {kind}, token {'set' if api_key else 'none'})")
+    return _hosts_msg(f"managed host {name} saved" + (" (new)" if new else ""))
+
+
+async def managed_host_delete(request: Request):
+    """Delete a managed host — only while `main.managed_host_delete_refusal` has nothing
+    against it (R-W5: off, no snapshot being taken, no backend naming it). A refusal is a
+    400 naming the reason; nothing is deleted."""
+    f = await _form(request)
+    name = (f.get("host") or request.query_params.get("host") or "").strip()
+    if not name:
+        return _hosts_msg("no managed host named")
+    if _delete_managed_host is None:
+        why = "managed hosts cannot be deleted here"
+    else:
+        try:
+            why = str(_delete_managed_host(name) or "")
+        except Exception as e:                          # noqa: BLE001 — refused, not a 500
+            why = f"not deleted: {type(e).__name__}: {e}"
+    if why:
+        logger.info(f"ui: managed host delete {name!r} refused: {why}")
+        return await _backends_view({}, notice=f"{name}: not deleted — {why}", status=400)
+    logger.info(f"ui: managed host {name!r} deleted")
+    return _hosts_msg(f"managed host {name} deleted")
+
+
+def _hosts_msg(msg: str) -> RedirectResponse:
+    return RedirectResponse("/ui/backends?msg=" + _q(msg[:600]), status_code=303)
+
+
+async def _host_post(request: Request, action: str, per_service: bool = False):
+    """A card action: the host as form field `host` (or in the query, which is how the
+    buttons on the page's action form carry it), a service's backend id as `bid`; the
+    controller's answer comes back to the Backends tab as `?msg=`."""
+    f = await _form(request)
+    name = (f.get("host") or request.query_params.get("host") or "").strip()
+    bid = (f.get("bid") or request.query_params.get("bid") or "").strip()
+    if not name:
+        msg = "no managed host named"
+    elif _host_action is None:
+        msg = "host actions are not available"
+    else:
+        try:
+            ans = (await _host_action(name, action, bid=bid) if per_service
+                   else await _host_action(name, action))
+            msg = f"{name}: {ans}"
         except Exception as e:                          # noqa: BLE001 — say it, don't 500
             msg = f"{name}: {action} failed: {type(e).__name__}: {e}"
-    logger.info(f"ui: thunder {action} {name!r} → {msg}")
-    return RedirectResponse("/ui/backends?msg=" + _q(msg[:600]), status_code=303)
+    logger.info(f"ui: host {action} {name!r}{f' {bid}' if bid else ''} → {msg}")
+    return _hosts_msg(msg)
 
 
-async def thunder_start(request: Request):
-    return await _thunder_post(request, "start")
+async def managed_host_start(request: Request):
+    return await _host_post(request, "start")
 
 
-async def thunder_stop(request: Request):
-    return await _thunder_post(request, "stop")
+async def managed_host_stop(request: Request):
+    return await _host_post(request, "stop")
 
 
-async def thunder_restart(request: Request):
-    return await _thunder_post(request, "restart")
+async def managed_host_forget(request: Request):
+    return await _host_post(request, "forget_unreconciled")
 
 
-async def thunder_forget(request: Request):
-    return await _thunder_post(request, "forget_unreconciled")
+async def managed_host_restart_service(request: Request):
+    return await _host_post(request, "restart_service", per_service=True)
 
 
-def _thunder_msg(msg: str) -> RedirectResponse:
-    return RedirectResponse("/ui/backends?msg=" + _q(msg[:600]), status_code=303)
+async def managed_host_resetup(request: Request):
+    return await _host_post(request, "resetup", per_service=True)
 
 
-async def thunder_sync(request: Request):
+async def managed_host_sync(request: Request):
     """"Sync now": re-plan at once and retry the transfers that gave up."""
-    f = await _form(request)
-    name = (f.get("name") or request.query_params.get("name") or "").strip()
-    if not name or _thunder_sync_now is None:
-        msg = "no Thunder backend named" if not name else "model sync is not available"
-    else:
-        try:
-            msg = f"{name}: {await _thunder_sync_now(name)}"
-        except Exception as e:                          # noqa: BLE001 — say it, don't 500
-            msg = f"{name}: sync failed: {type(e).__name__}: {e}"
-    logger.info(f"ui: thunder sync {name!r} → {msg}")
-    return _thunder_msg(msg)
+    return await _host_post(request, "sync")
 
 
-async def thunder_delete_unknown(request: Request):
-    """Delete the ticked files of a Thunder instance's `unknown` list. The controller
-    judges them against a FRESH plan and refuses the whole request if one became
-    needed meanwhile — a stale page can never delete a file an alias now uses."""
+async def managed_host_delete_unknown(request: Request):
+    """Delete the ticked files of a host's `unknown` list. The controller judges them
+    against a FRESH plan and refuses the whole request if one became needed meanwhile —
+    a stale page can never delete a file an alias now uses."""
     f = await _form_multi(request)
-    name = ((f.get("name") or [""])[-1] or request.query_params.get("name") or "").strip()
+    name = ((f.get("host") or [""])[-1] or request.query_params.get("host") or "").strip()
     paths = [p for p in f.get("path") or [] if p]
-    if not name or _thunder_delete_unknown is None:
-        msg = "no Thunder backend named" if not name else "model sync is not available"
+    if not name or _host_action is None:
+        msg = "no managed host named" if not name else "model sync is not available"
     elif not paths:
         msg = f"{name}: no file ticked — nothing deleted"
     else:
         try:
-            msg = f"{name}: {await _thunder_delete_unknown(name, paths)}"
+            msg = f"{name}: {await _host_action(name, 'delete_unknown', paths=paths)}"
         except Exception as e:                          # noqa: BLE001
             msg = f"{name}: delete failed: {type(e).__name__}: {e}"
-    logger.info(f"ui: thunder delete-unknown {name!r} ({len(paths)} path(s)) → {msg}")
-    return _thunder_msg(msg)
+    logger.info(f"ui: host delete-unknown {name!r} ({len(paths)} path(s)) → {msg}")
+    return _hosts_msg(msg)
 
 
-async def thunder_modelsrc_scan(request: Request):
+async def hosts_modelsrc_scan(request: Request):
     """"Fetch host key": ssh-keyscan the LAN source; the fingerprint comes back as the
     message and stays in memory until "Confirm fingerprint"."""
-    if _thunder_modelsrc_scan is None:
+    if _modelsrc_scan is None:
         msg = "LAN source is not available"
     else:
         try:
-            msg = str(await _thunder_modelsrc_scan())
+            msg = str(await _modelsrc_scan())
         except Exception as e:                          # noqa: BLE001 — say it, don't 500
             msg = f"host key not fetched: {type(e).__name__}: {e}"
     logger.info(f"ui: LAN source host-key scan → {msg}")
-    return _thunder_msg(msg)
+    return _hosts_msg(msg)
 
 
-async def thunder_modelsrc_pin(request: Request):
+async def hosts_modelsrc_pin(request: Request):
     """"Confirm fingerprint": pin the fetched key — only if it is still the one whose
     fingerprint the button carried (the operator's confirmation was about THAT key)."""
     f = await _form(request)
     fp = (f.get("fp") or request.query_params.get("fp") or "").strip()
-    if _thunder_modelsrc_pin is None:
+    if _modelsrc_pin is None:
         msg = "LAN source is not available"
     elif not fp:
         msg = "no fingerprint confirmed — nothing pinned"
     else:
         try:
-            msg = str(await _thunder_modelsrc_pin(fp))
+            msg = str(await _modelsrc_pin(fp))
         except Exception as e:                          # noqa: BLE001
             msg = f"host key not pinned: {type(e).__name__}: {e}"
     logger.info(f"ui: LAN source host-key pin → {msg}")
-    return _thunder_msg(msg)
+    return _hosts_msg(msg)
 
 
-async def thunder_catalog_save(request: Request):
+async def hosts_catalog_save(request: Request):
     """Save the model-sync catalog. JSON the parser or `modelsync.validate_catalog`
     refuses is a 400 with the textarea exactly as typed — never a partial save: a
     typo'd key would otherwise be dropped silently and its alias stay blocked."""
@@ -3718,18 +3988,18 @@ async def thunder_catalog_save(request: Request):
         return await _backends_view(request.query_params, catalog_refused=(text, errs),
                                     status=400)
     logger.info(f"ui: model-sync catalog saved ({len(cat)} entries)")
-    return _thunder_msg(f"model-sync catalog saved ({len(cat)} entries)")
+    return _hosts_msg(f"model-sync catalog saved ({len(cat)} entries)")
 
 
-async def thunder_hf_token(request: Request):
+async def hosts_hf_token(request: Request):
     """Save the HF token: a typed value replaces it, blank keeps it, the box removes it
     (the backend-key rule). A refused value is a 400 naming why — never the value."""
     f = await _form(request)
     tok = (f.get("hf_token") or "").strip()
     if _save_hf_token is None:
-        return _thunder_msg("the HF token cannot be saved here")
+        return _hosts_msg("the HF token cannot be saved here")
     if not tok and not f.get("hf_token_clear"):
-        return _thunder_msg("HF token unchanged (blank keeps it)")
+        return _hosts_msg("HF token unchanged (blank keeps it)")
     try:
         err = str(_save_hf_token(tok) or "")
     except Exception as e:                              # noqa: BLE001 — refused, not a 500
@@ -3738,16 +4008,16 @@ async def thunder_hf_token(request: Request):
         return await _backends_view(request.query_params, hf_refused=err, status=400)
     msg = "HF token saved (encrypted)" if tok else "HF token removed"
     logger.info(f"ui: {msg}")
-    return _thunder_msg(msg)
+    return _hosts_msg(msg)
 
 
-async def thunder_modelsrc_host(request: Request):
+async def hosts_modelsrc_host(request: Request):
     """Save `modelsrc_host`. Anything but a plain `[user@]host` is a 400 with the field
     as typed — it would end up in an ssh argv."""
     f = await _form(request)
     v = (f.get("modelsrc_host") or "")
     if _save_modelsrc_host is None:
-        return _thunder_msg("modelsrc_host cannot be saved here")
+        return _hosts_msg("modelsrc_host cannot be saved here")
     try:
         err = str(_save_modelsrc_host(v) or "")
     except Exception as e:                              # noqa: BLE001 — refused, not a 500
@@ -3757,7 +4027,7 @@ async def thunder_modelsrc_host(request: Request):
     msg = (f"modelsrc_host saved: {v.strip()}" if v.strip()
            else "modelsrc_host reset to the default")
     logger.info(f"ui: {msg}")
-    return _thunder_msg(msg + " — the LAN source is listed again with the next model sync")
+    return _hosts_msg(msg + " — the LAN source is listed again with the next model sync")
 
 
 # ── Tab: Input ──────────────────────────────────────────────────────────────────
@@ -7678,9 +7948,9 @@ _FAULT_SOURCE = {"health": ("health poll", "the discovery poll failed — the ba
                  "job": ("media job", "a generation attempt failed on this backend "
                                       "(the job may still have succeeded after a retry or failover)"),
                  "watchdog": ("watchdog", "a ComfyUI service restart"),
-                 "lifecycle": ("Thunder lifecycle",
-                               "start/stop/snapshot of a Thunder instance failed"),
-                 "sync": ("model sync", "a model transfer to a Thunder instance failed")}
+                 "lifecycle": ("host lifecycle",
+                               "start/stop/snapshot of a managed host's instance failed"),
+                 "sync": ("model sync", "a model transfer to a managed host failed")}
 
 
 def _fault_kind_label(kind: str) -> str:
@@ -7731,20 +8001,21 @@ def _fault_backend_table(f: dict, sk: str) -> str:
             f"<th>last error</th><th>last</th></tr>{rows}</table>")
 
 
-def _dash_thunder() -> str:
-    """The cost guard on the Dashboard (spec "Kosten-Wächter"): one keyed line per Thunder
-    instance up for more than 24 h — the page an operator looks at daily, unlike the
-    Backends tab. Nothing when none is (and the wrapper then goes, keyed by `data-sk`)."""
+def _dash_hosts() -> str:
+    """The cost guard on the Dashboard (spec "Kosten-Wächter"): one keyed line per managed
+    host up for more than 24 h (main.host_longrun — in memory, no store read per tick) —
+    the page an operator looks at daily, unlike the Backends tab. Nothing when none is
+    (and the wrapper then goes, keyed by `data-sk`)."""
     try:
-        views = list(_thunder_longrun() or [])
+        views = list(_host_longrun() or [])
     except Exception as e:                              # noqa: BLE001 — a banner, not the page
-        logger.warning(f"ui: thunder long-run check failed: {type(e).__name__}: {e}")
+        logger.warning(f"ui: host long-run check failed: {type(e).__name__}: {e}")
         views = []
     rows = "".join(
-        f'<p class="bad" data-k="dash-longrun-{_esc(n)}">⚠ {_esc(_thunder_longrun_text(n, v))}'
+        f'<p class="bad" data-k="dash-longrun-{_esc(n)}">⚠ {_esc(_host_longrun_text(n, v))}'
         ' — see <a href="/ui/backends">Backends</a></p>'
         for n, v in views if isinstance(v, dict) and v.get("long_running"))
-    return f'<div data-sk="dash-thunder">{rows}</div>' if rows else ""
+    return f'<div data-sk="dash-hosts">{rows}</div>' if rows else ""
 
 
 def _dash_faults(f: dict) -> str:
@@ -7922,7 +8193,7 @@ async def dashboard_page(request: Request):
     f = await asyncio.to_thread(_faults_info)
     aliases = await asyncio.to_thread(store.get_ip_aliases)
     fmap = {s.get("bid"): s for s in f.get("backends") or []}
-    body = ("<h2>Dashboard</h2>" + _dash_thunder()
+    body = ("<h2>Dashboard</h2>" + _dash_hosts()
             + _dash_cards(d, bes, f) + _dash_backends(bes, offline, fmap) + _dash_faults(f)
             + _dash_parked(d) + _dash_llm(d, now, aliases) + _dash_jobs(d, now) + _JOB_TICK)
     return HTMLResponse(_page("Dashboard", body, "dashboard", refresh=4))
@@ -9136,7 +9407,7 @@ async def mapping_export_all(request: Request):
 # Where a GET to a POST-only action sends the operator back to, when the parent path
 # is not itself a page.
 _ACTION_BACK = {"/ui/chat": "/ui/aliases?sub=chat", "/ui/ipalias": "/ui/users",
-                "/ui/mapping": "/ui/aliases"}
+                "/ui/mapping": "/ui/aliases", "/ui/hosts/managed": "/ui/backends"}
 
 
 def _action_back(path: str, get_res: list) -> str:
@@ -9198,17 +9469,22 @@ def register(app) -> None:
     app.add_api_route("/ui/backends/undrain", backend_undrain, methods=["POST"])
     app.add_api_route("/ui/backends/restart", backend_restart, methods=["POST"])
     app.add_api_route("/ui/backends/enable", backend_enable, methods=["POST"])
-    app.add_api_route("/ui/thunder/start", thunder_start, methods=["POST"])
-    app.add_api_route("/ui/thunder/stop", thunder_stop, methods=["POST"])
-    app.add_api_route("/ui/thunder/restart", thunder_restart, methods=["POST"])
-    app.add_api_route("/ui/thunder/forget", thunder_forget, methods=["POST"])
-    app.add_api_route("/ui/thunder/sync", thunder_sync, methods=["POST"])
-    app.add_api_route("/ui/thunder/delete-unknown", thunder_delete_unknown, methods=["POST"])
-    app.add_api_route("/ui/thunder/modelsrc-scan", thunder_modelsrc_scan, methods=["POST"])
-    app.add_api_route("/ui/thunder/modelsrc-pin", thunder_modelsrc_pin, methods=["POST"])
-    app.add_api_route("/ui/thunder/catalog", thunder_catalog_save, methods=["POST"])
-    app.add_api_route("/ui/thunder/modelsrc-host", thunder_modelsrc_host, methods=["POST"])
-    app.add_api_route("/ui/thunder/hf-token", thunder_hf_token, methods=["POST"])
+    app.add_api_route("/ui/hosts/managed/save", managed_host_save, methods=["POST"])
+    app.add_api_route("/ui/hosts/managed/delete", managed_host_delete, methods=["POST"])
+    app.add_api_route("/ui/hosts/managed/start", managed_host_start, methods=["POST"])
+    app.add_api_route("/ui/hosts/managed/stop", managed_host_stop, methods=["POST"])
+    app.add_api_route("/ui/hosts/managed/forget", managed_host_forget, methods=["POST"])
+    app.add_api_route("/ui/hosts/managed/restart-service", managed_host_restart_service,
+                      methods=["POST"])
+    app.add_api_route("/ui/hosts/managed/resetup", managed_host_resetup, methods=["POST"])
+    app.add_api_route("/ui/hosts/managed/sync", managed_host_sync, methods=["POST"])
+    app.add_api_route("/ui/hosts/managed/delete-unknown", managed_host_delete_unknown,
+                      methods=["POST"])
+    app.add_api_route("/ui/hosts/managed/modelsrc-scan", hosts_modelsrc_scan, methods=["POST"])
+    app.add_api_route("/ui/hosts/managed/modelsrc-pin", hosts_modelsrc_pin, methods=["POST"])
+    app.add_api_route("/ui/hosts/managed/catalog", hosts_catalog_save, methods=["POST"])
+    app.add_api_route("/ui/hosts/managed/modelsrc-host", hosts_modelsrc_host, methods=["POST"])
+    app.add_api_route("/ui/hosts/managed/hf-token", hosts_hf_token, methods=["POST"])
     app.add_api_route("/ui/input", input_page, methods=["GET"])
     app.add_api_route("/ui/routing", routing_page, methods=["GET"])
     app.add_api_route("/ui/chat/create", chat_create, methods=["POST"])

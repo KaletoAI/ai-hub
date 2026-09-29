@@ -3762,10 +3762,8 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(c.state.phase, "off")
         with self.assertNoLogs("main", "WARNING"):          # answered, not logged twice
             self.assertEqual(await m.host_action("tc", "stop"), "stop refused: not running")
-            self.assertEqual(await m.thunder_action("tc", "stop"),
-                             "stop refused: not running")
-            self.assertEqual(await m.thunder_action("tc", "restart"),
-                             "ComfyUI restart refused: no running instance to restart "
+            self.assertEqual(await m.host_action("tc", "restart_service", bid="comfyui:tc"),
+                             "restart of comfyui:tc refused: no running instance to restart "
                              "ComfyUI on (off)")
             self.assertEqual(await m.host_action("tc", "resetup", bid="comfyui:tc"),
                              "setup re-run of comfyui:tc refused: no running instance (off)")
@@ -3933,36 +3931,35 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         m = self.m
         c = _FakeCtl("tc", refuse={"stop": "not running"})
         m.host_controllers = {"tc": c}
-        msg = await m.thunder_action("tc", "start")
+        msg = await m.host_action("tc", "start")
         self.assertIn("start", msg)
         self.assertEqual(c.calls, ["start"])
         # held (not GC-able) and still running: the call did not wait for the op
         held = [t for t in m._bg_refs if not t.done()]
         self.assertTrue(held)
-        msg = await m.thunder_action("tc", "stop")
+        msg = await m.host_action("tc", "stop")
         self.assertIn("not running", msg)
-        await m.thunder_action("tc", "restart")
+        await m.host_action("tc", "restart_service", bid="comfyui:tc")
         self.assertEqual(c.calls[-1], "restart")
         c.state.unreconciled_uuids = ["u9"]
-        await m.thunder_action("tc", "forget_unreconciled")
+        await m.host_action("tc", "forget_unreconciled")
         self.assertEqual(c.calls[-1], "forget")
-        self.assertIn("unknown", await m.thunder_action("nope", "start"))
-        self.assertIn("unknown", await m.thunder_action("tc", "explode"))
+        self.assertIn("unknown", await m.host_action("nope", "start"))
+        self.assertIn("unknown", await m.host_action("tc", "explode"))
         c.gate.set()
         await asyncio.sleep(0)
 
     async def test_host_view_and_names(self):
-        # the Thunder card's binds read managed hosts (card name = host name) until
-        # Task 7 replaces the card
+        # the host card's binds read managed hosts (card name = host name)
         m = self.m
         c = _FakeCtl("tc", phase="ready")
         m.host_controllers = {"tc": c}
         self.assertEqual(m.host_view("tc")["phase"], "ready")
         self.assertIsNone(m.host_view("nope"))
         import admin
-        self.assertEqual(admin._thunder_names(), ["tc"])
-        self.assertIs(admin._thunder_view, m.host_view)
-        self.assertIs(admin._thunder_action, m.thunder_action)
+        self.assertEqual(admin._host_names(), ["tc"])
+        self.assertIs(admin._host_view, m.host_view)
+        self.assertIs(admin._host_action, m.host_action)
 
     async def test_boot_resumes_and_runs_each_controller_and_shutdown_closes(self):
         m = self.m

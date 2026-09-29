@@ -60,9 +60,9 @@ _MUTATING_CALLBACKS = {"_cancel_generation", "_drain_backend", "_cancel_drain", 
                        "_set_backend_enabled", "_voice_lib_save", "_voice_lib_delete",
                        "_voice_lib_ship", "_scan_start", "_apply_backends", "_apply_chat_aliases",
                        "_apply_server_settings", "_apply_users", "_apply_reasoning", "_apply_hosts",
-                       "_thunder_action", "_thunder_sync_now", "_thunder_delete_unknown",
-                       "_save_modelsync_catalog", "_thunder_modelsrc_scan",
-                       "_thunder_modelsrc_pin", "_save_modelsrc_host", "_save_hf_token"}
+                       "_host_action", "_save_managed_host", "_delete_managed_host",
+                       "_save_modelsync_catalog", "_modelsrc_scan",
+                       "_modelsrc_pin", "_save_modelsrc_host", "_save_hf_token"}
 # Views that may write despite being a GET: none. (The Users page's reverse-DNS names
 # used to be persisted from the render; they now stay in memory until the operator
 # presses "Save resolved names", a POST.)
@@ -131,7 +131,9 @@ class RouteInventory(unittest.TestCase):
         # Guard the guard: a walker that finds nothing would pass everything below.
         self.assertIn("store.delete_user", self._reach("users_del"))
         self.assertIn("_drain_backend", self._reach("backend_drain"))
-        self.assertIn("_thunder_action", self._reach("thunder_stop"))
+        self.assertIn("_host_action", self._reach("managed_host_stop"))
+        self.assertIn("_save_managed_host", self._reach("managed_host_save"))
+        self.assertIn("_delete_managed_host", self._reach("managed_host_delete"))
         self.assertIn("store.upsert", self._reach("cand_add"))
         self.assertTrue(len(self.routes) > 50)
 
@@ -286,7 +288,7 @@ PAGES = ["/ui/backends", f"/ui/backends?edit=comfyui:{NASTY}", "/ui/aliases?sub=
          "/ui/aliases?sub=media",
          "/ui/aliases?edit=" + NASTY.replace("%", "%25").replace("&", "%26").replace("+", "%2B")
          .replace("#", "%23").replace(" ", "%20"),
-         "/ui/reasoning", "/ui/users", "/ui/playground?sub=voice"]
+         "/ui/reasoning", "/ui/users", "/ui/playground?sub=voice", "/ui/backends?mhost_new=1"]
 
 
 class RenderedPages(_Store):

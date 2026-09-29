@@ -495,18 +495,16 @@ class HostActions(_StoreCase):
         self.assertIn("nothing deleted", self.run_("vm1", "delete_unknown", paths=[]))
         self.assertEqual(self.ctl.calls, [])
 
-    def test_thunder_card_wrappers_until_task7(self):
-        # the Thunder card still posts (name, action) with name = the HOST; its
-        # "restart" is the ComfyUI service's restart
-        self.ctl.state.phase = "ready"
-        asyncio.run(main.thunder_action("vm1", "restart"))
-        self.assertEqual(self.ctl.calls, [("restart_service", "comfyui:tc")])
+    def test_console_binds(self):
+        # the host card posts (host, action[, bid]) straight to host_action — the
+        # Thunder-card wrappers are gone with the card
         self.assertEqual(main.host_names(), ["vm1"])
         import admin
-        self.assertIs(admin._thunder_names, main.host_names)
-        self.assertIs(admin._thunder_view, main.host_view)
-        self.assertIs(admin._thunder_longrun, main.host_longrun)
-        self.assertIs(admin._thunder_action, main.thunder_action)
+        self.assertIs(admin._host_names, main.host_names)
+        self.assertIs(admin._host_view, main.host_view)
+        self.assertIs(admin._host_longrun, main.host_longrun)
+        self.assertIs(admin._host_action, main.host_action)
+        self.assertFalse(hasattr(main, "thunder_action"))
 
 
 class UnknownProvider(_StoreCase):
@@ -529,7 +527,9 @@ class UnknownProvider(_StoreCase):
         self.assertIn("unknown provider", h["pod"]["error"])
         # the Backends tab still renders with it
         import admin
-        admin._thunder_panel(admin._thunder_views(), [])
+        views = admin._host_views()
+        self.assertIn("unknown provider", admin._managed_hosts_section(views))
+        self.assertIn("pod", admin._hosts_panel([], "", views))
 
 
     def test_running_host_whose_entry_turns_unreadable_keeps_its_controller(self):
