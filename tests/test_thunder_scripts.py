@@ -303,7 +303,11 @@ class HostBootstrapLib(unittest.TestCase):
             uv.parent.mkdir(parents=True)
             uv.write_text("#!/bin/sh\necho uv 0.0-test\n")
             uv.chmod(0o755)
-            r = _lib("ensure_tools", home=t, script=HOST, path=_stubs(t))
+            stub = _stubs(t)
+            flock = pathlib.Path(stub, "flock")      # present whatever this box has
+            flock.write_text("#!/bin/sh\nexit 0\n")
+            flock.chmod(0o755)
+            r = _lib("ensure_tools", home=t, script=HOST, path=stub)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIn("uv 0.0-test", r.stdout)
             self.assertNotIn("installing uv", r.stdout)
@@ -355,6 +359,41 @@ class HostBootstrapLib(unittest.TestCase):
             self.assertEqual(r.stdout.splitlines()[-1], "GW:DONE")
             self.assertFalse([ln for ln in r.stdout.splitlines()
                               if ln.startswith(("GW:UNKNOWN_MODEL", "GW:TEMPLATE_NODE"))])
+
+    def test_comfy_stop_kills_main_py_running_from_the_checkout(self):
+        # a template ComfyUI that came back after the host bootstrap stopped it would
+        # win the 8188 bind race against start-comfy.sh — killed by its cwd, whatever
+        # its command line; a process elsewhere is left alone
+        import signal
+        import sys
+        import time
+        with tempfile.TemporaryDirectory() as t:
+            cui = pathlib.Path(t, "ComfyUI")
+            (cui / "sub").mkdir(parents=True)
+            other = pathlib.Path(t, "other")
+            other.mkdir()
+            inside = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                      cwd=cui / "sub")
+            outside = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                       cwd=other)
+            try:
+                stub = _stubs(t)
+                pathlib.Path(stub, "pgrep").write_text(
+                    f"#!/bin/sh\necho {inside.pid}\necho {outside.pid}\n")
+                r = _lib('stop_comfy_processes "$1"', str(cui), path=stub)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                deadline = time.time() + 5
+                while inside.poll() is None and time.time() < deadline:
+                    time.sleep(0.05)
+                self.assertIsNotNone(inside.poll())
+                self.assertIsNone(outside.poll())
+                sig = pathlib.Path(t, "signals").read_text()
+                self.assertIn("pkill -f [s]tart-comfy[.]sh", sig)
+            finally:
+                for proc in (inside, outside):
+                    if proc.poll() is None:
+                        proc.send_signal(signal.SIGKILL)
+                    proc.wait()
 
     def test_comfy_script_needs_the_host_uv(self):
         # uv moved to the host bootstrap: without it make_venv says so instead of

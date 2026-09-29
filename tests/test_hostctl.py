@@ -5376,6 +5376,66 @@ class SplitBootstrap(unittest.IsolatedAsyncioTestCase):
         host, comfy = _boots(fake)
         self.assertEqual((len(host), len(comfy)), (1, 1))
 
+    async def test_host_bootstrap_finished_by_hand_is_not_rerun(self):
+        # review fix 1: an operator who finished a failed host bootstrap by hand and
+        # restarted ComfyUI has a working host — a later start must not re-run the host
+        # bootstrap, whose inventory would take the synced models for the template's
+        tpl = b"GW:UNKNOWN_MODEL models/checkpoints/tpl.safetensors\t5000000\n"
+        fake = FakeThunder()
+        c, saved, _, _ = make(fake, ssh_script={
+            HOST_BOOT: (1, b"GW:PHASE tools\n" + tpl, b"host-bootstrap: failed in phase tools")})
+        await c.start()
+        self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "bootstrapping"))
+        unknown = dict(c.state.bootstrap_unknown)
+        self.assertEqual(unknown, {"models/checkpoints/tpl.safetensors": 5000000})
+        await c.restart_comfy()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        self.assertTrue(saved["thunder"]["host_bootstrapped"])
+        self.assertTrue(any("host bootstrap counts as done" in ln for ln in c.state.log))
+        await self._stop_ready(c, fake)
+        self.assertEqual((c.state.host_incomplete_snapshots, c.state.incomplete_snapshots),
+                         ([], []))
+        n = len(fake.calls)
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        self.assertEqual(_boots(fake, n), ([], []))
+        self.assertEqual(c.state.bootstrap_unknown, unknown)
+
+    async def test_host_rerun_uploads_nodes_and_skips_our_models(self):
+        # review fixes 1+4: a host bootstrap re-run on a snapshot (the ComfyUI part is
+        # complete) gets the current node list first — its template-node report leaves
+        # our packs out — and never reports a file the snapshot's manifest knows
+        fake = FakeThunder()
+        _ready_snap(fake)
+        out = (b"GW:UNKNOWN_MODEL models/checkpoints/ours.safetensors\t9000000\n"
+               b"GW:UNKNOWN_MODEL models/checkpoints/tpl.safetensors\t5000000\n"
+               b"GW:DONE\n")
+        c, saved, _, _ = make(fake, ssh_script={HOST_BOOT: (0, out, b"")}, state={
+            "phase": "off", "host_bootstrapped": False, "host_incomplete_snapshots": ["s9"],
+            "manifests": {"s9": {"models/checkpoints/ours.safetensors": {"size": 9000000}}},
+            "bootstrap_unknown": {"models/checkpoints/tpl.safetensors": 5000000}})
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        cmds = _ssh_cmds(fake)
+        host, comfy = _boots(fake)
+        self.assertEqual((len(host), comfy), (1, []))
+        self.assertLess(cmds.index("cat > ~/.gw-nodes.txt"), cmds.index(host[0]))
+        self.assertEqual(saved["thunder"]["bootstrap_unknown"],
+                         {"models/checkpoints/tpl.safetensors": 5000000})
+
+    async def test_host_rerun_node_upload_failure_is_not_fatal(self):
+        # only the host bootstrap's report needs the list: it runs unfiltered instead
+        fake = FakeThunder()
+        _ready_snap(fake)
+        c, _, _, _ = make(fake, ssh_script={"cat > ~/.gw-nodes.txt": (1, b"", b"disk full")},
+                          state={"phase": "off", "host_bootstrapped": False,
+                                 "host_incomplete_snapshots": ["s9"]})
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        self.assertEqual(len(_boots(fake)[0]), 1)
+        self.assertTrue(any("template-node report lists every pack" in ln
+                            for ln in c.state.log))
+
 
 class LegacyBootstrapState(unittest.TestCase):
     """A record written before the split has no host flag: the one-piece bootstrap did

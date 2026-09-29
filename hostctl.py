@@ -2066,7 +2066,12 @@ class Controller:
         rep = parse_bootstrap(text)
         for line in rep["bad"]:
             self._log(f"host bootstrap: unreadable report line ignored: {line!r}")
-        s.bootstrap_unknown = dict(rep["unknown"])
+        # a re-run (a snapshot taken before it finished) also sees the models WE synced:
+        # what a manifest knows is ours, never the template's — the panel would offer
+        # to delete it
+        known = set(self._manifest) | set(s.manifests.get(s.snapshot_id) or {})
+        s.bootstrap_unknown = {rel: n for rel, n in rep["unknown"].items()
+                               if rel not in known}
         s.bootstrap_template_nodes = list(rep["template_nodes"])
         self._persist()
         why = bootstrap_verdict(rc, rep, err.decode("utf-8", "replace") + "\n" + text,
@@ -2372,8 +2377,9 @@ class Controller:
         comfy = self._comfy()
         need_host = not s.host_bootstrapped
         need_comfy = self._comfy_pending()
+        upload = comfy is not None and (need_comfy or need_host)
         try:
-            if need_comfy and not self._nodes_text:
+            if upload and not self._nodes_text:
                 self._nodes_text = self._node_list()     # lost with a restart
             item = await self._wait_running(s.disk_gb)
             s.ip, s.port = str(item["ip"]), int(item["port"])
@@ -2385,12 +2391,15 @@ class Controller:
             await self._wait_ssh()
             if need_host or need_comfy:
                 self._set_phase("bootstrapping")
-            if need_comfy:
+            if upload:
                 try:
                     await self._upload_nodes()      # first: the host bootstrap reads it
                 except Exception as e:
-                    self._svc_set(comfy, "setup failed", _errtext(e))
-                    raise _ServiceError(comfy, _errtext(e)) from e
+                    if need_comfy:
+                        self._svc_set(comfy, "setup failed", _errtext(e))
+                        raise _ServiceError(comfy, _errtext(e)) from e
+                    # only the host bootstrap's report needs it: unfiltered, not fatal
+                    self._log(f"{_errtext(e)} — the template-node report lists every pack")
             if need_host:
                 await self._host_bootstrap()        # a failure is the host's
             if need_comfy:
@@ -2414,10 +2423,15 @@ class Controller:
     def _ready(self) -> None:
         """ComfyUI answers: whatever the bootstrap left undone, this instance works — a
         snapshot of it is a good template (an operator who fixed a failed bootstrap by
-        hand and restarted ComfyUI has confirmed exactly that)."""
+        hand and restarted ComfyUI has confirmed exactly that). The same holds for the
+        host bootstrap: re-running it on a later start would take the models synced
+        meanwhile for the TEMPLATE's (`GW:UNKNOWN_MODEL`) and offer to delete them."""
         if self.state.bootstrap_incomplete and self._comfy() is not None:
             self._log("ComfyUI answers — the unfinished bootstrap counts as done now")
             self.state.bootstrap_incomplete = False
+        if not self.state.host_bootstrapped:
+            self._log("the host is ready — the unfinished host bootstrap counts as done now")
+            self.state.host_bootstrapped = True
         self._set_phase("ready")
 
     async def _create(self) -> None:
@@ -2453,11 +2467,12 @@ class Controller:
                           "bootstrap runs on it")
         else:
             template = str(cfg.get("bootstrap_template") or "").strip() or (
-                "comfy-ui" if comfy
-                else getattr(self._prov, "DEFAULT_TEMPLATE_NO_COMFY", "comfy-ui"))
+                "comfy-ui" if comfy else self._prov.DEFAULT_TEMPLATE_NO_COMFY)
             need_host = comfy_missing = True
-        # the ComfyUI bootstrap (and its node list) only with a ComfyUI service (R-W3)
-        self._nodes_text = self._node_list() if (comfy_missing and comfy) else ""
+        # the node list only with a ComfyUI service (R-W3): for its bootstrap, and for
+        # a host bootstrap re-run, whose template-node report leaves our packs out
+        self._nodes_text = (self._node_list() if comfy and (comfy_missing or need_host)
+                            else "")
         needs = (need_host, comfy_missing)
         spec = self._prov.spec_for(await self.api.specs(), str(cfg["gpu_type"]), num_gpus)
         storage = (spec or {}).get("storageGB") if isinstance((spec or {}).get("storageGB"), dict) else {}
@@ -2519,7 +2534,9 @@ class Controller:
         comfy = self._comfy() is not None
         s.bootstrap_incomplete = comfy_missing and comfy
         s.comfy_absent = comfy_missing and not comfy
-        if need_host:
+        if need_host and snap is None:
+            # a fresh template: the last instance's findings are not this one's (a
+            # re-run on a snapshot keeps them until the host bootstrap reports anew)
             s.bootstrap_unknown, s.bootstrap_template_nodes = {}, []
         self._set_phase("creating")
 

@@ -294,6 +294,21 @@ run_install_scripts() {
   done
 }
 
+# stop_comfy_processes <comfy dir>: our start loop, and every `main.py` whose working
+# directory is inside <comfy dir> (the template's ComfyUI runs from there, whatever
+# python and flags it was started with).
+stop_comfy_processes() {
+  local cui=$1 p cwd
+  pkill -f '[s]tart-comfy[.]sh' || true
+  for p in $(pgrep -f 'main\.py' || true); do
+    cwd=$(readlink -f "/proc/$p/cwd" 2>/dev/null || true)
+    case $cwd in
+      "$cui"|"$cui"/*) kill "$p" 2>/dev/null || true ;;
+    esac
+  done
+  pkill -f '[m]ain[.]py --listen 127[.]0[.]0[.]1 --port 8188' || true
+}
+
 write_start_script() {
   # The interpreter is fixed at write time (whichever venv was chosen); everything
   # else is resolved when the script runs.
@@ -372,13 +387,6 @@ main() {
   export GIT_TERMINAL_PROMPT=0 PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1
   trap 'rc=$?; echo "bootstrap: failed in phase $PHASE (line $LINENO, exit $rc)" >&2' ERR
 
-  phase stop
-  # Our own start loop and the ComfyUI it runs (a re-run after a smoke failure that
-  # was started by hand): a checkout and pip under a running ComfyUI break both. The
-  # template's autostart is the host bootstrap's business (ops/host-bootstrap.sh).
-  pkill -f '[s]tart-comfy[.]sh' || true
-  pkill -f '[m]ain[.]py --listen 127[.]0[.]0[.]1 --port 8188' || true
-
   phase locate
   CUI=
   for d in "$HOME/ComfyUI" /workspace/ComfyUI /opt/ComfyUI; do
@@ -400,6 +408,14 @@ main() {
     fi
   fi
   echo "ComfyUI: $CUI"
+
+  phase stop
+  # Before the checkout, any ComfyUI running from this checkout: our own loop (a re-run
+  # after a smoke failure that was started by hand) and a template ComfyUI that came
+  # back after the host bootstrap stopped it — that one would win the 8188 bind race
+  # against start-comfy.sh. A checkout and pip under a running ComfyUI break both. The
+  # template's rc-file autostart guard is the host bootstrap's (ops/host-bootstrap.sh).
+  stop_comfy_processes "$CUI"
 
   phase checkout
   if [ ! -e "$CUI/.git" ]; then git -C "$CUI" init --quiet; fi
