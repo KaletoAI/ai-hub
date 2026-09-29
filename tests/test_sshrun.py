@@ -11,7 +11,8 @@ import sshrun
 
 class Argv(unittest.TestCase):
     def test_tunnel_has_host_after_double_dash_and_forward_failure(self):
-        a = sshrun.tunnel_argv("/k", "/kh", "ubuntu@1.2.3.4", 30022, 18188)
+        a = sshrun.tunnel_argv("/k", "/kh", "ubuntu@1.2.3.4", 30022, [(18188, 8188)],
+                               "/d/ctl/x")
         self.assertEqual(a[-2:], ["--", "ubuntu@1.2.3.4"])
         self.assertIn("ExitOnForwardFailure=yes", a)
         self.assertIn("127.0.0.1:18188:127.0.0.1:8188", a)
@@ -35,6 +36,161 @@ class Argv(unittest.TestCase):
 
     def test_no_port_no_dash_p(self):
         self.assertNotIn("-p", sshrun.ssh_base("/k", "/kh"))
+
+
+class ControlMaster(unittest.TestCase):
+    """R-W1: one master connection whose forwards change without a restart."""
+    H = "ubuntu@1.2.3.4"
+
+    def test_master_shape(self):
+        a = sshrun.tunnel_argv("/k", "/kh", self.H, 30022, [(18188, 8188)], "/d/ctl/x")
+        base = sshrun.ssh_base("/k", "/kh", port=30022)
+        self.assertEqual(a[:len(base)], base)
+        self.assertEqual(a[len(base):len(base) + 9],
+                         ["-N", "-M", "-S", "/d/ctl/x", "-o", "ControlPersist=no",
+                          "-o", "ExitOnForwardFailure=yes", "-L"])
+        # the path is given by -S only, never as a ControlPath= option (a %-pattern
+        # would be expanded by ssh), and the master dies with its supervisor
+        self.assertFalse(any(x.startswith("ControlPath") for x in a))
+        self.assertNotIn("ControlPersist=yes", a)
+        self.assertEqual(a[-2:], ["--", self.H])
+
+    def test_every_forward_once_before_the_host(self):
+        fw = [(18188, 8188), (18000, 8000), (18188, 8188), (18001, 8001)]
+        a = sshrun.tunnel_argv("/k", "/kh", self.H, 22, fw, "/d/ctl/x")
+        ls = [a[i + 1] for i, x in enumerate(a) if x == "-L"]
+        self.assertEqual(ls, ["127.0.0.1:18188:127.0.0.1:8188",
+                              "127.0.0.1:18000:127.0.0.1:8000",
+                              "127.0.0.1:18001:127.0.0.1:8001"])     # dup dropped
+        self.assertLess(max(i for i, x in enumerate(a) if x == "-L"), a.index("--"))
+
+    def test_one_local_port_for_two_targets_refused(self):
+        # ExitOnForwardFailure would end the whole master — every service's tunnel
+        with self.assertRaises(ValueError):
+            sshrun.tunnel_argv("/k", "/kh", self.H, 22, [(18188, 8188), (18188, 8000)],
+                               "/d/ctl/x")
+
+    def test_bad_ports_refused(self):
+        for fw in ([(0, 8188)], [(18188, 70000)], [("x", 1)], [(True, 8188)]):
+            with self.subTest(fw=fw), self.assertRaises(ValueError):
+                sshrun.tunnel_argv("/k", "/kh", self.H, 22, fw, "/d/ctl/x")
+        with self.assertRaises(ValueError):
+            sshrun.control_argv("/d/ctl/x", self.H, "forward", 18188, 0)
+
+    def test_no_forwards_is_a_bare_master(self):
+        a = sshrun.tunnel_argv("/k", "/kh", self.H, 22, [], "/d/ctl/x")
+        self.assertNotIn("-L", a)
+        self.assertIn("-M", a)
+
+    def test_control_forward_and_cancel(self):
+        for op in ("forward", "cancel"):
+            with self.subTest(op=op):
+                self.assertEqual(
+                    sshrun.control_argv("/d/ctl/x", self.H, op, 18000, 8000),
+                    ["ssh", "-S", "/d/ctl/x", "-O", op,
+                     "-L", "127.0.0.1:18000:127.0.0.1:8000", "--", self.H])
+
+    def test_control_unknown_op_refused(self):
+        for op in ("exit", "stop", "check", "forward;rm"):
+            with self.subTest(op=op), self.assertRaises(ValueError):
+                sshrun.control_argv("/d/ctl/x", self.H, op, 18000, 8000)
+
+    def test_hostile_host_after_double_dash(self):
+        a = sshrun.control_argv("/d/ctl/x", "-oProxyCommand=evil", "forward", 1, 2)
+        self.assertLess(a.index("--"), a.index("-oProxyCommand=evil"))
+        a = sshrun.tunnel_argv("/k", "/kh", "-oProxyCommand=evil", 22, [(1, 2)], "/d/x")
+        self.assertLess(a.index("--"), a.index("-oProxyCommand=evil"))
+
+    def test_ctl_path_with_space_is_one_element(self):
+        p = "/data dir/thunder-ctl/my host"
+        for a in (sshrun.tunnel_argv("/k", "/kh", self.H, 22, [(1, 2)], p),
+                  sshrun.control_argv(p, self.H, "cancel", 1, 2)):
+            self.assertEqual(a[a.index("-S") + 1], p)
+
+    def test_ctl_path_length_limit(self):
+        # sun_path is 104 bytes on BSD/macOS, 108 on Linux, and the master binds
+        # "<path>.<16 random chars>" first — a longer path fails only at spawn time
+        ok = "/" + "a" * (sshrun.CTL_PATH_MAX - 1)
+        sshrun.tunnel_argv("/k", "/kh", self.H, 22, [(1, 2)], ok)
+        sshrun.control_argv(ok, self.H, "forward", 1, 2)
+        self.assertLessEqual(sshrun.CTL_PATH_MAX + 17 + 1, 104)
+        long = ok + "b"
+        with self.assertRaisesRegex(ValueError, "too long"):
+            sshrun.tunnel_argv("/k", "/kh", self.H, 22, [(1, 2)], long)
+        with self.assertRaisesRegex(ValueError, "too long"):
+            sshrun.control_argv(long, self.H, "forward", 1, 2)
+        # bytes, not characters: a non-ASCII name must not slip past the limit
+        with self.assertRaisesRegex(ValueError, "too long"):
+            sshrun.check_ctl_path("/" + "\u00e4" * 50)
+
+    def test_ctl_path_shape(self):
+        # ssh percent- and tilde-expands -S too; "none" disables multiplexing
+        for bad in ("", "rel/x", "~/x", "/d/%h", "none", "/d/a\nb", "/d/\x7f"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                sshrun.check_ctl_path(bad)
+        self.assertEqual(sshrun.check_ctl_path("/d/x y"), "/d/x y")
+
+
+class Control(unittest.IsolatedAsyncioTestCase):
+    async def _with_run(self, result):
+        calls = []
+
+        async def fake_run(argv, stdin=None, timeout=60):
+            calls.append((argv, stdin, timeout))
+            return result
+        orig, sshrun.run = sshrun.run, fake_run
+        try:
+            out = await sshrun.control("/d/ctl/x", "ubuntu@h", "forward", 18000, 8000)
+        finally:
+            sshrun.run = orig
+        return out, calls
+
+    async def test_control_runs_the_argv_with_timeout(self):
+        out, calls = await self._with_run((0, b"", b""))
+        self.assertEqual(out, (0, ""))
+        argv, stdin, timeout = calls[0]
+        self.assertEqual(argv, sshrun.control_argv("/d/ctl/x", "ubuntu@h", "forward",
+                                                   18000, 8000))
+        self.assertIsNone(stdin)
+        self.assertEqual(timeout, 15)
+
+    async def test_control_failure_carries_the_reason(self):
+        out, _ = await self._with_run(
+            (255, b"", b"mux_client_forward: forwarding request failed: Port forwarding failed\n"))
+        self.assertEqual(out[0], 255)
+        self.assertIn("Port forwarding failed", out[1])
+
+    async def test_control_refuses_before_spawning(self):
+        with self.assertRaises(ValueError):
+            await sshrun.control("/d/%h", "ubuntu@h", "forward", 1, 2)
+
+
+class PrepareCtl(unittest.TestCase):
+    def test_creates_0700_dir_and_clears_stale_socket(self):
+        import socket
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "ctl", "h")
+            self.assertEqual(sshrun.prepare_ctl_path(p), p)
+            self.assertEqual(os.stat(os.path.dirname(p)).st_mode & 0o777, 0o700)
+            # a socket left by a SIGKILLed master: ssh would say "already exists,
+            # disabling multiplexing" and run on WITHOUT a control socket
+            s = socket.socket(socket.AF_UNIX)
+            s.bind(p)
+            s.close()
+            os.chmod(os.path.dirname(p), 0o755)
+            sshrun.prepare_ctl_path(p)
+            self.assertFalse(os.path.exists(p))
+            self.assertEqual(os.stat(os.path.dirname(p)).st_mode & 0o777, 0o700)
+
+    def test_refuses_a_non_socket_in_the_way(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "ctl", "h")
+            os.makedirs(os.path.dirname(p))
+            with open(p, "w") as f:
+                f.write("x")
+            with self.assertRaises(ValueError):
+                sshrun.prepare_ctl_path(p)
+            self.assertTrue(os.path.exists(p))
 
 
 class SafeRel(unittest.TestCase):

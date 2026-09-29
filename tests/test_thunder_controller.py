@@ -328,6 +328,13 @@ class View(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(snap["monthly"], 120 * 0.00006849 * 730)
 
 
+def _backend_named(name):
+    return {"name": name, "type": "comfyui", "api_key": "tok",
+            "thunder": {"gpu_type": "a6000", "num_gpus": 1, "vcpus": 8, "local_port": 18188,
+                        "bootstrap_template": "comfy-ui", "reserve_gb": 20,
+                        "nodes": [], "comfy_commit": COMMIT}}
+
+
 class Tunnel(unittest.IsolatedAsyncioTestCase):
     async def test_default_tunnel_factory_builds_supervisor_with_safe_argv(self):
         fake = FakeThunder()
@@ -343,6 +350,20 @@ class Tunnel(unittest.IsolatedAsyncioTestCase):
         d = c.deps.datadir
         self.assertIn(f"UserKnownHostsFile={d}/thunder-known_hosts/u0", argv)
         self.assertEqual(argv[argv.index("-i") + 1], f"{d}/thunder.key")
+        # R-W1: a ControlMaster whose socket sits under the data dir, 0700
+        self.assertIn("-M", argv)
+        ctl = argv[argv.index("-S") + 1]
+        self.assertTrue(ctl.startswith(f"{d}/thunder-ctl/"), ctl)
+        self.assertIn("ControlPersist=no", argv)
+        self.assertEqual(os.stat(os.path.dirname(ctl)).st_mode & 0o777, 0o700)
+
+    async def test_ctl_path_is_short_and_per_backend(self):
+        a, _, _, _ = make(FakeThunder(), backend=_backend_named("GPU 1"))
+        b, _, _, _ = make(FakeThunder(), backend=_backend_named("gpu-1"),
+                          datadir=a.deps.datadir)
+        self.assertNotEqual(a._ctl_path(), b._ctl_path())      # slugs alike, not the path
+        long, _, _, _ = make(FakeThunder(), backend=_backend_named("x" * 200))
+        self.assertLessEqual(len(long._ctl_path().encode()), sshrun.CTL_PATH_MAX)
 
     async def test_tunnel_argv_refuses_without_instance(self):
         fake = FakeThunder()

@@ -16,20 +16,24 @@ per instance). What this module guards is the part that fails SILENTLY or danger
   quoted into a remote command (absolute, `..`, hidden segments such as
   `hf-cache/.token`, control characters, backslashes). Quoting stops the shell;
   it does not stop `cat ../../.ssh/id_ed25519`.
-- **the tunnel.** `Supervisor` restarts `ssh -N -L …` with a doubling backoff (reset
-  after a stable minute), logs the stderr tail of every exit — a tunnel that died on a
-  changed host key and one that died on a refused port look identical otherwise — and
-  on `stop()` ends and REAPS its process: an orphaned `ssh -N` keeps the local port
-  bound, and the next tunnel then exits at once on `ExitOnForwardFailure`.
+- **the tunnel.** One ssh ControlMaster (`tunnel_argv`) carries every forward of a host;
+  `control` adds/cancels one on the running master, so attaching a service never
+  restarts the tunnel under another service's stream. `Supervisor` restarts it with a
+  doubling backoff (reset after a stable minute), logs the stderr tail of every exit
+  — a tunnel that died on a changed host key and one that died on a refused port look
+  identical otherwise — and on `stop()` ends and REAPS its process: an orphaned
+  `ssh -N` keeps the local port bound, and the next tunnel then exits at once on
+  `ExitOnForwardFailure`.
 
 - **the LAN stream.** `pipe` copies one process's stdout into another's stdin (the
   share's `cat` into the instance's `cat >> .part`) chunk by chunk, and ends BOTH on an
   idle timeout, on a destination that died, and on cancellation — a source left writing
   into a pipe nobody reads hangs forever, and an ssh left behind keeps its session.
 
-The builders, `safe_rel`, `q` and `next_backoff` are pure (no `main`/`adapters`
-imports, no I/O at import, no module-level config); `run`, `pipe`, `Supervisor` and
-`keygen` spawn processes and are injected into the controller. Covered by test_sshrun.py.
+The builders, `check_ctl_path`, `safe_rel`, `q` and `next_backoff` are pure (no
+`main`/`adapters` imports, no I/O at import, no module-level config); `run`, `control`,
+`pipe`, `Supervisor` and `keygen` spawn processes (`prepare_ctl_path` touches the
+disk) and are injected into the controller. Covered by test_sshrun.py.
 """
 from __future__ import annotations
 
@@ -37,6 +41,7 @@ import asyncio
 import os
 import shlex
 import signal
+import stat
 import time
 from typing import Callable, Optional
 
@@ -66,16 +71,113 @@ def ssh_base(key: str, known_hosts: str, strict: str = "accept-new",
     return argv
 
 
-def tunnel_argv(key: str, known_hosts: str, host: str, port: int, lport: int,
-                rport: int = 8188) -> list[str]:
-    """`ssh -N -L 127.0.0.1:<lport>:127.0.0.1:<rport> -- host`. Bound to loopback on
-    BOTH ends: the local side must not expose the instance's ComfyUI to the LAN, and
-    ExitOnForwardFailure makes a taken local port an exit (→ restart, logged) instead
-    of a connected-looking tunnel that forwards nothing."""
-    return ssh_base(key, known_hosts, port=port) + [
-        "-N", "-o", "ExitOnForwardFailure=yes",
-        "-L", f"127.0.0.1:{lport}:127.0.0.1:{rport}",
-        "--", host]
+# The control socket is a Unix socket: its path must fit sun_path (104 bytes on
+# BSD/macOS, 108 on Linux, incl. the NUL), and the master first binds
+# "<path>.<16 random chars>" and links it into place — a path that fits by itself
+# still fails at spawn time, as a tunnel that restarts forever. 104 - 17 - 1:
+CTL_PATH_MAX = 86
+_CONTROL_OPS = ("forward", "cancel")
+
+
+def check_ctl_path(ctl_path: str) -> str:
+    """The ControlMaster socket path, returned unchanged; `ValueError` otherwise. ssh
+    tilde- and %-expands `-S` just like `ControlPath`, and `none` switches
+    multiplexing OFF — so only an absolute path without `%` and control characters,
+    within `CTL_PATH_MAX` BYTES (a non-ASCII name is longer than it looks)."""
+    if not isinstance(ctl_path, str) or not ctl_path:
+        raise ValueError("empty control socket path")
+    if not ctl_path.startswith("/"):
+        raise ValueError(f"control socket path must be absolute: {ctl_path!r}")
+    if "%" in ctl_path:
+        raise ValueError(f"'%' in control socket path (ssh expands it): {ctl_path!r}")
+    if any(ord(c) < 32 or ord(c) == 127 for c in ctl_path):
+        raise ValueError(f"control character in control socket path: {ctl_path!r}")
+    n = len(ctl_path.encode("utf-8"))
+    if n > CTL_PATH_MAX:
+        raise ValueError(f"control socket path too long ({n} > {CTL_PATH_MAX} bytes — "
+                         f"a Unix socket path is limited): {ctl_path!r}")
+    return ctl_path
+
+
+def _port(v) -> int:
+    if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= 65535:
+        raise ValueError(f"not a port: {v!r}")
+    return v
+
+
+def _fwd(lport, rport) -> str:
+    """One `-L` spec, loopback on BOTH ends: the local side must not expose the
+    instance's services to the LAN, the remote side reaches them on the VM only."""
+    return f"127.0.0.1:{_port(lport)}:127.0.0.1:{_port(rport)}"
+
+
+def tunnel_argv(key: str, known_hosts: str, host: str, port: int,
+                forwards: list[tuple[int, int]], ctl_path: str) -> list[str]:
+    """The ControlMaster tunnel: `ssh -N -M -S <ctl_path> -L … -L … -- host`, one `-L`
+    per `(local, remote)` forward. Forwards added or removed later go through the
+    master's socket (`control`), so attaching a service never restarts the tunnel and
+    never cuts a stream running through another forward (R-W1); a master that died is
+    respawned from THIS argv with every current forward.
+
+    ControlPersist=no: the master is the Supervisor's own child and must not outlive
+    it as a detached background process holding the local ports. The path goes in via
+    `-S` only (checked by `check_ctl_path`). ExitOnForwardFailure makes a taken local
+    port an exit (→ restart, logged) instead of a connected-looking tunnel that
+    forwards nothing — which is also why one local port for two targets is refused
+    here rather than left to take down every forward at once. Exact duplicates are
+    dropped (a second identical `-L` would fail as "port in use")."""
+    check_ctl_path(ctl_path)
+    specs: list[str] = []
+    seen: dict[int, int] = {}
+    for lport, rport in forwards:
+        spec = _fwd(lport, rport)
+        if lport in seen:
+            if seen[lport] != rport:
+                raise ValueError(f"local port {lport} forwarded to both "
+                                 f"{seen[lport]} and {rport}")
+            continue
+        seen[lport] = rport
+        specs.append(spec)
+    argv = ssh_base(key, known_hosts, port=port) + [
+        "-N", "-M", "-S", ctl_path,
+        "-o", "ControlPersist=no",
+        "-o", "ExitOnForwardFailure=yes"]
+    for spec in specs:
+        argv += ["-L", spec]
+    return argv + ["--", host]
+
+
+def control_argv(ctl_path: str, host: str, op: str, lport: int, rport: int) -> list[str]:
+    """`ssh -S <ctl_path> -O forward|cancel -L … -- host`: add or remove ONE forward on
+    a running master. Only these two ops — `exit`/`stop` would end the master (every
+    service's tunnel) from a call meant for one service. The host is required by
+    ssh's syntax; the master's own connection is what carries the forward."""
+    check_ctl_path(ctl_path)
+    if op not in _CONTROL_OPS:
+        raise ValueError(f"unknown control op {op!r}")
+    return ["ssh", "-S", ctl_path, "-O", op, "-L", _fwd(lport, rport), "--", host]
+
+
+def prepare_ctl_path(ctl_path: str) -> str:
+    """Make the socket's directory (0700 — the socket grants the master's session to
+    whoever can connect to it) and remove a STALE socket left there. Called right
+    before a master spawns, when no master of ours is alive: one that was SIGKILLed
+    leaves its socket behind, and the next master then logs "ControlSocket … already
+    exists, disabling multiplexing" and runs WITHOUT one — the tunnel looks fine and
+    every later `-O forward` fails. Something that is not a socket is refused, never
+    deleted. → the path."""
+    check_ctl_path(ctl_path)
+    d = os.path.dirname(ctl_path)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    os.chmod(d, 0o700)
+    try:
+        st = os.lstat(ctl_path)
+    except FileNotFoundError:
+        return ctl_path
+    if not stat.S_ISSOCK(st.st_mode):
+        raise ValueError(f"not a control socket, left in place: {ctl_path!r}")
+    os.remove(ctl_path)
+    return ctl_path
 
 
 def exec_argv(key: str, known_hosts: str, host: str, port: int,
@@ -178,6 +280,16 @@ async def run(argv: list[str], stdin: Optional[bytes] = None,
         await p.wait()
         raise
     return p.returncode, out, err
+
+
+async def control(ctl_path: str, host: str, op: str, lport: int, rport: int,
+                  timeout: float = 15) -> tuple[int, str]:
+    """Run `control_argv` → (rc, reason). The reason is ssh's own text (stderr, else
+    stdout) — "Port forwarding failed" on a taken port is what the service's `down`
+    line must say. The argv is validated BEFORE anything spawns."""
+    argv = control_argv(ctl_path, host, op, lport, rport)
+    rc, out, err = await run(argv, timeout=timeout)
+    return rc, (err.strip() or out.strip()).decode("utf-8", "replace")
 
 
 async def _kill(p) -> None:

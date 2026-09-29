@@ -1340,13 +1340,26 @@ class Controller:
             pass
         return path
 
+    def _ctl_path(self) -> str:
+        """The tunnel's ControlMaster socket, `<datadir>/thunder-ctl/<slug>-<hash>`. The
+        hash keeps two backends whose names slug alike ("GPU 1", "gpu-1") apart — a
+        shared path would have one master clear the other's LIVE socket as stale — and
+        the slug is cut so the path stays within a Unix socket's length limit."""
+        slug = thunder._slug(self.name)[:24]
+        h = hashlib.sha256(self.name.encode("utf-8")).hexdigest()[:8]
+        return os.path.join(self.deps.datadir, "thunder-ctl", f"{slug}-{h}")
+
     def _tunnel_argv(self) -> list[str]:
-        """Called by the Supervisor per spawn, so it follows the CURRENT instance."""
+        """Called by the Supervisor per spawn, so it follows the CURRENT instance — and
+        prepares the control socket each time (0700 dir; a socket a SIGKILLed master
+        left behind is removed, or the new master would run without one)."""
         s = self.state
         if not (s.uuid and s.ip and s.port):
             raise RuntimeError("no instance to tunnel to")
+        ctl = sshrun.prepare_ctl_path(self._ctl_path())
         return sshrun.tunnel_argv(self._key_path(), self._known_hosts_path(s.uuid),
-                                  f"{_SSH_USER}@{s.ip}", s.port, self.lport, _COMFY_PORT)
+                                  f"{_SSH_USER}@{s.ip}", s.port,
+                                  [(self.lport, _COMFY_PORT)], ctl)
 
     def _tunnel_factory(self):
         """The tunnel Supervisor seam (tests replace it per instance)."""
