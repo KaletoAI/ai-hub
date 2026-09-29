@@ -1,5 +1,5 @@
 """Thunder lifecycle controller against a stubbed Thunder API and a fake ssh.
-run: venv/bin/python -m unittest tests.test_thunder_controller -v"""
+run: venv/bin/python -m unittest tests.test_hostctl -v"""
 import asyncio
 import hashlib
 import json
@@ -16,7 +16,7 @@ import httpx
 import modelsync as ms
 import sshrun
 import thunder
-import thunderctl
+import hostctl
 from tests.fakes import FakeThunder  # the scripted Thunder REST API
 
 
@@ -45,7 +45,7 @@ def make(fake, backend=None, ssh_script=None, datadir=None, default_nodes="",
     clock = [1_790_000_000.0]
     phases, faults, tunnels = [], [], []
     if datadir is None:
-        datadir = tempfile.mkdtemp(prefix="thunderctl-test-")
+        datadir = tempfile.mkdtemp(prefix="hostctl-test-")
         _TMPDIRS.append(datadir)
     # a bootstrap that succeeds unless the test scripts otherwise
     script = {"bash -s": (0, b"GW:PHASE smoke\nGW:SMOKE ok\nGW:DONE\n", b"")}
@@ -73,7 +73,7 @@ def make(fake, backend=None, ssh_script=None, datadir=None, default_nodes="",
     async def keygen(path):
         return "ssh-ed25519 AAAAtest ai-hub"
 
-    deps = thunderctl.Deps(
+    deps = hostctl.Deps(
         client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(fake.handler), base_url="https://t"),
         load_state=lambda n: saved.get(n), save_state=save_state,
         set_enabled=lambda bid, on: enabled.__setitem__(bid, on) or True,
@@ -88,7 +88,7 @@ def make(fake, backend=None, ssh_script=None, datadir=None, default_nodes="",
                                 "bootstrap_template": "comfy-ui", "reserve_gb": 20,
                                 "nodes": ["https://github.com/a/pack@0123abc"],
                                 "comfy_commit": COMMIT}}
-    c = thunderctl.Controller(b, deps)
+    c = hostctl.Controller(b, deps)
 
     def tunnel():
         t = _NoTunnel(c, fake)
@@ -131,7 +131,7 @@ class Persistence(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("transfers", d)
         self.assertEqual(d["manifests"], {"s1": {"models/a.safetensors": {"size": 1}}})
         # a new controller (gateway restart) sees the same instance
-        c2 = thunderctl.Controller(c.backend, c.deps)
+        c2 = hostctl.Controller(c.backend, c.deps)
         self.assertEqual((c2.state.phase, c2.state.uuid, c2.state.index), ("ready", "u7", "7"))
         self.assertEqual(c2.state.log, [])
         self.assertEqual(c2.state.transfers, {})
@@ -142,7 +142,7 @@ class Persistence(unittest.IsolatedAsyncioTestCase):
         c, saved, _, _ = make(fake)
         saved["thunder"] = {"phase": "ready", "uuid": "u1", "port": "30022", "someday": 1,
                             "manifests": None, "log": ["stale"]}
-        c2 = thunderctl.Controller(c.backend, c.deps)
+        c2 = hostctl.Controller(c.backend, c.deps)
         self.assertEqual(c2.state.phase, "ready")
         self.assertEqual(c2.state.port, 30022)
         self.assertEqual(c2.state.manifests, {})
@@ -153,7 +153,7 @@ class Persistence(unittest.IsolatedAsyncioTestCase):
         fake = FakeThunder()
         c, saved, _, _ = make(fake)
         saved["thunder"] = {"phase": "warping", "uuid": "u1", "index": "1"}
-        c2 = thunderctl.Controller(c.backend, c.deps)
+        c2 = hostctl.Controller(c.backend, c.deps)
         self.assertEqual(c2.state.phase, "failed")
         self.assertEqual(c2.state.failed_phase, "warping")
         self.assertEqual(c2.state.uuid, "u1")
@@ -197,7 +197,7 @@ class LoadFailure(unittest.IsolatedAsyncioTestCase):
 
     def _check_blocked(self, c, saved):
         self.assertEqual(c.state.phase, "failed")
-        self.assertEqual(c.state.failed_phase, thunderctl.LOAD_FAILED)
+        self.assertEqual(c.state.failed_phase, hostctl.LOAD_FAILED)
         self.assertIn("state load failed", c.state.error)
         before = dict(saved)
         c._set_phase("failed", "still unread")
@@ -213,7 +213,7 @@ class LoadFailure(unittest.IsolatedAsyncioTestCase):
         def boom(n):
             raise OSError("store locked")
         c.deps.load_state = boom
-        c2 = thunderctl.Controller(c.backend, c.deps)
+        c2 = hostctl.Controller(c.backend, c.deps)
         self._check_blocked(c2, saved)
         self.assertEqual(saved["thunder"]["uuid"], "u9")
         with self.assertRaises(RuntimeError):
@@ -224,7 +224,7 @@ class LoadFailure(unittest.IsolatedAsyncioTestCase):
         fake = FakeThunder()
         c, saved, _, _ = make(fake)
         saved["thunder"] = ["garbage"]
-        c2 = thunderctl.Controller(c.backend, c.deps)
+        c2 = hostctl.Controller(c.backend, c.deps)
         self._check_blocked(c2, saved)
         self.assertEqual(saved["thunder"], ["garbage"])
         with self.assertRaises(RuntimeError):
@@ -234,7 +234,7 @@ class LoadFailure(unittest.IsolatedAsyncioTestCase):
         fake = FakeThunder()
         c, saved, _, _ = make(fake)
         saved["thunder"] = "garbage"
-        c2 = thunderctl.Controller(c.backend, c.deps)
+        c2 = hostctl.Controller(c.backend, c.deps)
         c2._unblock_persist()                    # what resume() does once reconciled
         c2._set_phase("off")
         self.assertEqual(saved["thunder"]["phase"], "off")
@@ -408,8 +408,8 @@ class Start(unittest.IsolatedAsyncioTestCase):
         boot = [x for x in cmds if "bash -s --" in x]
         self.assertEqual(boot, ["bash -o pipefail -c "
                                 f"'bash -s -- {COMMIT} 2>&1 | tee ~/gw-bootstrap.log'"])
-        self.assertIn(thunderctl._START_CMD, cmds)
-        self.assertTrue(thunderctl._START_CMD.endswith(
+        self.assertIn(hostctl._START_CMD, cmds)
+        self.assertTrue(hostctl._START_CMD.endswith(
             "setsid nohup ~/start-comfy.sh >/dev/null 2>&1 < /dev/null &"))
         # "off" first: template + request time are persisted before the create
         self.assertEqual(c.h.phases, ["off", "creating", "connecting", "bootstrapping",
@@ -614,7 +614,7 @@ class Start(unittest.IsolatedAsyncioTestCase):
         self.assertIn("GW:TEMPLATE_NODE ComfyUI-Manager", joined)
         self.assertIn("some noise", joined)
         # a restart keeps them (the panel shows them until they are deleted)
-        c2 = thunderctl.Controller(c.backend, c.deps)
+        c2 = hostctl.Controller(c.backend, c.deps)
         self.assertEqual(c2.state.bootstrap_template_nodes, ["ComfyUI-Manager"])
 
     async def test_known_hosts_reset_for_new_uuid(self):
@@ -857,7 +857,7 @@ class Start(unittest.IsolatedAsyncioTestCase):
         saved["thunder"] = dict({"phase": "creating", "uuid": "", "index": "0",
                                  "created_template": "comfy-ui",
                                  "create_requested_at": 1_790_000_000.0}, **state)
-        return thunderctl.Controller(c.backend, c.deps), saved
+        return hostctl.Controller(c.backend, c.deps), saved
 
     async def test_template_and_request_time_are_persisted_before_create(self):
         fake = FakeThunder()
@@ -920,7 +920,7 @@ class RestartComfy(unittest.IsolatedAsyncioTestCase):
         cmds = [p for m, p, _ in fake.calls[n:] if m == "SSH"]
         self.assertEqual(len(cmds), 1)
         self.assertIn("pkill -f", cmds[0])
-        self.assertTrue(cmds[0].endswith("; " + thunderctl._START_CMD))
+        self.assertTrue(cmds[0].endswith("; " + hostctl._START_CMD))
         self.assertEqual(c.h.phases[-2:], ["starting", "ready"])
 
     async def test_pkill_pattern_matches_comfy_but_not_the_remote_shell(self):
@@ -941,10 +941,10 @@ class RestartComfy(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(argv[0], "$COMFY_PY")
         comfy = " ".join(["/home/ubuntu/ComfyUI/venv/bin/python"] + argv[1:])
         self.assertIn("--listen 127.0.0.1", comfy)
-        pat = shlex.split(thunderctl._RESTART_CMD.split(";")[0])[2]
+        pat = shlex.split(hostctl._RESTART_CMD.split(";")[0])[2]
         self.assertTrue(re.search(pat, comfy), comfy)
-        self.assertFalse(re.search(pat, "bash -c " + thunderctl._RESTART_CMD))
-        self.assertFalse(re.search(pat, "bash -c " + shlex.quote(thunderctl._RESTART_CMD)))
+        self.assertFalse(re.search(pat, "bash -c " + hostctl._RESTART_CMD))
+        self.assertFalse(re.search(pat, "bash -c " + shlex.quote(hostctl._RESTART_CMD)))
         self.assertFalse(re.search(pat, "/bin/bash /home/ubuntu/start-comfy.sh"))
 
     async def test_restart_closes_ports_first(self):
@@ -978,7 +978,7 @@ class RestartComfy(unittest.IsolatedAsyncioTestCase):
         fake = FakeThunder()
         c, saved, _, _ = make(fake)
         saved["thunder"] = "garbage"
-        c2 = thunderctl.Controller(c.backend, c.deps)
+        c2 = hostctl.Controller(c.backend, c.deps)
         with self.assertRaises(RuntimeError):
             await c2.restart_comfy()
 
@@ -1045,7 +1045,7 @@ class Stop(unittest.IsolatedAsyncioTestCase):
         kinds = _paths(fake, n)
         snap = kinds.index(("POST", "/snapshots/create"))
         delete = kinds.index(("POST", "/instances/0/delete"))
-        du = next(i for i, (m, p) in enumerate(kinds) if m == "SSH" and p == thunderctl._DU_CMD)
+        du = next(i for i, (m, p) in enumerate(kinds) if m == "SSH" and p == hostctl._DU_CMD)
         self.assertLess(du, snap)
         self.assertLess(snap, delete)
         body = next(b for m, p, b in fake.calls[n:] if p == "/snapshots/create")
@@ -1104,8 +1104,8 @@ class Stop(unittest.IsolatedAsyncioTestCase):
         fake, c, saved, _ = await self._ready(ssh_script={"du -sb": (0, b"12345678\n", b"")})
         await c.stop()
         self.assertEqual(saved["thunder"]["base_bytes"], 12345678)
-        self.assertIn(thunderctl._DU_CMD, _ssh_cmds(fake))
-        self.assertEqual(thunderctl._DU_CMD,
+        self.assertIn(hostctl._DU_CMD, _ssh_cmds(fake))
+        self.assertEqual(hostctl._DU_CMD,
                          "du -sb --exclude=ComfyUI/models --exclude=hf-cache ~ | cut -f1")
 
     async def test_failed_du_keeps_old_base_and_still_stops(self):
@@ -1169,7 +1169,7 @@ class Stop(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):                  # nothing running
             await c.stop()
         saved["thunder"] = "garbage"
-        c2 = thunderctl.Controller(c.backend, c.deps)
+        c2 = hostctl.Controller(c.backend, c.deps)
         with self.assertRaises(RuntimeError):                  # unreconciled (Note for Task 6)
             await c2.stop()
         self.assertEqual(fake.calls, [])
@@ -1433,7 +1433,7 @@ class ReviewFixes(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_creates(fake), [])
         self.assertIsNone(c._op)
         # a restart keeps the block
-        c2 = thunderctl.Controller(c.backend, c.deps)
+        c2 = hostctl.Controller(c.backend, c.deps)
         c2._tunnel_factory = c._tunnel_factory
         with self.assertRaises(RuntimeError):
             await c2.start()
@@ -1462,7 +1462,7 @@ class ReviewFixes(unittest.IsolatedAsyncioTestCase):
         c, saved, _, _ = make(fake, state={"phase": "off", "pending_snapshot": "s7",
                                            "incomplete_snapshots": ["s7"],
                                            "manifests": {"s7": {}}})
-        for _ in range(thunderctl._PENDING_MISSES):
+        for _ in range(hostctl._PENDING_MISSES):
             await c.watch_snapshots()
         self.assertEqual(c.state.pending_snapshot, "")
         self.assertEqual(saved["thunder"]["incomplete_snapshots"], ["s7"])
@@ -1774,7 +1774,7 @@ class Resume(unittest.IsolatedAsyncioTestCase):
         c, _, _, _ = make(fake, state=_persisted(phase="restoring", ip="", port=0))
         await c.resume()
         self.assertEqual(c.state.phase, "ready", c.state.error)
-        self.assertIn(thunderctl._START_CMD, _ssh_cmds(fake))
+        self.assertIn(hostctl._START_CMD, _ssh_cmds(fake))
         self.assertFalse([x for x in _ssh_cmds(fake) if "bash -s" in x])
 
     async def test_resume_interrupted_first_start_runs_the_bootstrap(self):
@@ -1854,7 +1854,7 @@ class Resume(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(c.persist_blocked)
         self.assertEqual((c.state.phase, c.state.uuid, c.state.index), ("failed", "", ""))
         self.assertIn("u4", c.state.error)
-        self.assertNotEqual(c.state.failed_phase, thunderctl.LOAD_FAILED)
+        self.assertNotEqual(c.state.failed_phase, hostctl.LOAD_FAILED)
         self.assertEqual([o["uuid"] for o in c.view()["orphans"]], ["u4"])
         self.assertIn("4", fake.instances)                    # never deleted
         await c.stop()                                         # nothing of ours to stop
@@ -1874,7 +1874,7 @@ class Resume(unittest.IsolatedAsyncioTestCase):
                 raise OSError("store locked")
             return record
         c0.deps.load_state = load
-        c = thunderctl.Controller(c0.backend, c0.deps)
+        c = hostctl.Controller(c0.backend, c0.deps)
         c._tunnel_factory = c0._tunnel_factory
         c.h = c0.h
         self.assertTrue(c.persist_blocked)
@@ -1900,10 +1900,10 @@ async def _one_round(c):
     """One 60 s run_forever round: its 5 s ticks pass until the 60 s work ran, the next
     tick ends the loop."""
     orig, n = c.deps.sleep, [0]
-    ticks = thunderctl._WATCH_S // thunderctl._SYNC_POLL_S
+    ticks = hostctl._WATCH_S // hostctl._SYNC_POLL_S
 
     async def sleep(sec):
-        if sec == thunderctl._SYNC_POLL_S:
+        if sec == hostctl._SYNC_POLL_S:
             n[0] += 1
             if n[0] > ticks:
                 raise asyncio.CancelledError()
@@ -1973,7 +1973,7 @@ class Watcher(unittest.IsolatedAsyncioTestCase):
         c, _, _, _ = make(fake, state={"phase": "off", "pending_snapshot": "s7",
                                        "pending_snapshot_name": "aihub-thunder-x",
                                        "manifests": {"s7": {}}})
-        for _ in range(thunderctl._PENDING_MISSES - 1):
+        for _ in range(hostctl._PENDING_MISSES - 1):
             await c.watch_snapshots()
             self.assertEqual(c.state.pending_snapshot, "s7")
         await c.watch_snapshots()
@@ -2147,7 +2147,7 @@ class AccountRefresh(unittest.IsolatedAsyncioTestCase):
             ticks.append(1)
         c.refresh_account, c._sync_tick = boom, tick
         await _one_round(c)
-        self.assertEqual(len(ticks), thunderctl._WATCH_S // thunderctl._SYNC_POLL_S)
+        self.assertEqual(len(ticks), hostctl._WATCH_S // hostctl._SYNC_POLL_S)
         self.assertTrue([ln for ln in c.state.log if "account refresh failed" in ln])
 
     async def test_foreign_instances_priced_from_their_own_config(self):
@@ -2176,7 +2176,7 @@ class AccountRefresh(unittest.IsolatedAsyncioTestCase):
 
 class BootstrapParse(unittest.TestCase):
     def test_prefix_not_position(self):
-        r = thunderctl.parse_bootstrap(
+        r = hostctl.parse_bootstrap(
             "noise GW:SMOKE ok\nGW:SMOKEY ok\nGW:PHASE smoke\n  GW:NODE_FAIL x y\n"
             "GW:SMOKE fail a,b\nGW:DONE\n")
         self.assertEqual(r["smoke"], "fail a,b")
@@ -2185,7 +2185,7 @@ class BootstrapParse(unittest.TestCase):
         self.assertEqual(r["phase"], "smoke")
 
     def test_unknown_model_bad_size_is_skipped(self):
-        r = thunderctl.parse_bootstrap("GW:UNKNOWN_MODEL models/a.bin\tlots\n"
+        r = hostctl.parse_bootstrap("GW:UNKNOWN_MODEL models/a.bin\tlots\n"
                                        "GW:UNKNOWN_MODEL models/b c.bin\t7\n")
         self.assertEqual(r["unknown"], {"models/b c.bin": 7})
 
@@ -2832,7 +2832,7 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
         orig = c.deps.sleep
 
         async def sleep(sec):
-            if asyncio.current_task() in c._fetches.values() and sec != thunderctl._SYNC_POLL_S:
+            if asyncio.current_task() in c._fetches.values() and sec != hostctl._SYNC_POLL_S:
                 waits.append(sec)
             await orig(sec)
         c.deps.sleep = sleep
@@ -2910,16 +2910,16 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
 
     def test_parse_head(self):
         ok = "HTTP/1.1 302 Found\r\nContent-Length: 0\r\n\r\nHTTP/2 200\r\ncontent-length: 1234\r\n"
-        self.assertEqual(thunderctl.parse_head(ok), 1234)
-        self.assertIsNone(thunderctl.parse_head("HTTP/2 200\r\netag: x\r\n"))
-        self.assertIsNone(thunderctl.parse_head("HTTP/2 302\r\ncontent-length: 5\r\n\r\n"
+        self.assertEqual(hostctl.parse_head(ok), 1234)
+        self.assertIsNone(hostctl.parse_head("HTTP/2 200\r\netag: x\r\n"))
+        self.assertIsNone(hostctl.parse_head("HTTP/2 302\r\ncontent-length: 5\r\n\r\n"
                                                 "HTTP/2 403\r\ncontent-length: 7\r\n"))
-        self.assertIsNone(thunderctl.parse_head(""))
-        self.assertIsNone(thunderctl.parse_head("HTTP/2 200\r\ncontent-length: -1\r\n"))
+        self.assertIsNone(hostctl.parse_head(""))
+        self.assertIsNone(hostctl.parse_head("HTTP/2 200\r\ncontent-length: -1\r\n"))
         # a 2xx naming length 0 is unknown, not an empty model file: taken as the size,
         # every download would fail its size check and block the file's aliases
-        self.assertIsNone(thunderctl.parse_head("HTTP/2 200\r\ncontent-length: 0\r\n"))
-        self.assertIsNone(thunderctl.parse_head("HTTP/1.1 302 Found\r\nContent-Length: 9\r\n"
+        self.assertIsNone(hostctl.parse_head("HTTP/2 200\r\ncontent-length: 0\r\n"))
+        self.assertIsNone(hostctl.parse_head("HTTP/1.1 302 Found\r\nContent-Length: 9\r\n"
                                                 "\r\nHTTP/2 200\r\ncontent-length: 0\r\n"))
 
     async def test_unknown_files_listed_never_pruned(self):
@@ -3062,7 +3062,7 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
         orig, ticks = c.deps.sleep, [0]
 
         async def sleep(sec):
-            if sec == thunderctl._SYNC_POLL_S and asyncio.current_task() is loop_task:
+            if sec == hostctl._SYNC_POLL_S and asyncio.current_task() is loop_task:
                 ticks[0] += 1
                 if ticks[0] > 1:
                     raise asyncio.CancelledError()
@@ -3139,7 +3139,7 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(c.is_alias_ready("img"))
         self.assertTrue(c.view()["sync_error"])
         broken[0] = False
-        c.h.clock[0] += thunderctl._SYNC_REFRESH_S
+        c.h.clock[0] += hostctl._SYNC_REFRESH_S
         await c._sync_tick()
         self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
         self.assertEqual(c.view()["sync_error"], "")
@@ -3158,26 +3158,26 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
                 self.assertIsInstance(e["aliases"], list)
 
     def test_remote_paths_stay_under_the_two_roots(self):
-        self.assertEqual(thunderctl.remote_path("models/vae/a.safetensors"),
+        self.assertEqual(hostctl.remote_path("models/vae/a.safetensors"),
                          "ComfyUI/models/vae/a.safetensors")
-        self.assertEqual(thunderctl.remote_path("hf-cache/hub/x"), "hf-cache/hub/x")
+        self.assertEqual(hostctl.remote_path("hf-cache/hub/x"), "hf-cache/hub/x")
         for bad in ("models/../x", "/etc/passwd", "other/x", "models/", "hf-cache/.ssh/k",
                     "models/a\nb"):
             with self.assertRaises(ValueError, msg=bad):
-                thunderctl.remote_path(bad)
-        idx = thunderctl.parse_index("ComfyUI/models/vae/a.st\t5\nhf-cache/hub/b\t7\n"
+                hostctl.remote_path(bad)
+        idx = hostctl.parse_index("ComfyUI/models/vae/a.st\t5\nhf-cache/hub/b\t7\n"
                                      "hf-cache/.locks/c\t1\nComfyUI/custom_nodes/x\t3\n"
                                      "junk\nGW:END\n")
         self.assertEqual(idx, {"models/vae/a.st": 5, "hf-cache/hub/b": 7})
         with self.assertRaises(RuntimeError):            # cut off → never "all missing"
-            thunderctl.parse_index("ComfyUI/models/vae/a.st\t5\n")
+            hostctl.parse_index("ComfyUI/models/vae/a.st\t5\n")
 
     def test_curl_config_quotes_nothing_it_cannot_carry(self):
-        cfg = thunderctl.curl_config("https://example.com/a", "")
+        cfg = hostctl.curl_config("https://example.com/a", "")
         self.assertIn('url = "https://example.com/a"', cfg)
         self.assertNotIn("header", cfg)
         self.assertNotIn("location-trusted", cfg)
-        cfg = thunderctl.curl_config("https://huggingface.co/a", "tok")
+        cfg = hostctl.curl_config("https://huggingface.co/a", "tok")
         self.assertIn('header = "Authorization: Bearer tok"', cfg)
 
 
@@ -3229,7 +3229,7 @@ class RemoteShell(unittest.TestCase):
         import time as _t
         end = _t.monotonic() + secs
         while True:
-            rc, out, err = self.sh(thunderctl._poll_cmd(rel))
+            rc, out, err = self.sh(hostctl._poll_cmd(rel))
             self.assertEqual(rc, 0, err)
             if out.startswith("GW:END") or _t.monotonic() > end:
                 return out.splitlines()
@@ -3237,11 +3237,11 @@ class RemoteShell(unittest.TestCase):
 
     def test_fetch_poll_done_roundtrip(self):
         rel = "models/diffusion_models/it's a file.safetensors"
-        cfg = thunderctl.curl_config("https://huggingface.co/x", _TOKEN)
-        rc, out, err = self.sh(thunderctl._fetch_cmd(rel), cfg.encode(), STUB_SLEEP="2")
+        cfg = hostctl.curl_config("https://huggingface.co/x", _TOKEN)
+        rc, out, err = self.sh(hostctl._fetch_cmd(rel), cfg.encode(), STUB_SLEEP="2")
         self.assertEqual((rc, out.strip()), (0, "GW:STARTED"), err)
         # while it runs: a second start adopts, and no process shows the token
-        rc, out, _ = self.sh(thunderctl._fetch_cmd(rel), cfg.encode())
+        rc, out, _ = self.sh(hostctl._fetch_cmd(rel), cfg.encode())
         self.assertEqual(out.strip(), "GW:ADOPT")
         for pid in [p for p in os.listdir("/proc") if p.isdigit()]:
             try:
@@ -3253,26 +3253,26 @@ class RemoteShell(unittest.TestCase):
         self.assertEqual((state, size, log), ("GW:END", "7", []))
         with open(os.path.join(self.home, "cfg-seen")) as f:
             self.assertEqual(f.read(), cfg.rstrip("\n"))
-        rc, out, err = self.sh(thunderctl._done_cmd(rel))
+        rc, out, err = self.sh(hostctl._done_cmd(rel))
         self.assertEqual((rc, out.strip()), (0, "7"), err)
-        final = os.path.join(self.home, "ComfyUI", thunderctl.remote_path(rel)[len("ComfyUI/"):])
+        final = os.path.join(self.home, "ComfyUI", hostctl.remote_path(rel)[len("ComfyUI/"):])
         with open(final) as f:
             self.assertEqual(f.read(), "payload")
         self.assertEqual(sorted(os.listdir(os.path.dirname(final))),
                          ["it's a file.safetensors"])
-        rc, out, _ = self.sh(thunderctl._INDEX_CMD)
-        self.assertEqual(thunderctl.parse_index(out), {rel: 7})
-        rc, out, _ = self.sh(thunderctl._sha_cmd(rel.replace(".safetensors", ".x")))
+        rc, out, _ = self.sh(hostctl._INDEX_CMD)
+        self.assertEqual(hostctl.parse_index(out), {rel: 7})
+        rc, out, _ = self.sh(hostctl._sha_cmd(rel.replace(".safetensors", ".x")))
         self.assertNotEqual(rc, 0)                    # no .part: sha fails, not "empty"
 
     def test_curl_error_lands_in_the_poll(self):
         rel = "hf-cache/hub/x.bin"
-        cfg = thunderctl.curl_config("https://example.com/x", "")
-        self.sh(thunderctl._fetch_cmd(rel), cfg.encode(), STUB_FAIL="404 not found")
+        cfg = hostctl.curl_config("https://example.com/x", "")
+        self.sh(hostctl._fetch_cmd(rel), cfg.encode(), STUB_FAIL="404 not found")
         state, size, *log = self.poll(rel)
         self.assertEqual(state, "GW:END")
         self.assertIn("curl: (22) 404 not found", "\n".join(log))
-        rc, _, err = self.sh(thunderctl._discard_cmd(rel))
+        rc, _, err = self.sh(hostctl._discard_cmd(rel))
         self.assertEqual(rc, 0, err)
         self.assertEqual(os.listdir(os.path.join(self.home, "hf-cache", "hub")), [])
 
@@ -3282,10 +3282,10 @@ class RemoteShell(unittest.TestCase):
         os.makedirs(d)
         with open(os.path.join(d, "v.safetensors.part.lock"), "w") as f:
             f.write(f"{os.getpid()}\n")               # alive, but no curl (this test)
-        rc, out, _ = self.sh(thunderctl._KILL_CMD)
+        rc, out, _ = self.sh(hostctl._KILL_CMD)
         self.assertEqual((rc, out.strip()), (0, "GW:KILLED"))   # we are still here
-        cfg = thunderctl.curl_config("https://example.com/v", "")
-        rc, out, err = self.sh(thunderctl._fetch_cmd(rel), cfg.encode())
+        cfg = hostctl.curl_config("https://example.com/v", "")
+        rc, out, err = self.sh(hostctl._fetch_cmd(rel), cfg.encode())
         self.assertEqual(out.strip(), "GW:STARTED", err)
         self.assertEqual(self.poll(rel)[:2], ["GW:END", "7"])
 
@@ -3293,19 +3293,19 @@ class RemoteShell(unittest.TestCase):
         rel = "models/loras/l.safetensors"
         keep = os.path.join(self.home, "ComfyUI", "models", "loras", "keep.safetensors")
         old = os.path.join(self.home, "ComfyUI", "models", "loras", "old one.safetensors")
-        cfg = thunderctl.curl_config("https://example.com/l", "")
-        self.sh(thunderctl._fetch_cmd(rel), cfg.encode(), STUB_SLEEP="20")
+        cfg = hostctl.curl_config("https://example.com/l", "")
+        self.sh(hostctl._fetch_cmd(rel), cfg.encode(), STUB_SLEEP="20")
         for p in (keep, old):
             with open(p, "w") as f:
                 f.write("x")
-        self.assertEqual(self.sh(thunderctl._poll_cmd(rel))[1].splitlines()[0], "GW:RUN")
-        rc, out, err = self.sh(thunderctl._KILL_CMD)
+        self.assertEqual(self.sh(hostctl._poll_cmd(rel))[1].splitlines()[0], "GW:RUN")
+        rc, out, err = self.sh(hostctl._KILL_CMD)
         self.assertEqual((rc, out.strip()), (0, "GW:KILLED"), err)
-        self.assertEqual(self.sh(thunderctl._poll_cmd(rel))[1].splitlines()[0], "GW:END")
-        rc, out, err = self.sh(thunderctl._prune_cmd(["models/loras/old one.safetensors"]))
+        self.assertEqual(self.sh(hostctl._poll_cmd(rel))[1].splitlines()[0], "GW:END")
+        rc, out, err = self.sh(hostctl._prune_cmd(["models/loras/old one.safetensors"]))
         self.assertEqual((rc, out.split()), (0, ["GW:RM-OK", "GW:PRUNED"]), err)
         self.assertEqual(os.listdir(os.path.dirname(keep)), ["keep.safetensors"])
-        rc, out, err = self.sh(thunderctl._prune_cmd([]))
+        rc, out, err = self.sh(hostctl._prune_cmd([]))
         self.assertEqual(out.split(), ["GW:PRUNED"])
 
     def test_started_only_once_the_lock_names_the_curl(self):
@@ -3314,16 +3314,16 @@ class RemoteShell(unittest.TestCase):
         # lock names a running curl whenever GW:STARTED arrives — every time.
         rel = "models/loras/r.safetensors"
         lock = os.path.join(self.home, "ComfyUI", "models", "loras", "r.safetensors.part.lock")
-        cfg = thunderctl.curl_config("https://example.com/r", "")
+        cfg = hostctl.curl_config("https://example.com/r", "")
         for _ in range(5):
-            rc, out, err = self.sh(thunderctl._fetch_cmd(rel), cfg.encode(), STUB_SLEEP="20")
+            rc, out, err = self.sh(hostctl._fetch_cmd(rel), cfg.encode(), STUB_SLEEP="20")
             self.assertEqual((rc, out.strip()), (0, "GW:STARTED"), err)
             with open(lock) as f:
                 pid = f.read().strip()
             with open(f"/proc/{pid}/comm") as f:
                 self.assertEqual(f.read().strip(), "curl")
-            self.assertEqual(self.sh(thunderctl._KILL_CMD)[1].strip(), "GW:KILLED")
-            self.assertEqual(self.sh(thunderctl._poll_cmd(rel))[1].splitlines()[0], "GW:END")
+            self.assertEqual(self.sh(hostctl._KILL_CMD)[1].strip(), "GW:KILLED")
+            self.assertEqual(self.sh(hostctl._poll_cmd(rel))[1].splitlines()[0], "GW:END")
 
     def test_a_stale_lock_of_a_dead_pid_does_not_count_as_started(self):
         # the lock a dead curl left behind must not pass for the new child's: removed
@@ -3333,42 +3333,42 @@ class RemoteShell(unittest.TestCase):
         os.makedirs(d)
         with open(os.path.join(d, "d.safetensors.part.lock"), "w") as f:
             f.write("999999999\n")                        # no such process
-        cfg = thunderctl.curl_config("https://example.com/d", "")
-        rc, out, err = self.sh(thunderctl._fetch_cmd(rel), cfg.encode(), STUB_SLEEP="20")
+        cfg = hostctl.curl_config("https://example.com/d", "")
+        rc, out, err = self.sh(hostctl._fetch_cmd(rel), cfg.encode(), STUB_SLEEP="20")
         self.assertEqual(out.strip(), "GW:STARTED", err)
         with open(os.path.join(d, "d.safetensors.part.lock")) as f:
             self.assertNotEqual(f.read().strip(), "999999999")
-        self.sh(thunderctl._KILL_CMD)
+        self.sh(hostctl._KILL_CMD)
 
     def test_curl_that_never_comes_up_is_a_start_failure(self):
         # the lock's pid lives on but never as a curl: no GW:STARTED — the controller
         # counts a failed attempt instead of polling a download a kill could not end
         rel = "models/vae/nc.safetensors"
-        cfg = thunderctl.curl_config("https://example.com/nc", "")
-        rc, out, err = self.sh(thunderctl._fetch_cmd(rel), cfg.encode(), STUB_BECOME="5")
+        cfg = hostctl.curl_config("https://example.com/nc", "")
+        rc, out, err = self.sh(hostctl._fetch_cmd(rel), cfg.encode(), STUB_BECOME="5")
         self.assertEqual(rc, 0, err)
         self.assertEqual(out.splitlines()[0], "GW:START-FAIL")
         self.assertNotIn("GW:STARTED", out)
 
     def test_head_reports_the_final_content_length(self):
         rel = "models/vae/v.safetensors"
-        cfg = thunderctl.curl_config("https://huggingface.co/v", _TOKEN, head=True)
-        rc, out, err = self.sh(thunderctl._head_cmd(rel), cfg.encode())
+        cfg = hostctl.curl_config("https://huggingface.co/v", _TOKEN, head=True)
+        rc, out, err = self.sh(hostctl._head_cmd(rel), cfg.encode())
         self.assertEqual(rc, 0, err)
-        self.assertEqual(thunderctl.parse_head(out), 7)
+        self.assertEqual(hostctl.parse_head(out), 7)
         with open(os.path.join(self.home, "head-cfg")) as f:
             self.assertEqual(f.read(), cfg.rstrip("\n"))
-        self.assertNotIn(_TOKEN, thunderctl._head_cmd(rel))
+        self.assertNotIn(_TOKEN, hostctl._head_cmd(rel))
 
     def test_manifest_read_write_and_df(self):
-        rc, out, _ = self.sh(thunderctl._MANIFEST_READ)
-        self.assertEqual(thunderctl.parse_manifest(out), {})
-        rc, out, err = self.sh(thunderctl._MANIFEST_WRITE, b'{"models/a": {"size": 1}}')
+        rc, out, _ = self.sh(hostctl._MANIFEST_READ)
+        self.assertEqual(hostctl.parse_manifest(out), {})
+        rc, out, err = self.sh(hostctl._MANIFEST_WRITE, b'{"models/a": {"size": 1}}')
         self.assertEqual(rc, 0, err)
-        rc, out, _ = self.sh(thunderctl._MANIFEST_READ)
-        self.assertEqual(thunderctl.parse_manifest(out), {"models/a": {"size": 1, "aliases": []}})
+        rc, out, _ = self.sh(hostctl._MANIFEST_READ)
+        self.assertEqual(hostctl.parse_manifest(out), {"models/a": {"size": 1, "aliases": []}})
         self.assertFalse(os.path.exists(os.path.join(self.home, ".gw-modelsync.json.tmp")))
-        rc, out, err = self.sh(thunderctl._DF_CMD)
+        rc, out, err = self.sh(hostctl._DF_CMD)
         self.assertEqual(rc, 0, err)
         self.assertTrue(out.strip().isdigit(), out)
 
@@ -3404,7 +3404,7 @@ class _FakeCtl:
     def __init__(self, name, phase="off", uuid="", refuse=None):
         self.name = name
         self.backend = {"name": name, "type": "comfyui", "thunder": {"gpu_type": "a6000"}}
-        self.state = thunderctl.State(phase=phase, uuid=uuid)
+        self.state = hostctl.State(phase=phase, uuid=uuid)
         self.refuse = refuse or {}
         self.calls = []
         self.gate = asyncio.Event()
@@ -3476,7 +3476,7 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         m.sync_thunder_controllers()
         self.assertEqual(list(m.thunder_controllers), ["tc"])
         c = m.thunder_controllers["tc"]
-        self.assertIsInstance(c, thunderctl.Controller)
+        self.assertIsInstance(c, hostctl.Controller)
         # a rebuild hands NEW dicts: the instance stays, its backend is the current one
         fresh = self._tb(gpu_type="h100")
         m.backends = [dict(plain), fresh]
@@ -3624,7 +3624,7 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         m.backends = [self._tb()]
         m.sync_thunder_controllers()
         c = m.thunder_controllers["tc"]
-        self.assertIsInstance(c, thunderctl.Controller)
+        self.assertIsInstance(c, hostctl.Controller)
         self.assertEqual(c.state.phase, "off")
         with self.assertNoLogs("main", "WARNING"):          # answered, not logged twice
             self.assertEqual(await m.thunder_action("tc", "stop"),
@@ -3909,7 +3909,7 @@ async def _fake_keygen(path):
 
 
 def _lan(share, datadir, clock, pinned=True, host=_SRCHOST):
-    lan = thunderctl.LanSource(datadir, host=lambda: host, ssh=share.ssh,
+    lan = hostctl.LanSource(datadir, host=lambda: host, ssh=share.ssh,
                                keygen=_fake_keygen, now=lambda: clock[0])
     if pinned:
         with open(lan.known_hosts_path, "w") as f:
@@ -4227,16 +4227,16 @@ class LanSourceUnit(unittest.IsolatedAsyncioTestCase):
         self.clock = [1000.0]
 
     def test_share_mapping(self):
-        self.assertEqual(thunderctl.share_rel("models/vae/a.st"), "vae/a.st")
-        self.assertEqual(thunderctl.share_rel("hf-cache/hub/m/blobs/x"), "hf-cache/hub/m/blobs/x")
+        self.assertEqual(hostctl.share_rel("models/vae/a.st"), "vae/a.st")
+        self.assertEqual(hostctl.share_rel("hf-cache/hub/m/blobs/x"), "hf-cache/hub/m/blobs/x")
         for bad in ("models/hf-cache/hub/x", "models/hf-cache", "other/x", "models/",
                     "models/../x", "hf-cache/", "models/a/"):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
-                thunderctl.share_rel(bad)
-        self.assertEqual(thunderctl.plan_of_share("vae/a.st"), "models/vae/a.st")
-        self.assertEqual(thunderctl.plan_of_share("hf-cache/hub/x"), "hf-cache/hub/x")
+                hostctl.share_rel(bad)
+        self.assertEqual(hostctl.plan_of_share("vae/a.st"), "models/vae/a.st")
+        self.assertEqual(hostctl.plan_of_share("hf-cache/hub/x"), "hf-cache/hub/x")
         for bad in ("hf-cache", "../x", ".hidden/x", "-x/y", "a//b"):
-            self.assertIsNone(thunderctl.plan_of_share(bad), bad)
+            self.assertIsNone(hostctl.plan_of_share(bad), bad)
 
     def test_parse_source_list(self):
         text = ("F\tvae/a.st\t12\nF\thf-cache/hub/m/blobs/b\t7\n"
@@ -4246,18 +4246,18 @@ class LanSourceUnit(unittest.IsolatedAsyncioTestCase):
                 "L\thf-cache/hub/m/snapshots/r/up.st\t../../../../../x\n"   # escapes
                 "L\tvae/abs.st\t/etc/passwd\n"
                 "L\tvae/same.st\ta.st\n")
-        self.assertEqual(thunderctl.parse_source_list(text), {
+        self.assertEqual(hostctl.parse_source_list(text), {
             "models/vae/a.st": 12, "hf-cache/hub/m/blobs/b": 7,
             "hf-cache/hub/m/snapshots/r/w.st": {"link": "../../blobs/b"},
             "models/vae/same.st": {"link": "a.st"}})
 
     def test_parse_index_reads_links(self):
-        idx = thunderctl.parse_index("ComfyUI/models/vae/a.st\t5\n"
+        idx = hostctl.parse_index("ComfyUI/models/vae/a.st\t5\n"
                                      "L\thf-cache/hub/m/snapshots/r/x\t../../blobs/b\n"
                                      "L\t.hidden/l\tx\nGW:END\n")
         self.assertEqual(idx, {"models/vae/a.st": 5,
                                "hf-cache/hub/m/snapshots/r/x": {"link": "../../blobs/b"}})
-        self.assertIn("-type l -printf 'L", thunderctl._INDEX_CMD)
+        self.assertIn("-type l -printf 'L", hostctl._INDEX_CMD)
 
     def test_argv_pinned_and_quoted(self):
         sh = FakeShare()
@@ -4279,7 +4279,7 @@ class LanSourceUnit(unittest.IsolatedAsyncioTestCase):
             b64 = f.read().split()[1]
         want = subprocess.run(["ssh-keygen", "-lf", k + ".pub"], check=True,
                               capture_output=True, text=True).stdout.split()[1]
-        self.assertEqual(thunderctl.host_key_fingerprint(b64), want)
+        self.assertEqual(hostctl.host_key_fingerprint(b64), want)
 
     async def test_scan_then_pin_writes_known_hosts(self):
         sh = FakeShare()
@@ -4289,7 +4289,7 @@ class LanSourceUnit(unittest.IsolatedAsyncioTestCase):
             lan.pin("SHA256:x")                           # nothing scanned
         fp = await lan.scan()
         self.assertEqual(sh.calls[-1], ["ssh-keyscan", "-t", "ed25519", "--", "192.168.8.24"])
-        self.assertEqual(fp, thunderctl.host_key_fingerprint(_ED_B64))
+        self.assertEqual(fp, hostctl.host_key_fingerprint(_ED_B64))
         self.assertFalse(os.path.exists(lan.known_hosts_path))    # memory only
         with self.assertRaises(ValueError):
             lan.pin("SHA256:someone-else")               # not the confirmed one
@@ -4321,7 +4321,7 @@ class LanSourceUnit(unittest.IsolatedAsyncioTestCase):
         sh = FakeShare()
         sh.files["vae/a.st"] = b"xyz"
         host = ["modelsrc@192.168.8.24"]
-        lan = thunderctl.LanSource(self.d, host=lambda: host[0], ssh=sh.ssh,
+        lan = hostctl.LanSource(self.d, host=lambda: host[0], ssh=sh.ssh,
                                    keygen=_fake_keygen, now=lambda: self.clock[0])
         with open(lan.known_hosts_path, "w") as f:
             f.write(f"192.168.8.24 ssh-ed25519 {_ED_B64}\n")
@@ -4357,7 +4357,7 @@ class LanSourceUnit(unittest.IsolatedAsyncioTestCase):
         def host():
             reads[0] += 1
             return "modelsrc@192.168.8.24"
-        lan = thunderctl.LanSource(self.d, host=host, ssh=FakeShare().ssh,
+        lan = hostctl.LanSource(self.d, host=host, ssh=FakeShare().ssh,
                                    keygen=_fake_keygen, now=lambda: self.clock[0])
         with open(lan.known_hosts_path, "w") as f:
             f.write(f"192.168.8.24 ssh-ed25519 {_ED_B64}\n")
@@ -4391,7 +4391,7 @@ class LanSourceUnit(unittest.IsolatedAsyncioTestCase):
             if state["fail"]:
                 raise RuntimeError("database is locked")
             return _SRCHOST
-        lan = thunderctl.LanSource(self.d, host=host, ssh=sh.ssh, keygen=_fake_keygen,
+        lan = hostctl.LanSource(self.d, host=host, ssh=sh.ssh, keygen=_fake_keygen,
                                    now=lambda: self.clock[0])
         with open(lan.known_hosts_path, "w") as f:
             f.write(f"192.168.8.24 ssh-ed25519 {_ED_B64}\n")
@@ -4637,12 +4637,12 @@ class FinalReviewFixes(unittest.IsolatedAsyncioTestCase):
 
 
 class DepsContract(unittest.TestCase):
-    """The main↔thunderctl seam: every field `thunderctl.Deps` declares is provided by
-    `main._thunder_deps()` with a callable that accepts the arguments thunderctl calls
+    """The main↔hostctl seam: every field `hostctl.Deps` declares is provided by
+    `main._thunder_deps()` with a callable that accepts the arguments hostctl calls
     it with. A renamed or re-shaped dependency fails only at run time otherwise — in
     the middle of a start, after the instance was paid for."""
 
-    # how thunderctl calls each callable field (positional arity); None = not a callable
+    # how hostctl calls each callable field (positional arity); None = not a callable
     ARITY = {"client_factory": 0, "load_state": 1, "save_state": 2, "set_enabled": 2,
              "begin_drain": 1, "inflight": 1, "is_draining": 1, "note_fault": 4,
              "datadir": None, "probe_comfy": 1, "bootstrap_script": 0, "log": 1, "now": 0,
@@ -4656,9 +4656,9 @@ class DepsContract(unittest.TestCase):
         import inspect
         m = _main()
         d = m._thunder_deps()
-        names = [f.name for f in dataclasses.fields(thunderctl.Deps)]
+        names = [f.name for f in dataclasses.fields(hostctl.Deps)]
         self.assertEqual(sorted(names), sorted(self.ARITY), "Deps grew or lost a field — "
-                         "add it to ARITY with the arity thunderctl calls it with")
+                         "add it to ARITY with the arity hostctl calls it with")
         for name in names:
             v = getattr(d, name)
             arity = self.ARITY[name]
@@ -4667,7 +4667,7 @@ class DepsContract(unittest.TestCase):
                 self.assertTrue(v)
                 continue
             if name == "lan":
-                self.assertIsInstance(v, thunderctl.LanSource)
+                self.assertIsInstance(v, hostctl.LanSource)
                 continue
             if name == "spawn":
                 self.assertTrue(v is None or callable(v))

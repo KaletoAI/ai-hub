@@ -52,7 +52,7 @@ try:
     import main
     import admin
     import store
-    import thunderctl
+    import hostctl
 finally:
     os.chdir(_prev)
     _tmp.cleanup()
@@ -478,11 +478,11 @@ class Panel(_Base):
         self.assertRegex(html, r"<details[^>]*>\s*<summary>[^<]*log")
 
     def test_card_log_shows_the_whole_ring(self):
-        log = [f"line {i}" for i in range(thunderctl._LOG_MAX + 30)]
+        log = [f"line {i}" for i in range(hostctl._LOG_MAX + 30)]
         self.views = {"tc": _view(log=log)}
         html = self.page()
-        self.assertEqual(admin._THUNDER_LOG_LINES, thunderctl._LOG_MAX)
-        self.assertIn(f"log (last {thunderctl._LOG_MAX} lines)", html)
+        self.assertEqual(admin._THUNDER_LOG_LINES, hostctl._LOG_MAX)
+        self.assertIn(f"log (last {hostctl._LOG_MAX} lines)", html)
         self.assertIn("line 30\n", html)
         self.assertNotIn("line 29\n", html)
 
@@ -537,7 +537,7 @@ GiB = 10 ** 9
 
 
 def _plan(**over) -> dict:
-    """A controller `view()["plan"]` (thunderctl.Controller._plan_view) with one alias of
+    """A controller `view()["plan"]` (hostctl.Controller._plan_view) with one alias of
     each status the panel names."""
     f = lambda path, size, present, node=None, cls=None: {          # noqa: E731
         "path": path, "size": size, "node": node, "cls": cls, "present": present}
@@ -903,7 +903,7 @@ class LanSourcePanel(Actions):
 
     def setUp(self):
         super().setUp()
-        import thunderctl
+        import hostctl
         self.live = [{"name": "tc", "type": "comfyui", "url": "http://127.0.0.1:18188",
                       "enabled": True, "healthy": True, "models": 0, "source": "ui",
                       "thunder": {"gpu_type": "a6000"}}]
@@ -915,7 +915,7 @@ class LanSourcePanel(Actions):
         async def ssh(argv, stdin=None, timeout=60):
             self.scans.append(list(argv))
             return (0, f"192.168.8.24 ssh-ed25519 {_ED_B64}\n".encode(), b"")
-        self.lan = thunderctl.LanSource(self.d.name, host=lambda: "modelsrc@192.168.8.24",
+        self.lan = hostctl.LanSource(self.d.name, host=lambda: "modelsrc@192.168.8.24",
                                         ssh=ssh)
         with open(self.lan.key_path + ".pub", "w") as f:
             f.write("ssh-ed25519 AAAAgatewaykey ai-hub\n")
@@ -929,7 +929,7 @@ class LanSourcePanel(Actions):
                      "_thunder_modelsrc_pin": main.modelsrc_pin}.items():
             self.addCleanup(setattr, admin, k, getattr(admin, k))
             setattr(admin, k, v)
-        self.fp = thunderctl.host_key_fingerprint(_ED_B64)
+        self.fp = hostctl.host_key_fingerprint(_ED_B64)
 
     def block(self) -> str:
         m = re.search(r'<div class="tcard" data-k="thunder-modelsrc">.*?</div></div>',
@@ -991,12 +991,12 @@ class LanSourcePanel(Actions):
 
 class LanSourceWiring(CatalogWiring):
     def test_bound_and_deps(self):
-        import thunderctl
+        import hostctl
         self.assertIs(admin._thunder_modelsrc_view, main.modelsrc_view)
         self.assertIs(admin._thunder_modelsrc_scan, main.modelsrc_scan)
         self.assertIs(admin._thunder_modelsrc_pin, main.modelsrc_pin)
         # the host rule is main's ship-target rule (plain [user@]host characters)
-        self.assertEqual(thunderctl._SRC_HOST_RE.pattern, main._VOICE_HOST_RE.pattern)
+        self.assertEqual(hostctl._SRC_HOST_RE.pattern, main._VOICE_HOST_RE.pattern)
         self.assertEqual(main._modelsrc_host(), "modelsrc@192.168.8.24")
         store.set_settings({"modelsrc_host": "src@10.0.0.2"})
         self.assertEqual(main._modelsrc_host(), "src@10.0.0.2")
@@ -1091,13 +1091,13 @@ class HfToken(Actions):
         self.assertNotIn("X-Injected", r.text)
         self.assertEqual(main._thunder_hf_token(), "hf_Good1")      # nothing written
         # what the transfer would withhold is not saveable either (one rule, both ends)
-        import thunderctl
+        import hostctl
         for bad in ('hf_a"b', "hf_a\\b", "hf_ä", "h" * 513):
             with self.subTest(bad=bad):
-                self.assertFalse(thunderctl.hf_token_ok(bad))
+                self.assertFalse(hostctl.hf_token_ok(bad))
                 self.post(status=400, hf_token=bad)
                 self.assertEqual(main._thunder_hf_token(), "hf_Good1")
-        self.assertTrue(thunderctl.hf_token_ok("hf_Good1"))
+        self.assertTrue(hostctl.hf_token_ok("hf_Good1"))
         self.assertRegex(r.text, r'<details class="optblock" data-k="thunder-catalog" open>')
 
 

@@ -38,7 +38,7 @@ import socket
 import stats
 import store
 import modelsync
-import thunderctl
+import hostctl
 import thunder
 from adapters import (AdapterContext, ComfyExecutorStuck, NormalizedRequest, image_params,
                       is_image_field, lora_counterpart, lora_groups,
@@ -5857,7 +5857,7 @@ def _finalize_drain(bid: str) -> None:
     logger.info(f"backends changed → {len(backends)} effective")
 
 
-# ── Thunder Compute (thunderctl.py) ───────────────────────────────────────────
+# ── Thunder Compute (hostctl.py) ───────────────────────────────────────────
 # One Controller per `comfyui` backend carrying a `thunder` block, keyed by backend
 # name. The controller owns a billing cloud instance, so it outlives its config: a
 # block removed (or a backend deleted) while the instance runs keeps the controller —
@@ -5866,7 +5866,7 @@ def _finalize_drain(bid: str) -> None:
 _HERE = Path(__file__).resolve().parent
 _THUNDER_STATE_KEY = "thunder_state"        # store setting: backend name → State dict
 _THUNDER_PROBE_S = 10
-thunder_controllers: dict = {}              # name → thunderctl.Controller
+thunder_controllers: dict = {}              # name → hostctl.Controller
 # name → the controller's background tasks (resume, run_forever, console actions), so
 # a retired controller and the shutdown can cancel them; also held by _bg.
 _thunder_tasks: dict = {}
@@ -5884,7 +5884,7 @@ def _thunder_load_state(name: str) -> Optional[dict]:
         return None
     if not isinstance(d, dict):
         # raised, not read as {}: the controller then refuses to start and never saves
-        # over a record that may name a running instance (thunderctl._load_failed)
+        # over a record that may name a running instance (hostctl._load_failed)
         raise ValueError(f"store setting {_THUNDER_STATE_KEY} is a {type(d).__name__}, "
                          "not a dict")
     return d.get(name)
@@ -5892,7 +5892,7 @@ def _thunder_load_state(name: str) -> Optional[dict]:
 
 def _thunder_save_state(name: str, d: dict) -> None:
     """Read-modify-write of the ONE shared setting. Safe only because neither this
-    function nor thunderctl's `_persist` awaits between the read and the write — every
+    function nor hostctl's `_persist` awaits between the read and the write — every
     controller saves on the event loop thread, one after the other. Moving this to a
     worker thread (asyncio.to_thread) would open a lost-update race: two controllers
     reading the same dict, the later write erasing the other's instance record."""
@@ -6041,9 +6041,9 @@ def save_hf_token(token: str) -> str:
     (encrypted at rest — `hf_token` is in `store._SECRET_SETTINGS`). → the refusal, ""
     = saved. The refusal never repeats the value: it is a secret."""
     token = str(token or "")
-    # the transfer's own rule (thunderctl.hf_token_ok): a token it would withhold must
+    # the transfer's own rule (hostctl.hf_token_ok): a token it would withhold must
     # not be saveable — every gated download would then go without it, silently
-    if token and not thunderctl.hf_token_ok(token):
+    if token and not hostctl.hf_token_ok(token):
         return ("the HF token may hold only printable ASCII without spaces, quotes or "
                 "backslashes (at most 512 characters) — not saved")
     if not store.is_active():
@@ -6058,11 +6058,11 @@ def _thunder_datadir() -> str:
     return os.path.dirname(os.path.abspath(jobs_cfg.get("store_path", "store.db")))
 
 
-# ── the LAN model source (thunderctl.LanSource, ops/modelsrc-serve.sh on the share) ──
+# ── the LAN model source (hostctl.LanSource, ops/modelsrc-serve.sh on the share) ──
 # ONE per gateway: every Thunder controller reads the same share, so the index cache,
 # the sha256 cache and the pinned host key are shared. Rebuilt only when the data dir
 # moves (a test, a store_path change).
-_modelsrc_obj: Optional["thunderctl.LanSource"] = None
+_modelsrc_obj: Optional["hostctl.LanSource"] = None
 _modelsrc_key_task: Optional[asyncio.Task] = None
 
 
@@ -6071,7 +6071,7 @@ def _modelsrc_host() -> str:
     LanSource holds it to plain characters (the `_VOICE_HOST_RE` rule) before any argv."""
     v = store.get_setting("modelsrc_host") if store.is_active() else None
     v = str(v or "").strip()
-    return v or thunderctl.MODELSRC_HOST_DEFAULT
+    return v or hostctl.MODELSRC_HOST_DEFAULT
 
 
 def save_modelsrc_host(value: str) -> str:
@@ -6105,11 +6105,11 @@ def thunder_orphan_snapshots() -> list:
     return thunder.foreign_snapshots(snaps, list(thunder_controllers), table)
 
 
-def modelsrc() -> "thunderctl.LanSource":
+def modelsrc() -> "hostctl.LanSource":
     global _modelsrc_obj
     d = _thunder_datadir()
     if _modelsrc_obj is None or _modelsrc_obj.datadir != d:
-        _modelsrc_obj = thunderctl.LanSource(d, host=_modelsrc_host, log=logger.info)
+        _modelsrc_obj = hostctl.LanSource(d, host=_modelsrc_host, log=logger.info)
     return _modelsrc_obj
 
 
@@ -6158,10 +6158,10 @@ async def modelsrc_pin(fingerprint: str) -> str:
     return f"host key {fp} pinned — the LAN source is listed with the next model sync"
 
 
-def _thunder_deps() -> "thunderctl.Deps":
+def _thunder_deps() -> "hostctl.Deps":
     ops = _HERE / "ops"
     lan = modelsrc()
-    return thunderctl.Deps(
+    return hostctl.Deps(
         # own client per controller (closed by Controller.aclose): Thunder calls must not
         # compete with proxied traffic for the shared pool, nor outlive a closed one
         client_factory=lambda: httpx.AsyncClient(),
@@ -6231,7 +6231,7 @@ def sync_thunder_controllers() -> None:
         _thunder_warned.discard(name)       # block is back: warn again if it goes
         c = thunder_controllers.get(name)
         if c is None:
-            c = thunder_controllers[name] = thunderctl.Controller(b, _thunder_deps())
+            c = thunder_controllers[name] = hostctl.Controller(b, _thunder_deps())
             if _thunder_booted:
                 _thunder_run(name, c)
                 _modelsrc_prepare()

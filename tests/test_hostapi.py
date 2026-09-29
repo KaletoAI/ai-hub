@@ -1,6 +1,6 @@
 """The provider seam: `hostapi.ProviderApi`/`ThunderApi` (the HTTP half of a managed
 host's provider), the provider registry, and `thunder.OPTION_FIELDS`/`options_of` (the
-host form as data). The ThunderApi cases moved here from test_thunder_controller.py
+host form as data). The ThunderApi cases moved here from test_hostctl.py
 unchanged — every one guards a rule whose failure is silent or costs money: an index
 tried before the uuid can delete a STRANGER's instance, a token echoed into an error
 lands in the panel and the fault log, a price list fetched per view hammers the API.
@@ -11,7 +11,7 @@ import httpx
 
 import hostapi
 import thunder
-import thunderctl
+import hostctl
 from tests.fakes import FakeThunder  # the scripted Thunder REST API
 
 
@@ -194,10 +194,10 @@ class Api(unittest.IsolatedAsyncioTestCase):
         for e in errors:
             self.assertNotIn(token, e)
 
-    def test_thunderctl_reexports_the_same_class(self):
-        # until Task 3 renames thunderctl, its name must stay importable — and be the
+    def test_hostctl_reexports_the_same_class(self):
+        # until Task 3 renames hostctl, its name must stay importable — and be the
         # SAME class, or an isinstance/patch in one place misses the other
-        self.assertIs(thunderctl.ThunderApi, hostapi.ThunderApi)
+        self.assertIs(hostctl.ThunderApi, hostapi.ThunderApi)
         self.assertTrue(issubclass(hostapi.ThunderApi, hostapi.ProviderApi))
 
 
@@ -264,7 +264,7 @@ class Registry(unittest.TestCase):
                           thunder.DEFAULT_TEMPLATE_NO_COMFY),
                          ("thunder", "Thunder Compute", "ubuntu", "snapshot", "base"))
         # the controller's ssh user is the provider's, not a second literal
-        self.assertEqual(thunderctl._SSH_USER, thunder.SSH_USER)
+        self.assertEqual(hostctl._SSH_USER, thunder.SSH_USER)
 
 
 class OptionFields(unittest.TestCase):

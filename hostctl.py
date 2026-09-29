@@ -69,7 +69,7 @@ Never imports `main`: everything the controller needs from the gateway arrives i
 `ThunderApi` owns the HTTP and lives in hostapi.py (the provider seam: Bearer token,
 timeout, any 2xx is success, uuid first and the index only on a 404, token redaction,
 the one-hour price cache — test_hostapi.py); it is re-exported here until this module
-is renamed. Covered by test_thunder_controller.py.
+is renamed. Covered by test_hostctl.py.
 """
 from __future__ import annotations
 
@@ -1219,7 +1219,7 @@ class Controller:
 
     @property
     def bid(self) -> str:
-        # = main.backend_id; recomputed, not imported (thunderctl never imports main)
+        # = main.backend_id; recomputed, not imported (hostctl never imports main)
         return f'{self.backend.get("type", "comfyui")}:{self.name}'
 
     @property

@@ -24,7 +24,7 @@ because each one fails silently or costs money when it drifts:
 - `_cached`: price lists change rarely; one fetch per hour, and `cached()` hands the
   last body to a synchronous view that must not wait on the network.
 
-`ThunderApi` moved here unchanged from thunderctl.py (which re-exports it until the
+`ThunderApi` moved here unchanged from hostctl.py (which re-exports it until the
 controller module is renamed). No `main`/`adapters` imports. Covered by
 test_hostapi.py.
 """

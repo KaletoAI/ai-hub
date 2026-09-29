@@ -195,7 +195,7 @@ _thunder_default_nodes: Callable[[], str] = lambda: ""
 _thunder_sync_now: Callable = None
 _thunder_delete_unknown: Callable = None
 _modelsync_catalog: Callable[[], list] = lambda: []
-# The LAN model source (Task 15, main.modelsrc*): its view (thunderctl.LanSource.view —
+# The LAN model source (Task 15, main.modelsrc*): its view (hostctl.LanSource.view —
 # no network), "Fetch host key" (async → message) and "Confirm fingerprint" (async
 # (fingerprint) → message).
 _thunder_modelsrc_view: Callable[[], Optional[dict]] = lambda: None
@@ -1699,7 +1699,7 @@ def _btype_block(types: str, cur_type: str, inner: str) -> str:
     return f'<div data-btype="{types}"{style}>{inner}</div>'
 
 
-# Thunder Compute (thunderctl.py): the optional block of a ComfyUI backend. The GPU and
+# Thunder Compute (hostctl.py): the optional block of a ComfyUI backend. The GPU and
 # template lists are what the form offers; a stored value outside them (config.yaml) is
 # kept as an extra option so an edit never silently switches it.
 _THUNDER_GPUS = ("a6000", "l40", "a100xl", "h100")
@@ -2716,7 +2716,7 @@ async def backend_save(request: Request):
         b["comfy_input_dir"] = cid
     else:
         b.pop("comfy_input_dir", None)         # blank = derive from the output dir
-    # ── Thunder Compute block (thunderctl.py reads it; the api key is its token) ──
+    # ── Thunder Compute block (hostctl.py reads it; the api key is its token) ──
     if thunder_on:
         th_nodes = [ln.rstrip() for ln in (f.get("thunder_nodes", "") or "").splitlines()]
         while th_nodes and not th_nodes[-1].strip():
@@ -3036,7 +3036,7 @@ async def backend_enable(request: Request):
 
 # ── Thunder Compute: lifecycle panel + actions ──────────────────────────────────
 
-_THUNDER_LOG_LINES = 200                     # = thunderctl._LOG_MAX: the whole ring
+_THUNDER_LOG_LINES = 200                     # = hostctl._LOG_MAX: the whole ring
 _THUNDER_PHASE_KIND = {"off": "muted", "ready": "ok", "failed": "bad", "draining": "warn",
                        "pruning": "warn", "snapshotting": "warn", "deleting": "warn"}
 
@@ -3077,12 +3077,12 @@ def _hms(s) -> str:
     return f"{s // 3600}h {s % 3600 // 60:02d}m" if s >= 3600 else f"{s // 60}m {s % 60:02d}s"
 
 
-# ── Thunder: the model-sync half of the card (thunderctl.Controller._plan_view) ──
+# ── Thunder: the model-sync half of the card (hostctl.Controller._plan_view) ──
 # The view is the controller's in-memory report; every reader below tolerates a missing
 # or odd field (the card must never take the Backends tab down). Sizes are decimal GB,
 # the unit of the 503 texts (modelsync.status_text), so both say the same number.
-_SYNC_PHASES = ("syncing", "ready")          # thunderctl._SYNC_PHASES: a plan is made there
-_LAN_WAIT_PREFIX = "waiting for LAN source"  # thunderctl._LAN_WAIT
+_SYNC_PHASES = ("syncing", "ready")          # hostctl._SYNC_PHASES: a plan is made there
+_LAN_WAIT_PREFIX = "waiting for LAN source"  # hostctl._LAN_WAIT
 
 
 def _gb1(n) -> str:
