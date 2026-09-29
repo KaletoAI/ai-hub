@@ -6,6 +6,7 @@ import os
 import socket
 import tempfile
 import unittest
+from unittest import mock
 
 import sshrun
 
@@ -211,6 +212,37 @@ class PrepareCtl(unittest.TestCase):
                 sshrun.prepare_ctl_path(p)
             self.assertTrue(os.path.exists(p))
 
+    def test_unjudgeable_probe_is_a_named_value_error(self):
+        # Ruling M3: any other OSError of the probe (EACCES on a socket another user
+        # owns, a timeout) left the caller with a bare OSError — as a tunnel spawn
+        # failure that says nothing about the socket. It is a ValueError naming it now,
+        # and the socket stays.
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "ctl", "h")
+            sshrun.prepare_ctl_path(p)
+            s = socket.socket(socket.AF_UNIX)
+            s.bind(p)
+            s.close()
+            real = socket.socket
+
+            class Refusing:
+                def __init__(self, *a, **k):
+                    self._s = real(*a, **k)
+
+                def settimeout(self, t):
+                    self._s.settimeout(t)
+
+                def connect(self, path):
+                    raise PermissionError(13, "Permission denied")
+
+                def close(self):
+                    self._s.close()
+            with mock.patch.object(sshrun.socket, "socket", Refusing):
+                with self.assertRaisesRegex(ValueError, "not checkable.*PermissionError") as cm:
+                    sshrun.prepare_ctl_path(p)
+            self.assertIn(p, str(cm.exception))
+            self.assertTrue(os.path.exists(p))
+
 
 class SafeRel(unittest.TestCase):
     def test_ok(self):
@@ -326,6 +358,33 @@ class Run(unittest.IsolatedAsyncioTestCase):
         await sup.stop()
         self.assertGreaterEqual(len(n), 2)
         self.assertTrue(logs)
+        # Ruling M3: the owner can SAY why the tunnel never comes up
+        self.assertIn("ssh-binary", sup.last_spawn_error)
+
+    async def test_last_spawn_error_cleared_by_a_good_spawn(self):
+        fail = [True]
+
+        def argv():
+            if fail[0]:
+                raise ValueError("control socket in use, left in place: '/x'")
+            return ["sleep", "5"]
+
+        sup = sshrun.Supervisor(argv, log=lambda m: None, min_backoff=0.01, max_backoff=0.02)
+        self.assertEqual(sup.last_spawn_error, "")
+        sup.start()
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            if sup.last_spawn_error:
+                break
+        self.assertIn("control socket in use", sup.last_spawn_error)
+        fail[0] = False
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if sup.running:
+                break
+        self.assertTrue(sup.running)
+        self.assertEqual(sup.last_spawn_error, "")
+        await sup.stop()
 
     async def test_start_during_stop_runs_one_loop_and_orphans_nothing(self):
         # review 2026-09-27: stop() dropped its task before the old loop ended, so a

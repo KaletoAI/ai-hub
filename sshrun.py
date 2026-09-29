@@ -172,7 +172,8 @@ def prepare_ctl_path(ctl_path: str) -> str:
     disabling multiplexing" and run WITHOUT one — the tunnel looks fine and every later
     `-O forward` fails. Stale is MEASURED, not assumed: a socket something still
     listens on (a master of ours, or another backend's on the same path) is refused
-    with `ValueError` and left alone, as is anything that is not a socket. → the path."""
+    with `ValueError` and left alone, as is anything that is not a socket and a socket
+    the probe cannot judge (any other OSError, named in the message). → the path."""
     check_ctl_path(ctl_path)
     d = os.path.dirname(ctl_path)
     os.makedirs(d, mode=0o700, exist_ok=True)
@@ -189,6 +190,12 @@ def prepare_ctl_path(ctl_path: str) -> str:
         probe.connect(ctl_path)
     except (ConnectionRefusedError, FileNotFoundError):
         pass                            # nobody listens: stale
+    except OSError as e:
+        # a probe that could not decide (permission, a timeout on a wedged listener):
+        # neither stale nor provably ours — left in place, and NAMED, because the
+        # caller's log line is all the operator sees of a tunnel that never comes up
+        raise ValueError(f"control socket not checkable ({type(e).__name__}: {e}), "
+                         f"left in place: {ctl_path!r}") from e
     else:
         raise ValueError(f"control socket in use, left in place: {ctl_path!r}")
     finally:
@@ -465,6 +472,10 @@ class Supervisor:
         self._min = min_backoff
         self._max = max_backoff
         self._cur: Optional[_Run] = None     # the latest run, kept after it stopped
+        # why the last spawn attempt failed ("" after a successful spawn): a tunnel that
+        # can never start (argv_fn raising, no ssh binary) otherwise looks exactly like
+        # one that restarts now and then — the owner shows this instead
+        self.last_spawn_error = ""
 
     @property
     def running(self) -> bool:
@@ -568,8 +579,10 @@ class Supervisor:
                                   stdout=asyncio.subprocess.DEVNULL,
                                   stderr=asyncio.subprocess.PIPE)
         except Exception as e:          # missing ssh binary, argv_fn raising
+            self.last_spawn_error = str(e) or type(e).__name__
             self._say(f"tunnel spawn failed: {e}")
             return 0.0
+        self.last_spawn_error = ""
         r.proc = p
         if r.stopping:                  # stop() arrived during the spawn
             return 0.0
