@@ -181,7 +181,7 @@ _voice_dir_ok: Callable[[str], bool] = lambda d: True
 _apply_hosts: Callable[[], None] = lambda: None           # refresh main's hosts_meta cache
 # ComfyUI backend name → sorted installed LoRA filenames (discovery, verbatim).
 _backend_loras: Callable[[], dict] = lambda: {}
-# Thunder Compute backends (main.thunder_controllers): names, a controller's view()
+# Thunder Compute backends (main.host_controllers via the Thunder shim): names, a controller's view()
 # (None = no such controller) and the async console action (name, action) → message.
 _thunder_names: Callable[[], list] = lambda: []
 _thunder_view: Callable[[str], Optional[dict]] = lambda name: None
@@ -3279,10 +3279,23 @@ def _thunder_card(name: str, v: dict, cfg: Optional[dict]) -> str:
         rows.append(f'<p class="bad" data-k="{_esc(k)}-persist">State not saved: '
                     f"{_esc(v['persist_error'])} — a gateway restart would not know this "
                     "instance; a Start stops before the create while saving fails.</p>")
-    if v.get("waiting_jobs") is not None and (phase == "draining" or op):
-        n = _nbytes(v.get("waiting_jobs"))
-        rows.append(f'<p class="hint" data-k="{_esc(k)}-drain">Draining — waiting for '
-                    f"{n} job{'s' if n != 1 else ''} to finish before the snapshot.</p>")
+    if v.get("tunnel_error"):
+        # Ruling M3: a tunnel that can never start must not read like a restart
+        rows.append(f'<p class="bad" data-k="{_esc(k)}-tunnel">Tunnel will not come up: '
+                    f"{_esc(v['tunnel_error'])}</p>")
+    wj = v.get("waiting_jobs")
+    if wj is not None and (phase == "draining" or op):
+        if isinstance(wj, dict):
+            # one line per service still busy (a host drains every attached backend)
+            waits = "; ".join(
+                f"{_nbytes(n)} job{'s' if _nbytes(n) != 1 else ''} on {bid}"
+                for bid, n in sorted(wj.items(), key=lambda kv: str(kv[0])))
+            rows.append(f'<p class="hint" data-k="{_esc(k)}-drain">Draining — waiting for '
+                        f"{_esc(waits or 'the drain to complete')} before the snapshot.</p>")
+        else:
+            n = _nbytes(wj)
+            rows.append(f'<p class="hint" data-k="{_esc(k)}-drain">Draining — waiting for '
+                        f"{n} job{'s' if n != 1 else ''} to finish before the snapshot.</p>")
     t = cfg or {}
     gpu = f"{_esc(t.get('gpu_type') or '?')} ×{_esc(t.get('num_gpus') or 1)}"
     facts = [f"GPU {gpu}", f"{_esc(t.get('vcpus') or '?')} vCPU"]

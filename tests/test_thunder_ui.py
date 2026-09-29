@@ -445,6 +445,22 @@ class Panel(_Base):
         self.views = {"tc": _view(phase="off")}
         self.assertIn("<main>", self.page())
 
+    def test_card_drain_per_service_and_tunnel_error(self):
+        # a host drains EVERY attached backend: the card names who it still waits for;
+        # a tunnel whose spawn keeps failing says so (Ruling M3) instead of looking like
+        # a restart now and then
+        self.views = {"tc": _view(phase="draining", op="stopping",
+                                  waiting_jobs={"openai:vllm": 1, "comfyui:tc": 2},
+                                  tunnel_error="control socket in use, left in place: '/x'")}
+        html = self.page()
+        drain = re.search(r'<p class="hint" data-k="thunder-tc-drain">.*?</p>', html).group(0)
+        self.assertIn("2 jobs on comfyui:tc", drain)
+        self.assertIn("1 job on openai:vllm", drain)
+        tun = re.search(r'<p class="bad" data-k="thunder-tc-tunnel">.*?</p>', html).group(0)
+        self.assertIn("Tunnel will not come up: control socket in use", tun)
+        self.views = {"tc": _view(phase="ready")}
+        self.assertNotIn("thunder-tc-tunnel", self.page())
+
     def test_card_shows_the_truth(self):
         log = [f"line {i}" for i in range(120)]
         self.views = {"tc": _view(
@@ -816,12 +832,18 @@ class CatalogWiring(unittest.TestCase):
 
 
 class _FakeCtl:
-    def __init__(self, ready=(), unknown_ok=True, phase="ready"):
+    """The shim's host `thunder-<name>` with the ComfyUI backend `name` as its service."""
+    def __init__(self, ready=(), unknown_ok=True, phase="ready", name="tc"):
         self.ready, self.unknown_ok, self.phase = set(ready), unknown_ok, phase
         self.deleted, self.synced = [], 0
+        self.name = f"thunder-{name}"
+        self.services = [{"name": name, "type": "comfyui"}]
 
-    def is_alias_ready(self, alias):
-        return alias in self.ready
+    def has_service(self, bid):
+        return bid == f"comfyui:{self.services[0]['name']}"
+
+    def is_alias_ready(self, bid, alias):
+        return self.has_service(bid) and alias in self.ready
 
     def view(self):
         return {"phase": self.phase, "plan": {"aliases": {
@@ -846,13 +868,13 @@ class MainSyncWiring(CatalogWiring):
 
     def setUp(self):
         super().setUp()
-        saved = dict(main.thunder_controllers), main.image_models
-        self.addCleanup(lambda: (main.thunder_controllers.clear(),
-                                 main.thunder_controllers.update(saved[0]),
+        saved = dict(main.host_controllers), main.image_models
+        self.addCleanup(lambda: (main.host_controllers.clear(),
+                                 main.host_controllers.update(saved[0]),
                                  setattr(main, "image_models", saved[1])))
-        main.thunder_controllers.clear()
+        main.host_controllers.clear()
         main.image_models = {}
-        self.ctl = main.thunder_controllers["tc"] = _FakeCtl(ready={"done"})
+        self.ctl = main.host_controllers["thunder-tc"] = _FakeCtl(ready={"done"})
         store.upsert("solo", [{"backend": "tc", "workflow_json": {}}])
         store.upsert("mixed", [{"backend": "tc", "workflow_json": {}},
                                {"backend": "k12", "workflow_json": {}}])
@@ -863,7 +885,7 @@ class MainSyncWiring(CatalogWiring):
         self.assertEqual({a: r["gated_only"] for a, r in rows.items()},
                          {"solo": True, "mixed": False, "done": False})
         # a second Thunder backend that has not synced it either is no way out
-        main.thunder_controllers["k12"] = _FakeCtl()
+        main.host_controllers["thunder-k12"] = _FakeCtl(name="k12")
         self.assertTrue(main.thunder_view("tc")["plan"]["aliases"]["mixed"]["gated_only"])
         self.assertIsNone(main.thunder_view("nope"))
 
@@ -1003,7 +1025,7 @@ class LanSourceWiring(CatalogWiring):
         saved = main.jobs_cfg
         self.addCleanup(setattr, main, "jobs_cfg", saved)
         main.jobs_cfg = dict(saved, store_path=os.path.join(self.tmp.name, "store.db"))
-        deps = main._thunder_deps()
+        deps = main._host_deps()
         self.assertIs(deps.lan, main.modelsrc())
         self.assertEqual(deps.lan.datadir, self.tmp.name)
         self.assertEqual(deps.lan.host(), "src@10.0.0.2")
@@ -1229,18 +1251,23 @@ class CostBanner(_Base):
         """main.thunder_longrun is what the Dashboard polls every 4 s: Controller.view()
         only — thunder_view's alias-gate note would read the store per not-ready alias."""
         class Ctl:
-            def __init__(self, long):
+            def __init__(self, long, name):
                 self.long = long
+                self.services = [{"name": name, "type": "comfyui"}]
+
+            def has_service(self, bid):
+                return bid == f"comfyui:{self.services[0]['name']}"
 
             def view(self):
                 return {"phase": "ready", "long_running": self.long, "uptime_s": 90000,
                         "session_cost": 1.5,
                         "plan": {"aliases": {"a": {"ready": False}, "b": {"ready": False}}}}
-        saved = dict(main.thunder_controllers)
-        self.addCleanup(lambda: (main.thunder_controllers.clear(),
-                                 main.thunder_controllers.update(saved)))
-        main.thunder_controllers.clear()
-        main.thunder_controllers.update({"tc": Ctl(True), "k2": Ctl(False)})
+        saved = dict(main.host_controllers)
+        self.addCleanup(lambda: (main.host_controllers.clear(),
+                                 main.host_controllers.update(saved)))
+        main.host_controllers.clear()
+        main.host_controllers.update({"thunder-tc": Ctl(True, "tc"),
+                                      "thunder-k2": Ctl(False, "k2")})
 
         def boom(*a, **k):
             raise AssertionError("store read on the Dashboard path")
@@ -1308,15 +1335,17 @@ class OrphanSnapshots(_Base):
 
         snap = lambda n, i, gb=100: {"id": i, "name": n, "status": "READY",   # noqa: E731
                                      "min_disk_gb": gb, "created_at": 1}
-        saved = dict(main.thunder_controllers)
-        self.addCleanup(lambda: (main.thunder_controllers.clear(),
-                                 main.thunder_controllers.update(saved)))
-        main.thunder_controllers.clear()
-        main.thunder_controllers["tc"] = Ctl([snap("aihub-tc-20260926t120000z", "a"),
-                                              snap("aihub-gone-20260926t120000z", "b")], None)
-        main.thunder_controllers["k2"] = Ctl([snap("aihub-gone-20260926t120000z", "b"),
-                                              snap("aihub-k2-20260926t120000z", "c")],
-                                             {"snapshot_gb": 0.001})
+        saved = dict(main.host_controllers)
+        self.addCleanup(lambda: (main.host_controllers.clear(),
+                                 main.host_controllers.update(saved)))
+        main.host_controllers.clear()
+        # ownership is by HOST name (R-W4): the shim's hosts are `thunder-<backend>`
+        main.host_controllers["thunder-tc"] = Ctl(
+            [snap("aihub-thunder-tc-20260926t120000z", "a"),
+             snap("aihub-gone-20260926t120000z", "b")], None)
+        main.host_controllers["thunder-k2"] = Ctl(
+            [snap("aihub-gone-20260926t120000z", "b"),
+             snap("aihub-thunder-k2-20260926t120000z", "c")], {"snapshot_gb": 0.001})
         out = main.thunder_orphan_snapshots()
         self.assertEqual([o["id"] for o in out], ["b"])      # once, though both list it
         self.assertAlmostEqual(out[0]["monthly"], 100 * 0.001 * 730)

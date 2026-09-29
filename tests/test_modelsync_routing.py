@@ -37,20 +37,28 @@ finally:
 
 
 class _FakeCtl:
-    """A controller's routing face: in-memory readiness per alias, and a status text.
-    Counts the calls so a test can see the gate asked the controller at all."""
+    """A managed host's routing face (the shim's host `thunder-<backend>` with that one
+    ComfyUI service): in-memory readiness per alias, and a status text. Counts the
+    calls so a test can see the gate asked the controller at all — and asked it about
+    THIS service."""
 
     def __init__(self, name, ready=(), texts=None):
         self.name = name
+        self.bid = f"comfyui:{name}"
         self.ready = set(ready)
         self.texts = dict(texts or {})
         self.asked = []
 
-    def is_alias_ready(self, alias):
+    def has_service(self, bid):
+        return bid == self.bid
+
+    def is_alias_ready(self, bid, alias):
+        assert bid == self.bid, bid
         self.asked.append(alias)
         return alias in self.ready
 
-    def alias_status(self, alias):
+    def alias_status(self, bid, alias):
+        assert bid == self.bid, bid
         return self.texts.get(alias, f"models for {alias} are not planned on {self.name} yet")
 
 
@@ -71,7 +79,7 @@ class _Base(unittest.TestCase):
         self._store_active = main.store._active
         main.store._active = False
         self._saved = (main._gen_backends[:], dict(main.image_models), dict(main.backend_healthy),
-                       dict(main.thunder_controllers), dict(main.backend_inflight),
+                       dict(main.host_controllers), dict(main.backend_inflight),
                        main._gen_waiting[:], dict(main.gen_exec_faults))
         main._gen_backends[:] = [THUNDER, THUNDER2, GPU]
         main.image_models.clear()
@@ -87,8 +95,8 @@ class _Base(unittest.TestCase):
         main.backend_inflight.clear()
         main._gen_waiting.clear()
         main.gen_exec_faults.clear()
-        main.thunder_controllers.clear()
-        self.ctl = main.thunder_controllers["thunder"] = _FakeCtl(
+        main.host_controllers.clear()
+        self.ctl = main.host_controllers["thunder-thunder"] = _FakeCtl(
             "thunder", ready=(), texts={"img": SYNC_TEXT})
 
     def tearDown(self):
@@ -97,7 +105,7 @@ class _Base(unittest.TestCase):
         main._gen_backends[:] = gb
         main.image_models.clear(); main.image_models.update(im)
         main.backend_healthy.clear(); main.backend_healthy.update(bh)
-        main.thunder_controllers.clear(); main.thunder_controllers.update(tc)
+        main.host_controllers.clear(); main.host_controllers.update(tc)
         main.backend_inflight.clear(); main.backend_inflight.update(bi)
         main._gen_waiting[:] = gw
         main.gen_exec_faults.clear(); main.gen_exec_faults.update(ef)
@@ -184,7 +192,7 @@ class NoBackend503(_Base):
         self.assertEqual(e.detail, SYNC_TEXT)
 
     def test_several_gates_are_joined(self):
-        main.thunder_controllers["thunder2"] = _FakeCtl(
+        main.host_controllers["thunder-thunder2"] = _FakeCtl(
             "thunder2", texts={"both": "models for both are blocked on thunder2: no source"})
         e = self.pick_error("both")
         self.assertEqual(e.detail, "models for both are not planned on thunder yet; "

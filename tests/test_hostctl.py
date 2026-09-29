@@ -1,4 +1,9 @@
-"""Thunder lifecycle controller against a stubbed Thunder API and a fake ssh.
+"""Managed-host lifecycle controller against a stubbed Thunder API and a fake ssh.
+
+The fixture is ONE host (named like its backend, `thunder`) with ONE ComfyUI service —
+the shape every test before the host/service split was written for, so their money
+invariants read unchanged; the host-level tests (several services, drain of all, host
+faults, forwards on the running master) build their own.
 run: venv/bin/python -m unittest tests.test_hostctl -v"""
 import asyncio
 import hashlib
@@ -10,6 +15,7 @@ import shutil
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 import httpx
 
@@ -21,6 +27,7 @@ from tests.fakes import FakeThunder  # the scripted Thunder REST API
 
 
 COMMIT = "1d61dcc35c35541388c0001bacc7703db14e8bea"
+BID = "comfyui:thunder"         # the fixture's one ComfyUI service
 _TMPDIRS = []
 
 
@@ -30,7 +37,7 @@ def tearDownModule():
 
 
 def make(fake, backend=None, ssh_script=None, datadir=None, default_nodes="",
-         probe=None, state=None):
+         probe=None, state=None, host_name=None, services=None):
     """A controller on the stub API. `c.h` carries the harness: `clock` (a list; the
     fake sleep ADVANCES it, so every timeout is reachable without waiting), `phases`
     (every persisted phase in order), `faults`, `tunnels`. `ssh_script` maps a
@@ -38,8 +45,16 @@ def make(fake, backend=None, ssh_script=None, datadir=None, default_nodes="",
     order (the last one sticks); the bootstrap succeeds by default. Every ssh call is also appended to `fake.calls` as
     ("SSH", remote_cmd, stdin), so the order against API calls is checkable. The
     datadir is a fresh temp dir per controller unless given. `state` is a persisted
-    record the controller loads at construction (a gateway restart)."""
-    saved = {} if state is None else {"thunder": state}
+    record the controller loads at construction (a gateway restart). The host is named
+    like the backend unless `host_name` says otherwise, its options ARE the backend's
+    `thunder` block (the shim's shape) and `services` replaces the one ComfyUI service."""
+    b = backend or {"name": "thunder", "type": "comfyui", "api_key": "tok",
+                    "thunder": {"gpu_type": "a6000", "num_gpus": 1, "vcpus": 8, "local_port": 18188,
+                                "bootstrap_template": "comfy-ui", "reserve_gb": 20,
+                                "nodes": ["https://github.com/a/pack@0123abc"],
+                                "comfy_commit": COMMIT}}
+    hname = host_name or b["name"]
+    saved = {} if state is None else {hname: state}
     enabled = {}
     ssh_calls = []
     clock = [1_790_000_000.0]
@@ -83,12 +98,12 @@ def make(fake, backend=None, ssh_script=None, datadir=None, default_nodes="",
         ssh=ssh, spawn=None, probe_comfy=probe or (lambda url: asyncio.sleep(0, True)),
         bootstrap_script=lambda: b"#!/bin/bash\necho GW:DONE\n",
         keygen=keygen, default_nodes=lambda: default_nodes)
-    b = backend or {"name": "thunder", "type": "comfyui", "api_key": "tok",
-                    "thunder": {"gpu_type": "a6000", "num_gpus": 1, "vcpus": 8, "local_port": 18188,
-                                "bootstrap_template": "comfy-ui", "reserve_gb": 20,
-                                "nodes": ["https://github.com/a/pack@0123abc"],
-                                "comfy_commit": COMMIT}}
-    c = hostctl.Controller(b, deps)
+    host = {"name": hname, "provider": "thunder", "options": b["thunder"],
+            "api_key": b.get("api_key", "")}
+    if services is None:
+        services = [dict(b, local_port=int(b["thunder"].get("local_port") or 18188),
+                         remote_port=8188)]
+    c = hostctl.Controller(host, services, deps)
 
     def tunnel():
         t = _NoTunnel(c, fake)
@@ -97,6 +112,11 @@ def make(fake, backend=None, ssh_script=None, datadir=None, default_nodes="",
     c._tunnel_factory = tunnel                    # never spawn ssh in tests
     c.h = types.SimpleNamespace(clock=clock, phases=phases, faults=faults, tunnels=tunnels)
     return c, saved, enabled, ssh_calls
+
+
+def again(c):
+    """The same host after a gateway restart: a new controller on the same deps."""
+    return hostctl.Controller(c.host, c.services, c.deps)
 
 
 class _NoTunnel:
@@ -131,7 +151,7 @@ class Persistence(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("transfers", d)
         self.assertEqual(d["manifests"], {"s1": {"models/a.safetensors": {"size": 1}}})
         # a new controller (gateway restart) sees the same instance
-        c2 = hostctl.Controller(c.backend, c.deps)
+        c2 = again(c)
         self.assertEqual((c2.state.phase, c2.state.uuid, c2.state.index), ("ready", "u7", "7"))
         self.assertEqual(c2.state.log, [])
         self.assertEqual(c2.state.transfers, {})
@@ -142,7 +162,7 @@ class Persistence(unittest.IsolatedAsyncioTestCase):
         c, saved, _, _ = make(fake)
         saved["thunder"] = {"phase": "ready", "uuid": "u1", "port": "30022", "someday": 1,
                             "manifests": None, "log": ["stale"]}
-        c2 = hostctl.Controller(c.backend, c.deps)
+        c2 = again(c)
         self.assertEqual(c2.state.phase, "ready")
         self.assertEqual(c2.state.port, 30022)
         self.assertEqual(c2.state.manifests, {})
@@ -153,7 +173,7 @@ class Persistence(unittest.IsolatedAsyncioTestCase):
         fake = FakeThunder()
         c, saved, _, _ = make(fake)
         saved["thunder"] = {"phase": "warping", "uuid": "u1", "index": "1"}
-        c2 = hostctl.Controller(c.backend, c.deps)
+        c2 = again(c)
         self.assertEqual(c2.state.phase, "failed")
         self.assertEqual(c2.state.failed_phase, "warping")
         self.assertEqual(c2.state.uuid, "u1")
@@ -213,7 +233,7 @@ class LoadFailure(unittest.IsolatedAsyncioTestCase):
         def boom(n):
             raise OSError("store locked")
         c.deps.load_state = boom
-        c2 = hostctl.Controller(c.backend, c.deps)
+        c2 = again(c)
         self._check_blocked(c2, saved)
         self.assertEqual(saved["thunder"]["uuid"], "u9")
         with self.assertRaises(RuntimeError):
@@ -224,7 +244,7 @@ class LoadFailure(unittest.IsolatedAsyncioTestCase):
         fake = FakeThunder()
         c, saved, _, _ = make(fake)
         saved["thunder"] = ["garbage"]
-        c2 = hostctl.Controller(c.backend, c.deps)
+        c2 = again(c)
         self._check_blocked(c2, saved)
         self.assertEqual(saved["thunder"], ["garbage"])
         with self.assertRaises(RuntimeError):
@@ -234,7 +254,7 @@ class LoadFailure(unittest.IsolatedAsyncioTestCase):
         fake = FakeThunder()
         c, saved, _, _ = make(fake)
         saved["thunder"] = "garbage"
-        c2 = hostctl.Controller(c.backend, c.deps)
+        c2 = again(c)
         c2._unblock_persist()                    # what resume() does once reconciled
         c2._set_phase("off")
         self.assertEqual(saved["thunder"]["phase"], "off")
@@ -373,8 +393,9 @@ class Tunnel(unittest.IsolatedAsyncioTestCase):
 
     async def test_bid_and_url(self):
         c, _, _, _ = make(FakeThunder())
-        self.assertEqual(c.bid, "comfyui:thunder")
-        self.assertEqual(c.url, "http://127.0.0.1:18188")
+        self.assertEqual(c.service_bids(), ["comfyui:thunder"])
+        self.assertTrue(c.has_service("comfyui:thunder"))
+        self.assertEqual(c._svc_url(c.services[0]), "http://127.0.0.1:18188")
 
 
 
@@ -442,7 +463,7 @@ class Start(unittest.IsolatedAsyncioTestCase):
         # misleading reason
         fake = FakeThunder()
         c, _, _, calls = make(fake, default_nodes="# default\nregistry:x@1.0\n")
-        c.backend["thunder"]["nodes"] = []
+        c.cfg["nodes"] = []
         await c.start()
         up = [stdin for argv, stdin in calls if argv[-1] == "cat > ~/.gw-nodes.txt"]
         self.assertEqual(up, [b"# default\nregistry:x@1.0\n"])
@@ -450,7 +471,7 @@ class Start(unittest.IsolatedAsyncioTestCase):
     async def test_no_node_list_at_all_refuses_before_create(self):
         fake = FakeThunder()
         c, _, enabled, _ = make(fake)
-        c.backend["thunder"]["nodes"] = []
+        c.cfg["nodes"] = []
         await c.start()
         self.assertEqual(c.state.phase, "off")
         self.assertIn("node", c.state.error)
@@ -614,7 +635,7 @@ class Start(unittest.IsolatedAsyncioTestCase):
         self.assertIn("GW:TEMPLATE_NODE ComfyUI-Manager", joined)
         self.assertIn("some noise", joined)
         # a restart keeps them (the panel shows them until they are deleted)
-        c2 = hostctl.Controller(c.backend, c.deps)
+        c2 = again(c)
         self.assertEqual(c2.state.bootstrap_template_nodes, ["ComfyUI-Manager"])
 
     async def test_known_hosts_reset_for_new_uuid(self):
@@ -688,7 +709,7 @@ class Start(unittest.IsolatedAsyncioTestCase):
         fake = FakeThunder()
         c, _, enabled, _ = make(fake)
         for bad in ("abc", "", "1d61dcc3", COMMIT + "0", "g" * 40, None):
-            c.backend["thunder"]["comfy_commit"] = bad
+            c.cfg["comfy_commit"] = bad
             with self.assertRaises(RuntimeError) as cm:
                 await c.start()
             self.assertIn("comfy_commit", str(cm.exception))
@@ -857,7 +878,7 @@ class Start(unittest.IsolatedAsyncioTestCase):
         saved["thunder"] = dict({"phase": "creating", "uuid": "", "index": "0",
                                  "created_template": "comfy-ui",
                                  "create_requested_at": 1_790_000_000.0}, **state)
-        return hostctl.Controller(c.backend, c.deps), saved
+        return again(c), saved
 
     async def test_template_and_request_time_are_persisted_before_create(self):
         fake = FakeThunder()
@@ -941,10 +962,10 @@ class RestartComfy(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(argv[0], "$COMFY_PY")
         comfy = " ".join(["/home/ubuntu/ComfyUI/venv/bin/python"] + argv[1:])
         self.assertIn("--listen 127.0.0.1", comfy)
-        pat = shlex.split(hostctl._RESTART_CMD.split(";")[0])[2]
+        pat = shlex.split(hostctl._restart_cmd(8188).split(";")[0])[2]
         self.assertTrue(re.search(pat, comfy), comfy)
-        self.assertFalse(re.search(pat, "bash -c " + hostctl._RESTART_CMD))
-        self.assertFalse(re.search(pat, "bash -c " + shlex.quote(hostctl._RESTART_CMD)))
+        self.assertFalse(re.search(pat, "bash -c " + hostctl._restart_cmd(8188)))
+        self.assertFalse(re.search(pat, "bash -c " + shlex.quote(hostctl._restart_cmd(8188))))
         self.assertFalse(re.search(pat, "/bin/bash /home/ubuntu/start-comfy.sh"))
 
     async def test_restart_closes_ports_first(self):
@@ -978,7 +999,7 @@ class RestartComfy(unittest.IsolatedAsyncioTestCase):
         fake = FakeThunder()
         c, saved, _, _ = make(fake)
         saved["thunder"] = "garbage"
-        c2 = hostctl.Controller(c.backend, c.deps)
+        c2 = again(c)
         with self.assertRaises(RuntimeError):
             await c2.restart_comfy()
 
@@ -1097,7 +1118,8 @@ class Stop(unittest.IsolatedAsyncioTestCase):
         c.deps.sleep = sleep
         await c.stop()
         self.assertEqual(c.state.phase, "off", c.state.error)
-        self.assertEqual(seen[:2], [(2, 0), (2, 0)])
+        # per service now ({bid: jobs}): 0 jobs, but the drain itself is not over
+        self.assertEqual(seen[:2], [(2, {BID: 0}), (2, {BID: 0})])
         self.assertIsNone(c.view()["waiting_jobs"])
 
     async def test_stop_measures_base_bytes(self):
@@ -1169,7 +1191,7 @@ class Stop(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):                  # nothing running
             await c.stop()
         saved["thunder"] = "garbage"
-        c2 = hostctl.Controller(c.backend, c.deps)
+        c2 = again(c)
         with self.assertRaises(RuntimeError):                  # unreconciled (Note for Task 6)
             await c2.stop()
         self.assertEqual(fake.calls, [])
@@ -1433,7 +1455,7 @@ class ReviewFixes(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_creates(fake), [])
         self.assertIsNone(c._op)
         # a restart keeps the block
-        c2 = hostctl.Controller(c.backend, c.deps)
+        c2 = again(c)
         c2._tunnel_factory = c._tunnel_factory
         with self.assertRaises(RuntimeError):
             await c2.start()
@@ -1874,7 +1896,7 @@ class Resume(unittest.IsolatedAsyncioTestCase):
                 raise OSError("store locked")
             return record
         c0.deps.load_state = load
-        c = hostctl.Controller(c0.backend, c0.deps)
+        c = again(c0)
         c._tunnel_factory = c0._tunnel_factory
         c.h = c0.h
         self.assertTrue(c.persist_blocked)
@@ -2167,7 +2189,7 @@ class AccountRefresh(unittest.IsolatedAsyncioTestCase):
     async def test_no_token_no_calls(self):
         fake = FakeThunder()
         c, _, _, _ = make(fake, state={"phase": "off"})
-        c.backend = dict(c.backend, api_key="")
+        c.host = dict(c.host, api_key="")
         await _one_round(c)
         self.assertEqual(fake.calls, [])
         self.assertEqual(c.snapshots(), [])
@@ -2397,9 +2419,10 @@ def _sync_make(aliases=None, catalog=None, src=None, token=_TOKEN, **kw):
     c, saved, enabled, calls = make(fake, **kw)
     box = {"aliases": dict(aliases or {}), "catalog": list(catalog or [])}
 
-    def needs(name):
+    def needs(bid):                     # called with the ComfyUI service's backend id
         return [ms.alias_need(a, ms.refs_for(cand, cand["workflow_json"], []), box["catalog"])
-                for a, cand in sorted(box["aliases"].items()) if cand.get("backend") == name]
+                for a, cand in sorted(box["aliases"].items())
+                if f"comfyui:{cand.get('backend')}" == bid]
     c.deps.alias_needs = needs
     c.deps.alias_signature = lambda name: json.dumps(box, sort_keys=True)
     c.deps.url_catalog = lambda: ms.url_catalog(box["catalog"])
@@ -2455,23 +2478,23 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
                     "https://example.com/b.safetensors": 300}
         vm.chunk = 50
         vm.hold.add("https://example.com/b.safetensors")
-        self.assertFalse(c.is_alias_ready("img"))               # no plan yet
+        self.assertFalse(c.is_alias_ready(BID, "img"))               # no plan yet
         self.assertIsNone(c.plan)
         await c.start()
         self.assertEqual(c.state.phase, "ready", c.state.error)
         self.assertEqual(c.h.phases[-3:], ["starting", "syncing", "ready"])
         self.assertIsNotNone(c.plan)
-        self.assertFalse(c.is_alias_ready("img"))
+        self.assertFalse(c.is_alias_ready(BID, "img"))
         # a finished, b still downloading: a is present, the alias is not ready
         self.assertTrue(await _until(lambda: a in vm.files and c.plan is not None and any(
             f["path"] == a and f["present"] for f in c.plan["per_alias"]["img"]["files"])))
-        self.assertFalse(c.is_alias_ready("img"))
+        self.assertFalse(c.is_alias_ready(BID, "img"))
         self.assertNotIn("img", c.ready_aliases)
-        self.assertIn("syncing on thunder", c.alias_status("img"))
+        self.assertIn("syncing on thunder", c.alias_status(BID, "img"))
         self.assertIn(b, [t["file"] for t in c.view()["transfers"]])
         vm.hold.clear()
-        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
-        self.assertEqual(c.alias_status("img"), "models for img are ready on thunder")
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")))
+        self.assertEqual(c.alias_status(BID, "img"), "models for img are ready on thunder")
         man = json.loads(vm.manifest)
         self.assertEqual(man[a]["size"], 100)
         self.assertEqual(man[b]["size"], 300)
@@ -2481,12 +2504,12 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(c.view()["transfers"], [])
         # readiness is also a phase question
         c.state.phase = "draining"
-        self.assertFalse(c.is_alias_ready("img"))
-        self.assertEqual(c.alias_status("img"), "thunder instance is draining")
+        self.assertFalse(c.is_alias_ready(BID, "img"))
+        self.assertEqual(c.alias_status(BID, "img"), "thunder instance is draining")
         c.state.phase = "syncing"
-        self.assertTrue(c.is_alias_ready("img"))
-        self.assertFalse(c.is_alias_ready("other"))
-        self.assertIn("not planned", c.alias_status("other"))
+        self.assertTrue(c.is_alias_ready(BID, "img"))
+        self.assertFalse(c.is_alias_ready(BID, "other"))
+        self.assertIn("not planned", c.alias_status(BID, "other"))
 
     async def test_at_most_three_transfers_at_once(self):
         names = [f"f{i}.safetensors" for i in range(5)]
@@ -2501,7 +2524,7 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(vm.started), 3)
         self.assertEqual(len(c._fetches), 3)
         vm.hold.clear()
-        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")))
         self.assertEqual(len(vm.started), 5)
 
     async def test_alias_removed_during_session_keeps_files_until_stop(self):
@@ -2539,11 +2562,11 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
                                          catalog=[_url("held.safetensors")])
         vm.sizes = {"https://example.com/held.safetensors": 5}
         await c.start()
-        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")))
         # the alias now loads a file no source has → blocked; its synced file is held
         box["aliases"]["img"] = _cand("nowhere.safetensors")
         await c._sync_tick()
-        self.assertFalse(c.is_alias_ready("img"))
+        self.assertFalse(c.is_alias_ready(BID, "img"))
         self.assertEqual(c.plan["held"], [[h, 5, "img"]])
         await c.stop()
         self.assertIn(h, vm.files)
@@ -2573,7 +2596,7 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(c.state.phase, "ready", c.state.error)
         self.assertIsNone(c.plan)                     # not before the first sync
         await c._sync_tick()
-        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")))
         self.assertEqual(vm.started, [])              # no second curl on the same .part
         self.assertEqual(vm.files[p], 30)
         self.assertTrue(any("adopted" in ln for ln in c.state.log))
@@ -2587,7 +2610,7 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
         fake, vm, c, box, _ = _sync_make(aliases={"img": _cand(*names)}, catalog=cat)
         vm.sizes = {e["url"]: 4 for e in cat}
         await c.start()
-        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")))
         cfg = {p: t for p, t in vm.started}
         self.assertIn(f'header = "Authorization: Bearer {_TOKEN}"', cfg[_dm("h.safetensors")])
         self.assertIn(f'header = "Authorization: Bearer {_TOKEN}"', cfg[_dm("w.safetensors")])
@@ -2612,9 +2635,9 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await _until(lambda: _idle(c) and "img" in (c.plan or {}).get(
             "per_alias", {}) and c.plan["per_alias"]["img"]["blocked"]))
         blob = "\n".join(c.state.log) + json.dumps(c.view(), default=str) + json.dumps(
-            c.h.faults, default=str) + c.alias_status("img")
+            c.h.faults, default=str) + c.alias_status(BID, "img")
         self.assertNotIn(_TOKEN, blob)
-        self.assertIn("401", c.alias_status("img"))
+        self.assertIn("401", c.alias_status(BID, "img"))
 
     async def test_failed_transfer_blocks_after_three_attempts_with_fault(self):
         url = "https://example.com/x.safetensors"
@@ -2624,13 +2647,16 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
         await c.start()
         self.assertTrue(await _until(lambda: _idle(c) and c.plan["per_alias"]["img"]["blocked"]))
         self.assertEqual(len(vm.started), 3)
-        self.assertFalse(c.is_alias_ready("img"))
-        st = c.alias_status("img")
+        self.assertFalse(c.is_alias_ready(BID, "img"))
+        st = c.alias_status(BID, "img")
         self.assertIn("blocked on thunder", st)
         self.assertIn("transfer failed", st)
         self.assertIn("404", st)
         sync_faults = [f for f in c.h.faults if f[1:3] == ("sync", "transfer")]
         self.assertEqual(len(sync_faults), 1)
+        # a transfer is the ComfyUI SERVICE's event (R-K1), not the host's
+        self.assertEqual((sync_faults[0][0]["name"], sync_faults[0][0]["type"]),
+                         ("thunder", "comfyui"))
         self.assertIn(_dm("x.safetensors"), sync_faults[0][3])
         # no retry loop: the next sync keeps it blocked without a fourth curl
         await c.sync_once()
@@ -2641,7 +2667,7 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
         vm.sizes[url] = 3
         box["catalog"] = [_url("x.safetensors")] + [{"match": {"alias": "other"}, "paths": []}]
         await c._sync_tick()
-        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")))
 
     async def test_sha256_mismatch_discards_the_part(self):
         url = "https://example.com/x.safetensors"
@@ -2651,7 +2677,7 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
         vm.sha[url] = "cd" * 32
         await c.start()
         self.assertTrue(await _until(lambda: _idle(c) and c.plan["per_alias"]["img"]["blocked"]))
-        self.assertIn("sha256", c.alias_status("img"))
+        self.assertIn("sha256", c.alias_status(BID, "img"))
         self.assertNotIn(_dm("x.safetensors"), vm.files)
         self.assertNotIn(_dm("x.safetensors") + ".part", vm.files)
         self.assertEqual(len(_gw(fake, "gw-discard")), 3)
@@ -2659,7 +2685,7 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
         vm.sha[url] = "AB" * 32
         box["catalog"] = [_url("x.safetensors", sha="AB" * 32)]
         await c._sync_tick()
-        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")))
         self.assertEqual(json.loads(vm.manifest)[_dm("x.safetensors")]["sha256"], "ab" * 32)
 
     async def test_disk_growth_calls_modify(self):
@@ -2680,7 +2706,7 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
         first_mod = next(i for i, (m, p, _) in enumerate(fake.calls) if p.endswith("/modify"))
         self.assertTrue([i for i in lists if i < first_mod])
         self.assertEqual((c.state.disk_gb, saved["thunder"]["disk_gb"]), (140, 140))
-        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")))
 
     async def test_disk_beyond_spec_max_blocks_the_alias(self):
         big, url = _dm("big.safetensors"), "https://example.com/big.safetensors"
@@ -2692,9 +2718,9 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
         await c.start()
         self.assertEqual(c.state.disk_gb, 320)
         self.assertEqual([p for m, p, b in fake.calls if p.endswith("/modify")], [])
-        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("small")))
-        self.assertFalse(c.is_alias_ready("img"))
-        self.assertIn("disk", c.alias_status("img"))
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "small")))
+        self.assertFalse(c.is_alias_ready(BID, "img"))
+        self.assertIn("disk", c.alias_status(BID, "img"))
         self.assertNotIn(big, [p for p, _ in vm.started])
 
     async def test_stop_kills_transfers_before_snapshot(self):
@@ -2817,7 +2843,7 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(p, json.loads(vm.manifest or "{}"))  # its write never happened
         self.assertEqual(c._unsaved[p]["size"], 5)
         await c.sync_once()
-        self.assertTrue(c.is_alias_ready("img"))              # present, not re-fetched
+        self.assertTrue(c.is_alias_ready(BID, "img"))              # present, not re-fetched
         self.assertEqual(len(vm.started), 1)
         await c.stop()
         self.assertEqual(json.loads(vm.manifest)[p]["size"], 5)
@@ -2862,7 +2888,7 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
             t["bytes"] == 20 and t["eta"] is not None for t in c.view()["transfers"])))
         self.assertEqual(sorted(t["total"] for t in c.view()["transfers"]), [40, 60])
         vm.cap.clear()
-        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")))
         self.assertEqual(len(vm.heads), 2)                    # once per URL and session
         self.assertNotIn(_TOKEN, "\n".join(c.state.log))
 
@@ -2877,9 +2903,9 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
         await c.start()
         self.assertEqual({e["path"]: e["size"] for e in c.plan["fetch"]},
                          {_dm("a.safetensors"): None, _dm("b.safetensors"): 99})
-        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("one")
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "one")
                                      and c.plan["per_alias"]["two"]["blocked"]))
-        self.assertIn("size 5 ≠ 99", c.alias_status("two"))
+        self.assertIn("size 5 ≠ 99", c.alias_status(BID, "two"))
         self.assertTrue(any("no Content-Length" in ln for ln in c.state.log))
 
     async def test_unreadable_manifest_is_warned_about(self):
@@ -2902,7 +2928,7 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
                                              catalog=[_url("h.safetensors", hf)], token=bad)
             vm.sizes[f"{hf}/h.safetensors"] = 4
             await c.start()
-            self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+            self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")))
             for _, cfg in vm.started + vm.heads:
                 self.assertNotIn("header", cfg, repr(bad))
                 self.assertNotIn(bad, cfg)
@@ -2930,7 +2956,7 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
         vm.files = {stranger: 123, old: 44, "hf-cache/token": 40}
         vm.manifest = json.dumps({old: {"size": 44, "source": "lan", "aliases": "nobody"}})
         await c.start()
-        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")))
         self.assertEqual(c.plan["unknown"], [[stranger, 123]])
         self.assertEqual(c.plan["prune"], [old])
         self.assertEqual(c.view()["plan"]["unknown"], [[stranger, 123]])
@@ -2955,7 +2981,7 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             await c.delete_unknown([stranger])          # no instance
         await c.start()
-        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")))
         with self.assertRaises(ValueError):             # a needed file is no "unknown"
             await c.delete_unknown([stranger, _dm("x.safetensors")])
         self.assertIn(stranger, vm.files)
@@ -2981,7 +3007,7 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(vm.started), n)
         del vm.fail[url]
         await c.sync_now()
-        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")))
         self.assertGreater(len(vm.started), n)
         self.assertTrue(any("tried again" in ln for ln in c.state.log))
 
@@ -2993,7 +3019,7 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
         vm.files = {old: 7}
         vm.manifest = json.dumps({old: {"size": 7, "aliases": ["gone"], "source": "url"}})
         await c.start()
-        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")))
         pv = c.view()["plan"]
         self.assertEqual(pv["prune"], [old])
         self.assertEqual(pv["prune_sizes"], [[old, 7]])
@@ -3007,12 +3033,12 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
         await c.start()
         self.assertEqual(c.plan["fetch"][0]["source"], "lan")
         for a in ("img", "known"):
-            st = c.alias_status(a)
+            st = c.alias_status(BID, a)
             self.assertIn("waiting for LAN source (not configured)", st)
-            self.assertFalse(c.is_alias_ready(a))
+            self.assertFalse(c.is_alias_ready(BID, a))
             self.assertTrue([b for b in c.view()["plan"]["aliases"][a]["blocked"]
                              if b.startswith("waiting for LAN source (not configured)")])
-        self.assertNotIn("not in source", c.alias_status("img"))
+        self.assertNotIn("not in source", c.alias_status(BID, "img"))
         self.assertEqual(vm.started, [])
 
     async def test_signature_change_triggers_a_sync(self):
@@ -3027,7 +3053,7 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
         box["aliases"]["two"] = _cand("x.safetensors")
         await c._sync_tick()
         self.assertEqual(len(_gw(fake, "gw-index")), n + 1)
-        self.assertTrue(c.is_alias_ready("two"))
+        self.assertTrue(c.is_alias_ready(BID, "two"))
         # not outside syncing|ready
         box["aliases"]["three"] = _cand("x.safetensors")
         c.state.phase = "starting"
@@ -3048,7 +3074,7 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(vm.started), 3)          # no sync outside syncing|ready …
         c.state.phase = "ready"
         await c._sync_tick()                          # … the pending re-plan runs now
-        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")))
         self.assertEqual(len(vm.started), 4)
 
     async def test_run_forever_polls_the_signature_every_5s(self):
@@ -3073,7 +3099,7 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
             await loop_task
         c.deps.sleep = orig
         self.assertEqual(len(_gw(fake, "gw-index")), n + 1)
-        self.assertTrue(c.is_alias_ready("two"))
+        self.assertTrue(c.is_alias_ready(BID, "two"))
 
     async def test_required_bytes_hint_uses_the_snapshots_manifest(self):
         f = _dm("big.safetensors")
@@ -3117,7 +3143,7 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((a["missing"], a["ready"], a["held"]), (1, False, 0))
         self.assertTrue(v["plan"]["aliases"]["bad"]["blocked"])
         vm.cap.clear()
-        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")))
         self.assertTrue(c.view()["plan"]["aliases"]["img"]["ready"])
         self.assertEqual(c.view()["ready_aliases"], ["img"])
 
@@ -3136,12 +3162,12 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
         await c.start()
         self.assertEqual(c.state.phase, "ready", c.state.error)
         self.assertIsNone(c.plan)
-        self.assertFalse(c.is_alias_ready("img"))
+        self.assertFalse(c.is_alias_ready(BID, "img"))
         self.assertTrue(c.view()["sync_error"])
         broken[0] = False
         c.h.clock[0] += hostctl._SYNC_REFRESH_S
         await c._sync_tick()
-        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")))
         self.assertEqual(c.view()["sync_error"], "")
 
     async def test_manifest_write_is_atomic_and_manifest_aliases_are_lists(self):
@@ -3149,7 +3175,7 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
                                          catalog=[_url("x.safetensors")])
         vm.sizes["https://example.com/x.safetensors"] = 3
         await c.start()
-        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")))
         cmd = fake.calls[_gw(fake, "gw-manifest-write")[0]][1]
         self.assertIn("cat > .gw-modelsync.json.tmp && mv -f .gw-modelsync.json.tmp "
                       ".gw-modelsync.json", cmd)
@@ -3400,10 +3426,14 @@ def _main():
 
 class _FakeCtl:
     """Stands in for a Controller in the wiring tests: records calls, raises what the
-    test scripts (a refusal is a RuntimeError before the first await)."""
+    test scripts (a refusal is a RuntimeError before the first await). `name` is the
+    Thunder BACKEND; the fake is the shim's host `thunder-<name>` with it as service."""
     def __init__(self, name, phase="off", uuid="", refuse=None):
-        self.name = name
-        self.backend = {"name": name, "type": "comfyui", "thunder": {"gpu_type": "a6000"}}
+        self.name = f"thunder-{name}"
+        self.host = {"name": self.name, "provider": "thunder",
+                     "options": {"gpu_type": "a6000"}, "api_key": "tok"}
+        self.services = [{"name": name, "type": "comfyui", "thunder": {"gpu_type": "a6000"},
+                          "local_port": 18188, "remote_port": 8188}]
         self.state = hostctl.State(phase=phase, uuid=uuid)
         self.refuse = refuse or {}
         self.calls = []
@@ -3437,6 +3467,12 @@ class _FakeCtl:
     async def aclose(self):
         self.calls.append("aclose")
 
+    def has_service(self, bid):
+        return bid in [f"{x['type']}:{x['name']}" for x in self.services]
+
+    def set_services(self, services):
+        self.services = list(services)
+
     def view(self):
         return {"phase": self.state.phase, "uptime_s": 42, "cost_per_h": 0.57,
                 "log": ["x"]}
@@ -3448,15 +3484,15 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         import store
         self.store = store
         self._saved = {n: getattr(m, n) for n in (
-            "backends", "thunder_controllers", "_thunder_tasks", "_thunder_booted",
+            "backends", "host_controllers", "_host_tasks", "_hosts_booted",
             "backend_inflight", "_draining", "jobs_cfg")}
         self._saved_store = (store._DB_PATH, store._active)
         self.tmp = tempfile.mkdtemp(prefix="thunder-wiring-")
         _TMPDIRS.append(self.tmp)
         store.init(os.path.join(self.tmp, "store.db"))
-        m.thunder_controllers = {}
-        m._thunder_tasks = {}
-        m._thunder_booted = False
+        m.host_controllers = {}
+        m._host_tasks = {}
+        m._hosts_booted = False
         m.jobs_cfg = dict(m.jobs_cfg, store_path=os.path.join(self.tmp, "store.db"))
 
     def tearDown(self):
@@ -3473,32 +3509,54 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         m = self.m
         plain = {"name": "k12", "type": "comfyui", "url": "http://10.0.0.1:8188"}
         m.backends = [plain, self._tb()]
-        m.sync_thunder_controllers()
-        self.assertEqual(list(m.thunder_controllers), ["tc"])
-        c = m.thunder_controllers["tc"]
+        m.sync_host_controllers()
+        # the shim: the block is the host `thunder-<backend>`, the backend its service
+        self.assertEqual(list(m.host_controllers), ["thunder-tc"])
+        c = m.host_controllers["thunder-tc"]
         self.assertIsInstance(c, hostctl.Controller)
-        # a rebuild hands NEW dicts: the instance stays, its backend is the current one
+        self.assertEqual((c.name, c.host["provider"], c.host["api_key"]),
+                         ("thunder-tc", "thunder", "tok"))
+        svc = c.services[0]
+        self.assertEqual((svc["name"], svc["local_port"], svc["remote_port"]),
+                         ("tc", 18188, 8188))
+        # a rebuild hands NEW dicts: the instance stays, its host/services are current
         fresh = self._tb(gpu_type="h100")
         m.backends = [dict(plain), fresh]
-        m.sync_thunder_controllers()
-        self.assertIs(m.thunder_controllers["tc"], c)
-        self.assertIs(c.backend, fresh)
+        m.sync_host_controllers()
+        self.assertIs(m.host_controllers["thunder-tc"], c)
+        self.assertIs(c.cfg, fresh["thunder"])
         self.assertEqual(c.cfg["gpu_type"], "h100")
+        self.assertEqual(c.services[0]["thunder"], {"gpu_type": "h100"})
+        self.assertNotIn("local_port", fresh)           # the service is a copy
         # block removed while an instance runs → kept, warned
         c.state.phase = "ready"
         m.backends = [plain, {"name": "tc", "type": "comfyui", "url": "http://x"}]
         with self.assertLogs("main", "WARNING") as cm:
-            m.sync_thunder_controllers()
-        self.assertIs(m.thunder_controllers.get("tc"), c)
+            m.sync_host_controllers()
+        self.assertIs(m.host_controllers.get("thunder-tc"), c)
         self.assertIn("backend config removed while instance runs", "\n".join(cm.output))
         # … and once it is off, the next sync removes it
         c.state.phase = "off"
-        m.sync_thunder_controllers()
-        self.assertEqual(m.thunder_controllers, {})
+        m.sync_host_controllers()
+        self.assertEqual(m.host_controllers, {})
         # a thunder block on a non-ComfyUI backend is no Thunder backend
         m.backends = [{"name": "llm", "type": "openai", "url": "http://x", "thunder": {"a": 1}}]
-        m.sync_thunder_controllers()
-        self.assertEqual(m.thunder_controllers, {})
+        m.sync_host_controllers()
+        self.assertEqual(m.host_controllers, {})
+
+    def test_names_that_slug_alike_do_not_share_a_controller(self):
+        # "GPU 1" and "gpu-1" both map to host `thunder-gpu-1`: one machine's state and
+        # snapshots must never be driven for two backends — the second is refused out
+        # loud, and its card/gate lookups find nothing rather than the other's host
+        m = self.m
+        m.backends = [self._tb("GPU 1"), self._tb("gpu-1")]
+        with self.assertLogs("main", "WARNING") as cm:
+            m.sync_host_controllers()
+        self.assertEqual(list(m.host_controllers), ["thunder-gpu-1"])
+        self.assertIn("same managed host", "\n".join(cm.output))
+        self.assertIsNotNone(m._shim_ctl("GPU 1"))
+        self.assertIsNone(m._shim_ctl("gpu-1"))
+        self.assertIsNone(m.modelsync_gate({"name": "gpu-1", "type": "comfyui"}, "img"))
 
     def test_rebuild_backends_syncs_controllers(self):
         m = self.m
@@ -3507,10 +3565,12 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         m.config_backends = []
         try:
             m.rebuild_backends()
-            c = m.thunder_controllers["tc"]
+            c = m.host_controllers["thunder-tc"]
             m.rebuild_backends()
-            self.assertIs(m.thunder_controllers["tc"], c)
-            self.assertIs(c.backend, next(b for b in m.backends if b["name"] == "tc"))
+            self.assertIs(m.host_controllers["thunder-tc"], c)
+            live = next(b for b in m.backends if b["name"] == "tc")
+            self.assertIs(c.cfg, live["thunder"])
+            self.assertEqual(c.services[0]["name"], "tc")
         finally:
             m.config_backends = saved_cfg
 
@@ -3526,7 +3586,7 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         m.config_backends = [dict(self._tb(), **extra)]
         try:
             m.rebuild_backends()
-            c = m.thunder_controllers["tc"]
+            c = m.host_controllers["thunder-tc"]
             for on in (True, False, True, False):          # two start/stop cycles
                 self.assertTrue(m.set_backend_enabled("comfyui:tc", on))
                 stored = self.store.get_backend("tc", "comfyui") or {}
@@ -3537,10 +3597,13 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(stored.get("thunder"), {"gpu_type": "a6000"})
                 self.assertEqual(stored.get("api_key"), "tok")   # decrypted on read
                 self.assertIs(stored.get("enabled"), on)
-                self.assertIs(m.thunder_controllers["tc"], c)
-                self.assertIs(c.backend, live)
+                # the service's forward ends never leak into the stored backend
+                self.assertNotIn("local_port", stored)
+                self.assertNotIn("remote_port", stored)
+                self.assertIs(m.host_controllers["thunder-tc"], c)
+                self.assertIs(c.cfg, live["thunder"])
             self.assertEqual(c.cfg, {"gpu_type": "a6000"})
-            self.assertEqual(m.backend_host(c.backend), "thunder-box")
+            self.assertEqual(m.backend_host(c.services[0]), "thunder-box")
         finally:
             m.config_backends = saved_cfg
 
@@ -3557,22 +3620,22 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
     def test_removed_block_warns_once_per_controller(self):
         m = self.m
         m.backends = [self._tb()]
-        m.sync_thunder_controllers()
-        c = m.thunder_controllers["tc"]
+        m.sync_host_controllers()
+        c = m.host_controllers["thunder-tc"]
         c.state.phase = "ready"
         gone = [{"name": "tc", "type": "comfyui", "url": "http://x"}]
         m.backends = gone
         with self.assertLogs("main", "WARNING") as cm:
-            m.sync_thunder_controllers()
-            m.sync_thunder_controllers()
-            m.sync_thunder_controllers()
+            m.sync_host_controllers()
+            m.sync_host_controllers()
+            m.sync_host_controllers()
         self.assertEqual(len([x for x in cm.output if "config removed" in x]), 1)
         # the block returns and goes again → warned again
         m.backends = [self._tb()]
-        m.sync_thunder_controllers()
+        m.sync_host_controllers()
         m.backends = gone
         with self.assertLogs("main", "WARNING") as cm:
-            m.sync_thunder_controllers()
+            m.sync_host_controllers()
         self.assertEqual(len([x for x in cm.output if "config removed" in x]), 1)
 
     def test_off_controller_with_op_in_flight_is_not_retired(self):
@@ -3580,14 +3643,14 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         m = self.m
         fc = _FakeCtl("tc")
         fc.op = "starting"
-        m.thunder_controllers = {"tc": fc}
+        m.host_controllers = {"thunder-tc": fc}
         m.backends = []
         with self.assertLogs("main", "WARNING"):
-            m.sync_thunder_controllers()
-        self.assertIs(m.thunder_controllers.get("tc"), fc)
+            m.sync_host_controllers()
+        self.assertIs(m.host_controllers.get("thunder-tc"), fc)
         fc.op = None
-        m.sync_thunder_controllers()
-        self.assertEqual(m.thunder_controllers, {})
+        m.sync_host_controllers()
+        self.assertEqual(m.host_controllers, {})
 
     def test_off_controller_with_a_pending_snapshot_is_not_retired(self):
         # the stop is done, but the watcher still has to rotate the old snapshot out —
@@ -3595,15 +3658,15 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         m = self.m
         fc = _FakeCtl("tc")
         fc.state.pending_snapshot = "s7"
-        m.thunder_controllers = {"tc": fc}
+        m.host_controllers = {"thunder-tc": fc}
         m.backends = []
         with self.assertLogs("main", "WARNING") as cm:
-            m.sync_thunder_controllers()
-        self.assertIs(m.thunder_controllers.get("tc"), fc)
+            m.sync_host_controllers()
+        self.assertIs(m.host_controllers.get("thunder-tc"), fc)
         self.assertIn("s7", "\n".join(cm.output))
         fc.state.pending_snapshot = ""
-        m.sync_thunder_controllers()
-        self.assertEqual(m.thunder_controllers, {})
+        m.sync_host_controllers()
+        self.assertEqual(m.host_controllers, {})
 
     def test_config_backend_entry_is_json_safe(self):
         # an unquoted YAML date is a datetime.date: the store's json.dumps raised on
@@ -3622,8 +3685,8 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         # its first await, so the refusal is the answer — not a background log line
         m = self.m
         m.backends = [self._tb()]
-        m.sync_thunder_controllers()
-        c = m.thunder_controllers["tc"]
+        m.sync_host_controllers()
+        c = m.host_controllers["thunder-tc"]
         self.assertIsInstance(c, hostctl.Controller)
         self.assertEqual(c.state.phase, "off")
         with self.assertNoLogs("main", "WARNING"):          # answered, not logged twice
@@ -3638,8 +3701,8 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
     def test_deps_wiring(self):
         m = self.m
         m.backends = [self._tb(), self._tb("tb")]
-        m.sync_thunder_controllers()
-        deps = m.thunder_controllers["tc"].deps
+        m.sync_host_controllers()
+        deps = m.host_controllers["thunder-tc"].deps
         self.assertEqual(deps.datadir, self.tmp)
         self.assertIs(deps.set_enabled, m.set_backend_enabled)
         self.assertIs(deps.begin_drain, m.begin_drain)
@@ -3650,21 +3713,24 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(deps.inflight("comfyui:tb"), 0)
         self.assertTrue(deps.is_draining("comfyui:tc"))
         self.assertFalse(deps.is_draining("comfyui:tb"))
-        # persistence: one settings key, one entry per backend name, others untouched
-        deps.save_state("tc", {"phase": "ready", "uuid": "u1"})
-        deps.save_state("tb", {"phase": "off"})
-        self.assertEqual(self.store.get_setting("thunder_state"),
-                         {"tc": {"phase": "ready", "uuid": "u1"}, "tb": {"phase": "off"}})
-        self.assertEqual(deps.load_state("tc"), {"phase": "ready", "uuid": "u1"})
+        # persistence: one settings key, one entry per HOST name, others untouched
+        deps.save_state("thunder-tc", {"phase": "ready", "uuid": "u1"})
+        deps.save_state("thunder-tb", {"phase": "off"})
+        self.assertEqual(self.store.get_setting("host_state"),
+                         {"thunder-tc": {"phase": "ready", "uuid": "u1"},
+                          "thunder-tb": {"phase": "off"}})
+        self.assertEqual(deps.load_state("thunder-tc"), {"phase": "ready", "uuid": "u1"})
         self.assertIsNone(deps.load_state("nope"))
         # every controller's uuid is known (orphans = instances nobody owns)
-        m.thunder_controllers["tc"].state.uuid = "u1"
-        m.thunder_controllers["tb"].state.uuid = "u2"
+        m.host_controllers["thunder-tc"].state.uuid = "u1"
+        m.host_controllers["thunder-tb"].state.uuid = "u2"
         self.assertEqual(deps.known_uuids(), {"u1", "u2"})
         # the repo files
         self.assertTrue(deps.bootstrap_script().startswith(b"#!"))
         self.assertIsInstance(deps.default_nodes(), str)
         self.assertTrue(deps.default_nodes().strip())
+        # forwards on the running master go through its control socket (R-W1)
+        self.assertIs(deps.control, sshrun.control)
         cl = deps.client_factory()
         self.assertIsNot(cl, m.http_client)
         self.assertIsNot(cl, deps.client_factory())
@@ -3689,44 +3755,46 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
                           "img": [{"backend": "tc", "workflow_json": {}}]}   # store wins
         try:
             m.backends = [self._tb()]
-            m.sync_thunder_controllers()
-            deps = m.thunder_controllers["tc"].deps
+            m.sync_host_controllers()
+            deps = m.host_controllers["thunder-tc"].deps
             self.assertIs(deps.alias_needs, m.thunder_alias_needs)
-            needs = {n.alias: n for n in deps.alias_needs("tc")}
+            # called with the ComfyUI service's backend id; any other type needs nothing
+            self.assertEqual(deps.alias_needs("openai:tc"), [])
+            needs = {n.alias: n for n in deps.alias_needs("comfyui:tc")}
             self.assertEqual(sorted(needs), ["cfgalias", "img"])     # no cloud, no k12
             self.assertEqual(sorted((r.cls, r.value, r.selectable) for r in needs["img"].refs),
                              [("UNETLoader", "flux.safetensors", True),
                               ("VAELoader", "pinned.safetensors", False)])
             self.assertEqual([r.value for r in needs["cfgalias"].refs], ["t5.safetensors"])
-            self.assertEqual(deps.alias_needs("k12")[0].refs[0].value, "k.st")
+            self.assertEqual(deps.alias_needs("comfyui:k12")[0].refs[0].value, "k.st")
             # the catalog: defaults while unset, the setting once set, [] when garbage
             self.assertEqual(deps.url_catalog(), {})
             cat = [{"file": "models/vae/ae.safetensors", "url": "https://hf.co/x/ae.safetensors"},
                    {"match": {"alias": "img"}, "paths": ["models/loras/"]}]
-            sig0 = deps.alias_signature("tc")
-            self.assertEqual(sig0, deps.alias_signature("tc"))          # stable
+            sig0 = deps.alias_signature("comfyui:tc")
+            self.assertEqual(sig0, deps.alias_signature("comfyui:tc"))          # stable
             self.store.set_settings({"modelsync_catalog": cat})
             self.assertEqual(deps.url_catalog(), {"models/vae/ae.safetensors":
                                                   {"url": "https://hf.co/x/ae.safetensors"}})
             self.assertEqual(needs["img"].catalog, [])
-            self.assertEqual({n.alias: n for n in deps.alias_needs("tc")}["img"].catalog,
+            self.assertEqual({n.alias: n for n in deps.alias_needs("comfyui:tc")}["img"].catalog,
                              ["models/loras/"])
-            sig1 = deps.alias_signature("tc")
+            sig1 = deps.alias_signature("comfyui:tc")
             self.assertNotEqual(sig1, sig0)                              # catalog counts
             # another backend's candidate changes nothing, this backend's does
             self.store.upsert("other", [{"backend": "k12", "workflow_json": wf}])
-            self.assertEqual(deps.alias_signature("tc"), sig1)
+            self.assertEqual(deps.alias_signature("comfyui:tc"), sig1)
             self.store.upsert("other", [{"backend": "tc", "workflow_json": wf}])
-            sig2 = deps.alias_signature("tc")
+            sig2 = deps.alias_signature("comfyui:tc")
             self.assertNotEqual(sig2, sig1)
             self.store.delete("other")
-            self.assertEqual(deps.alias_signature("tc"), sig1)
+            self.assertEqual(deps.alias_signature("comfyui:tc"), sig1)
             # a path workflow's content counts (same path, new file)
             with open(path, "w") as f:
                 json.dump({"1": {"class_type": "CLIPLoader",
                                  "inputs": {"clip_name": "t5-v2.safetensors"}}}, f)
             os.utime(path, (1, 1))
-            self.assertNotEqual(deps.alias_signature("tc"), sig1)
+            self.assertNotEqual(deps.alias_signature("comfyui:tc"), sig1)
             self.store.set_settings({"modelsync_catalog": {"not": "a list"}})
             self.assertEqual(deps.url_catalog(), {})
             self.assertEqual(deps.source_index(), {})
@@ -3738,14 +3806,14 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
 
     def test_unreadable_setting_is_never_overwritten(self):
         m = self.m
-        self.store.set_settings({"thunder_state": ["garbage"]})
+        self.store.set_settings({"host_state": ["garbage"]})
         m.backends = [self._tb()]
-        m.sync_thunder_controllers()
-        c = m.thunder_controllers["tc"]
+        m.sync_host_controllers()
+        c = m.host_controllers["thunder-tc"]
         self.assertTrue(c.persist_blocked)          # load failed → no start, no save
         with self.assertRaises(ValueError):
-            c.deps.save_state("tc", {"phase": "off"})
-        self.assertEqual(self.store.get_setting("thunder_state"), ["garbage"])
+            c.deps.save_state("thunder-tc", {"phase": "off"})
+        self.assertEqual(self.store.get_setting("host_state"), ["garbage"])
 
     async def test_probe_comfy(self):
         m = self.m
@@ -3757,7 +3825,7 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         saved = m.http_client
         m.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         try:
-            deps = m._thunder_deps()
+            deps = m._host_deps()
             self.assertTrue(await deps.probe_comfy("http://good:1"))
             self.assertFalse(await deps.probe_comfy("http://bad:1"))
         finally:
@@ -3774,7 +3842,7 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         saved = m.http_client
         m.http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
         try:
-            self.assertFalse(await m._thunder_deps().probe_comfy("http://x:1"))
+            self.assertFalse(await m._host_deps().probe_comfy("http://x:1"))
         finally:
             await m.http_client.aclose()
             m.http_client = saved
@@ -3782,7 +3850,7 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
     async def test_actions_run_in_background_and_refusals_are_text(self):
         m = self.m
         c = _FakeCtl("tc", refuse={"stop": "not running"})
-        m.thunder_controllers = {"tc": c}
+        m.host_controllers = {"thunder-tc": c}
         msg = await m.thunder_action("tc", "start")
         self.assertIn("start", msg)
         self.assertEqual(c.calls, ["start"])
@@ -3804,7 +3872,7 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
     async def test_thunder_view_and_names(self):
         m = self.m
         c = _FakeCtl("tc", phase="ready")
-        m.thunder_controllers = {"tc": c}
+        m.host_controllers = {"thunder-tc": c}
         self.assertEqual(m.thunder_view("tc")["phase"], "ready")
         self.assertIsNone(m.thunder_view("nope"))
         import admin
@@ -3815,23 +3883,23 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
     async def test_boot_resumes_and_runs_each_controller_and_shutdown_closes(self):
         m = self.m
         a, b = _FakeCtl("a", phase="ready"), _FakeCtl("b")
-        m.thunder_controllers = {"a": a, "b": b}
-        m._thunder_boot()
+        m.host_controllers = {"thunder-a": a, "thunder-b": b}
+        m._hosts_boot()
         await asyncio.sleep(0)
         self.assertEqual(sorted(a.calls), ["resume", "run_forever"])
         self.assertEqual(sorted(b.calls), ["resume", "run_forever"])
         # a controller that appears later (backend added in the console) is started too
         m.backends = [self._tb("late")]
-        m.sync_thunder_controllers()
-        late = m.thunder_controllers["late"]
-        self.assertEqual(len(m._thunder_tasks["late"]), 2)
-        for t in m._thunder_tasks["late"]:
+        m.sync_host_controllers()
+        late = m.host_controllers["thunder-late"]
+        self.assertEqual(len(m._host_tasks["thunder-late"]), 2)
+        for t in m._host_tasks["thunder-late"]:
             t.cancel()
-        await m._thunder_shutdown()
+        await m._hosts_shutdown()
         self.assertIn("aclose", a.calls)
         self.assertIn("aclose", b.calls)
         # the background loops are gone, the instance was never touched
-        for ts in m._thunder_tasks.values():
+        for ts in m._host_tasks.values():
             self.assertTrue(all(t.done() for t in ts))
         self.assertNotIn("stop", a.calls)
         self.assertEqual(late.state.phase, "off")
@@ -3840,15 +3908,34 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         m = self.m
         tb = self._tb()
         m.backends = [tb, {"name": "k12", "type": "comfyui", "url": "http://10.0.0.1:8188"}]
-        m.thunder_controllers = {"tc": _FakeCtl("tc", phase="ready")}
+        m.host_controllers = {"thunder-tc": _FakeCtl("tc", phase="ready")}
         h = await m.health(verbose=False)
         self.assertEqual(h["backends"]["comfyui:tc"]["thunder"],
                          {"phase": "ready", "uptime_s": 42, "cost_per_h": 0.57})
         self.assertNotIn("thunder", h["backends"]["comfyui:k12"])
 
+    def test_host_fault_pseudo_backend_is_recorded(self):
+        # R-K1: the controller books machine events on {"name": <host>, "type":
+        # "managed-host"} — main._note_fault and faults.record must take it (it has no
+        # url, and no backend of that id exists), grouped apart from its services
+        m = self.m
+        with mock.patch.object(m.faults, "record") as rec:
+            m._note_fault({"name": "thunder-tc", "type": hostctl.HOST_FAULT_TYPE},
+                          "lifecycle", "instance_vanished", "gone")
+        kw = rec.call_args.kwargs
+        self.assertEqual((kw["bid"], kw["backend"], kw["type"], kw["host"]),
+                         ("managed-host:thunder-tc", "thunder-tc", "managed-host",
+                          "thunder-tc"))
+        with mock.patch.object(m.faults, "_DB_PATH", None):
+            ev = m.faults.record(**kw)
+        self.assertEqual((ev["bid"], ev["type"], ev["kind"]),
+                         ("managed-host:thunder-tc", "managed-host", "instance_vanished"))
+
     def test_deploy_and_gitignore_exclude_keys(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        names = ["thunder.key", "thunder.key.pub", "thunder-known_hosts",
+        # thunder-ctl: the ControlMaster sockets — a deploy's rsync --delete must not
+        # pull the live socket out from under a running master
+        names = ["thunder.key", "thunder.key.pub", "thunder-known_hosts", "thunder-ctl",
                  "modelsrc.key", "modelsrc.key.pub", "modelsrc-known_hosts"]
         with open(os.path.join(root, ".gitignore")) as f:
             gi = {ln.strip().rstrip("/") for ln in f}
@@ -3979,7 +4066,7 @@ class LanTransfer(unittest.IsolatedAsyncioTestCase):
         vm.content[path] = b"012"
         vm.files[path + ".part"] = 3
         await c.start()
-        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")),
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")),
                         c.state.log[-8:])
         src, dst = pipe.log[0]
         self.assertTrue(src[-1].endswith(" 3"), src)
@@ -4000,7 +4087,7 @@ class LanTransfer(unittest.IsolatedAsyncioTestCase):
         sh.sha_answers = ["f" * 64]
         fake, vm, c, lan, pipe = _lan_make({"img": _cand("a.safetensors")}, sh)
         await c.start()
-        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")),
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")),
                         c.state.log[-8:])
         # attempt 1 streamed everything, the digests differed: .part discarded, attempt 2
         # starts from byte 0 (not resumed onto bad bytes), then verifies
@@ -4017,7 +4104,7 @@ class LanTransfer(unittest.IsolatedAsyncioTestCase):
         fake, vm, c, lan, pipe = _lan_make({"img": _cand("a.safetensors")}, sh)
         await c.start()
         self.assertTrue(await _until(lambda: _idle(c) and "transfer failed"
-                                     in c.alias_status("img")), c.state.log[-8:])
+                                     in c.alias_status(BID, "img")), c.state.log[-8:])
         self.assertEqual(len(pipe.log), 3)
         self.assertEqual(c.h.faults[-1][1:3], ("sync", "transfer"))
         self.assertNotIn(_dm("a.safetensors") + ".part", vm.files)
@@ -4039,7 +4126,7 @@ class LanTransfer(unittest.IsolatedAsyncioTestCase):
         c.deps.pipe = short_once
         pipe.log = []
         await c.start()
-        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")),
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")),
                         c.state.log[-8:])
         self.assertEqual(shlex.split(pipe.log[0][0][-1])[2], "4")
         self.assertTrue(any("stream failed (source rc 255, instance rc 0)" in ln
@@ -4052,8 +4139,8 @@ class LanTransfer(unittest.IsolatedAsyncioTestCase):
         await _until(lambda: _idle(c))
         self.assertEqual(pipe.log, [])
         self.assertEqual(sh.calls, [])            # not even a `list`
-        self.assertIn("waiting for LAN source (not configured)", c.alias_status("img"))
-        self.assertFalse(c.is_alias_ready("img"))
+        self.assertIn("waiting for LAN source (not configured)", c.alias_status(BID, "img"))
+        self.assertFalse(c.is_alias_ready(BID, "img"))
 
     async def test_hostile_host_setting_never_reaches_ssh(self):
         sh = self.share(a=b"abc")
@@ -4066,7 +4153,7 @@ class LanTransfer(unittest.IsolatedAsyncioTestCase):
         await c.start()
         await _until(lambda: _idle(c))
         self.assertEqual((sh.calls, pipe.log), ([], []))
-        self.assertIn("waiting for LAN source (not configured", c.alias_status("img"))
+        self.assertIn("waiting for LAN source (not configured", c.alias_status(BID, "img"))
 
     async def test_one_lan_stream_at_a_time(self):
         sh = self.share(a=b"a" * 5, b=b"b" * 7, c=b"c" * 9)
@@ -4080,7 +4167,7 @@ class LanTransfer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pipe.active, 1)
         self.assertEqual([t["source"] for t in c.view()["transfers"]], ["lan"])
         pipe.gate.set()
-        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")),
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")),
                         c.state.log[-8:])
         self.assertEqual((pipe.peak, len(pipe.log)), (1, 3))
 
@@ -4095,7 +4182,7 @@ class LanTransfer(unittest.IsolatedAsyncioTestCase):
         await c.start()
         self.assertTrue(await _until(lambda: vm.started and pipe.active == 1))
         pipe.gate.set()
-        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")),
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")),
                         c.state.log[-8:])
         # and without the pin, the URL file of that alias is withheld as before
         sh2 = self.share(a=b"lan-bytes")
@@ -4113,7 +4200,7 @@ class LanTransfer(unittest.IsolatedAsyncioTestCase):
         fake, vm, c, lan, pipe = _lan_make({"img": _cand("a.safetensors")}, sh)
         await c.start()
         await _until(lambda: _idle(c))
-        st = c.alias_status("img")
+        st = c.alias_status(BID, "img")
         self.assertIn("waiting for LAN source (unreachable: ssh: connect to host", st)
         self.assertEqual(pipe.log, [])
         # a good listing, then an incomplete one (rc 1): the good one stays, transfers wait
@@ -4133,7 +4220,7 @@ class LanTransfer(unittest.IsolatedAsyncioTestCase):
         sh = self.share(a=b"abc")
         fake, vm, c, lan, pipe = _lan_make({"img": _cand("a.safetensors")}, sh)
         await c.start()
-        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")))
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")))
         n = len(sh.lists())
         self.assertEqual(n, 1)
         c.h.clock[0] += 300
@@ -4150,11 +4237,11 @@ class LanTransfer(unittest.IsolatedAsyncioTestCase):
         fake, vm, c, lan, pipe = _lan_make({"img": _cand("a.safetensors")}, sh, pinned=False)
         await c.start()
         await _until(lambda: _idle(c))
-        self.assertIn("waiting for LAN source (not configured)", c.alias_status("img"))
+        self.assertIn("waiting for LAN source (not configured)", c.alias_status(BID, "img"))
         fp = await lan.scan()
         lan.pin(fp)
         await c._sync_tick()                              # the pin alone triggers a plan
-        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("img")),
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")),
                         c.state.log[-8:])
 
     async def test_stop_ends_the_lan_stream(self):
@@ -4179,7 +4266,7 @@ class LanTransfer(unittest.IsolatedAsyncioTestCase):
         fake, vm, c, lan, pipe = _lan_make({"hf": {"backend": "thunder", "workflow_json": {}}},
                                            sh, catalog=cat)
         await c.start()
-        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready("hf")),
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "hf")),
                         c.state.log[-8:])
         self.assertIn(repo + "blobs/abc", lan.cached())
         self.assertNotIn("models/vae/x.safetensors", lan.cached())
@@ -4194,7 +4281,7 @@ class LanTransfer(unittest.IsolatedAsyncioTestCase):
         await c.sync_once()
         linked = [cmd for m, cmd, _ in fake.calls if m == "SSH" and cmd.startswith(": gw-link ")]
         self.assertEqual(len(linked), 1)                  # present links are not re-made
-        self.assertTrue(c.is_alias_ready("hf"))
+        self.assertTrue(c.is_alias_ready(BID, "hf"))
         # the alias goes: the stop prunes the link with the files it belongs to
         c.h.box["aliases"].clear()
         await c._before_snapshot()
@@ -4214,7 +4301,7 @@ class LanTransfer(unittest.IsolatedAsyncioTestCase):
         await c.start()
         await _until(lambda: _idle(c))
         self.assertEqual(vm.links, {})
-        self.assertIn("waiting for LAN source (not configured)", c.alias_status("hf"))
+        self.assertIn("waiting for LAN source (not configured)", c.alias_status(BID, "hf"))
 
 
 class LanSourceUnit(unittest.IsolatedAsyncioTestCase):
@@ -4625,10 +4712,10 @@ class FinalReviewFixes(unittest.IsolatedAsyncioTestCase):
     async def test_start_without_token_is_refused_before_any_call(self):
         fake = FakeThunder()
         c, _, enabled, _ = make(fake)
-        c.backend = dict(c.backend, api_key="")
+        c.host = dict(c.host, api_key="")
         with self.assertRaises(RuntimeError) as cm:
             await c.start()
-        self.assertIn("no Thunder API token set", str(cm.exception))
+        self.assertIn("no Thunder Compute API token set", str(cm.exception))
         self.assertIn("API key field", str(cm.exception))
         self.assertEqual(fake.calls, [])
         self.assertEqual(enabled, {})
@@ -4636,9 +4723,431 @@ class FinalReviewFixes(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(c._op)
 
 
+def _svc(name, typ, lport, rport):
+    """An attached service as main hands it over: the backend dict plus its forward."""
+    return {"name": name, "type": typ, "url": f"http://127.0.0.1:{lport}",
+            "local_port": lport, "remote_port": rport}
+
+
+class _MasterTunnel(_NoTunnel):
+    """Like the Supervisor: builds the master's argv from `_tunnel_argv` at every
+    (re)spawn — which is when the controller learns what the master carries."""
+    def __init__(self, c, fake):
+        super().__init__(c, fake)
+        self.argvs = []
+
+    def start(self):
+        super().start()
+        self.argvs.append(self.c._tunnel_argv())
+
+    def respawn(self):
+        """The master died; the Supervisor spawns it again from the SAME argv_fn."""
+        self.argvs.append(self.c._tunnel_argv())
+
+
+def _fwds(argv):
+    return [argv[i + 1] for i, a in enumerate(argv) if a == "-L"]
+
+
+def _master(c, fake):
+    def factory():
+        t = _MasterTunnel(c, fake)
+        c.h.tunnels.append(t)
+        return t
+    c._tunnel_factory = factory
+
+
+def _controls(c, answer=(0, "")):
+    calls = []
+
+    async def control(ctl, host, op, lport, rport, timeout=15):
+        calls.append((ctl, host, op, lport, rport))
+        return answer() if callable(answer) else answer
+    c.deps.control = control
+    return calls
+
+
+class ManagedHost(unittest.IsolatedAsyncioTestCase):
+    """One host, several services (spec 2026-09-29 "Host-Controller", R-K1, R-W1,
+    R-W4): what is the MACHINE's (enable/drain/disable of every service, snapshots and
+    host faults by host name, one tunnel) and what is one SERVICE's (its forward, its
+    status, its faults)."""
+
+    def _three(self):
+        return [_svc("thunder", "comfyui", 18188, 8188), _svc("vllm", "openai", 18200, 8000),
+                _svc("embed", "openai", 18201, 8001)]
+
+    async def test_stop_drains_every_service(self):
+        # Review Focus 5: three services, one with a running job — all three drained,
+        # the snapshot only after the last job, then all three off; a start turns all
+        # three on again
+        fake = FakeThunder()
+        c, saved, enabled, _ = make(fake, services=self._three())
+        bids = ["comfyui:thunder", "openai:vllm", "openai:embed"]
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        self.assertEqual(enabled, {b: True for b in bids})
+        sv = c.view()["services"]
+        self.assertEqual(sv["comfyui:thunder"]["status"], "up")
+        self.assertEqual((sv["openai:vllm"]["local_port"], sv["openai:vllm"]["remote_port"]),
+                         (18200, 8000))
+        # no command profile before services.py: shown, never failing the host
+        self.assertEqual(sv["openai:vllm"]["status"], "down")
+        self.assertIn("no start profile", sv["openai:vllm"]["error"])
+        drained, busy, seen = [], {"openai:vllm": [1, 1, 0]}, []
+        c.deps.begin_drain = lambda bid: drained.append(bid) or True
+
+        def inflight(bid):
+            seq = busy.get(bid)
+            v = seq.pop(0) if seq else 0
+            fake.calls.append(("INFLIGHT", f"{bid}={v}", None))
+            return v
+        c.deps.inflight = inflight
+        sleep = c.deps.sleep
+
+        async def watching_sleep(sec):
+            if c.state.phase == "draining":
+                seen.append(c.view()["waiting_jobs"])
+            await sleep(sec)
+        c.deps.sleep = watching_sleep
+        n = len(fake.calls)
+        await c.stop()
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        self.assertEqual(drained, bids)
+        kinds = _paths(fake, n)
+        snap = kinds.index(("POST", "/snapshots/create"))
+        busy_at = [i for i, k in enumerate(kinds) if k == ("INFLIGHT", "openai:vllm=1")]
+        idle_at = kinds.index(("INFLIGHT", "openai:vllm=0"))
+        self.assertEqual(len(busy_at), 2)
+        self.assertLess(max(busy_at), snap)
+        self.assertLess(idle_at, snap)
+        self.assertEqual(seen, [{"openai:vllm": 1}, {"openai:vllm": 1}])
+        self.assertIsNone(c.view()["waiting_jobs"])
+        self.assertIn("waiting for 1 job(s) on openai:vllm", "\n".join(c.state.log))
+        self.assertEqual(enabled, {b: False for b in bids})
+        # … and the next start switches every one of them on again
+        fake.status_script = ["PROVISIONING", "RUNNING"]      # the new instance's
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        self.assertEqual(enabled, {b: True for b in bids})
+
+    async def test_drain_of_one_service_that_cannot_start_stops_the_stop(self):
+        # a second service's begin_drain failing must not let routing go on sending it
+        # jobs during the snapshot: the stop fails on it (instance kept), as before
+        fake = FakeThunder()
+        c, _, _, _ = make(fake, services=self._three())
+        await c.start()
+
+        def begin(bid):
+            if bid == "openai:embed":
+                raise OSError("store locked")
+            return True
+        c.deps.begin_drain = begin
+        await c.stop()
+        self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "draining"))
+        self.assertIn("openai:embed", c.state.error)
+        self.assertEqual(c.state.uuid, "u0")                 # it bills: never forgotten
+
+    async def test_enable_failure_of_a_later_service_disables_the_earlier_ones(self):
+        fake = FakeThunder()
+        c, _, enabled, _ = make(fake, services=self._three())
+        calls = []
+
+        def set_enabled(bid, on):
+            calls.append((bid, on))
+            if bid == "openai:embed" and on:
+                return False
+            enabled[bid] = on
+            return True
+        c.deps.set_enabled = set_enabled
+        await c.start()
+        self.assertEqual(c.state.phase, "off")
+        self.assertIn("cannot enable backend openai:embed", c.state.error)
+        self.assertEqual(_creates(fake), [])
+        # the two it did enable go back off; the one that failed is not touched again
+        self.assertEqual(enabled, {"comfyui:thunder": False, "openai:vllm": False})
+        self.assertNotIn(("openai:embed", False), calls)
+
+    async def test_no_service_refused(self):
+        fake = FakeThunder()
+        c, saved, enabled, _ = make(fake, services=[])
+        with self.assertRaises(RuntimeError) as cm:
+            await c.start()
+        self.assertIn("no backend is attached to managed host thunder", str(cm.exception))
+        self.assertEqual(fake.calls, [])                    # not one provider call
+        self.assertEqual(enabled, {})
+        self.assertEqual(c.state.phase, "off")
+        self.assertIsNone(c._op)
+        self.assertEqual(saved, {})
+
+    async def test_snapshots_named_after_host(self):
+        # R-W4: prefix, ownership, rotation and the restore template follow the HOST
+        # name; a snapshot carrying the backend's name is foreign (display only)
+        fake = FakeThunder()
+        fake.snaps += [
+            {"id": "sh", "name": "aihub-gpu-box-20260925t120000z", "status": "READY",
+             "minimumDiskSizeGb": 100, "createdAt": 1},
+            {"id": "sb", "name": "aihub-thunder-20260926t120000z", "status": "READY",
+             "minimumDiskSizeGb": 100, "createdAt": 2}]
+        c, saved, _, _ = make(fake, host_name="gpu-box")
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        self.assertEqual(_creates(fake)[0]["template"], "aihub-gpu-box-20260925t120000z")
+        self.assertEqual(c.state.snapshot_id, "sh")
+        self.assertEqual(list(saved), ["gpu-box"])           # the state is the host's
+        await c.stop()
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        body = next(b for m, p, b in fake.calls if p == "/snapshots/create")
+        self.assertRegex(body["name"], r"^aihub-gpu-box-\d{8}t\d{6}z$")
+        new = c.state.pending_snapshot
+        for x in fake.snaps:
+            if x["id"] == new:
+                x["status"] = "READY"
+        await c.watch_snapshots()
+        ids = {x["id"] for x in fake.snaps}
+        self.assertEqual(c.state.snapshot_id, new)
+        self.assertNotIn("sh", ids)                          # the host's older one rotated
+        self.assertIn("sb", ids)                             # the backend-named one never
+        self.assertEqual([x["name"] for x in thunder.foreign_snapshots(
+            await c.api.snapshots(), ["gpu-box"])], ["aihub-thunder-20260926t120000z"])
+        # key and known_hosts per provider kind, the control socket per host
+        d = c.deps.datadir
+        self.assertEqual(c._key_path(), os.path.join(d, "thunder.key"))
+        self.assertEqual(c._known_hosts_path("u0"), os.path.join(d, "thunder-known_hosts", "u0"))
+        self.assertTrue(os.path.basename(c._ctl_path()).startswith("gpu-box-"))
+
+    async def test_host_faults_use_pseudo_backend(self):
+        # R-K1: machine events on {"name": <host>, "type": "managed-host"}, a service's
+        # own failure (its bootstrap, its start, its transfers) on its backend
+        host = {"name": "box", "type": "managed-host"}
+        # instance gone (two account refreshes without it)
+        fake = FakeThunder()
+        c, _, _, _ = make(fake, host_name="box", state=_persisted())
+        await c.refresh_account()
+        await c.refresh_account()
+        self.assertEqual([f[0] for f in c.h.faults if f[2] == "instance_vanished"], [host])
+        # a pending snapshot FAILED
+        fake = FakeThunder()
+        fake.snaps.append({"id": "s5", "name": "aihub-box-20260926t120000z",
+                           "status": "FAILED", "minimumDiskSizeGb": 100, "createdAt": 1})
+        c, _, _, _ = make(fake, host_name="box", state=_persisted(phase="off", uuid="",
+                                                                   index="", pending_snapshot="s5"))
+        await c.watch_snapshots()
+        self.assertEqual(c.h.faults[-1][0], host)
+        self.assertEqual(c.h.faults[-1][2], "snapshot_failed")
+        # the ComfyUI bootstrap failing → the ComfyUI service's fault, its status
+        fake = FakeThunder()
+        c, _, _, _ = make(fake, host_name="box",
+                          ssh_script={"bash -s": (1, b"GW:PHASE nodes\n", b"boom")})
+        await c.start()
+        self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "bootstrapping"))
+        f = c.h.faults[-1]
+        self.assertEqual((f[0]["name"], f[0]["type"], f[1], f[2]),
+                         ("thunder", "comfyui", "lifecycle", "error"))
+        self.assertEqual(c.view()["services"]["comfyui:thunder"]["status"], "setup failed")
+        # ComfyUI never answering → the service's fault, status down with the reason
+        fake = FakeThunder()
+        c, _, _, _ = make(fake, host_name="box", probe=lambda url: asyncio.sleep(0, False))
+        await c.start()
+        self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "starting"))
+        self.assertEqual((c.h.faults[-1][0]["name"], c.h.faults[-1][0]["type"]),
+                         ("thunder", "comfyui"))
+        sv = c.view()["services"]["comfyui:thunder"]
+        self.assertEqual(sv["status"], "down")
+        self.assertIn("did not answer", sv["error"])
+        # a failure of the machine itself (the instance gone while starting) → the host
+        fake = FakeThunder()
+        fake.status_script = ["PROVISIONING", "TERMINATED"]
+        c, _, _, _ = make(fake, host_name="box")
+        await c.start()
+        self.assertEqual(c.state.phase, "failed")
+        self.assertEqual(c.h.faults[-1][0], host)
+
+    async def test_forward_added_without_tunnel_restart(self):
+        # Review Focus 2 part 1 (R-W1): a service attached while the host runs gets its
+        # forward through the master's control socket — the tunnel carrying the other
+        # service's stream is neither restarted nor respawned
+        fake = FakeThunder()
+        c, _, _, _ = make(fake)
+        _master(c, fake)
+        calls = _controls(c)
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        t = c.h.tunnels[0]
+        argv = t.argvs[0]
+        self.assertEqual(_fwds(argv), ["127.0.0.1:18188:127.0.0.1:8188"])
+        ctl = argv[argv.index("-S") + 1]
+        c.set_services(c.services + [_svc("vllm", "openai", 18200, 8000)])
+        self.assertTrue(await _until(lambda: calls))
+        self.assertEqual(calls, [(ctl, "ubuntu@10.0.0.5", "forward", 18200, 8000)])
+        self.assertEqual(len(c.h.tunnels), 1)               # no new Supervisor
+        self.assertTrue(t.running)
+        self.assertEqual(len(t.argvs), 1)                   # and no respawn either
+        self.assertEqual(c._fwd_active, {(18188, 8188), (18200, 8000)})
+        # the same set again changes nothing
+        c.set_services(list(c.services))
+        await _until(lambda: c._fwd_task.done())
+        self.assertEqual(len(calls), 1)
+        # detached → cancel on the same socket, still no restart
+        c.set_services(c.services[:1])
+        self.assertTrue(await _until(lambda: len(calls) == 2))
+        self.assertEqual(calls[-1], (ctl, "ubuntu@10.0.0.5", "cancel", 18200, 8000))
+        self.assertEqual((len(c.h.tunnels), len(t.argvs)), (1, 1))
+        self.assertEqual(c._fwd_active, {(18188, 8188)})
+
+    async def test_failed_forward_marks_only_that_service_down(self):
+        fake = FakeThunder()
+        c, _, _, _ = make(fake)
+        _master(c, fake)
+        calls = _controls(c, (255, "Port forwarding failed."))
+        await c.start()
+        c.set_services(c.services + [_svc("vllm", "openai", 18200, 8000)])
+        self.assertTrue(await _until(lambda: calls and c._fwd_task.done()))
+        sv = c.view()["services"]
+        self.assertEqual(sv["openai:vllm"]["status"], "down")
+        self.assertIn("Port forwarding failed", sv["openai:vllm"]["error"])
+        self.assertEqual(sv["comfyui:thunder"]["status"], "up")
+        self.assertEqual(c.state.phase, "ready")
+        # a master that dies meanwhile is respawned WITHOUT the failed forward — with
+        # ExitOnForwardFailure it would take every service's tunnel down with it
+        c.h.tunnels[0].respawn()
+        self.assertEqual(_fwds(c.h.tunnels[0].argvs[-1]), ["127.0.0.1:18188:127.0.0.1:8188"])
+        # the port is free again: the retry (run_forever's tick) adds it on the master
+        _controls(c)                                        # answers rc 0 from now on
+        await c.reconcile_forwards()
+        self.assertEqual(c._fwd_active, {(18188, 8188), (18200, 8000)})
+        c.h.tunnels[0].respawn()
+        self.assertEqual(len(_fwds(c.h.tunnels[0].argvs[-1])), 2)
+
+    async def test_master_restart_carries_all_forwards(self):
+        fake = FakeThunder()
+        c, _, _, _ = make(fake)
+        _master(c, fake)
+        _controls(c)
+        await c.start()
+        c.set_services(c.services + [_svc("vllm", "openai", 18200, 8000),
+                                     _svc("embed", "openai", 18201, 8001)])
+        await _until(lambda: c._fwd_task is not None and c._fwd_task.done())
+        # the master dies: the Supervisor's respawn builds its argv from the CURRENT set
+        c.h.tunnels[0].respawn()
+        argv = c.h.tunnels[0].argvs[-1]
+        self.assertEqual(sorted(_fwds(argv)), ["127.0.0.1:18188:127.0.0.1:8188",
+                                              "127.0.0.1:18200:127.0.0.1:8000",
+                                              "127.0.0.1:18201:127.0.0.1:8001"])
+        self.assertEqual(argv[-2:], ["--", "ubuntu@10.0.0.5"])
+        self.assertEqual(c._fwd_active, {(18188, 8188), (18200, 8000), (18201, 8001)})
+        # a service whose local port another one already forwards is left out (sshrun
+        # refuses one port for two targets — the whole master would never start)
+        c.set_services(c.services + [_svc("dup", "openai", 18200, 9000)])
+        c.h.tunnels[0].respawn()
+        self.assertNotIn("127.0.0.1:18200:127.0.0.1:9000", _fwds(c.h.tunnels[0].argvs[-1]))
+
+    async def test_comfy_bootstrap_only_with_comfy_service(self):
+        # R-W3 (Task 4 splits the scripts): a host with no ComfyUI service runs no
+        # ComfyUI bootstrap, needs no commit or node list, starts no ComfyUI and syncs
+        # no models
+        fake = FakeThunder()
+        c, _, enabled, calls = make(fake, services=[_svc("vllm", "openai", 18200, 8000)])
+        c.cfg["comfy_commit"] = "not-a-sha"              # ComfyUI-only requirements …
+        c.cfg["nodes"] = []                               # … do not refuse this host
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        cmds = _ssh_cmds(fake)
+        self.assertFalse([x for x in cmds if "bash -s" in x or "gw-nodes" in x], cmds)
+        self.assertNotIn(hostctl._START_CMD, cmds)
+        self.assertEqual(enabled, {"openai:vllm": True})
+        self.assertIsNone(c.plan)
+        self.assertFalse(c.is_alias_ready("openai:vllm", "img"))
+        # with a ComfyUI service the bootstrap runs, fed the script deps hand over
+        fake = FakeThunder()
+        c, _, _, calls = make(fake)
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        boot = [(argv[-1], stdin) for argv, stdin in calls if "bash -s --" in argv[-1]]
+        self.assertEqual(len(boot), 1)
+        self.assertEqual(boot[0][1], b"#!/bin/bash\necho GW:DONE\n")
+        self.assertIn(hostctl._START_CMD, _ssh_cmds(fake))
+
+    async def test_restart_pattern_uses_the_service_port(self):
+        # the pkill pattern names the SERVICE's port: a fixed 8188 would kill nothing
+        # (or another ComfyUI) for a service on another port
+        self.assertIn("--port 8190'", hostctl._restart_cmd(8190))
+        with self.assertRaises(ValueError):
+            hostctl._restart_cmd(0)
+        fake = FakeThunder()
+        _ready_snap(fake)
+        c, _, _, _ = make(fake, services=[_svc("thunder", "comfyui", 18188, 8190)])
+        await c.start()
+        n = len(fake.calls)
+        await c.restart_comfy()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        cmds = [p for m, p, _ in fake.calls[n:] if m == "SSH"]
+        self.assertIn("--port 8190'", cmds[0])
+
+    async def test_resume_probes_each_service_on_its_own_forward(self):
+        # after a gateway restart every service is probed through ITS local port, and
+        # the one that does not answer is restarted with ITS remote port in the pattern
+        fake = FakeThunder()
+        _inst(fake)
+        up, asked = {"http://127.0.0.1:18190": False}, []
+
+        async def probe(url):
+            asked.append(url)
+            await asyncio.sleep(0)
+            return up.get(url, True)
+        c, _, _, _ = make(fake, state=_persisted(), probe=probe,
+                          services=[_svc("thunder", "comfyui", 18190, 8190),
+                                    _svc("vllm", "openai", 18200, 8000)])
+        n = len(fake.calls)
+        task = asyncio.ensure_future(c.resume())
+        self.assertTrue(await _until(
+            lambda: any("pkill" in p for m, p, _ in fake.calls[n:] if m == "SSH")))
+        up["http://127.0.0.1:18190"] = True
+        await task
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        self.assertEqual(set(asked), {"http://127.0.0.1:18190"})
+        kill = next(p for m, p, _ in fake.calls[n:] if m == "SSH" and "pkill" in p)
+        self.assertIn("--port 8190'", kill)
+        self.assertEqual(c.view()["services"]["comfyui:thunder"]["status"], "up")
+
+    async def test_tunnel_error_is_in_the_view(self):
+        # Ruling M3: a tunnel whose spawn keeps failing says why on the card
+        c, _, _, _ = make(FakeThunder())
+        self.assertEqual(c.view()["tunnel_error"], "")
+        c._tunnel = types.SimpleNamespace(running=False, last_spawn_error=
+                                          "control socket in use, left in place: '/x'")
+        self.assertIn("control socket in use", c.view()["tunnel_error"])
+
+    async def test_ctl_path_falls_back_to_tmp_when_the_datadir_is_long(self):
+        # Ruling M2: a data dir so deep that `<datadir>/<kind>-ctl/<name>` exceeds a Unix
+        # socket's limit would respawn the tunnel forever on "path too long"
+        base = tempfile.mkdtemp(prefix="hostctl-m2-")
+        _TMPDIRS.append(base)
+        deep = os.path.join(base, "d" * 70)
+        os.makedirs(deep)
+        c, _, _, _ = make(FakeThunder(), datadir=deep)
+        p = c._ctl_path()
+        self.assertTrue(p.startswith(f"/tmp/ai-hub-{os.getuid()}-ctl/thunder-thunder-"), p)
+        self.assertLessEqual(len(p.encode()), sshrun.CTL_PATH_MAX)
+        short, _, _, _ = make(FakeThunder())
+        self.assertTrue(short._ctl_path().startswith(
+            os.path.join(short.deps.datadir, "thunder-ctl") + "/"))
+        # the fallback directory must be this uid's own real directory
+        fb = os.path.join(base, "fb-{uid}")
+        with mock.patch.object(hostctl, "_CTL_FALLBACK", fb):
+            d = fb.format(uid=os.getuid())
+            os.symlink(base, d)
+            with self.assertRaisesRegex(ValueError, "not this gateway's own"):
+                c._prepare_ctl()
+            os.remove(d)
+            path = c._prepare_ctl()
+            self.assertEqual(os.path.dirname(path), d)
+            self.assertEqual(os.stat(d).st_mode & 0o777, 0o700)
+
+
 class DepsContract(unittest.TestCase):
     """The main↔hostctl seam: every field `hostctl.Deps` declares is provided by
-    `main._thunder_deps()` with a callable that accepts the arguments hostctl calls
+    `main._host_deps()` with a callable that accepts the arguments hostctl calls
     it with. A renamed or re-shaped dependency fails only at run time otherwise — in
     the middle of a start, after the instance was paid for."""
 
@@ -4648,14 +5157,14 @@ class DepsContract(unittest.TestCase):
              "datadir": None, "probe_comfy": 1, "bootstrap_script": 0, "log": 1, "now": 0,
              "sleep": 1, "ssh": 1, "spawn": None, "known_uuids": 0, "keygen": 1,
              "default_nodes": 0, "alias_needs": 1, "alias_signature": 1, "source_index": 0,
-             "url_catalog": 0, "hf_token": 0, "lan": None, "pipe": 3}
-    KWARGS = {"ssh": ("stdin", "timeout"), "pipe": ("timeout_idle",)}
+             "url_catalog": 0, "hf_token": 0, "lan": None, "pipe": 3, "control": 5}
+    KWARGS = {"ssh": ("stdin", "timeout"), "pipe": ("timeout_idle",), "control": ("timeout",)}
 
     def test_every_field_provided_with_the_called_arity(self):
         import dataclasses
         import inspect
         m = _main()
-        d = m._thunder_deps()
+        d = m._host_deps()
         names = [f.name for f in dataclasses.fields(hostctl.Deps)]
         self.assertEqual(sorted(names), sorted(self.ARITY), "Deps grew or lost a field — "
                          "add it to ARITY with the arity hostctl calls it with")

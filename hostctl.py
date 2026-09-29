@@ -1,16 +1,32 @@
-"""Thunder Compute lifecycle controller: one object per `comfyui` backend that carries
-a `thunder` block. It talks to the Thunder REST API, supervises the SSH tunnel the
-ComfyUI adapter reaches the instance through, and remembers WHICH instance it owns.
+"""Managed-host lifecycle controller: one object per MANAGED HOST — a machine a
+provider (Thunder Compute today, `hostapi.PROVIDERS`) creates, lists and deletes — with
+the backends ATTACHED to it as its services. It talks to the provider's REST API,
+supervises the ONE ssh tunnel every service is reached through (a ControlMaster with a
+forward per service), and remembers WHICH machine it owns.
 
 That last part is what everything else rests on. An instance bills by the hour
 whether or not the gateway remembers it, and Thunder has no "stop" — so a gateway
 restart that forgot the instance's uuid would leave it running (and billing) with
 nobody to snapshot or delete it. The state is therefore persisted on EVERY phase
-change (store setting `thunder_state`, one entry per backend name, written by
-`main` through the injected `save_state`) and read back by the constructor;
-`resume()` then reconciles it with `/instances/list`. The log ring and the live
-transfer table are NOT persisted: both describe the running process, and a stale
-"downloading 40 %" after a restart would be a lie.
+change (store setting `host_state`, one entry per HOST name, written by `main` through
+the injected `save_state`) and read back by the constructor; `resume()` then reconciles
+it with `/instances/list`. The log ring and the live transfer table are NOT persisted:
+both describe the running process, and a stale "downloading 40 %" after a restart would
+be a lie.
+
+Host vs. service (spec 2026-09-29, R-K1). Everything about the MACHINE is the host's:
+the phase, the instance ids, the snapshots (named, owned and rotated by the host name,
+R-W4), the ssh key and known_hosts (per provider kind), the ControlMaster socket, the
+bootstrap state, and the faults of creating, snapshotting and deleting it (booked on the
+pseudo backend `{"name": <host>, "type": "managed-host"}`). Everything about ONE
+service is that backend's: `enabled`, its drain, its forward (`local_port` →
+`remote_port` on the VM), its start/probe status in `State.services`, and the faults of
+starting it or syncing its models. Start enables EVERY attached backend before the
+create; the stop drains them all and `off` disables those attached at that moment. A
+forward that changes while the host runs goes through the master's control socket
+(`sshrun.control`), never a tunnel restart that would cut another service's stream
+(R-W1); a master that died is respawned with every current forward. Only a ComfyUI
+service is started, probed and model-synced in this version (one per host).
 
 The steps are imperative and idempotent, not a pure `next_step` state machine
 (ledger Ruling 3): every step re-checks the world before acting (a snapshot with the
@@ -66,10 +82,10 @@ grows its disk or replaces the manifest the snapshot records.
 
 Never imports `main`: everything the controller needs from the gateway arrives in
 `Deps`, so it stays hot-reload-safe and testable against a stub API and a fake ssh.
-`ThunderApi` owns the HTTP and lives in hostapi.py (the provider seam: Bearer token,
-timeout, any 2xx is success, uuid first and the index only on a 404, token redaction,
-the one-hour price cache — test_hostapi.py); it is re-exported here until this module
-is renamed. Covered by test_hostctl.py.
+The provider's pure module and API class come from `hostapi.provider(kind)` (the
+provider seam: Bearer token, timeout, any 2xx is success, uuid first and the index only
+on a 404, token redaction, the one-hour price cache — test_hostapi.py). Covered by
+test_hostctl.py.
 """
 from __future__ import annotations
 
@@ -83,6 +99,7 @@ import math
 import os
 import posixpath
 import re
+import stat
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Awaitable, Callable, Optional
@@ -93,14 +110,14 @@ import httpx
 import hostapi
 import modelsync
 import sshrun
-import thunder
 
 PHASES = ("off", "creating", "restoring", "connecting", "bootstrapping", "starting",
           "syncing", "ready", "draining", "pruning", "snapshotting", "deleting", "failed")
 
-_LOG_MAX = 200                  # lines in the per-backend log ring
-_COMFY_PORT = 8188              # ComfyUI on the instance, loopback only
-_SSH_USER = thunder.SSH_USER
+_LOG_MAX = 200                  # lines in the per-host log ring
+COMFY_PORT = 8188               # ComfyUI's default port on the instance, loopback only
+# the fault log groups by backend+type: host events go to this pseudo backend's type
+HOST_FAULT_TYPE = "managed-host"
 
 # start path timing
 _CREATE_POLL_S = 10             # /instances/list while creating/restoring
@@ -128,14 +145,19 @@ _START_CMD = ("test -x ~/start-comfy.sh || { echo 'start-comfy.sh missing' >&2; 
 # the login shell is; `bash -s` reads the script from ssh's stdin, tee only the pipe.
 _BOOTSTRAP_LOG = "~/gw-bootstrap.log"
 _BOOTSTRAP_TAIL = 200
-# Kill ComfyUI (the loop restarts it 2 s later) and start the loop in case it is not
-# alive (a failed bootstrap, a killed wrapper). The bracket keeps the pattern from
-# matching the remote `bash -c "<this command>"` itself — pkill spares only its own
-# process, and a pattern that hit the shell would kill the restart half-way. It
-# matches the loop's `<venv python> main.py --listen 127.0.0.1 --port 8188 …`, whatever
-# venv the bootstrap picked (`ComfyUI/main.py` never appears in that command line).
-_RESTART_CMD = ("pkill -f '[m]ain[.]py --listen 127[.]0[.]0[.]1 --port "
-                f"{_COMFY_PORT}'; " + _START_CMD)
+
+
+def _restart_cmd(port: int) -> str:
+    """Kill ComfyUI (the loop restarts it 2 s later) and start the loop in case it is
+    not alive (a failed bootstrap, a killed wrapper). The bracket keeps the pattern from
+    matching the remote `bash -c "<this command>"` itself — pkill spares only its own
+    process, and a pattern that hit the shell would kill the restart half-way. It
+    matches the loop's `<venv python> main.py --listen 127.0.0.1 --port <port> …`,
+    whatever venv the bootstrap picked (`ComfyUI/main.py` never appears in that command
+    line). `port` is the SERVICE's remote port: a pattern with another service's port
+    kills nothing, or the wrong ComfyUI. An int by construction — no quoting needed."""
+    return ("pkill -f '[m]ain[.]py --listen 127[.]0[.]0[.]1 --port "
+            f"{sshrun._port(int(port))}'; " + _START_CMD)
 
 # stop path / background timing
 _DRAIN_POLL_S = 2               # inflight check while draining (no timeout: a job may finish)
@@ -156,8 +178,10 @@ _PENDING_MISSES = 3             # rounds a pending snapshot may be absent from t
 _ABSENT_CONFIRM = 2
 _ABSENT_RECHECK_S = 5
 _RESUME_PROBE_S = 30            # a freshly started tunnel needs a moment before ComfyUI answers
-# a Start without a token is refused before any call (each would be Thunder's 401)
-_NO_TOKEN = "no Thunder API token set — put it into the backend's API key field"
+# a Start without a token is refused before any call (each would be the provider's 401)
+_NO_TOKEN = "no {name} API token set — put it into the API key field"
+# a Start without a service creates a machine that serves nothing and bills anyway
+_NO_SERVICE = "no backend is attached to managed host {host} — nothing to start"
 _STOP_STEPS = ("draining", "pruning", "snapshotting", "deleting")
 # Phases before any bootstrap ran: the instance holds nothing a snapshot should keep (a
 # template, or an unchanged copy of the snapshot it was restored from).
@@ -165,6 +189,10 @@ _PRE_BOOT = ("creating", "restoring", "connecting")
 # ops a stop() may abort (Ruling 13): an operator must be able to end a hanging, billing
 # start; "stopping" itself is never aborted
 _ABORTABLE = ("starting", "restarting ComfyUI", "resuming")
+# the fallback directory for control sockets when `<datadir>/<kind>-ctl/<name>` exceeds
+# `sshrun.CTL_PATH_MAX` (Ruling M2); the ai-hub unit has PrivateTmp, so /tmp is its own
+_CTL_FALLBACK = "/tmp/ai-hub-{uid}-ctl"
+_SVC_STATUSES = ("starting", "up", "setup failed", "down")
 
 # model sync (spec "Controller": URL transfer, triggers, disk growth; "Stop" 1–2)
 _SYNC_PHASES = ("syncing", "ready")   # the phases a plan is made (and trusted) in
@@ -199,12 +227,6 @@ _SRC_SHA_TIMEOUT_S = 30 * 60    # sha256 of a 20 GB file on the share
 _KEYSCAN_TIMEOUT_S = 30
 _LAN_IDLE_S = 120               # a LAN stream moving no byte this long is ended
 _FLOCK_BUSY = 75                # rc of `flock -n -E 75`: another stream still appends
-
-
-# ── Thunder REST client ──────────────────────────────────────────────────────
-# Moved to hostapi.py (the provider seam); the name stays importable here until this
-# module is renamed — the SAME class, not a copy.
-ThunderApi = hostapi.ThunderApi
 
 
 # ── state / dependencies ─────────────────────────────────────────────────────
@@ -245,6 +267,9 @@ class State:
     # when create answered without a uuid (Ruling 10), also after a gateway restart
     created_template: str = ""
     create_requested_at: float = 0.0
+    # per attached service (backend id → {"status", "error", "setup_hash"}): what the last
+    # start/probe of it said. Host state stays above — a service's failure is its own
+    services: dict = field(default_factory=dict)
     log: list = field(default_factory=list)         # not persisted
     transfers: dict = field(default_factory=dict)   # not persisted
 
@@ -317,12 +342,13 @@ class Deps:
     known_uuids: Callable[[], set] = field(default=lambda: set())
     keygen: Callable[[str], Awaitable[str]] = sshrun.keygen   # path → public key
     default_nodes: Callable[[], str] = field(default=lambda: "")  # ops/thunder-nodes.default.txt
-    # model sync (P2): what the aliases on this backend need, a hash of exactly that
-    # input (candidates + catalog), the source's files, the public download sources and
-    # the Hugging Face token. The two alias readers are blocking store reads — the
-    # controller calls them in a worker thread.
-    alias_needs: Callable[[str], list] = field(default=lambda name: [])
-    alias_signature: Callable[[str], str] = field(default=lambda name: "")
+    # model sync (P2): what the aliases on a ComfyUI service need (called with the
+    # service's BACKEND ID), a hash of exactly that input (candidates + catalog), the
+    # source's files, the public download sources and the Hugging Face token. The two
+    # alias readers are blocking store reads — the controller calls them in a worker
+    # thread.
+    alias_needs: Callable[[str], list] = field(default=lambda bid: [])
+    alias_signature: Callable[[str], str] = field(default=lambda bid: "")
     source_index: Callable[[], dict] = field(default=lambda: {})
     url_catalog: Callable[[], dict] = field(default=lambda: {})
     hf_token: Callable[[], str] = field(default=lambda: "")
@@ -330,6 +356,8 @@ class Deps:
     # `source_index`) and the stream runner. None = no LAN source.
     lan: Optional[Any] = None
     pipe: Callable[..., Awaitable[tuple]] = sshrun.pipe
+    # a forward added/cancelled on the RUNNING master (R-W1): `sshrun.control`
+    control: Callable[..., Awaitable[tuple]] = sshrun.control
 
 
 # ── bootstrap output ─────────────────────────────────────────────────────────
@@ -1124,25 +1152,63 @@ class _Vanished(Exception):
     """The instance disappeared under a stop before its snapshot → `off` + fault."""
 
 
+class _ServiceError(RuntimeError):
+    """A failure that belongs to ONE service (its bootstrap, its start): the host fails
+    as before, but the fault is booked on that service's backend (R-K1)."""
+
+    def __init__(self, svc: dict, msg: str):
+        super().__init__(msg)
+        self.svc = svc
+
+
+def service_bid(svc: dict) -> str:
+    """= main.backend_id (recomputed, not imported: hostctl never imports main)."""
+    return f'{svc.get("type", "openai")}:{svc["name"]}'
+
+
 # ── controller ───────────────────────────────────────────────────────────────
 
 class Controller:
-    """Lifecycle of one Thunder-backed ComfyUI backend. The start and stop paths
-    build on `_set_phase` (persist on every change) and `_log` (the panel's ring)."""
+    """Lifecycle of one managed host and its attached services. The start and stop
+    paths build on `_set_phase` (persist on every change) and `_log` (the panel's ring).
 
-    def __init__(self, backend: dict, deps: Deps):
-        self.backend = backend
+    `host` = `{"name", "provider", "options", "api_key"}` (the provider's pure module and
+    API class come from `hostapi.provider`; an unknown provider is a ValueError — such a
+    host is shown, never driven). `services` = the attached backend dicts, each with
+    `local_port` (the gateway's end of its forward) and `remote_port` (the service's
+    loopback port on the VM); `set_services` replaces the list after every rebuild."""
+
+    def __init__(self, host: dict, services: list, deps: Deps):
+        prov = hostapi.provider((host or {}).get("provider"))
+        if prov is None:
+            raise ValueError(f"managed host {(host or {}).get('name')!r}: unknown provider "
+                             f"{(host or {}).get('provider')!r}")
+        self.host = host
+        self._prov, self._api_cls = prov
+        self._Error = self._api_cls.Error              # the provider's API error class
         self.deps = deps
-        self._api: Optional[ThunderApi] = None
+        self.services: list = []
+        self._api = None
         self._client: Optional[httpx.AsyncClient] = None
         self._tunnel = None
+        # what the running master carries: set per spawn from its argv (the forwards it
+        # was started with), then kept in step by every control forward/cancel
+        self._fwd_active: set = set()
+        # forwards `control forward` could not add (a local port taken): left out of a
+        # respawned master's argv — with ExitOnForwardFailure one of them would take
+        # the WHOLE tunnel down — and retried through the control socket instead
+        self._fwd_failed: set = set()
+        self._ctl_used = ""                            # the socket path the master got
+        self._fwd_task: Optional[asyncio.Task] = None  # a pending forward reconcile
+        self._fwd_dirty = False
+        self._plan_bid: Optional[str] = None           # the ComfyUI service the plan is for
         self._snaps: Optional[list[dict]] = None      # last /snapshots/list, for view()
         self._persist_blocked = False
         self._persist_error = ""                       # the last failed save ("" = saved)
         self._op: Optional[str] = None                 # start/restart/stop/resume in flight
         self._op_task: Optional[asyncio.Task] = None   # the abortable op's task (Ruling 13)
         self._aborted: Optional[asyncio.Task] = None   # the op task stop() cancelled
-        self._drain_waiting: Optional[int] = None      # jobs a draining stop waits for
+        self._drain_waiting: Optional[dict] = None     # {bid: jobs} a draining stop waits for
         self._orphans: list[dict] = []                 # last orphans() answer, for view()
         self._resume_pending = False                   # resume() could not reach the API
         self._pending_misses = 0                       # watcher rounds without the pending row
@@ -1176,12 +1242,13 @@ class Controller:
             self._load_failed(f"state load failed: {e!r}")
         else:
             if loaded is None:
-                pass                    # no record: this backend never had an instance
+                pass                    # no record: this host never had an instance
             elif not isinstance(loaded, dict):
                 self._load_failed(f"state load failed: stored entry is a "
                                   f"{type(loaded).__name__}, not a dict")
             else:
                 self.state = state_from(loaded)
+        self.set_services(services)
 
     def _load_failed(self, msg: str) -> None:
         """The stored record exists but could not be read. It may name a RUNNING,
@@ -1215,40 +1282,128 @@ class Controller:
     # identity / config
     @property
     def name(self) -> str:
-        return str(self.backend["name"])
+        """The HOST name — the identity of the state record, the snapshots and the
+        control socket (R-W5: never renamed)."""
+        return str(self.host["name"])
 
     @property
-    def bid(self) -> str:
-        # = main.backend_id; recomputed, not imported (hostctl never imports main)
-        return f'{self.backend.get("type", "comfyui")}:{self.name}'
+    def kind(self) -> str:
+        """The provider kind (`thunder`): names the key file and the known_hosts dir."""
+        return str(self._prov.KIND)
 
     @property
     def cfg(self) -> dict:
-        return self.backend.get("thunder") or {}
+        """The provider options of the host (GPU, vCPUs, template, reserve, nodes …)."""
+        o = self.host.get("options")
+        return o if isinstance(o, dict) else {}
+
+    def _token(self) -> str:
+        return str(self.host.get("api_key") or "")
+
+    def _host_backend(self) -> dict:
+        """The pseudo backend host events are booked on (R-K1): the fault log groups by
+        backend + type, so a host's faults form their own group next to its services'."""
+        return {"name": self.name, "type": HOST_FAULT_TYPE}
 
     @property
-    def lport(self) -> int:
-        return int(self.cfg.get("local_port") or 18188)
-
-    @property
-    def url(self) -> str:
-        return f"http://127.0.0.1:{self.lport}"
-
-    @property
-    def api(self) -> ThunderApi:
-        """One client for the controller's lifetime; a new token (backend saved in the
-        console) gets a new ThunderApi on the same client."""
-        token = str(self.backend.get("api_key") or "")
+    def api(self):
+        """One client for the controller's lifetime; a new token (saved in the console)
+        gets a new API object on the same client."""
+        token = self._token()
         if self._api is None or self._api._token != token:
             if self._client is None:
                 self._client = self.deps.client_factory()
-            self._api = ThunderApi(self._client, token)
+            self._api = self._api_cls(self._client, token)
         return self._api
+
+    # attached services
+    def set_services(self, services) -> None:
+        """The attached backends as main sees them now (every rebuild hands NEW dicts —
+        kept as given, so the controller always reads the current ones). While the
+        tunnel runs, a changed forward set is applied through the master's control
+        socket in the background, never by restarting the tunnel (R-W1)."""
+        self.services = [x for x in (services or []) if isinstance(x, dict) and x.get("name")]
+        self._kick_forwards()
+
+    def service_bids(self) -> list:
+        return [service_bid(x) for x in self.services]
+
+    def has_service(self, bid: str) -> bool:
+        return bid in self.service_bids()
+
+    def _comfy(self) -> Optional[dict]:
+        """The ComfyUI service — one per host (spec; the console refuses a second), so
+        the first one is THE one: the bootstrap, the model sync and the routing gate
+        are about it."""
+        return next((x for x in self.services if x.get("type") == "comfyui"), None)
+
+    def _comfy_bid(self) -> Optional[str]:
+        c = self._comfy()
+        return service_bid(c) if c is not None else None
+
+    @staticmethod
+    def _ports(svc: dict) -> Optional[tuple]:
+        """(local, remote) of a service, None when either is no port."""
+        try:
+            lp, rp = svc.get("local_port"), svc.get("remote_port")
+            sshrun._fwd(lp, rp)             # the one port rule (ints 1–65535, no bools)
+        except (TypeError, ValueError):
+            return None
+        return lp, rp
+
+    def _svc_url(self, svc: dict) -> str:
+        p = self._ports(svc)
+        return f"http://127.0.0.1:{p[0]}" if p else ""
+
+    def _forwards(self) -> list:
+        """(local, remote) per attached service with valid ports, in list order. A
+        local port an EARLIER service already forwards elsewhere is left out: sshrun
+        refuses one port for two targets, and the whole tunnel would never start."""
+        out: list = []
+        seen: dict = {}
+        for x in self.services:
+            p = self._ports(x)
+            if p is None or p[0] in seen:
+                continue
+            seen[p[0]] = p[1]
+            out.append(p)
+        return out
+
+    def _svc_set(self, svc: dict, status: str, error: str = "") -> None:
+        """Record a service's status (persisted — `setup_hash` rides along); logged only
+        when it changes, so a retried probe does not fill the ring."""
+        bid = service_bid(svc)
+        cur = self.state.services.get(bid)
+        cur = dict(cur) if isinstance(cur, dict) else {}
+        new = dict(cur, status=status, error=str(error or ""))
+        new.setdefault("setup_hash", "")
+        if new != cur:
+            self.state.services[bid] = new
+            self._log(f"service {bid}: {status}" + (f" — {error}" if error else ""))
+            self._persist()
+
+    def _services_view(self) -> dict:
+        out: dict = {}
+        for x in self.services:
+            bid = service_bid(x)
+            st = self.state.services.get(bid)
+            st = st if isinstance(st, dict) else {}
+            p = self._ports(x)
+            out[bid] = {"name": str(x.get("name")), "type": str(x.get("type") or "openai"),
+                        "local_port": p[0] if p else x.get("local_port"),
+                        "remote_port": p[1] if p else x.get("remote_port"),
+                        "status": str(st.get("status") or "down"),
+                        "error": str(st.get("error") or "")}
+        return out
 
     async def aclose(self) -> None:
         """Gateway shutdown: end the tunnel process and the HTTP client. The INSTANCE is
         not touched — it keeps running and `resume()` picks it up again."""
         await self._stop_tunnel()
+        t, self._fwd_task = self._fwd_task, None
+        if t is not None and not t.done():
+            t.cancel()
+            await asyncio.gather(t, return_exceptions=True)
         # local tasks only: the curls on the instance run on and are adopted by the
         # next gateway process through their lockfiles
         await self._cancel_sync_tasks()
@@ -1294,7 +1449,7 @@ class Controller:
         if len(self.state.log) > _LOG_MAX:
             del self.state.log[:-_LOG_MAX]
         try:
-            self.deps.log(f"[thunder {self.name}] {msg}")
+            self.deps.log(f"[host {self.name}] {msg}")
         except Exception:
             pass
 
@@ -1317,12 +1472,17 @@ class Controller:
 
     # tunnel
     def _key_path(self) -> str:
-        return os.path.join(self.deps.datadir, "thunder.key")
+        """One key per PROVIDER (R-W4): `<kind>.key` — for Thunder the file it always was."""
+        return os.path.join(self.deps.datadir, f"{self.kind}.key")
 
     def _known_hosts_path(self, uuid: str) -> str:
         """Per instance: IP, port AND host key change with every instance, so one shared
         file would either refuse the next instance or have to trust any key."""
-        return os.path.join(self.deps.datadir, "thunder-known_hosts", sshrun.safe_rel(uuid))
+        return os.path.join(self.deps.datadir, f"{self.kind}-known_hosts",
+                            sshrun.safe_rel(uuid))
+
+    def _login(self) -> str:
+        return f"{self._prov.SSH_USER}@{self.state.ip}"
 
     def _reset_known_hosts(self, uuid: str) -> str:
         """A NEW instance: its host key is new too, so a file left for this uuid (a
@@ -1341,25 +1501,58 @@ class Controller:
         return path
 
     def _ctl_path(self) -> str:
-        """The tunnel's ControlMaster socket, `<datadir>/thunder-ctl/<slug>-<hash>`. The
-        hash keeps two backends whose names slug alike ("GPU 1", "gpu-1") apart — a
-        shared path would have one master clear the other's LIVE socket as stale — and
-        the slug is cut so the path stays within a Unix socket's length limit."""
-        slug = thunder.slug(self.name)[:24]
-        h = hashlib.sha256(self.name.encode("utf-8")).hexdigest()[:8]
-        return os.path.join(self.deps.datadir, "thunder-ctl", f"{slug}-{h}")
+        """The tunnel's ControlMaster socket, `<datadir>/<kind>-ctl/<slug>-<hash>`. The
+        hash keeps two hosts whose names slug alike apart — a shared path would have one
+        master clear the other's LIVE socket as stale — and the slug is cut so the path
+        stays short. A data dir so deep that even then the path exceeds what a Unix
+        socket can bind (`sshrun.CTL_PATH_MAX`) moves the socket to
+        `/tmp/ai-hub-<uid>-ctl/` (Ruling M2) — refused there, the tunnel would respawn
+        forever on "path too long"."""
+        leaf = (re.sub(r"[^a-z0-9]+", "-", self.name.lower()).strip("-") or "host")[:24]
+        leaf += "-" + hashlib.sha256(self.name.encode("utf-8")).hexdigest()[:8]
+        path = os.path.join(self.deps.datadir, f"{self.kind}-ctl", leaf)
+        if len(path.encode("utf-8")) <= sshrun.CTL_PATH_MAX:
+            return path
+        return os.path.join(_CTL_FALLBACK.format(uid=os.getuid()), f"{self.kind}-{leaf}")
+
+    def _prepare_ctl(self) -> str:
+        """`sshrun.prepare_ctl_path` on `_ctl_path()`. The /tmp fallback directory must be
+        OURS — a real directory owned by this uid, no symlink: in a shared /tmp another
+        user could have made it first and would then own the socket that grants this
+        gateway's session on the VM."""
+        path = self._ctl_path()
+        d = os.path.dirname(path)
+        if not path.startswith(os.path.join(os.path.abspath(self.deps.datadir), "")):
+            try:
+                st = os.lstat(d)
+            except FileNotFoundError:
+                pass
+            else:
+                if (stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode)
+                        or st.st_uid != os.getuid()):
+                    raise ValueError(f"control socket directory {d!r} is not this "
+                                     "gateway's own (symlink or another owner) — not used")
+        return sshrun.prepare_ctl_path(path)
 
     def _tunnel_argv(self) -> list[str]:
-        """Called by the Supervisor per spawn, so it follows the CURRENT instance — and
-        prepares the control socket each time (0700 dir; a socket a SIGKILLed master
-        left behind is removed, or the new master would run without one)."""
+        """Called by the Supervisor per spawn, so it follows the CURRENT instance and
+        carries EVERY current forward (a respawned master has them all) — and prepares
+        the control socket each time (0700 dir; a socket a SIGKILLed master left behind
+        is removed, or the new master would run without one)."""
         s = self.state
         if not (s.uuid and s.ip and s.port):
             raise RuntimeError("no instance to tunnel to")
-        ctl = sshrun.prepare_ctl_path(self._ctl_path())
-        return sshrun.tunnel_argv(self._key_path(), self._known_hosts_path(s.uuid),
-                                  f"{_SSH_USER}@{s.ip}", s.port,
-                                  [(self.lport, _COMFY_PORT)], ctl)
+        fwds = [f for f in self._forwards() if f not in self._fwd_failed]
+        ctl = self._prepare_ctl()
+        argv = sshrun.tunnel_argv(self._key_path(), self._known_hosts_path(s.uuid),
+                                  self._login(), s.port, fwds, ctl)
+        if ctl != self._ctl_used and os.path.dirname(os.path.dirname(ctl)) != \
+                os.path.abspath(self.deps.datadir):
+            self._log(f"control socket in {os.path.dirname(ctl)} — the data dir path is "
+                      "too long for a Unix socket")
+        self._ctl_used = ctl
+        self._fwd_active = set(fwds)
+        return argv
 
     def _tunnel_factory(self):
         """The tunnel Supervisor seam (tests replace it per instance)."""
@@ -1368,7 +1561,7 @@ class Controller:
 
     async def _start_tunnel(self) -> None:
         """A fresh Supervisor for the current instance. An old one is stopped (and its
-        ssh reaped) first: its process holds the local port, and the new tunnel would
+        ssh reaped) first: its process holds the local ports, and the new tunnel would
         exit at once on ExitOnForwardFailure."""
         await self._stop_tunnel()
         self._tunnel = self._tunnel_factory()
@@ -1376,8 +1569,75 @@ class Controller:
 
     async def _stop_tunnel(self) -> None:
         t, self._tunnel = self._tunnel, None
+        self._fwd_active = set()
         if t is not None:
             await t.stop()
+
+    def _tunnel_error(self) -> str:
+        """Why the tunnel's last spawn failed ("" = it did not): shown on the card as
+        "tunnel will not come up" — otherwise a tunnel that can never start looks like
+        one that restarts now and then (Ruling M3)."""
+        t = self._tunnel
+        return str(getattr(t, "last_spawn_error", "") or "") if t is not None else ""
+
+    def _kick_forwards(self) -> None:
+        """Apply a changed forward set to the running master soon: `set_services` is
+        synchronous, the control call is not. One task at a time; a change while it
+        runs makes it look once more."""
+        self._fwd_dirty = True
+        if self._tunnel is None:
+            return                      # no master: its next spawn carries the set
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if self._fwd_task is None or self._fwd_task.done():
+            self._fwd_task = asyncio.ensure_future(self._forward_loop())
+
+    async def _forward_loop(self) -> None:
+        while self._fwd_dirty:
+            self._fwd_dirty = False
+            try:
+                await self.reconcile_forwards()
+            except Exception as e:      # the next change or tick tries again
+                self._log(f"forward update failed: {_errtext(e)}")
+
+    async def reconcile_forwards(self) -> None:
+        """Bring the RUNNING master's forwards to the attached services' set through its
+        control socket — `forward` for a new one, `cancel` for one no longer wanted.
+        Never a tunnel restart (R-W1: it would cut every other service's stream). A
+        master that is not up has nothing to change: its next spawn carries the current
+        set (`_tunnel_argv`). A forward that fails (its local port taken) makes only
+        THAT service `down`, with ssh's reason."""
+        t, s = self._tunnel, self.state
+        if (t is None or not getattr(t, "running", False) or not self._ctl_used
+                or not (s.ip and s.port)):
+            return
+        want = self._forwards()
+        self._fwd_failed &= set(want)
+        by_fwd = {self._ports(x): x for x in self.services}
+        for lp, rp in sorted(self._fwd_active - set(want)):
+            rc, why = await self.deps.control(self._ctl_used, self._login(), "cancel", lp, rp)
+            if rc == 0:
+                self._fwd_active.discard((lp, rp))
+                self._log(f"forward {lp} → {rp} removed")
+            else:
+                self._log(f"removing forward {lp} → {rp} failed (rc {rc}): {why}")
+        for lp, rp in want:
+            if (lp, rp) in self._fwd_active:
+                continue
+            rc, why = await self.deps.control(self._ctl_used, self._login(), "forward", lp, rp)
+            svc = by_fwd.get((lp, rp))
+            if rc == 0:
+                self._fwd_active.add((lp, rp))
+                self._fwd_failed.discard((lp, rp))
+                self._log(f"forward {lp} → {rp} added")
+            elif (lp, rp) not in self._fwd_active:
+                # (a master respawned meanwhile carries it already — then it is no failure)
+                self._fwd_failed.add((lp, rp))
+                if svc is not None:
+                    self._svc_set(svc, "down",
+                                  f"forward {lp} → {rp} failed: {why or f'rc {rc}'}")
 
     # prices / snapshots for the panel
     async def refresh_prices(self) -> None:
@@ -1385,13 +1645,13 @@ class Controller:
         try:
             await self.api.pricing()
             await self.api.specs()
-        except thunder.ThunderError as e:
+        except self._Error as e:
             self._log(f"price list unavailable ({e.status or 'transport'}): {e}")
 
     async def refresh_snapshots(self) -> Optional[list[dict]]:
         try:
             self._snaps = await self.api.snapshots()
-        except thunder.ThunderError as e:
+        except self._Error as e:
             self._log(f"snapshot list unavailable ({e.status or 'transport'}): {e}")
         return self._snaps
 
@@ -1412,7 +1672,7 @@ class Controller:
         if live or foreign:
             try:
                 items = await self.api.list_instances()
-            except thunder.ThunderError as e:
+            except self._Error as e:
                 self._log(f"instance list unavailable ({e.status or 'transport'}): {e}")
         if live and items is not None:
             self._check_own_listed(items)
@@ -1427,7 +1687,7 @@ class Controller:
         disappearance — the phase stays: ending it (snapshot? delete?) is the stop
         path's call, and one odd list must never make a billing instance look gone."""
         uuid = self.state.uuid
-        if any(it.get("uuid") == uuid and not thunder.is_gone_status(it.get("status"))
+        if any(it.get("uuid") == uuid and not self._prov.is_gone_status(it.get("status"))
                for it in items):
             self._own_absent = 0
             return
@@ -1436,10 +1696,18 @@ class Controller:
             msg = (f"instance {uuid} is no longer listed at Thunder (phase "
                    f"{self.state.phase}) — deleted outside the gateway? Stop clears it")
             self._log(msg)
-            try:
-                self.deps.note_fault(self.backend, "lifecycle", "instance_vanished", msg)
-            except Exception as e:
-                self._log(f"fault log unavailable: {e!r}")
+            self._fault(None, "lifecycle", "instance_vanished", msg)
+
+    def _fault(self, svc: Optional[dict], source: str, kind: str, detail: str) -> None:
+        """Book a fault (R-K1): on the service's backend when `svc` is given (its start,
+        its bootstrap, its transfers), else on the host's pseudo backend (create,
+        snapshot, delete, instance gone). Never raises: the fault log is a record, not
+        a reason to stop."""
+        try:
+            self.deps.note_fault(svc if svc is not None else self._host_backend(),
+                                 source, kind, detail)
+        except Exception as e:
+            self._log(f"fault log unavailable: {e!r}")
 
     def snapshots(self) -> list[dict]:
         """The last `/snapshots/list` answer (a copy; [] before the first)."""
@@ -1461,9 +1729,9 @@ class Controller:
         table = self.pricing_table()
         api = self._api
         specs = api.cached("specs") if api is not None else None
-        out["cost_per_h"] = (thunder.hourly_cost(table, gpu, n, int(o.get("cpu_cores") or 0),
+        out["cost_per_h"] = (self._prov.hourly_cost(table, gpu, n, int(o.get("cpu_cores") or 0),
                                                  int(o.get("storage") or 0),
-                                                 thunder.spec_for(specs, gpu, n))
+                                                 self._prov.spec_for(specs, gpu, n))
                              if (gpu and table is not None) else None)
         return out
 
@@ -1475,8 +1743,8 @@ class Controller:
             return None
         cfg = self.cfg
         gpu, n = str(cfg.get("gpu_type") or ""), int(cfg.get("num_gpus") or 1)
-        return thunder.hourly_cost(table, gpu, n, int(cfg.get("vcpus") or 0),
-                                   self.state.disk_gb, thunder.spec_for(specs, gpu, n))
+        return self._prov.hourly_cost(table, gpu, n, int(cfg.get("vcpus") or 0),
+                                   self.state.disk_gb, self._prov.spec_for(specs, gpu, n))
 
     def _snapshot_view(self) -> dict:
         s = self.state
@@ -1485,7 +1753,7 @@ class Controller:
         monthly = None
         table = self.pricing_table()
         if gb and table is not None:
-            monthly = thunder.snapshot_monthly(table, gb)
+            monthly = self._prov.snapshot_monthly(table, gb)
         return {"id": s.snapshot_id, "pending": s.pending_snapshot,
                 "pending_name": s.pending_snapshot_name,
                 "name": (row or {}).get("name", ""), "status": (row or {}).get("status", ""),
@@ -1500,7 +1768,7 @@ class Controller:
         cph = self.cost_per_h()
         # spec "Kosten-Wächter": an instance up for more than a day is almost always one
         # somebody forgot — the panel and the Dashboard key their banner on this
-        return {"name": self.name, "phase": s.phase, "error": s.error,
+        return {"name": self.name, "provider": self.kind, "phase": s.phase, "error": s.error,
                 "failed_phase": s.failed_phase, "index": s.index, "uuid": s.uuid,
                 "ip": s.ip, "port": s.port, "started_at": s.started_at,
                 "uptime_s": uptime, "long_running": running and uptime > _LONG_RUN_S,
@@ -1514,7 +1782,12 @@ class Controller:
                 "bootstrap_unknown": dict(s.bootstrap_unknown),
                 "bootstrap_template_nodes": list(s.bootstrap_template_nodes),
                 "bootstrap_incomplete": s.bootstrap_incomplete,
-                "op": self._op, "waiting_jobs": self._drain_waiting,
+                "op": self._op,
+                # {bid: jobs} while a stop drains, else None
+                "waiting_jobs": (dict(self._drain_waiting)
+                                 if self._drain_waiting is not None else None),
+                "services": self._services_view(),
+                "tunnel_error": self._tunnel_error(),
                 "unreconciled_uuids": list(s.unreconciled_uuids),
                 "orphans": [self._orphan_view(x) for x in self._orphans]}
 
@@ -1528,15 +1801,13 @@ class Controller:
         if self._op is not None:
             raise RuntimeError(f"already {self._op}")
 
-    def _fail(self, msg: str) -> None:
+    def _fail(self, msg: str, svc: Optional[dict] = None) -> None:
         """An instance exists (and bills): `failed(<phase>)`, never `off` — the stop
         path needs the uuid to snapshot and delete it. The fault log keeps it after the
-        panel has moved on."""
+        panel has moved on — on the service's backend when the failure was that
+        service's (`_ServiceError`), else on the host."""
         self._set_phase("failed", msg)
-        try:
-            self.deps.note_fault(self.backend, "lifecycle", "error", msg)
-        except Exception as e:
-            self._log(f"fault log unavailable: {e!r}")
+        self._fault(svc, "lifecycle", "error", msg)
 
     def _cfg_int(self, key: str, default: int) -> int:
         v = self.cfg.get(key)
@@ -1549,13 +1820,17 @@ class Controller:
         """Bytes the aliases' models need on the new disk (spec "Start" 2): a plan
         against the source index, with the manifest of the snapshot the instance is
         started from as the destination (its URL files carry their measured size). A
-        size nobody knows yet (a URL never downloaded) counts 0. Never raises: a broken
+        size nobody knows yet (a URL never downloaded) counts 0, and so does a host
+        without a ComfyUI service (nothing is synced there). Never raises: a broken
         input sizes the disk by the other terms, it must not stop a start."""
+        bid = self._comfy_bid()
+        if bid is None:
+            return 0
         try:
             man = normalize_manifest(self.state.manifests.get(snapshot_id) or {})
             dest = {k: v["size"] for k, v in man.items() if isinstance(v.get("size"), int)}
             def inputs():                       # blocking store reads: off the loop
-                return (self.deps.alias_needs(self.name) or [], self.deps.source_index() or {},
+                return (self.deps.alias_needs(bid) or [], self.deps.source_index() or {},
                         self.deps.url_catalog() or {})
             needs, src, urls = await asyncio.to_thread(inputs)
             p = modelsync.plan(needs, self._with_head_sizes(src, urls), dest, man, urls)
@@ -1641,11 +1916,11 @@ class Controller:
     async def _fresh_item(self) -> dict:
         it = self._find_ours(await self.api.list_instances())
         if it is None:
-            raise thunder.ThunderError(
+            raise self._Error(
                 f"instance {self.state.uuid or self.state.index} is not in /instances/list",
                 None)
-        if thunder.is_gone_status(it.get("status")):
-            raise thunder.ThunderError(f"instance {it.get('uuid')} is {it.get('status')}", None)
+        if self._prov.is_gone_status(it.get("status")):
+            raise self._Error(f"instance {it.get('uuid')} is {it.get('status')}", None)
         return it
 
     async def _ensure_ports_closed(self, item: dict) -> dict:
@@ -1655,15 +1930,15 @@ class Controller:
         Open ports are removed and the list read AGAIN — a 200 on the PATCH is not
         proof — and ports still open raise, so `bootstrapping`/`starting` are never
         entered with a public port. → the fresh item."""
-        ports = thunder.ports_open(item)
+        ports = self._prov.ports_open(item)
         if not ports:
             return item
         self._log(f"public http ports {ports} open on the instance — removing")
         await self.api.remove_ports(item, ports)
         fresh = await self._fresh_item()
-        still = thunder.ports_open(fresh)
+        still = self._prov.ports_open(fresh)
         if still:
-            raise thunder.ThunderError(
+            raise self._Error(
                 f"public http ports {still} still open after removing them — "
                 "ComfyUI is not started behind a public port", None)
         self._log("public http ports closed")
@@ -1672,7 +1947,7 @@ class Controller:
     def _ssh_argv(self, cmd: str) -> list[str]:
         s = self.state
         return sshrun.exec_argv(self._key_path(), self._known_hosts_path(s.uuid),
-                                f"{_SSH_USER}@{s.ip}", s.port, cmd)
+                                self._login(), s.port, cmd)
 
     async def _exec(self, cmd: str, stdin: Optional[bytes] = None,
                     timeout: float = 60) -> tuple[int, bytes, bytes]:
@@ -1688,17 +1963,17 @@ class Controller:
         while True:
             try:
                 it = self._find_ours(await self.api.list_instances())
-            except thunder.ThunderError as e:
+            except self._Error as e:
                 it, last_err = None, str(e)
                 self._log(f"instance list failed while waiting: {e}")
             if it is not None:
                 status = it.get("status") or "?"
-                if thunder.is_gone_status(status):
-                    raise thunder.ThunderError(f"instance {it.get('uuid')} became {status} "
+                if self._prov.is_gone_status(status):
+                    raise self._Error(f"instance {it.get('uuid')} became {status} "
                                                "while starting", None)
                 if status == "RESTORING" and self.state.phase != "restoring":
                     self._set_phase("restoring")
-                if thunder.is_running(status) and it.get("ip") and it.get("port"):
+                if self._prov.is_running(status) and it.get("ip") and it.get("port"):
                     return it
             if self.deps.now() >= deadline:
                 raise TimeoutError(f"instance not RUNNING after {limit // 60} min "
@@ -1773,31 +2048,65 @@ class Controller:
                   f"{_BOOTSTRAP_LOG} follow")
         return (out or b"").decode("utf-8", "replace")
 
-    async def _wait_comfy(self, settle: bool = False) -> None:
-        """Probe ComfyUI through the tunnel every 3 s until it answers. `settle`: wait
-        one interval first — right after a pkill the old process may still answer."""
+    # services: start / probe / restart (ComfyUI only in this version — the provisional
+    # internal profile; command services join with services.py)
+    async def _wait_comfy(self, svc: dict, settle: bool = False) -> None:
+        """Probe a ComfyUI service through its forward every 3 s until it answers.
+        `settle`: wait one interval first — right after a pkill the old process may
+        still answer."""
+        url = self._svc_url(svc)
         deadline = self.deps.now() + _COMFY_READY_S
         if settle:
             await self.deps.sleep(_COMFY_PROBE_S)
         while True:
             try:
-                ok = bool(await self.deps.probe_comfy(self.url))
+                ok = bool(await self.deps.probe_comfy(url))
             except Exception:
                 ok = False              # tunnel not up yet, ComfyUI still importing
             if ok:
                 self._log("ComfyUI answers")
                 return
             if self.deps.now() >= deadline:
-                raise TimeoutError(f"ComfyUI did not answer on {self.url} within "
+                raise TimeoutError(f"ComfyUI did not answer on {url} within "
                                    f"{_COMFY_READY_S // 60} min (see ~/comfy.log)")
             await self.deps.sleep(_COMFY_PROBE_S)
 
-    async def _start_comfy(self, cmd: str, settle: bool = False) -> None:
-        rc, _, err = await self._exec(cmd, timeout=60)
-        if rc != 0:
-            raise RuntimeError(f"starting ComfyUI failed (rc {rc}): "
-                               + " | ".join(_tail(err, 3)))
-        await self._wait_comfy(settle)
+    async def _start_comfy(self, svc: dict, restart: bool = False) -> None:
+        """Start (or, `restart`, kill and restart) one ComfyUI service and wait until it
+        answers. Its status follows (`starting` → `up`, else `down` with the reason); a
+        failure raises `_ServiceError` — the host fails as before, the fault is the
+        service's."""
+        p = self._ports(svc)
+        if p is None:
+            why = "no valid local/remote port"
+            self._svc_set(svc, "down", why)
+            raise _ServiceError(svc, f"{service_bid(svc)}: {why}")
+        self._svc_set(svc, "starting")
+        try:
+            rc, _, err = await self._exec(_restart_cmd(p[1]) if restart else _START_CMD,
+                                          timeout=60)
+            if rc != 0:
+                raise RuntimeError(f"starting ComfyUI failed (rc {rc}): "
+                                   + " | ".join(_tail(err, 3)))
+            await self._wait_comfy(svc, settle=restart)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self._svc_set(svc, "down", _errtext(e))
+            raise _ServiceError(svc, _errtext(e)) from e
+        self._svc_set(svc, "up")
+
+    async def _start_services(self, restart: bool = False,
+                              only: Optional[list] = None) -> None:
+        """Every attached service (or just `only`), in list order. A service type
+        without a start profile yet (anything but ComfyUI in this version) is left
+        `down` with that reason — it does not fail the host."""
+        for svc in list(self.services if only is None else only):
+            if svc.get("type") == "comfyui":
+                await self._start_comfy(svc, restart=restart)
+            else:
+                self._svc_set(svc, "down", f"no start profile for type "
+                                           f"{svc.get('type') or 'openai'!r} yet")
 
     # ops: one lifecycle operation at a time
     async def _run_op(self, name: str, coro) -> None:
@@ -1820,8 +2129,8 @@ class Controller:
     async def start(self) -> None:
         """Spec "Start" 0–6 (`starting` → `syncing` → first plan → `ready`).
 
-        Refusals (unreconciled state, an instance already known, a bad commit, a
-        start in flight) RAISE before anything happens. Everything else ends in the
+        Refusals (unreconciled state, an instance already known, no attached service, a
+        bad commit, a start in flight) RAISE before anything happens. Everything else ends in the
         state: a failure before `create` → `off` with the reason (nothing bills), a
         failure after it → `failed(<phase>)` with the instance KEPT (diagnosis; the
         stop path removes it). The uuid is persisted before the first wait, so a
@@ -1834,15 +2143,16 @@ class Controller:
             # `failed` with an index but no uuid still names an instance (Ruling 10)
             raise RuntimeError(f"already {s.phase}"
                                + (f" (instance {s.uuid or s.index})" if s.uuid or s.index else ""))
-        self._commit()
+        if not self.services:
+            # a machine serving nothing would bill for nothing
+            raise RuntimeError(_NO_SERVICE.format(host=self.name))
+        if self._comfy() is not None:
+            self._commit()              # only the ComfyUI bootstrap pins a commit
         if not self._token():
-            # every Thunder call would be a 401; say what to do instead of showing it
-            raise RuntimeError(_NO_TOKEN)
+            # every provider call would be a 401; say what to do instead of showing it
+            raise RuntimeError(_NO_TOKEN.format(name=self._prov.NAME))
         self._abort_note = ""
         await self._run_op("starting", self._checked_start())
-
-    def _token(self) -> str:
-        return str(self.backend.get("api_key") or "")
 
     async def _checked_start(self) -> None:
         """The start op: the unreconciled check INSIDE it, so the op's task exists from
@@ -1872,11 +2182,11 @@ class Controller:
                 await self.deps.sleep(_ABSENT_RECHECK_S)
             try:
                 items = await self.api.list_instances()
-            except thunder.ThunderError as e:
+            except self._Error as e:
                 raise RuntimeError(f"cannot check the unreconciled instances "
                                    f"({', '.join(s.unreconciled_uuids)}): {e}") from e
             listed = {it.get("uuid") for it in items
-                      if not thunder.is_gone_status(it.get("status"))}
+                      if not self._prov.is_gone_status(it.get("status"))}
             still = [u for u in s.unreconciled_uuids if u in listed]
             if still:
                 raise RuntimeError(f"instance(s) {', '.join(still)} seen while the stored "
@@ -1894,45 +2204,60 @@ class Controller:
             self.state.unreconciled_uuids = []
             self._persist()
 
-    def _enable(self) -> None:
-        """Step 0. A backend that stays disabled is never polled or routed to — an
-        instance created for it would bill for nothing, so a failure here ends the
-        start before the create."""
-        try:
-            ok = self.deps.set_enabled(self.bid, True)
-        except Exception as e:
-            raise _PreCreate(f"cannot enable backend {self.bid}: {_errtext(e)}") from e
-        if ok is False:
-            raise _PreCreate(f"cannot enable backend {self.bid}: not a known backend")
+    def _enable(self, done: list) -> None:
+        """Step 0: EVERY attached backend. One that stays disabled is never polled or
+        routed to — an instance created for it would bill for nothing, so any failure
+        here ends the start before the create. `done` collects the ones enabled, which
+        the caller disables again (and only those — the one that failed never was)."""
+        for svc in list(self.services):
+            bid = service_bid(svc)
+            try:
+                ok = self.deps.set_enabled(bid, True)
+            except Exception as e:
+                raise _PreCreate(f"cannot enable backend {bid}: {_errtext(e)}") from e
+            if ok is False:
+                raise _PreCreate(f"cannot enable backend {bid}: not a known backend")
+            done.append(svc)
 
-    def _disable(self) -> None:
-        """`off` = disabled (spec "Stop" 1): no discovery against a dead tunnel port."""
-        try:
-            self.deps.set_enabled(self.bid, False)
-        except Exception as e:
-            self._log(f"disabling the backend failed: {e!r}")
+    def _disable(self, svcs: Optional[list] = None) -> None:
+        """`off` = disabled (spec "Stop" 1): no discovery against a dead tunnel port —
+        for every backend attached AT THIS MOMENT (R-K2: one that moved to another host
+        or a real URL is that one's business now), or just `svcs`."""
+        for svc in list(self.services if svcs is None else svcs):
+            bid = service_bid(svc)
+            try:
+                self.deps.set_enabled(bid, False)
+            except Exception as e:
+                self._log(f"disabling backend {bid} failed: {e!r}")
+            self._svc_set(svc, "down")
 
     async def _start(self) -> None:
-        enabled = False
+        enabled: list = []
         try:
-            self._enable()
-            enabled = True
+            self._enable(enabled)
             created = await self._create()
         except Exception as e:
             msg = _errtext(e)
-            if isinstance(e, thunder.ThunderError) and e.status is None:
+            if isinstance(e, self._Error) and e.status is None:
                 msg += " (an instance may exist anyway — check the orphan list)"
             self._set_phase("off", f"start failed: {msg}")
             if enabled:
-                self._disable()
+                self._disable(enabled)
             return
         await self._after_create(created)
 
     async def _after_create(self, needs_bootstrap: bool) -> None:
-        """Steps 3–6 from a created instance on: RUNNING → port guard → tunnel → ssh →
-        bootstrap (if needed) → ComfyUI. Also how resume() continues a start the
-        gateway restart interrupted before the bootstrap."""
+        """Steps 3–6 from a created instance on: RUNNING → port guard → tunnel (every
+        service's forward) → ssh → the ComfyUI bootstrap (if needed, and only with a
+        ComfyUI service attached) → each service started and probed. Also how resume()
+        continues a start the gateway restart interrupted before the bootstrap."""
         s = self.state
+        comfy = self._comfy()
+        if needs_bootstrap and comfy is None:
+            # the ComfyUI part runs only for a ComfyUI service (R-W3); the mark stays,
+            # so a snapshot of this instance still bootstraps once one is attached
+            self._log("no ComfyUI service attached — ComfyUI bootstrap skipped")
+            needs_bootstrap = False
         try:
             if needs_bootstrap and not self._nodes_text:
                 self._nodes_text = self._node_list()     # lost with a restart
@@ -1947,10 +2272,17 @@ class Controller:
             if needs_bootstrap:
                 s.bootstrap_incomplete = True
                 self._set_phase("bootstrapping")
-                await self._bootstrap()
+                try:
+                    await self._bootstrap()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    # the bootstrap is the ComfyUI service's setup: its fault (R-K1)
+                    self._svc_set(comfy, "setup failed", _errtext(e))
+                    raise _ServiceError(comfy, _errtext(e)) from e
             await self._ensure_ports_closed(await self._fresh_item())
             self._set_phase("starting")
-            await self._start_comfy(_START_CMD)
+            await self._start_services()
             # spec "Start" 6: the first plan before `ready`; aliases go live one by one
             # as their files arrive (`ready_aliases`), `ready` is the INSTANCE's state
             self._set_phase("syncing")
@@ -1958,13 +2290,13 @@ class Controller:
             await self.sync_once()
             self._ready()
         except Exception as e:
-            self._fail(_errtext(e))
+            self._fail(_errtext(e), getattr(e, "svc", None))
 
     def _ready(self) -> None:
         """ComfyUI answers: whatever the bootstrap left undone, this instance works — a
         snapshot of it is a good template (an operator who fixed a failed bootstrap by
         hand and restarted ComfyUI has confirmed exactly that)."""
-        if self.state.bootstrap_incomplete:
+        if self.state.bootstrap_incomplete and self._comfy() is not None:
             self._log("ComfyUI answers — the unfinished bootstrap counts as done now")
             self.state.bootstrap_incomplete = False
         self._set_phase("ready")
@@ -1981,24 +2313,26 @@ class Controller:
         num_gpus = self._cfg_int("num_gpus", 1)
         snaps = await self.api.snapshots()
         self._snaps = snaps
-        snap = thunder.newest_ready(snaps, self.name)
+        snap = self._prov.newest_ready(snaps, self.name)
+        comfy = self._comfy() is not None
         if snap is not None:
             template = snap["name"]
             needs_bootstrap = snap["id"] in s.incomplete_snapshots
-            if needs_bootstrap:
+            if needs_bootstrap and comfy:
                 self._log(f"snapshot {snap['name']} was taken before its bootstrap finished "
                           "— the bootstrap runs again on it")
-            self._nodes_text = self._node_list() if needs_bootstrap else ""
         else:
             template = str(cfg.get("bootstrap_template") or "comfy-ui")
             needs_bootstrap = True
-            self._nodes_text = self._node_list()
-        spec = thunder.spec_for(await self.api.specs(), str(cfg["gpu_type"]), num_gpus)
+        # the ComfyUI bootstrap (and its node list) only with a ComfyUI service (R-W3);
+        # `needs_bootstrap` itself stays: it marks the instance's snapshots incomplete
+        self._nodes_text = self._node_list() if (needs_bootstrap and comfy) else ""
+        spec = self._prov.spec_for(await self.api.specs(), str(cfg["gpu_type"]), num_gpus)
         storage = (spec or {}).get("storageGB") if isinstance((spec or {}).get("storageGB"), dict) else {}
         if spec is None:
             self._log(f"no /v2/specs entry for {cfg['gpu_type']} x{num_gpus} — disk "
                       "limits unknown, Thunder decides")
-        disk_gb = thunder.choose_disk_gb(
+        disk_gb = self._prov.choose_disk_gb(
             required_bytes=await self._required_bytes_hint((snap or {}).get("id") or ""),
             base_bytes=s.base_bytes,
             reserve_gb=self._cfg_int("reserve_gb", 20),
@@ -2015,7 +2349,7 @@ class Controller:
             raise _PreCreate(f"state could not be saved ({self._persist_error or 'blocked'}) "
                              "— not creating an instance nobody could find after a restart")
         fut = asyncio.ensure_future(
-            self.api.create(thunder.create_body(cfg, template, disk_gb, pub)))
+            self.api.create(self._prov.create_body(cfg, template, disk_gb, pub)))
         try:
             created = await asyncio.shield(fut)
         except asyncio.CancelledError as cancel:
@@ -2025,7 +2359,7 @@ class Controller:
                 created = await fut
             except Exception as e:
                 note = f"create answered {_errtext(e)}"
-                if isinstance(e, thunder.ThunderError) and e.status is None:
+                if isinstance(e, self._Error) and e.status is None:
                     note += " (an instance may exist anyway — check the orphan list)"
                 self._abort_note = note
                 self._log(f"create aborted; {note}")
@@ -2061,18 +2395,21 @@ class Controller:
             raise RuntimeError(f"no running instance to restart ComfyUI on ({s.phase})")
         if s.phase == "failed" and s.failed_phase in _STOP_STEPS:
             raise RuntimeError(f"a stop did not finish ({s.failed_phase}) — stop again")
-        await self._run_op("restarting ComfyUI", self._restart())
+        comfy = self._comfy()
+        if comfy is None:
+            raise RuntimeError(f"no ComfyUI service attached to {self.name}")
+        await self._run_op("restarting ComfyUI", self._restart(only=[comfy]))
 
-    async def _restart(self) -> None:
+    async def _restart(self, only: Optional[list] = None) -> None:
         try:
             await self._ensure_ports_closed(await self._fresh_item())
             if self._tunnel is None:
                 await self._start_tunnel()
             self._set_phase("starting")
-            await self._start_comfy(_RESTART_CMD, settle=True)
+            await self._start_services(restart=True, only=only)
             self._ready()
         except Exception as e:
-            self._fail(_errtext(e))
+            self._fail(_errtext(e), getattr(e, "svc", None))
 
     # ── stop (spec "Stop" 1–4) ──────────────────────────────────────────────
 
@@ -2238,29 +2575,41 @@ class Controller:
             self._fail(_errtext(e))
 
     async def _drain(self) -> None:
-        """Step 1. The existing drain (routing stops now, the backend is disabled once
-        idle — wanted for `off`). No timeout: a running job may finish; the panel shows
-        how many are left."""
+        """Step 1. The existing drain for EVERY attached backend (routing stops now,
+        each backend is disabled once idle — wanted for `off`). The snapshot waits until
+        none has a job left AND none is still draining — one busy service keeps the
+        whole machine. No timeout: a running job may finish; the panel shows how many
+        are left per service (`waiting_jobs`)."""
         self._set_phase("draining")
-        try:
-            started = self.deps.begin_drain(self.bid)
-        except Exception as e:
-            # routing would go on sending jobs, and the wait below could never end
-            # with nothing saying why
-            raise RuntimeError(f"drain could not start: {_errtext(e)}") from e
-        if not started:
-            self._log("drain: backend already offline")
+        svcs = list(self.services)
+        for svc in svcs:
+            bid = service_bid(svc)
+            try:
+                started = self.deps.begin_drain(bid)
+            except Exception as e:
+                # routing would go on sending jobs, and the wait below could never end
+                # with nothing saying why
+                raise RuntimeError(f"drain of {bid} could not start: {_errtext(e)}") from e
+            if not started:
+                self._log(f"drain: backend {bid} already offline")
         await self._stop_transfers()
         last = None
         while True:
-            n = int(self.deps.inflight(self.bid) or 0)
-            if n <= 0 and not self.deps.is_draining(self.bid):
+            waiting: dict = {}
+            for svc in svcs:
+                bid = service_bid(svc)
+                n = int(self.deps.inflight(bid) or 0)
+                if n > 0 or self.deps.is_draining(bid):
+                    waiting[bid] = max(0, n)
+            if not waiting:
                 break
-            if n != last:
-                self._log(f"draining: waiting for {n} job(s) to finish" if n > 0
-                          else "draining: waiting for the drain to complete")
-                last = n
-            self._drain_waiting = n
+            if waiting != last:
+                self._log("draining: " + "; ".join(
+                    f"waiting for {n} job(s) on {bid}" if n > 0
+                    else f"waiting for the drain of {bid} to complete"
+                    for bid, n in sorted(waiting.items())))
+                last = waiting
+            self._drain_waiting = waiting
             await self.deps.sleep(_DRAIN_POLL_S)
         self._drain_waiting = None
 
@@ -2290,7 +2639,7 @@ class Controller:
         """Our instance in a FRESH list (Ruling 10, via `_find_ours`), None when it is
         gone: not listed, or listed with a gone status. A list error raises."""
         it = self._find_ours(await self.api.list_instances())
-        if it is None or thunder.is_gone_status(it.get("status")):
+        if it is None or self._prov.is_gone_status(it.get("status")):
             return None
         return it
 
@@ -2326,7 +2675,7 @@ class Controller:
                 # the rotation removes it once the new one is READY (or it failed)
                 self._log(f"previous snapshot {s.pending_snapshot} is not READY yet — "
                           "the watcher follows the new one")
-            s.pending_snapshot_name = thunder.snapshot_name(self.name, self.deps.now())
+            s.pending_snapshot_name = self._prov.snapshot_name(self.name, self.deps.now())
         self._set_phase("snapshotting")
         snaps = await self.api.snapshots()
         self._snaps = snaps
@@ -2352,16 +2701,13 @@ class Controller:
     async def _failed_snapshot_row(self, row: dict) -> None:
         s = self.state
         self._log(f"snapshot {row['name']} FAILED — taking a new one")
-        try:
-            self.deps.note_fault(self.backend, "lifecycle", "snapshot_failed", row["name"])
-        except Exception as e:
-            self._log(f"fault log unavailable: {e!r}")
+        self._fault(None, "lifecycle", "snapshot_failed", row["name"])
         if s.pending_snapshot == row["id"]:
             s.pending_snapshot = ""
         s.manifests.pop(row["id"], None)
         old = s.pending_snapshot_name
         for _ in range(3):                  # the name has 1-s resolution
-            s.pending_snapshot_name = thunder.snapshot_name(self.name, self.deps.now())
+            s.pending_snapshot_name = self._prov.snapshot_name(self.name, self.deps.now())
             if s.pending_snapshot_name != old:
                 break
             await self.deps.sleep(1)
@@ -2392,7 +2738,7 @@ class Controller:
         while True:
             try:
                 still = await self._our_item()
-            except thunder.ThunderError as e:
+            except self._Error as e:
                 still = item                     # unknown ≠ gone
                 self._log(f"instance list failed while deleting: {e}")
             if still is None:
@@ -2426,10 +2772,7 @@ class Controller:
                 pass
         self._disable()
         if fault:
-            try:
-                self.deps.note_fault(self.backend, "lifecycle", "instance_vanished", why)
-            except Exception as e:
-                self._log(f"fault log unavailable: {e!r}")
+            self._fault(None, "lifecycle", "instance_vanished", why)
 
     # ── snapshot watcher (spec "Stop" 4) ────────────────────────────────────
 
@@ -2450,7 +2793,7 @@ class Controller:
             return
         try:
             snaps = await self.api.snapshots()
-        except thunder.ThunderError as e:
+        except self._Error as e:
             self._log(f"snapshot list unavailable ({e.status or 'transport'}): {e}")
             return
         if s is not self.state or s.pending_snapshot != pid:
@@ -2471,12 +2814,12 @@ class Controller:
             s.snapshot_id, s.pending_snapshot, s.pending_snapshot_name = pid, "", ""
             self._log(f"snapshot {name} READY")
             self._persist()
-            for sid in thunder.rotation(snaps, self.name):
+            for sid in self._prov.rotation(snaps, self.name):
                 if sid in (pid, s.pending_snapshot):
                     continue                 # never the one just made (a missing createdAt)
                 try:
                     await self.api.delete_snapshot(sid)
-                except thunder.ThunderError as e:
+                except self._Error as e:
                     self._log(f"rotation: deleting snapshot {sid} failed: {e}")
                     continue
                 self._forget_snapshot(sid)
@@ -2495,26 +2838,29 @@ class Controller:
             why = "failed" if status == "FAILED" else "vanished from the snapshot list"
             self._log(f"snapshot {name} {why} — the last READY one ({s.snapshot_id or 'none'}) "
                       "stays the start template; this session's changes are lost")
-            try:
-                self.deps.note_fault(self.backend, "lifecycle", "snapshot_failed", name)
-            except Exception as e:
-                self._log(f"fault log unavailable: {e!r}")
+            self._fault(None, "lifecycle", "snapshot_failed", name)
 
     # ── model sync (spec "Controller": URL transfer, triggers, disk growth) ─────
 
-    def is_alias_ready(self, alias: str) -> bool:
-        """May `alias` route to this backend? Only with a plan (none before the first
-        sync) that has every file of the alias present and nothing blocking it — and
-        only while the instance is `ready|syncing`: a plan is no promise about an
-        instance that is draining, restarting ComfyUI or gone."""
+    def is_alias_ready(self, bid: str, alias: str) -> bool:
+        """May `alias` route to service `bid` of this host? Only for the ComfyUI service
+        the plan was made for, with a plan (none before the first sync) that has every
+        file of the alias present and nothing blocking it — and only while the instance
+        is `ready|syncing`: a plan is no promise about an instance that is draining,
+        restarting ComfyUI or gone."""
         return (self.state.phase in _SYNC_PHASES and self.plan is not None
+                and bid == self._plan_bid and bid == self._comfy_bid()
                 and alias in self.ready_aliases)
 
-    def alias_status(self, alias: str) -> str:
+    def alias_status(self, bid: str, alias: str) -> str:
         """Why (not) — the text a client's 503 carries."""
         if self.state.phase not in _SYNC_PHASES:
-            return f"thunder instance is {self.state.phase}"
-        return modelsync.status_text(self.plan, alias, self.name)
+            return f"{self.kind} instance is {self.state.phase}"
+        comfy = self._comfy()
+        if comfy is None or service_bid(comfy) != bid:
+            return f"{bid} is not the ComfyUI service of managed host {self.name}"
+        return modelsync.status_text(self.plan if bid == self._plan_bid else None, alias,
+                                     str(comfy.get("name")))
 
     def _lan_ok(self) -> bool:
         """LAN transfers may run: a pinned, reachable source with a good listing."""
@@ -2532,7 +2878,10 @@ class Controller:
             self.deps.lan.invalidate()
 
     async def _signature(self) -> str:
-        return str(await asyncio.to_thread(self.deps.alias_signature, self.name))
+        bid = self._comfy_bid()
+        # the service id is part of it: a different ComfyUI service is a new plan
+        return (f"{bid}|" + str(await asyncio.to_thread(self.deps.alias_signature, bid))
+                if bid is not None else "")
 
     async def _sync_tick(self) -> None:
         """One 5-s trigger round: re-plan when the aliases or the catalog changed (the
@@ -2604,12 +2953,16 @@ class Controller:
         """(plan, manifest) from a fresh destination index (the manifest is never the
         truth about which files exist, spec "Manifest"), the manifest (plus entries a
         failed write lost) and the gateway's inputs."""
+        bid = self._comfy_bid()
+        if bid is None:
+            # never a plan with no needs: its prune list would be every synced file
+            raise RuntimeError("no ComfyUI service attached — nothing to sync")
         dest = await self._dest_index()
         man = await self._read_manifest()
         man.update(copy.deepcopy(self._unsaved))
 
         def inputs():
-            return (self.deps.alias_needs(self.name) or [], self.deps.source_index() or {},
+            return (self.deps.alias_needs(bid) or [], self.deps.source_index() or {},
                     self.deps.url_catalog() or {})
         needs, src, urls = await asyncio.to_thread(inputs)
         self._plan_inputs = (needs, src, dest, man, urls)
@@ -2699,8 +3052,9 @@ class Controller:
 
     async def _sync_body(self) -> None:
         async with self._sync_lock:
-            if not self._syncing():
-                return
+            bid = self._comfy_bid()
+            if not self._syncing() or bid is None:
+                return                  # no ComfyUI service: nothing is synced here
             self._last_try = self.deps.now()
             try:
                 sig = await self._signature()
@@ -2729,8 +3083,9 @@ class Controller:
                 # df unreadable: go on — a full disk fails the curl, which is reported
                 self._log(f"free disk space unknown ({_errtext(e)}) — downloading anyway")
                 go, disk = self._fetchable(plan), {}
-            before = set(self.ready_aliases)
+            before = set(self.ready_aliases) if self._plan_bid == bid else set()
             self.plan = self._annotate(plan, disk)
+            self._plan_bid = bid
             self.ready_aliases = {a for a in self.plan["per_alias"]
                                   if modelsync.ready(self.plan, a)}
             self._sig, self._sync_error = sig, ""
@@ -2814,20 +3169,20 @@ class Controller:
             return avail, f" (instance is {s.phase})"
         try:
             num_gpus = int(cfg.get("num_gpus") or 1)
-            spec = thunder.spec_for(await self.api.specs(), str(cfg.get("gpu_type") or ""),
+            spec = self._prov.spec_for(await self.api.specs(), str(cfg.get("gpu_type") or ""),
                                     num_gpus)
             storage = (spec or {}).get("storageGB")
             storage = storage if isinstance(storage, dict) else {}
             used = max(0, int(s.disk_gb or 0) * 1024 ** 3 - avail)
-            new = thunder.choose_disk_gb(
+            new = self._prov.choose_disk_gb(
                 required_bytes=used + need, base_bytes=0,
                 reserve_gb=math.ceil(reserve / 1024 ** 3), snapshot_min_gb=s.disk_gb,
                 spec_min=int(storage.get("min") or 0), spec_max=int(storage.get("max") or 0),
                 num_gpus=num_gpus)
-        except thunder.DiskTooSmall as e:
+        except self._prov.DiskTooSmall as e:
             self._log(f"disk cannot grow enough: {e}")
             return avail, f" (disk cannot grow: {e})"
-        except (thunder.ThunderError, TypeError, ValueError) as e:
+        except (self._Error, TypeError, ValueError) as e:
             self._log(f"disk growth unavailable: {_errtext(e)}")
             return avail, f" (disk growth unavailable: {_errtext(e)})"
         if new <= int(s.disk_gb or 0):
@@ -2837,7 +3192,7 @@ class Controller:
             if not self._syncing():             # a stop began during the list
                 return avail, f" (instance is {s.phase})"
             await self.api.modify(item, {"disk_size_gb": new})
-        except thunder.ThunderError as e:
+        except self._Error as e:
             self._log(f"disk growth to {new} GB failed: {e}")
             return avail, f" (disk growth to {new} GB failed)"
         self._log(f"disk grown {s.disk_gb} → {new} GB: {_gb(need)} GB to fetch, "
@@ -3041,10 +3396,9 @@ class Controller:
                     await self.deps.sleep(_RETRY_DELAYS_S[min(attempt, len(_RETRY_DELAYS_S)) - 1])
             if why:
                 self._failed[path] = why
-                try:
-                    self.deps.note_fault(self.backend, "sync", "transfer", f"{path}: {why}")
-                except Exception as ex:
-                    self._log(f"fault log unavailable: {ex!r}")
+                # a transfer is the ComfyUI service's (its models); the host's pseudo
+                # backend only when that service was detached meanwhile
+                self._fault(self._comfy(), "sync", "transfer", f"{path}: {why}")
         finally:
             if self._fetches.get(path) is me:
                 del self._fetches[path]
@@ -3304,14 +3658,14 @@ class Controller:
         if items is None:
             try:
                 items = await self.api.list_instances()
-            except thunder.ThunderError as e:
+            except self._Error as e:
                 self._log(f"orphan check: instance list unavailable: {e}")
                 return list(self._orphans)
         known = self._known_uuids()
         if self.state.uuid:
             known.add(self.state.uuid)
         self._orphans = [it for it in items if it.get("uuid") not in known
-                         and not thunder.is_gone_status(it.get("status"))]
+                         and not self._prov.is_gone_status(it.get("status"))]
         return list(self._orphans)
 
     # ── after a gateway restart ─────────────────────────────────────────────
@@ -3343,19 +3697,19 @@ class Controller:
             return
         try:
             items = await self.api.list_instances()
-        except thunder.ThunderError as e:
+        except self._Error as e:
             self._log(f"resume: instance list unavailable ({e}) — retrying")
             self._resume_pending = True
             return
         it = self._find_ours(items)
-        if it is not None and thunder.is_gone_status(it.get("status")):
+        if it is not None and self._prov.is_gone_status(it.get("status")):
             it = None
         if it is None:
             # one answer without it is not proof (see _ABSENT_CONFIRM)
             await self.deps.sleep(_ABSENT_RECHECK_S)
             try:
                 it = await self._our_item()
-            except thunder.ThunderError as e:
+            except self._Error as e:
                 self._log(f"resume: instance list unavailable ({e}) — retrying")
                 self._resume_pending = True
                 return
@@ -3399,11 +3753,19 @@ class Controller:
         except Exception as e:
             self._fail(_errtext(e))
             return
-        if await self._probe_briefly():
+        # every service probed on its own forward; only one that does not answer is
+        # restarted — the others keep their jobs
+        dead = []
+        for svc in [x for x in self.services if x.get("type") == "comfyui"]:
+            if await self._probe_briefly(svc):
+                self._svc_set(svc, "up")
+            else:
+                dead.append(svc)
+        if not dead:
             self._ready()
         else:
             self._log("resume: ComfyUI does not answer — restarting it")
-            await self._restart()
+            await self._restart(only=dead)
 
     async def _reattach(self, item: dict, keep_failed: bool = False) -> None:
         """Port guard first (a restart must not find the instance behind a public port
@@ -3422,11 +3784,14 @@ class Controller:
         if s.ip and s.port:
             await self._start_tunnel()
 
-    async def _probe_briefly(self) -> bool:
+    async def _probe_briefly(self, svc: dict) -> bool:
+        url = self._svc_url(svc)
+        if not url:
+            return False
         deadline = self.deps.now() + _RESUME_PROBE_S
         while True:
             try:
-                if await self.deps.probe_comfy(self.url):
+                if await self.deps.probe_comfy(url):
                     self._log("ComfyUI answers")
                     return True
             except Exception:
@@ -3443,7 +3808,7 @@ class Controller:
             return
         try:
             snaps = await self.api.snapshots()
-        except thunder.ThunderError as e:
+        except self._Error as e:
             self._log(f"snapshot list unavailable ({e.status or 'transport'}): {e}")
             return
         row = next((x for x in snaps if x.get("name") == s.pending_snapshot_name
@@ -3482,13 +3847,13 @@ class Controller:
                 await self.deps.sleep(_ABSENT_RECHECK_S)
             try:
                 items = await self.api.list_instances()
-            except thunder.ThunderError as e:
+            except self._Error as e:
                 self._log(f"resume: instance list unavailable ({e}) — state stays "
                           "unreconciled")
                 self._resume_pending = True
                 return False
             for it in items:
-                if it.get("uuid") not in known and not thunder.is_gone_status(it.get("status")):
+                if it.get("uuid") not in known and not self._prov.is_gone_status(it.get("status")):
                     found.setdefault(str(it.get("uuid") or it.get("index") or len(found)), it)
             if found:
                 break
@@ -3512,8 +3877,9 @@ class Controller:
     # ── background ──────────────────────────────────────────────────────────
 
     async def run_forever(self) -> None:
-        """Background loop (spawned by main next to resume()): every 5 s the model-sync
-        trigger (`_sync_tick`); every 60 s the snapshot watcher while a snapshot is
+        """Background loop (spawned by main next to resume()): every 5 s a forward that
+        is still missing on the running master (a failed `forward`, a port that was
+        busy) is tried again, and the model-sync trigger (`_sync_tick`) runs; every 60 s the snapshot watcher while a snapshot is
         pending, and resume() again while it could not reach the API; every 10 min the
         account view (`refresh_account` — prices, snapshots, foreign instances)."""
         every = max(1, _WATCH_S // _SYNC_POLL_S)
@@ -3536,6 +3902,9 @@ class Controller:
                             raise
                         except Exception as e:  # display only: never costs the sync tick
                             self._log(f"account refresh failed: {_errtext(e)}")
+                if (self._tunnel is not None and self._fwd_active != set(self._forwards())
+                        and (self._fwd_task is None or self._fwd_task.done())):
+                    await self.reconcile_forwards()
                 await self._sync_tick()
             except asyncio.CancelledError:
                 raise

@@ -28,6 +28,8 @@ voiceref/
 thunder.key
 thunder.key.pub
 thunder-known_hosts/
+# the managed-host tunnels' ControlMaster sockets (hostctl, <kind>-ctl/)
+thunder-ctl/
 modelsrc.key
 modelsrc.key.pub
 modelsrc-known_hosts

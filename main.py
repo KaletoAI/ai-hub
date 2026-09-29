@@ -39,6 +39,7 @@ import stats
 import store
 import modelsync
 import hostctl
+import sshrun
 import thunder
 from adapters import (AdapterContext, ComfyExecutorStuck, NormalizedRequest, image_params,
                       is_image_field, lora_counterpart, lora_groups,
@@ -160,9 +161,9 @@ def rebuild_backends() -> None:
         host_backends.setdefault(h, []).append(bid)
     apply_hosts()
     rebuild_route_index()                  # backend set/enabled flags changed
-    # Every rebuild hands out NEW backend dicts; a Thunder controller reads its token and
-    # `thunder` block from the dict it holds, so it must be given the current one.
-    sync_thunder_controllers()
+    # Every rebuild hands out NEW backend dicts; a managed-host controller reads its token,
+    # options and services from what it was handed, so it must be given the current ones.
+    sync_host_controllers()
 
 
 def apply_hosts() -> None:
@@ -998,10 +999,10 @@ async def lifespan(app: FastAPI):
 
     log_config_summary()
     await asyncio.gather(*[refresh_backend(b, http_client) for b in enabled_backends()])
-    # Thunder controllers exist since rebuild_backends(); now each reconciles its persisted
-    # state with Thunder's instance list (an instance that billed through the restart
-    # gets its tunnel back) and starts its background loop.
-    _thunder_boot()
+    # Managed-host controllers exist since rebuild_backends(); now each reconciles its
+    # persisted state with the provider's instance list (an instance that billed through
+    # the restart gets its tunnel back) and starts its background loop.
+    _hosts_boot()
     health_task = asyncio.create_task(health_loop())
     probe_task = asyncio.create_task(fast_probe_loop())
     watch_task = asyncio.create_task(watch_config_loop())
@@ -1039,7 +1040,7 @@ async def lifespan(app: FastAPI):
         jobs_prune_task.cancel()
     if prune_task is not None:
         prune_task.cancel()
-    await _thunder_shutdown()          # tunnels + Thunder clients; the instances run on
+    await _hosts_shutdown()            # tunnels + provider clients; the instances run on
     await http_client.aclose()         # drain the shared connection pool last
 
 
@@ -5857,58 +5858,95 @@ def _finalize_drain(bid: str) -> None:
     logger.info(f"backends changed → {len(backends)} effective")
 
 
-# ── Thunder Compute (hostctl.py) ───────────────────────────────────────────
-# One Controller per `comfyui` backend carrying a `thunder` block, keyed by backend
-# name. The controller owns a billing cloud instance, so it outlives its config: a
+# ── Managed hosts (hostctl.py) — for now synthesized from `thunder` blocks ────────
+# One Controller per MANAGED HOST, keyed by host name. Until managed hosts have their
+# own store entries (plan Task 6), a temporary SHIM derives them: every `comfyui`
+# backend with a `thunder` block becomes the host `thunder-<backend slug>` whose one
+# service is that backend (its `local_port` from the block, ComfyUI's 8188 on the VM).
+# The console's Thunder card still speaks backend names (`thunder_*` below map them to
+# their host). A controller owns a billing cloud instance, so it outlives its config: a
 # block removed (or a backend deleted) while the instance runs keeps the controller —
-# dropping it would leave the instance billing with nobody to snapshot or delete it.
+# with its last service list — because dropping it would leave the instance billing
+# with nobody to snapshot or delete it.
 
 _HERE = Path(__file__).resolve().parent
-_THUNDER_STATE_KEY = "thunder_state"        # store setting: backend name → State dict
+_HOST_STATE_KEY = "host_state"              # store setting: host name → State dict
 _THUNDER_PROBE_S = 10
-thunder_controllers: dict = {}              # name → hostctl.Controller
-# name → the controller's background tasks (resume, run_forever, console actions), so
-# a retired controller and the shutdown can cancel them; also held by _bg.
-_thunder_tasks: dict = {}
-_thunder_booted = False                     # lifespan ran _thunder_boot (new ones start at once)
-_thunder_warned: set = set()                # names warned "config removed while instance runs"
+host_controllers: dict = {}                 # host name → hostctl.Controller
+# host name → the controller's background tasks (resume, run_forever, console actions),
+# so a retired controller and the shutdown can cancel them; also held by _bg.
+_host_tasks: dict = {}
+_hosts_booted = False                       # lifespan ran _hosts_boot (new ones start at once)
+_host_warned: set = set()                   # hosts warned "config removed while instance runs"
+_shim_collided: set = set()                 # backend names warned "same host name as another"
 
 
 def _is_thunder(b: dict) -> bool:
     return b.get("type") == "comfyui" and bool(b.get("thunder"))
 
 
-def _thunder_load_state(name: str) -> Optional[dict]:
-    d = store.get_setting(_THUNDER_STATE_KEY)
+def _shim_host_name(backend_name) -> str:
+    """The managed host a Thunder backend's block stands for (the shim): its name is the
+    identity of the state record and the snapshots (`aihub-thunder-<slug>-…`)."""
+    return "thunder-" + thunder.slug(backend_name)
+
+
+def _shim_host(b: dict) -> dict:
+    return {"name": _shim_host_name(b["name"]), "provider": thunder.KIND,
+            "options": b.get("thunder") or {}, "api_key": b.get("api_key") or ""}
+
+
+def _shim_service(b: dict) -> dict:
+    """The backend as the host's service: a COPY with the forward's two ends — never
+    written into the backend dict itself, which the store copies on every enable."""
+    try:
+        lport = int((b.get("thunder") or {}).get("local_port") or 18188)
+    except (TypeError, ValueError):
+        lport = 18188                       # the controller marks a bad one down itself
+    return dict(b, local_port=lport, remote_port=hostctl.COMFY_PORT)
+
+
+def _shim_ctl(backend_name) -> Optional["hostctl.Controller"]:
+    """The controller of the Thunder backend `backend_name` (the shim's host) — only if
+    that backend really is one of its services: two names slugging alike share a host
+    name, and the second one must not read the first one's controller."""
+    c = host_controllers.get(_shim_host_name(backend_name))
+    if c is None or not c.has_service(f"comfyui:{backend_name}"):
+        return None
+    return c
+
+
+def _host_load_state(name: str) -> Optional[dict]:
+    d = store.get_setting(_HOST_STATE_KEY)
     if d is None:
         return None
     if not isinstance(d, dict):
         # raised, not read as {}: the controller then refuses to start and never saves
         # over a record that may name a running instance (hostctl._load_failed)
-        raise ValueError(f"store setting {_THUNDER_STATE_KEY} is a {type(d).__name__}, "
+        raise ValueError(f"store setting {_HOST_STATE_KEY} is a {type(d).__name__}, "
                          "not a dict")
     return d.get(name)
 
 
-def _thunder_save_state(name: str, d: dict) -> None:
+def _host_save_state(name: str, d: dict) -> None:
     """Read-modify-write of the ONE shared setting. Safe only because neither this
     function nor hostctl's `_persist` awaits between the read and the write — every
     controller saves on the event loop thread, one after the other. Moving this to a
     worker thread (asyncio.to_thread) would open a lost-update race: two controllers
     reading the same dict, the later write erasing the other's instance record."""
-    cur = store.get_setting(_THUNDER_STATE_KEY)
+    cur = store.get_setting(_HOST_STATE_KEY)
     if cur is None:
         cur = {}
     if not isinstance(cur, dict):
-        # writing {name: d} would erase every other backend's instance record
-        raise ValueError(f"store setting {_THUNDER_STATE_KEY} is unreadable — not saved")
+        # writing {name: d} would erase every other host's instance record
+        raise ValueError(f"store setting {_HOST_STATE_KEY} is unreadable — not saved")
     cur[name] = d
-    store.set_settings({_THUNDER_STATE_KEY: cur})
+    store.set_settings({_HOST_STATE_KEY: cur})
 
 
-def _thunder_known_uuids() -> set:
+def _host_known_uuids() -> set:
     """Instances some controller owns — `orphans()` lists everything else."""
-    return {c.state.uuid for c in thunder_controllers.values() if c.state.uuid}
+    return {c.state.uuid for c in host_controllers.values() if c.state.uuid}
 
 
 async def _thunder_probe(url: str) -> bool:
@@ -5925,7 +5963,7 @@ async def _thunder_probe(url: str) -> bool:
 def _thunder_default_nodes() -> str:
     """ops/thunder-nodes.default.txt for the backend FORM only (a new Thunder block's
     nodes textarea): "" when unreadable, so the console still renders. The controller
-    deliberately uses the UNGUARDED reader in `_thunder_deps` — there an unreadable
+    deliberately uses the UNGUARDED reader in `_host_deps` — there an unreadable
     default list must fail the start, not bootstrap with nothing."""
     try:
         return (_HERE / "ops" / "thunder-nodes.default.txt").read_text("utf-8")
@@ -6000,23 +6038,34 @@ def _mapping_fields(cand: dict) -> list:
             if isinstance(b, dict) and b.get("node") is not None and b.get("field")]
 
 
-def thunder_alias_needs(backend_name: str) -> list:
-    """`modelsync.AliasNeed` per alias candidate on this backend (built by
+def _comfy_name_of(bid: str) -> Optional[str]:
+    """The backend NAME of a ComfyUI backend id (`comfyui:<name>`), None for any other
+    type — the model sync is about ComfyUI candidates only."""
+    kind, sep, name = str(bid or "").partition(":")
+    return name if sep and kind == "comfyui" else None
+
+
+def thunder_alias_needs(bid: str) -> list:
+    """`modelsync.AliasNeed` per alias candidate on the ComfyUI service `bid` (built by
     `modelsync.alias_need`, the only builder that fills `covered`). Blocking store
     read — the controller calls it in a worker thread."""
+    name = _comfy_name_of(bid)
+    if name is None:
+        return []
     catalog = _modelsync_catalog()
     return [modelsync.alias_need(alias, modelsync.refs_for(
                 cand, adapters.cand_workflow(cand), _mapping_fields(cand)), catalog)
-            for alias, cand in _thunder_alias_cands(backend_name)]
+            for alias, cand in _thunder_alias_cands(name)]
 
 
-def thunder_alias_signature(backend_name: str) -> str:
-    """A stable hash of exactly what `thunder_alias_needs` reads: this backend's
+def thunder_alias_signature(bid: str) -> str:
+    """A stable hash of exactly what `thunder_alias_needs` reads: this service's
     candidates (a path workflow's CONTENT too — the file may change under the same
     path) and the catalog. Polled every 5 s: any store write, deletion or config
     change that matters to the sync shows up here, none that does not."""
+    name = _comfy_name_of(bid)
     parts = []
-    for alias, cand in _thunder_alias_cands(backend_name):
+    for alias, cand in (_thunder_alias_cands(name) if name is not None else []):
         wf = None if "workflow_json" in cand else adapters.cand_workflow(cand)
         parts.append([alias, cand, wf])
     data = [parts, _modelsync_catalog()]
@@ -6089,12 +6138,12 @@ def save_modelsrc_host(value: str) -> str:
 
 
 def thunder_orphan_snapshots() -> list:
-    """`aihub-` snapshots no Thunder backend owns (`thunder.foreign_snapshots`) over
-    every controller's CACHED snapshot list (deduplicated by id — two backends of one
-    account list the same snapshots) and the first cached price list. No API call: the
-    controllers refresh both in their background loop."""
+    """`aihub-` snapshots no managed host owns (`thunder.foreign_snapshots`, by HOST
+    name — R-W4) over every controller's CACHED snapshot list (deduplicated by id — two
+    hosts of one account list the same snapshots) and the first cached price list. No
+    API call: the controllers refresh both in their background loop."""
     snaps, seen, table = [], set(), None
-    for c in list(thunder_controllers.values()):
+    for c in list(host_controllers.values()):
         for sn in c.snapshots() or []:
             sid = sn.get("id") or sn.get("name")
             if sid not in seen:
@@ -6102,7 +6151,7 @@ def thunder_orphan_snapshots() -> list:
                 snaps.append(sn)
         if table is None:
             table = c.pricing_table()
-    return thunder.foreign_snapshots(snaps, list(thunder_controllers), table)
+    return thunder.foreign_snapshots(snaps, list(host_controllers), table)
 
 
 def modelsrc() -> "hostctl.LanSource":
@@ -6118,7 +6167,7 @@ def _modelsrc_prepare() -> None:
     operator installs on the share host FIRST. Generated in the background at boot (and
     for a Thunder backend added later), never by a page view."""
     global _modelsrc_key_task
-    if not thunder_controllers or os.path.exists(modelsrc().key_path + ".pub"):
+    if not host_controllers or os.path.exists(modelsrc().key_path + ".pub"):
         return
     if _modelsrc_key_task is not None and not _modelsrc_key_task.done():
         return
@@ -6158,14 +6207,14 @@ async def modelsrc_pin(fingerprint: str) -> str:
     return f"host key {fp} pinned — the LAN source is listed with the next model sync"
 
 
-def _thunder_deps() -> "hostctl.Deps":
+def _host_deps() -> "hostctl.Deps":
     ops = _HERE / "ops"
     lan = modelsrc()
     return hostctl.Deps(
-        # own client per controller (closed by Controller.aclose): Thunder calls must not
-        # compete with proxied traffic for the shared pool, nor outlive a closed one
+        # own client per controller (closed by Controller.aclose): provider calls must
+        # not compete with proxied traffic for the shared pool, nor outlive a closed one
         client_factory=lambda: httpx.AsyncClient(),
-        load_state=_thunder_load_state, save_state=_thunder_save_state,
+        load_state=_host_load_state, save_state=_host_save_state,
         set_enabled=set_backend_enabled, begin_drain=begin_drain,
         inflight=lambda bid: backend_inflight.get(bid, 0),
         is_draining=lambda bid: bid in _draining,
@@ -6174,17 +6223,17 @@ def _thunder_deps() -> "hostctl.Deps":
         probe_comfy=_thunder_probe,
         bootstrap_script=lambda: (ops / "thunder-bootstrap.sh").read_bytes(),
         log=logger.info,
-        known_uuids=_thunder_known_uuids,
+        known_uuids=_host_known_uuids,
         default_nodes=lambda: (ops / "thunder-nodes.default.txt").read_text("utf-8"),
         alias_needs=thunder_alias_needs, alias_signature=thunder_alias_signature,
         # the LAN share's last good listing ({} until pinned and listed), and the share
         # itself for its refresh, the stream and the sha256
         source_index=lan.cached, lan=lan,
         url_catalog=lambda: modelsync.url_catalog(_modelsync_catalog()),
-        hf_token=_thunder_hf_token)
+        hf_token=_thunder_hf_token, control=sshrun.control)
 
 
-def _thunder_task_done(name: str, what: str, answered: Optional[set] = None):
+def _host_task_done(name: str, what: str, answered: Optional[set] = None):
     def done(t: asyncio.Task) -> None:
         if t.cancelled():
             return
@@ -6192,27 +6241,27 @@ def _thunder_task_done(name: str, what: str, answered: Optional[set] = None):
         if e is not None and not (answered and t in answered):
             # a refusal that came after the first await (start's unreconciled check),
             # or a bug — either way the console's action already answered
-            logger.warning(f"[thunder {name}] {what}: {type(e).__name__}: {e}")
+            logger.warning(f"[host {name}] {what}: {type(e).__name__}: {e}")
     return done
 
 
-def _thunder_spawn(name: str, what: str, coro, answered: Optional[set] = None) -> asyncio.Task:
+def _host_spawn(name: str, what: str, coro, answered: Optional[set] = None) -> asyncio.Task:
     t = _bg(coro)
-    t.add_done_callback(_thunder_task_done(name, what, answered))
-    held = [x for x in _thunder_tasks.get(name, []) if not x.done()]
+    t.add_done_callback(_host_task_done(name, what, answered))
+    held = [x for x in _host_tasks.get(name, []) if not x.done()]
     held.append(t)
-    _thunder_tasks[name] = held
+    _host_tasks[name] = held
     return t
 
 
-def _thunder_run(name: str, c) -> None:
-    _thunder_spawn(name, "resume", c.resume())
-    _thunder_spawn(name, "background loop", c.run_forever())
+def _host_run(name: str, c) -> None:
+    _host_spawn(name, "resume", c.resume())
+    _host_spawn(name, "background loop", c.run_forever())
 
 
-def _thunder_retire(name: str) -> None:
-    c = thunder_controllers.pop(name)
-    for t in _thunder_tasks.pop(name, []):
+def _host_retire(name: str) -> None:
+    c = host_controllers.pop(name)
+    for t in _host_tasks.pop(name, []):
         t.cancel()
     try:
         asyncio.get_running_loop()
@@ -6221,65 +6270,103 @@ def _thunder_retire(name: str) -> None:
     _bg(c.aclose())
 
 
-def sync_thunder_controllers() -> None:
-    """Match the controllers to the current backend list (rebuild_backends calls it):
-    a new Thunder backend gets a controller (started at once after boot), an existing
-    one keeps its INSTANCE and is handed the current backend dict, and one whose block
+def sync_host_controllers() -> None:
+    """Match the controllers to the current backend list (rebuild_backends calls it) —
+    through the shim: each Thunder backend is one host with itself as the service. A new
+    host gets a controller (started at once after boot), an existing one keeps its
+    INSTANCE and is handed the current host entry and service list, and one whose block
     or backend is gone is retired only when off and idle."""
-    want = {b["name"]: b for b in backends if _is_thunder(b)}
-    for name, b in want.items():
-        _thunder_warned.discard(name)       # block is back: warn again if it goes
-        c = thunder_controllers.get(name)
+    want: dict = {}
+    for b in backends:
+        if not _is_thunder(b):
+            continue
+        hn = _shim_host_name(b["name"])
+        if hn in want:
+            # two backend names that slug alike would share ONE machine's state and
+            # snapshots — the second is not controlled (the console names it)
+            if b["name"] not in _shim_collided:
+                _shim_collided.add(b["name"])
+                logger.warning(f"[host {hn}] backend {b['name']!r} maps to the same managed "
+                               f"host as {want[hn][1][0]['name']!r} — not controlled; "
+                               "rename one of them")
+            continue
+        want[hn] = (_shim_host(b), [_shim_service(b)])
+    for hn, (h, svcs) in want.items():
+        _host_warned.discard(hn)            # block is back: warn again if it goes
+        c = host_controllers.get(hn)
         if c is None:
-            c = thunder_controllers[name] = hostctl.Controller(b, _thunder_deps())
-            if _thunder_booted:
-                _thunder_run(name, c)
+            c = host_controllers[hn] = hostctl.Controller(h, svcs, _host_deps())
+            if _hosts_booted:
+                _host_run(hn, c)
                 _modelsrc_prepare()
         else:
-            c.backend = b
-    for name in [n for n in thunder_controllers if n not in want]:
-        c = thunder_controllers[name]
+            c.host = h
+            c.set_services(svcs)
+    for hn in [n for n in host_controllers if n not in want]:
+        c = host_controllers[hn]
         # an `off` controller whose snapshot is still CREATING is not idle: its watcher
         # still has to rotate the old snapshot out (and mark or drop the new one) —
-        # retired, both would sit at Thunder and bill per GB-month, unseen
+        # retired, both would sit at the provider and bill per GB-month, unseen
         if c.state.phase == "off" and c.op is None and not c.state.pending_snapshot:
-            _thunder_warned.discard(name)
-            _thunder_retire(name)
-        elif name not in _thunder_warned:   # once per controller, not per rebuild
-            _thunder_warned.add(name)
+            _host_warned.discard(hn)
+            _host_retire(hn)
+        elif hn not in _host_warned:        # once per controller, not per rebuild
+            _host_warned.add(hn)
             what = (f"instance runs ({c.state.phase})" if c.state.phase != "off" or c.op
                     else f"snapshot {c.state.pending_snapshot} is still being taken")
-            logger.warning(f"[thunder {name}] backend config removed while {what} — "
+            logger.warning(f"[host {hn}] backend config removed while {what} — "
                            "controller kept" + ("" if c.state.phase == "off" and not c.op
                                                 else "; stop it from the console"))
 
 
-def _thunder_boot() -> None:
+def _hosts_boot() -> None:
     """Lifespan, after the first discovery: resume + background loop per controller."""
-    global _thunder_booted
-    _thunder_booted = True
-    for name, c in list(thunder_controllers.items()):
-        _thunder_run(name, c)
+    global _hosts_booted
+    _hosts_booted = True
+    for name, c in list(host_controllers.items()):
+        _host_run(name, c)
     _modelsrc_prepare()
 
 
-async def _thunder_shutdown() -> None:
+async def _hosts_shutdown() -> None:
     """Lifespan end: stop the background work, then each controller's tunnel and
     client. The INSTANCES are not touched — they keep running and resume() finds them."""
-    global _thunder_booted
-    _thunder_booted = False
-    tasks = [t for ts in _thunder_tasks.values() for t in ts if not t.done()]
+    global _hosts_booted
+    _hosts_booted = False
+    tasks = [t for ts in _host_tasks.values() for t in ts if not t.done()]
     if _modelsrc_key_task is not None and not _modelsrc_key_task.done():
         tasks.append(_modelsrc_key_task)
     for t in tasks:
         t.cancel()
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
-    for name, c in list(thunder_controllers.items()):
+    for name, c in list(host_controllers.items()):
         try:
             await c.aclose()
         except Exception as e:
-            logger.warning(f"[thunder {name}] shutdown: {type(e).__name__}: {e}")
+            logger.warning(f"[host {name}] shutdown: {type(e).__name__}: {e}")
+
+
+# ── the console's Thunder card: backend names → the shim's host (Task 7 replaces) ──
+
+def _thunder_card_ctl(name: str):
+    """(host name, controller) of the card named `name` — a Thunder BACKEND name, the
+    key the card and its buttons still carry; a host name is accepted too."""
+    c = _shim_ctl(name)
+    if c is not None:
+        return _shim_host_name(name), c
+    c = host_controllers.get(name)
+    return (name, c) if c is not None else (name, None)
+
+
+def thunder_names() -> list:
+    """The card names: each controller's ComfyUI backend (its only service under the
+    shim), else the host name."""
+    out = []
+    for hn, c in host_controllers.items():
+        comfy = next((x for x in c.services if x.get("type") == "comfyui"), None)
+        out.append(str(comfy["name"]) if comfy is not None else hn)
+    return out
 
 
 _THUNDER_OPS = {"start": ("start", "start"), "stop": ("stop", "stop"),
@@ -6290,11 +6377,11 @@ _THUNDER_ANSWER_S = 30
 
 
 async def thunder_action(name: str, action: str) -> str:
-    """Console action on a Thunder backend. start/stop/restart run as held background
-    tasks — a start takes up to hours — and the call answers after the op's first step:
-    a refusal (RuntimeError before its first await: "already …", "not running") comes
-    back as the message, never as an exception into the console."""
-    c = thunder_controllers.get(name)
+    """Console action on a Thunder card (`name` = its backend). start/stop/restart run as
+    held background tasks — a start takes up to hours — and the call answers after the
+    op's first step: a refusal (RuntimeError before its first await: "already …", "not
+    running") comes back as the message, never as an exception into the console."""
+    hn, c = _thunder_card_ctl(name)
     if c is None:
         return f"unknown Thunder backend {name!r}"
     if action == "forget_unreconciled":
@@ -6305,7 +6392,7 @@ async def thunder_action(name: str, action: str) -> str:
         return f"unknown action {action!r}"
     meth, label = op
     answered: set = set()
-    t = _thunder_spawn(name, label, getattr(c, meth)(), answered)
+    t = _host_spawn(hn, label, getattr(c, meth)(), answered)
     await asyncio.sleep(0)                  # let the op run up to its first await
     if t.done() and not t.cancelled():
         # the done-callback runs after this (call_soon order): the refusal is the
@@ -6330,14 +6417,14 @@ async def thunder_delete_unknown(name: str, paths: list) -> str:
     request when one path is no longer unknown (needed or synced meanwhile). The answer
     is awaited up to `_THUNDER_ANSWER_S` — the refusal is what the operator must see — and
     a delete still running then goes on as a held task whose failure is logged."""
-    c = thunder_controllers.get(name)
+    hn, c = _thunder_card_ctl(name)
     if c is None:
         return f"unknown Thunder backend {name!r}"
     paths = [str(p) for p in paths or [] if p]
     if not paths:
         return "no file selected — nothing deleted"
     answered: set = set()
-    t = _thunder_spawn(name, "delete unknown files", c.delete_unknown(paths), answered)
+    t = _host_spawn(hn, "delete unknown files", c.delete_unknown(paths), answered)
     answered.add(t)                         # the answer below reports it, not the log
     done, _ = await asyncio.wait({t}, timeout=_THUNDER_ANSWER_S)
     if t not in done:
@@ -6356,10 +6443,10 @@ async def thunder_delete_unknown(name: str, paths: list) -> str:
 
 def _thunder_only_aliases(aliases) -> set:
     """Aliases of this backend's plan that no candidate can serve right now outside the
-    model-sync gate — every candidate sits on a Thunder backend that has not synced it.
-    Their schema, image slots and LoRA list read EMPTY until the sync finishes (the gate
-    empties the candidate set), which the panel says instead of leaving it a mystery.
-    Blocking (store read)."""
+    model-sync gate — every candidate sits on a managed host's ComfyUI service that has
+    not synced it. Their schema, image slots and LoRA list read EMPTY until the sync
+    finishes (the gate empties the candidate set), which the panel says instead of
+    leaving it a mystery. Blocking (store read)."""
     out = set()
     for alias in aliases:
         cands = store.get(alias) if store.is_active() else None
@@ -6369,9 +6456,9 @@ def _thunder_only_aliases(aliases) -> set:
         for cand in cands or []:
             if not isinstance(cand, dict):
                 continue
-            bc = thunder_controllers.get(cand.get("backend"))
-            if not (adapters.cand_kind(cand) == "comfyui" and bc is not None
-                    and not bc.is_alias_ready(alias)):
+            bname = cand.get("backend")
+            bc = _shim_ctl(bname) if adapters.cand_kind(cand) == "comfyui" else None
+            if not (bc is not None and not bc.is_alias_ready(f"comfyui:{bname}", alias)):
                 open_ = True
                 break
         if not open_:
@@ -6380,15 +6467,18 @@ def _thunder_only_aliases(aliases) -> set:
 
 
 def thunder_longrun() -> list:
-    """[(name, view)] of the controllers whose instance is up for more than 24 h — for
-    the Dashboard's cost banner, polled every 4 s: `Controller.view()` alone (in memory),
-    never `thunder_view`, whose alias-gate note reads the store per alias."""
+    """[(card name, view)] of the controllers whose instance is up for more than 24 h —
+    for the Dashboard's cost banner, polled every 4 s: `Controller.view()` alone (in
+    memory), never `thunder_view`, whose alias-gate note reads the store per alias."""
     out = []
-    for name, c in sorted(thunder_controllers.items(), key=lambda kv: str(kv[0]).lower()):
+    for name in sorted(thunder_names(), key=lambda n: str(n).lower()):
+        hn, c = _thunder_card_ctl(name)
+        if c is None:
+            continue
         try:
             v = c.view()
         except Exception as e:              # a banner, never the Dashboard
-            logger.warning(f"[thunder {name}] view failed: {type(e).__name__}: {e}")
+            logger.warning(f"[host {hn}] view failed: {type(e).__name__}: {e}")
             continue
         if isinstance(v, dict) and v.get("long_running"):
             out.append((name, v))
@@ -6396,9 +6486,9 @@ def thunder_longrun() -> list:
 
 
 def thunder_view(name: str) -> Optional[dict]:
-    """A controller's view for the panel, plus `gated_only` per planned alias (see
-    `_thunder_only_aliases`)."""
-    c = thunder_controllers.get(name)
+    """A controller's view for the card named `name`, plus `gated_only` per planned
+    alias (see `_thunder_only_aliases`)."""
+    hn, c = _thunder_card_ctl(name)
     if c is None:
         return None
     v = c.view()
@@ -6406,7 +6496,7 @@ def thunder_view(name: str) -> Optional[dict]:
     try:
         only = _thunder_only_aliases([a for a, r in rows.items() if not r.get("ready")])
     except Exception as e:                  # the panel note is a courtesy, never an error
-        logger.warning(f"[thunder {name}] alias gate note unavailable: {e!r}")
+        logger.warning(f"[host {hn}] alias gate note unavailable: {e!r}")
         only = set()
     for a, r in rows.items():
         r["gated_only"] = a in only
@@ -6415,21 +6505,23 @@ def thunder_view(name: str) -> Optional[dict]:
 
 def modelsync_gate(backend: dict, alias: str) -> Optional[str]:
     """None = `alias` may route to `backend`; else why not (the text a client's 503
-    carries). Only a ComfyUI backend with a Thunder controller is ever gated — backends
-    are keyed (name, type), so a same-named LLM backend is not the box. Runs per request
-    and per waiter × backend inside a worker thread: it reads the controller's in-memory
-    plan only (`is_alias_ready`/`alias_status` do no I/O), never anything slower."""
+    carries). Only a ComfyUI backend that is a managed host's service is ever gated —
+    backends are keyed (name, type), so a same-named LLM backend is not the box. Backend
+    → host → controller → the service's plan. Runs per request and per waiter × backend
+    inside a worker thread: it reads the controller's in-memory plan only
+    (`is_alias_ready`/`alias_status` do no I/O), never anything slower."""
     if backend.get("type") != "comfyui":
         return None
-    c = thunder_controllers.get(backend.get("name"))
-    if c is None or c.is_alias_ready(alias):
+    c = _shim_ctl(backend.get("name"))
+    bid = backend_id(backend)
+    if c is None or c.is_alias_ready(bid, alias):
         return None
-    return c.alias_status(alias)
+    return c.alias_status(bid, alias)
 
 
 def _thunder_info(b: dict) -> dict:
-    """/health (admin view): the Thunder lifecycle of a Thunder backend."""
-    c = thunder_controllers.get(b["name"]) if b.get("type") == "comfyui" else None
+    """/health (admin view): the lifecycle of the managed host a Thunder backend is on."""
+    c = _shim_ctl(b["name"]) if b.get("type") == "comfyui" else None
     if c is None:
         return {}
     v = c.view()
@@ -6631,7 +6723,7 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
            parse_voice_target=parse_voice_target, voice_dir_ok=_voice_dir_ok,
            apply_hosts=apply_hosts,
            thunder_view=thunder_view, thunder_action=thunder_action,
-           thunder_names=lambda: list(thunder_controllers),
+           thunder_names=thunder_names,
            thunder_default_nodes=_thunder_default_nodes,
            thunder_sync_now=thunder_sync_now, thunder_delete_unknown=thunder_delete_unknown,
            thunder_modelsrc_view=modelsrc_view, thunder_modelsrc_scan=modelsrc_scan,

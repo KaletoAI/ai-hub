@@ -5,6 +5,7 @@ unchanged — every one guards a rule whose failure is silent or costs money: an
 tried before the uuid can delete a STRANGER's instance, a token echoed into an error
 lands in the panel and the fault log, a price list fetched per view hammers the API.
 run: venv/bin/python -m unittest tests.test_hostapi -v"""
+import types
 import unittest
 
 import httpx
@@ -194,11 +195,20 @@ class Api(unittest.IsolatedAsyncioTestCase):
         for e in errors:
             self.assertNotIn(token, e)
 
-    def test_hostctl_reexports_the_same_class(self):
-        # until Task 3 renames hostctl, its name must stay importable — and be the
-        # SAME class, or an isinstance/patch in one place misses the other
-        self.assertIs(hostctl.ThunderApi, hostapi.ThunderApi)
+    def test_controller_uses_the_registry_class(self):
+        # the re-export ended with the rename: the controller takes its API class from
+        # the registry — the SAME class, or an isinstance/patch in one place misses the
+        # other
+        self.assertFalse(hasattr(hostctl, "ThunderApi"))
         self.assertTrue(issubclass(hostapi.ThunderApi, hostapi.ProviderApi))
+        deps = types.SimpleNamespace(load_state=lambda n: None, now=lambda: 0.0,
+                                     log=lambda m: None)
+        c = hostctl.Controller({"name": "h", "provider": "thunder", "options": {},
+                                "api_key": ""}, [], deps)
+        self.assertIs(c._api_cls, hostapi.ThunderApi)
+        self.assertIs(c._Error, thunder.ThunderError)
+        with self.assertRaises(ValueError):             # shown, never driven
+            hostctl.Controller({"name": "h", "provider": "runpod"}, [], deps)
 
 
 class Base(unittest.IsolatedAsyncioTestCase):
@@ -264,7 +274,11 @@ class Registry(unittest.TestCase):
                           thunder.DEFAULT_TEMPLATE_NO_COMFY),
                          ("thunder", "Thunder Compute", "ubuntu", "snapshot", "base"))
         # the controller's ssh user is the provider's, not a second literal
-        self.assertEqual(hostctl._SSH_USER, thunder.SSH_USER)
+        deps = types.SimpleNamespace(load_state=lambda n: None, now=lambda: 0.0,
+                                     log=lambda m: None)
+        c = hostctl.Controller({"name": "h", "provider": "thunder"}, [], deps)
+        c.state.ip = "10.0.0.5"
+        self.assertEqual(c._login(), f"{thunder.SSH_USER}@10.0.0.5")
 
 
 class OptionFields(unittest.TestCase):
