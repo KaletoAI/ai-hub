@@ -25,7 +25,8 @@ code, image clients like anima-verse, …) and a fleet of backends.
 - [Call parking](#call-parking) — queue instead of `503` when busy
 - [Reasoning control](#reasoning-control) — thinking on/off per request, per alias, per model×backend
 - [Claude Code / Anthropic Messages](#claude-code--anthropic-messages) — `/v1/messages`, mixed Anthropic + open-weight
-- [Media generation](#media-generation) — ComfyUI image/video/audio (incl. an on-demand [Thunder Compute](#thunder-compute-on-demand-comfyui) GPU with model sync) + Meshy.ai and Tripo3D cloud meshes & rigging, aliases, mapping, chains, LoRA, jobs
+- [Media generation](#media-generation) — ComfyUI image/video/audio + Meshy.ai and Tripo3D cloud meshes & rigging, aliases, mapping, chains, LoRA, jobs
+- [Managed hosts](#managed-hosts-thunder-compute-runpod-later) — on-demand GPU machines (Thunder Compute) the gateway starts and stops; ComfyUI and OpenAI-compatible backends attach to them, with model sync
 - [The `/ui` console](#the-ui-console)
 - [Stats & routing dashboard](#stats--routing-dashboard)
 - [Endpoint reference](#endpoint-reference)
@@ -716,8 +717,8 @@ respect.
 ## Media generation
 
 Generation runs on three backend types: **`type: comfyui`** — a ComfyUI server on
-your own GPU, or on a GPU rented on demand from
-[Thunder Compute](#thunder-compute-on-demand-comfyui) — and the two cloud mesh APIs
+your own GPU, or on a GPU rented on demand as a
+[managed host](#managed-hosts-thunder-compute-runpod-later) — and the two cloud mesh APIs
 **`type: meshy`** (Meshy.ai) and **`type: tripo`** (Tripo3D), both further down. A ComfyUI
 backend speaks a different protocol, so it declares `type: comfyui`.
 Discovery is via `/object_info` (checkpoints/UNETs/VAEs **and** installed LoRAs);
@@ -762,260 +763,6 @@ restarts the service via the **ComfyUI-Manager** reboot endpoint (requires the
 Manager extension and a systemd unit with `Restart=always`); auto-restart fires
 at most once per `restart_cooldown_s` (default 600 s). A GPU that fell off the
 bus needs a host reboot instead — the backend then simply stays down.
-
-### Thunder Compute (on-demand ComfyUI)
-
-A ComfyUI backend can also be a GPU rented from **Thunder Compute**
-(<https://www.thundercompute.com>) that the gateway starts and stops **on demand** —
-image, 3D mesh and video workflows on a big GPU for an evening, without paying for it
-around the clock. The backend stays `type: comfyui`; a `thunder` block makes it an
-on-demand instance. The gateway then:
-
-- creates, snapshots and deletes the instance through Thunder's REST API (Thunder has
-  **no stop** — "off" is snapshot → delete, "on" is a new instance from that snapshot);
-- reaches ComfyUI **only through an SSH tunnel** it supervises
-  (`ssh -N -L 127.0.0.1:<local port>:127.0.0.1:8188`), so the backend URL is
-  `http://127.0.0.1:<local port>` and the ordinary ComfyUI adapter does everything else
-  (discovery, jobs, watchdog, VRAM policy);
-- copies onto the instance **exactly the model files** the aliases that name this
-  backend need — every GB on that disk bills, running or snapshotted.
-
-**Why SSH only.** Thunder's own port forwarding (`https://<uuid>-<port>.thundercompute.net`)
-is public **without authentication** — ComfyUI behind it is code execution (the Manager)
-and file read (`/view`) for anyone who finds the URL. So the gateway never opens one:
-after every create and restore it reads the instance's forwarded HTTP ports and removes
-any it finds, and it never starts ComfyUI while one is open; ComfyUI listens on
-`127.0.0.1` only (the bootstrap switches a template autostart off). No new dependency —
-the system `ssh`, `ssh-keygen` and `ssh-keyscan`.
-
-**Prerequisites.**
-
-- A Thunder Compute account and an **API token** (Thunder console → API tokens). The
-  token goes into the backend's **API key** field (General tab) — stored encrypted,
-  never rendered back, never sent to ComfyUI, never in `/health`.
-- `ssh` / `ssh-keygen` / `ssh-keyscan` on the gateway host. The gateway generates its
-  instance key `thunder.key` (ed25519) next to `store.db` on first need and hands the
-  public half to every create — there is nothing to install on Thunder's side.
-- For models that have no public download URL: the **LAN model source** below.
-
-**Creating the backend.** *Backends → Add*, type **ComfyUI**; on the **ComfyUI** tab tick
-*on-demand Thunder instance* in the **Thunder Compute (optional)** block:
-
-| Field | Default | What |
-|---|---|---|
-| gpu | `a6000` | Thunder GPU type (`a6000`, `l40`, `a100xl`, `h100`) |
-| gpus | `1` | GPUs per instance |
-| vcpus | `8` | required; vCPUs above the GPU's smallest option bill extra (`additional_vcpus`) |
-| template | `comfy-ui` | Thunder template for the **first** start (the bootstrap); `base` is the alternative |
-| disk reserve GB | `20` | free space kept on top of the models and the base install when the disk is sized |
-| local port | `18188` | the tunnel's port on the gateway — unique per Thunder backend (a collision is refused) |
-| ComfyUI commit | `1d61dcc3…` | the full 40-hex sha the bootstrap pins ComfyUI to |
-| custom nodes | `ops/thunder-nodes.default.txt` | one pack per line: `<git-url>@<commit>` or `registry:<id>@<version>`; `#` comments allowed; empty = the default list |
-
-Ticked, **url** (read-only) and **host** are derived — `http://127.0.0.1:<local port>`
-and `thunder-<name>`, so host coordination does not lump every Thunder backend together
-with the gateway box as "127.0.0.1" — and blank ComfyUI output/input dirs become
-`/home/ubuntu/ComfyUI/output|input`. A missing GPU type or vCPU count, a bad port or a
-commit that is not a full sha is refused on Save, before anything can bill. The console
-is the intended place: a Thunder backend written in `config.yaml` must spell out `url`
-and `host` itself, and the first Start/Stop turns it into a store entry (which overrides
-the config entry wholesale from then on).
-
-**Start / Stop / Restart** — the lifecycle card above the backend list (Backends tab,
-live while an instance runs):
-
-- **Start** enables the backend (a stopped one is disabled, so nothing polls a dead
-  tunnel port), then creates an instance from this backend's **newest READY snapshot**
-  (`aihub-<name slug>-<YYYYmmdd>t<HHMMSS>z` — all lowercase, the backend name slugified
-  to `[a-z0-9-]`). With none yet, the **first start bootstraps** a fresh
-  instance from the template: `ops/thunder-bootstrap.sh` is streamed over SSH and pins
-  ComfyUI to the commit, builds its own venv (Python 3.13, torch 2.11.0+cu130 — unless
-  the template's already matches), installs the node packs, ComfyUI-Manager and a
-  looping `~/start-comfy.sh`, and ends with a CUDA smoke test (up to a few hours; the log
-  shows in the card). The disk is sized from the models the aliases need + the base
-  install + the reserve (never below the snapshot's minimum or 100 GB per GPU; Thunder
-  disks only grow). A restore from a snapshot takes up to **~8 min per 100 GB**
-  (Thunder's figure). Then: port check, tunnel, ComfyUI, model sync, `ready`.
-  Without an API token a Start is refused before any API call ("no Thunder API token
-  set — put it into the backend's API key field") and the backend stays `off`.
-  A failure before the instance exists ends in `off`; after it in `failed (<phase>)`
-  with the instance **kept** for diagnosis — it bills until you press Stop. A node pack
-  that failed to install or a failed smoke test is `failed (bootstrapping)`.
-- **Stop** drains the backend (running jobs finish, new ones go elsewhere), ends running
-  transfers, deletes the files no selected alias needs any more (see below), takes a
-  snapshot, deletes the instance and disables the backend → `off`. The instance only
-  counts as gone once two fresh instance lists in a row no longer show it; one that
-  stays is `failed (deleting)` — press Stop again, every step resumes where it stopped.
-  The snapshot settles in the background: READY → this backend's older snapshots are
-  deleted (never the newest READY one); FAILED → a fault entry, and the previous READY
-  snapshot stays the one the next start uses. A Stop during a Start **aborts** the start
-  and stops from wherever it got (before the create: just `off`; before the bootstrap
-  ran: deleted without a snapshot). A snapshot taken before the bootstrap finished is
-  marked, and the next start from it bootstraps again.
-- **Restart ComfyUI** restarts ComfyUI on the running instance (`start-comfy.sh` is a
-  loop, so the ⟳ restart via ComfyUI-Manager works too) — also the way out of a failed
-  start once the cause is fixed on the box.
-- There is **no auto-stop**: an instance runs, and bills, until Stop. A gateway restart
-  does not touch it — the state (`thunder_state` store setting) is persisted on every
-  phase change and reconciled with Thunder's instance list on boot; an interrupted stop
-  runs on. The node list and the ComfyUI commit are applied by the bootstrap only — a
-  start from a snapshot keeps what the snapshot holds.
-
-**Selecting aliases.** An alias runs on the Thunder instance when one of its
-candidates names this backend — in *Aliases → Media*, add the Thunder backend as a
-candidate (with its own pins and bypassed nodes, like any other). There is no second
-list: every alias that names the backend is synced, every other one is not, and removing
-the candidate frees its files at the next Stop.
-
-**Model sync rules.** The sync runs when the instance comes up, when an alias's
-candidates change (checked every 5 s), when the LAN source changes, and on *Sync now*.
-
-- **What a candidate needs** is its workflow after **that candidate's** `fixed` pins and
-  without its `bypass` nodes — the same two per-backend rules the adapter applies —
-  so bypassing the unused one of two loader branches on the Thunder candidate saves that
-  download. Counted are the weight inputs of loader nodes (not the per-job image, mask,
-  mesh, path, video, audio loaders; not inputs that only say HOW to load —
-  dtype/format/quant/mode…), plus any string input of any node ending in
-  `.safetensors`, `.gguf`, `.ckpt`, `.pt`, `.pth`, `.bin`, `.onnx` or `.sft`. Empty LoRA
-  slots do not count. For a loader field clients may choose (mapped), only the default is
-  synced — the card says so.
-- **Resolution never guesses:** a file name is looked up in the loader's own folders
-  (ComfyUI's order), then as a unique suffix anywhere in the source; two hits are
-  *ambiguous*, none is *missing* — the alias is blocked with the reason.
-- **Hub ids and bare names.** A value like `org/repo` (a node that fetches its own
-  model) is only covered by a catalog entry matching the node **class and value**;
-  without one the alias is blocked and the reason names the entry it needs. A bare name
-  (a variant name a node resolves itself) counts only when a catalog entry matches it.
-  An alias with **no** model reference at all is `blocked: no model references known`
-  until a catalog alias entry says what it needs (`"paths": []` = nothing).
-- **Two roots:** `models/…` ↔ `~/ComfyUI/models/…` and `hf-cache/…` ↔ `~/hf-cache/…`
-  (ComfyUI runs with `HF_HOME=~/hf-cache`, so nodes that load through the Hugging Face
-  cache read the synced copy; its `snapshots/` symlinks are recreated). `hf-cache/token`
-  and anything with a dot segment are never synced.
-- **Where files come from:** a catalog `file` + `url` entry → the instance downloads it
-  itself (`curl`, ≤ 3 at a time, resumable, sha256-checked when the entry has one, else
-  by size; the HF token is attached only for `huggingface.co`/`hf.co`, and only via
-  stdin, never on a command line). Everything else streams from the LAN source through
-  the gateway — one stream per backend, resumed from the partial file, sha256-verified on
-  both sides. A file is *present* when the instance holds it at the source's size;
-  partial `.part` files never are. Aliases with the fewest missing bytes go first.
-- **Disk:** when the downloads do not fit, the gateway grows the instance's disk through
-  the API; beyond the GPU's maximum the alias is `blocked: disk`.
-- **Failures:** three attempts with backoff, then the alias is blocked with the file and
-  the error, and a `sync` fault is logged; *Sync now* tries again.
-- **Nothing is deleted during a session.** At **Stop**, files the gateway synced that no
-  selected alias needs any more are deleted before the snapshot (the card previews
-  "deleted at stop: N files, X GB"). A **blocked** alias's files are *held*, never
-  deleted, until the block is fixed. Files the gateway did not put there and nobody needs
-  — models the template brought, a node's own downloads — are listed as **unknown** with
-  their size and deleted only when you tick them in the card. Delete template models
-  before the first Stop, or every snapshot carries them.
-- **Routing waits for the sync.** Until all of an alias's files are present and nothing
-  blocks it, the Thunder candidate is out of routing **and** of the queue — other
-  candidates of the alias are unaffected. An alias that runs **only** there answers at
-  once with a `503` that says why:
-  `models for <alias> are syncing on <backend> (12.3 of 31.0 GB)` or
-  `models for <alias> are blocked on <backend>: <reason>`. Meanwhile its schema, image
-  slots and LoRA list read empty (the card notes it).
-
-**Catalog and HF token.** *Backends → Thunder panel → Model-sync catalog and HF token*: one
-JSON list for every Thunder backend (store setting `modelsync_catalog`), validated as a
-whole on Save — a refused Save comes back with the text as typed and saves nothing.
-Entries:
-
-```json
-[
- {"match": {"class": "SomeModelLoader", "value": "org/model"}, "paths": ["models/org/model/"]},
- {"match": {"alias": "my-rig-alias"}, "paths": []},
- {"file": "models/vae/x.safetensors", "url": "https://huggingface.co/…/x.safetensors", "sha256": "…"}
-]
-```
-
-Paths start with `models/` or `hf-cache/`; a trailing `/` is a whole directory. The
-catalog is seeded **once** with entries for public hub models some 3D nodes load
-themselves (TRELLIS.2, Pixal3D, StableX normals, Hunyuan3D-2.1's texture stage); after
-that it is yours — emptied, it stays empty. The **HF token** (for gated Hugging Face
-downloads) is stored encrypted, never shown again: blank keeps it, *clear* removes it.
-
-**LAN model source.** Files without a public URL come from a model share on the LAN,
-served read-only by the SSH forced command `ops/modelsrc-serve.sh` (verbs `list`,
-`cat <rel> <offset>`, `sha256 <rel>`; no absolute paths, no `..`, no dot files, no
-`*.log`, of the HF cache only `hf-cache/hub/…`, no symlink on the path — everything
-else is refused). The
-share root defaults to `/mnt/xfs/shared/comfyui-models` (env `MODELSRC_ROOT`); share
-path `<x>` is `models/<x>`, and the Hugging Face cache must be a **real directory**
-`hf-cache/` inside the share (a symlinked one makes `list` fail with exit 1 — it
-would otherwise silently lack the HF half of the share). The share host is set in `modelsrc_host` (field at the end of the LAN card;
-default `modelsrc@192.168.8.24`). Install on your model-share host — the example below
-uses a Proxmox host `pveK12` sharing `/mnt/xfs/shared/comfyui-models`; adjust the path
-to yours. Copy the script over first (`scp ops/modelsrc-serve.sh root@<share-host>:/tmp/`),
-then run these there as root, with the public key the LAN card shows
-(`modelsrc.key.pub`, generated by the gateway):
-
-```bash
-install -m 0755 /tmp/modelsrc-serve.sh /usr/local/bin/modelsrc-serve
-useradd --system --home /var/lib/modelsrc --shell /bin/bash modelsrc
-setfacl -R -m u:modelsrc:rX /mnt/xfs/shared/comfyui-models
-setfacl -R -d -m u:modelsrc:rX /mnt/xfs/shared/comfyui-models
-install -d -m 0700 -o modelsrc /var/lib/modelsrc/.ssh
-echo 'command="/usr/local/bin/modelsrc-serve",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty <public key from the LAN card>' \
-  > /var/lib/modelsrc/.ssh/authorized_keys
-chown modelsrc /var/lib/modelsrc/.ssh/authorized_keys && chmod 600 /var/lib/modelsrc/.ssh/authorized_keys
-```
-
-The `modelsrc` user needs a **real login shell** (`/bin/bash`): sshd runs the forced
-command through the user's shell, and with `/usr/sbin/nologin` it runs nothing — every
-listing then fails as "unreachable". (`setfacl` comes with the `acl` package.)
-
-Then **pin the host key** in the LAN card: *Fetch host key* runs `ssh-keyscan` and shows
-the fingerprint (nothing is trusted yet); compare it with
-`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the share host, then
-*Confirm fingerprint* pins exactly that key (`modelsrc-known_hosts`; every later
-connection checks it strictly). Until then aliases that need LAN files show
-`waiting for LAN source (not configured)` and fetch nothing yet — not even their URL
-files: nothing that cannot make an alias ready this session goes onto the paid disk
-(aliases that need only URL files sync normally). A changed
-share host drops the old listing and needs a new pin. The listing is cached for 10 min
-and re-read at every start and on *Sync now*.
-
-**Costs and warnings.** The card shows GPU × count, vCPUs, disk, uptime, **$/h** (from
-Thunder's public price list: the GPU rate + the extra vCPUs + disk beyond the included
-100 GB per GPU), the session total so far, and the snapshot (size, **$/month** while
-off). Snapshots and the account's instance list are re-read every 10 minutes, the price
-list hourly.
-An instance up for more than **24 h** puts a banner on its card **and** on the
-Dashboard. Instances in the account that no Thunder backend owns are listed on the card
-with their $/h, and `aihub-…` snapshots no backend owns (a renamed or deleted backend
-leaves them behind) with their $/month — **neither is ever deleted automatically**.
-`/health` (full view) carries `thunder: {phase, uptime_s, cost_per_h}` per Thunder
-backend; lifecycle and sync failures land in the [fault log](#backend-fault-log) under
-the sources `lifecycle` and `sync`.
-
-**Known limits — verify on the first live run.**
-
-- Not yet checked against the live API: the exact instance status values; whether the
-  listed `port` is the SSH port; which id form `/instances/{id}/delete|modify` and the
-  port removal accept (the gateway tries the uuid first and the index only on a `404` —
-  a `400`/`422` for the wrong form would not fall back); that deleting an already-gone
-  snapshot answers `404` (treated as "gone"); the `additional_vcpus` share of the $/h
-  against a real invoice; and whether the 3D CUDA extensions run on Thunder's GPUs (the
-  bootstrap's smoke test says so).
-- `flock` is assumed on the instance image (the ComfyUI loop and the LAN append lock
-  use it).
-- On the first sync, check `~/comfy.log` on the instance: the 3D nodes should read the
-  synced `models/…` / `hf-cache/…` copies and download nothing from Hugging Face. A node
-  that does download puts its files on the disk as *unknown*.
-- A catalog directory entry syncs the whole directory: `facebook/dinov2-giant` brings
-  its weights twice (`.bin` and `.safetensors`, ~4.5 GB extra), and the TRELLIS.2
-  directory ~1.5 GB of checkpoints only another pipeline loads. The catalog cannot
-  exclude single files inside a directory yet.
-- The bootstrap's log reaches the card when the bootstrap ends, not line by line.
-- One LAN stream per backend: the first sync of a large alias set is bounded by the
-  share host's uplink.
-
-The instance key, the LAN key and the known_hosts files (`thunder.key*`,
-`thunder-known_hosts/`, `modelsrc.key*`, `modelsrc-known_hosts`) live next to `store.db`;
-they are gitignored and excluded by `deploy.sh`, so a deploy never deletes them.
 
 ### Meshy.ai (cloud mesh generation)
 
@@ -1447,6 +1194,405 @@ client-integration walkthrough.
 
 ---
 
+## Managed hosts (Thunder Compute; RunPod later)
+
+A **managed host** is a GPU machine rented on demand that the gateway **starts and
+stops** for you — image, 3D mesh, video or LLM work on a big GPU for an evening, without
+paying for it around the clock. The machine and what runs on it are two levels:
+
+- the **host** carries the **Steuerung** — the provider whose API creates, snapshots and
+  deletes the machine (today **Thunder Compute**, <https://www.thundercompute.com>;
+  RunPod is planned and plugs into the same seam), its options and the API token;
+- **backends attach to it** by naming it as their `host`. The backend keeps its own
+  type: a `comfyui` backend is set up, started and model-synced fully automatically; an
+  `openai` backend (vLLM, llama-swap, any OpenAI-compatible server) brings a **setup
+  script** and a **start command**. **One VM can carry several services** — e.g. one
+  ComfyUI plus a vLLM.
+
+For every attached backend the gateway then:
+
+- reaches the service **only through one SSH tunnel** it supervises — an ssh
+  ControlMaster with one forward per service
+  (`127.0.0.1:<local port>` → `127.0.0.1:<remote port>` inside the VM), so the backend's
+  URL is `http://127.0.0.1:<local port>` and the ordinary adapter does everything else
+  (discovery, jobs, watchdog, VRAM policy, chat routing);
+- enables it at Start and disables it at Stop (nothing polls a dead tunnel port);
+- for ComfyUI, copies onto the machine **exactly the model files** the aliases that name
+  this backend need — every GB on that disk bills, running or snapshotted.
+
+**Why SSH only.** Thunder's own port forwarding (`https://<uuid>-<port>.thundercompute.net`)
+is public **without authentication** — ComfyUI behind it is code execution (the Manager)
+and file read (`/view`) for anyone who finds the URL, and an LLM server is free compute
+for strangers. So the gateway never opens one: after every create and restore, and
+before a service is attached to a running host, it reads the instance's forwarded HTTP
+ports and removes any it finds, and it never starts a service while one is open. Every
+service listens on `127.0.0.1` inside the VM (the host bootstrap switches a template's
+own autostart off). No new dependency — the system `ssh`, `ssh-keygen` and
+`ssh-keyscan`.
+
+**Prerequisites.**
+
+- A Thunder Compute account and an **API token** (Thunder console → API tokens). It goes
+  into the host's **API token** field — stored encrypted, never rendered back, never sent
+  to a service, never in `/health`.
+- `ssh` / `ssh-keygen` / `ssh-keyscan` on the gateway host. The gateway generates its
+  instance key `thunder.key` (ed25519, one per provider kind: `<kind>.key`) next to
+  `store.db` on first need and hands the public half to every create — there is nothing
+  to install on Thunder's side.
+- For ComfyUI models that have no public download URL: the **LAN model source** below.
+
+### Creating a managed host
+
+*Backends* tab → **Managed hosts** (below the backend list) → **+ Managed host**:
+
+- **name** — `a-z`, `0-9` and `-`. It is the host's identity: its snapshots
+  (`aihub-<name>-<stamp>`), its state record and its tunnel socket are named after it, so
+  it **cannot be renamed**. A name that is already a managed host, a key of the
+  *Hosts · GPU policy* table, or the host any backend derives today (from its `host`
+  field or its URL — `http://k12:8188` counts as host `k12`) is refused, or two boxes
+  would share one host policy.
+- **Steuerung** — the provider (today only *Thunder Compute*). Fixed once saved: the
+  host's state and snapshots belong to it.
+- the provider's **options** (Thunder):
+
+  | Field | Default | What |
+  |---|---|---|
+  | gpu | `a6000` | Thunder GPU type (`a6000`, `l40`, `a100xl`, `h100`) |
+  | gpus | `1` | GPUs per instance; each includes 100 GB of disk |
+  | vcpus | `8` | vCPUs above the GPU's smallest option bill extra (`additional_vcpus`) |
+  | template | `auto` | Thunder's image for the **first** start: `auto` = `comfy-ui` when a ComfyUI backend is attached at that start, else `base` (so a vLLM-only host does not inherit the template's ComfyUI and its bundled models) |
+  | disk reserve GB | `20` | free space kept on top of the models and the install when the disk is sized |
+  | ComfyUI commit | `1d61dcc3…` | the full 40-hex sha the ComfyUI bootstrap pins ComfyUI to |
+  | custom nodes | `ops/thunder-nodes.default.txt` | one pack per line: `<git-url>@<commit>` or `registry:<id>@<version>`; `#` comments allowed; empty = the default list (a new host's field is pre-filled with it) |
+
+- **API token** — blank keeps the stored one, *clear* removes it. Without it the host
+  cannot be started.
+
+An invalid value (a GPU the provider does not know, `1.5` vCPUs, a commit that is no
+full sha) is refused on Save — a `400` with the form as typed, nothing stored — before
+anything can bill. The host's label and GPU flags live in its row of
+*Hosts · GPU policy*, like any other box; the attached backends group under the host's
+name there. Managed hosts are console-only (store setting `managed_hosts`, the token
+encrypted).
+
+### Attaching backends
+
+In the backend form (*Backends → Add/Edit*, General tab) choose the host in
+**managed host** (the free-text **host** field is for ordinary boxes: pick
+*(none / free text)* to use it). A **Service on the managed host** block appears:
+
+- **remote port** — the port the service listens on **inside the VM**, on
+  `127.0.0.1`; required, unique per host. Pre-filled with the default of the type the
+  form opened with (ComfyUI `8188`, OpenAI-compatible `8000`) — switching the type in the
+  open form does not change it, so check it.
+- **url** becomes read-only and is **derived on Save**: `http://127.0.0.1:<local port>`,
+  where the local port is the gateway's end of the tunnel, picked from `18100–18999`,
+  unique across all hosts and **stable** over Saves, renames and a move to another host
+  (a URL that moved would pull the backend out from under running jobs).
+- **ComfyUI** (`type: comfyui`) needs nothing else: it is installed and started by the
+  host's ComfyUI bootstrap. Blank output/input dirs (ComfyUI tab) become
+  `/home/ubuntu/ComfyUI/output|input`.
+- **OpenAI-compatible** (`type: openai`) needs:
+  - **setup script** (optional) — a shell script run once per host disk and again
+    whenever it changes (see below), e.g. `pip install -U vllm`. A command in it that
+    reads stdin consumes the rest of the script: give it `-y` or `</dev/null`.
+  - **start command** (required) — e.g.
+    `vllm serve <model> --host 127.0.0.1 --port 8000`. It must listen on
+    `127.0.0.1:<remote port>`.
+  - **health path** (default `/v1/models`) — probed through the tunnel; `200`, `401` or
+    `403` count as up (a server with its own API key answers `401` and is running).
+
+  **No tokens in the setup script or start command** — both are stored in plain text.
+  The Hugging Face token belongs in the HF-token setting (Managed hosts →
+  *Model-sync catalog and HF token*).
+
+Refused on Save (`400`, the form as typed): a type that cannot run on a managed host
+(`meshy`, `tripo`, `anthropic`), a missing or out-of-range remote port, a remote port
+another service of the host already uses, a **second ComfyUI** on one host, a command
+service whose file-name slug (the name reduced to `[a-z0-9-]`) another command service
+of the host already uses, a missing start command, a health path with odd characters.
+A **`config.yaml` backend** naming a managed host is **not attached** — its card says
+*not attachable (config-defined backend — create it in the console)*; the tunnel
+fields only exist on console-made backends.
+
+**Detaching**: set the backend's host back to *(none / free text)* and type its real URL
+(the old tunnel URL is refused — nothing would forward it any more), or move it to
+another managed host. A running host then ends that service's process on the VM and
+removes its forward. **A detach never disables the backend** — `enabled` belongs to the
+host it is attached to now: Start enables what is attached, Stop disables what is
+attached at that moment.
+
+**Changes while the host runs** are applied within ~5 s, without restarting the tunnel:
+a new service gets its forward added to the running ssh master (`ssh -O forward`), the
+port check, its setup if needed, its start and its probe; a detached one gets its
+process ended and its forward cancelled; a changed start command, setup script or
+remote port restarts that one service. Other services keep serving throughout — a
+stream in flight on the vLLM is not cut because a ComfyUI was attached. A forward that
+cannot be added (the local port is busy) marks only that service `down` with ssh's
+reason and is retried with a backoff. Changes made while a Stop runs wait until the host
+is `off`.
+
+**Per-service setup (command services).** The setup script is streamed over SSH on
+stdin (`bash -s`, never on a command line), its output goes to the card log and to
+`~/gw-svc-<slug>.setup.log` on the VM. Success records the script's **sha256** for the
+host's disk — a start from a snapshot taken after it runs nothing, a start from the
+template or from an older snapshot runs it again, and an edited script runs again at the
+next start, or at once when the host is running. A failing script (exit ≠ 0) marks only
+that service **`setup failed`** (naming its last output line and the log) — the host
+stays `ready` and the other services keep running. **Re-run setup** in the service
+table forces it, whatever the hash says, then restarts the service. The start command
+runs inside a gateway-written wrapper `~/gw-svc-<slug>.sh` (a `flock`ed lock so a
+second start is a no-op, a `while :` restart loop, log `~/gw-svc-<slug>.log`), started
+with `setsid nohup`.
+
+**Separate Hugging Face caches.** A command service runs with
+`HF_HOME=~/hf-cache-<slug>` — its own cache. `~/hf-cache` belongs to ComfyUI and the
+model sync alone; LLM weights never appear there, so the sync never lists them as
+*unknown* files or prunes them.
+
+### Start / Stop
+
+The host's **card** (Backends tab → Managed hosts; live while an instance runs) shows the
+phase, the provider, costs, the snapshot, the log — and the **service table**: one row
+per attached backend with its type, `VM :<remote> → local :<local>`, status
+(`starting`, `up`, `setup failed`, `down`), the last error, and per service **Restart**
+and **Re-run setup** (while the host runs and no operation is in flight).
+
+- **Start** (asks first) is refused without an API token ("no Thunder Compute API token
+  set …"), without an attached backend, or when no attached backend can run — before any
+  API call; the host stays `off`. Otherwise it enables every attached backend that can run, then
+  creates an instance from the host's **newest READY snapshot**
+  (`aihub-<host name>-<YYYYmmdd>t<HHMMSS>z`, all lowercase). With none yet, the **first
+  start bootstraps** a fresh instance from the template (`auto`: see the options): first
+  the **host bootstrap** (`ops/host-bootstrap.sh`, whatever is attached: the template's
+  own autostart off, the models and node packs the template brought reported, `flock`
+  and `uv` installed when missing; log `~/gw-host-bootstrap.log`), then — only with a
+  ComfyUI backend attached — the **ComfyUI bootstrap** (`ops/thunder-bootstrap.sh`: pins
+  ComfyUI to the commit, builds its own venv — Python 3.13, torch 2.11.0+cu130, unless
+  the template's already matches — installs the node packs, ComfyUI-Manager and a
+  looping `~/start-comfy.sh <port>`, and ends with a CUDA smoke test; up to a few hours;
+  log `~/gw-bootstrap.log`), then each command service's setup. A ComfyUI attached later
+  is bootstrapped then (at once on a running host, else at the next start). The disk is
+  sized from the models the aliases need + the base install + the reserve (never below
+  the snapshot's minimum or 100 GB per GPU; Thunder disks only grow). A restore from a
+  snapshot takes up to **~8 min per 100 GB** (Thunder's figure). Then: port check,
+  tunnel, every service started and probed, model sync, `ready`.
+  The host is `ready` once the VM runs and the tunnel stands; each service has its own
+  status, and routing follows each backend's normal health poll. A service whose setup
+  or start fails is that service's `setup failed` / `down` — the host stays up. A
+  failure of the machine itself before the instance exists ends in `off`; after it in
+  `failed (<phase>)` with the instance **kept** for diagnosis — it bills until you press
+  Stop. A failed host bootstrap is `failed (bootstrapping)`.
+- **Stop** (asks first) drains **every** attached backend (running jobs finish, new ones
+  go elsewhere; the card says how many jobs it still waits for, per service), ends
+  running transfers, deletes the synced files no selected alias needs any more (see
+  below), takes a snapshot, deletes the instance and disables the attached backends →
+  `off`. The instance only counts as gone once two fresh instance lists in a row no
+  longer show it; one that stays is `failed (deleting)` — press Stop again, every step
+  resumes where it stopped. The snapshot settles in the background: READY → this host's
+  older snapshots are deleted (never the newest READY one); FAILED → a fault entry, and
+  the previous READY snapshot stays the one the next start uses. A Stop during a Start
+  **aborts** the start and stops from wherever it got (before the create: just `off`;
+  before any bootstrap ran: deleted without a snapshot). A snapshot taken before a
+  bootstrap finished is marked, and the next start from it runs that bootstrap again.
+- **Restart** (service table) restarts one service on the running instance: its loop is
+  ended and started fresh on its port (so a changed start command takes effect). For
+  ComfyUI this is also the way out of a failed start once the cause is fixed on the box;
+  the ⟳ restart via ComfyUI-Manager works too (`start-comfy.sh` is a loop).
+- There is **no auto-stop**: an instance runs, and bills, until Stop. A gateway restart
+  does not touch it — the state (`host_state` store setting, one record per host name)
+  is persisted on every phase change and reconciled with Thunder's instance list on
+  boot: the tunnel comes back with every forward, each service is probed on its own
+  forward and only one that does not answer is restarted; an interrupted stop runs on.
+  The node list and the ComfyUI commit are applied by the bootstrap only — a start from
+  a snapshot keeps what the snapshot holds.
+
+**Deleting a host** (*Delete* on its card, asks first) is allowed only while it is `off`
+with no operation in flight, no snapshot still settling, and **no backend naming it**
+(re-point or delete those first). Its state goes; the snapshots it left behind then show
+as *foreign* (listed with their $/month, never deleted automatically).
+
+### Model sync (ComfyUI services)
+
+**Selecting aliases.** An alias runs on the managed host when one of its candidates
+names the ComfyUI backend attached to it — in *Aliases → Media*, add that backend as a
+candidate (with its own pins and bypassed nodes, like any other). There is no second
+list: every alias that names the backend is synced, every other one is not, and removing
+the candidate frees its files at the next Stop. There is no model sync for command
+services yet — their setup script or start command fetches what they need (into their
+own HF cache).
+
+**Model sync rules.** The sync runs when the instance comes up, when an alias's
+candidates change (checked every 5 s), when the LAN source changes, and on *Sync now*.
+
+- **What a candidate needs** is its workflow after **that candidate's** `fixed` pins and
+  without its `bypass` nodes — the same two per-backend rules the adapter applies —
+  so bypassing the unused one of two loader branches on the managed candidate saves that
+  download. Counted are the weight inputs of loader nodes (not the per-job image, mask,
+  mesh, path, video, audio loaders; not inputs that only say HOW to load —
+  dtype/format/quant/mode…), plus any string input of any node ending in
+  `.safetensors`, `.gguf`, `.ckpt`, `.pt`, `.pth`, `.bin`, `.onnx` or `.sft`. Empty LoRA
+  slots do not count. For a loader field clients may choose (mapped), only the default is
+  synced — the card says so.
+- **Resolution never guesses:** a file name is looked up in the loader's own folders
+  (ComfyUI's order), then as a unique suffix anywhere in the source; two hits are
+  *ambiguous*, none is *missing* — the alias is blocked with the reason.
+- **Hub ids and bare names.** A value like `org/repo` (a node that fetches its own
+  model) is only covered by a catalog entry matching the node **class and value**;
+  without one the alias is blocked and the reason names the entry it needs. A bare name
+  (a variant name a node resolves itself) counts only when a catalog entry matches it.
+  An alias with **no** model reference at all is `blocked: no model references known`
+  until a catalog alias entry says what it needs (`"paths": []` = nothing).
+- **Two roots:** `models/…` ↔ `~/ComfyUI/models/…` and `hf-cache/…` ↔ `~/hf-cache/…`
+  (ComfyUI runs with `HF_HOME=~/hf-cache`, so nodes that load through the Hugging Face
+  cache read the synced copy; its `snapshots/` symlinks are recreated). `hf-cache/token`
+  and anything with a dot segment are never synced.
+- **Where files come from:** a catalog `file` + `url` entry → the instance downloads it
+  itself (`curl`, ≤ 3 at a time, resumable, sha256-checked when the entry has one, else
+  by size; the HF token is attached only for `huggingface.co`/`hf.co`, and only via
+  stdin, never on a command line). Everything else streams from the LAN source through
+  the gateway — one stream per host, resumed from the partial file, sha256-verified on
+  both sides. A file is *present* when the instance holds it at the source's size;
+  partial `.part` files never are. Aliases with the fewest missing bytes go first.
+- **Disk:** when the downloads do not fit, the gateway grows the instance's disk through
+  the API; beyond the GPU's maximum the alias is `blocked: disk`.
+- **Failures:** three attempts with backoff, then the alias is blocked with the file and
+  the error, and a `sync` fault is logged; *Sync now* tries again.
+- **Nothing is deleted during a session.** At **Stop**, files the gateway synced that no
+  selected alias needs any more are deleted before the snapshot (the card previews
+  "deleted at stop: N files, X GB"). A **blocked** alias's files are *held*, never
+  deleted, until the block is fixed. Files the gateway did not put there and nobody needs
+  — models the template brought, a node's own downloads — are listed as **unknown** with
+  their size and deleted only when you tick them in the card. Delete template models
+  before the first Stop, or every snapshot carries them.
+- **Routing waits for the sync.** Until all of an alias's files are present and nothing
+  blocks it, the managed candidate is out of routing **and** of the queue — other
+  candidates of the alias are unaffected. An alias that runs **only** there answers at
+  once with a `503` that says why:
+  `models for <alias> are syncing on <backend> (12.3 of 31.0 GB)` or
+  `models for <alias> are blocked on <backend>: <reason>`. Meanwhile its schema, image
+  slots and LoRA list read empty (the card notes it).
+
+**Catalog and HF token.** *Backends → Managed hosts → Model-sync catalog and HF token*:
+one JSON list for every managed host (store setting `modelsync_catalog`), validated as a
+whole on Save — a refused Save comes back with the text as typed and saves nothing.
+Entries:
+
+```json
+[
+ {"match": {"class": "SomeModelLoader", "value": "org/model"}, "paths": ["models/org/model/"]},
+ {"match": {"alias": "my-rig-alias"}, "paths": []},
+ {"file": "models/vae/x.safetensors", "url": "https://huggingface.co/…/x.safetensors", "sha256": "…"}
+]
+```
+
+Paths start with `models/` or `hf-cache/`; a trailing `/` is a whole directory. The
+catalog is seeded **once** with entries for public hub models some 3D nodes load
+themselves (TRELLIS.2, Pixal3D, StableX normals, Hunyuan3D-2.1's texture stage); after
+that it is yours — emptied, it stays empty. The **HF token** (for gated Hugging Face
+downloads) is stored encrypted, never shown again: blank keeps it, *clear* removes it.
+
+**LAN model source.** Files without a public URL come from a model share on the LAN,
+served read-only by the SSH forced command `ops/modelsrc-serve.sh` (verbs `list`,
+`cat <rel> <offset>`, `sha256 <rel>`; no absolute paths, no `..`, no dot files, no
+`*.log`, of the HF cache only `hf-cache/hub/…`, no symlink on the path — everything
+else is refused). The
+share root defaults to `/mnt/xfs/shared/comfyui-models` (env `MODELSRC_ROOT`); share
+path `<x>` is `models/<x>`, and the Hugging Face cache must be a **real directory**
+`hf-cache/` inside the share (a symlinked one makes `list` fail with exit 1 — it
+would otherwise silently lack the HF half of the share). The share host is set in `modelsrc_host` (field at the end of the LAN card;
+default `modelsrc@192.168.8.24`). Install on your model-share host — the example below
+uses a Proxmox host `pveK12` sharing `/mnt/xfs/shared/comfyui-models`; adjust the path
+to yours. Copy the script over first (`scp ops/modelsrc-serve.sh root@<share-host>:/tmp/`),
+then run these there as root, with the public key the LAN card shows
+(`modelsrc.key.pub`, generated by the gateway):
+
+```bash
+install -m 0755 /tmp/modelsrc-serve.sh /usr/local/bin/modelsrc-serve
+useradd --system --home /var/lib/modelsrc --shell /bin/bash modelsrc
+setfacl -R -m u:modelsrc:rX /mnt/xfs/shared/comfyui-models
+setfacl -R -d -m u:modelsrc:rX /mnt/xfs/shared/comfyui-models
+install -d -m 0700 -o modelsrc /var/lib/modelsrc/.ssh
+echo 'command="/usr/local/bin/modelsrc-serve",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty <public key from the LAN card>' \
+  > /var/lib/modelsrc/.ssh/authorized_keys
+chown modelsrc /var/lib/modelsrc/.ssh/authorized_keys && chmod 600 /var/lib/modelsrc/.ssh/authorized_keys
+```
+
+The `modelsrc` user needs a **real login shell** (`/bin/bash`): sshd runs the forced
+command through the user's shell, and with `/usr/sbin/nologin` it runs nothing — every
+listing then fails as "unreachable". (`setfacl` comes with the `acl` package.)
+
+Then **pin the host key** in the LAN card: *Fetch host key* runs `ssh-keyscan` and shows
+the fingerprint (nothing is trusted yet); compare it with
+`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the share host, then
+*Confirm fingerprint* pins exactly that key (`modelsrc-known_hosts`; every later
+connection checks it strictly). Until then aliases that need LAN files show
+`waiting for LAN source (not configured)` and fetch nothing yet — not even their URL
+files: nothing that cannot make an alias ready this session goes onto the paid disk
+(aliases that need only URL files sync normally). A changed
+share host drops the old listing and needs a new pin. The listing is cached for 10 min
+and re-read at every start and on *Sync now*.
+
+### Costs, warnings and orphans
+
+The card shows GPU × count, vCPUs, disk, uptime, **$/h** (from Thunder's public price
+list: the GPU rate + the extra vCPUs + disk beyond the included 100 GB per GPU), the
+session total so far, and the snapshot (size, **$/month** while off). Snapshots and the
+account's instance list are re-read every 10 minutes, the price list hourly.
+An instance up for more than **24 h** puts a banner on its card **and** on the
+Dashboard. Instances in the account that no managed host owns are listed on the card
+with their $/h, and `aihub-…` snapshots no host owns (a deleted host leaves them behind)
+with their $/month — **neither is ever deleted automatically**.
+`/health` (full view) carries
+`hosts_managed: {<host>: {provider, phase, uptime_s, cost_per_h, services: {<backend id>: <status>}}}`
+— never the token. Failures land in the [fault log](#backend-fault-log): the machine's
+(create, snapshot, delete, an instance that vanished) under the pseudo backend
+`managed-host:<host>`, a service's (its setup, its start, a model transfer) under that
+backend — sources `lifecycle` and `sync`.
+
+### Known limits — verify on the first live run
+
+- Not yet checked against the live API: the exact instance status values; whether the
+  listed `port` is the SSH port; which id form `/instances/{id}/delete|modify` and the
+  port removal accept (the gateway tries the uuid first and the index only on a `404` —
+  a `400`/`422` for the wrong form would not fall back); that deleting an already-gone
+  snapshot answers `404` (treated as "gone"); the `additional_vcpus` share of the $/h
+  against a real invoice; and whether the 3D CUDA extensions run on Thunder's GPUs (the
+  ComfyUI bootstrap's smoke test says so).
+- `flock` is required on the instance (the service loops, the lock-based stop and the
+  LAN append lock use it); the host bootstrap installs it via `sudo -n apt-get` when the
+  image lacks it — an image without passwordless sudo and without `flock` fails the host
+  bootstrap.
+- On the first sync, check `~/comfy.log` on the instance: the 3D nodes should read the
+  synced `models/…` / `hf-cache/…` copies and download nothing from Hugging Face. A node
+  that does download puts its files on the disk as *unknown*.
+- A catalog directory entry syncs the whole directory: `facebook/dinov2-giant` brings
+  its weights twice (`.bin` and `.safetensors`, ~4.5 GB extra), and the TRELLIS.2
+  directory ~1.5 GB of checkpoints only another pipeline loads. The catalog cannot
+  exclude single files inside a directory yet.
+- A bootstrap's or setup script's log reaches the card when it ends, not line by line.
+- One LAN stream per host: the first sync of a large alias set is bounded by the share
+  host's uplink.
+- The tunnel's control socket path must fit a Unix socket (at most 86 bytes). It lives in
+  `<datadir>/<kind>-ctl/` next to `store.db`; a data directory too long for that moves it
+  to `/tmp/ai-hub-<uid>-ctl/` (0700, private to the service under `PrivateTmp`). A path
+  that fits neither leaves the tunnel down, and the card says so ("Tunnel will not come
+  up: …").
+- Editing a running command service's health path restarts it; a running service that
+  a later edit makes unrunnable (e.g. its remote port now collides) shows `down` but keeps
+  running on the VM until the next Stop.
+- A failed setup script's last output line is shown on the card and in the fault log —
+  one more reason to keep secrets out of it.
+- No model sync for LLM services; one ComfyUI per host; RunPod and a provider "stop" that
+  keeps the volume are not built yet.
+
+The instance key, the LAN key, the known_hosts files and the tunnel sockets
+(`thunder.key*`, `thunder-known_hosts/`, `thunder-ctl/`, `modelsrc.key*`,
+`modelsrc-known_hosts`) live next to `store.db`; they are gitignored and excluded by
+`deploy.sh`, so a deploy never deletes them.
+
+---
+
 ## The `/ui` console
 
 A server-rendered console mounted at `/ui` (sign in with an admin key once
@@ -1458,7 +1604,7 @@ session cookie is marked `Secure`. Tabs:
 | Tab | What |
 |---|---|
 | **Dashboard** | live per-backend status (a down backend names its cause) + in-flight, a **backend faults · 24h** card, column and panel (see [Backend fault log](#backend-fault-log)), parked calls, media-job counts/recent, recent LLM calls |
-| **Backends** | add/edit/remove backends (LLM, ComfyUI, Meshy, Tripo), incl. the `paid` cost tier; the editor is split into **General** (name, type, url, host, cost tier, concurrency, credential — never shown again once stored: blank keeps it, *clear* removes it), **Models** (whitelist/blacklist, discovery filters, bare-id listing, context windows), **Behavior** (prompt-cache passthrough, sampling defaults, self-retries) and one tab named after the type (**ComfyUI** / **Cloud task API** / **Anthropic**); the **Hosts · GPU policy** panel below the list edits the per-box VRAM flags (see [Hosts & VRAM policy](#hosts--vram-policy)); with a Thunder backend, the **Thunder panel** above the list carries its lifecycle card (Start/Stop, costs, model sync, log), the LAN model source and the model-sync catalog + HF token (see [Thunder Compute](#thunder-compute-on-demand-comfyui)) |
+| **Backends** | add/edit/remove backends (LLM, ComfyUI, Meshy, Tripo), incl. the `paid` cost tier; the editor is split into **General** (name, type, url, host, cost tier, concurrency, credential — never shown again once stored: blank keeps it, *clear* removes it), **Models** (whitelist/blacklist, discovery filters, bare-id listing, context windows), **Behavior** (prompt-cache passthrough, sampling defaults, self-retries) and one tab named after the type (**ComfyUI** / **Cloud task API** / **Anthropic**); the **Hosts · GPU policy** panel below the list edits the per-box VRAM flags (see [Hosts & VRAM policy](#hosts--vram-policy)); the **Managed hosts** section below the list adds a rented GPU machine (**+ Managed host**: name, **Steuerung** = provider, its options, API token) and carries one lifecycle card per host (Start/Stop, costs, service table with Restart / Re-run setup, model sync, log), the LAN model source and the model-sync catalog + HF token; a backend attaches through the **managed host** select in its General tab (see [Managed hosts](#managed-hosts-thunder-compute-runpod-later)) |
 | **Input & Routing** | sub-tabs **Input** (what clients can call — chat aliases, generation models, endpoints), **LLM models**, **Image models**, **LoRAs** — all searchable |
 | **Aliases** | sub-tabs **Chat** and **Media** — the alias list on the left; with nothing picked the right column is the LIVE overview (chat: alias → backend · model · status + alias/model collisions; media: alias → backends, or pick a backend to see everything mapped onto it); pick an alias for its editor. Chat editor: per-alias `park_s`, reasoning/voice/sampling defaults, backends — plus that alias's live routes. Media editor: register a ComfyUI workflow, wire its node mapping, pin values (a cloud alias — Meshy, Tripo — needs no workflow: one schema-driven editor renders its endpoint + option defaults instead). Old `/ui/mapping?…` and `/ui/routing?sub=chat|gen` links redirect here. |
 | **Reasoning** | the normalized-thinking rule list (model glob × backend set → adapter) + test resolver |
@@ -1470,7 +1616,7 @@ session cookie is marked `Secure`. Tabs:
 
 **Live views update in place — an update never reloads the page.** Anything that
 moves on its own (the Dashboard, Media Jobs, a running job's detail page, the
-Backends tab while a backend drains or a Thunder instance runs, the Media Playground while a job generates,
+Backends tab while a backend drains or a managed host runs, the Media Playground while a job generates,
 the Voice sub-tab while a reference uploads) re-fetches its own URL every few
 seconds and patches only the parts of the page that actually changed. So an update
 never interrupts you: your scroll position, a sort order you clicked, half-typed
@@ -1508,8 +1654,8 @@ failures — always on, independent of `stats.enabled`:
 | `call` | a chat dispatch fails over (connect error/timeout, llama-swap "unable to start process") or returns a 5xx to the client — with the backend's own error text |
 | `job` | a generation attempt fails on the backend (`connection_lost` mid-job, `max_wait`, execution error) — also when a self-retry or another backend then completed the job |
 | `watchdog` | a ComfyUI service restart (auto or manual) and a failed restart |
-| `lifecycle` | a Thunder instance: a snapshot that FAILED (`snapshot_failed`), an instance that vanished outside a stop (`instance_vanished`), a failed start/stop step |
-| `sync` | a Thunder model transfer that gave up after three attempts (`transfer`) |
+| `lifecycle` | a managed host: a snapshot that FAILED (`snapshot_failed`), an instance that vanished outside a stop (`instance_vanished`), a failed start/stop step (booked on the pseudo backend `managed-host:<host>`), a service's failed setup or start (booked on that backend) |
+| `sync` | a managed host's model transfer that gave up after three attempts (`transfer`) |
 
 **A backend that is switched off is not a fault.** `unreachable` — no connection at all:
 host powered off, service stopped — is left out everywhere: no outage, no downtime, no
@@ -1735,8 +1881,8 @@ possible but needs that user to own `/opt/ai-hub` and to hold its own SSH key on
 voice host — a decision for the operator, not the unit file.
 
 `deploy.sh` is an rsync-over-SSH helper (`DEPLOY_HOST=root@host ./deploy.sh`):
-syncs code (excluding `config.yaml`, `venv/`, the databases, `jobs/`, the Thunder/LAN
-ssh keys and known_hosts files), installs requirements in a remote venv, syncs the
+syncs code (excluding `config.yaml`, `venv/`, the databases, `jobs/`, the managed-host/LAN
+ssh keys, known_hosts files and tunnel sockets), installs requirements in a remote venv, syncs the
 systemd unit, restarts.
 
 **Upgrading an install from before 2026-09-08** (the rename) — do this BEFORE the
@@ -1801,8 +1947,8 @@ new index (`idx_calls_ts_backend`, the old `idx_calls_ts` is dropped) and `fault
 
 > **Secrets & data never to commit:** `config.yaml`, `store.db` (+ `secret.key` —
 > they travel together, keys encrypted at rest), `stats.db*`, `jobs.db*`,
-> `jobs/`, `*.key`, and the Thunder files `thunder.key*`, `thunder-known_hosts/`,
-> `modelsrc.key*`, `modelsrc-known_hosts`. All gitignored.
+> `jobs/`, `*.key`, and the managed-host files `thunder.key*`, `thunder-known_hosts/`,
+> `thunder-ctl/`, `modelsrc.key*`, `modelsrc-known_hosts`. All gitignored.
 
 ## License
 

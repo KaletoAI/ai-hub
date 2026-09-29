@@ -16,9 +16,10 @@ per-backend concurrency caps, an optional multi-user auth layer, **call parking*
 Responses background mode), a full **media-generation subsystem** (image/video/
 audio; workflow mapping, LoRAs, jobs), a **normalized reasoning toggle** (one
 `reasoning: off|on|auto` control mapped to the right per-(model,backend)
-mechanism, plus per-alias defaults), **on-demand Thunder Compute GPU instances** as
-ComfyUI backends (start/stop via snapshots, an ssh tunnel, and a per-alias model sync
-that gates routing), and a server-rendered `/ui` console. Read
+mechanism, plus per-alias defaults), **managed hosts** — GPU machines rented on demand
+(Thunder Compute; RunPod later) that ComfyUI and OpenAI-compatible backends attach to as
+services (start/stop via snapshots, one ssh ControlMaster tunnel, per-service setup, and
+a per-alias model sync that gates routing) — and a server-rendered `/ui` console. Read
 `README.md` first — it documents every config knob, endpoint, and routing rule.
 
 ## Run / develop
@@ -33,7 +34,7 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
   restart for backend/alias changes. Read **only at startup**:
   `stats.enabled` and the stats/jobs DB paths.
 - **No linter or build step, and no blanket test suite** — only targeted stdlib
-  `unittest` files for the mechanisms that fail SILENTLY (see the sixty-eight listed under
+  `unittest` files for the mechanisms that fail SILENTLY (see the seventy-one listed under
   `anthropic_bridge.py`): `venv/bin/python -m unittest discover -s tests -t .`.
   Everything else is verified by running the server and hitting endpoints with
   `curl` (README "Try it"), `curl -H "Authorization: Bearer <admin key>"
@@ -52,12 +53,12 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
 
 ## Architecture
 
-Twenty-one self-contained Python files hold everything (`ls *.py` is the count of
+Twenty-three self-contained Python files hold everything (`ls *.py` is the count of
 record; the tests live in `tests/`, the scripts that run on OTHER boxes in `ops/`).
 `main.py` owns app state; the others (`adapters`, `meshy`, `tripo`, `cloudtask`, `jobs`,
 `store`, `stats`, `admin`, `reasoning`, `scheduler`, `responses_bridge`,
 `anthropic_bridge`, `openai_image_bridge`, `previewanim`, `netscan`, `faults`, `thunder`,
-`thunderctl`, `modelsync`, `sshrun`) never import `main` — they receive what they need
+`hostapi`, `hostctl`, `services`, `modelsync`, `sshrun`) never import `main` — they receive what they need
 via injected callables, staying hot-reload-safe.
 
 - **`main.py`** — config loading, health/discovery loop, routing, all HTTP
@@ -636,7 +637,12 @@ via injected callables, staying hot-reload-safe.
   inert from the first tick onward. POST bodies parsed by
   hand (`parse_qs`) to stay `python-multipart`-free. Markup conventions: `_field(label,
   control, hint=)` ties its `<label for>` to the control (its id, else `fld-<name>` is
-  added) and renders `hint` as its own row — never append a hint inside the control;
+  added — `_CTRL_TAG` finds the control with a regex that skips QUOTED attribute values
+  whole: it used to stop at the first `>`, and the type select's inline handler holds
+  `indexOf(…)>=0`, so the id landed INSIDE the handler and its `"` cut it short —
+  switching the backend type silently toggled nothing, `test_backend_form_tabs`
+  `test_label_id_never_lands_inside_a_handler`) and renders `hint` as its own row —
+  never append a hint inside the control;
   colours come from the `:root` palette in `_CSS` (`var(--muted)` …), boxed pickers use
   `.box`; a sortable cell whose text is not the quantity carries `data-sv` (raw value),
   and `_SORT_JS`'s `num()` reads the console's units (`102 ms`, `1.2 s`, `5m`, `$`).
@@ -746,7 +752,7 @@ via injected callables, staying hot-reload-safe.
   running the tool. Covered by
   `test_anthropic_bridge.py` (stdlib `unittest` — a streaming tool-call bridge fails
   silently rather than crashing). `ls tests/test_*.py` is the count of record —
-  **sixty-eight** files today — and each exists for that same reason: the mechanism it
+  **seventy-one** files today — and each exists for that same reason: the mechanism it
   guards fails SILENTLY, so it is named next to that mechanism above.
   `test_anthropic_bridge.py`, `test_prune_branch.py` (a
   dead-branch prune that cascades one node too far or too few surfaces as an aborted
@@ -1076,8 +1082,10 @@ via injected callables, staying hot-reload-safe.
   under BYOK where `cost` is only the fee — is what gets booked on the plain path, the
   stream and the Messages bridge, never reaches a strict client's usage chunk, and falls
   back to the price list when absent or not a finite non-negative number).
-  Newest are the eight the Thunder Compute backend brought — each guards a mechanism
-  that fails silently, and most of them one that BILLS while it does:
+  Newest are the eleven of the managed hosts — eight came with the Thunder Compute
+  backend (two renamed when the machine became its own level), three with the
+  host/service split — each guards a mechanism that fails silently, and most of them one
+  that BILLS while it does:
   `test_thunder.py` (the pure API/disk/cost rules: a rotation that deletes the last
   usable snapshot leaves nothing to restore, a disk below the snapshot's minimum is a
   refused restore, a $/h that bills the included 100 GB or every vCPU is wrong without
@@ -1087,27 +1095,70 @@ via injected callables, staying hot-reload-safe.
   `foreign_snapshots`);
   `test_sshrun.py` (the ssh argv: a host without `--` before it is parsed as an OPTION,
   a secret in argv is world-readable, a tunnel not bound to loopback on both ends puts
-  ComfyUI on the LAN, a `safe_rel` that lets `..` or a dot segment through reads files
+  a service on the LAN, a `safe_rel` that lets `..` or a dot segment through reads files
   outside the model tree, and a supervisor that does not reap leaves an `ssh -N` holding
-  the local port, so every later tunnel dies on `ExitOnForwardFailure`);
-  `test_thunder_controller.py` (the controller against a stubbed Thunder API and a fake
-  ssh — the biggest file, because every mistake here bills or deletes: the uuid
-  persisted before the first wait, a mutating call only on an item found by uuid in a
-  FRESH list (never a stored, reusable index), `off` only after two lists without the
-  instance, the port guard before `bootstrapping`/`starting`, `GW:NODE_FAIL` read by tag,
-  a stop aborting a start, the stop order drain → transfers → prune → snapshot → delete
-  and every step resumable, a FAILED snapshot never adopted, rotation only after READY,
-  resume after a restart, an unreadable state never overwritten, the transfers — options
-  on stdin, the HF token for HF hosts only, lockfile adoption, resume from the offset, a
-  sha256 mismatch, disk growth by `modify`, one LAN stream — held vs pruned files, the
-  token in no log or view, and main's wiring incl. the deploy excludes);
-  `test_thunder_scripts.py` (the bootstrap only ever runs on a rented instance, so a
+  the local port, so every later tunnel dies on `ExitOnForwardFailure`; plus the
+  ControlMaster: every forward once and before `--`, one local port to two remote ports
+  refused, `-O exit`/`stop` refused (they end every service's tunnel), a control path
+  ssh would expand (`%`, `$`, `~`) or longer than 86 bytes refused, a stale socket
+  removed but a live one kept — a master that finds a stale one runs without
+  multiplexing and every later `-O forward` fails);
+  `test_hostapi.py` (the provider seam: an index tried before the uuid can delete a
+  STRANGER's instance, a token echoed into an error lands in the panel and the fault
+  log, a 201/202 read as failure calls a paid create a failure, a price list fetched per
+  view hammers the API; and `options_of` must return a VALID value on every key — a
+  stored typo becomes the gpu_type, a "0" vcpus a 422 after the start began — with the
+  registry being the one list the form and the controller both read);
+  `test_services.py` (what runs a backend on the VM, only ever wrong on a live instance
+  otherwise: admin text in a command line is visible to every process via `ps` and lands
+  in the gateway's log, a heredoc delimiter a line of the start command equals ends the
+  script early, a CRLF from a textarea is a different command, a shared `~/hf-cache`
+  makes LLM weights "unknown" to the model sync, a stop by pattern hits the ssh shell
+  running it; the wrapper runs for real in `bash -c` — the lock makes a second start a
+  no-op, the loop restarts a killed service, the stop ends the loop AND its child and
+  frees the lock, a restart runs a REWRITTEN wrapper);
+  `test_hostctl.py` (the controller against a stubbed
+  provider API and a fake ssh — the biggest file, because every mistake here bills or
+  deletes: the uuid persisted before the first wait, a mutating call only on an item
+  found by uuid in a FRESH list (never a stored, reusable index), `off` only after two
+  lists without the instance, the port guard before `bootstrapping`/`starting` and
+  before an attach, `GW:NODE_FAIL` read by tag, a stop aborting a start, the stop order
+  drain → transfers → prune → snapshot → delete and every step resumable, a FAILED
+  snapshot never adopted, rotation only after READY, resume after a restart, an
+  unreadable state never overwritten, the transfers — options on stdin, the HF token
+  for HF hosts only, lockfile adoption, resume from the offset, a sha256 mismatch, disk
+  growth by `modify`, one LAN stream — held vs pruned files, the token in no log or
+  view; and the host/service split: every service drained before the snapshot and
+  disabled at `off`, a DETACH that never disables (R-K2) and a move H1 → H2 H1 never
+  touches, a forward added on the running master without a respawn (a respawn cuts the
+  other service's stream), a failed forward downing only its service, a list changed
+  mid-stop waiting until `off`, the bootstrap split — a vLLM-only host gets `base` and
+  the host bootstrap only, a ComfyUI attached later is bootstrapped from a no-ComfyUI
+  snapshot — the setup hash per disk (same script → no setup, changed → setup + restart,
+  a template re-runs it), a failed setup downing only that service while the host stays
+  `ready`, admin text on stdin only across every path, host faults on the pseudo
+  backend, snapshots named after the HOST, and main's wiring incl. the deploy excludes);
+  `test_managed_hosts.py` (the store and main half: a token put into `set_settings` as
+  part of a dict is stored in PLAINTEXT and every `get_settings()` reader sees it (R-W10);
+  a host whose entry is gone while its instance runs must keep its controller, and one
+  with an unknown provider must be shown but never driven — nor take the rebuild down;
+  a config backend naming a managed host must not be attached (R-K3); a `local_port`
+  that moves on a Save or rename moves the backend's URL under running jobs, and two
+  services on one port make the whole tunnel refuse; the routing gate and the health
+  view must resolve backend → host → controller (R-W7) — by backend name they find
+  nothing and route onto a box whose models are still downloading; an undriven host
+  deleted while its record names an instance forgets a billing machine; and the "auto"
+  template (M5));
+  `test_thunder_scripts.py` (the bootstraps only ever run on a rented instance, so a
   regression surfaces as a billed hour: the start script a LOOP on `127.0.0.1` with
-  `HF_HOME`, no any-address anywhere in the script, strict mode, the `GW:` lines, the
-  smoke baseline even without any node pack, a short commit refused, a template
-  autostart's backup surviving a re-run, an unsuitable venv removed only after the new
-  one is built, and the default node list — every line pinned, the Manager in it — with
-  the parser of both line forms);
+  `HF_HOME` taking its port, no any-address anywhere, strict mode, stdin-safe last
+  lines, the `GW:` lines, the smoke baseline even without any node pack, a short commit
+  refused, a template autostart's backup surviving a re-run, an unsuitable venv removed
+  only after the new one is built, the default node list — every line pinned, the
+  Manager in it — with the parser of both line forms; and the split: the autostart guard
+  and the template reports only in the host script, `flock`/`uv` only there, no ComfyUI
+  install there, both copies of `parse_node_line` identical, the ComfyUI `stop` killing
+  only `main.py` processes inside the checkout);
   `test_modelsync.py` (the derived model set: a HOW input taken as a reference blocks an
   alias forever, an ignored pin or bypass syncs the wrong tens of GB, a guessed
   resolution copies the wrong file, a hub ref covered by less than class+value reads
@@ -1115,26 +1166,33 @@ via injected callables, staying hot-reload-safe.
   session, a `.part` counted as present, a symlink that would dangle, and a catalog path
   onto `hf-cache/token` ships the HF credential — plus a default catalog without any
   private name);
-  `test_modelsync_routing.py` (the routing gate: until its models are there the Thunder
-  backend is healthy, free and a perfect candidate, and a job routed there comes back as
-  a plausible "value not in list". Pins leaving `ready` AND `allc`, other backends
-  untouched, a force pin not bypassing it, `_entry_can_use` following, the chain's
-  path-relay successor, and the 503 carrying the sync progress or the block reason
-  instead of "no healthy backend");
+  `test_modelsync_routing.py` (the routing gate: until its models are there the managed
+  ComfyUI backend is healthy, free and a perfect candidate, and a job routed there comes
+  back as a plausible "value not in list". Pins leaving `ready` AND `allc`, other
+  backends untouched, a force pin not bypassing it, `_entry_can_use` following, the
+  chain's path-relay successor, the lookup through the backend's `host`, and the 503
+  carrying the sync progress or the block reason instead of "no healthy backend");
   `test_modelsrc_serve.py` (the forced command on the share host, run by subprocess
   against a tmp share: a path escaping the share hands out /etc as model bytes,
   `hf-cache/token` leaks the HF credential, a `;id` that reaches a shell is remote code
   execution, and a `list` that drops the HF cache's snapshot links makes a synced cache
   look complete while every HF loader re-downloads);
-  `test_thunder_ui.py` (the console half: url/host derived from the block and the url
-  `readonly` — a disabled input is not submitted and reads as cleared; two Thunder
-  backends on one local port make the second one probe the FIRST instance — healthy,
-  routed, wrong; a bad commit/GPU/vCPU refused before anything bills; every action a
-  POST, Stop and Forget confirmed; the tab live while an instance runs; the API token and
-  the HF token never rendered; keyed sync rows; "delete unknown" confirming what the
-  TICKED boxes hold; a refused catalog saving nothing; a pin only for the fingerprint the
-  operator saw; the install command giving the share user a real shell; the 24 h banner
-  on card and Dashboard; unowned snapshots listed, never deleted).
+  `test_hosts_ui.py` (the console half: the host form's token
+  never rendered, blank keeping and the box clearing it; its options taken from the
+  provider's OWN `OPTION_FIELDS` — a hand-kept copy offers a GPU the provider refuses at
+  the start — and a refused Save a 400 with the form as typed and nothing stored; a new
+  name colliding with a Hosts-map key or a backend's host (an URL hostname included) —
+  else one box's policies apply to two; Delete only while off and unnamed; every action
+  a POST, Start/Stop/Forget/Delete confirmed; the tab live while an instance runs; the
+  service table's Restart / Re-run setup carrying the BACKEND id (else the wrong service
+  restarts); every managed host in the Hosts panel; the backend form's attachment —
+  `url`/`local_port` derived and stable over Saves, renames and moves, the url
+  `readonly` (a disabled input is not submitted and reads as cleared), everything the
+  host could not run refused up front, a detach dropping the tunnel URL, the old
+  Thunder block gone; keyed sync rows; "delete unknown" confirming what the TICKED boxes
+  hold; a refused catalog saving nothing; a pin only for the fingerprint the operator
+  saw; the install command giving the share user a real shell; the 24 h banner on card
+  and Dashboard; unowned snapshots listed, never deleted).
   Run them all with `python -m unittest discover -s tests -t .` (no runner dependency).
 - **`openai_image_bridge.py`** — pure request/response plumbing for the OpenAI
   image shims (`multipart_list`, `parse_size`, `coerce_scalar`, `images_uploads`
@@ -1170,12 +1228,39 @@ via injected callables, staying hot-reload-safe.
   re-offered. `main.start_scan`/`scan_status` own the ONE task and the settings
   `scan_cidrs`/`scan_ports`; `admin._scan_panel` renders it live (`data-sk="scan"`),
   *Add* opens `_backend_form(prefill=…)`. Manual only, never writes the store.
-- **`thunder.py`** — the PURE half of the **Thunder Compute** backend (a `comfyui` backend
-  with a `thunder` block = a GPU instance rented on demand and reached through an ssh
-  tunnel; spec `docs/superpowers/specs/2026-09-27-thunder-comfyui-design.md`, local only):
-  what goes to and comes back from the Thunder REST API, what a start needs and what it
-  costs. Thunder has NO stop — "off" is snapshot → delete, "on" a new instance whose
-  `template` is the snapshot's name — and IP, ssh port and host key change per instance.
+- **Managed hosts** (spec `docs/superpowers/specs/2026-09-29-managed-hosts-design.md` on
+  top of `2026-09-27-thunder-comfyui-design.md`, both local only; the rulings R-K*/R-W*
+  and the ledger's M1–M5 are cited below). The MACHINE is its own level: a *managed
+  host* (store setting `managed_hosts` = `{name: {provider, options, api_key}}`) carries a
+  **provider** ("Steuerung": Thunder Compute today, RunPod later), and ANY backend attaches
+  to it by naming it as its `host` — a VM can carry several services (one ComfyUI plus
+  vLLM/llama-swap …). Six modules share the work: `thunder.py` (the provider's pure
+  half), `hostapi.py` (its HTTP half + the registry), `services.py` (what runs a backend
+  on the VM, by type), `hostctl.py` (one lifecycle controller per host), `sshrun.py`
+  (argv, tunnel, streams) and `modelsync.py` (which model files a ComfyUI alias needs).
+  It replaced the per-backend `thunder` block (a checkbox fieldset at the bottom of the
+  ComfyUI tab nobody found — and one that could not carry a vLLM next to it); no stored
+  block existed, so there is no migration, and the old `thunder_state` key is never read.
+- **`thunder.py`** — the PURE half of the **Thunder Compute** provider and the shape of
+  the PROVIDER INTERFACE a second provider copies (duck-typed modules like
+  `meshy.py`/`tripo.py`, no ABC): `KIND` (`thunder`, the registry key and the key-file
+  prefix), `NAME` (shown in the Steuerung select, the card and the refusal texts),
+  `SSH_USER` (`ubuntu`), `STOP_MODE` (`snapshot` = stop is snapshot + delete; a RunPod-like
+  `native` stop that keeps the volume is NOT built — `hostctl._stop_run` is the one
+  place it would branch), `DEFAULT_TEMPLATE_NO_COMFY` (`base`), and the host form as
+  DATA: `OPTION_FIELDS` (gpu_type, num_gpus, vcpus, bootstrap_template, reserve_gb,
+  comfy_commit, nodes — key/label/type/choices/default/hint/min) read by
+  `options_of(form) → (options, errors, typed)`, which never raises and returns a VALID
+  value on every key (the field's default where a field is blank, absent or refused —
+  a stored typo would become the gpu_type, a "0" vcpus a 422 after the start began),
+  the refusals, and what was typed for re-rendering the form. Blank is the ONE unset;
+  ints are whole digits ≥ `min` (`1.5`/`-1`/`1e3`/`+2` refused), the commit a full
+  40-hex sha. `bootstrap_template` defaults to `AUTO_TEMPLATE = ""` shown as "auto"
+  (Ruling M5): the controller picks `comfy-ui` when a ComfyUI service is attached at
+  the first start, else `base` — a fixed `comfy-ui` default gave every vLLM-only host
+  the template's ComfyUI and its bundled models. The rest is the API model: Thunder has
+  NO stop — "off" is snapshot → delete, "on" a new instance whose `template` is the
+  snapshot's name — and IP, ssh port and host key change per instance.
   `create_body` int()s what the form stored ("8" would be a 422); `parse_instances`
   takes the map OR the list shape, every field optional, counts arriving as STRINGS, and
   an unknown status reads as "not finished yet" (the values are undocumented — the
@@ -1186,49 +1271,135 @@ via injected callables, staying hot-reload-safe.
   GPU config's rate + vCPUs above the spec's SMALLEST option × `additional_vcpus` + disk
   BEYOND the included 100 GB per GPU (the plan's full-size billing was a defect), None
   without a price — a made-up number is worse than none. Snapshots are named
-  `aihub-<slug>-<YYYYmmdd>t<HHMMSS>z` (fully lowercase: `[a-z0-9-]` is the one rule
-  Thunder could enforce) and `_owned` needs that exact stamp shape, so a hand-made
-  `aihub-x-final` is never ours; `rotation` deletes only OLDER snapshots of this backend
-  (by `createdAt`, not the name) and only once a NEWER READY one exists — the last READY
-  one never, FAILED ones always; `foreign_snapshots` lists `aihub-` snapshots no backend
-  owns with $/month (display only — a renamed backend leaves its snapshots behind).
-- **`sshrun.py`** — system-`ssh` plumbing for Thunder (no asyncssh/paramiko: no new
-  dependency, and OpenSSH already gives a `-L` that dies loudly on
-  `ExitOnForwardFailure`, keepalives and a known_hosts file per instance). Pure argv
-  builders: `ssh_base` (BatchMode — a prompt would hang a subprocess nobody answers —
-  IdentitiesOnly, the caller's known_hosts, keepalives, ConnectTimeout) and
-  `tunnel_argv` (`-N -L 127.0.0.1:<lport>:127.0.0.1:8188`, loopback on BOTH ends); every
-  argv ends `-- <host> [cmd]` (a host starting with `-` is otherwise an OPTION), remote
-  words are the caller's to `q()` (= `shlex.quote`), and nothing secret is ever in argv
+  `aihub-<slug(host name)>-<YYYYmmdd>t<HHMMSS>z` (fully lowercase: `[a-z0-9-]` is the one
+  rule Thunder could enforce) and `_owned` needs that exact stamp shape, so a hand-made
+  `aihub-x-final` is never ours; ownership, `newest_ready` and `rotation` run on the
+  HOST name (R-W4) — `rotation` deletes only OLDER snapshots of this host (by
+  `createdAt`, not the name) and only once a NEWER READY one exists — the last READY one
+  never, FAILED ones always; `foreign_snapshots` lists `aihub-` snapshots no host owns
+  with $/month (display only — a deleted host leaves its snapshots behind, and a
+  snapshot named after a pre-split BACKEND is foreign too). `test_thunder.py`.
+- **`hostapi.py`** — the HTTP half of a provider and the registry.
+  `PROVIDERS = {"thunder": (thunder, ThunderApi)}` + `provider(kind)` (→ tuple or None,
+  a non-string is None) is the ONE place the console (the Steuerung select, the option
+  form) and the controller look a provider up — a second list would let the form offer
+  a provider the controller cannot drive. `ProviderApi` holds every rule a REST client
+  of a billing API gets wrong silently: `httpx.Timeout(30, connect=10)`; ANY 2xx is
+  success (Thunder's create answers 201, its snapshot create 202 — `== 200` calls a
+  paid create a failure); a transport failure is an `Error` NAMED by its type (`str()`
+  of an httpx error can be empty); every error text passes `_redact` (an API that echoes
+  the request, Authorization included, must not put the token into the panel or fault
+  log) and is clipped; `_by_id` tries the UUID first and the index only on a 404
+  (Ruling 11: the docs contradict each other, and a reused index can name a stranger's
+  machine — a 400/422 for the wrong form does NOT fall back); `_cached` fetches a price
+  list once per hour and `cached()` hands a synchronous view the last body. A provider
+  is its class attributes: `API`, `ITEM_PATH` (`/instances/{id}/{suffix}`; the base has
+  none and `_by_id` refuses without one) and `Error` (`thunder.ThunderError`).
+  `test_hostapi.py`.
+- **`services.py`** — the service PROFILES (pure: imports only `sshrun`, returns remote
+  command strings and stdin bytes, `hostctl` runs them), picked by backend TYPE
+  (`profile_for`: `comfyui` → `COMFY`, `openai` → `COMMAND`, anything else None = cannot
+  run on a managed host). ComfyUI: set up by the ComfyUI bootstrap (no per-service
+  script), run by the `~/start-comfy.sh <port>` loop it writes — the loop takes the
+  service's REMOTE port (M4 d), so a ComfyUI on another port than 8188 is started,
+  probed (`/object_info` = 200) and restarted there; default port 8188. Command (vLLM,
+  llama-swap, any OpenAI-compatible server): the backend's `svc_setup` (optional, run
+  once per sha256 — `setup_hash`, CRLF→LF first: a browser textarea's `\r` is a
+  different command), `svc_start` (required) and `svc_health` (default `/v1/models`,
+  regex `^/[A-Za-z0-9._~/?=&-]*$`; 200, 401 or 403 = up — R-W9: a server with its own
+  API key answers 401 and IS up); default port 8000. The gateway writes
+  `~/gw-svc-<slug>.sh` (flock'd `~/gw-svc-<slug>.lock` holding the loop's pid, a
+  `while :` loop running `bash -c "$GW_START"`, fd 9 closed for every child, log
+  `~/gw-svc-<slug>.log`, and its OWN `HF_HOME=~/hf-cache-<slug>` — R-W2: `~/hf-cache`
+  belongs to the model sync, whose unknown/prune lists would otherwise hold LLM weights)
+  and starts it with `setsid nohup`; the setup runs as `bash -s` tee'd to
+  `~/gw-svc-<slug>.setup.log` (like the bootstraps: after a timeout the log end is
+  still readable). **The admin's text is never in a command** (visible to every
+  process on the VM via `ps`, and logged): the setup script goes on stdin, the start
+  command as a quoted heredoc INSIDE the wrapper — whose delimiter is derived so no line
+  of the text equals it — which is itself streamed into `cat >` and renamed into place
+  (the running loop keeps its inode). Stop is by the LOCK: `setsid` made the loop a
+  process-group leader, so `kill -- -<pid>` ends the loop and every child (TERM, ≤ 20 s,
+  KILL), and only a HELD lock is trusted — a pid in a lock nobody holds belongs to a
+  process long gone, or to a stranger by now; restart = stop + fresh loop, so a
+  rewritten wrapper (changed `svc_start`) actually runs. `slug(name)` = `[a-z0-9-]`, ≤ 48
+  chars, unique per host (R-W8). `validate` refuses with FIXED texts only (the admin's
+  text never echoes into an error). `test_services.py` (pure + a real `bash -c` run of
+  the wrapper against a temp HOME).
+- **`sshrun.py`** — system-`ssh` plumbing (no asyncssh/paramiko: no new dependency, and
+  OpenSSH already gives forwards that die loudly on `ExitOnForwardFailure`, keepalives,
+  a known_hosts file per instance and ControlMaster multiplexing). Pure argv builders:
+  `ssh_base` (BatchMode — a prompt would hang a subprocess nobody answers —
+  IdentitiesOnly, the caller's known_hosts, keepalives, ConnectTimeout), `tunnel_argv(key,
+  kh, host, port, forwards, ctl_path)` — ONE ControlMaster per host (`-N -M -S <ctl>
+  -o ControlPersist=no -o ExitOnForwardFailure=yes`, one `-L 127.0.0.1:<l>:127.0.0.1:<r>`
+  per service, loopback on BOTH ends; exact duplicates dropped, one local port to two
+  remote ports refused — it would take every forward down at once; empty = a bare
+  master) — and `control_argv` (`-S <ctl> -O forward|cancel -L …`; `exit`/`stop` refused,
+  they would end every service's tunnel), run by async `control()` → `(rc, reason)`. That
+  is R-W1: a forward added or removed while the host runs never restarts the tunnel under
+  another service's stream. `check_ctl_path` (absolute, no `%`/`$`/`~` — ssh expands all
+  three in `-S`, so the path is passed ONLY via `-S`, never as `ControlPath=` — no
+  control characters, ≤ `CTL_PATH_MAX` = 86 BYTES: sun_path 104/108 minus the 17-byte
+  temp name the master binds first); `prepare_ctl_path` (called only right before a
+  master spawns: parent dir 0700, a STALE socket — connect refused — removed, since a
+  master finding one runs WITHOUT a control socket and every later `-O forward` fails;
+  a socket something listens on, or any non-socket, is left in place with a
+  `ValueError`, and an unjudgeable probe is a named `ValueError` too, M3). Every argv
+  ends `-- <host> [cmd]` (a host starting with `-` is otherwise an OPTION), remote words
+  are the caller's to `q()` (= `shlex.quote`), and nothing secret is ever in argv
   (world-readable in /proc) — the key is a FILE. `safe_rel` is the remote path guard
   (absolute, `..`, dot segments such as `hf-cache/.token`, control characters,
   backslashes): quoting stops the shell, not `cat ../../.ssh/id_ed25519`. `run` is
   one-shot with stdin through a PIPE and answers a timeout with `(124, b"", b"timeout")`
-  — everything read so far is lost, which is why the bootstrap tees its own log on the
+  — everything read so far is lost, which is why every script tees its own log on the
   box. `pipe` (the LAN stream) copies one process's stdout into another's stdin in 1 MiB
   chunks and ends BOTH on an idle timeout, a destination that died, and cancellation —
   a source writing into a pipe nobody reads hangs forever. `Supervisor` keeps the tunnel
   up with a doubling backoff (reset after a stable minute), logs the stderr tail of
-  every exit (a changed host key and a refused port look identical otherwise), and on
-  `stop()` ends AND reaps its ssh: an orphan `ssh -N` keeps the local port bound and the
-  next tunnel exits at once. `running` means "an ssh is alive right now", never
-  "supervision active" and never "port free". Processes end by pid (`_signal`), never
-  `proc.kill()`. `test_sshrun.py`.
-- **`thunderctl.py`** — one `Controller` per Thunder backend: the lifecycle, the tunnel,
-  the model sync. Never imports `main` — everything arrives in `Deps` (store I/O,
-  `set_backend_enabled`, `begin_drain`, the fault log, the ComfyUI probe, runners); main
-  wires it in `_thunder_deps()`/`sync_thunder_controllers()` (called by
-  `rebuild_backends`: a new block gets a controller, an existing one keeps its INSTANCE
-  and gets the new dict, a removed one is retired only when `off`, idle and without a
-  pending snapshot — a running one is kept with a warning). `ThunderApi`: Bearer token, `httpx.Timeout(30,
-  connect=10)`, any 2xx is success (`create` 201, `/snapshots/create` 202), error bodies
-  clipped; the by-id calls (`delete`/`modify`/`ports`) try the UUID first and the index
-  only on a 404 (Ruling 11 — the docs contradict each other; a reused index can name a
-  stranger, a uuid cannot). The state is persisted on EVERY phase change (store setting
-  `thunder_state`, one entry per backend name): an instance bills whether or not the
-  gateway remembers it; a failed save is kept in `persist_error` (card + `view()`), and
-  one right before the create POST ends the start in `off` instead of creating an
-  instance no restart could find. An unreadable record makes the controller `failed(load)` with
+  every exit (a changed host key and a refused port look identical otherwise), keeps
+  `last_spawn_error` (cleared by a good spawn — M3: a tunnel that can never start must
+  not read like a restart), and on `stop()` ends AND reaps its ssh: an orphan `ssh -N`
+  keeps the local port bound and the next tunnel exits at once. `running` means "an ssh
+  is alive right now", never "supervision active" and never "port free". Processes end
+  by pid (`_signal`), never `proc.kill()`. `test_sshrun.py`.
+- **`hostctl.py`** — one `Controller(host, services, deps)` per MANAGED HOST (the file
+  was `thunderctl.py`; history follows the rename): the lifecycle, the tunnel, the
+  services, the model sync. Never imports `main` — everything arrives in `Deps` (store
+  I/O, `set_enabled`, `begin_drain`/`inflight`/`is_draining`, the fault log, the probes
+  `probe_comfy`/`probe_http`, both bootstrap scripts, ssh `run`/`control`/`pipe`/`spawn`,
+  the model-sync callables taking a SERVICE bid). The provider module and API class come
+  from `hostapi.provider(host["provider"])` (unknown → `ValueError`); every provider
+  call goes through `self._prov`/`self._Error`, so a second provider is data, not a fork.
+  **Host vs service** (R-K1): the machine's — phase, instance ids, snapshots (by host
+  name, R-W4), `<kind>.key` + `<kind>-known_hosts/<uuid>`, the control socket, the
+  bootstrap flags, and the faults of creating/snapshotting/deleting it, booked on the
+  pseudo backend `{"name": <host>, "type": "managed-host"}` (the fault log groups by
+  backend+type) — vs one service's: its backend's `enabled`, its drain, its forward, its
+  status in `State.services` (`{bid: {status starting|up|setup failed|down, error,
+  setup_hash}}`), and the faults of setting it up, starting it or syncing its models,
+  booked on its backend (name/type/host/url only — the dict holds admin text).
+  `set_services(list)` hands over the attached backends (main, per rebuild);
+  `_problems()` marks those that cannot run — no profile, bad ports, `validate`, a second
+  ComfyUI, a duplicate local or remote port, a command slug collision — `down` with the
+  cause: no forward, never enabled (enabling a duplicate-port backend would route to
+  ANOTHER service), never started, and attached like a new one once fixed.
+  **Tunnel** (R-W1): the Supervisor's argv carries every current forward; a change while
+  it runs goes through `reconcile_forwards()` → `deps.control(forward|cancel)` (serialised
+  by `_fwd_lock`), never a respawn; a master that died is respawned with all of them. A
+  forward the master refuses (port busy) marks only THAT service `down` with ssh's
+  reason, is kept OUT of a respawned master's argv (ExitOnForwardFailure would take the
+  whole tunnel down) and retried with a doubling backoff (5 s → 300 s); success resets it
+  to `starting` and the tick brings it up (M4 b). The control socket is
+  `<datadir>/<kind>-ctl/<slug>-<sha8>` (the hash keeps names that slug alike apart — a
+  shared path would let one controller delete the other's LIVE socket); when that
+  exceeds 86 bytes, `/tmp/ai-hub-<uid>-ctl/<kind>-<slug>-<sha8>` (Ruling M2; must be a
+  real dir owned by this uid — the unit's `PrivateTmp` makes /tmp private), else the
+  card shows `tunnel_error`. The state is persisted on EVERY phase change (store setting
+  `host_state`, one entry per HOST name): an instance bills whether or not the gateway
+  remembers it; a failed save is kept in `persist_error` (card + `view()`), and one right
+  before the create POST ends the start in `off` instead of creating an instance no
+  restart could find. An unreadable record makes the controller `failed(load)` with
   saving SUPPRESSED and start refused (it may name a billing instance); the log ring and
   the transfer table are not persisted (a stale "40 %" after a restart would lie). The
   rules everything else rests on:
@@ -1243,49 +1414,89 @@ via injected callables, staying hot-reload-safe.
   any odd 2xx body as `[]`, and one bad answer must not make the controller forget (and
   stop deleting) what bills; one that stays is `failed(deleting)`, and only a
   confirmed-gone instance clears the ids and `started_at` (the session cost stops there).
-  **Start** (`start()`): enable the backend (a stop leaves it disabled — no discovery
-  against a dead tunnel port) → newest READY snapshot of ours, else the template + the
-  bootstrap → `choose_disk_gb` (from the manifest copy stored for THAT snapshot id) →
-  create → poll (15 min + 8 min per 100 GB — estimates from the CLI docs) → the port
-  guard `_ensure_ports_closed` (`httpPorts` non-empty → removed and re-checked;
-  `bootstrapping`/`starting` are never entered with one open: Thunder's forwarding has no
-  auth and ComfyUI is code execution) → a fresh known_hosts per uuid → tunnel → the
-  bootstrap (`ops/thunder-bootstrap.sh` via `bash -s`, tee'd to `~/gw-bootstrap.log`,
-  judged by its `GW:` lines BY TAG — any `GW:NODE_FAIL` is `failed(bootstrapping)` even
-  after `GW:DONE`, Ruling 9; an empty node list uploads `ops/thunder-nodes.default.txt`,
-  never an empty file) → `~/start-comfy.sh` (a flock-guarded LOOP: ComfyUI-Manager's
-  reboot exits the process and expects a wrapper) → sync → `ready`. Before the create a
-  failure is `off`, after it `failed(<phase>)` with the instance KEPT for diagnosis. A
-  start is refused while `unreconciled_uuids` (instances seen next to an unreadable
-  record) are still listed — gone only after `_ABSENT_CONFIRM` lists without them, and
-  checked INSIDE the start op, so a stop during the check aborts it instead of answering
-  "done" while the start creates on — *Forget unreconciled* is the operator's reset. A
-  Start without an API token is refused before any call.
+  **Start** (`start()`): refused before any call without a token (`no <NAME> API token
+  set …`), without a service, or with none that can run; the commit is checked only
+  with a ComfyUI service → enable EVERY runnable service (`_enable`; one failing =
+  `_PreCreate`, the ones already enabled are disabled again) → newest READY snapshot of
+  this host, else the template (`bootstrap_template`, "" = auto, M5) → `choose_disk_gb`
+  (from the manifest copy stored for THAT snapshot id) → create → poll (15 min + 8 min
+  per 100 GB) → the port guard `_ensure_ports_closed` (`httpPorts` non-empty → removed
+  and re-checked; `bootstrapping`/`starting` are never entered with one open, and an
+  attach to a running host runs it too: Thunder's forwarding has no auth) → a fresh
+  known_hosts per uuid → tunnel → the bootstrap split (R-W3): the HOST bootstrap
+  (`ops/host-bootstrap.sh`, every host, first start or a snapshot taken before it
+  finished; `~/gw-host-bootstrap.log`, 30 min) and — only with a ComfyUI service — the
+  ComfyUI bootstrap (`ops/thunder-bootstrap.sh`, `~/gw-bootstrap.log`; the node list
+  `~/.gw-nodes.txt` is uploaded BEFORE the host bootstrap so its template-pack report
+  skips our own packs; an empty list uploads `ops/thunder-nodes.default.txt`), both
+  judged by their `GW:` lines BY TAG (`parse_bootstrap`/`bootstrap_verdict`: any
+  `GW:NODE_FAIL` fails even after `GW:DONE`, Ruling 9) → per service: setup if its hash
+  differs, start, probe (command 20 min, ComfyUI 10 min) → sync → `ready`. The host is
+  `ready` once the VM runs and the tunnel stands; a service's setup or start failing is
+  THAT service's `setup failed`/`down` + a fault on its backend, the instance kept and
+  the other services running (M4 g) — the host fails only on what is the machine's
+  (provider, ssh, port guard, host bootstrap). Each script keeps its own done-flag that a
+  snapshot inherits (`host_bootstrapped` / `host_incomplete_snapshots`,
+  `bootstrap_incomplete` / `incomplete_snapshots` — ComfyUI only — and
+  `no_comfy_snapshots` for a disk that never had ComfyUI, so attaching one later
+  bootstraps it without calling the snapshot broken); `_ready()` counts an unfinished
+  host bootstrap as done (finished by hand) and clears the ComfyUI flag only when ComfyUI
+  is `up`; the host bootstrap's `GW:UNKNOWN_MODEL` report drops every path a manifest
+  knows (our synced models are never "unknown"). The command setup hash is tied to the
+  DISK: recorded per snapshot (`setup_snapshots`), restored from the snapshot at create,
+  "" on a template — a hash from another disk would skip a setup that disk needs. Before
+  the create a failure is `off`, after it `failed(<phase>)` with the instance KEPT for
+  diagnosis. A start is refused while `unreconciled_uuids` (instances seen next to an
+  unreadable record) are still listed — gone only after `_ABSENT_CONFIRM` lists without
+  them, checked INSIDE the start op, so a stop during the check aborts it — *Forget
+  unreconciled* is the operator's reset.
+  **Attach/detach while running** (`_reconcile_services`, the 5-s tick): `_attached`
+  (bid → signature: type, remote port, problem, setup hash, wrapper hash, health path;
+  local port apart) is diffed against the current list and ONE op "updating services"
+  runs (abortable by a stop): new → enable, forward, port guard, setup if needed, start,
+  probe; changed → setup if needed + restart; local-port-only → probe; detached → the
+  profile's `stop_cmd` (+ transfers ended for ComfyUI), forward cancelled, and NEVER
+  `set_enabled(False)` (R-K2: `enabled` belongs to the host the backend is on NOW — a
+  backend moved H1 → H2 or to a real URL is not H1's to switch off). A ComfyUI attached
+  to a running host is bootstrapped inside that op (`_ensure_comfy_bootstrap` refuses
+  outside an op or during a stop). Buttons: `restart_service(bid)` (ComfyUI →
+  `restart_comfy`, stop the loop's group + start fresh on its port; command → stop +
+  start, host phase untouched) and `resetup(bid)` (forced setup — ComfyUI: the bootstrap
+  — then restart; the host stays `ready`); both op-guarded.
   **Stop aborts start** (Ruling 13): `stop()` cancels a start/restart in flight and stops
   from the phase it reached — before any bootstrap (`creating|restoring|connecting`) the
   instance holds nothing worth a snapshot and is deleted straight away. Otherwise
-  draining (`begin_drain`, then `inflight == 0 and not draining` — `_finalize_drain`'s
-  disable is exactly what `off` wants) → every transfer cancelled AND awaited
-  (`_cancel_sync_tasks`; else the snapshot freezes growing `.part`s, or an in-flight sync
-  replaces the manifest) → pruning → snapshotting (the name is persisted BEFORE the POST
-  and looked up before creating, so a restart never takes two; a FAILED snapshot of that
-  name is never adopted — a new one is taken) → deleting → `off`. A snapshot taken before
-  the bootstrap finished goes into `incomplete_snapshots`, and a start from it bootstraps
-  again. `watch_snapshots()` settles the pending snapshot: READY → `rotation`; FAILED →
-  fault `lifecycle`/`snapshot_failed` and the previous READY one stays the template — a
-  FAILED snapshot is never what a start restores. `resume()` after a gateway restart
-  reconciles with the list (an interrupted stop runs on, a live instance gets its tunnel
-  back, a vanished one is `off` + `instance_vanished`); foreign instances are shown with
-  $/h and NEVER adopted or deleted. `refresh_account()` re-reads snapshots and foreign
-  instances every 10 min (`_ACCOUNT_S`) and the price list hourly (`ThunderApi._cached`,
-  `_PRICE_TTL_S`), and books fault `lifecycle`/`instance_vanished` (phase untouched —
-  that is the stop path's call) when our uuid is missing from two refreshes in a row; `view()["long_running"]` (> 24 h) drives the card and
-  Dashboard banner.
-  **Model sync** (`sync_once`): the destination index is rebuilt by `find` over both
-  roots on EVERY plan (the manifest `~/.gw-modelsync.json` records where a file CAME
-  from, never that it exists), `modelsync.plan` decides, and `plan`/`ready_aliases` are
-  REBOUND whole there and nowhere else (routing reads them from a worker thread). What
-  only the controller knows joins an alias's `blocked`: a LAN source that is not usable
+  draining (`begin_drain` for EVERY service, then all `inflight == 0` and none still
+  draining; one that cannot drain is `failed(draining)`, instance kept; `waiting_jobs`
+  per bid on the card) → every transfer cancelled AND awaited (`_cancel_sync_tasks`;
+  else the snapshot freezes growing `.part`s, or an in-flight sync replaces the
+  manifest) → pruning (a host without ComfyUI: only unfinished downloads — no plan, whose
+  prune list would be every synced file) → snapshotting (the name is persisted BEFORE the
+  POST and looked up before creating, so a restart never takes two; a FAILED snapshot of
+  that name is never adopted — a new one is taken) → deleting → `off`, which disables
+  the services attached AT THAT MOMENT. A service list handed over during a stop (Ruling
+  M4 a) is kept in `_pending_services` — the drain's list stands, nothing attaches into a
+  stopping host — and applied at `off` BEFORE the disable (so a backend moved away
+  meanwhile is left alone). `watch_snapshots()` settles the pending snapshot: READY →
+  `rotation`; FAILED → fault `lifecycle`/`snapshot_failed` and the previous READY one
+  stays the template. `resume()` after a gateway restart reconciles with the list (an
+  interrupted stop runs on; a live instance gets its tunnel back with every forward,
+  each service probed on its OWN forward and only a non-answering one restarted — a
+  command service whose setup changed meanwhile gets setup + restart; an interrupted
+  setup is `setup failed` naming its log, never run twice; a vanished instance is `off`
+  + `instance_vanished`); foreign instances are shown with $/h and NEVER adopted or
+  deleted. `refresh_account()` re-reads snapshots and foreign instances every 10 min
+  (`_ACCOUNT_S`) and the price list hourly, and books `lifecycle`/`instance_vanished`
+  (phase untouched — that is the stop path's call) when our uuid is missing from two
+  refreshes in a row; `view()["long_running"]` (> 24 h) drives the card and Dashboard
+  banner.
+  **Model sync** (`sync_once`, for the host's ONE ComfyUI service — `_plan_bid`; no
+  ComfyUI service = no plan, `_compute_plan` refuses): the destination index is rebuilt
+  by `find` over both roots on EVERY plan (the manifest `~/.gw-modelsync.json` records
+  where a file CAME from, never that it exists), `modelsync.plan` decides, and
+  `plan`/`ready_aliases` are REBOUND whole there and nowhere else (routing reads them from
+  a worker thread via `is_alias_ready(bid, alias)`/`alias_status(bid, alias)`). What only
+  the controller knows joins an alias's `blocked`: a LAN source that is not usable
   (`waiting for LAN source (…)`), a transfer that gave up after three attempts (fault
   `sync`/`transfer`), a disk that cannot grow within the spec maximum (it grows by
   `modify` otherwise). Ruling 18: an alias still waiting on a LAN file or a failed
@@ -1303,14 +1514,55 @@ via injected callables, staying hot-reload-safe.
   carrying the fingerprint `scan()` showed; `modelsrc_host` held to `_VOICE_HOST_RE`
   before any argv; a pin for a PREVIOUS host names itself instead of failing as
   "unreachable"; listing cached 10 min, re-read at every start and on Sync now) streams
-  exactly ONE file per backend through the gateway (`pipe`: the share's `cat <rel>
+  exactly ONE file per host through the gateway (`pipe`: the share's `cat <rel>
   <offset>` into `flock -n … cat >> <rel>.part` — a second appender exits 75), resumed
   from the `.part`'s size, sha256 on both sides; the HF cache's snapshot symlinks are
   recreated. Triggers: the start path, a 5-s alias-signature poll in `run_forever`, a
   changed LAN source, a re-plan when a transfer ends and every 60 s while one runs. A
   sync re-checks the phase after planning: a plan about an instance on its way out
   never grows its disk or replaces the manifest the snapshot records.
-  `test_thunder_controller.py`.
+  **main's half**: `host_controllers` (host name → Controller); `sync_host_controllers()`
+  runs inside `rebuild_backends` BEFORE host grouping and the route index (it writes the
+  derived URL onto the dicts the adapters are built from): a controller per
+  `managed_hosts` entry (an existing one keeps its INSTANCE and gets the new entry and
+  service list; one whose entry is gone is retired only when `off`, idle and without a
+  pending snapshot — kept with a warning otherwise; an unknown provider or a
+  constructor that raises is booked in `_host_errors` — token redacted — and shown
+  "not driven", never aborting the rebuild; a provider change is never applied).
+  Attached = STORE backends with `host == name`; a `config.yaml` backend naming a
+  managed host is NOT attached (R-K3: its store copy would override the config
+  wholesale) — warned once and listed `not_attachable` on the card. `_attach_fields`
+  sets `remote_port` (profile default when unset), `local_port` and `url =
+  http://127.0.0.1:<local_port>` on the live dict and the store row (only on change).
+  `assign_local_port(name, type, prev=None)`: the row's port while valid and not held,
+  else the lowest free one of 18100–18999; held = every other backend's port plus the
+  ports other controllers still forward for backends that no longer exist; a port a
+  controller forwards for THIS backend wins over a row that merely claims it (the
+  claimant moves), and `prev` (a console rename's old identity) keeps the port across the
+  rename — a port that moves takes the URL from under running jobs. Lookups all go
+  backend → `host` → controller → service (R-W7, `_host_ctl`, only if `has_service`):
+  `modelsync_gate`, `_gated_only_aliases`, `_chain_successor_on`, `host_view`.
+  `host_action(name, start|stop|restart_service <bid>|resetup <bid>|forget_unreconciled|
+  sync|delete_unknown <paths>)` always answers text ("not driven: …" for a host without a
+  controller). `managed_host_refusal(name, entry, new)`: name `[a-z0-9-]` 1–40, not
+  starting/ending with `-`; a NEW name collides with nothing (R-W6) — no managed host or
+  retained controller, no key of the `hosts` map, no backend's `backend_host()` (a URL
+  hostname without a dot counts: `http://k12:8188` is host `k12`) — or two boxes would
+  share one host policy; the provider known and never changed; `options_of` clean.
+  `save_managed_host` stores the NORMALIZED options; the token is written by
+  `store.set_managed_host` with `encrypt_secret` and read by `get_managed_hosts` with
+  `decrypt_secret` (R-W10: `set_settings` only encrypts STRING values, so a dict holding
+  a token would sit in plaintext, and every raw `get_settings()` reader would see it);
+  views, summaries and `/health` carry `api_key_set` only. `delete_managed_host` (and
+  `managed_host_delete_refusal`, which the card asks) refuses unless the host is `off`,
+  no op, no pending snapshot, **no backend names it** (it would point at a dead forward
+  and keep the name taken via R-W6), and — without a controller — the stored record is
+  readable and says `off` without uuid/index/pending snapshot (an undriven host may still
+  name a billing instance); deleting also drops its `host_state` record and its Hosts-map
+  entry. There is no rename (R-W5: the name IS the identity of state, snapshots and
+  socket). `/health` (full view only) carries `hosts_managed: {name: {provider, phase,
+  uptime_s, cost_per_h, services: {bid: status}[, error]}}`. `test_hostctl.py`,
+  `test_managed_hosts.py`.
 - **`modelsync.py`** — the PURE half of the model sync: which files an alias candidate
   needs and where they are in the source. `effective_workflow` applies THAT
   candidate's `fixed` pins and drops its `bypass` nodes (the adapter's two per-backend
@@ -1348,45 +1600,92 @@ via injected callables, staying hot-reload-safe.
   (`resolve_link`): a link is kept only when its target stays in its root and is a file
   the same alias syncs — one that would dangle is dropped, never "present".
   `status_text` is the 503 wording. `test_modelsync.py`.
-- **`ops/`** (not Python — runs on other boxes): `thunder-bootstrap.sh` (streamed to the
-  instance; everything inside `main()` called on the LAST line, because bash reads a
-  piped script as it runs and a child reading stdin would swallow the rest; adaptive —
-  reuses the template's ComfyUI pinned to the commit, keeps a venv only if it matches the
-  k12-gpu build (Python 3.13, torch 2.11.0+cu130); `GW:` protocol lines; ComfyUI on
-  `127.0.0.1` only — the script never even contains the any-address, a test pins it), `thunder-nodes.default.txt`
-  (`<git-url>@<commit>` / `registry:<id>@<version>`, derived from the k12-gpu workflows),
-  and `modelsrc-serve.sh` — the SSH forced command on the model-share host and the WHOLE
-  security boundary of the gateway's LAN key: it parses `SSH_ORIGINAL_COMMAND` in the
-  `shlex.quote` grammar WITHOUT a shell, allows `list` (`F\t<rel>\t<size>` /
-  `L\t<rel>\t<target>` for in-tree links to listed files), `cat <rel> <offset>` and
-  `sha256 <rel>`, refuses (exit 2) absolute paths, `..`, dot segments, `*.log`, anything
-  in the HF cache but `hf-cache/hub/…`, and any path whose `realpath -e` is not itself;
-  cat/sha256 then read ONLY from fd 3, re-verified via `/proc/self/fd/3` (no swap after
-  the check can redirect the read); L lines never cross `models/`↔`hf-cache/`;
-  exit 1 = "list incomplete" (discard the listing) or a symlinked `hf-cache/`. Its user needs a REAL login shell
+- **`ops/`** (not Python — runs on other boxes). Both bootstraps are streamed to the
+  instance and keep everything inside `main()` called on the LAST line (bash reads a
+  piped script as it runs and a child reading stdin would swallow the rest; `main` also
+  gets `</dev/null`), speak the `GW:` protocol, and never even contain the any-address
+  (a test pins it). The split is R-W3: `host-bootstrap.sh` runs on the first start of
+  EVERY host whatever is attached — the template's own autostart off (Thunder's
+  `comfy-ui` template starts a ComfyUI on every interface, on a vLLM-only host just as
+  much: the moved pkill + `disable_rc_autostart`), the models and node packs the
+  template brought reported (`GW:UNKNOWN_MODEL`, `GW:TEMPLATE_NODE`, the latter filtered
+  by `~/.gw-nodes.txt` when present), `flock` (via `sudo -n apt-get` only when missing)
+  and `uv` (`~/.local/bin/uv`) installed; no service is installed there.
+  `thunder-bootstrap.sh` is the ComfyUI part only, run when a ComfyUI service is
+  attached: a `stop` phase first (`stop_comfy_processes`: our loop and every `main.py`
+  whose cwd is the checkout — a re-run never checks out under a running ComfyUI), then
+  adaptive — reuses the template's ComfyUI pinned to the commit, keeps a venv only if it
+  matches the k12-gpu build (Python 3.13, torch 2.11.0+cu130; `make_venv` refuses without
+  the host bootstrap's uv), node packs, ComfyUI-Manager, the smoke test — and writes
+  `~/start-comfy.sh <port>` (digits only, default 8188; lock opened `9>>` so a second
+  start never truncates it, recording `"<pid> <port>"` for the group stop; ComfyUI on
+  `127.0.0.1` with `HF_HOME=~/hf-cache`). `parse_node_line` exists in both scripts
+  byte-identically (a streamed script cannot source a shared file; a test pins them
+  equal). `thunder-nodes.default.txt` (`<git-url>@<commit>` /
+  `registry:<id>@<version>`, derived from the k12-gpu workflows), and `modelsrc-serve.sh`
+  — the SSH forced command on the model-share host and the WHOLE security boundary of
+  the gateway's LAN key: it parses `SSH_ORIGINAL_COMMAND` in the `shlex.quote` grammar
+  WITHOUT a shell, allows `list` (`F\t<rel>\t<size>` / `L\t<rel>\t<target>` for in-tree
+  links to listed files), `cat <rel> <offset>` and `sha256 <rel>`, refuses (exit 2)
+  absolute paths, `..`, dot segments, `*.log`, anything in the HF cache but
+  `hf-cache/hub/…`, and any path whose `realpath -e` is not itself; cat/sha256 then read
+  ONLY from fd 3, re-verified via `/proc/self/fd/3` (no swap after the check can redirect
+  the read); L lines never cross `models/`↔`hf-cache/`; exit 1 = "list incomplete"
+  (discard the listing) or a symlinked `hf-cache/`. Its user needs a REAL login shell
   (`/bin/bash`: sshd runs the forced command through it, `nologin` runs nothing) and
   `hf-cache/` must be a real directory in the share. `test_modelsrc_serve.py`,
   `test_thunder_scripts.py`.
-  Console side (`admin.py`): the ComfyUI pane's "Thunder Compute (optional)" fieldset
-  (`_thunder_fieldset`; `backend_save` reads all nine `thunder_*` fields, DERIVES `url`
-  = `http://127.0.0.1:<local_port>` and `host` = `thunder-<name>` — a host from
-  127.0.0.1 would group every Thunder backend with the gateway box — renders the url
-  `readonly`, never `disabled`, refuses a missing GPU/vCPU, a commit that is no full sha
-  and a local port another Thunder backend holds); `_thunder_panel` (`data-sk="thunder"`
-  above the backend list: a keyed card per backend with phase, costs, snapshot, sync
-  tables, transfers, held/prune/unknown, log; the LAN card with public key, install
-  command and the Fetch → Confirm pin; the catalog editor + HF token, `hf_token` being
-  in `store._SECRET_SETTINGS`); every action a POST in `_POST_ACTIONS`
-  (`/ui/thunder/{start,stop,restart,forget,sync,delete-unknown,catalog,hf-token,
-  modelsrc-scan,modelsrc-pin,modelsrc-host}`), Stop/Forget/delete with `data-confirm`;
-  the Backends tab is live while a phase ≠ `off` or an op runs; `_FAULT_SOURCE` knows
-  `lifecycle` and `sync`. `/health` (full view) carries `thunder: {phase, uptime_s,
-  cost_per_h}` — never the token. The six key files (`thunder.key`, `thunder.key.pub`,
-  `thunder-known_hosts/`, `modelsrc.key`, `modelsrc.key.pub`, `modelsrc-known_hosts`,
-  next to `store.db`) are in `.gitignore` AND in both `deploy.sh` exclude lists
-  (`RSYNC_EXCLUDES`/`TAR_EXCLUDES`) — without the latter `rsync --delete` wipes the
-  instance key and the LAN pin on every deploy (pinned by
-  `test_thunder_controller.MainWiring.test_deploy_and_gitignore_exclude_keys`).
+  Console side (`admin.py`, routes under `/ui/hosts/managed/*` — Ruling M1: the concept
+  in the URL, no provider name; the host travels as field/query `host`, a service as
+  `bid`): the Backends tab's **Managed hosts** section (`_managed_hosts_section`,
+  `data-sk="mhosts"`, below the backend list) with "+ Managed host" → the host form
+  (`_managed_host_form`, `?mhost_new=1` / `?mhost=<name>`: name + **Steuerung** select
+  from `hostapi.PROVIDERS`, then the provider's OWN `OPTION_FIELDS` as `opt__<key>` — a
+  hand-kept copy drifts, which is exactly how the old `_THUNDER_*` constants had to be
+  pinned by a test; a new Thunder host's nodes pre-filled from the default list; an
+  existing host has no name field and a fixed provider; the token a password field
+  never rendered, blank keeps, `api_key_clear` clears); `managed_host_save` hands the
+  typed options to `main.save_managed_host` and answers a refusal with 400 + the form
+  as typed (never the token). One keyed card per host (`_host_card`, `data-k=
+  "host-<name>"`: provider + phase badges, the 24 h banner, errors, `tunnel_error`,
+  per-service drain lines, GPU/vCPU from `options`, costs, snapshot, bootstrap notes,
+  unreconciled uuids, orphans, template models/nodes, the **service table**
+  `_svc_table` — backend, type, `VM :<remote> → local :<local>`, status, error, and
+  Restart / Re-run setup carrying the BACKEND id, rendered only while the host runs
+  with no op, mirroring the controller's refusals — `not_attachable` lines, the model
+  sync, the log ring), Start hidden for an undriven host, Delete only when
+  `managed_host_delete_refusal` is None (else a hint naming why); then the orphaned
+  snapshots, the LAN card (public key, install command, the Fetch → Confirm pin) and the
+  catalog editor + HF token (`hf_token` in `store._SECRET_SETTINGS`). `_hosts_panel`
+  lists EVERY managed host (also one without ComfyUI or without any backend), and
+  `_dash_hosts` puts the long-run banner on the Dashboard. The backend form attaches: a
+  `host_managed` select ("(none / free text)" + every store managed host) beside the
+  free-text `host` input — ONE `host` stored; its inline `_MHOST_JS` shows the
+  `data-mhost` fieldset (`_managed_fieldset`, rendered for EVERY backend, only `display`
+  switched: `remote_port` pre-filled with the profile default, and for `openai` the
+  `svc_setup`/`svc_start`/`svc_health` fields with the "no tokens here — plain text; the
+  HF token belongs in the HF-token setting" and the "stdin-reading commands swallow the
+  script" hints) and makes `url` readonly (never disabled). `backend_save` starts from the
+  old row, drops any legacy `thunder` key and, with a managed host, refuses (400, form as
+  typed) an unknown host, a type without a profile, a config-defined identity (R-K3), a
+  remote port missing/out of range/taken on that host, a second ComfyUI, a slug
+  collision (R-W8) and whatever `profile.validate` refuses, then assigns `local_port`
+  via `assign_local_port` and derives `url`; ComfyUI dirs default to
+  `/home/ubuntu/ComfyUI/output|input`. Detached: `remote_port`/`local_port` dropped, and
+  a url equal to the old derived one counts as blank → 400 (a backend left on a
+  127.0.0.1 port nothing forwards looks healthy-ish and is dead); `svc_*` stay on an
+  `openai` row (a detach does not throw away a script). Every action is a POST in
+  `_POST_ACTIONS` (`save, delete, start, stop, forget, restart-service, resetup, sync,
+  delete-unknown, catalog, hf-token, modelsrc-scan, modelsrc-pin, modelsrc-host`),
+  Start/Stop/Forget/Delete with `data-confirm`; the Backends tab is live (3 s) while a
+  host phase ≠ `off` or an op runs, static for the forms and refusals; `_FAULT_SOURCE`
+  labels `lifecycle` "host lifecycle" and `sync` "model sync". The key files
+  (`<kind>.key`, `<kind>.key.pub`, `<kind>-known_hosts/`, the control sockets in
+  `<kind>-ctl/` — today `thunder*` — plus `modelsrc.key`, `modelsrc.key.pub`,
+  `modelsrc-known_hosts`, next to `store.db`) are in `.gitignore` AND in both `deploy.sh`
+  exclude lists (`RSYNC_EXCLUDES`/`TAR_EXCLUDES`) — without the latter `rsync --delete`
+  wipes the instance key and the LAN pin on every deploy, and would pull a live socket
+  (pinned by `test_hostctl.MainWiring.test_deploy_and_gitignore_exclude_keys`).
 
 ### Request flow
 
@@ -1613,9 +1912,10 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   LoRA-backend rather than spilling); a LoRA on no backend is ignored (the normal
   ordering wins); an explicit `backend` force is never overridden. Per-backend LoRA sets
   come from discovery (`backend_loras`).
-- **Model-sync gate** (Thunder): `main.modelsync_gate(backend, alias)` inside
-  `_gen_routes` — a `comfyui` backend with a Thunder controller whose
-  `is_alias_ready(alias)` is False (before the first plan, outside `syncing|ready`, a
+- **Model-sync gate** (managed hosts): `main.modelsync_gate(backend, alias)` inside
+  `_gen_routes` — a `comfyui` backend attached to a managed host (backend → `host` →
+  controller → service, R-W7; by backend NAME the lookup finds nothing) whose
+  `is_alias_ready(bid, alias)` is False (before the first plan, outside `syncing|ready`, a
   file missing, a block) leaves `ready` AND `allc`: an alias with other candidates runs
   there, one without gets `_gen_pick`'s 503 carrying the gate texts (`models for
   <alias> are syncing on <backend> (12.3 of 31.0 GB)` / `… blocked on <backend>:
@@ -1623,8 +1923,9 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   designation, a force pin and `_entry_can_use` inherit it through `_gen_routes`; the
   chain's path-relay successor, read from the store, is judged by
   `_chain_successor_on`. In-memory only (`is_alias_ready`/`alias_status` do no I/O) —
-  it runs per waiter × backend in a worker thread. While gated, a Thunder-only alias's
-  schema, image slots and LoRAs read empty (`thunder_view`'s `gated_only` says so on the
+  it runs per waiter × backend in a worker thread. While gated, an alias that runs only
+  on managed hosts (`_gated_only_aliases`) reads its schema, image slots and LoRAs empty
+  (`host_view`'s `gated_only` says so on the
   card); a job already PARKED when its alias becomes gated still fails with the generic
   text. `test_modelsync_routing.py`.
 - **Execution-fault quarantine** (`scheduler.exec_fault_*`, state `main.gen_exec_faults`
@@ -1726,7 +2027,9 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   matter on SHARED boxes, the VRAM policy on all; `docs/host-coordination-plan.md`):
   backends group by physical box (`backend_host`: explicit `host` field, else URL
   IP → `backend_hosts`/`host_backends`, shown in `/health` and the Backends tab's
-  Hosts panel). Per-host policies (store settings `hosts`, cached `hosts_meta`):
+  Hosts panel). A backend attached to a managed host carries the host's NAME as `host`,
+  so all services of one VM group under it — never under the `127.0.0.1` of their
+  tunnel URLs, which would lump every rented VM together with the gateway box. Per-host policies (store settings `hosts`, cached `hosts_meta`):
   chat candidates on a host with a RUNNING media job sort LAST in `resolve_routes`
   (never dropped; flag `avoid_llm_during_media`, default on);
   opt-in `llm_unload_before_media` GETs llama-swap `/unload` first.
@@ -1913,9 +2216,10 @@ a bridge stopped on it and closed the source; the Responses bridge fails on any 
   be given a Tripo backend or vice versa (`cand_kind` == `backend_kind`).
 - Single instance only; verify with compile + a route/render check; restart the
   one instance when the user says idle. Never commit `config.yaml`, `store.db`
-  (+ `secret.key`), `stats.db*`, `jobs.db*`, `jobs/`, `voiceref/`, `*.key`, the Thunder
-  files `thunder.key*`, `thunder-known_hosts/`, `modelsrc.key*`, `modelsrc-known_hosts`
-  (gitignored; excluded by both `deploy.sh` lists — see `thunderctl.py` above).
+  (+ `secret.key`), `stats.db*`, `jobs.db*`, `jobs/`, `voiceref/`, `*.key`, the managed-host
+  files `thunder.key*`, `thunder-known_hosts/`, `thunder-ctl/`, `modelsrc.key*`,
+  `modelsrc-known_hosts` (gitignored; excluded by both `deploy.sh` lists — see the
+  console-side paragraph under `ops/` above).
 - Voice cloning (`/v1/audio/speech`): TTS backends read `voice` strictly as a
   file on THEIR host (no base64/URL/upload API — measured). The voice library
   (`voiceref/` blobs + store `voice_library`, UI in the Voice sub-tab) therefore
