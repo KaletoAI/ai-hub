@@ -1345,7 +1345,7 @@ class Controller:
         hash keeps two backends whose names slug alike ("GPU 1", "gpu-1") apart — a
         shared path would have one master clear the other's LIVE socket as stale — and
         the slug is cut so the path stays within a Unix socket's length limit."""
-        slug = thunder._slug(self.name)[:24]
+        slug = thunder.slug(self.name)[:24]
         h = hashlib.sha256(self.name.encode("utf-8")).hexdigest()[:8]
         return os.path.join(self.deps.datadir, "thunder-ctl", f"{slug}-{h}")
 

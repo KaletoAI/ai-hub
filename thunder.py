@@ -180,7 +180,8 @@ def _int(v) -> Optional[int]:
             return None
 
 
-def _slug(s) -> str:
+def slug(s) -> str:
+    """A name as a lowercase `[a-z0-9-]` token (snapshot prefix, control socket name)."""
     return re.sub(r"[^a-z0-9]+", "-", str(s).lower()).strip("-") or "backend"
 
 
@@ -281,7 +282,7 @@ SNAPSHOT_FAMILY = "aihub-"            # every snapshot this gateway writes start
 
 
 def snapshot_prefix(backend_name: str) -> str:
-    return f"{SNAPSHOT_FAMILY}{_slug(backend_name)}-"
+    return f"{SNAPSHOT_FAMILY}{slug(backend_name)}-"
 
 
 def snapshot_name(backend_name: str, now: float) -> str:

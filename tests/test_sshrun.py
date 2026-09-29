@@ -3,6 +3,7 @@ run: venv/bin/python -m unittest tests.test_sshrun -v"""
 import asyncio
 import gc
 import os
+import socket
 import tempfile
 import unittest
 
@@ -125,7 +126,9 @@ class ControlMaster(unittest.TestCase):
 
     def test_ctl_path_shape(self):
         # ssh percent- and tilde-expands -S too; "none" disables multiplexing
-        for bad in ("", "rel/x", "~/x", "/d/%h", "none", "/d/a\nb", "/d/\x7f"):
+        # ssh also expands ${VAR} there, and IGNORES the setting on an undefined one
+        for bad in ("", "rel/x", "~/x", "/d/%h", "/d/${HOME}", "/d/$X", "none",
+                    "/d/a\nb", "/d/\x7f"):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 sshrun.check_ctl_path(bad)
         self.assertEqual(sshrun.check_ctl_path("/d/x y"), "/d/x y")
@@ -167,13 +170,12 @@ class Control(unittest.IsolatedAsyncioTestCase):
 
 class PrepareCtl(unittest.TestCase):
     def test_creates_0700_dir_and_clears_stale_socket(self):
-        import socket
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "ctl", "h")
             self.assertEqual(sshrun.prepare_ctl_path(p), p)
             self.assertEqual(os.stat(os.path.dirname(p)).st_mode & 0o777, 0o700)
-            # a socket left by a SIGKILLed master: ssh would say "already exists,
-            # disabling multiplexing" and run on WITHOUT a control socket
+            # a socket left by a SIGKILLed master (bound, nobody listening): ssh would
+            # say "already exists, disabling multiplexing" and run on WITHOUT one
             s = socket.socket(socket.AF_UNIX)
             s.bind(p)
             s.close()
@@ -181,6 +183,23 @@ class PrepareCtl(unittest.TestCase):
             sshrun.prepare_ctl_path(p)
             self.assertFalse(os.path.exists(p))
             self.assertEqual(os.stat(os.path.dirname(p)).st_mode & 0o777, 0o700)
+
+    def test_keeps_a_socket_a_master_listens_on(self):
+        # "stale" is measured, not assumed: a live master's socket is never removed
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "ctl", "h")
+            sshrun.prepare_ctl_path(p)
+            srv = socket.socket(socket.AF_UNIX)
+            try:
+                srv.bind(p)
+                srv.listen(1)
+                with self.assertRaisesRegex(ValueError, "in use"):
+                    sshrun.prepare_ctl_path(p)
+                self.assertTrue(os.path.exists(p))
+            finally:
+                srv.close()
+            sshrun.prepare_ctl_path(p)          # closed now → stale → removed
+            self.assertFalse(os.path.exists(p))
 
     def test_refuses_a_non_socket_in_the_way(self):
         with tempfile.TemporaryDirectory() as d:

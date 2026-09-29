@@ -41,6 +41,7 @@ import asyncio
 import os
 import shlex
 import signal
+import socket
 import stat
 import time
 from typing import Callable, Optional
@@ -81,15 +82,20 @@ _CONTROL_OPS = ("forward", "cancel")
 
 def check_ctl_path(ctl_path: str) -> str:
     """The ControlMaster socket path, returned unchanged; `ValueError` otherwise. ssh
-    tilde- and %-expands `-S` just like `ControlPath`, and `none` switches
-    multiplexing OFF — so only an absolute path without `%` and control characters,
-    within `CTL_PATH_MAX` BYTES (a non-ASCII name is longer than it looks)."""
+    expands `-S` just like `ControlPath`: `~`, `%` tokens AND environment variables
+    (`${VAR}`) — and an UNDEFINED variable makes it ignore the setting, so the master
+    runs without a control socket and every later `-O forward` fails. `none` switches
+    multiplexing OFF. So: only an absolute path without `%`, `$` and control
+    characters, within `CTL_PATH_MAX` BYTES (a non-ASCII name is longer than it
+    looks)."""
     if not isinstance(ctl_path, str) or not ctl_path:
         raise ValueError("empty control socket path")
     if not ctl_path.startswith("/"):
         raise ValueError(f"control socket path must be absolute: {ctl_path!r}")
-    if "%" in ctl_path:
-        raise ValueError(f"'%' in control socket path (ssh expands it): {ctl_path!r}")
+    for ch in ("%", "$"):
+        if ch in ctl_path:
+            raise ValueError(f"{ch!r} in control socket path (ssh expands it): "
+                             f"{ctl_path!r}")
     if any(ord(c) < 32 or ord(c) == 127 for c in ctl_path):
         raise ValueError(f"control character in control socket path: {ctl_path!r}")
     n = len(ctl_path.encode("utf-8"))
@@ -125,7 +131,8 @@ def tunnel_argv(key: str, known_hosts: str, host: str, port: int,
     port an exit (→ restart, logged) instead of a connected-looking tunnel that
     forwards nothing — which is also why one local port for two targets is refused
     here rather than left to take down every forward at once. Exact duplicates are
-    dropped (a second identical `-L` would fail as "port in use")."""
+    dropped so the argv says what the tunnel carries (OpenSSH itself drops an identical
+    second `-L` silently)."""
     check_ctl_path(ctl_path)
     specs: list[str] = []
     seen: dict[int, int] = {}
@@ -160,12 +167,12 @@ def control_argv(ctl_path: str, host: str, op: str, lport: int, rport: int) -> l
 
 def prepare_ctl_path(ctl_path: str) -> str:
     """Make the socket's directory (0700 — the socket grants the master's session to
-    whoever can connect to it) and remove a STALE socket left there. Called right
-    before a master spawns, when no master of ours is alive: one that was SIGKILLed
-    leaves its socket behind, and the next master then logs "ControlSocket … already
-    exists, disabling multiplexing" and runs WITHOUT one — the tunnel looks fine and
-    every later `-O forward` fails. Something that is not a socket is refused, never
-    deleted. → the path."""
+    whoever can connect to it) and remove a STALE socket left there: one a SIGKILLed
+    master left behind makes the next master log "ControlSocket … already exists,
+    disabling multiplexing" and run WITHOUT one — the tunnel looks fine and every later
+    `-O forward` fails. Stale is MEASURED, not assumed: a socket something still
+    listens on (a master of ours, or another backend's on the same path) is refused
+    with `ValueError` and left alone, as is anything that is not a socket. → the path."""
     check_ctl_path(ctl_path)
     d = os.path.dirname(ctl_path)
     os.makedirs(d, mode=0o700, exist_ok=True)
@@ -176,7 +183,20 @@ def prepare_ctl_path(ctl_path: str) -> str:
         return ctl_path
     if not stat.S_ISSOCK(st.st_mode):
         raise ValueError(f"not a control socket, left in place: {ctl_path!r}")
-    os.remove(ctl_path)
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.settimeout(2)
+        probe.connect(ctl_path)
+    except (ConnectionRefusedError, FileNotFoundError):
+        pass                            # nobody listens: stale
+    else:
+        raise ValueError(f"control socket in use, left in place: {ctl_path!r}")
+    finally:
+        probe.close()
+    try:
+        os.remove(ctl_path)
+    except FileNotFoundError:
+        pass                            # gone between the probe and here: fine
     return ctl_path
 
 
