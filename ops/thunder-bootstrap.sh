@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# One-time setup of a Thunder Compute GPU VM (Ubuntu container, user `ubuntu`) as an
-# AI-Hub ComfyUI backend. The gateway streams this file over SSH and reads its output:
+# The ComfyUI part of a managed host's setup (Thunder Compute GPU VM, Ubuntu container,
+# user `ubuntu`): runs only when a ComfyUI service is attached — at the host's first
+# start right AFTER ops/host-bootstrap.sh (which stops the template's own ComfyUI
+# autostart, reports the models and node packs the template brought, and provides
+# `flock` and ~/.local/bin/uv), or later when a ComfyUI service is attached to a running
+# host. The gateway streams this file over SSH and reads its output:
 #
 #   ssh … -- ubuntu@<ip> bash -s -- <comfy_commit> [<nodes_file>]   (script on stdin)
 #
@@ -9,12 +13,7 @@
 # Lines starting with `GW:` are the machine-readable part of the output:
 #
 #   GW:PHASE <name>                   entering a phase (the log is shown in the panel)
-#   GW:TEMPLATE_NODE <dir>            a custom_nodes/ pack the template brought (not in
-#                                     the node list; reported, never deleted)
 #   GW:NODE_FAIL <name> <reason>      one node pack failed; the bootstrap goes on
-#   GW:UNKNOWN_MODEL <rel>\t<bytes>   a model the TEMPLATE brought (not in any manifest —
-#                                     delete it before the first snapshot or pay for it
-#                                     in every snapshot)
 #   GW:SMOKE ok | GW:SMOKE fail <a,b> CUDA matmul + the 3D extensions' imports
 #   GW:DONE                           finished; ~/start-comfy.sh is ready to run
 #
@@ -22,8 +21,8 @@
 # diagnosis), anything else = a step that cannot be skipped failed (see the last
 # GW:PHASE and the "bootstrap: failed in phase" line).
 #
-# Adaptive, because what Thunder's `comfy-ui` template ships (ComfyUI version, venv,
-# autostart) is only visible on the instance: an existing ComfyUI is reused and pinned
+# Adaptive, because what Thunder's `comfy-ui` template ships (ComfyUI version, venv)
+# is only visible on the instance: an existing ComfyUI is reused and pinned
 # to <comfy_commit>, an existing venv is kept only if it matches the k12-gpu build the
 # extension wheels are compiled for (Python 3.13, torch 2.11.0+cu130) — otherwise a new
 # one is built. Re-running on the same VM is safe (every step checks what is there).
@@ -56,6 +55,7 @@ node_fail() {
 
 # parse_node_line <line> → sets NODE_KIND (git|registry), NODE_NAME, NODE_SRC, NODE_REV.
 # Returns 0 for a node, 1 for a blank/comment line, 2 for a line that is neither form.
+# (ops/host-bootstrap.sh carries a byte-identical copy for its template-node report.)
 #   <https-url>@<commit>       NODE_NAME = repo name without .git
 #   registry:<id>@<version>    NODE_NAME = <id>
 # NODE_NAME becomes a directory under custom_nodes/, so it is held to plain characters
@@ -127,12 +127,13 @@ make_venv() {  # make_venv <dir>: Python $PY_VER venv with pip in it
   if py=$(command -v "python$PY_VER") && "$py" -m venv "$dir"; then
     return 0
   fi
-  # no system python$PY_VER (or no ensurepip for it): uv fetches a standalone build
-  # into ~/.local/share/uv — inside $HOME, so it is part of every snapshot
+  # no system python$PY_VER (or no ensurepip for it): uv (installed by the host
+  # bootstrap) fetches a standalone build into ~/.local/share/uv — inside $HOME, so it
+  # is part of every snapshot
   rm -rf "$dir"
   if [ ! -x "$HOME/.local/bin/uv" ]; then
-    curl -LsSf https://astral.sh/uv/install.sh \
-      | env UV_INSTALL_DIR="$HOME/.local/bin" UV_NO_MODIFY_PATH=1 sh || return 1
+    echo "no ~/.local/bin/uv (ops/host-bootstrap.sh installs it — did it run?)" >&2
+    return 1
   fi
   "$HOME/.local/bin/uv" venv --quiet --seed --python "$PY_VER" "$dir" || return 1
 }
@@ -293,38 +294,6 @@ run_install_scripts() {
   done
 }
 
-# disable_rc_autostart <rcfile>: comment out the template's `start-comfyui` hook.
-# Only when an ACTIVE line is left, so a re-run neither rewrites the file nor
-# overwrites the first backup (the one holding the original) with an edited copy.
-disable_rc_autostart() {
-  local rc=$1
-  if [ -f "$rc" ] && grep -q '^[^#]*start-comfyui' "$rc"; then
-    sed -i.gw-bak '/start-comfyui/{/^[[:space:]]*#/!s/^/# gw-disabled: /}' "$rc"
-    echo "disabled the template autostart in $rc (backup ${rc}.gw-bak)"
-  fi
-}
-
-# report_template_nodes <custom_nodes dir> <nodes file>: every pack dir the node list
-# does not name came with the template — `GW:TEMPLATE_NODE <dir>`. Reported, never
-# deleted; the likely case is the template's own ComfyUI-Manager under another
-# spelling, i.e. two Managers once ours is installed.
-report_template_nodes() {
-  local cn=$1 list=$2 line rc d
-  local -A listed=()
-  while IFS= read -r line || [ -n "$line" ]; do
-    rc=0
-    parse_node_line "$line" || rc=$?
-    if [ "$rc" -eq 0 ]; then listed[$NODE_NAME]=1; fi
-  done <"$list"
-  [ -d "$cn" ] || return 0
-  for d in "$cn"/*/; do
-    [ -d "$d" ] || continue
-    d=${d%/}; d=${d##*/}
-    [ "$d" = __pycache__ ] && continue
-    if [ -z "${listed[$d]:-}" ]; then echo "GW:TEMPLATE_NODE $d"; fi
-  done
-}
-
 write_start_script() {
   # The interpreter is fixed at write time (whichever venv was chosen); everything
   # else is resolved when the script runs.
@@ -378,11 +347,10 @@ print("ok" if not fails else "fail " + ",".join(fails))
 PY
 }
 
-# Last words on every exit path that got this far: the template's models and the node
-# failures matter most exactly when the smoke test failed and the instance stays up.
+# Last words on every exit path that got this far: the node failures matter most
+# exactly when the smoke test failed and the instance stays up.
 finish() {  # finish <smoke result>
   local smoke=$1
-  if [ -s "$UNKNOWN" ]; then cat "$UNKNOWN"; fi
   mkdir -p "$HOME/hf-cache"
   if [ "${#NODE_FAILS[@]}" -gt 0 ]; then
     echo "node steps failed (${#NODE_FAILS[@]}): ${NODE_FAILS[*]}"
@@ -402,9 +370,14 @@ main() {
   fi
   [ -f "$NODES" ] || die "node list $NODES not found (the controller uploads it first)"
   export GIT_TERMINAL_PROMPT=0 PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_INPUT=1
-  UNKNOWN=$(mktemp)
-  trap 'rm -f "$UNKNOWN"' EXIT
   trap 'rc=$?; echo "bootstrap: failed in phase $PHASE (line $LINENO, exit $rc)" >&2' ERR
+
+  phase stop
+  # Our own start loop and the ComfyUI it runs (a re-run after a smoke failure that
+  # was started by hand): a checkout and pip under a running ComfyUI break both. The
+  # template's autostart is the host bootstrap's business (ops/host-bootstrap.sh).
+  pkill -f '[s]tart-comfy[.]sh' || true
+  pkill -f '[m]ain[.]py --listen 127[.]0[.]0[.]1 --port 8188' || true
 
   phase locate
   CUI=
@@ -427,28 +400,6 @@ main() {
     fi
   fi
   echo "ComfyUI: $CUI"
-
-  phase autostart
-  # The template may start ComfyUI itself, listening on every interface. Stop it (and
-  # our own loop on a re-run) and keep it from coming back on the next login.
-  pkill -f 'start-comfy' || true
-  for d in $(pgrep -f 'main\.py' || true); do
-    if [ "$(readlink -f "/proc/$d/cwd" 2>/dev/null || true)" = "$CUI" ]; then
-      kill "$d" 2>/dev/null || true
-    fi
-  done
-  pkill -f "$CUI/main.py" || true
-  disable_rc_autostart "$HOME/.bashrc"
-  disable_rc_autostart "$HOME/.profile"
-
-  phase inventory
-  # Before the checkout: whatever sits in models/ now came with the template.
-  if [ -d "$CUI/models" ]; then
-    find "$CUI/models/" -type f -size +1M -printf 'GW:UNKNOWN_MODEL models/%P\t%s\n' >"$UNKNOWN" \
-      || echo "inventory of $CUI/models incomplete (find failed)" >&2
-  fi
-  echo "$(wc -l <"$UNKNOWN") template model file(s) found"
-  report_template_nodes "$CUI/custom_nodes" "$NODES"
 
   phase checkout
   if [ ! -e "$CUI/.git" ]; then git -C "$CUI" init --quiet; fi

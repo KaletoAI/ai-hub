@@ -28,6 +28,8 @@ from tests.fakes import FakeThunder  # the scripted Thunder REST API
 
 COMMIT = "1d61dcc35c35541388c0001bacc7703db14e8bea"
 BID = "comfyui:thunder"         # the fixture's one ComfyUI service
+HOST_BOOT = "gw-host-bootstrap.log"       # in the host bootstrap's command only
+HOST_SCRIPT = b"#!/bin/bash\necho host; echo GW:DONE\n"
 _TMPDIRS = []
 
 
@@ -62,8 +64,11 @@ def make(fake, backend=None, ssh_script=None, datadir=None, default_nodes="",
     if datadir is None:
         datadir = tempfile.mkdtemp(prefix="hostctl-test-")
         _TMPDIRS.append(datadir)
-    # a bootstrap that succeeds unless the test scripts otherwise
-    script = {"bash -s": (0, b"GW:PHASE smoke\nGW:SMOKE ok\nGW:DONE\n", b"")}
+    # both bootstraps succeed unless the test scripts otherwise; the host bootstrap's
+    # key comes FIRST (its command also says `bash -s`), so a test that scripts
+    # "bash -s" scripts the ComfyUI bootstrap only, as before the split
+    script = {HOST_BOOT: (0, b"GW:PHASE tools\nGW:DONE\n", b""),
+              "bash -s": (0, b"GW:PHASE smoke\nGW:SMOKE ok\nGW:DONE\n", b"")}
     script.update(ssh_script or {})
 
     async def ssh(argv, stdin=None, timeout=60):
@@ -97,6 +102,7 @@ def make(fake, backend=None, ssh_script=None, datadir=None, default_nodes="",
         now=lambda: clock[0], sleep=sleep,
         ssh=ssh, spawn=None, probe_comfy=probe or (lambda url: asyncio.sleep(0, True)),
         bootstrap_script=lambda: b"#!/bin/bash\necho GW:DONE\n",
+        host_bootstrap_script=lambda: HOST_SCRIPT,
         keygen=keygen, default_nodes=lambda: default_nodes)
     host = {"name": hname, "provider": "thunder", "options": b["thunder"],
             "api_key": b.get("api_key", "")}
@@ -427,7 +433,10 @@ class Start(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["disk_size_gb"], 100)
         cmds = _ssh_cmds(fake)
         boot = [x for x in cmds if "bash -s --" in x]
+        # R-W3: the host bootstrap first, then the ComfyUI part
         self.assertEqual(boot, ["bash -o pipefail -c "
+                                "'bash -s -- 2>&1 | tee ~/gw-host-bootstrap.log'",
+                                "bash -o pipefail -c "
                                 f"'bash -s -- {COMMIT} 2>&1 | tee ~/gw-bootstrap.log'"])
         self.assertIn(hostctl._START_CMD, cmds)
         self.assertTrue(hostctl._START_CMD.endswith(
@@ -447,10 +456,14 @@ class Start(unittest.IsolatedAsyncioTestCase):
         await c.start()
         remote = [(argv[-1], stdin) for argv, stdin in calls]
         up = [i for i, (cmd, _) in enumerate(remote) if cmd == "cat > ~/.gw-nodes.txt"]
-        run = [i for i, (cmd, _) in enumerate(remote) if "bash -s --" in cmd]
-        self.assertEqual(len(up), 1)
-        self.assertLess(up[0], run[0])
+        host = [i for i, (cmd, _) in enumerate(remote) if HOST_BOOT in cmd]
+        run = [i for i, (cmd, _) in enumerate(remote) if "tee ~/gw-bootstrap.log" in cmd]
+        self.assertEqual((len(up), len(host), len(run)), (1, 1, 1))
+        # the list goes up before the HOST bootstrap: its template report reads it
+        self.assertLess(up[0], host[0])
+        self.assertLess(host[0], run[0])
         self.assertEqual(remote[up[0]][1], b"https://github.com/a/pack@0123abc\n")
+        self.assertEqual(remote[host[0]][1], HOST_SCRIPT)
         self.assertEqual(remote[run[0]][1], b"#!/bin/bash\necho GW:SMOKE ok\necho GW:DONE\n")
         # every argv ends in `-- ubuntu@ip <cmd>` with the instance's port and our key
         argv = calls[0][0]
@@ -616,13 +629,15 @@ class Start(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "bootstrapping"))
 
     async def test_bootstrap_reports_are_collected_and_persisted(self):
+        # the template's models and packs come from the HOST bootstrap (R-W3); the
+        # ComfyUI bootstrap after it (no such lines) must not wipe them
         out = (b"GW:PHASE inventory\nsome noise\n"
                b"GW:TEMPLATE_NODE ComfyUI-Manager\n"
                b"GW:UNKNOWN_MODEL models/checkpoints/sd15.safetensors\t2132625894\n"
                b"GW:UNKNOWN_MODEL models/../../.ssh/id\t5\n"
-               b"GW:SMOKE ok\nGW:DONE\n")
+               b"GW:DONE\n")
         fake = FakeThunder()
-        c, saved, _, _ = make(fake, ssh_script={"bash -s": (0, out, b"")})
+        c, saved, _, _ = make(fake, ssh_script={HOST_BOOT: (0, out, b"")})
         await c.start()
         self.assertEqual(c.state.phase, "ready", c.state.error)
         self.assertEqual(saved["thunder"]["bootstrap_unknown"],
@@ -2211,6 +2226,20 @@ class BootstrapParse(unittest.TestCase):
                                        "GW:UNKNOWN_MODEL models/b c.bin\t7\n")
         self.assertEqual(r["unknown"], {"models/b c.bin": 7})
 
+    def test_host_verdict_needs_done_not_smoke(self):
+        # the host bootstrap has no smoke test: rc 0 + GW:DONE is success, and a
+        # timeout names ITS budget, not the ComfyUI bootstrap's hours
+        v = hostctl.bootstrap_verdict
+        done = hostctl.parse_bootstrap("GW:PHASE tools\nGW:DONE\n")
+        self.assertEqual(v(0, done, "", smoke_test=False), "")
+        self.assertIn("without GW:DONE", v(0, hostctl.parse_bootstrap("GW:PHASE tools\n"),
+                                            "", smoke_test=False))
+        self.assertIn("without GW:SMOKE ok", v(0, done, ""))    # the ComfyUI rule stays
+        self.assertIn("rc 3", v(3, done, "x", smoke_test=False))
+        self.assertIn("after 30 min", v(124, done, "", smoke_test=False,
+                                        timeout_s=hostctl._HOST_BOOTSTRAP_S))
+        self.assertIn("after 3 h", v(124, done, ""))
+
 
 
 # ── main wiring (Task 7) ──────────────────────────────────────────────────────
@@ -3727,6 +3756,10 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(deps.known_uuids(), {"u1", "u2"})
         # the repo files
         self.assertTrue(deps.bootstrap_script().startswith(b"#!"))
+        # R-W3: the host bootstrap is its own repo file
+        self.assertTrue(deps.host_bootstrap_script().startswith(b"#!"))
+        self.assertIn(b"disable_rc_autostart", deps.host_bootstrap_script())
+        self.assertNotIn(b"disable_rc_autostart", deps.bootstrap_script())
         self.assertIsInstance(deps.default_nodes(), str)
         self.assertTrue(deps.default_nodes().strip())
         # forwards on the running master go through its control socket (R-W1)
@@ -5043,9 +5076,8 @@ class ManagedHost(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("127.0.0.1:18200:127.0.0.1:9000", _fwds(c.h.tunnels[0].argvs[-1]))
 
     async def test_comfy_bootstrap_only_with_comfy_service(self):
-        # R-W3 (Task 4 splits the scripts): a host with no ComfyUI service runs no
-        # ComfyUI bootstrap, needs no commit or node list, starts no ComfyUI and syncs
-        # no models
+        # R-W3: a host with no ComfyUI service runs the host bootstrap only — no
+        # ComfyUI bootstrap, no commit or node list, starts no ComfyUI, syncs no models
         fake = FakeThunder()
         c, _, enabled, calls = make(fake, services=[_svc("vllm", "openai", 18200, 8000)])
         c.cfg["comfy_commit"] = "not-a-sha"              # ComfyUI-only requirements …
@@ -5053,7 +5085,9 @@ class ManagedHost(unittest.IsolatedAsyncioTestCase):
         await c.start()
         self.assertEqual(c.state.phase, "ready", c.state.error)
         cmds = _ssh_cmds(fake)
-        self.assertFalse([x for x in cmds if "bash -s" in x or "gw-nodes" in x], cmds)
+        self.assertEqual([x for x in cmds if "bash -s" in x or "gw-nodes" in x],
+                         ["bash -o pipefail -c "
+                          "'bash -s -- 2>&1 | tee ~/gw-host-bootstrap.log'"])
         self.assertNotIn(hostctl._START_CMD, cmds)
         self.assertEqual(enabled, {"openai:vllm": True})
         self.assertIsNone(c.plan)
@@ -5064,8 +5098,8 @@ class ManagedHost(unittest.IsolatedAsyncioTestCase):
         await c.start()
         self.assertEqual(c.state.phase, "ready", c.state.error)
         boot = [(argv[-1], stdin) for argv, stdin in calls if "bash -s --" in argv[-1]]
-        self.assertEqual(len(boot), 1)
-        self.assertEqual(boot[0][1], b"#!/bin/bash\necho GW:DONE\n")
+        self.assertEqual(len(boot), 2)
+        self.assertEqual([b[1] for b in boot], [HOST_SCRIPT, b"#!/bin/bash\necho GW:DONE\n"])
         self.assertIn(hostctl._START_CMD, _ssh_cmds(fake))
 
     async def test_restart_pattern_uses_the_service_port(self):
@@ -5145,6 +5179,228 @@ class ManagedHost(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(os.stat(d).st_mode & 0o777, 0o700)
 
 
+def _boots(fake, n=0):
+    """(host, comfy) bootstrap runs among the ssh calls since fake.calls[n]."""
+    cmds = [p for m, p, _ in fake.calls[n:] if m == "SSH"]
+    return ([x for x in cmds if HOST_BOOT in x],
+            [x for x in cmds if "tee ~/gw-bootstrap.log" in x])
+
+
+class SplitBootstrap(unittest.IsolatedAsyncioTestCase):
+    """R-W3 + Ruling M4: the host bootstrap runs on every host's first start, the
+    ComfyUI bootstrap only with a ComfyUI service; each has its own done-flag, and a
+    snapshot inherits both."""
+
+    def _vllm(self, fake, **kw):
+        c, saved, enabled, calls = make(fake, services=[_svc("vllm", "openai", 18200, 8000)],
+                                        **kw)
+        c.cfg.pop("bootstrap_template")          # the host form's default: unset
+        return c, saved
+
+    async def _stop_ready(self, c, fake):
+        await c.stop()
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        fake.snaps[-1]["status"] = "READY"
+        await c.watch_snapshots()
+        fake.status_script = ["PROVISIONING", "RUNNING"]
+
+    async def test_vllm_only_host_runs_the_host_bootstrap_on_base(self):
+        fake = FakeThunder()
+        c, saved = self._vllm(fake)
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        self.assertEqual(_creates(fake)[0]["template"], thunder.DEFAULT_TEMPLATE_NO_COMFY)
+        host, comfy = _boots(fake)
+        self.assertEqual((len(host), comfy), (1, []))
+        self.assertIn("bootstrapping", c.h.phases)
+        self.assertTrue(saved["thunder"]["host_bootstrapped"])
+        self.assertTrue(c.view()["host_bootstrapped"])
+        self.assertFalse(c.state.bootstrap_incomplete)
+        self.assertTrue(c.state.comfy_absent)
+        # the stop neither warns about an unfinished bootstrap nor marks the snapshot
+        await c.stop()
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        joined = "\n".join(c.state.log)
+        self.assertNotIn("did not finish", joined)
+        self.assertNotIn("marked", joined)
+        self.assertEqual((c.state.incomplete_snapshots, c.state.host_incomplete_snapshots),
+                         ([], []))
+        self.assertEqual(c.state.no_comfy_snapshots, ["s0"])
+
+    async def test_configured_template_wins_and_comfy_default_is_comfy_ui(self):
+        fake = FakeThunder()
+        c, _ = self._vllm(fake)
+        c.cfg["bootstrap_template"] = "comfy-ui"
+        await c.start()
+        self.assertEqual(_creates(fake)[0]["template"], "comfy-ui")
+        fake = FakeThunder()
+        c, _, _, _ = make(fake)
+        c.cfg.pop("bootstrap_template")
+        await c.start()
+        self.assertEqual(_creates(fake)[0]["template"], "comfy-ui")
+
+    async def test_comfy_host_runs_host_then_comfy_bootstrap(self):
+        fake = FakeThunder()
+        c, saved, _, _ = make(fake)
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        cmds = _ssh_cmds(fake)
+        host, comfy = _boots(fake)
+        self.assertEqual((len(host), len(comfy)), (1, 1))
+        self.assertLess(cmds.index("cat > ~/.gw-nodes.txt"), cmds.index(host[0]))
+        self.assertLess(cmds.index(host[0]), cmds.index(comfy[0]))
+        self.assertLess(cmds.index(comfy[0]), cmds.index(hostctl._START_CMD))
+        self.assertEqual((saved["thunder"]["host_bootstrapped"],
+                          saved["thunder"]["bootstrap_incomplete"],
+                          saved["thunder"]["comfy_absent"]), (True, False, False))
+
+    async def test_host_bootstrap_failure_fails_the_host(self):
+        fake = FakeThunder()
+        c, saved, _, _ = make(fake, ssh_script={
+            HOST_BOOT: (1, b"GW:PHASE tools\n", b"host-bootstrap: failed in phase tools")})
+        await c.start()
+        self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "bootstrapping"))
+        self.assertIn("host bootstrap", c.state.error)
+        self.assertIn("phase tools", c.state.error)
+        self.assertIn("0", fake.instances)                  # kept for diagnosis
+        self.assertEqual(_boots(fake)[1], [])               # the ComfyUI part never ran
+        self.assertFalse(saved["thunder"]["host_bootstrapped"])
+        # booked on the HOST's pseudo backend, not the ComfyUI service
+        self.assertEqual(c.h.faults[-1][0], {"name": "thunder", "type": "managed-host"})
+        self.assertNotEqual(c.view()["services"][BID]["status"], "setup failed")
+        # its snapshot carries both marks; a start from it runs both bootstraps again
+        await self._stop_ready(c, fake)
+        self.assertTrue(any("host bootstrap did not finish" in ln for ln in c.state.log))
+        self.assertEqual((c.state.host_incomplete_snapshots, c.state.incomplete_snapshots),
+                         (["s0"], ["s0"]))
+        c.deps.ssh = make(fake)[0].deps.ssh                 # both succeed now
+        n = len(fake.calls)
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        self.assertEqual(_creates(fake)[-1]["template"], fake.snaps[0]["name"])
+        host, comfy = _boots(fake, n)
+        self.assertEqual((len(host), len(comfy)), (1, 1))
+
+    async def test_host_flag_carried_into_snapshots(self):
+        # vLLM-only: a failed host bootstrap marks the snapshot, a finished one does not
+        fake = FakeThunder()
+        c, saved = self._vllm(fake, ssh_script={HOST_BOOT: (124, b"", b"timeout")})
+        await c.start()
+        self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "bootstrapping"))
+        self.assertIn("30 min", c.state.error)
+        await self._stop_ready(c, fake)
+        self.assertEqual(saved["thunder"]["host_incomplete_snapshots"], ["s0"])
+        self.assertEqual(c.state.incomplete_snapshots, [])  # no ComfyUI: never "incomplete"
+        c.deps.ssh = make(fake)[0].deps.ssh
+        n = len(fake.calls)
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        self.assertEqual(len(_boots(fake, n)[0]), 1)       # ran again on the snapshot
+        await self._stop_ready(c, fake)
+        self.assertEqual(c.state.snapshot_id, "s1")
+        self.assertNotIn("s1", c.state.host_incomplete_snapshots)   # (s0 rotated away)
+        n = len(fake.calls)
+        await c.start()                                     # from s1: nothing to run
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        self.assertEqual(_boots(fake, n), ([], []))
+        self.assertNotIn("bootstrapping", c.h.phases[-4:])
+
+    async def test_comfy_attached_later_bootstraps_from_a_no_comfy_snapshot(self):
+        fake = FakeThunder()
+        c, _ = self._vllm(fake)
+        await c.start()
+        await self._stop_ready(c, fake)
+        c.services = [_svc("thunder", "comfyui", 18188, 8188)]
+        n = len(fake.calls)
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        self.assertEqual(_creates(fake)[-1]["template"], fake.snaps[0]["name"])
+        host, comfy = _boots(fake, n)
+        self.assertEqual((len(host), len(comfy)), (0, 1))  # host part is in the snapshot
+        self.assertFalse(c.state.comfy_absent or c.state.bootstrap_incomplete)
+
+    async def test_ensure_comfy_bootstrap_on_a_running_host(self):
+        # Task 5 wires the attach; the controller side: a ComfyUI service on a running
+        # host without ComfyUI gets exactly the ComfyUI bootstrap, once
+        fake = FakeThunder()
+        c, saved = self._vllm(fake)
+        await c.start()
+        self.assertFalse(await c._ensure_comfy_bootstrap())   # no ComfyUI attached
+        c.services = c.services + [_svc("thunder", "comfyui", 18188, 8188)]
+        n = len(fake.calls)
+        self.assertTrue(await c._ensure_comfy_bootstrap())
+        cmds = [p for m, p, _ in fake.calls[n:] if m == "SSH"]
+        host, comfy = _boots(fake, n)
+        self.assertEqual((host, len(comfy)), ([], 1))
+        self.assertLess(cmds.index("cat > ~/.gw-nodes.txt"), cmds.index(comfy[0]))
+        self.assertEqual((saved["thunder"]["bootstrap_incomplete"],
+                          saved["thunder"]["comfy_absent"]), (False, False))
+        n = len(fake.calls)
+        self.assertFalse(await c._ensure_comfy_bootstrap())   # done: nothing runs
+        self.assertEqual(_boots(fake, n), ([], []))
+
+    async def test_ensure_comfy_bootstrap_failure_is_the_services(self):
+        fake = FakeThunder()
+        c, saved = self._vllm(fake, ssh_script={"bash -s": (3, b"GW:SMOKE fail x\n", b"")})
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        comfy = _svc("thunder", "comfyui", 18188, 8188)
+        c.services = c.services + [comfy]
+        with self.assertRaises(hostctl._ServiceError) as cm:
+            await c._ensure_comfy_bootstrap()
+        self.assertIs(cm.exception.svc, comfy)
+        self.assertEqual(c.view()["services"]["comfyui:thunder"]["status"], "setup failed")
+        self.assertTrue(saved["thunder"]["bootstrap_incomplete"])
+        self.assertFalse(saved["thunder"]["comfy_absent"])
+        # a snapshot of this instance now holds a half-install: marked incomplete
+        await c.stop()
+        self.assertEqual(c.state.incomplete_snapshots, ["s0"])
+
+    async def test_resume_of_an_interrupted_host_bootstrap_names_its_log(self):
+        fake = FakeThunder()
+        _inst(fake)
+        c, _, _, _ = make(fake, state=_persisted(phase="bootstrapping",
+                                                 host_bootstrapped=False))
+        await c.resume()
+        self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "bootstrapping"))
+        self.assertIn("gw-host-bootstrap.log", c.state.error)
+
+    async def test_resume_interrupted_first_start_runs_both(self):
+        fake = FakeThunder()
+        _inst(fake)
+        c, _, _, _ = make(fake, state=_persisted(phase="creating", ip="", port=0,
+                                                 host_bootstrapped=False,
+                                                 bootstrap_incomplete=True))
+        await c.resume()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        host, comfy = _boots(fake)
+        self.assertEqual((len(host), len(comfy)), (1, 1))
+
+
+class LegacyBootstrapState(unittest.TestCase):
+    """A record written before the split has no host flag: the one-piece bootstrap did
+    the host part too, so its verdict carries over — and what it marked incomplete may
+    lack the host part."""
+
+    def test_complete_record_counts_as_host_bootstrapped(self):
+        s = hostctl.state_from({"phase": "ready", "uuid": "u1", "incomplete_snapshots": ["s1"]})
+        self.assertTrue(s.host_bootstrapped)
+        self.assertEqual(s.host_incomplete_snapshots, ["s1"])
+        self.assertEqual((s.comfy_absent, s.no_comfy_snapshots), (False, []))
+
+    def test_incomplete_record_is_not(self):
+        s = hostctl.state_from({"phase": "bootstrapping", "uuid": "u1",
+                                "bootstrap_incomplete": True})
+        self.assertFalse(s.host_bootstrapped)
+
+    def test_new_record_is_read_as_written(self):
+        s = hostctl.state_from({"phase": "ready", "host_bootstrapped": False,
+                                "host_incomplete_snapshots": [],
+                                "incomplete_snapshots": ["s1"]})
+        self.assertFalse(s.host_bootstrapped)
+        self.assertEqual(s.host_incomplete_snapshots, [])
+
+
 class DepsContract(unittest.TestCase):
     """The main↔hostctl seam: every field `hostctl.Deps` declares is provided by
     `main._host_deps()` with a callable that accepts the arguments hostctl calls
@@ -5157,7 +5413,8 @@ class DepsContract(unittest.TestCase):
              "datadir": None, "probe_comfy": 1, "bootstrap_script": 0, "log": 1, "now": 0,
              "sleep": 1, "ssh": 1, "spawn": None, "known_uuids": 0, "keygen": 1,
              "default_nodes": 0, "alias_needs": 1, "alias_signature": 1, "source_index": 0,
-             "url_catalog": 0, "hf_token": 0, "lan": None, "pipe": 3, "control": 5}
+             "url_catalog": 0, "hf_token": 0, "lan": None, "pipe": 3, "control": 5,
+             "host_bootstrap_script": 0}
     KWARGS = {"ssh": ("stdin", "timeout"), "pipe": ("timeout_idle",), "control": ("timeout",)}
 
     def test_every_field_provided_with_the_called_arity(self):

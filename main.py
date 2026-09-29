@@ -6222,6 +6222,7 @@ def _host_deps() -> "hostctl.Deps":
         datadir=_thunder_datadir(),
         probe_comfy=_thunder_probe,
         bootstrap_script=lambda: (ops / "thunder-bootstrap.sh").read_bytes(),
+        host_bootstrap_script=lambda: (ops / "host-bootstrap.sh").read_bytes(),
         log=logger.info,
         known_uuids=_host_known_uuids,
         default_nodes=lambda: (ops / "thunder-nodes.default.txt").read_text("utf-8"),

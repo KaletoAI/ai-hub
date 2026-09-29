@@ -39,8 +39,15 @@ half an hour to RUNNING must not forget it), and `bootstrapping`/`starting` are 
 entered while Thunder forwards a public HTTP port (`_ensure_ports_closed`: its port
 forwarding has no auth, and ComfyUI behind it is code execution for anyone). A failure
 before `create` ends in `off`; after it in `failed(<phase>)` with the instance KEPT for
-diagnosis. The bootstrap's verdict is read from its `GW:` lines by tag
-(`parse_bootstrap`/`bootstrap_verdict`, ledger Ruling 9).
+diagnosis. The setup is two scripts (R-W3): the HOST bootstrap (`ops/host-bootstrap.sh`:
+the template's autostart off, the models and node packs it brought reported, flock/uv)
+runs on the first start of EVERY host, the ComfyUI bootstrap (`ops/thunder-bootstrap.sh`)
+after it and only when a ComfyUI service is attached — or later, when one is attached
+to a running host (`_ensure_comfy_bootstrap`). Each keeps its own done-flag
+(`host_bootstrapped`, `bootstrap_incomplete`) that a snapshot inherits, so a start from
+a snapshot taken before a script finished runs that script again. Both verdicts are
+read from the `GW:` lines by tag (`parse_bootstrap`/`bootstrap_verdict`, ledger
+Ruling 9).
 
 The stop path (`stop()`, spec "Stop") is draining → pruning → snapshotting → deleting →
 `off`, each step re-entrant: the snapshot NAME is persisted before its POST and looked
@@ -50,8 +57,10 @@ is `failed(deleting)`, never `off`, because it bills. Only a confirmed-gone inst
 clears the ids and `started_at` (the session cost stops there). A stop() aborts a start
 in flight and stops from the phase it reached (Ruling 13); a snapshot taken before the
 bootstrap finished is marked (`incomplete_snapshots`) so a start from it bootstraps
-again. `watch_snapshots()` settles the pending snapshot (READY → rotation, FAILED →
-fault, the last READY one stays the template) and `resume()` reconciles the persisted
+again (the host bootstrap: `host_incomplete_snapshots`; a snapshot of a host that never
+had a ComfyUI service: `no_comfy_snapshots`, so attaching one later bootstraps it
+without calling the snapshot broken). `watch_snapshots()` settles the pending snapshot
+(READY → rotation, FAILED → fault, the last READY one stays the template) and `resume()` reconciles the persisted
 state with the instance list after a gateway restart. Every mutating call uses an item
 found in a FRESH list by `_find_ours` (Ruling 10); `orphans()` only ever displays.
 
@@ -126,6 +135,7 @@ _RESTORE_PER_100GB_S = 8 * 60   #   Thunder's docs: a restore takes up to 8 min 
 _SSH_READY_S = 5 * 60           # a RUNNING instance whose sshd does not answer by then
 _SSH_PROBE_S = 5
 _BOOTSTRAP_S = 3 * 3600         # venv + torch + node packs + CUDA extension builds
+_HOST_BOOTSTRAP_S = 30 * 60     # kill + inventory + at most an apt install and uv
 _COMFY_READY_S = 10 * 60        # first start loads custom nodes (3D packs import slowly)
 _COMFY_PROBE_S = 3
 _STDERR_LOG_LINES = 20          # stderr tail logged for a failed remote step
@@ -144,6 +154,7 @@ _START_CMD = ("test -x ~/start-comfy.sh || { echo 'start-comfy.sh missing' >&2; 
 # in `bash -o pipefail -c` so the SCRIPT's exit status survives the `| tee` whatever
 # the login shell is; `bash -s` reads the script from ssh's stdin, tee only the pipe.
 _BOOTSTRAP_LOG = "~/gw-bootstrap.log"
+_HOST_BOOTSTRAP_LOG = "~/gw-host-bootstrap.log"   # the host bootstrap's own (R-W3)
 _BOOTSTRAP_TAIL = 200
 
 
@@ -249,17 +260,31 @@ class State:
     # the id finds the snapshot by name instead of taking a second one
     pending_snapshot_name: str = ""
     manifests: dict = field(default_factory=dict)   # snapshot id → model manifest
-    # what the last bootstrap reported: models the TEMPLATE brought (rel → bytes; paid
-    # for in every snapshot until deleted) and custom_nodes packs it brought
+    # what the last HOST bootstrap reported: models the TEMPLATE brought (rel → bytes;
+    # paid for in every snapshot until deleted) and custom_nodes packs it brought
     bootstrap_unknown: dict = field(default_factory=dict)
     bootstrap_template_nodes: list = field(default_factory=list)
-    # True from the create of an instance that needs the bootstrap until the bootstrap
-    # succeeded (or ComfyUI was confirmed running): a snapshot taken meanwhile holds a
-    # half-finished install — a timed-out bootstrap may even still run on the box
+    # The host bootstrap (R-W3, every host): True once it finished on the running
+    # instance (or the instance came from a snapshot where it had). A snapshot taken
+    # while False lands in `host_incomplete_snapshots`, and a start from one runs it
+    # again. (A record written before the split has no such key: `state_from` derives
+    # it — the old one-piece bootstrap did the host part too.)
+    host_bootstrapped: bool = False
+    host_incomplete_snapshots: list = field(default_factory=list)
+    # The COMFYUI bootstrap: True from the create of an instance that needs it — with a
+    # ComfyUI service attached — until it succeeded (or ComfyUI was confirmed running):
+    # a snapshot taken meanwhile holds a half-finished install — a timed-out bootstrap
+    # may even still run on the box
     bootstrap_incomplete: bool = False
     # snapshot ids taken while `bootstrap_incomplete`: a start from one runs the
     # bootstrap again (kept apart from `manifests`, whose entries are model files)
     incomplete_snapshots: list = field(default_factory=list)
+    # The instance carries no ComfyUI install of ours because no ComfyUI service was
+    # attached (a vLLM-only host). Not "incomplete" — nothing failed, nothing is logged —
+    # but its snapshots (`no_comfy_snapshots`) still get the ComfyUI bootstrap once a
+    # ComfyUI service is attached, and `_ensure_comfy_bootstrap` runs it on this instance.
+    comfy_absent: bool = False
+    no_comfy_snapshots: list = field(default_factory=list)
     # uuids of unowned instances seen when the stored record was unreadable: one may be
     # ours, so no start while any of them is still listed (or the operator forgets them)
     unreconciled_uuids: list = field(default_factory=list)
@@ -307,6 +332,13 @@ def state_from(d: Optional[dict]) -> State:
         if f.name in _VOLATILE or f.name not in d:
             continue
         setattr(s, f.name, _coerce(getattr(s, f.name), d[f.name]))
+    if "host_bootstrapped" not in d:
+        # a record from before the host/ComfyUI split: the one-piece bootstrap did the
+        # host part as well, so what it called complete is host-bootstrapped too, and a
+        # snapshot it marked incomplete may lack the host part (re-running it is safe)
+        s.host_bootstrapped = not s.bootstrap_incomplete
+        if "host_incomplete_snapshots" not in d:
+            s.host_incomplete_snapshots = list(s.incomplete_snapshots)
     if s.phase not in PHASES:
         # never "off": that would forget an instance that may still be billing
         s.failed_phase, s.phase = s.phase, "failed"
@@ -358,14 +390,17 @@ class Deps:
     pipe: Callable[..., Awaitable[tuple]] = sshrun.pipe
     # a forward added/cancelled on the RUNNING master (R-W1): `sshrun.control`
     control: Callable[..., Awaitable[tuple]] = sshrun.control
+    # ops/host-bootstrap.sh (R-W3); b"" fails the host bootstrap (no GW:DONE)
+    host_bootstrap_script: Callable[[], bytes] = field(default=lambda: b"")
 
 
 # ── bootstrap output ─────────────────────────────────────────────────────────
 
 def parse_bootstrap(out: str) -> dict:
-    """The `GW:` lines of `ops/thunder-bootstrap.sh`'s stdout (its header documents
-    them). Matched by TAG — the first whitespace-separated token of a line that starts
-    with `GW:` — never by position: the script prints other lines in between, and a
+    """The `GW:` lines of `ops/host-bootstrap.sh`'s and `ops/thunder-bootstrap.sh`'s
+    stdout (their headers document them — one protocol for both). Matched by TAG — the
+    first whitespace-separated token of a line that starts with `GW:` — never by
+    position: the script prints other lines in between, and a
     later version may add tags (ledger Ruling 9). An UNKNOWN_MODEL path that could
     leave the model tree (`safe_rel`) is dropped here — the panel later offers to
     DELETE these paths."""
@@ -397,10 +432,12 @@ def parse_bootstrap(out: str) -> dict:
     return r
 
 
-def bootstrap_verdict(rc: int, rep: dict, err: str) -> str:
+def bootstrap_verdict(rc: int, rep: dict, err: str, smoke_test: bool = True,
+                      timeout_s: int = _BOOTSTRAP_S) -> str:
     """"" when the bootstrap succeeded, else why not. Success needs ALL of: rc 0,
     `GW:SMOKE ok`, `GW:DONE` and no `GW:NODE_FAIL` at all (Ruling 9: a pack that did not
-    install fails workflows later with a plausible-looking error)."""
+    install fails workflows later with a plausible-looking error). `smoke_test=False`
+    (the host bootstrap, which has none): rc 0 and `GW:DONE`."""
     why = []
     if rep["node_fails"]:
         why.append("node packs failed: " + "; ".join(rep["node_fails"]))
@@ -409,14 +446,19 @@ def bootstrap_verdict(rc: int, rep: dict, err: str) -> str:
         why.append("smoke test " + smoke)
     where = f" in phase {rep['phase']}" if rep["phase"] else ""
     if rc == 124:
-        why.append(f"timed out after {_BOOTSTRAP_S // 3600} h{where}")
-    elif rc == 3 and smoke is None:
+        took = (f"{timeout_s // 3600} h" if timeout_s % 3600 == 0
+                else f"{timeout_s // 60} min")
+        why.append(f"timed out after {took}{where}")
+    elif rc == 3 and smoke is None and smoke_test:
         why.append("smoke test failed")
-    elif rc not in (0, 3):
+    elif rc not in ((0, 3) if smoke_test else (0,)):
         last = next((ln.strip() for ln in reversed((err or "").splitlines())
                      if ln.strip() and not ln.startswith("GW:")), "")
         why.append(f"bootstrap exited rc {rc}{where}" + (f": {last}" if last else ""))
-    if not why and not (smoke == "ok" and rep["done"]):
+    if not smoke_test:
+        if not why and not rep["done"]:
+            why.append(f"bootstrap ended without GW:DONE{where}")
+    elif not why and not (smoke == "ok" and rep["done"]):
         why.append(f"bootstrap ended without GW:SMOKE ok / GW:DONE{where}")
     return "; ".join(why)
 
@@ -1782,6 +1824,7 @@ class Controller:
                 "bootstrap_unknown": dict(s.bootstrap_unknown),
                 "bootstrap_template_nodes": list(s.bootstrap_template_nodes),
                 "bootstrap_incomplete": s.bootstrap_incomplete,
+                "host_bootstrapped": s.host_bootstrapped,
                 "op": self._op,
                 # {bid: jobs} while a stop drains, else None
                 "waiting_jobs": (dict(self._drain_waiting)
@@ -1993,50 +2036,121 @@ class Controller:
                 raise TimeoutError(f"ssh not reachable after {_SSH_READY_S // 60} min: {last}")
             await self.deps.sleep(_SSH_PROBE_S)
 
-    async def _bootstrap(self) -> None:
+    async def _run_script(self, script: bytes, args: str, logfile: str,
+                          timeout: int) -> tuple[int, str, bytes]:
+        """Stream a bootstrap script to `bash -s` on the instance, tee'd to `logfile`
+        there. → (rc, stdout text, stderr); the stdout comes from the log file when the
+        ssh lost it (a timeout keeps nothing, a dropped connection little). Every
+        non-blank line goes to the panel log."""
+        inner = f"bash -s --{(' ' + args) if args else ''} 2>&1 | tee {logfile}"
+        rc, out, err = await self._exec(f"bash -o pipefail -c {sshrun.q(inner)}",
+                                        stdin=script, timeout=timeout)
+        text = (out or b"").decode("utf-8", "replace")
+        if rc != 0 and not text.strip():
+            # timeout (sshrun.run keeps nothing) or a dropped connection: the log on
+            # the instance still says how far it got
+            text = await self._bootstrap_log_tail(logfile)
+        for line in text.splitlines():
+            if line.strip():
+                self._log(line)
+        return rc, text, err or b""
+
+    async def _host_bootstrap(self) -> None:
+        """`ops/host-bootstrap.sh` (R-W3): every host, first. Its failure is the HOST's
+        (`failed(bootstrapping)`, the instance kept) — no service can be trusted on a box
+        whose template may still run its own ComfyUI on every interface."""
         s = self.state
+        self._log("host bootstrap: template autostart, template inventory, tools")
+        rc, text, err = await self._run_script(self.deps.host_bootstrap_script(), "",
+                                               _HOST_BOOTSTRAP_LOG, _HOST_BOOTSTRAP_S)
+        rep = parse_bootstrap(text)
+        for line in rep["bad"]:
+            self._log(f"host bootstrap: unreadable report line ignored: {line!r}")
+        s.bootstrap_unknown = dict(rep["unknown"])
+        s.bootstrap_template_nodes = list(rep["template_nodes"])
+        self._persist()
+        why = bootstrap_verdict(rc, rep, err.decode("utf-8", "replace") + "\n" + text,
+                                smoke_test=False, timeout_s=_HOST_BOOTSTRAP_S)
+        if why:
+            for line in _tail(err):
+                self._log(f"stderr: {line}")
+            raise RuntimeError(f"host bootstrap: {why}")
+        if s.bootstrap_unknown:
+            gb = sum(s.bootstrap_unknown.values()) / 1024 ** 3
+            self._log(f"host bootstrap: {len(s.bootstrap_unknown)} template model file(s), "
+                      f"{gb:.1f} GB — delete them before the first stop or every "
+                      "snapshot carries them")
+        s.host_bootstrapped = True
+        self._persist()
+        self._log("host bootstrap done")
+
+    async def _upload_nodes(self) -> None:
+        """The ComfyUI bootstrap's node list → `~/.gw-nodes.txt`. Before the host
+        bootstrap when both run: its template-node report leaves our packs out."""
         rc, _, err = await self._exec("cat > ~/.gw-nodes.txt",
                                       stdin=self._nodes_text.encode("utf-8"))
         if rc != 0:
             raise RuntimeError(f"node list upload failed (rc {rc}): "
                                + " | ".join(_tail(err, 3)))
+
+    async def _bootstrap(self) -> None:
+        """`ops/thunder-bootstrap.sh` — the ComfyUI part; the node list is uploaded."""
+        s = self.state
         self._log(f"bootstrap: ComfyUI {self._commit()[:12]}, node list uploaded")
-        inner = f"bash -s -- {sshrun.q(self._commit())} 2>&1 | tee {_BOOTSTRAP_LOG}"
-        rc, out, err = await self._exec(f"bash -o pipefail -c {sshrun.q(inner)}",
-                                        stdin=self.deps.bootstrap_script(),
-                                        timeout=_BOOTSTRAP_S)
-        text = (out or b"").decode("utf-8", "replace")
-        if rc != 0 and not text.strip():
-            # timeout (sshrun.run keeps nothing) or a dropped connection: the log on
-            # the instance still says how far it got
-            text = await self._bootstrap_log_tail()
-        for line in text.splitlines():
-            if line.strip():
-                self._log(line)
+        rc, text, err = await self._run_script(self.deps.bootstrap_script(),
+                                               sshrun.q(self._commit()), _BOOTSTRAP_LOG,
+                                               _BOOTSTRAP_S)
         rep = parse_bootstrap(text)
         for line in rep["bad"]:
             self._log(f"bootstrap: unreadable report line ignored: {line!r}")
-        s.bootstrap_unknown = dict(rep["unknown"])
-        s.bootstrap_template_nodes = list(rep["template_nodes"])
-        self._persist()
         # the script's own last line names the cause; ssh's stderr only when it has none
-        why = bootstrap_verdict(rc, rep, (err or b"").decode("utf-8", "replace") + "\n" + text)
+        why = bootstrap_verdict(rc, rep, err.decode("utf-8", "replace") + "\n" + text)
         if why:
             for line in _tail(err):
                 self._log(f"stderr: {line}")
             raise RuntimeError(why)
-        if s.bootstrap_unknown:
-            gb = sum(s.bootstrap_unknown.values()) / 1024 ** 3
-            self._log(f"bootstrap: {len(s.bootstrap_unknown)} template model file(s), "
-                      f"{gb:.1f} GB — delete them before the first stop or every "
-                      "snapshot carries them")
         s.bootstrap_incomplete = False
         self._persist()
         self._log("bootstrap done")
 
-    async def _bootstrap_log_tail(self) -> str:
+    def _comfy_pending(self) -> bool:
+        """A ComfyUI service is attached and this instance lacks a finished ComfyUI
+        bootstrap (an unfinished one, or none because no ComfyUI was attached before)."""
+        s = self.state
+        return self._comfy() is not None and (s.bootstrap_incomplete or s.comfy_absent)
+
+    async def _ensure_comfy_bootstrap(self, upload: bool = True) -> bool:
+        """Run the ComfyUI bootstrap when a ComfyUI service is attached and the instance
+        lacks it — at a start right after the host bootstrap, or on a RUNNING host a
+        ComfyUI service was just attached to (Task 5 wires the attach). → True when it
+        ran (and succeeded), False when there was nothing to do. A failure raises
+        `_ServiceError` (fault + `setup failed` on the service); the caller decides what
+        it means for the host — today the start fails the whole host (Task 5 makes it
+        the service's alone). `upload=False`: the node list is already on the box."""
+        comfy = self._comfy()
+        if not self._comfy_pending():
+            return False
+        s = self.state
+        # from here on a snapshot of this instance holds a (half-)install: "incomplete"
+        s.bootstrap_incomplete, s.comfy_absent = True, False
+        self._persist()
         try:
-            rc, out, err = await self._exec(f"tail -n {_BOOTSTRAP_TAIL} {_BOOTSTRAP_LOG}",
+            if not self._nodes_text:
+                self._nodes_text = self._node_list()     # lost with a restart
+            if upload:
+                await self._upload_nodes()
+            await self._bootstrap()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # the bootstrap is the ComfyUI service's setup: its fault (R-K1)
+            self._svc_set(comfy, "setup failed", _errtext(e))
+            raise _ServiceError(comfy, _errtext(e)) from e
+        return True
+
+    async def _bootstrap_log_tail(self, logfile: str = _BOOTSTRAP_LOG) -> str:
+        try:
+            rc, out, err = await self._exec(f"tail -n {_BOOTSTRAP_TAIL} {logfile}",
                                             timeout=60)
         except Exception as e:
             self._log(f"bootstrap log unavailable: {_errtext(e)}")
@@ -2045,7 +2159,7 @@ class Controller:
             self._log(f"bootstrap log unavailable (rc {rc}): " + " | ".join(_tail(err, 3)))
             return ""
         self._log(f"bootstrap output lost — last {_BOOTSTRAP_TAIL} lines of "
-                  f"{_BOOTSTRAP_LOG} follow")
+                  f"{logfile} follow")
         return (out or b"").decode("utf-8", "replace")
 
     # services: start / probe / restart (ComfyUI only in this version — the provisional
@@ -2235,7 +2349,7 @@ class Controller:
         enabled: list = []
         try:
             self._enable(enabled)
-            created = await self._create()
+            await self._create()
         except Exception as e:
             msg = _errtext(e)
             if isinstance(e, self._Error) and e.status is None:
@@ -2244,22 +2358,22 @@ class Controller:
             if enabled:
                 self._disable(enabled)
             return
-        await self._after_create(created)
+        await self._after_create()
 
-    async def _after_create(self, needs_bootstrap: bool) -> None:
+    async def _after_create(self) -> None:
         """Steps 3–6 from a created instance on: RUNNING → port guard → tunnel (every
-        service's forward) → ssh → the ComfyUI bootstrap (if needed, and only with a
-        ComfyUI service attached) → each service started and probed. Also how resume()
-        continues a start the gateway restart interrupted before the bootstrap."""
+        service's forward) → ssh → the host bootstrap (if this instance lacks it) → the
+        ComfyUI bootstrap (if needed, and only with a ComfyUI service attached) → each
+        service started and probed. What runs is read from the state flags `_created`
+        set (`host_bootstrapped`, `bootstrap_incomplete`/`comfy_absent`), so this is
+        also how resume() continues a start the gateway restart interrupted before the
+        bootstrap."""
         s = self.state
         comfy = self._comfy()
-        if needs_bootstrap and comfy is None:
-            # the ComfyUI part runs only for a ComfyUI service (R-W3); the mark stays,
-            # so a snapshot of this instance still bootstraps once one is attached
-            self._log("no ComfyUI service attached — ComfyUI bootstrap skipped")
-            needs_bootstrap = False
+        need_host = not s.host_bootstrapped
+        need_comfy = self._comfy_pending()
         try:
-            if needs_bootstrap and not self._nodes_text:
+            if need_comfy and not self._nodes_text:
                 self._nodes_text = self._node_list()     # lost with a restart
             item = await self._wait_running(s.disk_gb)
             s.ip, s.port = str(item["ip"]), int(item["port"])
@@ -2269,17 +2383,22 @@ class Controller:
             self._reset_known_hosts(s.uuid)
             await self._start_tunnel()
             await self._wait_ssh()
-            if needs_bootstrap:
-                s.bootstrap_incomplete = True
+            if need_host or need_comfy:
                 self._set_phase("bootstrapping")
+            if need_comfy:
                 try:
-                    await self._bootstrap()
-                except asyncio.CancelledError:
-                    raise
+                    await self._upload_nodes()      # first: the host bootstrap reads it
                 except Exception as e:
-                    # the bootstrap is the ComfyUI service's setup: its fault (R-K1)
                     self._svc_set(comfy, "setup failed", _errtext(e))
                     raise _ServiceError(comfy, _errtext(e)) from e
+            if need_host:
+                await self._host_bootstrap()        # a failure is the host's
+            if need_comfy:
+                # the ComfyUI service's setup: a failure is booked on it, but still
+                # fails the whole host start here — Task 5 makes it that service's alone
+                await self._ensure_comfy_bootstrap(upload=False)
+            elif comfy is None and s.comfy_absent:
+                self._log("no ComfyUI service attached — ComfyUI bootstrap skipped")
             await self._ensure_ports_closed(await self._fresh_item())
             self._set_phase("starting")
             await self._start_services()
@@ -2301,11 +2420,14 @@ class Controller:
             self.state.bootstrap_incomplete = False
         self._set_phase("ready")
 
-    async def _create(self) -> bool:
+    async def _create(self) -> None:
         """Steps 1–3 up to the create: template, disk, key, `POST /instances/create`;
-        index/uuid persisted with phase `creating`. → whether the instance needs the
-        bootstrap (no READY snapshot of ours to restore from, or the newest one was
-        taken before a bootstrap finished)."""
+        index/uuid persisted with phase `creating`, together with what the instance
+        needs: the host bootstrap (no READY snapshot of ours to restore from, or the
+        newest one was taken before it finished) and the ComfyUI bootstrap (with a
+        ComfyUI service: the same, or a snapshot of a host that had none). Without a
+        snapshot the template is the configured one, else `comfy-ui` with a ComfyUI
+        service and the provider's `DEFAULT_TEMPLATE_NO_COMFY` (`base`) without (R-W3)."""
         s, cfg = self.state, self.cfg
         for k in ("gpu_type", "vcpus"):
             if not cfg.get(k):
@@ -2317,16 +2439,26 @@ class Controller:
         comfy = self._comfy() is not None
         if snap is not None:
             template = snap["name"]
-            needs_bootstrap = snap["id"] in s.incomplete_snapshots
-            if needs_bootstrap and comfy:
+            need_host = snap["id"] in s.host_incomplete_snapshots
+            comfy_missing = (snap["id"] in s.incomplete_snapshots
+                             or snap["id"] in s.no_comfy_snapshots)
+            if need_host:
+                self._log(f"snapshot {snap['name']} was taken before its host bootstrap "
+                          "finished — the host bootstrap runs again on it")
+            if comfy and snap["id"] in s.incomplete_snapshots:
                 self._log(f"snapshot {snap['name']} was taken before its bootstrap finished "
                           "— the bootstrap runs again on it")
+            elif comfy and comfy_missing:
+                self._log(f"snapshot {snap['name']} carries no ComfyUI — the ComfyUI "
+                          "bootstrap runs on it")
         else:
-            template = str(cfg.get("bootstrap_template") or "comfy-ui")
-            needs_bootstrap = True
-        # the ComfyUI bootstrap (and its node list) only with a ComfyUI service (R-W3);
-        # `needs_bootstrap` itself stays: it marks the instance's snapshots incomplete
-        self._nodes_text = self._node_list() if (needs_bootstrap and comfy) else ""
+            template = str(cfg.get("bootstrap_template") or "").strip() or (
+                "comfy-ui" if comfy
+                else getattr(self._prov, "DEFAULT_TEMPLATE_NO_COMFY", "comfy-ui"))
+            need_host = comfy_missing = True
+        # the ComfyUI bootstrap (and its node list) only with a ComfyUI service (R-W3)
+        self._nodes_text = self._node_list() if (comfy_missing and comfy) else ""
+        needs = (need_host, comfy_missing)
         spec = self._prov.spec_for(await self.api.specs(), str(cfg["gpu_type"]), num_gpus)
         storage = (spec or {}).get("storageGB") if isinstance((spec or {}).get("storageGB"), dict) else {}
         if spec is None:
@@ -2364,22 +2496,30 @@ class Controller:
                 self._abort_note = note
                 self._log(f"create aborted; {note}")
                 raise cancel
-            self._created(created, disk_gb, snap, needs_bootstrap)
+            self._created(created, disk_gb, snap, needs)
             raise cancel
-        self._created(created, disk_gb, snap, needs_bootstrap)
-        return needs_bootstrap
+        self._created(created, disk_gb, snap, needs)
 
     def _created(self, created: dict, disk_gb: int, snap: Optional[dict],
-                 needs_bootstrap: bool) -> None:
+                 needs: tuple) -> None:
+        """`needs` = (host bootstrap needed, ComfyUI install missing). The flags are
+        what `_after_create` (also after a gateway restart) runs from, and what a
+        snapshot of this instance inherits."""
         # from here on an instance exists and bills: persist it BEFORE any wait
         s = self.state
+        need_host, comfy_missing = needs
         s.index, s.uuid = created["index"], created["uuid"]
         s.ip, s.port = "", 0
         s.disk_gb = disk_gb
         s.started_at = self.deps.now()
         s.snapshot_id = snap["id"] if snap else ""
-        s.bootstrap_incomplete = needs_bootstrap
-        if needs_bootstrap:
+        s.host_bootstrapped = not need_host
+        # with a ComfyUI service the missing install is an unfinished bootstrap from the
+        # create on; without one it is just absent (nothing will run, nothing failed)
+        comfy = self._comfy() is not None
+        s.bootstrap_incomplete = comfy_missing and comfy
+        s.comfy_absent = comfy_missing and not comfy
+        if need_host:
             s.bootstrap_unknown, s.bootstrap_template_nodes = {}, []
         self._set_phase("creating")
 
@@ -2556,6 +2696,9 @@ class Controller:
             self._log(f"stop: instance never got past {p} — nothing to snapshot, deleting it")
         else:
             first = "draining"
+        if not s.host_bootstrapped and first != "deleting":
+            self._log("stop: the host bootstrap did not finish — the snapshot is marked, "
+                      "and a start from it runs the host bootstrap again")
         if s.bootstrap_incomplete and first != "deleting":
             self._log("stop: the bootstrap did not finish (after a timeout it may even "
                       "still run on the instance) — the snapshot may hold a half-finished "
@@ -2660,9 +2803,14 @@ class Controller:
         s.pending_snapshot = sid
         self._pending_misses = 0
         s.manifests[sid] = self._current_manifest()
+        if not s.host_bootstrapped and sid not in s.host_incomplete_snapshots:
+            s.host_incomplete_snapshots.append(sid)
+            self._log(f"snapshot {s.pending_snapshot_name} marked: host bootstrap incomplete")
         if s.bootstrap_incomplete and sid not in s.incomplete_snapshots:
             s.incomplete_snapshots.append(sid)
             self._log(f"snapshot {s.pending_snapshot_name} marked: bootstrap incomplete")
+        if s.comfy_absent and sid not in s.no_comfy_snapshots:
+            s.no_comfy_snapshots.append(sid)       # not a fault: no ComfyUI was attached
         self._persist()
 
     async def _snapshot(self, fresh_name: bool) -> None:
@@ -2763,7 +2911,7 @@ class Controller:
         await self._stop_tunnel()
         s.index, s.uuid, s.ip, s.port = "", "", "", 0
         s.started_at = 0.0
-        s.bootstrap_incomplete = False
+        s.bootstrap_incomplete = s.comfy_absent = s.host_bootstrapped = False
         self._set_phase("off", why)
         if uuid:
             try:
@@ -2779,8 +2927,10 @@ class Controller:
     def _forget_snapshot(self, sid: str) -> None:
         s = self.state
         s.manifests.pop(sid, None)
-        if sid in s.incomplete_snapshots:
-            s.incomplete_snapshots.remove(sid)
+        for marks in (s.incomplete_snapshots, s.host_incomplete_snapshots,
+                      s.no_comfy_snapshots):
+            if sid in marks:
+                marks.remove(sid)
 
     async def watch_snapshots(self) -> None:
         """One round: the pending snapshot READY → it becomes `snapshot_id` and the
@@ -3739,13 +3889,18 @@ class Controller:
             return
         if s.phase in _PRE_BOOT:
             self._log(f"resume: continuing the interrupted start at {s.phase}")
-            await self._after_create(s.bootstrap_incomplete)
+            await self._after_create()
             return
         if s.phase == "bootstrapping":
             await self._reattach(it, keep_failed=True)
-            self._fail("bootstrap interrupted by a gateway restart (it may still run on "
-                       "the instance, see ~/gw-bootstrap.log) — Restart ComfyUI once it is "
-                       "done, or Stop")
+            if not s.host_bootstrapped:
+                self._fail("host bootstrap interrupted by a gateway restart (it may still "
+                           f"run on the instance, see {_HOST_BOOTSTRAP_LOG}) — Stop, and "
+                           "the next start runs it again")
+            else:
+                self._fail("bootstrap interrupted by a gateway restart (it may still run on "
+                           f"the instance, see {_BOOTSTRAP_LOG}) — Restart ComfyUI once it is "
+                           "done, or Stop")
             return
         # starting / syncing / ready
         try:
