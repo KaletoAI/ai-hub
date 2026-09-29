@@ -65,13 +65,14 @@ class _StoreCase(unittest.TestCase):
     NAMES = ("backends", "config_backends", "host_controllers", "_host_tasks",
              "_hosts_booted", "jobs_cfg", "managed_hosts", "_host_errors",
              "_host_not_attachable", "_host_attached", "_not_attach_warned",
-             "_host_warned", "backend_hosts", "host_backends", "hosts_meta")
+             "_host_warned", "_host_error_warned", "backend_hosts", "host_backends",
+             "hosts_meta")
 
     def setUp(self):
         m = main
         self._saved = {n: getattr(m, n) for n in self.NAMES}
-        for n in ("_not_attach_warned", "_host_warned"):
-            setattr(m, n, set(getattr(m, n)))
+        for n in ("_not_attach_warned", "_host_warned", "_host_error_warned"):
+            setattr(m, n, set())                # "warned once" starts afresh per test
         self._saved_store = (store._DB_PATH, store._active, store._MASTER_KEY)
         self.tmp = tempfile.mkdtemp(prefix="managed-hosts-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
@@ -303,6 +304,22 @@ class LocalPort(_StoreCase):
         self.assertEqual(ports, [self.live(n, t)["local_port"] for n, t in
                                  (("a", "comfyui"), ("b", "openai"), ("c", "comfyui"),
                                   ("d", "openai"), ("e", "openai"))])
+
+    def test_a_forwarded_port_beats_a_row_that_merely_claims_it(self):
+        # "a-run" sorts FIRST and its controller forwards its port; a hand-edited row
+        # "b-hand" claiming the same port must move — never the running service
+        store.set_managed_host("vm1", _host())
+        store.upsert_backend(self.llm("a-run"))
+        main.rebuild_backends()
+        port = self.live("a-run", "openai")["local_port"]
+        store.upsert_backend(self.llm("b-hand", local_port=port))
+        main.rebuild_backends()
+        self.assertEqual([b["name"] for b in main.backends][:2], ["a-run", "b-hand"])
+        self.assertEqual(self.live("a-run", "openai")["local_port"], port)
+        self.assertEqual(store.get_backend("a-run", "openai")["local_port"], port)
+        moved = self.live("b-hand", "openai")["local_port"]
+        self.assertNotEqual(moved, port)
+        self.assertEqual(store.get_backend("b-hand", "openai")["local_port"], moved)
 
     def test_a_retained_controllers_forward_stays_taken(self):
         # a host deleted while running keeps its controller and its forwards: a port
@@ -540,6 +557,28 @@ class UnknownProvider(_StoreCase):
             main.rebuild_backends()
 
 
+    def test_a_failing_controller_never_leaks_the_token(self):
+        class Boom(Exception):
+            pass
+
+        def ctor(h, svcs, deps):
+            raise Boom(f"cannot use token {h['api_key']} " + "x" * 500)
+        saved = hostctl.Controller
+        self.addCleanup(setattr, hostctl, "Controller", saved)
+        hostctl.Controller = ctor
+        store.set_managed_host("vm1", _host())
+        with self.assertLogs("main", "WARNING") as cm:
+            main.rebuild_backends()                          # never raises
+        self.assertNotIn(TOKEN, "\n".join(cm.output))
+        v = main.host_view("vm1")
+        self.assertIn("not driven: Boom: cannot use token ***", v["error"])
+        self.assertLess(len(v["error"]), 260)                # clipped
+        h = asyncio.run(main.health(verbose=False))
+        self.assertNotIn(TOKEN, json.dumps(h, default=str))
+        self.assertNotIn(TOKEN, json.dumps(v, default=str))
+        self.assertIn("Boom", h["hosts_managed"]["vm1"]["error"])
+
+
 class Health(_StoreCase):
     def test_full_view_carries_hosts_managed(self):
         store.set_managed_host("vm1", _host())
@@ -605,6 +644,16 @@ class Refusals(_StoreCase):
         self.assertIn("already exists", main.save_managed_host("vm1", _host(), new=True))
         self.assertEqual(main.save_managed_host("vm1", _host(vcpus=16), new=False), "")
         self.assertEqual(main.host_controllers["vm1"].cfg["vcpus"], 16)
+        # the store holds the provider's normalized options, never what was typed
+        self.assertEqual(main.save_managed_host(
+            "vm1", _host(vcpus="16", num_gpus=" 2 ", bootstrap_template="auto"),
+            new=False), "")
+        opts = store.get_managed_hosts()["vm1"]["options"]
+        self.assertEqual(opts, thunder.options_of({"opt__vcpus": "16", "opt__num_gpus": "2",
+                                                   "opt__gpu_type": "a6000"})[0])
+        self.assertEqual((opts["vcpus"], opts["num_gpus"], opts["bootstrap_template"]),
+                         (16, 2, ""))
+        self.assertEqual(store.get_managed_hosts()["vm1"]["api_key"], TOKEN)
 
 
 class DeleteHost(_StoreCase):
@@ -637,6 +686,30 @@ class DeleteHost(_StoreCase):
         self.assertNotIn("vm1", store.get_hosts())
         self.assertIsNone(main.managed_host_refusal("vm1", _host()))   # name free again
         self.assertIn("unknown managed host", main.delete_managed_host("vm1"))
+
+
+    def test_undriven_host_is_deleted_only_when_its_record_is_off(self):
+        # an unknown provider after a restart: no controller, but the record may name a
+        # billing instance — deleting would erase the only pointer to it (and the token)
+        store.set_managed_host("pod", _host(provider="runpod"))
+        with self.assertLogs("main", "WARNING"):
+            main.sync_host_controllers()
+        self.assertNotIn("pod", main.host_controllers)
+        main._host_save_state("pod", {"phase": "ready", "uuid": "u1"})
+        self.assertIn("u1", main.delete_managed_host("pod"))
+        main._host_save_state("pod", {"phase": "failed", "index": "4"})
+        self.assertIsNotNone(main.delete_managed_host("pod"))
+        main._host_save_state("pod", {"phase": "off", "pending_snapshot": "s3"})
+        self.assertIn("s3", main.delete_managed_host("pod"))
+        store.set_settings({"host_state": ["garbage"]})
+        self.assertIn("unreadable", main.delete_managed_host("pod"))
+        self.assertIn("pod", store.get_managed_hosts())
+        store.set_settings({"host_state": {"pod": {"phase": "off"}}})
+        self.assertEqual(main.delete_managed_host("pod"), "")
+        self.assertEqual(store.get_managed_hosts(), {})
+        # never had a record at all: nothing to lose
+        store.set_managed_host("pod2", _host(provider="runpod"))
+        self.assertEqual(main.delete_managed_host("pod2"), "")
 
 
 class AutoTemplate(unittest.IsolatedAsyncioTestCase):

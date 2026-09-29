@@ -5937,6 +5937,13 @@ def _pick_local_port(bid: str, cur, host: str, rows: list) -> int:
         if backend_id(b) != bid and _lport_ok(b.get("local_port")):
             used.add(b["local_port"])
     live = {backend_id(b) for b in backends}
+    # a port a controller FORWARDS for this very backend (its service list of the last
+    # sync) is its, whoever else's row claims it: resolving the clash by list order
+    # could move a RUNNING service's forward (and URL) for a hand-edited row
+    if _lport_ok(cur) and any(
+            hostctl.service_bid(x) == bid and x.get("local_port") == cur
+            for c in host_controllers.values() for x in getattr(c, "services", []) or []):
+        return cur
     for hn, c in host_controllers.items():
         if hn == host:
             continue
@@ -6466,7 +6473,11 @@ def sync_host_controllers() -> None:
         try:
             _sync_one_host(name, dict(entry, name=name), attached[name])
         except Exception as e:
-            _host_error(name, f"not driven: {type(e).__name__}: {e}")
+            # the entry holds the provider token, and this text reaches /health and the
+            # console: the token is redacted, the message clipped
+            msg = hostctl._redact(str(e), str(entry.get("api_key") or ""))
+            msg = msg if len(msg) <= 200 else msg[:200] + "…"
+            _host_error(name, f"not driven: {type(e).__name__}: {msg}")
     for hn in [n for n in host_controllers if n not in managed_hosts]:
         c = host_controllers[hn]
         if _host_idle_off(c):
@@ -6820,7 +6831,12 @@ def save_managed_host(name: str, entry: dict, new: bool) -> str:
         return why
     if not store.is_active():
         return "the store is not active — not saved"
-    store.set_managed_host(name, entry)
+    # the store holds validated values only: the provider's own normalization ("auto"
+    # stored as "", every key present, ints as ints) — never what the caller typed
+    prov = hostapi.provider(entry.get("provider"))
+    opts = entry.get("options") if isinstance(entry.get("options"), dict) else {}
+    norm = prov[0].options_of({f"opt__{k}": v for k, v in opts.items()})[0]
+    store.set_managed_host(name, dict(entry, options=norm))
     apply_managed_hosts()
     return ""
 
@@ -6841,6 +6857,26 @@ def managed_host_delete_refusal(name: str) -> Optional[str]:
                 "delete them first")
     c = host_controllers.get(name)
     if c is None:
+        # no controller (an unknown provider: never driven) — the stored record is the
+        # ONLY pointer to an instance or a snapshot being taken, and the token leaves
+        # with the entry, so nothing could even list them as orphans afterwards
+        try:
+            rec = _host_load_state(name)
+        except Exception as e:
+            return (f"the state record of {name} is unreadable ({type(e).__name__}) — "
+                    "an instance may still run; not deleted")
+        if rec is None:
+            return None
+        if not isinstance(rec, dict):
+            return f"the state record of {name} is unreadable — not deleted"
+        if (rec.get("phase") != "off" or rec.get("uuid") or rec.get("index")
+                or rec.get("pending_snapshot")):
+            what = (f"snapshot {rec.get('pending_snapshot')} is still being taken"
+                    if rec.get("phase") == "off" and not (rec.get("uuid") or rec.get("index"))
+                    else f"its record names an instance ({rec.get('phase')}, "
+                         f"{rec.get('uuid') or rec.get('index')})")
+            return (f"{name} is not driven and {what} — make the host drivable and stop "
+                    "it first; not deleted")
         return None
     if c.op is not None:
         return f"{name} is busy ({c.op}) — delete it once it is off"
