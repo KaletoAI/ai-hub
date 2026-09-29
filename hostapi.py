@@ -182,7 +182,7 @@ class ThunderApi(ProviderApi):
         if not out["index"] and not out["uuid"]:
             # the instance may exist and bill anyway — the orphan list is where it shows
             # the body goes into the log and the fault log: an echoed token must not
-            raise thunder.ThunderError(
+            raise self.Error(
                 self._redact(f"create answered without identifier/uuid: {d}")[:_ERR_MAX], None)
         return out
 
@@ -207,18 +207,18 @@ class ThunderApi(ProviderApi):
         idx, uuid = item.get("index"), item.get("uuid")
         inst = str(idx) if idx is not None and str(idx) != "" else str(uuid or "")
         if not inst:
-            raise thunder.ThunderError("instance has neither index nor uuid", None)
+            raise self.Error("instance has neither index nor uuid", None)
         d = await self._call("POST", "/snapshots/create", {"instanceId": inst, "name": name})
         sid = str((d or {}).get("id") or "") if isinstance(d, dict) else ""
         if not sid:
-            raise thunder.ThunderError(
+            raise self.Error(
                 self._redact(f"snapshot create answered without id: {d}")[:_ERR_MAX], None)
         return sid
 
     async def delete_snapshot(self, sid: str) -> None:
         """404 = already gone → fine (rotation is re-run after a restart)."""
         if not sid:
-            raise thunder.ThunderError("empty snapshot id", None)
+            raise self.Error("empty snapshot id", None)
         r = await self._req("DELETE", f"/snapshots/{_q(sid)}")
         if r.status_code != 404:
             self._check(r)

@@ -41,7 +41,8 @@ STOP_MODE = "snapshot"
 DEFAULT_TEMPLATE_NO_COMFY = "base"
 # The ComfyUI revision the bootstrap pins (the k12-gpu build). A FULL sha only: the
 # bootstrap's fetch-by-sha fallback needs it and exits 2 on anything else — after the
-# instance was already created and billed. (admin._THUNDER_COMMIT_DEFAULT, pinned equal.)
+# instance was already created and billed. (admin._THUNDER_COMMIT_DEFAULT, _THUNDER_GPUS
+# and _THUNDER_TEMPLATES are pinned equal to these until the console reads them.)
 COMFY_COMMIT_DEFAULT = "1d61dcc35c35541388c0001bacc7703db14e8bea"
 GPU_TYPES = ("a6000", "l40", "a100xl", "h100")
 TEMPLATES = ("comfy-ui", "base")
@@ -77,63 +78,74 @@ _WHOLE_RE = re.compile(r"[0-9]+")
 
 def _form_str(v) -> str:
     """A form value as the string a browser would have sent. A form built by code may
-    carry an int; anything else unreadable is blank (= the default), never a raise."""
+    carry an int or a float; those are VALIDATED as their string (a 1.5 is an error,
+    not a silent default). Only None and a bool (an unchecked/checked box) read as
+    blank; `str()` of anything else never raises for the types a form carries."""
     if isinstance(v, bool) or v is None:
         return ""
-    if isinstance(v, (str, int)):
+    try:
         return str(v).strip()
-    return ""
+    except Exception:                   # a pathological __str__: still never a raise
+        return "?"
 
 
-def options_of(form) -> tuple[dict, list]:
-    """The `opt__<key>` values of the host form → `(options, errors)`. Validated, never
-    raising: blank or absent is the ONE "unset" and takes the field's default; an int
-    must be whole digits (`1.5`, `-1`, `1e3`, `+2` are errors, never a silent int — the
-    console's `_int_field` rule), at least the field's `min`; a select one of its
-    choices; `comfy_commit` a full 40-hex sha (the bootstrap exits 2 on anything else,
-    after the instance was paid for). A field in error keeps what was TYPED, so the form
-    re-renders it — options with a non-empty error list must never be stored.
-    `nodes` becomes a list of lines (trailing blank lines dropped, like a textarea's
-    final newline); a list is taken as the lines."""
+def options_of(form) -> tuple[dict, list, dict]:
+    """The `opt__<key>` values of the host form → `(options, errors, typed)`. Never
+    raises. `options` holds a VALID value on every key, always — the parsed value, or
+    the field's default where the field is blank, absent or in error — so whatever a
+    caller stores or hands to `create_body` is never a typo (a stored "rtx9090" would
+    become the gpu_type, a "0" vcpus a 422 after the start began). `errors` names each
+    refused field; `typed` is what the form carried, as strings, for re-rendering the
+    form as typed (only keys the form sent). Rules: blank/absent is the ONE "unset"; an
+    int must be whole digits (`1.5`, `-1`, `1e3`, `+2` are errors — the console's
+    `_int_field` rule) and at least the field's `min`; a select one of its choices;
+    `comfy_commit` a full 40-hex sha (the bootstrap exits 2 on anything else, after the
+    instance was paid for). `nodes` becomes a list of lines (trailing blank lines
+    dropped, like a textarea's final newline); a list is taken as the lines."""
     form = form if isinstance(form, dict) else {}
-    out, errors = {}, []
+    out, errors, typed = {}, [], {}
     for fld in OPTION_FIELDS:
         k, t, default = fld["key"], fld["type"], fld["default"]
-        raw = form.get(f"opt__{k}")
+        dflt = list(default) if isinstance(default, list) else default
+        name = f"opt__{k}"
+        raw = form.get(name)
         if t == "textarea":
             if isinstance(raw, (list, tuple)):
-                lines = [str(x).rstrip() for x in raw]
+                lines = [_form_str(x) if not isinstance(x, str) else x.rstrip() for x in raw]
             elif isinstance(raw, str):
                 lines = [ln.rstrip() for ln in raw.splitlines()]
             else:
-                lines = []
+                lines = [ln.rstrip() for ln in _form_str(raw).splitlines()]
             while lines and not lines[-1].strip():
                 lines.pop()
-            out[k] = lines if lines else list(default)
+            if name in form:
+                typed[k] = "\n".join(lines)
+            out[k] = lines if lines else dflt
             continue
         s = _form_str(raw)
+        if name in form:
+            typed[k] = s
+        out[k] = dflt
         if not s:
-            out[k] = list(default) if isinstance(default, list) else default
             continue
         if t == "int":
             lo = fld.get("min", 0)
-            if not _WHOLE_RE.fullmatch(s) or int(s) < lo:
+            if _WHOLE_RE.fullmatch(s) and int(s) >= lo:
+                out[k] = int(s)
+            else:
                 errors.append(f"{fld['label']}: '{s}' is not a whole number ≥ {lo}")
+        elif t == "select":
+            if s in fld["choices"]:
                 out[k] = s
             else:
-                out[k] = int(s)
-        elif t == "select":
-            if s not in fld["choices"]:
                 errors.append(f"{fld['label']}: '{s}' is not one of "
                               f"{', '.join(fld['choices'])}")
-            out[k] = s
         elif k == "comfy_commit" and not _COMMIT_RE.fullmatch(s):
             errors.append(f"{fld['label']}: '{s}' is not a full 40-hex commit sha "
                           "(blank = the default pin)")
-            out[k] = s
         else:
             out[k] = s
-    return out, errors
+    return out, errors, typed
 
 _GB = 1024 ** 3
 _GONE = {"DELETED", "TERMINATED", "DELETING"}

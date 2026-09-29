@@ -5,7 +5,6 @@ unchanged — every one guards a rule whose failure is silent or costs money: an
 tried before the uuid can delete a STRANGER's instance, a token echoed into an error
 lands in the panel and the fault log, a price list fetched per view hammers the API.
 run: venv/bin/python -m unittest tests.test_hostapi -v"""
-import json
 import unittest
 
 import httpx
@@ -13,78 +12,7 @@ import httpx
 import hostapi
 import thunder
 import thunderctl
-
-
-class FakeThunder:
-    """Scripted Thunder REST API: instances, snapshots, port forwards."""
-    def __init__(self):
-        self.instances = {}          # index -> item
-        self.snaps = []
-        self.calls = []
-        self.next_index = 0
-        self.status_script = ["PROVISIONING", "RUNNING"]
-        self.http_ports_on_create = []
-        self.delete_by = "index"     # which id form /delete accepts
-        self.ignore_port_remove = False   # a /ports PATCH that answers 200 and changes nothing
-        self.storage = {"min": 100, "max": 500}   # /v2/specs storageGB of a6000_x1
-        self.on_modify = None        # callback(old_gb, new_gb) — the VM's disk grows
-
-    def handler(self, req: httpx.Request) -> httpx.Response:
-        p, m = req.url.path, req.method
-        self.calls.append((m, p, json.loads(req.content) if req.content else None))
-        if p == "/instances/list":
-            for it in self.instances.values():
-                if self.status_script:
-                    it["status"] = self.status_script.pop(0)
-            return httpx.Response(200, json=self.instances)
-        if p == "/instances/create":
-            idx = str(self.next_index); self.next_index += 1
-            self.instances[idx] = {"uuid": f"u{idx}", "status": "PROVISIONING", "ip": "10.0.0.5",
-                                   "port": 30022, "httpPorts": list(self.http_ports_on_create),
-                                   "disk_size_gb": json.loads(req.content).get("disk_size_gb", 0)}
-            return httpx.Response(201, json={"identifier": int(idx), "uuid": f"u{idx}", "key": ""})
-        if p.endswith("/delete"):
-            ident = p.split("/")[2]
-            key = ident if self.delete_by == "index" else next((k for k, v in self.instances.items() if v["uuid"] == ident), None)
-            if key not in self.instances:
-                return httpx.Response(404, json={"error": "not_found"})
-            del self.instances[key]
-            return httpx.Response(200, json={"message": "ok"})
-        if p.endswith("/ports"):
-            ident = p.split("/")[2]
-            body = json.loads(req.content)
-            if ident not in self.instances:           # uuid form tried first (Ruling 11)
-                return httpx.Response(404, json={"error": "not_found"})
-            it = self.instances[ident]
-            if not self.ignore_port_remove:
-                it["httpPorts"] = [x for x in it["httpPorts"] if x not in body.get("remove_ports", [])]
-            return httpx.Response(200, json={})
-        if p.endswith("/modify"):
-            ident = p.split("/")[2]
-            body = json.loads(req.content)
-            if ident not in self.instances:           # uuid form tried first (Ruling 11)
-                return httpx.Response(404, json={"error": "not_found"})
-            it = self.instances[ident]
-            old = it.get("disk_size_gb", 0)
-            it["disk_size_gb"] = body.get("disk_size_gb")
-            if self.on_modify is not None:
-                self.on_modify(old, body.get("disk_size_gb"))
-            return httpx.Response(200, json={})
-        if p == "/snapshots/create":
-            body = json.loads(req.content)
-            sid = f"s{len(self.snaps)}"
-            self.snaps.append({"id": sid, "name": body["name"], "status": "CREATING", "minimumDiskSizeGb": 120, "createdAt": len(self.snaps) + 1})
-            return httpx.Response(202, json={"id": sid, "message": "ok"})
-        if p == "/snapshots/list":
-            return httpx.Response(200, json=self.snaps)
-        if p.startswith("/snapshots/") and m == "DELETE":
-            self.snaps = [s for s in self.snaps if s["id"] != p.split("/")[2]]
-            return httpx.Response(200, json={})
-        if p == "/v2/pricing":
-            return httpx.Response(200, json={"pricing": {"a6000_x1": 0.35, "additional_vcpus": 0.04, "disk_gb": 0.0003, "snapshot_gb": 0.00006849}})
-        if p == "/v2/specs":
-            return httpx.Response(200, json={"specs": {"a6000_x1": {"vcpuOptions": [6, 8], "storageGB": dict(self.storage)}}})
-        return httpx.Response(404)
+from tests.fakes import FakeThunder  # the scripted Thunder REST API
 
 
 def _api(fake, **kw):
@@ -306,6 +234,21 @@ class Base(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cm.exception.status, 403)
 
 
+    async def test_provider_without_item_path_is_refused(self):
+        # an empty ITEM_PATH would send the call to the API root — no request at all
+        seen = []
+
+        class NoPath(hostapi.ProviderApi):
+            API = "https://pods.example"
+            Error = Base._Err
+        api = NoPath(httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda req: seen.append(req) or httpx.Response(200))), "tok")
+        with self.assertRaises(Base._Err) as cm:
+            await api._by_id("POST", {"uuid": "u1"}, "stop")
+        self.assertIn("NoPath has no ITEM_PATH", str(cm.exception))
+        self.assertEqual(seen, [])
+
+
 class Registry(unittest.TestCase):
     def test_registry_has_thunder(self):
         self.assertEqual(hostapi.PROVIDERS["thunder"], (thunder, hostapi.ThunderApi))
@@ -354,7 +297,7 @@ class OptionFields(unittest.TestCase):
             def get(self, k, d=None):
                 read.add(k)
                 return super().get(k, d)
-        opts, errs = thunder.options_of({})
+        opts, errs, _ = thunder.options_of({})
         self.assertEqual(errs, [])
         body = thunder.create_body(Rec(opts), "comfy-ui", 120, "ssh-ed25519 AAAA")
         self.assertTrue(read)
@@ -364,64 +307,100 @@ class OptionFields(unittest.TestCase):
         self.assertLessEqual({"bootstrap_template", "reserve_gb", "comfy_commit", "nodes"},
                              set(self._fields()))
 
+    def _assert_valid(self, opts):
+        """Every key valid, whatever the form said: what a caller stores or hands to
+        create_body must never be a typo."""
+        f = self._fields()
+        self.assertEqual(set(opts), set(f))
+        for k, fld in f.items():
+            v = opts[k]
+            if fld["type"] == "int":
+                self.assertIsInstance(v, int, k)
+                self.assertNotIsInstance(v, bool, k)
+                self.assertGreaterEqual(v, fld["min"], k)
+            elif fld["type"] == "select":
+                self.assertIn(v, fld["choices"], k)
+            elif fld["type"] == "textarea":
+                self.assertIsInstance(v, list, k)
+            elif k == "comfy_commit":
+                self.assertRegex(v, r"^[0-9a-fA-F]{40}$")
+        thunder.create_body(opts, opts["bootstrap_template"], 100, "k")   # never raises
+
     def test_options_of_defaults(self):
-        opts, errs = thunder.options_of({})
-        self.assertEqual(errs, [])
+        opts, errs, typed = thunder.options_of({})
+        self.assertEqual((errs, typed), ([], {}))
         self.assertEqual(opts, {k: f["default"] for k, f in self._fields().items()})
         self.assertRegex(opts["comfy_commit"], r"^[0-9a-f]{40}$")
         # blank is the one "unset" — it takes the default like an absent field
         blank = {f"opt__{k}": "" for k in self._fields()}
-        self.assertEqual(thunder.options_of(blank), (opts, []))
+        bopts, berrs, btyped = thunder.options_of(blank)
+        self.assertEqual((bopts, berrs), (opts, []))
+        self.assertEqual(btyped, {k: "" for k in self._fields()})
+        # the default list is a COPY: a caller appending to it must not change the field
+        opts["nodes"].append("x")
+        self.assertEqual(thunder.options_of({})[0]["nodes"], [])
 
     def test_options_of_reads_values(self):
         sha = "ab" * 20
-        opts, errs = thunder.options_of({
-            "opt__gpu_type": "h100", "opt__num_gpus": " 2 ", "opt__vcpus": "16",
-            "opt__bootstrap_template": "base", "opt__reserve_gb": "0",
-            "opt__comfy_commit": sha, "opt__nodes": "https://x/a.git@1\n\nregistry:b@2\n\n"})
+        form = {"opt__gpu_type": "h100", "opt__num_gpus": " 2 ", "opt__vcpus": "16",
+                "opt__bootstrap_template": "base", "opt__reserve_gb": "0",
+                "opt__comfy_commit": sha, "opt__nodes": "https://x/a.git@1\n\nregistry:b@2\n\n"}
+        opts, errs, typed = thunder.options_of(form)
         self.assertEqual(errs, [])
         self.assertEqual(opts, {"gpu_type": "h100", "num_gpus": 2, "vcpus": 16,
                                 "bootstrap_template": "base", "reserve_gb": 0,
                                 "comfy_commit": sha,
                                 "nodes": ["https://x/a.git@1", "", "registry:b@2"]})
+        self.assertEqual(typed["num_gpus"], "2")
+        self.assertEqual(typed["nodes"], "https://x/a.git@1\n\nregistry:b@2")
 
     def test_options_of_validates(self):
-        opts, errs = thunder.options_of({"opt__comfy_commit": "1d61dcc", "opt__vcpus": "0",
-                                         "opt__gpu_type": "rtx9090"})
+        opts, errs, typed = thunder.options_of({"opt__comfy_commit": "1d61dcc",
+                                                "opt__vcpus": "0", "opt__gpu_type": "rtx9090"})
         self.assertEqual(len(errs), 3, errs)
         joined = " ".join(errs)
         for word in ("commit", "vcpus", "rtx9090"):
             self.assertIn(word, joined)
-        # what was typed stays, so the form re-renders it instead of an empty field
-        self.assertEqual((opts["comfy_commit"], opts["vcpus"], opts["gpu_type"]),
-                         ("1d61dcc", "0", "rtx9090"))
-        # untouched fields still carry their defaults
-        self.assertEqual(opts["num_gpus"], 1)
+        # the refused fields are their DEFAULTS in options — never the typo …
+        self._assert_valid(opts)
+        self.assertEqual(opts, thunder.options_of({})[0])
+        # … and what was typed comes back separately, for the form to re-render
+        self.assertEqual(typed, {"comfy_commit": "1d61dcc", "vcpus": "0", "gpu_type": "rtx9090"})
         # a whole number only: "1.5", "-1", "1e3", "+2" are errors, never a silent int
-        for bad in ("1.5", "-1", "1e3", "+2", "x", "1_000"):
-            _, errs = thunder.options_of({"opt__num_gpus": bad})
+        for bad in ("1.5", "-1", "1e3", "+2", "x", "1_000", 1.5, 2.0):
+            o, errs, t = thunder.options_of({"opt__num_gpus": bad})
             self.assertEqual(len(errs), 1, bad)
-        _, errs = thunder.options_of({"opt__reserve_gb": "-1"})
-        self.assertEqual(len(errs), 1)
-        _, errs = thunder.options_of({"opt__num_gpus": "0"})
-        self.assertEqual(len(errs), 1)
-        _, errs = thunder.options_of({"opt__bootstrap_template": "windows"})
-        self.assertEqual(len(errs), 1)
+            self.assertEqual(o["num_gpus"], 1, bad)
+            self.assertEqual(t["num_gpus"], str(bad), bad)
+        for form in ({"opt__reserve_gb": "-1"}, {"opt__num_gpus": "0"},
+                     {"opt__bootstrap_template": "windows"}):
+            o, errs, _ = thunder.options_of(form)
+            self.assertEqual(len(errs), 1, form)
+            self._assert_valid(o)
 
     def test_options_of_never_raises(self):
         for form in (None, [], "x", {"opt__vcpus": 8}, {"opt__nodes": ["a", "b"]},
                      {"opt__gpu_type": None}, {"opt__num_gpus": object()},
-                     {"opt__nodes": 5}):
-            opts, errs = thunder.options_of(form)
-            self.assertIsInstance(opts, dict)
+                     {"opt__nodes": 5}, {"opt__vcpus": [8]}, {"opt__gpu_type": {"a": 1}},
+                     {"opt__nodes": [None, 3, "c"]}):
+            opts, errs, typed = thunder.options_of(form)
+            self._assert_valid(opts)
             self.assertIsInstance(errs, list)
+            self.assertIsInstance(typed, dict)
         # an int (a form built by code, not a browser) is read as its string
-        self.assertEqual(thunder.options_of({"opt__vcpus": 8}), (thunder.options_of({})[0], []))
+        self.assertEqual(thunder.options_of({"opt__vcpus": 8})[:2], (thunder.options_of({})[0], []))
         self.assertEqual(thunder.options_of({"opt__nodes": ["a", "b"]})[0]["nodes"], ["a", "b"])
+        # anything else is validated as its string, never silently the default
+        self.assertEqual(len(thunder.options_of({"opt__num_gpus": object()})[1]), 1)
+        self.assertEqual(len(thunder.options_of({"opt__vcpus": [8]})[1]), 1)
 
-    def test_default_commit_matches_the_console_pin(self):
+    def test_lists_match_the_console_until_it_switches(self):
+        # admin.py still renders its own copies; a drift means the form offers (or
+        # re-saves) a value options_of refuses, or hides one it accepts
         import admin
         self.assertEqual(self._fields()["comfy_commit"]["default"], admin._THUNDER_COMMIT_DEFAULT)
+        self.assertEqual(tuple(thunder.GPU_TYPES), tuple(admin._THUNDER_GPUS))
+        self.assertEqual(tuple(thunder.TEMPLATES), tuple(admin._THUNDER_TEMPLATES))
 
 
 if __name__ == "__main__":

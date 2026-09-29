@@ -17,7 +17,7 @@ import modelsync as ms
 import sshrun
 import thunder
 import thunderctl
-from tests.test_hostapi import FakeThunder  # the scripted Thunder REST API
+from tests.fakes import FakeThunder  # the scripted Thunder REST API
 
 
 COMMIT = "1d61dcc35c35541388c0001bacc7703db14e8bea"
