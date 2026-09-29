@@ -26,6 +26,115 @@ from typing import Optional
 
 API = "https://api.thundercompute.com:8443"
 
+# ---- provider interface ---------------------------------------------------------------
+# The names every provider module exports (duck-typed like meshy.py/tripo.py; the API
+# class lives in hostapi.py, the registry there too). A second provider (RunPod) is a
+# module with these same names — the host controller and the console read nothing else.
+KIND = "thunder"                      # the key in hostapi.PROVIDERS and a host entry
+NAME = "Thunder Compute"              # what the console shows
+SSH_USER = "ubuntu"                   # the login on every instance of every template
+# Thunder has no stop: "stop" is snapshot → delete, "start" a create from the snapshot.
+# ("native" = the provider stops the machine and keeps its disk — RunPod.)
+STOP_MODE = "snapshot"
+# The template a host starts from when no ComfyUI service is attached: `comfy-ui`
+# carries a ComfyUI install nobody would use (and whose port the guard then watches).
+DEFAULT_TEMPLATE_NO_COMFY = "base"
+# The ComfyUI revision the bootstrap pins (the k12-gpu build). A FULL sha only: the
+# bootstrap's fetch-by-sha fallback needs it and exits 2 on anything else — after the
+# instance was already created and billed. (admin._THUNDER_COMMIT_DEFAULT, pinned equal.)
+COMFY_COMMIT_DEFAULT = "1d61dcc35c35541388c0001bacc7703db14e8bea"
+GPU_TYPES = ("a6000", "l40", "a100xl", "h100")
+TEMPLATES = ("comfy-ui", "base")
+
+# The host form as data (read by `options_of`, rendered by the console). `min` bounds an
+# int; every field has a default, which is also what an absent or blank field becomes.
+OPTION_FIELDS: list = [
+    {"key": "gpu_type", "label": "gpu", "type": "select", "choices": list(GPU_TYPES),
+     "default": "a6000",
+     "hint": "The GPU of the instance; its price per hour comes from Thunder's price list."},
+    {"key": "num_gpus", "label": "gpus", "type": "int", "min": 1, "default": 1,
+     "hint": "GPUs per instance; each one includes 100 GB of disk."},
+    {"key": "vcpus", "label": "vcpus", "type": "int", "min": 1, "default": 8,
+     "hint": "vCPUs; every one above the GPU configuration's smallest option is billed "
+             "extra."},
+    {"key": "bootstrap_template", "label": "template", "type": "select",
+     "choices": list(TEMPLATES), "default": "comfy-ui",
+     "hint": "Thunder's image for the FIRST start (later starts restore the snapshot). "
+             "<code>base</code> when no ComfyUI runs on this host."},
+    {"key": "reserve_gb", "label": "disk reserve GB", "type": "int", "min": 0, "default": 20,
+     "hint": "Free space kept on top of the models and the install. Disks only grow."},
+    {"key": "comfy_commit", "label": "ComfyUI commit", "type": "text",
+     "default": COMFY_COMMIT_DEFAULT,
+     "hint": "A full 40-hex sha (blank = the default pin)."},
+    {"key": "nodes", "label": "custom nodes", "type": "textarea", "default": [],
+     "hint": "One node pack per line: <code>&lt;git-url&gt;@&lt;commit&gt;</code> or "
+             "<code>registry:&lt;id&gt;@&lt;version&gt;</code>; <code>#</code> comments and "
+             "blank lines are ignored. Empty = the default list at bootstrap time."},
+]
+_COMMIT_RE = re.compile(r"[0-9a-fA-F]{40}")
+_WHOLE_RE = re.compile(r"[0-9]+")
+
+
+def _form_str(v) -> str:
+    """A form value as the string a browser would have sent. A form built by code may
+    carry an int; anything else unreadable is blank (= the default), never a raise."""
+    if isinstance(v, bool) or v is None:
+        return ""
+    if isinstance(v, (str, int)):
+        return str(v).strip()
+    return ""
+
+
+def options_of(form) -> tuple[dict, list]:
+    """The `opt__<key>` values of the host form → `(options, errors)`. Validated, never
+    raising: blank or absent is the ONE "unset" and takes the field's default; an int
+    must be whole digits (`1.5`, `-1`, `1e3`, `+2` are errors, never a silent int — the
+    console's `_int_field` rule), at least the field's `min`; a select one of its
+    choices; `comfy_commit` a full 40-hex sha (the bootstrap exits 2 on anything else,
+    after the instance was paid for). A field in error keeps what was TYPED, so the form
+    re-renders it — options with a non-empty error list must never be stored.
+    `nodes` becomes a list of lines (trailing blank lines dropped, like a textarea's
+    final newline); a list is taken as the lines."""
+    form = form if isinstance(form, dict) else {}
+    out, errors = {}, []
+    for fld in OPTION_FIELDS:
+        k, t, default = fld["key"], fld["type"], fld["default"]
+        raw = form.get(f"opt__{k}")
+        if t == "textarea":
+            if isinstance(raw, (list, tuple)):
+                lines = [str(x).rstrip() for x in raw]
+            elif isinstance(raw, str):
+                lines = [ln.rstrip() for ln in raw.splitlines()]
+            else:
+                lines = []
+            while lines and not lines[-1].strip():
+                lines.pop()
+            out[k] = lines if lines else list(default)
+            continue
+        s = _form_str(raw)
+        if not s:
+            out[k] = list(default) if isinstance(default, list) else default
+            continue
+        if t == "int":
+            lo = fld.get("min", 0)
+            if not _WHOLE_RE.fullmatch(s) or int(s) < lo:
+                errors.append(f"{fld['label']}: '{s}' is not a whole number ≥ {lo}")
+                out[k] = s
+            else:
+                out[k] = int(s)
+        elif t == "select":
+            if s not in fld["choices"]:
+                errors.append(f"{fld['label']}: '{s}' is not one of "
+                              f"{', '.join(fld['choices'])}")
+            out[k] = s
+        elif k == "comfy_commit" and not _COMMIT_RE.fullmatch(s):
+            errors.append(f"{fld['label']}: '{s}' is not a full 40-hex commit sha "
+                          "(blank = the default pin)")
+            out[k] = s
+        else:
+            out[k] = s
+    return out, errors
+
 _GB = 1024 ** 3
 _GONE = {"DELETED", "TERMINATED", "DELETING"}
 _HOURS_PER_MONTH = 730          # Thunder bills snapshots per GB·hour; 730 h ≈ one month

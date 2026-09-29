@@ -17,78 +17,7 @@ import modelsync as ms
 import sshrun
 import thunder
 import thunderctl
-
-
-class FakeThunder:
-    """Scripted Thunder REST API: instances, snapshots, port forwards."""
-    def __init__(self):
-        self.instances = {}          # index -> item
-        self.snaps = []
-        self.calls = []
-        self.next_index = 0
-        self.status_script = ["PROVISIONING", "RUNNING"]
-        self.http_ports_on_create = []
-        self.delete_by = "index"     # which id form /delete accepts
-        self.ignore_port_remove = False   # a /ports PATCH that answers 200 and changes nothing
-        self.storage = {"min": 100, "max": 500}   # /v2/specs storageGB of a6000_x1
-        self.on_modify = None        # callback(old_gb, new_gb) — the VM's disk grows
-
-    def handler(self, req: httpx.Request) -> httpx.Response:
-        p, m = req.url.path, req.method
-        self.calls.append((m, p, json.loads(req.content) if req.content else None))
-        if p == "/instances/list":
-            for it in self.instances.values():
-                if self.status_script:
-                    it["status"] = self.status_script.pop(0)
-            return httpx.Response(200, json=self.instances)
-        if p == "/instances/create":
-            idx = str(self.next_index); self.next_index += 1
-            self.instances[idx] = {"uuid": f"u{idx}", "status": "PROVISIONING", "ip": "10.0.0.5",
-                                   "port": 30022, "httpPorts": list(self.http_ports_on_create),
-                                   "disk_size_gb": json.loads(req.content).get("disk_size_gb", 0)}
-            return httpx.Response(201, json={"identifier": int(idx), "uuid": f"u{idx}", "key": ""})
-        if p.endswith("/delete"):
-            ident = p.split("/")[2]
-            key = ident if self.delete_by == "index" else next((k for k, v in self.instances.items() if v["uuid"] == ident), None)
-            if key not in self.instances:
-                return httpx.Response(404, json={"error": "not_found"})
-            del self.instances[key]
-            return httpx.Response(200, json={"message": "ok"})
-        if p.endswith("/ports"):
-            ident = p.split("/")[2]
-            body = json.loads(req.content)
-            if ident not in self.instances:           # uuid form tried first (Ruling 11)
-                return httpx.Response(404, json={"error": "not_found"})
-            it = self.instances[ident]
-            if not self.ignore_port_remove:
-                it["httpPorts"] = [x for x in it["httpPorts"] if x not in body.get("remove_ports", [])]
-            return httpx.Response(200, json={})
-        if p.endswith("/modify"):
-            ident = p.split("/")[2]
-            body = json.loads(req.content)
-            if ident not in self.instances:           # uuid form tried first (Ruling 11)
-                return httpx.Response(404, json={"error": "not_found"})
-            it = self.instances[ident]
-            old = it.get("disk_size_gb", 0)
-            it["disk_size_gb"] = body.get("disk_size_gb")
-            if self.on_modify is not None:
-                self.on_modify(old, body.get("disk_size_gb"))
-            return httpx.Response(200, json={})
-        if p == "/snapshots/create":
-            body = json.loads(req.content)
-            sid = f"s{len(self.snaps)}"
-            self.snaps.append({"id": sid, "name": body["name"], "status": "CREATING", "minimumDiskSizeGb": 120, "createdAt": len(self.snaps) + 1})
-            return httpx.Response(202, json={"id": sid, "message": "ok"})
-        if p == "/snapshots/list":
-            return httpx.Response(200, json=self.snaps)
-        if p.startswith("/snapshots/") and m == "DELETE":
-            self.snaps = [s for s in self.snaps if s["id"] != p.split("/")[2]]
-            return httpx.Response(200, json={})
-        if p == "/v2/pricing":
-            return httpx.Response(200, json={"pricing": {"a6000_x1": 0.35, "additional_vcpus": 0.04, "disk_gb": 0.0003, "snapshot_gb": 0.00006849}})
-        if p == "/v2/specs":
-            return httpx.Response(200, json={"specs": {"a6000_x1": {"vcpuOptions": [6, 8], "storageGB": dict(self.storage)}}})
-        return httpx.Response(404)
+from tests.test_hostapi import FakeThunder  # the scripted Thunder REST API
 
 
 COMMIT = "1d61dcc35c35541388c0001bacc7703db14e8bea"
@@ -186,11 +115,6 @@ class _NoTunnel:
 
     async def stop(self):
         self.running = False
-
-
-def _api(fake, **kw):
-    return thunderctl.ThunderApi(
-        httpx.AsyncClient(transport=httpx.MockTransport(fake.handler)), "tok", **kw)
 
 
 class Persistence(unittest.IsolatedAsyncioTestCase):
@@ -354,144 +278,6 @@ class TokenHygiene(unittest.IsolatedAsyncioTestCase):
                             ("saved", json.dumps(saved)),
                             ("log", "\n".join(c.state.log))):
             self.assertNotIn(token, text, where)
-
-
-class Api(unittest.IsolatedAsyncioTestCase):
-    async def test_api_delete_falls_back_to_index(self):
-        # uuid first (Ruling 11: a stale index can name a stranger's instance)
-        fake = FakeThunder()
-        fake.delete_by = "index"
-        fake.instances["0"] = {"uuid": "u0", "status": "RUNNING"}
-        await _api(fake).delete({"index": "0", "uuid": "u0"})
-        self.assertEqual(fake.instances, {})
-        paths = [p for _, p, _ in fake.calls]
-        self.assertEqual(paths, ["/instances/u0/delete", "/instances/0/delete"])
-
-    async def test_api_delete_by_uuid_never_touches_index(self):
-        fake = FakeThunder()
-        fake.delete_by = "uuid"
-        fake.instances["0"] = {"uuid": "u0", "status": "RUNNING"}
-        await _api(fake).delete({"index": "0", "uuid": "u0"})
-        self.assertEqual([p for _, p, _ in fake.calls], ["/instances/u0/delete"])
-
-    async def test_int_index_zero_is_kept(self):
-        # `item.get("index") or ""` dropped index 0
-        fake = FakeThunder()
-        fake.instances["0"] = {"uuid": "u0", "status": "RUNNING"}
-        await _api(fake).delete({"index": 0, "uuid": ""})
-        self.assertEqual([p for _, p, _ in fake.calls], ["/instances/0/delete"])
-
-    async def test_api_delete_both_404_is_ok(self):
-        fake = FakeThunder()
-        await _api(fake).delete({"index": "3", "uuid": "u3"})   # already gone
-        self.assertEqual(len(fake.calls), 2)
-
-    async def test_api_non_2xx_raises_thundererror_with_status(self):
-        def handler(req):
-            return httpx.Response(401, text="unauthorized " + "x" * 1000)
-        api = thunderctl.ThunderApi(httpx.AsyncClient(transport=httpx.MockTransport(handler)), "tok")
-        with self.assertRaises(thunder.ThunderError) as cm:
-            await api.list_instances()
-        self.assertEqual(cm.exception.status, 401)
-        self.assertIn("unauthorized", str(cm.exception))
-        self.assertLessEqual(len(str(cm.exception)), 300)
-
-    async def test_transport_error_is_thundererror_without_status(self):
-        def handler(req):
-            raise httpx.ConnectError("")          # empty str(e), like a real one can be
-        api = thunderctl.ThunderApi(httpx.AsyncClient(transport=httpx.MockTransport(handler)), "tok")
-        with self.assertRaises(thunder.ThunderError) as cm:
-            await api.snapshots()
-        self.assertIsNone(cm.exception.status)
-        self.assertIn("ConnectError", str(cm.exception))
-
-    async def test_bearer_token_sent(self):
-        seen = []
-
-        def handler(req):
-            seen.append(req.headers.get("authorization"))
-            return httpx.Response(200, json={})
-        api = thunderctl.ThunderApi(httpx.AsyncClient(transport=httpx.MockTransport(handler)), "tok")
-        await api.list_instances()
-        self.assertEqual(seen, ["Bearer tok"])
-
-    async def test_create_returns_index_as_string(self):
-        fake = FakeThunder()
-        r = await _api(fake).create({"template": "comfy-ui"})
-        self.assertEqual(r, {"index": "0", "uuid": "u0"})
-
-    async def test_list_instances_and_snapshots_are_parsed(self):
-        fake = FakeThunder()
-        fake.instances["4"] = {"uuid": "u4", "status": "running", "httpPorts": [8188]}
-        fake.snaps.append({"id": "s0", "name": "aihub-thunder-20260927t000000z",
-                           "status": "READY", "minimumDiskSizeGb": 120, "createdAt": 5})
-        api = _api(fake)
-        fake.status_script = []
-        items = await api.list_instances()
-        self.assertEqual(items[0]["index"], "4")
-        self.assertEqual(items[0]["http_ports"], [8188])
-        snaps = await api.snapshots()
-        self.assertEqual(snaps[0]["min_disk_gb"], 120)
-
-    async def test_remove_ports_uuid_then_index(self):
-        fake = FakeThunder()
-        fake.instances["0"] = {"uuid": "u0", "httpPorts": [8188, 22]}
-        await _api(fake).remove_ports({"index": "0", "uuid": "u0"}, [8188])
-        self.assertEqual(fake.calls, [("PATCH", "/instances/u0/ports", {"remove_ports": [8188]}),
-                                      ("PATCH", "/instances/0/ports", {"remove_ports": [8188]})])
-        self.assertEqual(fake.instances["0"]["httpPorts"], [22])
-
-    async def test_modify_falls_back_to_index_and_raises_when_both_404(self):
-        calls = []
-
-        def handler(req):
-            calls.append(req.url.path)
-            return httpx.Response(200, json={}) if req.url.path == "/instances/0/modify" \
-                else httpx.Response(404)
-        api = thunderctl.ThunderApi(httpx.AsyncClient(transport=httpx.MockTransport(handler)), "tok")
-        await api.modify({"index": "0", "uuid": "u0"}, {"disk_size_gb": 200})
-        self.assertEqual(calls, ["/instances/u0/modify", "/instances/0/modify"])
-        with self.assertRaises(thunder.ThunderError) as cm:
-            await api.modify({"index": "1", "uuid": "u1"}, {"disk_size_gb": 200})
-        self.assertEqual(cm.exception.status, 404)
-
-    async def test_snapshot_create_and_delete(self):
-        fake = FakeThunder()
-        api = _api(fake)
-        sid = await api.create_snapshot({"index": "0", "uuid": "u0"}, "aihub-thunder-x")
-        self.assertEqual(sid, "s0")
-        self.assertEqual(fake.calls[-1][2]["name"], "aihub-thunder-x")
-        # openapi CreateSnapshotRequest.instanceId is a STRING — an int is a 400
-        self.assertEqual(fake.calls[-1][2]["instanceId"], "0")
-        await api.create_snapshot({"index": 0, "uuid": "u0"}, "aihub-thunder-y")
-        self.assertEqual(fake.calls[-1][2]["instanceId"], "0")
-        await api.delete_snapshot(sid)
-        self.assertEqual([x["id"] for x in fake.snaps], ["s1"])
-
-    async def test_pricing_and_specs_cached_one_hour(self):
-        fake = FakeThunder()
-        clock = [1000.0]
-        api = _api(fake, clock=lambda: clock[0])
-        p1 = await api.pricing()
-        await api.pricing()
-        await api.specs()
-        await api.specs()
-        self.assertEqual(p1["pricing"]["a6000_x1"], 0.35)
-        self.assertEqual([p for _, p, _ in fake.calls], ["/v2/pricing", "/v2/specs"])
-        clock[0] += 3601
-        await api.pricing()
-        self.assertEqual(len(fake.calls), 3)
-
-    async def test_ids_are_path_quoted(self):
-        # an id with a "/" must not reach a different endpoint
-        seen = []
-
-        def handler(req):
-            seen.append(req.url.raw_path)
-            return httpx.Response(200, json={})
-        api = thunderctl.ThunderApi(httpx.AsyncClient(transport=httpx.MockTransport(handler)), "tok")
-        await api.delete_snapshot("a/../b")
-        self.assertEqual(seen, [b"/snapshots/a%2F..%2Fb"])
 
 
 class View(unittest.IsolatedAsyncioTestCase):
@@ -4813,21 +4599,6 @@ class FinalReviewFixes(unittest.IsolatedAsyncioTestCase):
         for _ in range(3):
             await c.refresh_account()
         self.assertEqual([f for f in c.h.faults if f[2] == "instance_vanished"], [])
-
-    # M4 ─ a 2xx body in an error is redacted
-    async def test_create_errors_redact_an_echoed_token(self):
-        secret = "sekrit-thunder-token"
-
-        def handler(req):
-            return httpx.Response(200, json={"echo": req.headers.get("authorization")})
-        api = thunderctl.ThunderApi(
-            httpx.AsyncClient(transport=httpx.MockTransport(handler)), secret)
-        for call in (lambda: api.create({}),
-                     lambda: api.create_snapshot({"index": "1"}, "aihub-x")):
-            with self.assertRaises(thunder.ThunderError) as cm:
-                await call()
-            self.assertNotIn(secret, str(cm.exception))
-            self.assertIn("***", str(cm.exception))
 
     # M7 ─ a Start without a token
     async def test_start_without_token_is_refused_before_any_call(self):
