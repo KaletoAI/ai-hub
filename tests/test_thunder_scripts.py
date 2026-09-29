@@ -395,6 +395,70 @@ class HostBootstrapLib(unittest.TestCase):
                         proc.send_signal(signal.SIGKILL)
                     proc.wait()
 
+    def test_start_script_runs_on_the_service_port_and_restarts_on_another(self):
+        # Ruling M4 (d): the loop takes the service's remote port, records "<pid> <port>"
+        # in its lock, and the profile's restart with ANOTHER port ends that loop (its
+        # whole process group) and starts one on the new port. Real processes; pkill is
+        # a logging stub (a test must never signal this box's own ComfyUI).
+        import sys
+        import time
+        import services
+        with tempfile.TemporaryDirectory() as t:
+            stub = _stubs(t)
+            cui = pathlib.Path(t, "ComfyUI")
+            cui.mkdir()
+            (cui / "main.py").write_text(
+                "import os, sys, time\n"
+                "with open(os.path.join(os.environ['HOME'], 'runs'), 'a') as f:\n"
+                "    f.write(f'{os.getpid()} {\" \".join(sys.argv[1:])}\\n')\n"
+                "time.sleep(300)\n")
+            r = _lib(f'PY={sys.executable}; write_start_script', home=t)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            env = dict(os.environ, HOME=t, PATH=stub + os.pathsep + os.environ["PATH"])
+
+            def sh(cmd):
+                return subprocess.run(["bash", "-c", cmd], capture_output=True, text=True,
+                                      env=env, timeout=60)
+
+            def runs():
+                p = pathlib.Path(t, "runs")
+                return p.read_text().splitlines() if p.exists() else []
+
+            def alive(pid):
+                try:
+                    with open(f"/proc/{pid}/stat") as f:
+                        return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+                except OSError:
+                    return False
+
+            def until(pred, secs=10):
+                end = time.time() + secs
+                while not pred() and time.time() < end:
+                    time.sleep(0.05)
+                return pred()
+            b = {"name": "gpu", "type": "comfyui", "remote_port": 8190}
+            try:
+                self.assertEqual(sh(services.COMFY.start_cmd(b)).returncode, 0)
+                self.assertTrue(until(lambda: len(runs()) == 1))
+                pid, args = runs()[0].split(" ", 1)
+                self.assertIn("--listen 127.0.0.1 --port 8190 --disable-cuda-malloc", args)
+                loop, port = pathlib.Path(t, ".start-comfy.lock").read_text().split()
+                self.assertEqual(port, "8190")
+                sh(services.COMFY.start_cmd(b))              # the lock: a no-op
+                time.sleep(0.5)
+                self.assertEqual(len(runs()), 1)
+                r = sh(services.COMFY.restart_cmd(dict(b, remote_port=8191)))
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertTrue(until(lambda: len(runs()) == 2), runs())
+                self.assertIn("--port 8191 ", runs()[1])
+                self.assertTrue(until(lambda: not alive(int(pid)) and not alive(int(loop))))
+                self.assertIn(f"pkill -f {services.COMFY_MAIN_PATTERN}",
+                              pathlib.Path(t, "signals").read_text())
+            finally:
+                sh(services.COMFY.stop_cmd(b))
+            pid2 = runs()[1].split()[0]
+            self.assertTrue(until(lambda: not alive(int(pid2))))
+
     def test_comfy_script_needs_the_host_uv(self):
         # uv moved to the host bootstrap: without it make_venv says so instead of
         # downloading behind the host script's back

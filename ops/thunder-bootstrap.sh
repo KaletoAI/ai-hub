@@ -306,7 +306,9 @@ stop_comfy_processes() {
       "$cui"|"$cui"/*) kill "$p" 2>/dev/null || true ;;
     esac
   done
-  pkill -f '[m]ain[.]py --listen 127[.]0[.]0[.]1 --port 8188' || true
+  # any port: the loop runs on the service's remote port (one ComfyUI per VM) — the
+  # same pattern the gateway's stop uses (services.COMFY_MAIN_PATTERN)
+  pkill -f '[m]ain[.]py --listen 127[.]0[.]0[.]1 --port [0-9]' || true
 }
 
 write_start_script() {
@@ -319,20 +321,26 @@ write_start_script() {
 # Written by ops/thunder-bootstrap.sh. Supervised by nothing but itself:
 # ComfyUI-Manager's reboot (the gateway's restart action and auto_restart) exits the
 # process and expects a wrapper to start it again — without the loop ComfyUI would stay
-# dead after the first restart. One instance per VM (the lock); fd 9 is closed for the
-# child so a killed wrapper cannot leave the lock held by an orphaned ComfyUI.
+# dead after the first restart. One instance per VM (the lock); fd 9 is closed for
+# every child so a killed wrapper cannot leave the lock held by an orphaned ComfyUI.
+# The lock is opened for APPEND (a second start must not truncate it) and records
+# "<pid> <port>": the gateway's stop ends this loop's process group by that pid.
+# Usage: start-comfy.sh [<port>] — the service's remote port (default 8188).
 # Loopback only: the gateway reaches it through its SSH tunnel, and Thunder's port
 # forwarding is public without auth. --disable-cuda-malloc like k12-gpu: Thunder's GPU
 # layer does not implement every CUDA call, cudaMallocAsync is the riskiest default.
 set -u
-exec 9>"$HOME/.start-comfy.lock"
+PORT=${1:-8188}
+case $PORT in ''|*[!0-9]*) echo "start-comfy.sh: bad port $PORT" >&2; exit 2 ;; esac
+exec 9>>"$HOME/.start-comfy.lock"
 flock -n 9 || exit 0
+echo "$$ $PORT" >"$HOME/.start-comfy.lock"
 export HF_HOME="$HOME/hf-cache"
 cd "$HOME/ComfyUI" || exit 1
 while :; do
-  "$COMFY_PY" main.py --listen 127.0.0.1 --port 8188 --disable-cuda-malloc \
+  "$COMFY_PY" main.py --listen 127.0.0.1 --port "$PORT" --disable-cuda-malloc \
     9>&- >>"$HOME/comfy.log" 2>&1
-  sleep 2
+  sleep 2 9>&-
 done
 START_COMFY_EOF
   } >"$HOME/start-comfy.sh"
@@ -412,7 +420,7 @@ main() {
   phase stop
   # Before the checkout, any ComfyUI running from this checkout: our own loop (a re-run
   # after a smoke failure that was started by hand) and a template ComfyUI that came
-  # back after the host bootstrap stopped it — that one would win the 8188 bind race
+  # back after the host bootstrap stopped it — that one would win the bind race
   # against start-comfy.sh. A checkout and pip under a running ComfyUI break both. The
   # template's rc-file autostart guard is the host bootstrap's (ops/host-bootstrap.sh).
   stop_comfy_processes "$CUI"

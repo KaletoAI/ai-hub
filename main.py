@@ -5960,6 +5960,17 @@ async def _thunder_probe(url: str) -> bool:
         return False
 
 
+async def _host_probe_http(url: str) -> int:
+    """A command service's health probe through its tunnel forward → the HTTP status
+    (0 = no answer). Streamed, body never read: the status is all the controller asks
+    (services.CommandProfile.probe_ok — 200/401/403 = up)."""
+    try:
+        async with http_client.stream("GET", url, timeout=_THUNDER_PROBE_S) as r:
+            return r.status_code
+    except httpx.HTTPError:
+        return 0
+
+
 def _thunder_default_nodes() -> str:
     """ops/thunder-nodes.default.txt for the backend FORM only (a new Thunder block's
     nodes textarea): "" when unreadable, so the console still renders. The controller
@@ -6220,7 +6231,7 @@ def _host_deps() -> "hostctl.Deps":
         is_draining=lambda bid: bid in _draining,
         note_fault=_note_fault,
         datadir=_thunder_datadir(),
-        probe_comfy=_thunder_probe,
+        probe_comfy=_thunder_probe, probe_http=_host_probe_http,
         bootstrap_script=lambda: (ops / "thunder-bootstrap.sh").read_bytes(),
         host_bootstrap_script=lambda: (ops / "host-bootstrap.sh").read_bytes(),
         log=logger.info,

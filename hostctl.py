@@ -25,8 +25,20 @@ starting it or syncing its models. Start enables EVERY attached backend before t
 create; the stop drains them all and `off` disables those attached at that moment. A
 forward that changes while the host runs goes through the master's control socket
 (`sshrun.control`), never a tunnel restart that would cut another service's stream
-(R-W1); a master that died is respawned with every current forward. Only a ComfyUI
-service is started, probed and model-synced in this version (one per host).
+(R-W1); a master that died is respawned with every current forward.
+
+Services run through their PROFILE (`services.py`, by backend type): ComfyUI (set up by
+the ComfyUI bootstrap, run by `~/start-comfy.sh <port>`, model-synced — one per host)
+and command services (an OpenAI-compatible server: the backend's setup script, run once
+per sha256 and recorded per snapshot, and its start command inside a flock'd restart
+loop `~/gw-svc-<slug>.sh`). The admin's text reaches the VM on stdin only — never in an
+ssh command line, a log line or a fault. A service's setup or start failing is THAT
+service's `setup failed`/`down` (+ a fault on its backend); the host fails only on what
+is the machine's (provider, ssh, port guard, host bootstrap) — Ruling M4 (g). Services
+attached, detached or changed while the host runs are brought in line by the 5-s tick
+(`_reconcile_services`) as an op of their own, which a stop aborts; a list handed over
+during a stop waits until `off` (M4 a). A detach ends the service's process on the VM
+and never disables its backend (R-K2).
 
 The steps are imperative and idempotent, not a pure `next_step` state machine
 (ledger Ruling 3): every step re-checks the world before acting (a snapshot with the
@@ -118,6 +130,7 @@ import httpx
 
 import hostapi
 import modelsync
+import services
 import sshrun
 
 PHASES = ("off", "creating", "restoring", "connecting", "bootstrapping", "starting",
@@ -137,17 +150,11 @@ _SSH_PROBE_S = 5
 _BOOTSTRAP_S = 3 * 3600         # venv + torch + node packs + CUDA extension builds
 _HOST_BOOTSTRAP_S = 30 * 60     # kill + inventory + at most an apt install and uv
 _COMFY_READY_S = 10 * 60        # first start loads custom nodes (3D packs import slowly)
-_COMFY_PROBE_S = 3
 _STDERR_LOG_LINES = 20          # stderr tail logged for a failed remote step
 
 _CREATED_SKEW_S = 5 * 60        # createdAt may precede our request by clock skew …
 _CREATED_LATE_S = 15 * 60       # … and follow it by Thunder's own queueing
 _COMMIT_RE = re.compile(r"[0-9a-fA-F]{40}")
-# The loop script is flock-guarded, so starting it while it runs is a no-op. A missing
-# script (a bootstrap that died before writing it) fails in seconds with a named reason
-# instead of a 10-minute probe timeout that says nothing.
-_START_CMD = ("test -x ~/start-comfy.sh || { echo 'start-comfy.sh missing' >&2; exit 3; }; "
-              "setsid nohup ~/start-comfy.sh >/dev/null 2>&1 < /dev/null &")
 # The bootstrap's output also goes to a file ON THE INSTANCE: `sshrun.run` answers a
 # timeout with (124, b"", b"timeout") and loses everything it read, and a dropped ssh
 # loses it too — the log file is where the last GW:PHASE is fetched from then. Wrapped
@@ -158,17 +165,29 @@ _HOST_BOOTSTRAP_LOG = "~/gw-host-bootstrap.log"   # the host bootstrap's own (R-
 _BOOTSTRAP_TAIL = 200
 
 
+def _start_cmd(port: int) -> str:
+    """Start the ComfyUI loop (`~/start-comfy.sh <port>`) on the service's REMOTE port
+    — `services.ComfyProfile.start_cmd`; a start while it runs is a no-op (its lock)."""
+    return services.COMFY.start_cmd({"remote_port": port})
+
+
 def _restart_cmd(port: int) -> str:
-    """Kill ComfyUI (the loop restarts it 2 s later) and start the loop in case it is
-    not alive (a failed bootstrap, a killed wrapper). The bracket keeps the pattern from
-    matching the remote `bash -c "<this command>"` itself — pkill spares only its own
-    process, and a pattern that hit the shell would kill the restart half-way. It
-    matches the loop's `<venv python> main.py --listen 127.0.0.1 --port <port> …`,
-    whatever venv the bootstrap picked (`ComfyUI/main.py` never appears in that command
-    line). `port` is the SERVICE's remote port: a pattern with another service's port
-    kills nothing, or the wrong ComfyUI. An int by construction — no quoting needed."""
-    return ("pkill -f '[m]ain[.]py --listen 127[.]0[.]0[.]1 --port "
-            f"{sshrun._port(int(port))}'; " + _START_CMD)
+    """End the ComfyUI loop (by its lock's process group, whatever port it runs on —
+    the pattern the ComfyUI bootstrap's `phase stop` uses too) and start it on `port`.
+    ValueError for a port that is none."""
+    return services.COMFY.restart_cmd({"remote_port": port})
+
+
+# command services (services.CommandProfile) and per-service upkeep
+_SVC_SETUP_S = 60 * 60          # a setup script: pip install vllm, a model pull
+_SVC_READY_S = 20 * 60          # a command service's first answer (a model load + compile)
+_SVC_PROBE_S = 3
+_FWD_RETRY_MIN_S = 5            # a forward `control forward` could not add is retried
+_FWD_RETRY_MAX_S = 300          # with doubling backoff up to this
+_ATTACH_RETRY_S = 60            # an attach the port guard could not check waits this long
+# per-service ops a stop() may abort like a start (Ruling 13): attach/restart/setup of
+# one service never outranks the machine being stopped
+_SVC_OP_PREFIXES = ("updating services", "restarting ", "re-running setup of ")
 
 # stop path / background timing
 _DRAIN_POLL_S = 2               # inflight check while draining (no timeout: a job may finish)
@@ -204,6 +223,13 @@ _ABORTABLE = ("starting", "restarting ComfyUI", "resuming")
 # `sshrun.CTL_PATH_MAX` (Ruling M2); the ai-hub unit has PrivateTmp, so /tmp is its own
 _CTL_FALLBACK = "/tmp/ai-hub-{uid}-ctl"
 _SVC_STATUSES = ("starting", "up", "setup failed", "down")
+
+
+def _abortable(op: Optional[str]) -> bool:
+    """An op a stop() aborts (Ruling 13): a start, a resume, a restart — and every
+    per-service op (attach, restart, re-run setup)."""
+    return op in _ABORTABLE or (isinstance(op, str) and op.startswith(_SVC_OP_PREFIXES))
+
 
 # model sync (spec "Controller": URL transfer, triggers, disk growth; "Stop" 1–2)
 _SYNC_PHASES = ("syncing", "ready")   # the phases a plan is made (and trusted) in
@@ -295,6 +321,10 @@ class State:
     # per attached service (backend id → {"status", "error", "setup_hash"}): what the last
     # start/probe of it said. Host state stays above — a service's failure is its own
     services: dict = field(default_factory=dict)
+    # snapshot id → {backend id: setup hash} of the command setups that had run on the
+    # instance when it was taken: a start from that snapshot knows which setups its disk
+    # already carries (a fresh template carries none — every setup runs again)
+    setup_snapshots: dict = field(default_factory=dict)
     log: list = field(default_factory=list)         # not persisted
     transfers: dict = field(default_factory=dict)   # not persisted
 
@@ -350,6 +380,10 @@ def _default_log(msg: str) -> None:
     pass
 
 
+async def _no_http_probe(url: str) -> int:
+    return 0                    # no prober wired: a command service never counts as up
+
+
 @dataclass
 class Deps:
     """What the controller needs from the gateway, injected by `main`. Every field a
@@ -392,6 +426,9 @@ class Deps:
     control: Callable[..., Awaitable[tuple]] = sshrun.control
     # ops/host-bootstrap.sh (R-W3); b"" fails the host bootstrap (no GW:DONE)
     host_bootstrap_script: Callable[[], bytes] = field(default=lambda: b"")
+    # GET <url> → the HTTP status (0 = no answer): a command service's health probe
+    # (services.CommandProfile.probe_ok: 200/401/403 = up, R-W9)
+    probe_http: Callable[[str], Awaitable[int]] = _no_http_probe
 
 
 # ── bootstrap output ─────────────────────────────────────────────────────────
@@ -1277,6 +1314,19 @@ class Controller:
         self._last_try = 0.0
         self._account_at: Optional[float] = None       # last account refresh (run_forever)
         self._own_absent = 0                           # account refreshes without our uuid
+        # attached services: a list handed over while a stop is in flight waits here
+        # until `off` (never attach into a stopping host, never let a service escape
+        # the drain — Ruling M4)
+        self._pending_services: Optional[list] = None
+        # what runs on the instance: backend id → the signature it was set up/started
+        # with (`_svc_sig`), and the dict it was started from (a detach stops THAT)
+        self._attached: dict = {}
+        self._attached_svcs: dict = {}
+        self._problem_bids: set = set()                # services marked down by _problems
+        self._fwd_retry: dict = {}                     # (lport, rport) → (next try, delay, why)
+        self._fwd_lock = asyncio.Lock()                # one reconcile at a time
+        self._svc_retry_at = 0.0                       # a postponed attach waits till then
+        self._bg_op: Optional[asyncio.Task] = None     # the service op run_forever spawned
         self.state = State()
         try:
             loaded = deps.load_state(self.name)
@@ -1290,7 +1340,10 @@ class Controller:
                                   f"{type(loaded).__name__}, not a dict")
             else:
                 self.state = state_from(loaded)
-        self.set_services(services)
+        # applied directly, never pending: a controller built while its host was
+        # stopping (a gateway restart mid-stop) drains exactly this list on resume
+        self.services = [x for x in (services or []) if isinstance(x, dict) and x.get("name")]
+        self._mark_problems()
 
     def _load_failed(self, msg: str) -> None:
         """The stored record exists but could not be read. It may name a RUNNING,
@@ -1363,9 +1416,97 @@ class Controller:
         """The attached backends as main sees them now (every rebuild hands NEW dicts —
         kept as given, so the controller always reads the current ones). While the
         tunnel runs, a changed forward set is applied through the master's control
-        socket in the background, never by restarting the tunnel (R-W1)."""
-        self.services = [x for x in (services or []) if isinstance(x, dict) and x.get("name")]
+        socket in the background, never by restarting the tunnel (R-W1); what runs on
+        the VM follows in the 5-s tick (`_reconcile_services`: attach, detach, a changed
+        setup or start command). While a STOP is in flight the list waits (`off` applies
+        it): the stop drains and later disables the services it started with — a
+        service attached meanwhile would escape the drain, and one detached meanwhile
+        is another host's business already (R-K2)."""
+        svcs = [x for x in (services or []) if isinstance(x, dict) and x.get("name")]
+        if self._stopping():
+            if self._pending_services is None:
+                self._log("services changed while stopping — applied once the host is off")
+            self._pending_services = svcs
+            return
+        self._pending_services = None
+        self.services = svcs
+        self._mark_problems()
         self._kick_forwards()
+
+    def _stopping(self) -> bool:
+        s = self.state
+        p = s.failed_phase if s.phase == "failed" else s.phase
+        return self._op == "stopping" or p in _STOP_STEPS
+
+    def _apply_pending_services(self) -> None:
+        """`off`: the list handed over during the stop becomes the attached one."""
+        pend, self._pending_services = self._pending_services, None
+        if pend is not None:
+            self.services = pend
+            self._mark_problems()
+            self._log("services changed during the stop — now applied")
+
+    def _problems(self) -> dict:
+        """backend id → why this service cannot run on the host (it is shown `down`
+        with that reason, gets no forward and is never enabled or started). In list
+        order, so of two services that clash the LATER one is refused: a type without
+        a profile (a cloud backend), a port that is none, what the profile's `validate`
+        refuses, a second ComfyUI (one per VM), a local port another service already
+        forwards (sshrun refuses one port for two targets — the whole tunnel would never
+        start), a remote port another service already listens on (its probe would find
+        the other service), a file-name slug another command service already uses."""
+        out: dict = {}
+        lports: dict = {}
+        rports: dict = {}
+        slugs: dict = {}
+        comfy = None
+        for x in self.services:
+            bid = service_bid(x)
+            prof = services.profile_for(x)
+            if prof is None:
+                out[bid] = f"type {x.get('type')!r} cannot run on a managed host"
+                continue
+            p = self._ports(x)
+            if p is None:
+                out[bid] = "no valid local/remote port"
+                continue
+            errs = prof.validate(x)
+            if errs:
+                out[bid] = "; ".join(errs)
+                continue
+            if prof is services.COMFY and comfy is not None:
+                out[bid] = f"a second ComfyUI on one host is not supported ({comfy} runs there)"
+                continue
+            if p[0] in lports:
+                out[bid] = f"local port {p[0]} is already forwarded for {lports[p[0]]}"
+                continue
+            if p[1] in rports:
+                out[bid] = f"remote port {p[1]} is already used by {rports[p[1]]}"
+                continue
+            sl = services.slug(x.get("name")) if prof is services.COMMAND else None
+            if sl is not None and sl in slugs:
+                out[bid] = f"name slug {sl!r} collides with {slugs[sl]} (its files on the VM)"
+                continue
+            if prof is services.COMFY:
+                comfy = bid
+            lports[p[0]], rports[p[1]] = bid, bid
+            if sl is not None:
+                slugs[sl] = bid
+        return out
+
+    def _mark_problems(self) -> None:
+        """A service that cannot run shows `down` with the reason (Ruling M4: a service
+        left out of the forwards must say why); one whose problem went away loses it."""
+        bad = self._problems()
+        for x in self.services:
+            bid = service_bid(x)
+            if bid in bad:
+                self._problem_bids.add(bid)
+                self._svc_set(x, "down", bad[bid])
+            elif bid in self._problem_bids:
+                self._problem_bids.discard(bid)
+                if bid not in self._attached:
+                    self._svc_set(x, "down")
 
     def service_bids(self) -> list:
         return [service_bid(x) for x in self.services]
@@ -1398,18 +1539,11 @@ class Controller:
         return f"http://127.0.0.1:{p[0]}" if p else ""
 
     def _forwards(self) -> list:
-        """(local, remote) per attached service with valid ports, in list order. A
-        local port an EARLIER service already forwards elsewhere is left out: sshrun
-        refuses one port for two targets, and the whole tunnel would never start."""
-        out: list = []
-        seen: dict = {}
-        for x in self.services:
-            p = self._ports(x)
-            if p is None or p[0] in seen:
-                continue
-            seen[p[0]] = p[1]
-            out.append(p)
-        return out
+        """(local, remote) per attached service that can run (`_problems`: a local
+        port an EARLIER service already forwards is left out — sshrun refuses one port
+        for two targets, and the whole tunnel would never start), in list order."""
+        bad = self._problems()
+        return [self._ports(x) for x in self.services if service_bid(x) not in bad]
 
     def _svc_set(self, svc: dict, status: str, error: str = "") -> None:
         """Record a service's status (persisted — `setup_hash` rides along); logged only
@@ -1442,10 +1576,12 @@ class Controller:
         """Gateway shutdown: end the tunnel process and the HTTP client. The INSTANCE is
         not touched — it keeps running and `resume()` picks it up again."""
         await self._stop_tunnel()
-        t, self._fwd_task = self._fwd_task, None
-        if t is not None and not t.done():
-            t.cancel()
-            await asyncio.gather(t, return_exceptions=True)
+        for attr in ("_fwd_task", "_bg_op"):
+            t = getattr(self, attr)
+            setattr(self, attr, None)
+            if t is not None and not t.done():
+                t.cancel()
+                await asyncio.gather(t, return_exceptions=True)
         # local tasks only: the curls on the instance run on and are adopted by the
         # next gateway process through their lockfiles
         await self._cancel_sync_tasks()
@@ -1650,13 +1786,23 @@ class Controller:
         Never a tunnel restart (R-W1: it would cut every other service's stream). A
         master that is not up has nothing to change: its next spawn carries the current
         set (`_tunnel_argv`). A forward that fails (its local port taken) makes only
-        THAT service `down`, with ssh's reason."""
+        THAT service `down`, with ssh's reason, and is retried with a doubling backoff
+        (5 s … 5 min — not every tick for a port somebody else holds for good); once it
+        succeeds the service is `starting` again and the 5-s tick brings it up (probe,
+        a start if it is not running) instead of leaving a stale `down`."""
+        async with self._fwd_lock:
+            # serialised: the set_services kick and an attach may both reconcile, and a
+            # second `forward` of one port would fail — and mark a working service down
+            await self._reconcile_forwards()
+
+    async def _reconcile_forwards(self) -> None:
         t, s = self._tunnel, self.state
         if (t is None or not getattr(t, "running", False) or not self._ctl_used
                 or not (s.ip and s.port)):
             return
         want = self._forwards()
         self._fwd_failed &= set(want)
+        self._fwd_retry = {f: v for f, v in self._fwd_retry.items() if f in want}
         by_fwd = {self._ports(x): x for x in self.services}
         for lp, rp in sorted(self._fwd_active - set(want)):
             rc, why = await self.deps.control(self._ctl_used, self._login(), "cancel", lp, rp)
@@ -1666,17 +1812,30 @@ class Controller:
             else:
                 self._log(f"removing forward {lp} → {rp} failed (rc {rc}): {why}")
         for lp, rp in want:
-            if (lp, rp) in self._fwd_active:
+            f = (lp, rp)
+            if f in self._fwd_active:
                 continue
+            retry = self._fwd_retry.get(f)
+            if retry is not None and self.deps.now() < retry[0]:
+                continue                    # backing off
             rc, why = await self.deps.control(self._ctl_used, self._login(), "forward", lp, rp)
-            svc = by_fwd.get((lp, rp))
+            svc = by_fwd.get(f)
             if rc == 0:
-                self._fwd_active.add((lp, rp))
-                self._fwd_failed.discard((lp, rp))
+                self._fwd_active.add(f)
+                self._fwd_failed.discard(f)
                 self._log(f"forward {lp} → {rp} added")
-            elif (lp, rp) not in self._fwd_active:
+                if retry is not None:
+                    del self._fwd_retry[f]
+                    if svc is not None:
+                        # up to the tick now: probe, start if needed (`_reconcile_services`)
+                        self._attached.pop(service_bid(svc), None)
+                        self._svc_set(svc, "starting", "forward restored")
+            elif f not in self._fwd_active:
                 # (a master respawned meanwhile carries it already — then it is no failure)
-                self._fwd_failed.add((lp, rp))
+                delay = (_FWD_RETRY_MIN_S if retry is None
+                         else min(_FWD_RETRY_MAX_S, retry[1] * 2))
+                self._fwd_retry[f] = (self.deps.now() + delay, delay, why or f"rc {rc}")
+                self._fwd_failed.add(f)
                 if svc is not None:
                     self._svc_set(svc, "down",
                                   f"forward {lp} → {rp} failed: {why or f'rc {rc}'}")
@@ -1745,9 +1904,12 @@ class Controller:
         its bootstrap, its transfers), else on the host's pseudo backend (create,
         snapshot, delete, instance gone). Never raises: the fault log is a record, not
         a reason to stop."""
+        # only what names the backend: the admin's setup script and start command
+        # (svc_setup/svc_start) must not travel on into the fault log's side
+        who = ({k: svc[k] for k in ("name", "type", "host", "url") if k in svc}
+               if svc is not None else self._host_backend())
         try:
-            self.deps.note_fault(svc if svc is not None else self._host_backend(),
-                                 source, kind, detail)
+            self.deps.note_fault(who, source, kind, detail)
         except Exception as e:
             self._log(f"fault log unavailable: {e!r}")
 
@@ -2037,12 +2199,16 @@ class Controller:
             await self.deps.sleep(_SSH_PROBE_S)
 
     async def _run_script(self, script: bytes, args: str, logfile: str,
-                          timeout: int) -> tuple[int, str, bytes]:
-        """Stream a bootstrap script to `bash -s` on the instance, tee'd to `logfile`
-        there. → (rc, stdout text, stderr); the stdout comes from the log file when the
-        ssh lost it (a timeout keeps nothing, a dropped connection little). Every
-        non-blank line goes to the panel log."""
-        inner = f"bash -s --{(' ' + args) if args else ''} 2>&1 | tee {logfile}"
+                          timeout: int, inner: Optional[str] = None,
+                          prefix: str = "") -> tuple[int, str, bytes]:
+        """Stream a script to `bash -s` on the instance, tee'd to `logfile` there (a
+        service's setup passes its own `inner` command — `services.CommandProfile.
+        setup_cmd` — which does the same). → (rc, stdout text, stderr); the stdout
+        comes from the log file when the ssh lost it (a timeout keeps nothing, a dropped
+        connection little). Every non-blank line goes to the panel log (`prefix` names
+        the service): that output IS the setup log the operator reads."""
+        if inner is None:
+            inner = f"bash -s --{(' ' + args) if args else ''} 2>&1 | tee {logfile}"
         rc, out, err = await self._exec(f"bash -o pipefail -c {sshrun.q(inner)}",
                                         stdin=script, timeout=timeout)
         text = (out or b"").decode("utf-8", "replace")
@@ -2052,7 +2218,7 @@ class Controller:
             text = await self._bootstrap_log_tail(logfile)
         for line in text.splitlines():
             if line.strip():
-                self._log(line)
+                self._log(prefix + line)
         return rc, text, err or b""
 
     async def _host_bootstrap(self) -> None:
@@ -2124,16 +2290,22 @@ class Controller:
         s = self.state
         return self._comfy() is not None and (s.bootstrap_incomplete or s.comfy_absent)
 
-    async def _ensure_comfy_bootstrap(self, upload: bool = True) -> bool:
+    async def _ensure_comfy_bootstrap(self, upload: bool = True, force: bool = False) -> bool:
         """Run the ComfyUI bootstrap when a ComfyUI service is attached and the instance
-        lacks it — at a start right after the host bootstrap, or on a RUNNING host a
-        ComfyUI service was just attached to (Task 5 wires the attach). → True when it
-        ran (and succeeded), False when there was nothing to do. A failure raises
-        `_ServiceError` (fault + `setup failed` on the service); the caller decides what
-        it means for the host — today the start fails the whole host (Task 5 makes it
-        the service's alone). `upload=False`: the node list is already on the box."""
+        lacks it (`force`: the operator's "re-run setup") — at a start right after the
+        host bootstrap, or on a RUNNING host a ComfyUI service was attached to. Only
+        inside an op (the start, the attach, the re-run) and never while the host stops
+        (Ruling M4): a bootstrap outside the op guard would run next to a stop that is
+        snapshotting the disk it installs to. → True when it ran (and succeeded), False
+        when there was nothing to do. A failure raises `_ServiceError` (`setup failed`
+        on the service); what that means is the caller's — never the host's failure
+        (the other services run on). `upload=False`: the node list is on the box."""
+        if self._op is None or self._stopping():
+            raise RuntimeError("the ComfyUI bootstrap runs only inside a host operation, "
+                               "never while the host stops"
+                               + (f" (now: {self._op})" if self._op else ""))
         comfy = self._comfy()
-        if not self._comfy_pending():
+        if comfy is None or not (force or self._comfy_pending()):
             return False
         s = self.state
         # from here on a snapshot of this instance holds a (half-)install: "incomplete"
@@ -2150,6 +2322,7 @@ class Controller:
         except Exception as e:
             # the bootstrap is the ComfyUI service's setup: its fault (R-K1)
             self._svc_set(comfy, "setup failed", _errtext(e))
+            self._fault(comfy, "lifecycle", "error", _errtext(e))
             raise _ServiceError(comfy, _errtext(e)) from e
         return True
 
@@ -2163,69 +2336,332 @@ class Controller:
         if rc != 0:
             self._log(f"bootstrap log unavailable (rc {rc}): " + " | ".join(_tail(err, 3)))
             return ""
-        self._log(f"bootstrap output lost — last {_BOOTSTRAP_TAIL} lines of "
-                  f"{logfile} follow")
+        self._log(f"output lost — last {_BOOTSTRAP_TAIL} lines of {logfile} follow")
         return (out or b"").decode("utf-8", "replace")
 
-    # services: start / probe / restart (ComfyUI only in this version — the provisional
-    # internal profile; command services join with services.py)
-    async def _wait_comfy(self, svc: dict, settle: bool = False) -> None:
-        """Probe a ComfyUI service through its forward every 3 s until it answers.
-        `settle`: wait one interval first — right after a pkill the old process may
-        still answer."""
-        url = self._svc_url(svc)
-        deadline = self.deps.now() + _COMFY_READY_S
-        if settle:
-            await self.deps.sleep(_COMFY_PROBE_S)
-        while True:
-            try:
-                ok = bool(await self.deps.probe_comfy(url))
-            except Exception:
-                ok = False              # tunnel not up yet, ComfyUI still importing
-            if ok:
-                self._log("ComfyUI answers")
-                return
-            if self.deps.now() >= deadline:
-                raise TimeoutError(f"ComfyUI did not answer on {url} within "
-                                   f"{_COMFY_READY_S // 60} min (see ~/comfy.log)")
-            await self.deps.sleep(_COMFY_PROBE_S)
-
-    async def _start_comfy(self, svc: dict, restart: bool = False) -> None:
-        """Start (or, `restart`, kill and restart) one ComfyUI service and wait until it
-        answers. Its status follows (`starting` → `up`, else `down` with the reason); a
-        failure raises `_ServiceError` — the host fails as before, the fault is the
-        service's."""
+    # services: setup / start / probe / restart / stop, per service through its profile
+    # (services.py). A service's failure is ITS status (`setup failed`/`down` + a fault
+    # on its backend) — never the host's: the other services on the VM run on.
+    def _svc_sig(self, svc: dict) -> tuple:
+        """What a running service was brought up with: (what needs a restart when it
+        changes, the local port — a moved forward needs only a probe)."""
+        prof = services.profile_for(svc)
         p = self._ports(svc)
-        if p is None:
-            why = "no valid local/remote port"
-            self._svc_set(svc, "down", why)
-            raise _ServiceError(svc, f"{service_bid(svc)}: {why}")
-        self._svc_set(svc, "starting")
+        run: tuple = (str(svc.get("type") or "openai"), p[1] if p else None,
+                      self._problems().get(service_bid(svc), ""))
+        if prof is services.COMMAND:
+            w = prof.wrapper_script(svc)
+            run += (prof.setup_hash(svc), hashlib.sha256(w).hexdigest(), prof.probe_path(svc))
+        return run, (p[0] if p else None)
+
+    def _note_attached(self, svc: dict) -> None:
+        bid = service_bid(svc)
+        self._attached[bid] = self._svc_sig(svc)
+        self._attached_svcs[bid] = svc
+
+    def _svc_fail(self, svc: dict, status: str, msg: str) -> bool:
+        """A service's own failure: its status and a fault on its backend. → False."""
+        self._svc_set(svc, status, msg)
+        self._fault(svc, "lifecycle", "error", f"{service_bid(svc)}: {msg}")
+        return False
+
+    def _setup_pending(self, svc: dict) -> bool:
+        """A command service whose setup script (as it is now) has not run on this
+        instance."""
+        prof = services.profile_for(svc)
+        if prof is not services.COMMAND:
+            return False
+        want = prof.setup_hash(svc)
+        st = self.state.services.get(service_bid(svc))
+        have = st.get("setup_hash") if isinstance(st, dict) else ""
+        return bool(want) and want != have
+
+    async def _setup_service(self, svc: dict, force: bool = False,
+                             upload: bool = True) -> bool:
+        """The service's setup, when it needs one (`force`: the operator's re-run). →
+        whether it may start. ComfyUI: the ComfyUI bootstrap (its own flags decide);
+        a command service: its `svc_setup` when the stored hash differs — stdin into
+        `bash -s`, tee'd to `~/gw-svc-<slug>.setup.log`, the output into the panel log,
+        rc ≠ 0 → `setup failed` (the host stays as it is), success → the hash stored."""
+        bid = service_bid(svc)
+        bad = self._problems().get(bid)
+        if bad:
+            self._svc_set(svc, "down", bad)
+            return False
+        prof = services.profile_for(svc)
+        if prof is services.COMFY:
+            try:
+                await self._ensure_comfy_bootstrap(upload=upload, force=force)
+            except _ServiceError:
+                return False                # its status and fault are set
+            return True
+        script = prof.setup_script(svc)
+        want = prof.setup_hash(svc)
+        if script is None or not (force or self._setup_pending(svc)):
+            return True
+        self._svc_set(svc, "starting", "running its setup script")
+        self._log(f"{bid}: setup script (log {prof.setup_log(svc)})")
         try:
-            rc, _, err = await self._exec(_restart_cmd(p[1]) if restart else _START_CMD,
-                                          timeout=60)
-            if rc != 0:
-                raise RuntimeError(f"starting ComfyUI failed (rc {rc}): "
-                                   + " | ".join(_tail(err, 3)))
-            await self._wait_comfy(svc, settle=restart)
+            rc, text, err = await self._run_script(script, "", prof.setup_log(svc),
+                                                   _SVC_SETUP_S, inner=prof.setup_cmd(svc),
+                                                   prefix=f"{bid} setup: ")
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            self._svc_set(svc, "down", _errtext(e))
-            raise _ServiceError(svc, _errtext(e)) from e
+            return self._svc_fail(svc, "setup failed", f"setup could not run: {_errtext(e)}")
+        if rc != 0:
+            # the reason is the script's own last line (its log, operator-visible)
+            last = next((ln.strip() for ln in reversed(text.splitlines()) if ln.strip()), "")
+            why = "timed out" if rc == 124 else f"rc {rc}"
+            return self._svc_fail(svc, "setup failed", f"setup script failed ({why})"
+                                  + (f": {last[:200]}" if last else "")
+                                  + f" — see {prof.setup_log(svc)}")
+        st = dict(self.state.services.get(bid) or {})
+        st["setup_hash"] = want
+        st.setdefault("status", "starting")
+        st.setdefault("error", "")
+        self.state.services[bid] = st
+        self._persist()
+        self._log(f"{bid}: setup done")
+        return True
+
+    async def _probe(self, svc: dict) -> bool:
+        """One probe through the service's forward: ComfyUI `/object_info` = 200 (the
+        streamed `probe_comfy`), a command service its health path = 200/401/403."""
+        url = self._svc_url(svc)
+        if not url:
+            return False
+        prof = services.profile_for(svc)
+        try:
+            if prof is services.COMMAND:
+                return prof.probe_ok(await self.deps.probe_http(url + prof.probe_path(svc)))
+            return bool(await self.deps.probe_comfy(url))
+        except Exception:
+            return False                # tunnel not up yet, the server still loading
+
+    async def _wait_service(self, svc: dict, settle: bool = False) -> None:
+        """Probe a service every 3 s until it answers (TimeoutError naming its log).
+        `settle`: wait one interval first — right after a stop the old process may still
+        answer."""
+        prof = services.profile_for(svc)
+        comfy = prof is services.COMFY
+        limit = _COMFY_READY_S if comfy else _SVC_READY_S
+        deadline = self.deps.now() + limit
+        if settle:
+            await self.deps.sleep(_SVC_PROBE_S)
+        while True:
+            if await self._probe(svc):
+                self._log("ComfyUI answers" if comfy else f"{service_bid(svc)} answers")
+                return
+            if self.deps.now() >= deadline:
+                what = "ComfyUI" if comfy else service_bid(svc)
+                raise TimeoutError(f"{what} did not answer on {self._svc_url(svc)} within "
+                                   f"{limit // 60} min (see {prof.log_path(svc)})")
+            await self.deps.sleep(_SVC_PROBE_S)
+
+    async def _run_service(self, svc: dict, restart: bool = False) -> bool:
+        """Start (or, `restart`, stop and start) one service and wait until it answers.
+        A command service's wrapper is written first (stdin → `~/gw-svc-<slug>.sh`, the
+        start command inside it — never in a command line). Status `starting` → `up`,
+        else `down` with the reason and a fault on its backend. → up?"""
+        bid = service_bid(svc)
+        bad = self._problems().get(bid)
+        if bad:
+            self._svc_set(svc, "down", bad)
+            return False
+        p = self._ports(svc)
+        if p in self._fwd_failed:
+            # no forward: a probe could only time out (minutes); it stays `down` with
+            # the forward's reason, and the forward's recovery brings it up
+            why = (self._fwd_retry.get(p) or (0, 0, "not added"))[2]
+            self._svc_set(svc, "down", f"forward {p[0]} → {p[1]} failed: {why}")
+            return False
+        prof = services.profile_for(svc)
+        self._svc_set(svc, "starting")
+        try:
+            if prof is services.COMMAND:
+                rc, _, err = await self._exec(prof.upload_cmd(svc),
+                                              stdin=prof.wrapper_script(svc), timeout=60)
+                if rc != 0:
+                    raise RuntimeError(f"writing its start script failed (rc {rc}): "
+                                       + " | ".join(_tail(err, 3)))
+            cmd = prof.restart_cmd(svc) if restart else prof.start_cmd(svc)
+            rc, _, err = await self._exec(cmd, timeout=90)
+            if rc != 0:
+                raise RuntimeError(f"starting {'ComfyUI' if prof is services.COMFY else bid} "
+                                   f"failed (rc {rc}): " + " | ".join(_tail(err, 3)))
+            await self._wait_service(svc, settle=restart)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            return self._svc_fail(svc, "down", _errtext(e))
         self._svc_set(svc, "up")
+        return True
+
+    async def _bring_up(self, svc: dict, restart: bool = False, setup: bool = True,
+                        force_setup: bool = False) -> bool:
+        """Setup (if `setup` and needed) then start and probe — the one path attach,
+        the buttons and resume use. Recorded as attached whatever the outcome: a
+        failing service is not retried every 5 s (the buttons are the way)."""
+        try:
+            ok = True
+            if setup or force_setup:
+                ok = await self._setup_service(svc, force=force_setup)
+            return await self._run_service(svc, restart=restart) if ok else False
+        finally:
+            self._note_attached(svc)
 
     async def _start_services(self, restart: bool = False,
-                              only: Optional[list] = None) -> None:
-        """Every attached service (or just `only`), in list order. A service type
-        without a start profile yet (anything but ComfyUI in this version) is left
-        `down` with that reason — it does not fail the host."""
+                              only: Optional[list] = None) -> list:
+        """Start every attached service (or just `only`) in list order — no setups
+        (the start path ran them first, a restart never does). → the ones not up."""
+        dead = []
         for svc in list(self.services if only is None else only):
-            if svc.get("type") == "comfyui":
-                await self._start_comfy(svc, restart=restart)
+            try:
+                if not await self._run_service(svc, restart=restart):
+                    dead.append(svc)
+            finally:
+                self._note_attached(svc)
+        return dead
+
+    async def _detach(self, bid: str) -> None:
+        """A service no longer attached: its process on the VM ends (the profile's stop,
+        by the lock's process group) and its forward goes (`reconcile_forwards`). Its
+        backend is NOT disabled (R-K2): it belongs to whatever it is attached to now."""
+        svc = self._attached_svcs.pop(bid, None)
+        self._attached.pop(bid, None)
+        if svc is None:
+            return
+        prof = services.profile_for(svc)
+        if prof is services.COMFY:
+            await self._stop_transfers()        # its model sync ends with it
+        try:
+            rc, _, err = await self._exec(prof.stop_cmd(svc), timeout=90)
+        except Exception as e:
+            rc, err = -1, _errtext(e).encode()
+        if rc != 0:
+            self._log(f"{bid} detached — stopping it on the VM failed (rc {rc}): "
+                      + " | ".join(_tail(err, 3)))
+        else:
+            self._log(f"{bid} detached — stopped on the VM (the backend itself is left "
+                      "as it is)")
+
+    async def restart_service(self, bid: str) -> None:
+        """The card's "Restart" of one service. ComfyUI: `restart_comfy` (the host passes
+        through `starting`, as before). A command service: stopped and started afresh
+        (a rewritten wrapper runs), the host's phase untouched. Refused (RuntimeError)
+        without a running instance, during another op, for a service not attached."""
+        known = next((x for x in self.services if service_bid(x) == bid), None)
+        if known is not None and known.get("type") == "comfyui":
+            await self.restart_comfy()          # its own checks (it may leave `failed`)
+            return
+        svc = self._svc_for_action(bid)
+        await self._run_op(f"restarting {bid}", self._service_op(svc, restart=True, setup=False))
+
+    async def resetup(self, bid: str) -> None:
+        """The card's "Re-run setup": the service's setup runs again whatever its hash
+        says (ComfyUI: the ComfyUI bootstrap), then the service is restarted. The host
+        stays `ready`; a failing setup is that service's `setup failed`."""
+        svc = self._svc_for_action(bid)
+        await self._run_op(f"re-running setup of {bid}",
+                           self._service_op(svc, restart=True, force_setup=True))
+
+    def _svc_for_action(self, bid: str) -> dict:
+        self._refuse_if_unreconciled()
+        self._refuse_if_busy()
+        s = self.state
+        if s.phase not in _SYNC_PHASES or not (s.uuid and s.ip and s.port):
+            raise RuntimeError(f"no running instance ({s.phase})")
+        svc = next((x for x in self.services if service_bid(x) == bid), None)
+        if svc is None:
+            raise RuntimeError(f"{bid} is not attached to managed host {self.name}")
+        return svc
+
+    async def _service_op(self, svc: dict, restart: bool, setup: bool = True,
+                          force_setup: bool = False) -> None:
+        """One service on the running host: the port guard first (like every entry into
+        starting something), then its setup/start/probe. A host-level failure here (the
+        provider list, ports that stay open) is logged — the host keeps its phase."""
+        try:
+            await self._ensure_ports_closed(await self._fresh_item())
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self._log(f"{service_bid(svc)}: not started — {_errtext(e)}")
+            return
+        await self._bring_up(svc, restart=restart, setup=setup, force_setup=force_setup)
+
+    def _reconcile_services(self) -> Optional[asyncio.Task]:
+        """The 5-s tick's attach/detach (spec "Anhängen/Abhängen im Betrieb"): compare
+        what runs (`_attached`) with the attached services and hand the difference to
+        ONE background op (so a stop aborts it, and nothing else runs meanwhile). Only
+        on a running host with its tunnel, and no op in flight. → the op's task."""
+        s = self.state
+        if (s.phase not in _SYNC_PHASES or self._op is not None or self._tunnel is None
+                or self.deps.now() < self._svc_retry_at):
+            return None
+        cur = {service_bid(x): x for x in self.services}
+        gone = [bid for bid in self._attached if bid not in cur]
+        changed = [x for bid, x in cur.items() if self._attached.get(bid) != self._svc_sig(x)]
+        if not gone and not changed:
+            return None
+        t = self._spawn_op("updating services", self._apply_services(gone, changed))
+        self._bg_op = t
+        return t
+
+    async def _apply_services(self, gone: list, changed: list) -> None:
+        for bid in gone:
+            await self._detach(bid)
+        if not changed:
+            return
+        await self.reconcile_forwards()         # a new service's forward first
+        try:
+            await self._ensure_ports_closed(await self._fresh_item())
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # nothing starts behind a port we could not check; retried in a minute
+            self._svc_retry_at = self.deps.now() + _ATTACH_RETRY_S
+            self._log(f"attaching postponed: {_errtext(e)}")
+            return
+        for svc in changed:
+            bid = service_bid(svc)
+            old = self._attached.get(bid)
+            new = self._svc_sig(svc)
+            if old is None or old[0][2]:
+                # new — or one that could not run until now: never enabled, never started
+                await self._attach(svc)
+            elif old[0] == new[0]:
+                # only the forward moved (reconcile_forwards did it): a probe says up
+                up = await self._probe(svc)
+                self._svc_set(svc, "up" if up else "down",
+                              "" if up else f"does not answer on {self._svc_url(svc)}")
+                self._note_attached(svc)
             else:
-                self._svc_set(svc, "down", f"no start profile for type "
-                                           f"{svc.get('type') or 'openai'!r} yet")
+                self._log(f"{bid}: configuration changed — setting up / restarting it")
+                await self._bring_up(svc, restart=True)
+
+    async def _attach(self, svc: dict) -> None:
+        """A service attached to the running host: its backend enabled (Start does that
+        for every service; this one missed it), its setup if needed, start, probe."""
+        bid = service_bid(svc)
+        bad = self._problems().get(bid)
+        if bad:
+            self._svc_set(svc, "down", bad)
+            self._note_attached(svc)
+            return
+        self._log(f"{bid} attached — enabling, setting up and starting it")
+        try:
+            ok = self.deps.set_enabled(bid, True)
+        except Exception as e:
+            ok, why = False, _errtext(e)
+        else:
+            why = "not a known backend"
+        if ok is False:
+            self._svc_set(svc, "down", f"cannot enable backend {bid}: {why}")
+            self._note_attached(svc)
+            return
+        await self._bring_up(svc)
 
     # ops: one lifecycle operation at a time
     async def _run_op(self, name: str, coro) -> None:
@@ -2244,6 +2680,23 @@ class Controller:
         finally:
             if self._op_task is t:
                 self._op, self._op_task = None, None
+
+    def _spawn_op(self, name: str, coro) -> asyncio.Task:
+        """`_run_op` for an op nobody awaits (the tick's attach/detach): THE op of this
+        controller from this very line on — set before the first await, so nothing
+        else can start in between — in its own task, which a stop() aborts like a
+        start. Its end (or crash, logged) frees the op."""
+        self._op = name
+        t = asyncio.ensure_future(coro)
+        self._op_task = t
+
+        def done(task: asyncio.Task) -> None:
+            if self._op_task is task:
+                self._op, self._op_task = None, None
+            if not task.cancelled() and task.exception() is not None:
+                self._log(f"{name} failed: {_errtext(task.exception())}")
+        t.add_done_callback(done)
+        return t
 
     async def start(self) -> None:
         """Spec "Start" 0–6 (`starting` → `syncing` → first plan → `ready`).
@@ -2265,6 +2718,10 @@ class Controller:
         if not self.services:
             # a machine serving nothing would bill for nothing
             raise RuntimeError(_NO_SERVICE.format(host=self.name))
+        bad = self._problems()
+        if all(service_bid(x) in bad for x in self.services):
+            raise RuntimeError(f"no attached service of {self.name} can run: " + "; ".join(
+                f"{bid}: {why}" for bid, why in bad.items()))
         if self._comfy() is not None:
             self._commit()              # only the ComfyUI bootstrap pins a commit
         if not self._token():
@@ -2328,8 +2785,14 @@ class Controller:
         routed to — an instance created for it would bill for nothing, so any failure
         here ends the start before the create. `done` collects the ones enabled, which
         the caller disables again (and only those — the one that failed never was)."""
+        bad = self._problems()
         for svc in list(self.services):
             bid = service_bid(svc)
+            if bid in bad:
+                # shown down with its reason; enabled it would route to nothing (or,
+                # with a duplicate local port, to ANOTHER service)
+                self._log(f"not enabling {bid}: {bad[bid]}")
+                continue
             try:
                 ok = self.deps.set_enabled(bid, True)
             except Exception as e:
@@ -2367,20 +2830,32 @@ class Controller:
 
     async def _after_create(self) -> None:
         """Steps 3–6 from a created instance on: RUNNING → port guard → tunnel (every
-        service's forward) → ssh → the host bootstrap (if this instance lacks it) → the
-        ComfyUI bootstrap (if needed, and only with a ComfyUI service attached) → each
-        service started and probed. What runs is read from the state flags `_created`
-        set (`host_bootstrapped`, `bootstrap_incomplete`/`comfy_absent`), so this is
-        also how resume() continues a start the gateway restart interrupted before the
-        bootstrap."""
+        service's forward) → ssh → the host bootstrap (if this instance lacks it) → each
+        service's setup (the ComfyUI bootstrap if needed; a command service's script if
+        its hash is not the one this disk carries) → each service started and probed →
+        the first model sync. What runs is read from the state flags `_created` set
+        (`host_bootstrapped`, `bootstrap_incomplete`/`comfy_absent`, the setup hashes),
+        so this is also how resume() continues a start the gateway restart interrupted
+        before the bootstrap. The HOST fails (`failed(<phase>)`, instance kept) only on
+        what is the machine's: the provider, ssh, the port guard, the host bootstrap. A
+        service's setup or start failing is that service's `setup failed`/`down` (+ a
+        fault on its backend); the host goes `ready` and the others run (Ruling M4 g)."""
         s = self.state
         comfy = self._comfy()
         need_host = not s.host_bootstrapped
         need_comfy = self._comfy_pending()
         upload = comfy is not None and (need_comfy or need_host)
+        comfy_blocked = False               # its bootstrap cannot run (no node list)
+        svcs = list(self.services)
         try:
             if upload and not self._nodes_text:
-                self._nodes_text = self._node_list()     # lost with a restart
+                try:
+                    self._nodes_text = self._node_list()     # lost with a restart
+                except _PreCreate as e:
+                    if not need_comfy:
+                        raise
+                    self._svc_fail(comfy, "setup failed", _errtext(e))
+                    upload, comfy_blocked = False, True
             item = await self._wait_running(s.disk_gb)
             s.ip, s.port = str(item["ip"]), int(item["port"])
             self._persist()
@@ -2389,28 +2864,33 @@ class Controller:
             self._reset_known_hosts(s.uuid)
             await self._start_tunnel()
             await self._wait_ssh()
-            if need_host or need_comfy:
+            if need_host or need_comfy or any(self._setup_pending(x) for x in svcs):
                 self._set_phase("bootstrapping")
             if upload:
                 try:
                     await self._upload_nodes()      # first: the host bootstrap reads it
                 except Exception as e:
                     if need_comfy:
-                        self._svc_set(comfy, "setup failed", _errtext(e))
-                        raise _ServiceError(comfy, _errtext(e)) from e
-                    # only the host bootstrap's report needs it: unfiltered, not fatal
-                    self._log(f"{_errtext(e)} — the template-node report lists every pack")
+                        self._svc_fail(comfy, "setup failed", _errtext(e))
+                        comfy_blocked = True
+                    else:
+                        # only the host bootstrap's report needs it: unfiltered, not fatal
+                        self._log(f"{_errtext(e)} — the template-node report lists every pack")
             if need_host:
                 await self._host_bootstrap()        # a failure is the host's
-            if need_comfy:
-                # the ComfyUI service's setup: a failure is booked on it, but still
-                # fails the whole host start here — Task 5 makes it that service's alone
-                await self._ensure_comfy_bootstrap(upload=False)
-            elif comfy is None and s.comfy_absent:
+            if comfy is None and s.comfy_absent:
                 self._log("no ComfyUI service attached — ComfyUI bootstrap skipped")
+            ready: list = []
+            for svc in svcs:
+                ok = (False if svc is comfy and comfy_blocked
+                      else await self._setup_service(svc, upload=False))
+                if ok:
+                    ready.append(svc)
+                else:
+                    self._note_attached(svc)        # its status says why; not retried
             await self._ensure_ports_closed(await self._fresh_item())
             self._set_phase("starting")
-            await self._start_services()
+            await self._start_services(only=ready)
             # spec "Start" 6: the first plan before `ready`; aliases go live one by one
             # as their files arrive (`ready_aliases`), `ready` is the INSTANCE's state
             self._set_phase("syncing")
@@ -2420,13 +2900,20 @@ class Controller:
         except Exception as e:
             self._fail(_errtext(e), getattr(e, "svc", None))
 
+    def _svc_status(self, svc: dict) -> str:
+        st = self.state.services.get(service_bid(svc))
+        return str(st.get("status") or "down") if isinstance(st, dict) else "down"
+
     def _ready(self) -> None:
-        """ComfyUI answers: whatever the bootstrap left undone, this instance works — a
-        snapshot of it is a good template (an operator who fixed a failed bootstrap by
-        hand and restarted ComfyUI has confirmed exactly that). The same holds for the
-        host bootstrap: re-running it on a later start would take the models synced
-        meanwhile for the TEMPLATE's (`GW:UNKNOWN_MODEL`) and offer to delete them."""
-        if self.state.bootstrap_incomplete and self._comfy() is not None:
+        """The host is `ready`: its instance runs and its tunnel stands. Whatever the
+        HOST bootstrap left undone counts as done now (an operator who fixed a failed
+        one by hand and restarted has confirmed it; re-running it on a later start would
+        take the models synced meanwhile for the TEMPLATE's and offer to delete them).
+        The ComfyUI bootstrap only when ComfyUI actually ANSWERS — a host is `ready` with
+        a ComfyUI whose setup failed, and a snapshot of that one must stay marked."""
+        comfy = self._comfy()
+        if (self.state.bootstrap_incomplete and comfy is not None
+                and self._svc_status(comfy) == "up"):
             self._log("ComfyUI answers — the unfinished bootstrap counts as done now")
             self.state.bootstrap_incomplete = False
         if not self.state.host_bootstrapped:
@@ -2538,6 +3025,17 @@ class Controller:
             # a fresh template: the last instance's findings are not this one's (a
             # re-run on a snapshot keeps them until the host bootstrap reports anew)
             s.bootstrap_unknown, s.bootstrap_template_nodes = {}, []
+        # the command setups this disk carries: those recorded with its snapshot, none
+        # on a template — a stored hash from another disk would skip a setup it needs
+        done = s.setup_snapshots.get(snap["id"], {}) if snap else {}
+        done = done if isinstance(done, dict) else {}
+        for bid in set(s.services) | set(done):
+            st = s.services.get(bid)
+            st = dict(st) if isinstance(st, dict) else {"status": "down", "error": ""}
+            st["setup_hash"] = str(done.get(bid) or "")
+            s.services[bid] = st
+        self._attached.clear()
+        self._attached_svcs.clear()
         self._set_phase("creating")
 
     async def restart_comfy(self) -> None:
@@ -2558,15 +3056,27 @@ class Controller:
         await self._run_op("restarting ComfyUI", self._restart(only=[comfy]))
 
     async def _restart(self, only: Optional[list] = None) -> None:
+        """Restart services (all, or `only`) through `starting`. The host fails only on
+        its own trouble (port guard, provider); a service that does not come back is
+        that service's `down` — the host returns to `ready`. Except from `failed`: a
+        restart that fixed nothing leaves the host failed (now at `starting`), one that
+        brought the services back makes it `ready` (the way out of a failed start)."""
+        was_failed = self.state.phase == "failed"
         try:
             await self._ensure_ports_closed(await self._fresh_item())
             if self._tunnel is None:
                 await self._start_tunnel()
             self._set_phase("starting")
-            await self._start_services(restart=True, only=only)
-            self._ready()
+            dead = await self._start_services(restart=True, only=only)
         except Exception as e:
             self._fail(_errtext(e), getattr(e, "svc", None))
+            return
+        if dead and was_failed:
+            st = self.state.services.get(service_bid(dead[0])) or {}
+            # (the service's fault is booked already — no second one for the host)
+            self._set_phase("failed", f"{service_bid(dead[0])}: {st.get('error') or 'down'}")
+            return
+        self._ready()
 
     # ── stop (spec "Stop" 1–4) ──────────────────────────────────────────────
 
@@ -2585,13 +3095,21 @@ class Controller:
             self._log("model prune skipped: no ssh address known")
             return
         await self._kill_remote()
+        no_comfy = self._comfy_bid() is None
+        if no_comfy:
+            # nothing is synced without a ComfyUI service, so there is no plan to prune
+            # by (a plan with no needs would name every synced file) — only unfinished
+            # downloads go (a ComfyUI detached this session may have left some)
+            self._log("no ComfyUI service — no model prune, only unfinished downloads "
+                      "are removed")
         async with self._manifest_lock:
-            try:
-                plan, man = await self._compute_plan()
-            except Exception as e:
-                plan, man = None, None
-                self._log(f"model prune skipped ({_errtext(e)}) — only unfinished "
-                          "downloads are removed")
+            plan, man = None, None
+            if not no_comfy:
+                try:
+                    plan, man = await self._compute_plan()
+                except Exception as e:
+                    self._log(f"model prune skipped ({_errtext(e)}) — only unfinished "
+                              "downloads are removed")
             prune = list(plan["prune"]) if plan else []
             try:
                 rc, out, err = await self._exec(_prune_cmd(prune), timeout=_PRUNE_TIMEOUT_S)
@@ -2669,11 +3187,11 @@ class Controller:
         if self._op == "stopping":
             raise RuntimeError("already stopping")
         prev_op = self._op
-        if prev_op in _ABORTABLE and self._op_task is None:
+        if _abortable(prev_op) and self._op_task is None:
             # an abortable op with no task to cancel: cancelling nothing and answering
             # "stop done" would let it go on (a start would still create) — refuse
             raise RuntimeError(f"{prev_op} is checking Thunder — retry in a moment")
-        prev = self._op_task if prev_op in _ABORTABLE else None
+        prev = self._op_task if _abortable(prev_op) else None
         if prev is not None and prev.done():
             prev = None
         if self.state.phase == "off" and prev_op != "starting":
@@ -2688,6 +3206,9 @@ class Controller:
             s = self.state
             if not (s.uuid or s.index):
                 # no instance was ever created (or it is long forgotten): nothing bills
+                self._apply_pending_services()
+                self._attached.clear()
+                self._attached_svcs.clear()
                 self._disable()
                 msg = ""
                 if prev is not None and prev_op == "starting":
@@ -2701,6 +3222,9 @@ class Controller:
         finally:
             self._op = None
             self._drain_waiting = None
+            if self._pending_services is not None and not self._stopping():
+                # a list handed over after `off` applied the pending one
+                self._apply_pending_services()
 
     async def _stop_run(self) -> None:
         s = self.state
@@ -2828,6 +3352,8 @@ class Controller:
             self._log(f"snapshot {s.pending_snapshot_name} marked: bootstrap incomplete")
         if s.comfy_absent and sid not in s.no_comfy_snapshots:
             s.no_comfy_snapshots.append(sid)       # not a fault: no ComfyUI was attached
+        s.setup_snapshots[sid] = {bid: st["setup_hash"] for bid, st in s.services.items()
+                                  if isinstance(st, dict) and st.get("setup_hash")}
         self._persist()
 
     async def _snapshot(self, fresh_name: bool) -> None:
@@ -2870,6 +3396,7 @@ class Controller:
         if s.pending_snapshot == row["id"]:
             s.pending_snapshot = ""
         s.manifests.pop(row["id"], None)
+        s.setup_snapshots.pop(row["id"], None)
         old = s.pending_snapshot_name
         for _ in range(3):                  # the name has 1-s resolution
             s.pending_snapshot_name = self._prov.snapshot_name(self.name, self.deps.now())
@@ -2929,12 +3456,17 @@ class Controller:
         s.index, s.uuid, s.ip, s.port = "", "", "", 0
         s.started_at = 0.0
         s.bootstrap_incomplete = s.comfy_absent = s.host_bootstrapped = False
+        self._attached.clear()                  # nothing runs any more
+        self._attached_svcs.clear()
         self._set_phase("off", why)
         if uuid:
             try:
                 os.remove(self._known_hosts_path(uuid))
             except (OSError, ValueError):
                 pass
+        # `off` disables what is attached NOW (R-K2): a list handed over during the stop
+        # applies first — a service detached meanwhile is another host's already
+        self._apply_pending_services()
         self._disable()
         if fault:
             self._fault(None, "lifecycle", "instance_vanished", why)
@@ -2944,6 +3476,7 @@ class Controller:
     def _forget_snapshot(self, sid: str) -> None:
         s = self.state
         s.manifests.pop(sid, None)
+        s.setup_snapshots.pop(sid, None)
         for marks in (s.incomplete_snapshots, s.host_incomplete_snapshots,
                       s.no_comfy_snapshots):
             if sid in marks:
@@ -2999,8 +3532,10 @@ class Controller:
                 self._forget_snapshot(pid)
             else:
                 # not confirmed failed: should it reappear READY, its incomplete-bootstrap
-                # mark must still make a start from it bootstrap again
+                # mark must still make a start from it bootstrap again (and without its
+                # setup record every command setup runs again on it — the safe side)
                 s.manifests.pop(pid, None)
+                s.setup_snapshots.pop(pid, None)
             self._persist()
             why = "failed" if status == "FAILED" else "vanished from the snapshot list"
             self._log(f"snapshot {name} {why} — the last READY one ({s.snapshot_id or 'none'}) "
@@ -3798,6 +4333,9 @@ class Controller:
         paths = [str(p) for p in paths or []]
         if not paths:
             return 0
+        if self._comfy_bid() is None:
+            raise RuntimeError(f"no ComfyUI service attached to {self.name} — its model "
+                               "files are not managed here")
         async with self._sync_lock:
             plan, _ = await self._compute_plan()
             if not self._syncing():
@@ -3914,10 +4452,10 @@ class Controller:
                 self._fail("host bootstrap interrupted by a gateway restart (it may still "
                            f"run on the instance, see {_HOST_BOOTSTRAP_LOG}) — Stop, and "
                            "the next start runs it again")
+            elif self._tunnel is None:
+                self._fail("resume: no tunnel to the instance (see the log) — Stop")
             else:
-                self._fail("bootstrap interrupted by a gateway restart (it may still run on "
-                           f"the instance, see {_BOOTSTRAP_LOG}) — Restart ComfyUI once it is "
-                           "done, or Stop")
+                await self._resume_setups()
             return
         # starting / syncing / ready
         try:
@@ -3926,18 +4464,69 @@ class Controller:
             self._fail(_errtext(e))
             return
         # every service probed on its own forward; only one that does not answer is
-        # restarted — the others keep their jobs
+        # restarted — the others keep their jobs. A command service whose setup script
+        # changed while the gateway was down gets it now (then a fresh start).
+        bad = self._problems()
         dead = []
-        for svc in [x for x in self.services if x.get("type") == "comfyui"]:
-            if await self._probe_briefly(svc):
+        for svc in list(self.services):
+            bid = service_bid(svc)
+            if bid in bad:
+                self._svc_set(svc, "down", bad[bid])
+                self._note_attached(svc)
+            elif self._setup_pending(svc):
+                self._log(f"resume: {bid}'s setup script changed — running it")
+                await self._bring_up(svc, restart=True)
+            elif await self._probe_briefly(svc):
                 self._svc_set(svc, "up")
+                self._note_attached(svc)
             else:
                 dead.append(svc)
         if not dead:
             self._ready()
         else:
-            self._log("resume: ComfyUI does not answer — restarting it")
+            self._log("resume: " + ", ".join(service_bid(x) for x in dead)
+                      + " not answering — restarting")
             await self._restart(only=dead)
+
+    async def _resume_setups(self) -> None:
+        """A gateway restart hit the per-service setups (the host bootstrap is done). A
+        setup that was running may STILL run on the instance — running it a second time
+        next to itself breaks both — so such a service is `setup failed` naming its log
+        (the card's "Re-run setup" once it is done); the others start, the host goes
+        `ready`. A ComfyUI attached only now (no install on this instance) is left to
+        the tick's attach, which bootstraps it."""
+        s = self.state
+        comfy = self._comfy()
+        bad = self._problems()
+        ready = []
+        for svc in list(self.services):
+            bid = service_bid(svc)
+            prof = services.profile_for(svc)
+            if bid in bad:
+                self._svc_set(svc, "down", bad[bid])
+                self._note_attached(svc)
+            elif svc is comfy and s.bootstrap_incomplete:
+                self._svc_fail(svc, "setup failed", "ComfyUI bootstrap interrupted by a "
+                               f"gateway restart (it may still run, see {_BOOTSTRAP_LOG}) "
+                               "— Re-run setup once it is done")
+                self._note_attached(svc)
+            elif svc is comfy and s.comfy_absent:
+                continue                        # the tick attaches (and bootstraps) it
+            elif self._setup_pending(svc):
+                self._svc_fail(svc, "setup failed", "setup interrupted by a gateway restart "
+                               f"(it may still run, see {prof.setup_log(svc)}) — Re-run "
+                               "setup once it is done")
+                self._note_attached(svc)
+            else:
+                ready.append(svc)
+        try:
+            await self._ensure_ports_closed(await self._fresh_item())
+            self._set_phase("starting")
+            await self._start_services(only=ready)
+        except Exception as e:
+            self._fail(_errtext(e))
+            return
+        self._ready()
 
     async def _reattach(self, item: dict, keep_failed: bool = False) -> None:
         """Port guard first (a restart must not find the instance behind a public port
@@ -3957,20 +4546,19 @@ class Controller:
             await self._start_tunnel()
 
     async def _probe_briefly(self, svc: dict) -> bool:
-        url = self._svc_url(svc)
-        if not url:
+        """Does a service answer within `_RESUME_PROBE_S` (a fresh tunnel needs a
+        moment)?"""
+        if not self._svc_url(svc):
             return False
         deadline = self.deps.now() + _RESUME_PROBE_S
         while True:
-            try:
-                if await self.deps.probe_comfy(url):
-                    self._log("ComfyUI answers")
-                    return True
-            except Exception:
-                pass
+            if await self._probe(svc):
+                self._log("ComfyUI answers" if svc.get("type") == "comfyui"
+                          else f"{service_bid(svc)} answers")
+                return True
             if self.deps.now() >= deadline:
                 return False
-            await self.deps.sleep(_COMFY_PROBE_S)
+            await self.deps.sleep(_SVC_PROBE_S)
 
     async def _adopt_pending_by_name(self) -> None:
         """A restart hit `snapshotting` between the POST and persisting its id: the
@@ -4051,7 +4639,9 @@ class Controller:
     async def run_forever(self) -> None:
         """Background loop (spawned by main next to resume()): every 5 s a forward that
         is still missing on the running master (a failed `forward`, a port that was
-        busy) is tried again, and the model-sync trigger (`_sync_tick`) runs; every 60 s the snapshot watcher while a snapshot is
+        busy) is tried again when its backoff allows, services attached/detached/changed
+        since the last round are brought in line (`_reconcile_services`, as an op of its
+        own), and the model-sync trigger (`_sync_tick`) runs; every 60 s the snapshot watcher while a snapshot is
         pending, and resume() again while it could not reach the API; every 10 min the
         account view (`refresh_account` — prices, snapshots, foreign instances)."""
         every = max(1, _WATCH_S // _SYNC_POLL_S)
@@ -4076,7 +4666,8 @@ class Controller:
                             self._log(f"account refresh failed: {_errtext(e)}")
                 if (self._tunnel is not None and self._fwd_active != set(self._forwards())
                         and (self._fwd_task is None or self._fwd_task.done())):
-                    await self.reconcile_forwards()
+                    await self.reconcile_forwards()     # (backing off per forward)
+                self._reconcile_services()              # attach/detach: a background op
                 await self._sync_tick()
             except asyncio.CancelledError:
                 raise

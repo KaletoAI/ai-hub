@@ -20,6 +20,7 @@ from unittest import mock
 import httpx
 
 import modelsync as ms
+import services
 import sshrun
 import thunder
 import hostctl
@@ -39,7 +40,7 @@ def tearDownModule():
 
 
 def make(fake, backend=None, ssh_script=None, datadir=None, default_nodes="",
-         probe=None, state=None, host_name=None, services=None):
+         probe=None, state=None, host_name=None, services=None, probe_http=None):
     """A controller on the stub API. `c.h` carries the harness: `clock` (a list; the
     fake sleep ADVANCES it, so every timeout is reachable without waiting), `phases`
     (every persisted phase in order), `faults`, `tunnels`. `ssh_script` maps a
@@ -66,10 +67,11 @@ def make(fake, backend=None, ssh_script=None, datadir=None, default_nodes="",
         _TMPDIRS.append(datadir)
     # both bootstraps succeed unless the test scripts otherwise; the host bootstrap's
     # key comes FIRST (its command also says `bash -s`), so a test that scripts
-    # "bash -s" scripts the ComfyUI bootstrap only, as before the split
-    script = {HOST_BOOT: (0, b"GW:PHASE tools\nGW:DONE\n", b""),
-              "bash -s": (0, b"GW:PHASE smoke\nGW:SMOKE ok\nGW:DONE\n", b"")}
+    # "bash -s" scripts the ComfyUI bootstrap only, as before the split; the test's own
+    # keys come before the default "bash -s" (a service's setup also says `bash -s`)
+    script = {HOST_BOOT: (0, b"GW:PHASE tools\nGW:DONE\n", b"")}
     script.update(ssh_script or {})
+    script.setdefault("bash -s", (0, b"GW:PHASE smoke\nGW:SMOKE ok\nGW:DONE\n", b""))
 
     async def ssh(argv, stdin=None, timeout=60):
         ssh_calls.append((argv, stdin))
@@ -101,6 +103,7 @@ def make(fake, backend=None, ssh_script=None, datadir=None, default_nodes="",
         note_fault=lambda *a, **k: faults.append(a), datadir=datadir, log=lambda m: None,
         now=lambda: clock[0], sleep=sleep,
         ssh=ssh, spawn=None, probe_comfy=probe or (lambda url: asyncio.sleep(0, True)),
+        probe_http=probe_http or (lambda url: asyncio.sleep(0, 200)),
         bootstrap_script=lambda: b"#!/bin/bash\necho GW:DONE\n",
         host_bootstrap_script=lambda: HOST_SCRIPT,
         keygen=keygen, default_nodes=lambda: default_nodes)
@@ -414,6 +417,11 @@ def _creates(fake):
     return [b for m, p, b in fake.calls if p == "/instances/create"]
 
 
+def _sv(c, bid=BID):
+    """A service's row of the view: {status, error, …}."""
+    return c.view()["services"][bid]
+
+
 def _ssh_cmds(fake):
     return [p for m, p, _ in fake.calls if m == "SSH"]
 
@@ -438,9 +446,9 @@ class Start(unittest.IsolatedAsyncioTestCase):
                                 "'bash -s -- 2>&1 | tee ~/gw-host-bootstrap.log'",
                                 "bash -o pipefail -c "
                                 f"'bash -s -- {COMMIT} 2>&1 | tee ~/gw-bootstrap.log'"])
-        self.assertIn(hostctl._START_CMD, cmds)
-        self.assertTrue(hostctl._START_CMD.endswith(
-            "setsid nohup ~/start-comfy.sh >/dev/null 2>&1 < /dev/null &"))
+        self.assertIn(hostctl._start_cmd(8188), cmds)
+        self.assertTrue(hostctl._start_cmd(8188).endswith(
+            "setsid nohup ~/start-comfy.sh 8188 >/dev/null 2>&1 < /dev/null &"))
         # "off" first: template + request time are persisted before the create
         self.assertEqual(c.h.phases, ["off", "creating", "connecting", "bootstrapping",
                                       "starting", "syncing", "ready"])
@@ -591,16 +599,22 @@ class Start(unittest.IsolatedAsyncioTestCase):
         self.assertLess(patch, start)
 
     async def test_bootstrap_smoke_fail_keeps_instance(self):
+        # Ruling M4 (g): a failing ComfyUI bootstrap is that SERVICE's `setup failed` —
+        # the host goes `ready` (instance kept, other services would run), ComfyUI is
+        # never started, and the snapshot of this host stays marked incomplete
         fake = FakeThunder()
         c, saved, _, _ = make(fake, ssh_script={"bash -s": (3, b"GW:SMOKE fail cumesh\n", b"")})
         await c.start()
-        self.assertEqual(c.state.phase, "failed")
-        self.assertEqual(c.state.failed_phase, "bootstrapping")
-        self.assertIn("cumesh", c.state.error)
+        self.assertEqual((c.state.phase, c.state.error), ("ready", ""))
+        self.assertEqual(_sv(c)["status"], "setup failed")
+        self.assertIn("cumesh", _sv(c)["error"])
         self.assertIn("0", fake.instances)
         self.assertEqual(saved["thunder"]["uuid"], "u0")
+        self.assertTrue(saved["thunder"]["bootstrap_incomplete"])
         self.assertFalse([x for x in _ssh_cmds(fake) if "start-comfy.sh" in x])
         self.assertEqual(len(c.h.faults), 1)
+        self.assertEqual((c.h.faults[0][0]["name"], c.h.faults[0][0]["type"]),
+                         ("thunder", "comfyui"))
 
     async def test_node_fail_fails_even_when_done(self):
         # Ruling 9: a missing node pack makes workflows fail later with a plausible error
@@ -609,8 +623,9 @@ class Start(unittest.IsolatedAsyncioTestCase):
         fake = FakeThunder()
         c, _, _, _ = make(fake, ssh_script={"bash -s": (0, out, b"")})
         await c.start()
-        self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "bootstrapping"))
-        self.assertIn("ComfyUI-Foo", c.state.error)
+        self.assertEqual(c.state.phase, "ready")
+        self.assertEqual(_sv(c)["status"], "setup failed")
+        self.assertIn("ComfyUI-Foo", _sv(c)["error"])
         self.assertFalse([x for x in _ssh_cmds(fake) if "start-comfy.sh" in x])
 
     async def test_bootstrap_nonzero_rc_fails(self):
@@ -618,15 +633,15 @@ class Start(unittest.IsolatedAsyncioTestCase):
         c, _, _, _ = make(fake, ssh_script={"bash -s": (1, b"GW:PHASE venv\n",
                                                         b"x\nbootstrap: cannot build the venv\n")})
         await c.start()
-        self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "bootstrapping"))
-        self.assertIn("rc 1", c.state.error)
-        self.assertIn("venv", c.state.error)
+        self.assertEqual((c.state.phase, _sv(c)["status"]), ("ready", "setup failed"))
+        self.assertIn("rc 1", _sv(c)["error"])
+        self.assertIn("venv", _sv(c)["error"])
 
     async def test_bootstrap_without_done_fails(self):
         fake = FakeThunder()
         c, _, _, _ = make(fake, ssh_script={"bash -s": (0, b"GW:PHASE nodes\n", b"")})
         await c.start()
-        self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "bootstrapping"))
+        self.assertEqual((c.state.phase, _sv(c)["status"]), ("ready", "setup failed"))
 
     async def test_bootstrap_reports_are_collected_and_persisted(self):
         # the template's models and packs come from the HOST bootstrap (R-W3); the
@@ -695,14 +710,16 @@ class Start(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(c.state.phase, "ready")
         self.assertEqual(seen, ["http://127.0.0.1:18188"] * 3)
 
-    async def test_comfy_never_answers_fails_starting(self):
+    async def test_comfy_never_answers_is_the_services_down(self):
         async def probe(url):
             raise httpx.ConnectError("refused")      # a raising probe counts as "not yet"
         fake = FakeThunder()
         _ready_snap(fake)
         c, _, _, _ = make(fake, probe=probe)
         await c.start()
-        self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "starting"))
+        self.assertEqual(c.state.phase, "ready")
+        self.assertEqual(_sv(c)["status"], "down")
+        self.assertIn("did not answer", _sv(c)["error"])
         self.assertIn("0", fake.instances)
 
     async def test_api_error_before_create_is_off_with_message(self):
@@ -825,9 +842,9 @@ class Start(unittest.IsolatedAsyncioTestCase):
         c, _, _, _ = make(fake, ssh_script={"bash -s": (124, b"", b"timeout"),
                                             "tail -n 200 ~/gw-bootstrap.log": (0, tail, b"")})
         await c.start()
-        self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "bootstrapping"))
-        self.assertIn("timed out", c.state.error)
-        self.assertIn("phase extensions", c.state.error)
+        self.assertEqual((c.state.phase, _sv(c)["status"]), ("ready", "setup failed"))
+        self.assertIn("timed out", _sv(c)["error"])
+        self.assertIn("phase extensions", _sv(c)["error"])
         self.assertTrue(any("building cumesh wheel" in ln for ln in c.state.log))
         self.assertIn("tail -n 200 ~/gw-bootstrap.log", _ssh_cmds(fake))
 
@@ -837,14 +854,14 @@ class Start(unittest.IsolatedAsyncioTestCase):
         c, _, _, _ = make(fake, ssh_script={"bash -s": (255, b"", b"Connection reset"),
                                             "tail -n 200": (0, tail, b"")})
         await c.start()
-        self.assertIn("rc 255 in phase venv", c.state.error)
-        self.assertIn("cannot build the venv", c.state.error)
+        self.assertIn("rc 255 in phase venv", _sv(c)["error"])
+        self.assertIn("cannot build the venv", _sv(c)["error"])
 
     async def test_bootstrap_output_present_needs_no_log_fetch(self):
         fake = FakeThunder()
         c, _, _, _ = make(fake, ssh_script={"bash -s": (1, b"GW:PHASE venv\nbootstrap: x\n", b"")})
         await c.start()
-        self.assertIn("rc 1 in phase venv: bootstrap: x", c.state.error)
+        self.assertIn("rc 1 in phase venv: bootstrap: x", _sv(c)["error"])
         self.assertFalse([x for x in _ssh_cmds(fake) if x.startswith("tail ")])
 
     async def test_missing_start_script_fails_fast_with_a_reason(self):
@@ -853,8 +870,8 @@ class Start(unittest.IsolatedAsyncioTestCase):
         c, _, _, _ = make(fake, ssh_script={"test -x ~/start-comfy.sh":
                                             (3, b"", b"start-comfy.sh missing\n")})
         await c.start()
-        self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "starting"))
-        self.assertIn("start-comfy.sh missing", c.state.error)
+        self.assertEqual((c.state.phase, _sv(c)["status"]), ("ready", "down"))
+        self.assertIn("start-comfy.sh missing", _sv(c)["error"])
         self.assertLess(c.h.clock[0] - 1_790_000_000.0, 60)     # no 10-min probe wait
 
     def _uuidless_create(self, c, fake, template):
@@ -956,14 +973,16 @@ class RestartComfy(unittest.IsolatedAsyncioTestCase):
         cmds = [p for m, p, _ in fake.calls[n:] if m == "SSH"]
         self.assertEqual(len(cmds), 1)
         self.assertIn("pkill -f", cmds[0])
-        self.assertTrue(cmds[0].endswith("; " + hostctl._START_CMD))
+        self.assertEqual(cmds[0], hostctl._restart_cmd(8188))
+        self.assertTrue(cmds[0].endswith("; " + hostctl._start_cmd(8188)))
         self.assertEqual(c.h.phases[-2:], ["starting", "ready"])
 
     async def test_pkill_pattern_matches_comfy_but_not_the_remote_shell(self):
         # The command line to match is the one start-comfy.sh really runs — read from
-        # the heredoc the bootstrap writes, not copied by hand. The remote
-        # `bash -c "<cmd>"` carries the pattern in ITS command line: a plain pattern
-        # would kill the shell running the restart before it starts the loop.
+        # the heredoc the bootstrap writes, not copied by hand (its port is the loop's
+        # argument now, any port matches). The remote `bash -c "<cmd>"` carries the
+        # pattern in ITS command line: a plain pattern would kill the shell running the
+        # restart before it starts the loop.
         # pkill -f reads the pattern as an ERE; for brackets and literals re agrees.
         import re
         import shlex
@@ -975,9 +994,11 @@ class RestartComfy(unittest.IsolatedAsyncioTestCase):
         line = next(ln for ln in heredoc.splitlines() if " main.py " in ln)
         argv = shlex.split(line.split("\\")[0].split("9>&-")[0])
         self.assertEqual(argv[0], "$COMFY_PY")
+        self.assertEqual(argv[argv.index("--port") + 1], "$PORT")
+        argv[argv.index("--port") + 1] = "8190"
         comfy = " ".join(["/home/ubuntu/ComfyUI/venv/bin/python"] + argv[1:])
         self.assertIn("--listen 127.0.0.1", comfy)
-        pat = shlex.split(hostctl._restart_cmd(8188).split(";")[0])[2]
+        pat = re.search(r"pkill -f '([^']*)'", hostctl._restart_cmd(8188)).group(1)
         self.assertTrue(re.search(pat, comfy), comfy)
         self.assertFalse(re.search(pat, "bash -c " + hostctl._restart_cmd(8188)))
         self.assertFalse(re.search(pat, "bash -c " + shlex.quote(hostctl._restart_cmd(8188))))
@@ -996,9 +1017,12 @@ class RestartComfy(unittest.IsolatedAsyncioTestCase):
         fake = FakeThunder()
         c, _, _, _ = make(fake, ssh_script={"bash -s": (3, b"GW:SMOKE fail x\n", b"")})
         await c.start()
-        self.assertEqual(c.state.phase, "failed")
+        self.assertEqual((c.state.phase, _sv(c)["status"]), ("ready", "setup failed"))
+        self.assertTrue(c.state.bootstrap_incomplete)
+        # fixed by hand on the box: a restart that answers confirms the install
         await c.restart_comfy()
-        self.assertEqual(c.state.phase, "ready", c.state.error)
+        self.assertEqual((c.state.phase, _sv(c)["status"]), ("ready", "up"), c.state.error)
+        self.assertFalse(c.state.bootstrap_incomplete)
 
     async def test_restart_refused_without_instance(self):
         fake = FakeThunder()
@@ -1018,7 +1042,8 @@ class RestartComfy(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             await c2.restart_comfy()
 
-    async def test_restart_that_never_answers_fails_starting(self):
+    async def test_restart_that_never_answers_is_the_services_down(self):
+        # the host stays ready (other services run on); ComfyUI shows why
         answers = [True]
 
         async def probe(url):
@@ -1026,7 +1051,14 @@ class RestartComfy(unittest.IsolatedAsyncioTestCase):
         fake, c = await self._ready(probe=probe)
         answers[0] = False
         await c.restart_comfy()
+        self.assertEqual(c.state.phase, "ready")
+        self.assertEqual(_sv(c)["status"], "down")
+        self.assertIn("did not answer", _sv(c)["error"])
+        # from `failed`, a restart that fixes nothing leaves the host failed
+        c.state.phase, c.state.failed_phase = "failed", "bootstrapping"
+        await c.restart_comfy()
         self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "starting"))
+        self.assertIn("comfyui:thunder", c.state.error)
 
     async def test_restart_waits_before_first_probe(self):
         # the old process may still answer for a moment after pkill
@@ -1265,7 +1297,7 @@ class Stop(unittest.IsolatedAsyncioTestCase):
         fake = FakeThunder()
         c, saved, _, _ = make(fake, ssh_script={"bash -s": (124, b"", b"timeout")})
         await c.start()
-        self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "bootstrapping"))
+        self.assertEqual((c.state.phase, _sv(c)["status"]), ("ready", "setup failed"))
         await c.stop()
         self.assertEqual(c.state.phase, "off", c.state.error)
         self.assertEqual(saved["thunder"]["incomplete_snapshots"], ["s0"])
@@ -1811,7 +1843,7 @@ class Resume(unittest.IsolatedAsyncioTestCase):
         c, _, _, _ = make(fake, state=_persisted(phase="restoring", ip="", port=0))
         await c.resume()
         self.assertEqual(c.state.phase, "ready", c.state.error)
-        self.assertIn(hostctl._START_CMD, _ssh_cmds(fake))
+        self.assertIn(hostctl._start_cmd(8188), _ssh_cmds(fake))
         self.assertFalse([x for x in _ssh_cmds(fake) if "bash -s" in x])
 
     async def test_resume_interrupted_first_start_runs_the_bootstrap(self):
@@ -4756,10 +4788,15 @@ class FinalReviewFixes(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(c._op)
 
 
-def _svc(name, typ, lport, rport):
-    """An attached service as main hands it over: the backend dict plus its forward."""
-    return {"name": name, "type": typ, "url": f"http://127.0.0.1:{lport}",
-            "local_port": lport, "remote_port": rport}
+def _svc(name, typ, lport, rport, **kw):
+    """An attached service as main hands it over: the backend dict plus its forward (a
+    command service with a start command — the store fields arrive in Task 6)."""
+    b = {"name": name, "type": typ, "url": f"http://127.0.0.1:{lport}",
+         "local_port": lport, "remote_port": rport}
+    if typ == "openai":
+        b["svc_start"] = f"serve-stub --port {rport}"
+    b.update(kw)
+    return b
 
 
 class _MasterTunnel(_NoTunnel):
@@ -4824,9 +4861,10 @@ class ManagedHost(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sv["comfyui:thunder"]["status"], "up")
         self.assertEqual((sv["openai:vllm"]["local_port"], sv["openai:vllm"]["remote_port"]),
                          (18200, 8000))
-        # no command profile before services.py: shown, never failing the host
-        self.assertEqual(sv["openai:vllm"]["status"], "down")
-        self.assertIn("no start profile", sv["openai:vllm"]["error"])
+        # the command services run through their wrappers (services.CommandProfile)
+        self.assertEqual((sv["openai:vllm"]["status"], sv["openai:embed"]["status"]),
+                         ("up", "up"))
+        self.assertIn(services.COMMAND.start_cmd(self._three()[1]), _ssh_cmds(fake))
         drained, busy, seen = [], {"openai:vllm": [1, 1, 0]}, []
         c.deps.begin_drain = lambda bid: drained.append(bid) or True
 
@@ -4968,21 +5006,23 @@ class ManagedHost(unittest.IsolatedAsyncioTestCase):
         await c.watch_snapshots()
         self.assertEqual(c.h.faults[-1][0], host)
         self.assertEqual(c.h.faults[-1][2], "snapshot_failed")
-        # the ComfyUI bootstrap failing → the ComfyUI service's fault, its status
+        # the ComfyUI bootstrap failing → the ComfyUI service's fault and status; the
+        # host is not failed for it (Ruling M4 g)
         fake = FakeThunder()
         c, _, _, _ = make(fake, host_name="box",
                           ssh_script={"bash -s": (1, b"GW:PHASE nodes\n", b"boom")})
         await c.start()
-        self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "bootstrapping"))
+        self.assertEqual(c.state.phase, "ready")
         f = c.h.faults[-1]
         self.assertEqual((f[0]["name"], f[0]["type"], f[1], f[2]),
                          ("thunder", "comfyui", "lifecycle", "error"))
+        self.assertEqual(len(c.h.faults), 1)
         self.assertEqual(c.view()["services"]["comfyui:thunder"]["status"], "setup failed")
         # ComfyUI never answering → the service's fault, status down with the reason
         fake = FakeThunder()
         c, _, _, _ = make(fake, host_name="box", probe=lambda url: asyncio.sleep(0, False))
         await c.start()
-        self.assertEqual((c.state.phase, c.state.failed_phase), ("failed", "starting"))
+        self.assertEqual(c.state.phase, "ready")
         self.assertEqual((c.h.faults[-1][0]["name"], c.h.faults[-1][0]["type"]),
                          ("thunder", "comfyui"))
         sv = c.view()["services"]["comfyui:thunder"]
@@ -5045,8 +5085,10 @@ class ManagedHost(unittest.IsolatedAsyncioTestCase):
         # ExitOnForwardFailure it would take every service's tunnel down with it
         c.h.tunnels[0].respawn()
         self.assertEqual(_fwds(c.h.tunnels[0].argvs[-1]), ["127.0.0.1:18188:127.0.0.1:8188"])
-        # the port is free again: the retry (run_forever's tick) adds it on the master
+        # the port is free again: the retry (run_forever's tick, once its backoff has
+        # passed) adds it on the master
         _controls(c)                                        # answers rc 0 from now on
+        c.h.clock[0] += hostctl._FWD_RETRY_MIN_S
         await c.reconcile_forwards()
         self.assertEqual(c._fwd_active, {(18188, 8188), (18200, 8000)})
         c.h.tunnels[0].respawn()
@@ -5088,7 +5130,7 @@ class ManagedHost(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([x for x in cmds if "bash -s" in x or "gw-nodes" in x],
                          ["bash -o pipefail -c "
                           "'bash -s -- 2>&1 | tee ~/gw-host-bootstrap.log'"])
-        self.assertNotIn(hostctl._START_CMD, cmds)
+        self.assertNotIn(hostctl._start_cmd(8188), cmds)
         self.assertEqual(enabled, {"openai:vllm": True})
         self.assertIsNone(c.plan)
         self.assertFalse(c.is_alias_ready("openai:vllm", "img"))
@@ -5100,12 +5142,14 @@ class ManagedHost(unittest.IsolatedAsyncioTestCase):
         boot = [(argv[-1], stdin) for argv, stdin in calls if "bash -s --" in argv[-1]]
         self.assertEqual(len(boot), 2)
         self.assertEqual([b[1] for b in boot], [HOST_SCRIPT, b"#!/bin/bash\necho GW:DONE\n"])
-        self.assertIn(hostctl._START_CMD, _ssh_cmds(fake))
+        self.assertIn(hostctl._start_cmd(8188), _ssh_cmds(fake))
 
     async def test_restart_pattern_uses_the_service_port(self):
         # the pkill pattern names the SERVICE's port: a fixed 8188 would kill nothing
         # (or another ComfyUI) for a service on another port
-        self.assertIn("--port 8190'", hostctl._restart_cmd(8190))
+        # (Ruling M4 d: the loop takes the port; the restart starts it on the service's)
+        self.assertTrue(hostctl._restart_cmd(8190).endswith(hostctl._start_cmd(8190)))
+        self.assertIn("~/start-comfy.sh 8190 ", hostctl._start_cmd(8190))
         with self.assertRaises(ValueError):
             hostctl._restart_cmd(0)
         fake = FakeThunder()
@@ -5116,7 +5160,7 @@ class ManagedHost(unittest.IsolatedAsyncioTestCase):
         await c.restart_comfy()
         self.assertEqual(c.state.phase, "ready", c.state.error)
         cmds = [p for m, p, _ in fake.calls[n:] if m == "SSH"]
-        self.assertIn("--port 8190'", cmds[0])
+        self.assertEqual(cmds[0], hostctl._restart_cmd(8190))
 
     async def test_resume_probes_each_service_on_its_own_forward(self):
         # after a gateway restart every service is probed through ITS local port, and
@@ -5141,7 +5185,7 @@ class ManagedHost(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(c.state.phase, "ready", c.state.error)
         self.assertEqual(set(asked), {"http://127.0.0.1:18190"})
         kill = next(p for m, p, _ in fake.calls[n:] if m == "SSH" and "pkill" in p)
-        self.assertIn("--port 8190'", kill)
+        self.assertEqual(kill, hostctl._restart_cmd(8190))
         self.assertEqual(c.view()["services"]["comfyui:thunder"]["status"], "up")
 
     async def test_tunnel_error_is_in_the_view(self):
@@ -5249,7 +5293,7 @@ class SplitBootstrap(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((len(host), len(comfy)), (1, 1))
         self.assertLess(cmds.index("cat > ~/.gw-nodes.txt"), cmds.index(host[0]))
         self.assertLess(cmds.index(host[0]), cmds.index(comfy[0]))
-        self.assertLess(cmds.index(comfy[0]), cmds.index(hostctl._START_CMD))
+        self.assertLess(cmds.index(comfy[0]), cmds.index(hostctl._start_cmd(8188)))
         self.assertEqual((saved["thunder"]["host_bootstrapped"],
                           saved["thunder"]["bootstrap_incomplete"],
                           saved["thunder"]["comfy_absent"]), (True, False, False))
@@ -5319,24 +5363,47 @@ class SplitBootstrap(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((len(host), len(comfy)), (0, 1))  # host part is in the snapshot
         self.assertFalse(c.state.comfy_absent or c.state.bootstrap_incomplete)
 
-    async def test_ensure_comfy_bootstrap_on_a_running_host(self):
-        # Task 5 wires the attach; the controller side: a ComfyUI service on a running
-        # host without ComfyUI gets exactly the ComfyUI bootstrap, once
+    async def test_comfy_attached_to_a_running_host_is_bootstrapped(self):
+        # a ComfyUI service attached to a running host without ComfyUI gets exactly the
+        # ComfyUI bootstrap, once — through the attach op (Ruling M4 f)
         fake = FakeThunder()
         c, saved = self._vllm(fake)
         await c.start()
-        self.assertFalse(await c._ensure_comfy_bootstrap())   # no ComfyUI attached
-        c.services = c.services + [_svc("thunder", "comfyui", 18188, 8188)]
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        c.set_services(c.services + [_svc("thunder", "comfyui", 18188, 8188)])
         n = len(fake.calls)
-        self.assertTrue(await c._ensure_comfy_bootstrap())
+        t = c._reconcile_services()
+        self.assertEqual(c.op, "updating services")
+        await t
         cmds = [p for m, p, _ in fake.calls[n:] if m == "SSH"]
         host, comfy = _boots(fake, n)
         self.assertEqual((host, len(comfy)), ([], 1))
         self.assertLess(cmds.index("cat > ~/.gw-nodes.txt"), cmds.index(comfy[0]))
+        self.assertLess(cmds.index(comfy[0]), cmds.index(hostctl._start_cmd(8188)))
         self.assertEqual((saved["thunder"]["bootstrap_incomplete"],
                           saved["thunder"]["comfy_absent"]), (False, False))
+        self.assertEqual(_sv(c)["status"], "up")
+        self.assertIsNone(c.op)
         n = len(fake.calls)
-        self.assertFalse(await c._ensure_comfy_bootstrap())   # done: nothing runs
+        self.assertIsNone(c._reconcile_services())          # done: nothing runs
+        self.assertEqual(_boots(fake, n), ([], []))
+
+    async def test_ensure_comfy_bootstrap_only_inside_an_op(self):
+        # Ruling M4 (f): never outside the op guard, never while the host stops
+        fake = FakeThunder()
+        c, _ = self._vllm(fake)
+        await c.start()
+        c.set_services(c.services + [_svc("thunder", "comfyui", 18188, 8188)])
+        n = len(fake.calls)
+        with self.assertRaisesRegex(RuntimeError, "inside a host operation"):
+            await c._ensure_comfy_bootstrap()
+        c._op = "stopping"
+        with self.assertRaisesRegex(RuntimeError, "never while the host stops"):
+            await c._ensure_comfy_bootstrap()
+        with self.assertRaisesRegex(RuntimeError, "already stopping"):
+            await c.resetup(BID)
+        self.assertIsNone(c._reconcile_services())          # no attach into a stop
+        c._op = None
         self.assertEqual(_boots(fake, n), ([], []))
 
     async def test_ensure_comfy_bootstrap_failure_is_the_services(self):
@@ -5345,13 +5412,17 @@ class SplitBootstrap(unittest.IsolatedAsyncioTestCase):
         await c.start()
         self.assertEqual(c.state.phase, "ready", c.state.error)
         comfy = _svc("thunder", "comfyui", 18188, 8188)
-        c.services = c.services + [comfy]
-        with self.assertRaises(hostctl._ServiceError) as cm:
-            await c._ensure_comfy_bootstrap()
-        self.assertIs(cm.exception.svc, comfy)
-        self.assertEqual(c.view()["services"]["comfyui:thunder"]["status"], "setup failed")
+        c.set_services(c.services + [comfy])
+        await c._reconcile_services()
+        self.assertEqual(c.state.phase, "ready")            # the host is not failed
+        self.assertEqual(_sv(c)["status"], "setup failed")
+        self.assertEqual(_sv(c, "openai:vllm")["status"], "up")
+        self.assertEqual(c.h.faults[-1][0]["name"], "thunder")
         self.assertTrue(saved["thunder"]["bootstrap_incomplete"])
         self.assertFalse(saved["thunder"]["comfy_absent"])
+        self.assertFalse([x for x in _ssh_cmds(fake) if "start-comfy.sh" in x])
+        # not retried every tick — the card's buttons are the way
+        self.assertIsNone(c._reconcile_services())
         # a snapshot of this instance now holds a half-install: marked incomplete
         await c.stop()
         self.assertEqual(c.state.incomplete_snapshots, ["s0"])
@@ -5437,6 +5508,504 @@ class SplitBootstrap(unittest.IsolatedAsyncioTestCase):
                             for ln in c.state.log))
 
 
+SECRET_START = "serve-model --api-key SECRET-START-9f3"
+SECRET_SETUP = "pip install thing  # SECRET-SETUP-7c1\n"
+COMFY = _svc("thunder", "comfyui", 18188, 8188)
+
+
+def _cmdsvc(name="vllm", lport=18200, rport=8000, **kw):
+    """A command service (services.CommandProfile) as a dict fixture — the store fields
+    `svc_setup`/`svc_start`/`svc_health` arrive in Task 6."""
+    return _svc(name, "openai", lport, rport, **dict(
+        {"svc_start": SECRET_START, "svc_setup": SECRET_SETUP, "svc_health": "/health"}, **kw))
+
+
+def _sha(text):
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _setups(fake, n=0, slug="vllm"):
+    """(remote command, stdin) of every setup run of service <slug> since fake.calls[n]."""
+    return [(p, stdin) for m, p, stdin in fake.calls[n:]
+            if m == "SSH" and f"gw-svc-{slug}.setup.log" in p]
+
+
+def _cmds(fake, n=0):
+    return [p for m, p, _ in fake.calls[n:] if m == "SSH"]
+
+
+class CommandServices(unittest.IsolatedAsyncioTestCase):
+    """Command services (vLLM & co., services.CommandProfile) on a managed host, and the
+    per-service lifecycle every service shares now: setup per hash, a failing service
+    that is its own trouble, attach/detach while the host runs, the buttons, resume, and
+    the Ruling M4 items (a list changed mid-stop, forward backoff, a service that cannot
+    run, the no-ComfyUI stop)."""
+
+    async def _stop_ready(self, c, fake):
+        await c.stop()
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        fake.snaps[-1]["status"] = "READY"
+        await c.watch_snapshots()
+        fake.status_script = ["PROVISIONING", "RUNNING"]
+
+    async def test_setup_runs_once_per_hash_and_per_disk(self):
+        fake = FakeThunder()
+        svc = _cmdsvc()
+        c, saved, _, _ = make(fake, services=[svc])
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        su = _setups(fake)
+        self.assertEqual(len(su), 1)
+        self.assertEqual(su[0][1], SECRET_SETUP.encode())       # the script on stdin
+        self.assertEqual(su[0][0], "bash -o pipefail -c "
+                         + shlex.quote(services.COMMAND.setup_cmd(svc)))
+        self.assertIn("bootstrapping", c.h.phases)
+        cmds = _cmds(fake)
+        self.assertLess(cmds.index(su[0][0]), cmds.index(services.COMMAND.start_cmd(svc)))
+        h = _sha(SECRET_SETUP)
+        self.assertEqual(saved["thunder"]["services"]["openai:vllm"]["setup_hash"], h)
+        self.assertEqual(_sv(c, "openai:vllm")["status"], "up")
+        # the snapshot records it: a start from that snapshot runs no setup
+        await self._stop_ready(c, fake)
+        self.assertEqual(saved["thunder"]["setup_snapshots"], {"s0": {"openai:vllm": h}})
+        n = len(fake.calls)
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        self.assertEqual(_setups(fake, n), [])
+        self.assertNotIn("bootstrapping", c.h.phases[-4:])
+        # a changed script while the host runs: set up, then restarted, by the tick
+        new = dict(svc, svc_setup="pip install other\n")
+        c.set_services([new])
+        n = len(fake.calls)
+        await c._reconcile_services()
+        su = _setups(fake, n)
+        self.assertEqual([x[1] for x in su], [b"pip install other\n"])
+        cmds = _cmds(fake, n)
+        self.assertLess(cmds.index(su[0][0]), cmds.index(services.COMMAND.restart_cmd(new)))
+        self.assertEqual(saved["thunder"]["services"]["openai:vllm"]["setup_hash"],
+                         _sha("pip install other\n"))
+        self.assertIsNone(c._reconcile_services())          # nothing changed since
+        # a start from a TEMPLATE (no snapshot of ours): the stored hash is another
+        # disk's — the setup runs again
+        state = json.loads(json.dumps(saved["thunder"]))
+        state.update(phase="off", uuid="", index="", ip="", port=0)
+        fake2 = FakeThunder()
+        c2, _, _, _ = make(fake2, services=[new], state=state)
+        await c2.start()
+        self.assertEqual(c2.state.phase, "ready", c2.state.error)
+        self.assertEqual(len(_setups(fake2)), 1)
+
+    async def test_failed_setup_is_that_service_alone(self):
+        # spec: rc ≠ 0 → that service `setup failed`, the host stays, the others run
+        fake = FakeThunder()
+        vllm = _cmdsvc()
+        embed = _cmdsvc("embed", 18201, 8001, svc_setup="pip install embed\n")
+        c, saved, _, _ = make(fake, services=[COMFY, vllm, embed], ssh_script={
+            "gw-svc-vllm.setup.log": (1, b"Collecting vllm\nERROR: No space left on device\n",
+                                      b"")})
+        await c.start()
+        self.assertEqual((c.state.phase, c.state.error), ("ready", ""))
+        v = _sv(c, "openai:vllm")
+        self.assertEqual(v["status"], "setup failed")
+        self.assertIn("rc 1", v["error"])
+        self.assertIn("No space left on device", v["error"])
+        self.assertIn("~/gw-svc-vllm.setup.log", v["error"])
+        self.assertEqual((_sv(c)["status"], _sv(c, "openai:embed")["status"]), ("up", "up"))
+        self.assertNotIn(services.COMMAND.start_cmd(vllm), _cmds(fake))
+        self.assertEqual(saved["thunder"]["services"]["openai:vllm"]["setup_hash"], "")
+        self.assertEqual([(f[0]["name"], f[0]["type"]) for f in c.h.faults],
+                         [("vllm", "openai")])
+        self.assertTrue([ln for ln in c.state.log
+                         if ln.endswith(" openai:vllm setup: ERROR: No space left on device")])
+        # not retried by every tick; the card's button re-runs it
+        self.assertIsNone(c._reconcile_services())
+        c.deps.ssh = make(fake)[0].deps.ssh                 # the setup succeeds now
+        await c.resetup("openai:vllm")
+        self.assertEqual(_sv(c, "openai:vllm")["status"], "up")
+        self.assertEqual(saved["thunder"]["services"]["openai:vllm"]["setup_hash"],
+                         _sha(SECRET_SETUP))
+        self.assertEqual(c.state.phase, "ready")
+
+    async def test_attach_while_running_leaves_the_other_service_alone(self):
+        # Review Focus 2: a service attached while ComfyUI serves a stream gets its
+        # forward on the running master, is enabled, set up, started and probed — no
+        # tunnel restart or respawn, nothing sent to ComfyUI
+        fake = FakeThunder()
+        c, _, enabled, _ = make(fake)
+        _master(c, fake)
+        ctl = _controls(c)
+        asked = []
+
+        async def probe_http(url):
+            asked.append(url)
+            return 401                          # its own API key: listening = up (R-W9)
+        c.deps.probe_http = probe_http
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        t = c.h.tunnels[0]
+        n = len(fake.calls)
+        vllm = _cmdsvc()
+        c.set_services(c.services + [vllm])
+        op = c._reconcile_services()
+        self.assertEqual(c.op, "updating services")
+        await op
+        self.assertIsNone(c.op)
+        self.assertEqual([x[2:] for x in ctl], [("forward", 18200, 8000)])
+        self.assertEqual((len(c.h.tunnels), len(t.argvs)), (1, 1))
+        self.assertTrue(t.running)
+        self.assertIs(enabled["openai:vllm"], True)
+        calls = [(p, stdin) for m, p, stdin in fake.calls[n:] if m == "SSH"]
+        names = [p for p, _ in calls]
+        self.assertFalse([p for p in names if "comfy" in p])  # ComfyUI never touched
+        up = names.index(services.COMMAND.upload_cmd(vllm))
+        self.assertEqual(calls[up][1], services.COMMAND.wrapper_script(vllm))
+        self.assertLess(up, names.index(services.COMMAND.start_cmd(vllm)))
+        # the port guard ran before anything was started
+        kinds = _paths(fake, n)
+        self.assertLess(kinds.index(("GET", "/instances/list")),
+                        kinds.index(("SSH", services.COMMAND.start_cmd(vllm))))
+        self.assertEqual(asked[-1], "http://127.0.0.1:18200/health")
+        self.assertEqual((_sv(c, "openai:vllm")["status"], _sv(c)["status"]), ("up", "up"))
+        self.assertEqual(c.state.phase, "ready")
+        # detached: stopped on the VM (by its lock), its forward cancelled — and its
+        # backend NEVER disabled (R-K2)
+        n = len(fake.calls)
+        c.set_services([x for x in c.services if x is not vllm])
+        await c._reconcile_services()
+        self.assertEqual(_cmds(fake, n), [services.COMMAND.stop_cmd(vllm)])
+        self.assertTrue(await _until(lambda: ctl[-1][2] == "cancel"))
+        self.assertEqual(ctl[-1][2:], ("cancel", 18200, 8000))
+        self.assertIs(enabled["openai:vllm"], True)
+        self.assertNotIn("openai:vllm", c.view()["services"])
+        self.assertEqual((len(c.h.tunnels), len(t.argvs)), (1, 1))
+
+    async def test_moving_a_service_to_another_host_never_disables_it(self):
+        # Review Focus 1: H1 → H2 while H1 runs — H1 ends the process on its VM and
+        # later, at `off`, disables only what is attached to it then; H2 enables it
+        calls = []
+        vllm = _cmdsvc()
+        h1, _, _, _ = make(FakeThunder(), services=[COMFY, vllm])
+        f2 = FakeThunder()
+        h2, _, _, _ = make(f2, host_name="h2", services=[])
+        for h in (h1, h2):
+            h.deps.set_enabled = lambda bid, on, h=h: calls.append((h.name, bid, on)) or True
+        await h1.start()
+        self.assertEqual(h1.state.phase, "ready", h1.state.error)
+        h1.set_services([COMFY])
+        h2.set_services([vllm])
+        await h1._reconcile_services()
+        await h1.stop()
+        self.assertEqual(h1.state.phase, "off", h1.state.error)
+        await h2.start()
+        self.assertEqual(h2.state.phase, "ready", h2.state.error)
+        self.assertEqual([x for x in calls if x[1] == "openai:vllm"],
+                         [("thunder", "openai:vllm", True), ("h2", "openai:vllm", True)])
+        self.assertIn(("thunder", "comfyui:thunder", False), calls)
+
+    async def test_services_changed_during_a_stop_wait_until_off(self):
+        # Ruling M4 (a): mid-stop the list waits — the drain's services stand, nothing
+        # is attached into the stopping host, and `off` disables what is attached THEN
+        # (the one that moved away is not touched)
+        fake = FakeThunder()
+        vllm, embed = _cmdsvc(), _cmdsvc("embed", 18201, 8001)
+        c, _, _, _ = make(fake, services=[COMFY, vllm])
+        calls, drained, seen = [], [], []
+        c.deps.set_enabled = lambda bid, on: calls.append((bid, on)) or True
+        await c.start()
+        c.deps.begin_drain = lambda bid: drained.append(bid) or True
+        busy = [1, 1]
+        c.deps.inflight = lambda bid: busy.pop(0) if bid == "openai:vllm" and busy else 0
+        sleep = c.deps.sleep
+
+        async def sleeping(sec):
+            if c.state.phase == "draining" and not seen:
+                c.set_services([COMFY, embed])              # embed in, vllm moved away
+                seen.append((list(c.services), c._reconcile_services(),
+                             c.view()["services"].keys()))
+            await sleep(sec)
+        c.deps.sleep = sleeping
+        await c.stop()
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        during, op, shown = seen[0]
+        self.assertEqual(during, [COMFY, vllm])             # the drain's list stood
+        self.assertIsNone(op)                               # no attach into a stop
+        self.assertNotIn("openai:embed", shown)
+        self.assertEqual(drained, ["comfyui:thunder", "openai:vllm"])
+        self.assertEqual(c.services, [COMFY, embed])        # applied at off
+        self.assertNotIn(("openai:embed", True), calls)     # never enabled by the stop
+        self.assertEqual(sorted(x for x in calls if x[1] is False),
+                         [("comfyui:thunder", False), ("openai:embed", False)])
+        # a stop that FAILED at a step is still a stop: a list keeps waiting
+        c.state.phase, c.state.failed_phase = "failed", "pruning"
+        c.set_services([COMFY])
+        self.assertEqual(c.services, [COMFY, embed])
+        self.assertEqual(c._pending_services, [COMFY])
+
+    async def test_failed_forward_backs_off_and_recovers(self):
+        # Ruling M4 (b): a forward that fails is retried with a doubling backoff, the
+        # service shows why meanwhile and is not started behind a missing forward; once
+        # the forward is added the service comes up by itself
+        fake = FakeThunder()
+        c, _, _, _ = make(fake)
+        _master(c, fake)
+        answers = [(255, "Port forwarding failed.")] * 3
+        ctl = _controls(c, lambda: answers.pop(0) if answers else (0, ""))
+        await c.start()
+        vllm = _cmdsvc()
+        c.set_services(c.services + [vllm])
+        self.assertTrue(await _until(lambda: ctl and c._fwd_task.done()))
+        self.assertEqual(len(ctl), 1)
+        await c._reconcile_services()                       # the tick's attach
+        v = _sv(c, "openai:vllm")
+        self.assertEqual(v["status"], "down")
+        self.assertIn("Port forwarding failed", v["error"])
+        self.assertNotIn(services.COMMAND.start_cmd(vllm), _cmds(fake))
+        self.assertEqual(len(ctl), 1)                       # backing off (5 s)
+        c.h.clock[0] += 5
+        await c.reconcile_forwards()
+        self.assertEqual(len(ctl), 2)                       # failed again: 10 s now
+        c.h.clock[0] += 5
+        await c.reconcile_forwards()
+        self.assertEqual(len(ctl), 2)
+        c.h.clock[0] += 5
+        await c.reconcile_forwards()
+        self.assertEqual(len(ctl), 3)                       # 20 s now
+        c.h.clock[0] += 19
+        await c.reconcile_forwards()
+        self.assertEqual(len(ctl), 3)
+        c.h.clock[0] += 1
+        await c.reconcile_forwards()
+        self.assertEqual(len(ctl), 4)                       # added
+        self.assertEqual((_sv(c, "openai:vllm")["status"], _sv(c, "openai:vllm")["error"]),
+                         ("starting", "forward restored"))
+        await c._reconcile_services()
+        self.assertEqual(_sv(c, "openai:vllm")["status"], "up")
+        self.assertIn(services.COMMAND.start_cmd(vllm), _cmds(fake))
+        self.assertEqual(c._fwd_active, {(18188, 8188), (18200, 8000)})
+
+    async def test_services_that_cannot_run_are_down_with_the_cause(self):
+        # Ruling M4 (c) + R-W8: shown down with the reason, never forwarded, enabled
+        # or started — the first of two that clash keeps running
+        fake = FakeThunder()
+        svcs = [COMFY, _cmdsvc("vllm", 18188, 8000),                   # local port taken
+                _cmdsvc("Qwen_1", 18201, 8001), _cmdsvc("qwen-1", 18202, 8002),  # slug
+                _svc("gpu2", "comfyui", 18203, 8189),                   # second ComfyUI
+                _cmdsvc("dup-remote", 18204, 8001),                     # remote port taken
+                {"name": "m", "type": "meshy", "local_port": 18205, "remote_port": 8005},
+                _cmdsvc("nostart", 18206, 8006, svc_start="  ")]
+        c, _, enabled, _ = make(fake, services=svcs)
+        _master(c, fake)
+        _controls_log = _controls(c)
+        v = c.view()["services"]
+        want = {"openai:vllm": "local port 18188 is already forwarded for comfyui:thunder",
+                "openai:qwen-1": "name slug 'qwen-1' collides with openai:Qwen_1",
+                "comfyui:gpu2": "a second ComfyUI on one host is not supported "
+                                "(comfyui:thunder runs there)",
+                "openai:dup-remote": "remote port 8001 is already used by openai:Qwen_1",
+                "meshy:m": "type 'meshy' cannot run on a managed host",
+                "openai:nostart": "start command (svc_start) is required"}
+        for bid, why in want.items():
+            self.assertEqual(v[bid]["status"], "down", bid)
+            self.assertIn(why, v[bid]["error"], bid)
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        self.assertEqual(sorted(b for b, on in enabled.items() if on),
+                         ["comfyui:thunder", "openai:Qwen_1"])
+        self.assertEqual(sorted(_fwds(c.h.tunnels[0].argvs[0])),
+                         ["127.0.0.1:18188:127.0.0.1:8188", "127.0.0.1:18201:127.0.0.1:8001"])
+        self.assertEqual([x for x in _cmds(fake) if "gw-svc-" in x and "qwen-1" not in x], [])
+        for bid, why in want.items():
+            self.assertIn(why, _sv(c, bid)["error"], bid)
+        # the clash resolved (the first one detached): the other one is attached now —
+        # enabled, started, up
+        c.set_services([x for x in svcs if x["name"] != "thunder"])
+        await c._reconcile_services()
+        self.assertEqual((_sv(c, "openai:vllm")["status"], _sv(c, "openai:vllm")["error"]),
+                         ("up", ""))
+        self.assertIs(enabled["openai:vllm"], True)
+        self.assertIn("127.0.0.1:18188:127.0.0.1:8000", [
+            ":".join(["127.0.0.1", str(x[3]), "127.0.0.1", str(x[4])]) for x in _controls_log])
+        # nothing that can run: the start is refused before anything bills
+        c2, _, _, _ = make(FakeThunder(), services=[svcs[6]])
+        with self.assertRaisesRegex(RuntimeError, "can run: meshy:m: type 'meshy'"):
+            await c2.start()
+
+    async def test_no_comfy_host_stop_has_no_model_prune(self):
+        # Ruling M4 (e): "no ComfyUI service" is a branch, not an exception text — no
+        # plan, no index, no manifest; unfinished downloads still go
+        fake = FakeThunder()
+        c, _, _, _ = make(fake, services=[_cmdsvc()])
+        c.cfg.pop("bootstrap_template")
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        with self.assertRaisesRegex(RuntimeError, "no ComfyUI service attached"):
+            await c.delete_unknown(["models/checkpoints/x.safetensors"])
+        n = len(fake.calls)
+        with mock.patch.object(c, "_compute_plan", side_effect=AssertionError("planned")):
+            await c.stop()
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        cmds = _cmds(fake, n)
+        self.assertFalse([x for x in cmds if x.startswith((": gw-index", ": gw-manifest"))])
+        self.assertEqual([x for x in cmds if x.startswith(": gw-prune")],
+                         [hostctl._prune_cmd([])])
+        log = "\n".join(c.state.log)
+        self.assertIn("no ComfyUI service — no model prune", log)
+        self.assertNotIn("model prune skipped", log)
+        self.assertIn(("POST", "/snapshots/create"), _paths(fake, n))
+
+    async def test_admin_text_travels_on_stdin_only(self):
+        # security (binding): svc_setup/svc_start never in an ssh argv, a log line, an
+        # error, a fault, the view or the persisted state — only in the stdin of the
+        # wrapper upload and of the setup
+        fake = FakeThunder()
+        vllm = _cmdsvc()
+        embed = _cmdsvc("embed", 18201, 8001, svc_setup="pip install SECRET-SETUP-2\n",
+                        svc_start="serve SECRET-START-2")
+        c, saved, _, calls = make(fake, services=[COMFY, vllm], ssh_script={
+            "gw-svc-embed.setup.log": [(1, b"", b"boom"), (0, b"ok\n", b"")]})
+        _master(c, fake)
+        _controls(c)
+        await c.start()
+        c.set_services([COMFY, vllm, embed])
+        await c._reconcile_services()                       # attach; its setup fails
+        self.assertEqual(_sv(c, "openai:embed")["status"], "setup failed")
+        await c.restart_service("openai:vllm")
+        await c.resetup("openai:embed")
+        c.set_services([COMFY, dict(vllm, svc_start=SECRET_START + " --v2")])
+        await c._reconcile_services()                       # changed + detached
+        await c.stop()
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        argvs = [" ".join(a) for a, _ in calls] + [" ".join(a) for a in c.h.tunnels[0].argvs]
+        self.assertTrue(argvs)
+        for text in argvs + c.state.log + [json.dumps(c.view()), repr(c.h.faults),
+                                           json.dumps(saved)]:
+            self.assertNotIn("SECRET", text)
+        stdins = b"\0".join(stdin or b"" for _, stdin in calls)
+        for secret in (SECRET_START, SECRET_SETUP, "SECRET-SETUP-2", "SECRET-START-2",
+                       SECRET_START + " --v2"):
+            self.assertIn(secret.encode(), stdins)
+
+    async def test_service_buttons(self):
+        fake = FakeThunder()
+        vllm = _cmdsvc()
+        c, _, _, _ = make(fake, services=[COMFY, vllm])
+        await c.start()
+        phases = list(c.h.phases)
+        n = len(fake.calls)
+        await c.restart_service("openai:vllm")
+        cmds = _cmds(fake, n)
+        self.assertEqual(cmds[-2:], [services.COMMAND.upload_cmd(vllm),
+                                     services.COMMAND.restart_cmd(vllm)])
+        self.assertEqual(_setups(fake, n), [])
+        self.assertFalse([p for p in cmds if "comfy" in p])  # ComfyUI untouched
+        self.assertEqual(c.h.phases, phases)                 # the host's phase too
+        n = len(fake.calls)
+        await c.resetup("openai:vllm")                       # the same hash: runs anyway
+        self.assertEqual(len(_setups(fake, n)), 1)
+        self.assertEqual(_cmds(fake, n)[-1], services.COMMAND.restart_cmd(vllm))
+        # ComfyUI: its restart is restart_comfy; its re-setup the ComfyUI bootstrap
+        n = len(fake.calls)
+        await c.restart_service(BID)
+        self.assertEqual(_cmds(fake, n)[-1], hostctl._restart_cmd(8188))
+        n = len(fake.calls)
+        await c.resetup(BID)
+        self.assertEqual((len(_boots(fake, n)[0]), len(_boots(fake, n)[1])), (0, 1))
+        self.assertEqual(_cmds(fake, n)[-1], hostctl._restart_cmd(8188))
+        self.assertEqual((c.state.phase, _sv(c)["status"]), ("ready", "up"))
+        # refusals
+        with self.assertRaisesRegex(RuntimeError, "not attached"):
+            await c.restart_service("openai:nope")
+        c._op = "starting"
+        with self.assertRaisesRegex(RuntimeError, "already starting"):
+            await c.resetup("openai:vllm")
+        c._op = None
+        await c.stop()
+        with self.assertRaisesRegex(RuntimeError, "no running instance"):
+            await c.restart_service("openai:vllm")
+
+    async def test_stop_aborts_an_attach(self):
+        # never an attach going on into a stopping host: the stop aborts it (a setup
+        # may take an hour) and takes over
+        fake = FakeThunder()
+        c, _, _, _ = make(fake)
+        await c.start()
+        ssh, entered, gate = c.deps.ssh, [], asyncio.Event()
+
+        async def slow(argv, stdin=None, timeout=60):
+            if "gw-svc-vllm.setup.log" in argv[-1]:
+                entered.append(1)
+                await gate.wait()
+            return await ssh(argv, stdin=stdin, timeout=timeout)
+        c.deps.ssh = slow
+        vllm = _cmdsvc()
+        c.set_services(c.services + [vllm])
+        op = c._reconcile_services()
+        self.assertTrue(await _until(lambda: entered))
+        await c.stop()
+        self.assertTrue(op.cancelled())
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        self.assertNotIn(services.COMMAND.start_cmd(vllm), _cmds(fake))
+        self.assertIsNone(c.op)
+
+    async def test_resume_restarts_only_the_service_that_does_not_answer(self):
+        fake = FakeThunder()
+        _inst(fake)
+        url = "http://127.0.0.1:18200/health"
+        answer = {url: 0}
+
+        async def probe_http(u):
+            await asyncio.sleep(0)
+            return answer.get(u, 200)
+        vllm = _cmdsvc()
+        st = {"openai:vllm": {"status": "up", "error": "", "setup_hash": _sha(SECRET_SETUP)}}
+        c, _, _, _ = make(fake, state=_persisted(services=st), services=[COMFY, vllm],
+                          probe_http=probe_http)
+        n = len(fake.calls)
+        task = asyncio.ensure_future(c.resume())
+        self.assertTrue(await _until(
+            lambda: services.COMMAND.restart_cmd(vllm) in _cmds(fake, n)))
+        answer[url] = 403
+        await task
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        cmds = _cmds(fake, n)
+        self.assertFalse([p for p in cmds if "comfy" in p])  # ComfyUI answered
+        self.assertEqual(_setups(fake, n), [])               # its hash matches
+        self.assertEqual((_sv(c)["status"], _sv(c, "openai:vllm")["status"]), ("up", "up"))
+        self.assertIsNone(c._reconcile_services())           # both recorded as running
+        # a setup script changed while the gateway was down runs on resume
+        fake = FakeThunder()
+        _inst(fake)
+        st["openai:vllm"]["setup_hash"] = _sha("old script\n")
+        c, _, _, _ = make(fake, state=_persisted(services=st), services=[COMFY, vllm])
+        await c.resume()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        su = _setups(fake)
+        self.assertEqual(len(su), 1)
+        self.assertLess(_cmds(fake).index(su[0][0]),
+                        _cmds(fake).index(services.COMMAND.restart_cmd(vllm)))
+
+    async def test_resume_of_interrupted_setups_is_per_service(self):
+        # Ruling M4 (g): a gateway restart during the per-service setups — a setup that
+        # may still run is that service's `setup failed` (naming its log), the host
+        # comes up with the rest
+        fake = FakeThunder()
+        _inst(fake)
+        vllm = _cmdsvc()
+        c, _, _, _ = make(fake, state=_persisted(phase="bootstrapping", host_bootstrapped=True,
+                                                 bootstrap_incomplete=True),
+                          services=[COMFY, vllm, _cmdsvc("embed", 18201, 8001, svc_setup="")])
+        await c.resume()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        self.assertEqual(_sv(c)["status"], "setup failed")
+        self.assertIn("gw-bootstrap.log", _sv(c)["error"])
+        self.assertEqual(_sv(c, "openai:vllm")["status"], "setup failed")
+        self.assertIn("gw-svc-vllm.setup.log", _sv(c, "openai:vllm")["error"])
+        self.assertEqual(_sv(c, "openai:embed")["status"], "up")
+        self.assertTrue(c.state.bootstrap_incomplete)        # its snapshot stays marked
+        self.assertEqual(_boots(fake), ([], []))            # nothing run twice
+        self.assertEqual(_setups(fake), [])
+
+
 class LegacyBootstrapState(unittest.TestCase):
     """A record written before the split has no host flag: the one-piece bootstrap did
     the host part too, so its verdict carries over — and what it marked incomplete may
@@ -5474,7 +6043,7 @@ class DepsContract(unittest.TestCase):
              "sleep": 1, "ssh": 1, "spawn": None, "known_uuids": 0, "keygen": 1,
              "default_nodes": 0, "alias_needs": 1, "alias_signature": 1, "source_index": 0,
              "url_catalog": 0, "hf_token": 0, "lan": None, "pipe": 3, "control": 5,
-             "host_bootstrap_script": 0}
+             "host_bootstrap_script": 0, "probe_http": 1}
     KWARGS = {"ssh": ("stdin", "timeout"), "pipe": ("timeout_idle",), "control": ("timeout",)}
 
     def test_every_field_provided_with_the_called_arity(self):
