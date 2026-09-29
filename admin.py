@@ -3583,7 +3583,10 @@ def _thunder_panel(views: list, binfo: list, catalog_refused: Optional[tuple] = 
         return ""
     cfg = {b.get("name"): b.get("thunder") for b in binfo
            if b.get("type") == "comfyui" and isinstance(b.get("thunder"), dict)}
-    cards = "".join(_thunder_card(n, v, cfg.get(n)) for n, v in views)
+    # a card is a MANAGED HOST now (main.host_names): its GPU/vCPU come from the host's
+    # options in its view; the backend-keyed block is the pre-host fallback (Task 7
+    # replaces the card)
+    cards = "".join(_thunder_card(n, v, cfg.get(n) or v.get("options")) for n, v in views)
     lan = _modelsrc_block(modelsrc_refused) if (views or modelsrc_refused is not None) else ""
     osnaps = _orphan_snaps_block() if views else ""
     return (f'<div data-sk="thunder"><div class="grouphdr">Thunder Compute</div>{cards}'

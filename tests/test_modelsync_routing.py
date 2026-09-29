@@ -1,10 +1,13 @@
-"""Generation routing gated on per-alias model-sync readiness (Thunder backends).
+"""Generation routing gated on per-alias model-sync readiness (managed-host ComfyUI).
 
 Why this file exists (it fails SILENTLY): a Thunder instance syncs exactly the models
 its aliases need, and until an alias's files are all there the backend is healthy,
 free and — to every other routing signal — a perfect candidate. Routed there anyway,
 the job runs a workflow whose weights are missing and comes back as a plausible
 ComfyUI "value not in list" error, or it parks for hours behind a sync nobody named.
+The gate finds the controller the way every lookup does since managed hosts (R-W7):
+backend → its `host` → that host's controller → the service (a backend the controller
+does not carry — a config backend naming the host, a same-named LLM — is never gated).
 So a not-ready alias must leave BOTH lists (`ready` and `allc`) of `_gen_routes`, the
 waiter designation must inherit that, a force pin must not bypass it, the chain's
 path-relay successor (read straight from the store, not via `_gen_routes`) must be
@@ -37,10 +40,10 @@ finally:
 
 
 class _FakeCtl:
-    """A managed host's routing face (the shim's host `thunder-<backend>` with that one
-    ComfyUI service): in-memory readiness per alias, and a status text. Counts the
-    calls so a test can see the gate asked the controller at all — and asked it about
-    THIS service."""
+    """A managed host's routing face (host `vm-<backend>` carrying that one ComfyUI
+    service): in-memory readiness per alias, and a status text. Counts the calls so a
+    test can see the gate asked the controller at all — and asked it about THIS
+    service."""
 
     def __init__(self, name, ready=(), texts=None):
         self.name = name
@@ -62,8 +65,10 @@ class _FakeCtl:
         return self.texts.get(alias, f"models for {alias} are not planned on {self.name} yet")
 
 
-THUNDER = {"name": "thunder", "type": "comfyui", "url": "http://127.0.0.1:18188", "enabled": True}
-THUNDER2 = {"name": "thunder2", "type": "comfyui", "url": "http://127.0.0.1:18189", "enabled": True}
+THUNDER = {"name": "thunder", "type": "comfyui", "url": "http://127.0.0.1:18188", "enabled": True,
+           "host": "vm-thunder"}
+THUNDER2 = {"name": "thunder2", "type": "comfyui", "url": "http://127.0.0.1:18189", "enabled": True,
+            "host": "vm-thunder2"}
 GPU = {"name": "gpu", "type": "comfyui", "url": "http://gpu:8188", "enabled": True}
 SYNC_TEXT = "models for img on thunder are syncing on thunder (12.3 of 31.0 GB)"
 
@@ -96,7 +101,7 @@ class _Base(unittest.TestCase):
         main._gen_waiting.clear()
         main.gen_exec_faults.clear()
         main.host_controllers.clear()
-        self.ctl = main.host_controllers["thunder-thunder"] = _FakeCtl(
+        self.ctl = main.host_controllers["vm-thunder"] = _FakeCtl(
             "thunder", ready=(), texts={"img": SYNC_TEXT})
 
     def tearDown(self):
@@ -127,8 +132,18 @@ class GateFunction(_Base):
 
     def test_same_named_llm_backend_never_gated(self):
         # backends are keyed (name, type): an LLM backend called "thunder" is not the box
-        self.assertIsNone(main.modelsync_gate({"name": "thunder", "type": "openai"}, "img"))
+        self.assertIsNone(main.modelsync_gate({"name": "thunder", "type": "openai",
+                                               "host": "vm-thunder"}, "img"))
         self.assertEqual(self.ctl.asked, [])
+
+    def test_lookup_goes_through_the_host(self):
+        # the same backend without its `host`, or on another host, is not the service
+        self.assertIsNone(main.modelsync_gate(dict(THUNDER, host=""), "img"))
+        self.assertIsNone(main.modelsync_gate(dict(THUNDER, host="vm-thunder2"), "img"))
+        self.assertEqual(self.ctl.asked, [])
+        # a controller keyed by the BACKEND name (the retired shim's way) is never read
+        main.host_controllers["thunder"] = main.host_controllers.pop("vm-thunder")
+        self.assertIsNone(main.modelsync_gate(THUNDER, "img"))
 
     def test_not_ready_alias_gets_the_controller_text(self):
         self.assertEqual(main.modelsync_gate(THUNDER, "img"), SYNC_TEXT)
@@ -192,7 +207,7 @@ class NoBackend503(_Base):
         self.assertEqual(e.detail, SYNC_TEXT)
 
     def test_several_gates_are_joined(self):
-        main.host_controllers["thunder-thunder2"] = _FakeCtl(
+        main.host_controllers["vm-thunder2"] = _FakeCtl(
             "thunder2", texts={"both": "models for both are blocked on thunder2: no source"})
         e = self.pick_error("both")
         self.assertEqual(e.detail, "models for both are not planned on thunder yet; "

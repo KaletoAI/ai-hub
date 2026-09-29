@@ -38,7 +38,9 @@ import socket
 import stats
 import store
 import modelsync
+import hostapi
 import hostctl
+import services
 import sshrun
 import thunder
 from adapters import (AdapterContext, ComfyExecutorStuck, NormalizedRequest, image_params,
@@ -155,15 +157,17 @@ def rebuild_backends() -> None:
         # may omit the key entirely. A cloud backend (Meshy, Tripo) bills per task, so it
         # is ALWAYS paid.
         b["paid"] = True if b.get("type") in adapters.CLOUD_TYPES else bool(b.get("paid"))
+    # Every rebuild hands out NEW backend dicts; a managed-host controller reads its
+    # entry and services from what it was handed, so it must be given the current ones.
+    # BEFORE the grouping and the route index: an attached backend's forward ends and
+    # URL are derived there (and written onto these dicts).
+    sync_host_controllers()
     backend_hosts = {backend_id(b): backend_host(b) for b in backends}
     host_backends = {}
     for bid, h in backend_hosts.items():
         host_backends.setdefault(h, []).append(bid)
     apply_hosts()
     rebuild_route_index()                  # backend set/enabled flags changed
-    # Every rebuild hands out NEW backend dicts; a managed-host controller reads its token,
-    # options and services from what it was handed, so it must be given the current ones.
-    sync_host_controllers()
 
 
 def apply_hosts() -> None:
@@ -3008,7 +3012,7 @@ def _gen_routes(alias: str, gated: Optional[list] = None) -> tuple[list, list]:
     result as the old per-include_busy filtering.
 
     A candidate whose backend has not synced this alias's models (`modelsync_gate`, a
-    Thunder backend) leaves BOTH lists: a Thunder-only alias then 503s at once naming
+    managed host's ComfyUI) leaves BOTH lists: such an alias then 503s at once naming
     the sync instead of parking for hours behind it. `gated`, when given, collects
     (backend name, reason) of every such candidate — the 503's text.
 
@@ -5761,10 +5765,12 @@ def gateway_info() -> dict:
             "host": backend_hosts.get(backend_id(b), ""),
             "host_explicit": bool((b.get("host") or "").strip()),
             "source": "config" if backend_id(b) in config_ids else "ui",
-            # The Thunder block (a COPY — nothing secret in it; its token is api_key): the
-            # editor pre-fills a config-defined backend from this summary, and a block it
-            # did not see would be dropped by the next Save. The panel reads GPU/vCPU here.
-            **({"thunder": copy.deepcopy(b["thunder"])} if _is_thunder(b) else {}),
+            # The old Thunder block, for the backend form's Thunder fieldset only (a COPY
+            # of what a Save would otherwise drop). Nothing else reads it since managed
+            # hosts replaced it; Task 8 removes the fieldset and this key.
+            **({"thunder": copy.deepcopy(b["thunder"])}
+               if b.get("type") == "comfyui" and isinstance(b.get("thunder"), dict)
+               and b["thunder"] else {}),
             **_comfy_watch_info(b), **_cloud_info(b), **_model_filter_info(b), **_loaded_info(b),
         } for b in backends],
         "virtual_models": list(virtual_models.keys()),
@@ -5822,15 +5828,16 @@ def _config_backend_entry(b: dict) -> dict:
     """A config-defined backend as the store copy `set_backend_enabled` writes. The
     store entry replaces the config entry WHOLESALE (rebuild_backends), so it must carry
     EVERY configured key — an allowlist silently dropped `host`, the ComfyUI output/input
-    dirs, `max_wait`, `auto_restart`, the model filters, … on the first toggle, and the
-    Thunder lifecycle toggles on every start and stop. Excluded: `enabled` (set by the
+    dirs, `max_wait`, `auto_restart`, the model filters, … on the first toggle (a config
+    backend is never attached to a managed host, R-K3, so only the console toggles it).
+    Excluded: `enabled` (set by the
     caller) and `_`-prefixed runtime keys. The one key rebuild_backends derives onto the
     live dict is `paid`, and it is kept: for a cloud type it is forced True on every
     rebuild anyway, for the rest it is `bool(paid)` — exactly what the config meant.
     `api_key` stays plaintext here; store.upsert_backend encrypts it like any store entry."""
     # JSON-safe: the store writes it as JSON, and a YAML config can hold what JSON
     # cannot (an unquoted `2026-09-28` is a datetime.date) — json.dumps then raised on
-    # every enable/disable, a Thunder start or stop included
+    # every enable/disable
     return json.loads(json.dumps({k: v for k, v in b.items()
                                   if k != "enabled" and not str(k).startswith("_")},
                                  default=str))
@@ -5858,16 +5865,19 @@ def _finalize_drain(bid: str) -> None:
     logger.info(f"backends changed → {len(backends)} effective")
 
 
-# ── Managed hosts (hostctl.py) — for now synthesized from `thunder` blocks ────────
-# One Controller per MANAGED HOST, keyed by host name. Until managed hosts have their
-# own store entries (plan Task 6), a temporary SHIM derives them: every `comfyui`
-# backend with a `thunder` block becomes the host `thunder-<backend slug>` whose one
-# service is that backend (its `local_port` from the block, ComfyUI's 8188 on the VM).
-# The console's Thunder card still speaks backend names (`thunder_*` below map them to
-# their host). A controller owns a billing cloud instance, so it outlives its config: a
-# block removed (or a backend deleted) while the instance runs keeps the controller —
-# with its last service list — because dropping it would leave the instance billing
-# with nobody to snapshot or delete it.
+# ── Managed hosts (hostctl.py) ────────────────────────────────────────────────────
+# One Controller per MANAGED HOST (store setting `managed_hosts`: {name: {provider,
+# options, api_key}}), keyed by host name. Its services are the STORE backends whose
+# `host` names it; each carries `local_port` (the gateway's end of the tunnel forward,
+# assigned here, stable across saves and renames) and `remote_port` (the service's
+# loopback port on the VM, the profile's default when unset), and its URL is derived
+# from the local port. A config-defined backend naming a managed host is NOT attached
+# (R-K3): the lifecycle would write a store copy of it on every start and stop, and
+# that copy overrides config wholesale. A controller owns a billing cloud instance, so
+# it outlives its entry: a host deleted (or its entry unreadable) while the instance
+# runs keeps its controller — with its last service list — because dropping it would
+# leave the instance billing with nobody to snapshot or delete it. Every lookup from a
+# backend goes backend → `host` → controller → service (R-W7).
 
 _HERE = Path(__file__).resolve().parent
 _HOST_STATE_KEY = "host_state"              # store setting: host name → State dict
@@ -5877,43 +5887,114 @@ host_controllers: dict = {}                 # host name → hostctl.Controller
 # so a retired controller and the shutdown can cancel them; also held by _bg.
 _host_tasks: dict = {}
 _hosts_booted = False                       # lifespan ran _hosts_boot (new ones start at once)
-_host_warned: set = set()                   # hosts warned "config removed while instance runs"
-_shim_collided: set = set()                 # backend names warned "same host name as another"
+_host_warned: set = set()                   # hosts warned "entry removed while instance runs"
+managed_hosts: dict = {}                    # name → entry (token decrypted), per sync
+_host_errors: dict = {}                     # name → why the host is not driven (as it stands)
+_host_error_warned: set = set()             # (name, error) already logged
+_host_attached: dict = {}                   # name → [bid] of the backends attached to it
+_host_not_attachable: dict = {}             # name → [bid] config backends naming it
+_not_attach_warned: set = set()             # (name, bid) warned "not attached"
+# The gateway's ends of the tunnel forwards (spec "Datenmodell"): one range, unique over
+# every host — two services on one local port make sshrun refuse the whole tunnel.
+LOCAL_PORT_MIN, LOCAL_PORT_MAX = 18100, 18999
+# A host name is the identity of its state record, snapshots (`aihub-<name>-<stamp>`)
+# and control socket (R-W5): its own slug, short enough for the socket path.
+_HOST_NAME_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?")
+NOT_ATTACHABLE_REASON = "config-defined backend — create it in the console"
 
 
-def _is_thunder(b: dict) -> bool:
-    return b.get("type") == "comfyui" and bool(b.get("thunder"))
+def _live_backend(bid: str) -> Optional[dict]:
+    return next((b for b in backends if backend_id(b) == bid), None)
 
 
-def _shim_host_name(backend_name) -> str:
-    """The managed host a Thunder backend's block stands for (the shim): its name is the
-    identity of the state record and the snapshots (`aihub-thunder-<slug>-…`)."""
-    return "thunder-" + thunder.slug(backend_name)
-
-
-def _shim_host(b: dict) -> dict:
-    return {"name": _shim_host_name(b["name"]), "provider": thunder.KIND,
-            "options": b.get("thunder") or {}, "api_key": b.get("api_key") or ""}
-
-
-def _shim_service(b: dict) -> dict:
-    """The backend as the host's service: a COPY with the forward's two ends — never
-    written into the backend dict itself, which the store copies on every enable."""
-    try:
-        lport = int((b.get("thunder") or {}).get("local_port") or 18188)
-    except (TypeError, ValueError):
-        lport = 18188                       # the controller marks a bad one down itself
-    return dict(b, local_port=lport, remote_port=hostctl.COMFY_PORT)
-
-
-def _shim_ctl(backend_name) -> Optional["hostctl.Controller"]:
-    """The controller of the Thunder backend `backend_name` (the shim's host) — only if
-    that backend really is one of its services: two names slugging alike share a host
-    name, and the second one must not read the first one's controller."""
-    c = host_controllers.get(_shim_host_name(backend_name))
-    if c is None or not c.has_service(f"comfyui:{backend_name}"):
+def _host_ctl(backend: Optional[dict]) -> Optional["hostctl.Controller"]:
+    """The controller of the managed host `backend` runs on — backend → `host` →
+    controller (R-W7) — only if that controller really carries this backend as a
+    service: a config backend naming the host is not attached, and a same-named
+    backend of another type is another backend."""
+    if not isinstance(backend, dict) or not backend.get("name"):
+        return None
+    hn = str(backend.get("host") or "").strip()
+    c = host_controllers.get(hn) if hn else None
+    if c is None or not c.has_service(backend_id(backend)):
         return None
     return c
+
+
+def _lport_ok(v) -> bool:
+    return (isinstance(v, int) and not isinstance(v, bool)
+            and LOCAL_PORT_MIN <= v <= LOCAL_PORT_MAX)
+
+
+def _pick_local_port(bid: str, cur, host: str, rows: list) -> int:
+    """`cur` when it is in the range and nobody else holds it, else the lowest free
+    port. Held = any OTHER backend's `local_port` (store rows and the live list), and a
+    port another host's controller still forwards for a backend that no longer exists
+    (a host deleted while running keeps its forwards). The backend's OWN host's old
+    service list is not counted: after a rename its old entry is replaced by this one."""
+    used = set()
+    for b in list(rows) + list(backends):
+        if backend_id(b) != bid and _lport_ok(b.get("local_port")):
+            used.add(b["local_port"])
+    live = {backend_id(b) for b in backends}
+    for hn, c in host_controllers.items():
+        if hn == host:
+            continue
+        for x in getattr(c, "services", []) or []:
+            if (hostctl.service_bid(x) not in live and hostctl.service_bid(x) != bid
+                    and _lport_ok(x.get("local_port"))):
+                used.add(x["local_port"])
+    if _lport_ok(cur) and cur not in used:
+        return cur
+    for p in range(LOCAL_PORT_MIN, LOCAL_PORT_MAX + 1):
+        if p not in used:
+            return p
+    raise RuntimeError(f"no free local port in {LOCAL_PORT_MIN}–{LOCAL_PORT_MAX}")
+
+
+def assign_local_port(backend_name: str, btype: str = "openai") -> int:
+    """The local port of backend `(backend_name, btype)` on a managed host: the one its
+    store row carries when that is still valid and unique, else the lowest free one in
+    18100–18999. Stable across Saves AND renames because it is read from the row (a
+    Save — and a rename — builds the new row from the old one). Returns, never writes:
+    the console's Save stores it with the row (Task 8); `sync_host_controllers` assigns
+    lazily for rows that have none yet. RuntimeError when the range is exhausted."""
+    bid = f"{btype}:{backend_name}"
+    rows = store.list_backends() if store.is_active() else []
+    row = next((b for b in rows if backend_id(b) == bid), None) or _live_backend(bid) or {}
+    return _pick_local_port(bid, row.get("local_port"), str(row.get("host") or ""), rows)
+
+
+def _attach_fields(b: dict, rows: list) -> None:
+    """An attached store backend's forward ends and URL: `remote_port` from the profile
+    when unset, `local_port` assigned, `url` = http://127.0.0.1:<local_port>. Written
+    onto the live dict (this rebuild's adapters are built from it next) and persisted
+    to its store row when anything changed. A type without a profile gets nothing — the
+    controller shows it `down` with the reason."""
+    prof = services.profile_for(b)
+    if prof is None:
+        return
+    ch = {}
+    if b.get("remote_port") in (None, ""):
+        ch["remote_port"] = prof.default_port
+    lp = _pick_local_port(backend_id(b), b.get("local_port"), str(b.get("host") or ""), rows)
+    if b.get("local_port") != lp:
+        ch["local_port"] = lp
+    url = f"http://127.0.0.1:{lp}"
+    if b.get("url") != url:
+        ch["url"] = url
+    if not ch:
+        return
+    b.update(ch)
+    row = store.get_backend(b["name"], b.get("type", "openai"))
+    if row is not None:
+        row.update(ch)
+        store.upsert_backend(row)
+        for r in rows:                       # later picks in this sync see the new port
+            if backend_id(r) == backend_id(b):
+                r.update(ch)
+    logger.info(f"[host {b.get('host')}] {backend_id(b)}: "
+                + ", ".join(f"{k}={v}" for k, v in sorted(ch.items())))
 
 
 def _host_load_state(name: str) -> Optional[dict]:
@@ -5949,7 +6030,7 @@ def _host_known_uuids() -> set:
     return {c.state.uuid for c in host_controllers.values() if c.state.uuid}
 
 
-async def _thunder_probe(url: str) -> bool:
+async def _comfy_probe(url: str) -> bool:
     """Does ComfyUI answer through the tunnel? Streamed: /object_info is megabytes and
     the status is all the controller asks — it probes every few seconds while starting."""
     try:
@@ -6025,7 +6106,7 @@ def save_modelsync_catalog(cat) -> list:
     return []
 
 
-def _thunder_alias_cands(backend_name: str) -> list:
+def _comfy_alias_cands(backend_name: str) -> list:
     """(alias, candidate) of every generation alias with a ComfyUI candidate on this
     backend — store aliases over same-named config ones, the order `_gen_routes` reads
     them in. A cloud candidate of the same backend NAME is another backend (keyed
@@ -6056,7 +6137,7 @@ def _comfy_name_of(bid: str) -> Optional[str]:
     return name if sep and kind == "comfyui" else None
 
 
-def thunder_alias_needs(bid: str) -> list:
+def service_alias_needs(bid: str) -> list:
     """`modelsync.AliasNeed` per alias candidate on the ComfyUI service `bid` (built by
     `modelsync.alias_need`, the only builder that fills `covered`). Blocking store
     read — the controller calls it in a worker thread."""
@@ -6066,17 +6147,17 @@ def thunder_alias_needs(bid: str) -> list:
     catalog = _modelsync_catalog()
     return [modelsync.alias_need(alias, modelsync.refs_for(
                 cand, adapters.cand_workflow(cand), _mapping_fields(cand)), catalog)
-            for alias, cand in _thunder_alias_cands(name)]
+            for alias, cand in _comfy_alias_cands(name)]
 
 
-def thunder_alias_signature(bid: str) -> str:
-    """A stable hash of exactly what `thunder_alias_needs` reads: this service's
+def service_alias_signature(bid: str) -> str:
+    """A stable hash of exactly what `service_alias_needs` reads: this service's
     candidates (a path workflow's CONTENT too — the file may change under the same
     path) and the catalog. Polled every 5 s: any store write, deletion or config
     change that matters to the sync shows up here, none that does not."""
     name = _comfy_name_of(bid)
     parts = []
-    for alias, cand in (_thunder_alias_cands(name) if name is not None else []):
+    for alias, cand in (_comfy_alias_cands(name) if name is not None else []):
         wf = None if "workflow_json" in cand else adapters.cand_workflow(cand)
         parts.append([alias, cand, wf])
     data = [parts, _modelsync_catalog()]
@@ -6119,7 +6200,7 @@ def _thunder_datadir() -> str:
 
 
 # ── the LAN model source (hostctl.LanSource, ops/modelsrc-serve.sh on the share) ──
-# ONE per gateway: every Thunder controller reads the same share, so the index cache,
+# ONE per gateway: every host controller reads the same share, so the index cache,
 # the sha256 cache and the pinned host key are shared. Rebuilt only when the data dir
 # moves (a test, a store_path change).
 _modelsrc_obj: Optional["hostctl.LanSource"] = None
@@ -6176,7 +6257,7 @@ def modelsrc() -> "hostctl.LanSource":
 def _modelsrc_prepare() -> None:
     """modelsrc.key exists before the console shows it: its public half is what the
     operator installs on the share host FIRST. Generated in the background at boot (and
-    for a Thunder backend added later), never by a page view."""
+    for a managed host added later), never by a page view."""
     global _modelsrc_key_task
     if not host_controllers or os.path.exists(modelsrc().key_path + ".pub"):
         return
@@ -6231,13 +6312,13 @@ def _host_deps() -> "hostctl.Deps":
         is_draining=lambda bid: bid in _draining,
         note_fault=_note_fault,
         datadir=_thunder_datadir(),
-        probe_comfy=_thunder_probe, probe_http=_host_probe_http,
+        probe_comfy=_comfy_probe, probe_http=_host_probe_http,
         bootstrap_script=lambda: (ops / "thunder-bootstrap.sh").read_bytes(),
         host_bootstrap_script=lambda: (ops / "host-bootstrap.sh").read_bytes(),
         log=logger.info,
         known_uuids=_host_known_uuids,
         default_nodes=lambda: (ops / "thunder-nodes.default.txt").read_text("utf-8"),
-        alias_needs=thunder_alias_needs, alias_signature=thunder_alias_signature,
+        alias_needs=service_alias_needs, alias_signature=service_alias_signature,
         # the LAN share's last good listing ({} until pinned and listed), and the share
         # itself for its refresh, the stream and the sha256
         source_index=lan.cached, lan=lan,
@@ -6282,53 +6363,128 @@ def _host_retire(name: str) -> None:
     _bg(c.aclose())
 
 
-def sync_host_controllers() -> None:
-    """Match the controllers to the current backend list (rebuild_backends calls it) —
-    through the shim: each Thunder backend is one host with itself as the service. A new
-    host gets a controller (started at once after boot), an existing one keeps its
-    INSTANCE and is handed the current host entry and service list, and one whose block
-    or backend is gone is retired only when off and idle."""
-    want: dict = {}
-    for b in backends:
-        if not _is_thunder(b):
-            continue
-        hn = _shim_host_name(b["name"])
-        if hn in want:
-            # two backend names that slug alike would share ONE machine's state and
-            # snapshots — the second is not controlled (the console names it)
-            if b["name"] not in _shim_collided:
-                _shim_collided.add(b["name"])
-                logger.warning(f"[host {hn}] backend {b['name']!r} maps to the same managed "
-                               f"host as {want[hn][1][0]['name']!r} — not controlled; "
-                               "rename one of them")
-            continue
-        want[hn] = (_shim_host(b), [_shim_service(b)])
-    for hn, (h, svcs) in want.items():
-        _host_warned.discard(hn)            # block is back: warn again if it goes
-        c = host_controllers.get(hn)
-        if c is None:
-            c = host_controllers[hn] = hostctl.Controller(h, svcs, _host_deps())
-            if _hosts_booted:
-                _host_run(hn, c)
-                _modelsrc_prepare()
-        else:
-            c.host = h
+def _load_managed_hosts() -> dict:
+    """The store's managed hosts; the last good read when the store cannot answer (a
+    read error must not look like "every host was deleted")."""
+    if not store.is_active():
+        return {}
+    try:
+        return store.get_managed_hosts()
+    except Exception as e:
+        logger.warning(f"managed_hosts unreadable — keeping the last read: "
+                       f"{type(e).__name__}: {e}")
+        return dict(managed_hosts)
+
+
+def _host_idle_off(c) -> bool:
+    """Off with nothing left to do — the only state a controller may be retired in. An
+    `off` controller whose snapshot is still CREATING is not idle: its watcher still has
+    to rotate the old snapshot out (and mark or drop the new one) — retired, both would
+    sit at the provider and bill per GB-month, unseen. A start is `off` until the create."""
+    return c.state.phase == "off" and c.op is None and not c.state.pending_snapshot
+
+
+def _host_error(name: str, msg: str) -> None:
+    _host_errors[name] = msg
+    if (name, msg) not in _host_error_warned:        # once per error, not per rebuild
+        _host_error_warned.add((name, msg))
+        logger.warning(f"[host {name}] {msg}")
+
+
+def _sync_one_host(name: str, h: dict, svcs: list) -> None:
+    prov = hostapi.provider(h.get("provider"))
+    c = host_controllers.get(name)
+    if prov is None:
+        # shown, never driven (Ruling M4) — a running controller of this name keeps its
+        # last host entry and gets the service list, so it can still be stopped
+        _host_error(name, f"unknown provider {h.get('provider')!r} — this host is not "
+                          "driven (known: " + ", ".join(sorted(hostapi.PROVIDERS)) + ")")
+        if c is not None:
             c.set_services(svcs)
-    for hn in [n for n in host_controllers if n not in want]:
+        return
+    if c is not None and c.kind != prov[0].KIND:
+        # the provider owns the state record and the snapshots: never swapped under a
+        # controller (managed_host_refusal refuses it; this is a hand-edited store)
+        _host_error(name, f"provider changed to {h.get('provider')!r} — not applied; "
+                          "delete the host and create a new one")
+        c.set_services(svcs)
+        return
+    _host_errors.pop(name, None)
+    _host_error_warned.difference_update({x for x in _host_error_warned if x[0] == name})
+    _host_warned.discard(name)                  # entry is back: warn again if it goes
+    if c is None:
+        c = host_controllers[name] = hostctl.Controller(h, svcs, _host_deps())
+        if _hosts_booted:
+            _host_run(name, c)
+            _modelsrc_prepare()
+    else:
+        c.host = h
+        c.set_services(svcs)
+
+
+def sync_host_controllers() -> None:
+    """Match the controllers to the store's managed hosts and the current backend list
+    (rebuild_backends calls it BEFORE it groups hosts and builds the route index, since
+    an attached backend's URL may be derived here). A new host gets a controller (started
+    at once after boot), an existing one keeps its INSTANCE and is handed the current
+    host entry and service list, and one whose entry is gone is retired only when off
+    and idle. One host that cannot be driven never stops the others — nor the rebuild."""
+    global managed_hosts
+    managed_hosts = _load_managed_hosts()
+    config_ids = {backend_id(b) for b in config_backends}
+    rows = store.list_backends() if store.is_active() else []
+    attached: dict = {n: [] for n in managed_hosts}
+    not_att: dict = {}
+    for b in backends:
+        hn = str(b.get("host") or "").strip()
+        if hn not in managed_hosts:
+            continue
+        bid = backend_id(b)
+        if bid in config_ids:
+            not_att.setdefault(hn, []).append(bid)
+            if (hn, bid) not in _not_attach_warned:
+                _not_attach_warned.add((hn, bid))
+                logger.warning(f"[host {hn}] {bid} is not attached: "
+                               f"{NOT_ATTACHABLE_REASON}")
+            continue
+        try:
+            _attach_fields(b, rows)
+        except Exception as e:                  # the controller shows it down (no port)
+            logger.warning(f"[host {hn}] {bid}: no forward assigned: "
+                           f"{type(e).__name__}: {e}")
+        attached[hn].append(b)
+    _not_attach_warned.intersection_update(
+        {(hn, bid) for hn, bids in not_att.items() for bid in bids})
+    _host_not_attachable.clear()
+    _host_not_attachable.update(not_att)
+    _host_attached.clear()
+    _host_attached.update({n: [backend_id(b) for b in svcs] for n, svcs in attached.items()})
+    for name in list(_host_errors):
+        if name not in managed_hosts:
+            _host_errors.pop(name, None)
+    for name, entry in managed_hosts.items():
+        try:
+            _sync_one_host(name, dict(entry, name=name), attached[name])
+        except Exception as e:
+            _host_error(name, f"not driven: {type(e).__name__}: {e}")
+    for hn in [n for n in host_controllers if n not in managed_hosts]:
         c = host_controllers[hn]
-        # an `off` controller whose snapshot is still CREATING is not idle: its watcher
-        # still has to rotate the old snapshot out (and mark or drop the new one) —
-        # retired, both would sit at the provider and bill per GB-month, unseen
-        if c.state.phase == "off" and c.op is None and not c.state.pending_snapshot:
+        if _host_idle_off(c):
             _host_warned.discard(hn)
             _host_retire(hn)
         elif hn not in _host_warned:        # once per controller, not per rebuild
             _host_warned.add(hn)
             what = (f"instance runs ({c.state.phase})" if c.state.phase != "off" or c.op
                     else f"snapshot {c.state.pending_snapshot} is still being taken")
-            logger.warning(f"[host {hn}] backend config removed while {what} — "
+            logger.warning(f"[host {hn}] managed host entry removed while {what} — "
                            "controller kept" + ("" if c.state.phase == "off" and not c.op
                                                 else "; stop it from the console"))
+
+
+def apply_managed_hosts() -> None:
+    """After a managed-host Save/Delete: re-read the entries, hand every controller its
+    current entry (a new token, new options) and services."""
+    sync_host_controllers()
 
 
 def _hosts_boot() -> None:
@@ -6359,52 +6515,103 @@ async def _hosts_shutdown() -> None:
             logger.warning(f"[host {name}] shutdown: {type(e).__name__}: {e}")
 
 
-# ── the console's Thunder card: backend names → the shim's host (Task 7 replaces) ──
+# ── host views and actions (the console's card, /health) ─────────────────────────
 
-def _thunder_card_ctl(name: str):
-    """(host name, controller) of the card named `name` — a Thunder BACKEND name, the
-    key the card and its buttons still carry; a host name is accepted too."""
-    c = _shim_ctl(name)
-    if c is not None:
-        return _shim_host_name(name), c
+def host_names() -> list:
+    """Every managed host the console shows: each store entry (driven or not) and each
+    controller kept past its entry (its instance may still bill), sorted."""
+    return sorted(set(managed_hosts) | set(host_controllers), key=lambda n: str(n).lower())
+
+
+def _undriven_view(name: str, h: dict) -> dict:
+    """The view of a host without a controller (an unknown provider): shown `off`, its
+    attached backends `down` — never a made-up lifecycle."""
+    svcs = {}
+    for bid in _host_attached.get(name, []):
+        b = _live_backend(bid) or {}
+        svcs[bid] = {"name": str(b.get("name") or bid.partition(":")[2]),
+                     "type": str(b.get("type") or "openai"),
+                     "local_port": b.get("local_port"), "remote_port": b.get("remote_port"),
+                     "status": "down", "error": "host not driven"}
+    return {"name": name, "provider": str(h.get("provider") or ""), "phase": "off",
+            "error": "", "failed_phase": "", "uptime_s": 0, "long_running": False,
+            "cost_per_h": None, "session_cost": None, "snapshot": {}, "log": [],
+            "transfers": [], "plan": None, "ready_aliases": [], "op": None,
+            "waiting_jobs": None, "services": svcs, "orphans": [],
+            "unreconciled_uuids": []}
+
+
+def host_view(name: str) -> Optional[dict]:
+    """A managed host's view for the console: the controller's (plus `gated_only` per
+    planned alias, see `_gated_only_aliases`), else the undriven one; with the host's
+    options (never its token — `api_key_set` only), why it is not driven (`error`), and
+    the config backends that name it but are not attached (`not_attachable`, R-K3)."""
     c = host_controllers.get(name)
-    return (name, c) if c is not None else (name, None)
+    h = managed_hosts.get(name)
+    if c is None and h is None:
+        return None
+    if c is not None:
+        v = c.view()
+        rows = (v.get("plan") or {}).get("aliases") or {}
+        try:
+            only = _gated_only_aliases([a for a, r in rows.items() if not r.get("ready")])
+        except Exception as e:              # the panel note is a courtesy, never an error
+            logger.warning(f"[host {name}] alias gate note unavailable: {e!r}")
+            only = set()
+        for a, r in rows.items():
+            r["gated_only"] = a in only
+    else:
+        v = _undriven_view(name, h)
+    src = h if h is not None else getattr(c, "host", None)
+    src = src if isinstance(src, dict) else {}
+    opts = src.get("options") if isinstance(src.get("options"), dict) else {}
+    v["options"] = copy.deepcopy(opts)
+    v["api_key_set"] = bool(src.get("api_key"))
+    v["managed"] = h is not None               # False: entry deleted, controller kept
+    err = _host_errors.get(name, "")
+    v["host_error"] = err
+    if err and not v.get("error"):
+        v["error"] = err
+    v["not_attachable"] = [{"bid": bid, "reason": NOT_ATTACHABLE_REASON}
+                           for bid in _host_not_attachable.get(name, [])]
+    return v
 
 
-def thunder_names() -> list:
-    """The card names: each controller's ComfyUI backend (its only service under the
-    shim), else the host name."""
+def host_longrun() -> list:
+    """[(host name, view)] of the controllers whose instance is up for more than 24 h —
+    for the Dashboard's cost banner, polled every 4 s: `Controller.view()` alone (in
+    memory), never `host_view`, whose alias-gate note reads the store per alias."""
     out = []
-    for hn, c in host_controllers.items():
-        comfy = next((x for x in c.services if x.get("type") == "comfyui"), None)
-        out.append(str(comfy["name"]) if comfy is not None else hn)
+    for name in sorted(host_controllers, key=lambda n: str(n).lower()):
+        c = host_controllers.get(name)
+        if c is None:
+            continue
+        try:
+            v = c.view()
+        except Exception as e:              # a banner, never the Dashboard
+            logger.warning(f"[host {name}] view failed: {type(e).__name__}: {e}")
+            continue
+        if isinstance(v, dict) and v.get("long_running"):
+            out.append((name, v))
     return out
 
 
-_THUNDER_OPS = {"start": ("start", "start"), "stop": ("stop", "stop"),
-                "restart": ("restart_comfy", "ComfyUI restart"), "sync": ("sync_now", "sync")}
+# action → (controller method, label, takes the service's backend id)
+_HOST_OPS = {"start": ("start", "start", False), "stop": ("stop", "stop", False),
+             "restart_service": ("restart_service", "restart", True),
+             "resetup": ("resetup", "setup re-run", True),
+             "sync": ("sync_now", "sync", False), "sync_now": ("sync_now", "sync", False)}
 # How long a console "delete unknown files" waits for its answer before it says
 # "still running" (the controller plans first — an ssh index of the whole disk).
 _THUNDER_ANSWER_S = 30
 
 
-async def thunder_action(name: str, action: str) -> str:
-    """Console action on a Thunder card (`name` = its backend). start/stop/restart run as
-    held background tasks — a start takes up to hours — and the call answers after the
-    op's first step: a refusal (RuntimeError before its first await: "already …", "not
-    running") comes back as the message, never as an exception into the console."""
-    hn, c = _thunder_card_ctl(name)
-    if c is None:
-        return f"unknown Thunder backend {name!r}"
-    if action == "forget_unreconciled":
-        c.forget_unreconciled()
-        return "unreconciled instances forgotten"
-    op = _THUNDER_OPS.get(action)
-    if op is None:
-        return f"unknown action {action!r}"
-    meth, label = op
+async def _host_op(name: str, coro, label: str) -> str:
+    """Run a controller op as a held background task — a start takes up to hours — and
+    answer after its first step: a refusal (RuntimeError before its first await:
+    "already …", "not running") comes back as the message, never as an exception."""
     answered: set = set()
-    t = _host_spawn(hn, label, getattr(c, meth)(), answered)
+    t = _host_spawn(name, label, coro, answered)
     await asyncio.sleep(0)                  # let the op run up to its first await
     if t.done() and not t.cancelled():
         # the done-callback runs after this (call_soon order): the refusal is the
@@ -6419,24 +6626,16 @@ async def thunder_action(name: str, action: str) -> str:
     return f"{label} requested"
 
 
-async def thunder_sync_now(name: str) -> str:
-    """The panel's "Sync now" (Controller.sync_now, refused without a running instance)."""
-    return await thunder_action(name, "sync")
-
-
-async def thunder_delete_unknown(name: str, paths: list) -> str:
+async def _host_delete_unknown(name: str, c, paths) -> str:
     """The panel's "delete unknown files": the controller re-plans and refuses the whole
     request when one path is no longer unknown (needed or synced meanwhile). The answer
     is awaited up to `_THUNDER_ANSWER_S` — the refusal is what the operator must see — and
     a delete still running then goes on as a held task whose failure is logged."""
-    hn, c = _thunder_card_ctl(name)
-    if c is None:
-        return f"unknown Thunder backend {name!r}"
     paths = [str(p) for p in paths or [] if p]
     if not paths:
         return "no file selected — nothing deleted"
     answered: set = set()
-    t = _host_spawn(hn, "delete unknown files", c.delete_unknown(paths), answered)
+    t = _host_spawn(name, "delete unknown files", c.delete_unknown(paths), answered)
     answered.add(t)                         # the answer below reports it, not the log
     done, _ = await asyncio.wait({t}, timeout=_THUNDER_ANSWER_S)
     if t not in done:
@@ -6453,12 +6652,64 @@ async def thunder_delete_unknown(name: str, paths: list) -> str:
     return f"deleted {n} unknown file{'s' if n != 1 else ''}"
 
 
-def _thunder_only_aliases(aliases) -> set:
-    """Aliases of this backend's plan that no candidate can serve right now outside the
+async def host_action(name: str, action: str, bid: Optional[str] = None,
+                      paths: Optional[list] = None) -> str:
+    """A console action on managed host `name`: start, stop, restart_service <bid>,
+    resetup <bid>, forget_unreconciled, sync / sync_now, delete_unknown <paths>. Always
+    answers with text — a refusal included — never with an exception."""
+    c = host_controllers.get(name)
+    if c is None:
+        if name in managed_hosts:
+            return (f"managed host {name!r} is not driven: "
+                    f"{_host_errors.get(name) or 'no controller'}")
+        return f"unknown managed host {name!r}"
+    if action == "forget_unreconciled":
+        c.forget_unreconciled()
+        return "unreconciled instances forgotten"
+    if action == "delete_unknown":
+        return await _host_delete_unknown(name, c, paths)
+    op = _HOST_OPS.get(action)
+    if op is None:
+        return f"unknown action {action!r}"
+    meth, label, per_service = op
+    if per_service:
+        bid = str(bid or "").strip()
+        if not bid:
+            return f"{label} refused: no backend named"
+        return await _host_op(name, getattr(c, meth)(bid), f"{label} of {bid}")
+    return await _host_op(name, getattr(c, meth)(), label)
+
+
+# The Thunder card's binds (admin `_thunder_*`), mapped onto managed hosts: the card
+# name IS the host name now. Task 7 replaces the card and removes these three.
+async def thunder_action(name: str, action: str) -> str:
+    """The card's start/stop/restart/forget: "restart" = the host's ComfyUI service."""
+    if action == "restart":
+        c = host_controllers.get(name)
+        comfy = next((x for x in (c.services if c is not None else [])
+                      if x.get("type") == "comfyui"), None)
+        if c is None or comfy is None:
+            return await host_action(name, "restart_service")
+        return await _host_op(name, c.restart_service(hostctl.service_bid(comfy)),
+                              "ComfyUI restart")
+    return await host_action(name, action)
+
+
+async def thunder_sync_now(name: str) -> str:
+    """The panel's "Sync now" (Controller.sync_now, refused without a running instance)."""
+    return await host_action(name, "sync")
+
+
+async def thunder_delete_unknown(name: str, paths: list) -> str:
+    return await host_action(name, "delete_unknown", paths=paths)
+
+
+def _gated_only_aliases(aliases) -> set:
+    """Aliases of a host's plan that no candidate can serve right now outside the
     model-sync gate — every candidate sits on a managed host's ComfyUI service that has
-    not synced it. Their schema, image slots and LoRA list read EMPTY until the sync
-    finishes (the gate empties the candidate set), which the panel says instead of
-    leaving it a mystery. Blocking (store read)."""
+    not synced it (backend → host → controller, R-W7). Their schema, image slots and
+    LoRA list read EMPTY until the sync finishes (the gate empties the candidate set),
+    which the panel says instead of leaving it a mystery. Blocking (store read)."""
     out = set()
     for alias in aliases:
         cands = store.get(alias) if store.is_active() else None
@@ -6468,9 +6719,10 @@ def _thunder_only_aliases(aliases) -> set:
         for cand in cands or []:
             if not isinstance(cand, dict):
                 continue
-            bname = cand.get("backend")
-            bc = _shim_ctl(bname) if adapters.cand_kind(cand) == "comfyui" else None
-            if not (bc is not None and not bc.is_alias_ready(f"comfyui:{bname}", alias)):
+            bid = f"comfyui:{cand.get('backend')}"
+            b = _live_backend(bid) if adapters.cand_kind(cand) == "comfyui" else None
+            c = _host_ctl(b)
+            if not (c is not None and not c.is_alias_ready(bid, alias)):
                 open_ = True
                 break
         if not open_:
@@ -6478,66 +6730,147 @@ def _thunder_only_aliases(aliases) -> set:
     return out
 
 
-def thunder_longrun() -> list:
-    """[(card name, view)] of the controllers whose instance is up for more than 24 h —
-    for the Dashboard's cost banner, polled every 4 s: `Controller.view()` alone (in
-    memory), never `thunder_view`, whose alias-gate note reads the store per alias."""
-    out = []
-    for name in sorted(thunder_names(), key=lambda n: str(n).lower()):
-        hn, c = _thunder_card_ctl(name)
-        if c is None:
-            continue
-        try:
-            v = c.view()
-        except Exception as e:              # a banner, never the Dashboard
-            logger.warning(f"[host {hn}] view failed: {type(e).__name__}: {e}")
-            continue
-        if isinstance(v, dict) and v.get("long_running"):
-            out.append((name, v))
-    return out
-
-
-def thunder_view(name: str) -> Optional[dict]:
-    """A controller's view for the card named `name`, plus `gated_only` per planned
-    alias (see `_thunder_only_aliases`)."""
-    hn, c = _thunder_card_ctl(name)
-    if c is None:
-        return None
-    v = c.view()
-    rows = (v.get("plan") or {}).get("aliases") or {}
-    try:
-        only = _thunder_only_aliases([a for a, r in rows.items() if not r.get("ready")])
-    except Exception as e:                  # the panel note is a courtesy, never an error
-        logger.warning(f"[host {hn}] alias gate note unavailable: {e!r}")
-        only = set()
-    for a, r in rows.items():
-        r["gated_only"] = a in only
-    return v
-
-
 def modelsync_gate(backend: dict, alias: str) -> Optional[str]:
     """None = `alias` may route to `backend`; else why not (the text a client's 503
     carries). Only a ComfyUI backend that is a managed host's service is ever gated —
     backends are keyed (name, type), so a same-named LLM backend is not the box. Backend
-    → host → controller → the service's plan. Runs per request and per waiter × backend
-    inside a worker thread: it reads the controller's in-memory plan only
+    → `host` → controller → the service's plan (R-W7). Runs per request and per waiter ×
+    backend inside a worker thread: it reads the controller's in-memory plan only
     (`is_alias_ready`/`alias_status` do no I/O), never anything slower."""
     if backend.get("type") != "comfyui":
         return None
-    c = _shim_ctl(backend.get("name"))
+    c = _host_ctl(backend)
     bid = backend_id(backend)
     if c is None or c.is_alias_ready(bid, alias):
         return None
     return c.alias_status(bid, alias)
 
 
-def _thunder_info(b: dict) -> dict:
-    """/health (admin view): the lifecycle of the managed host a Thunder backend is on."""
-    c = _shim_ctl(b["name"]) if b.get("type") == "comfyui" else None
+def hosts_managed_info() -> dict:
+    """/health (admin view): per managed host its provider, phase, uptime, price and
+    each attached service's status — from the controllers' memory, no I/O."""
+    out = {}
+    for name in host_names():
+        c = host_controllers.get(name)
+        h = managed_hosts.get(name) or {}
+        try:
+            v = c.view() if c is not None else _undriven_view(name, h)
+        except Exception as e:              # one host never takes /health down
+            logger.warning(f"[host {name}] view failed: {type(e).__name__}: {e}")
+            v = {}
+        e = {"provider": str(v.get("provider") or h.get("provider") or ""),
+             "phase": v.get("phase"), "uptime_s": v.get("uptime_s") or 0,
+             "cost_per_h": v.get("cost_per_h"),
+             "services": {bid: (s or {}).get("status")
+                          for bid, s in (v.get("services") or {}).items()}}
+        if _host_errors.get(name):
+            e["error"] = _host_errors[name]
+        out[name] = e
+    return out
+
+
+def managed_host_refusal(name: str, entry, new: bool = True) -> Optional[str]:
+    """Why a managed-host Save must be refused (None = fine) — for the console's form.
+    The name is `[a-z0-9-]` (it IS the identity: state, snapshots, socket — R-W5) and,
+    for a NEW host, collides with nothing (R-W6): no managed host, no key of the Hosts
+    map, no backend's `backend_host()` — a URL hostname without a dot counts. The
+    provider must be known, never changed on an existing host, and its options must
+    pass the provider's own `options_of`."""
+    name = str(name or "")
+    if not _HOST_NAME_RE.fullmatch(name):
+        return ("host name: 1–40 characters of a-z, 0-9 and '-' (not at either end) — "
+                "it names the host's snapshots and state and cannot be changed later")
+    existing = _load_managed_hosts() if store.is_active() else dict(managed_hosts)
+    if new:
+        if name in existing or name in host_controllers:
+            return f"a managed host named {name!r} already exists"
+        hosts_map = store.get_hosts() if store.is_active() else dict(hosts_meta)
+        if name in hosts_map:
+            return (f"{name!r} is already a host in the Hosts list — pick another name "
+                    "(a managed host's label and flags go there once it exists)")
+        b = next((x for x in backends if backend_host(x) == name), None)
+        if b is not None:
+            return (f"backend {backend_id(b)} already runs on a host named {name!r} — "
+                    "pick another name")
+    elif name not in existing:
+        return f"unknown managed host {name!r}"
+    e = entry if isinstance(entry, dict) else {}
+    prov = hostapi.provider(e.get("provider"))
+    if prov is None:
+        return (f"unknown provider {e.get('provider')!r} (known: "
+                + ", ".join(sorted(hostapi.PROVIDERS)) + ")")
+    if not new:
+        old = (existing.get(name) or {}).get("provider")
+        c = host_controllers.get(name)
+        if old != e.get("provider") or (c is not None and c.kind != prov[0].KIND):
+            return ("the provider of a managed host cannot change (its state and "
+                    "snapshots belong to it) — delete the host and create a new one")
+    opts = e.get("options") if isinstance(e.get("options"), dict) else {}
+    errs = prov[0].options_of({f"opt__{k}": v for k, v in opts.items()})[1]
+    if errs:
+        return "; ".join(errs)
+    return None
+
+
+def save_managed_host(name: str, entry: dict, new: bool) -> str:
+    """Store one managed host (token encrypted by the store) and apply it → the refusal,
+    "" = saved. What a blank token field means is the console's business."""
+    why = managed_host_refusal(name, entry, new=new)
+    if why:
+        return why
+    if not store.is_active():
+        return "the store is not active — not saved"
+    store.set_managed_host(name, entry)
+    apply_managed_hosts()
+    return ""
+
+
+def managed_host_delete_refusal(name: str) -> Optional[str]:
+    """R-W5: a host is deleted only while off, idle and without a snapshot being taken
+    — its instance and snapshots would otherwise bill with nobody to stop them — and
+    once no backend names it any more."""
+    existing = _load_managed_hosts() if store.is_active() else dict(managed_hosts)
+    if name not in existing:
+        return f"unknown managed host {name!r}"
+    # attached backends would be left pointing at a forward nobody opens any more, and
+    # would keep the name taken (R-W6) — they move first, deliberately
+    on = sorted(backend_id(b) for b in backends
+                if str(b.get("host") or "").strip() == name)
+    if on:
+        return (f"backends still name {name} as their host ({', '.join(on)}) — move or "
+                "delete them first")
+    c = host_controllers.get(name)
     if c is None:
-        return {}
-    v = c.view()
-    return {"thunder": {k: v.get(k) for k in ("phase", "uptime_s", "cost_per_h")}}
+        return None
+    if c.op is not None:
+        return f"{name} is busy ({c.op}) — delete it once it is off"
+    if c.state.phase != "off":
+        return f"{name} is {c.state.phase} — stop it first; only an off host can be deleted"
+    if c.state.pending_snapshot:
+        return (f"snapshot {c.state.pending_snapshot} of {name} is still being taken — "
+                "delete the host once it is done")
+    return None
+
+
+def delete_managed_host(name: str) -> str:
+    """Delete a managed host → the refusal, "" = deleted. Its state record and its Hosts
+    map entry go too: a later host of the same name must not adopt this one's snapshot
+    — they show as "foreign" from now on (R-W5). Its controller is retired by the sync
+    (off and idle)."""
+    why = managed_host_delete_refusal(name)
+    if why:
+        return why
+    store.set_managed_host(name, None)
+    cur = store.get_setting(_HOST_STATE_KEY)
+    if isinstance(cur, dict) and name in cur:
+        cur.pop(name)
+        store.set_settings({_HOST_STATE_KEY: cur})
+    # its label and coordination flags in the Hosts map were the managed host's too
+    # (same key) — left behind they would refuse a new host of this name (R-W6)
+    store.set_host(name, None)
+    apply_hosts()
+    apply_managed_hosts()
+    return ""
 
 
 def apply_chat_aliases() -> None:
@@ -6734,14 +7067,15 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
            voice_lib_ship=ship_voice_ref, voice_ship_config=voice_ship_config,
            parse_voice_target=parse_voice_target, voice_dir_ok=_voice_dir_ok,
            apply_hosts=apply_hosts,
-           thunder_view=thunder_view, thunder_action=thunder_action,
-           thunder_names=thunder_names,
+           # the Thunder card's binds, now keyed by managed host (Task 7 renames them)
+           thunder_view=host_view, thunder_action=thunder_action,
+           thunder_names=host_names,
            thunder_default_nodes=_thunder_default_nodes,
            thunder_sync_now=thunder_sync_now, thunder_delete_unknown=thunder_delete_unknown,
            thunder_modelsrc_view=modelsrc_view, thunder_modelsrc_scan=modelsrc_scan,
            thunder_modelsrc_pin=modelsrc_pin, save_modelsrc_host=save_modelsrc_host,
            save_hf_token=save_hf_token, hf_token_set=hf_token_set,
-           thunder_orphan_snapshots=thunder_orphan_snapshots, thunder_longrun=thunder_longrun,
+           thunder_orphan_snapshots=thunder_orphan_snapshots, thunder_longrun=host_longrun,
            modelsync_catalog=_modelsync_catalog, save_modelsync_catalog=save_modelsync_catalog,
            backend_loras=lambda: {b["name"]: sorted(backend_loras.get(backend_id(b), set()))
                                   for b in backends if b.get("type") == "comfyui"})
@@ -6799,7 +7133,6 @@ async def health(verbose: bool = True) -> dict:
                 "faults_24h": {k: (fmap.get(backend_id(b)) or {}).get(k, 0)
                                for k in ("faults", "outages", "downtime_s")},
                 **_comfy_watch_info(b), **_cloud_info(b), **_model_filter_info(b), **_loaded_info(b),
-                **_thunder_info(b),
             }
             for b in backends
         },
@@ -6811,4 +7144,6 @@ async def health(verbose: bool = True) -> dict:
         # Aliases that shadow a real model on a backend they don't map (→ that
         # model is unreachable by its bare name). Empty list = no such conflict.
         "alias_model_conflicts": [c for c in alias_model_conflicts() if c["shadowed"]],
+        # Managed hosts (hostctl.py): lifecycle and each attached service's status.
+        "hosts_managed": hosts_managed_info(),
     }

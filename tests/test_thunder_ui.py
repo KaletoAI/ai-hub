@@ -832,12 +832,13 @@ class CatalogWiring(unittest.TestCase):
 
 
 class _FakeCtl:
-    """The shim's host `thunder-<name>` with the ComfyUI backend `name` as its service."""
+    """Managed host `name` with the ComfyUI backend `name` (host `name`) as its service
+    — the card name is the HOST name since managed hosts replaced the shim."""
     def __init__(self, ready=(), unknown_ok=True, phase="ready", name="tc"):
         self.ready, self.unknown_ok, self.phase = set(ready), unknown_ok, phase
         self.deleted, self.synced = [], 0
-        self.name = f"thunder-{name}"
-        self.services = [{"name": name, "type": "comfyui"}]
+        self.name = name
+        self.services = [{"name": name, "type": "comfyui", "host": name}]
 
     def has_service(self, bid):
         return bid == f"comfyui:{self.services[0]['name']}"
@@ -868,26 +869,32 @@ class MainSyncWiring(CatalogWiring):
 
     def setUp(self):
         super().setUp()
-        saved = dict(main.host_controllers), main.image_models
+        saved = dict(main.host_controllers), main.image_models, main.backends
         self.addCleanup(lambda: (main.host_controllers.clear(),
                                  main.host_controllers.update(saved[0]),
-                                 setattr(main, "image_models", saved[1])))
+                                 setattr(main, "image_models", saved[1]),
+                                 setattr(main, "backends", saved[2])))
         main.host_controllers.clear()
         main.image_models = {}
-        self.ctl = main.host_controllers["thunder-tc"] = _FakeCtl(ready={"done"})
+        # the gate note resolves backend → host → controller (R-W7): the live backends
+        main.backends = [{"name": "tc", "type": "comfyui", "url": "http://127.0.0.1:18100",
+                          "host": "tc"},
+                         {"name": "k12", "type": "comfyui", "url": "http://127.0.0.1:18101",
+                          "host": "k12"}]
+        self.ctl = main.host_controllers["tc"] = _FakeCtl(ready={"done"})
         store.upsert("solo", [{"backend": "tc", "workflow_json": {}}])
         store.upsert("mixed", [{"backend": "tc", "workflow_json": {}},
                                {"backend": "k12", "workflow_json": {}}])
         store.upsert("done", [{"backend": "tc", "workflow_json": {}}])
 
     def test_gated_only_names_aliases_no_other_backend_serves(self):
-        rows = main.thunder_view("tc")["plan"]["aliases"]
+        rows = main.host_view("tc")["plan"]["aliases"]
         self.assertEqual({a: r["gated_only"] for a, r in rows.items()},
                          {"solo": True, "mixed": False, "done": False})
-        # a second Thunder backend that has not synced it either is no way out
-        main.host_controllers["thunder-k12"] = _FakeCtl(name="k12")
-        self.assertTrue(main.thunder_view("tc")["plan"]["aliases"]["mixed"]["gated_only"])
-        self.assertIsNone(main.thunder_view("nope"))
+        # a second managed host's ComfyUI that has not synced it either is no way out
+        main.host_controllers["k12"] = _FakeCtl(name="k12")
+        self.assertTrue(main.host_view("tc")["plan"]["aliases"]["mixed"]["gated_only"])
+        self.assertIsNone(main.host_view("nope"))
 
     def test_delete_unknown_answers(self):
         self.assertIn("deleted 2 unknown files",
@@ -897,7 +904,7 @@ class MainSyncWiring(CatalogWiring):
         self.assertIn("delete refused: not in the unknown list",
                       asyncio.run(main.thunder_delete_unknown("tc", ["models/a"])))
         self.assertIn("nothing deleted", asyncio.run(main.thunder_delete_unknown("tc", [])))
-        self.assertIn("unknown Thunder backend",
+        self.assertIn("unknown managed host",
                       asyncio.run(main.thunder_delete_unknown("x", ["models/a"])))
 
     def test_sync_now_answers(self):
@@ -1248,8 +1255,8 @@ class CostBanner(_Base):
         self.assertNotIn("dash-longrun", self.dash())
 
     def test_dashboard_banner_reads_no_store(self):
-        """main.thunder_longrun is what the Dashboard polls every 4 s: Controller.view()
-        only — thunder_view's alias-gate note would read the store per not-ready alias."""
+        """main.host_longrun is what the Dashboard polls every 4 s: Controller.view()
+        only — host_view's alias-gate note would read the store per not-ready alias."""
         class Ctl:
             def __init__(self, long, name):
                 self.long = long
@@ -1266,16 +1273,15 @@ class CostBanner(_Base):
         self.addCleanup(lambda: (main.host_controllers.clear(),
                                  main.host_controllers.update(saved)))
         main.host_controllers.clear()
-        main.host_controllers.update({"thunder-tc": Ctl(True, "tc"),
-                                      "thunder-k2": Ctl(False, "k2")})
+        main.host_controllers.update({"tc": Ctl(True, "tc"), "k2": Ctl(False, "k2")})
 
         def boom(*a, **k):
             raise AssertionError("store read on the Dashboard path")
         for fn in ("get", "list_aliases", "get_setting", "get_settings"):
             self.addCleanup(setattr, store, fn, getattr(store, fn))
             setattr(store, fn, boom)
-        self.assertIs(admin._thunder_longrun, main.thunder_longrun)
-        self.assertEqual([n for n, _ in main.thunder_longrun()], ["tc"])
+        self.assertIs(admin._thunder_longrun, main.host_longrun)
+        self.assertEqual([n for n, _ in main.host_longrun()], ["tc"])
         html = admin._dash_thunder()
         self.assertIn('data-k="dash-longrun-tc"', html)
         self.assertIn("Thunder tc running for 25 h (≈ $1.50)", html)
@@ -1339,7 +1345,7 @@ class OrphanSnapshots(_Base):
         self.addCleanup(lambda: (main.host_controllers.clear(),
                                  main.host_controllers.update(saved)))
         main.host_controllers.clear()
-        # ownership is by HOST name (R-W4): the shim's hosts are `thunder-<backend>`
+        # ownership is by HOST name (R-W4): the snapshots of host `thunder-tc`
         main.host_controllers["thunder-tc"] = Ctl(
             [snap("aihub-thunder-tc-20260926t120000z", "a"),
              snap("aihub-gone-20260926t120000z", "b")], None)

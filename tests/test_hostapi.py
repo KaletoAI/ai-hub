@@ -296,7 +296,8 @@ class OptionFields(unittest.TestCase):
             if fld["type"] == "select":
                 self.assertIn(fld["default"], fld["choices"], k)
         self.assertEqual(f["gpu_type"]["choices"], ["a6000", "l40", "a100xl", "h100"])
-        self.assertEqual(f["bootstrap_template"]["choices"], ["comfy-ui", "base"])
+        # "" = auto (Ruling M5): comfy-ui with a ComfyUI service, else base
+        self.assertEqual(f["bootstrap_template"]["choices"], ["", "comfy-ui", "base"])
 
     def test_option_fields_cover_create_body(self):
         # every option create_body reads must be on the form, or a new host can only

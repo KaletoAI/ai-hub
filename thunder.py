@@ -46,6 +46,7 @@ DEFAULT_TEMPLATE_NO_COMFY = "base"
 COMFY_COMMIT_DEFAULT = "1d61dcc35c35541388c0001bacc7703db14e8bea"
 GPU_TYPES = ("a6000", "l40", "a100xl", "h100")
 TEMPLATES = ("comfy-ui", "base")
+AUTO_TEMPLATE = ""                     # bootstrap_template "auto" (stored blank)
 
 # The host form as data (read by `options_of`, rendered by the console). `min` bounds an
 # int; every field has a default, which is also what an absent or blank field becomes.
@@ -58,10 +59,16 @@ OPTION_FIELDS: list = [
     {"key": "vcpus", "label": "vcpus", "type": "int", "min": 1, "default": 8,
      "hint": "vCPUs; every one above the GPU configuration's smallest option is billed "
              "extra."},
+    # "" = auto (Ruling M5): the controller picks `comfy-ui` when a ComfyUI service is
+    # attached at the first start, else `base` — a fixed `comfy-ui` default handed every
+    # vLLM-only host the template's ComfyUI and its bundled models. The form may send
+    # the word "auto" (`aliases`); what is stored is always "".
     {"key": "bootstrap_template", "label": "template", "type": "select",
-     "choices": list(TEMPLATES), "default": "comfy-ui",
+     "choices": [AUTO_TEMPLATE] + list(TEMPLATES), "default": AUTO_TEMPLATE,
+     "choice_labels": {AUTO_TEMPLATE: "auto"}, "aliases": {"auto": AUTO_TEMPLATE},
      "hint": "Thunder's image for the FIRST start (later starts restore the snapshot). "
-             "<code>base</code> when no ComfyUI runs on this host."},
+             "<code>auto</code> = <code>comfy-ui</code> when a ComfyUI backend is attached "
+             "at that start, else <code>base</code>."},
     {"key": "reserve_gb", "label": "disk reserve GB", "type": "int", "min": 0, "default": 20,
      "hint": "Free space kept on top of the models and the install. Disks only grow."},
     {"key": "comfy_commit", "label": "ComfyUI commit", "type": "text",
@@ -126,6 +133,7 @@ def options_of(form) -> tuple[dict, list, dict]:
         if name in form:
             typed[k] = s
         out[k] = dflt
+        s = fld.get("aliases", {}).get(s, s)   # "auto" is how a form says the blank
         if not s:
             continue
         if t == "int":

@@ -50,7 +50,7 @@ def make(fake, backend=None, ssh_script=None, datadir=None, default_nodes="",
     datadir is a fresh temp dir per controller unless given. `state` is a persisted
     record the controller loads at construction (a gateway restart). The host is named
     like the backend unless `host_name` says otherwise, its options ARE the backend's
-    `thunder` block (the shim's shape) and `services` replaces the one ComfyUI service."""
+    `thunder` block (the fixture's shape) and `services` replaces the one ComfyUI service."""
     b = backend or {"name": "thunder", "type": "comfyui", "api_key": "tok",
                     "thunder": {"gpu_type": "a6000", "num_gpus": 1, "vcpus": 8, "local_port": 18188,
                                 "bootstrap_template": "comfy-ui", "reserve_gb": 20,
@@ -3488,12 +3488,13 @@ def _main():
 class _FakeCtl:
     """Stands in for a Controller in the wiring tests: records calls, raises what the
     test scripts (a refusal is a RuntimeError before the first await). `name` is the
-    Thunder BACKEND; the fake is the shim's host `thunder-<name>` with it as service."""
+    managed HOST, carrying the ComfyUI backend of the same name as its service."""
     def __init__(self, name, phase="off", uuid="", refuse=None):
-        self.name = f"thunder-{name}"
+        self.name = name
+        self.kind = "thunder"
         self.host = {"name": self.name, "provider": "thunder",
                      "options": {"gpu_type": "a6000"}, "api_key": "tok"}
-        self.services = [{"name": name, "type": "comfyui", "thunder": {"gpu_type": "a6000"},
+        self.services = [{"name": name, "type": "comfyui", "host": name,
                           "local_port": 18188, "remote_port": 8188}]
         self.state = hostctl.State(phase=phase, uuid=uuid)
         self.refuse = refuse or {}
@@ -3513,7 +3514,7 @@ class _FakeCtl:
     def stop(self):
         return self._call("stop")
 
-    def restart_comfy(self):
+    def restart_service(self, bid):
         return self._call("restart")
 
     def resume(self):
@@ -3536,17 +3537,23 @@ class _FakeCtl:
 
     def view(self):
         return {"phase": self.state.phase, "uptime_s": 42, "cost_per_h": 0.57,
-                "log": ["x"]}
+                "log": ["x"], "provider": "thunder",
+                "services": {f"{x['type']}:{x['name']}": {"status": "up"}
+                             for x in self.services}}
 
 
 class MainWiring(unittest.IsolatedAsyncioTestCase):
+    """main's side of the managed hosts: the store's `managed_hosts` entries become
+    controllers, the store backends naming a host become its services."""
+
     def setUp(self):
         m = self.m = _main()
         import store
         self.store = store
         self._saved = {n: getattr(m, n) for n in (
-            "backends", "host_controllers", "_host_tasks", "_hosts_booted",
-            "backend_inflight", "_draining", "jobs_cfg")}
+            "backends", "config_backends", "host_controllers", "_host_tasks",
+            "_hosts_booted", "backend_inflight", "_draining", "jobs_cfg", "managed_hosts",
+            "_host_errors", "_host_attached", "_host_not_attachable")}
         self._saved_store = (store._DB_PATH, store._active)
         self.tmp = tempfile.mkdtemp(prefix="thunder-wiring-")
         _TMPDIRS.append(self.tmp)
@@ -3554,6 +3561,11 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         m.host_controllers = {}
         m._host_tasks = {}
         m._hosts_booted = False
+        m.managed_hosts = {}
+        m._host_errors = {}
+        m._host_attached = {}
+        m._host_not_attachable = {}
+        m.config_backends = []
         m.jobs_cfg = dict(m.jobs_cfg, store_path=os.path.join(self.tmp, "store.db"))
 
     def tearDown(self):
@@ -3561,154 +3573,151 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
             setattr(self.m, n, v)
         self.store._DB_PATH, self.store._active = self._saved_store
 
-    @staticmethod
-    def _tb(name="tc", **thunder_kw):
-        return {"name": name, "type": "comfyui", "url": "http://127.0.0.1:18188",
-                "api_key": "tok", "thunder": {"gpu_type": "a6000", **thunder_kw}}
+    def _host(self, name="tc", token="tok", **opts):
+        """A managed host in the store (its token encrypted there)."""
+        self.store.set_managed_host(name, {"provider": "thunder", "api_key": token,
+                                           "options": {"gpu_type": "a6000", **opts}})
 
-    def test_controllers_follow_backend_list(self):
+    @staticmethod
+    def _tb(name="tc", host=None, **kw):
+        """A ComfyUI backend attached to the managed host `host` (default: its name)."""
+        return dict({"name": name, "type": "comfyui", "url": "http://127.0.0.1:18188",
+                     "host": name if host is None else host}, **kw)
+
+    def test_controllers_follow_host_entries(self):
         m = self.m
         plain = {"name": "k12", "type": "comfyui", "url": "http://10.0.0.1:8188"}
+        self._host()
         m.backends = [plain, self._tb()]
         m.sync_host_controllers()
-        # the shim: the block is the host `thunder-<backend>`, the backend its service
-        self.assertEqual(list(m.host_controllers), ["thunder-tc"])
-        c = m.host_controllers["thunder-tc"]
+        self.assertEqual(list(m.host_controllers), ["tc"])
+        c = m.host_controllers["tc"]
         self.assertIsInstance(c, hostctl.Controller)
-        self.assertEqual((c.name, c.host["provider"], c.host["api_key"]),
-                         ("thunder-tc", "thunder", "tok"))
+        self.assertEqual((c.name, c.host["provider"], c.host["api_key"]), ("tc", "thunder", "tok"))
         svc = c.services[0]
-        self.assertEqual((svc["name"], svc["local_port"], svc["remote_port"]),
-                         ("tc", 18188, 8188))
+        self.assertIs(svc, m.backends[1])                   # the live dict itself
+        self.assertEqual((svc["name"], svc["remote_port"]), ("tc", 8188))
+        port = svc["local_port"]
+        self.assertTrue(18100 <= port <= 18999)
+        self.assertEqual(svc["url"], f"http://127.0.0.1:{port}")
         # a rebuild hands NEW dicts: the instance stays, its host/services are current
-        fresh = self._tb(gpu_type="h100")
+        self._host(gpu_type="h100")
+        fresh = self._tb()
         m.backends = [dict(plain), fresh]
         m.sync_host_controllers()
-        self.assertIs(m.host_controllers["thunder-tc"], c)
-        self.assertIs(c.cfg, fresh["thunder"])
+        self.assertIs(m.host_controllers["tc"], c)
         self.assertEqual(c.cfg["gpu_type"], "h100")
-        self.assertEqual(c.services[0]["thunder"], {"gpu_type": "h100"})
-        self.assertNotIn("local_port", fresh)           # the service is a copy
-        # block removed while an instance runs → kept, warned
+        self.assertIs(c.services[0], fresh)
+        self.assertEqual(fresh["local_port"], port)
+        # entry removed while an instance runs → kept, warned
         c.state.phase = "ready"
-        m.backends = [plain, {"name": "tc", "type": "comfyui", "url": "http://x"}]
+        self.store.set_managed_host("tc", None)
         with self.assertLogs("main", "WARNING") as cm:
             m.sync_host_controllers()
-        self.assertIs(m.host_controllers.get("thunder-tc"), c)
-        self.assertIn("backend config removed while instance runs", "\n".join(cm.output))
+        self.assertIs(m.host_controllers.get("tc"), c)
+        self.assertIn("managed host entry removed while instance runs", "\n".join(cm.output))
         # … and once it is off, the next sync removes it
         c.state.phase = "off"
         m.sync_host_controllers()
         self.assertEqual(m.host_controllers, {})
-        # a thunder block on a non-ComfyUI backend is no Thunder backend
-        m.backends = [{"name": "llm", "type": "openai", "url": "http://x", "thunder": {"a": 1}}]
+        # a backend naming no managed host (or an old thunder block) drives nothing
+        m.backends = [{"name": "tc", "type": "comfyui", "url": "http://x", "host": "tc",
+                       "thunder": {"gpu_type": "a6000"}}]
         m.sync_host_controllers()
         self.assertEqual(m.host_controllers, {})
 
-    def test_names_that_slug_alike_do_not_share_a_controller(self):
-        # "GPU 1" and "gpu-1" both map to host `thunder-gpu-1`: one machine's state and
-        # snapshots must never be driven for two backends — the second is refused out
-        # loud, and its card/gate lookups find nothing rather than the other's host
-        m = self.m
-        m.backends = [self._tb("GPU 1"), self._tb("gpu-1")]
-        with self.assertLogs("main", "WARNING") as cm:
-            m.sync_host_controllers()
-        self.assertEqual(list(m.host_controllers), ["thunder-gpu-1"])
-        self.assertIn("same managed host", "\n".join(cm.output))
-        self.assertIsNotNone(m._shim_ctl("GPU 1"))
-        self.assertIsNone(m._shim_ctl("gpu-1"))
-        self.assertIsNone(m.modelsync_gate({"name": "gpu-1", "type": "comfyui"}, "img"))
-
     def test_rebuild_backends_syncs_controllers(self):
         m = self.m
+        self._host()
         self.store.upsert_backend(self._tb())
-        saved_cfg = m.config_backends
-        m.config_backends = []
-        try:
-            m.rebuild_backends()
-            c = m.host_controllers["thunder-tc"]
-            m.rebuild_backends()
-            self.assertIs(m.host_controllers["thunder-tc"], c)
-            live = next(b for b in m.backends if b["name"] == "tc")
-            self.assertIs(c.cfg, live["thunder"])
-            self.assertEqual(c.services[0]["name"], "tc")
-        finally:
-            m.config_backends = saved_cfg
+        m.rebuild_backends()
+        c = m.host_controllers["tc"]
+        m.rebuild_backends()
+        self.assertIs(m.host_controllers["tc"], c)
+        live = next(b for b in m.backends if b["name"] == "tc")
+        self.assertIs(c.services[0], live)
+        self.assertEqual(c.cfg, {"gpu_type": "a6000"})
 
     def test_set_backend_enabled_keeps_config_backend_whole(self):
-        # a config-defined Thunder backend: the lifecycle enables it on every start and
-        # disables it on every stop, and each toggle writes a store copy that overrides
-        # config WHOLESALE — every configured key must survive, the thunder block included
+        # a config-defined backend toggled in the console: each toggle writes a store
+        # copy that overrides config WHOLESALE — every configured key must survive
         m = self.m
-        saved_cfg = m.config_backends
-        extra = {"host": "thunder-box", "comfy_output_dir": "/home/ubuntu/ComfyUI/output",
+        extra = {"host": "gpu-box", "comfy_output_dir": "/home/ubuntu/ComfyUI/output",
                  "max_wait": 900, "auto_restart": True,
-                 "models_allow": "flux*", "bypass": ["12"]}
-        m.config_backends = [dict(self._tb(), **extra)]
-        try:
-            m.rebuild_backends()
-            c = m.host_controllers["thunder-tc"]
-            for on in (True, False, True, False):          # two start/stop cycles
-                self.assertTrue(m.set_backend_enabled("comfyui:tc", on))
-                stored = self.store.get_backend("tc", "comfyui") or {}
-                live = next(b for b in m.backends if b["name"] == "tc")
-                for k, v in extra.items():
-                    self.assertEqual(stored.get(k), v, k)
-                    self.assertEqual(live.get(k), v, k)
-                self.assertEqual(stored.get("thunder"), {"gpu_type": "a6000"})
-                self.assertEqual(stored.get("api_key"), "tok")   # decrypted on read
-                self.assertIs(stored.get("enabled"), on)
-                # the service's forward ends never leak into the stored backend
-                self.assertNotIn("local_port", stored)
-                self.assertNotIn("remote_port", stored)
-                self.assertIs(m.host_controllers["thunder-tc"], c)
-                self.assertIs(c.cfg, live["thunder"])
-            self.assertEqual(c.cfg, {"gpu_type": "a6000"})
-            self.assertEqual(m.backend_host(c.services[0]), "thunder-box")
-        finally:
-            m.config_backends = saved_cfg
+                 "models_allow": "flux*", "bypass": ["12"],
+                 "sampling_defaults": {"stop": ["a"]}}
+        m.config_backends = [dict(self._tb(host=""), api_key="tok", **extra)]
+        m.rebuild_backends()
+        for on in (True, False, True, False):          # two start/stop cycles
+            self.assertTrue(m.set_backend_enabled("comfyui:tc", on))
+            stored = self.store.get_backend("tc", "comfyui") or {}
+            live = next(b for b in m.backends if b["name"] == "tc")
+            for k, v in extra.items():
+                self.assertEqual(stored.get(k), v, k)
+                self.assertEqual(live.get(k), v, k)
+            self.assertEqual(stored.get("api_key"), "tok")   # decrypted on read
+            self.assertIs(stored.get("enabled"), on)
+        self.assertEqual(m.host_controllers, {})           # a plain host drives nothing
+
+    def test_set_backend_enabled_keeps_an_attached_backends_forward(self):
+        # the lifecycle enables/disables its services on every start/stop: the stored
+        # forward ends and the derived URL must survive every toggle
+        m = self.m
+        self._host()
+        self.store.upsert_backend(self._tb())
+        m.rebuild_backends()
+        c = m.host_controllers["tc"]
+        live = next(b for b in m.backends if b["name"] == "tc")
+        ends = (live["local_port"], live["remote_port"], live["url"])
+        for on in (False, True):
+            self.assertTrue(m.set_backend_enabled("comfyui:tc", on))
+            stored = self.store.get_backend("tc", "comfyui")
+            self.assertEqual((stored["local_port"], stored["remote_port"], stored["url"]), ends)
+            self.assertIs(stored.get("enabled"), on)
+            self.assertIs(m.host_controllers["tc"], c)
+            self.assertEqual(m.backend_host(c.services[0]), "tc")
 
     def test_config_backend_entry_is_the_whole_dict_minus_enabled(self):
         m = self.m
         b = {"name": "n", "type": "comfyui", "enabled": False, "_tmp": 1,
-             "thunder": {"nodes": ["a"]}, "paid": False, "stuck_after_s": 120}
+             "sampling_defaults": {"stop": ["a"]}, "paid": False, "stuck_after_s": 120}
         e = m._config_backend_entry(b)
-        self.assertEqual(e, {"name": "n", "type": "comfyui", "thunder": {"nodes": ["a"]},
+        self.assertEqual(e, {"name": "n", "type": "comfyui", "sampling_defaults": {"stop": ["a"]},
                              "paid": False, "stuck_after_s": 120})
-        e["thunder"]["nodes"].append("b")                   # a copy, not the live block
-        self.assertEqual(b["thunder"]["nodes"], ["a"])
+        e["sampling_defaults"]["stop"].append("b")          # a copy, not the live dict
+        self.assertEqual(b["sampling_defaults"]["stop"], ["a"])
 
-    def test_removed_block_warns_once_per_controller(self):
+    def test_removed_entry_warns_once_per_controller(self):
         m = self.m
+        self._host()
         m.backends = [self._tb()]
         m.sync_host_controllers()
-        c = m.host_controllers["thunder-tc"]
+        c = m.host_controllers["tc"]
         c.state.phase = "ready"
-        gone = [{"name": "tc", "type": "comfyui", "url": "http://x"}]
-        m.backends = gone
+        self.store.set_managed_host("tc", None)
         with self.assertLogs("main", "WARNING") as cm:
             m.sync_host_controllers()
             m.sync_host_controllers()
             m.sync_host_controllers()
-        self.assertEqual(len([x for x in cm.output if "config removed" in x]), 1)
-        # the block returns and goes again → warned again
-        m.backends = [self._tb()]
+        self.assertEqual(len([x for x in cm.output if "entry removed" in x]), 1)
+        # the entry returns and goes again → warned again
+        self._host()
         m.sync_host_controllers()
-        m.backends = gone
+        self.store.set_managed_host("tc", None)
         with self.assertLogs("main", "WARNING") as cm:
             m.sync_host_controllers()
-        self.assertEqual(len([x for x in cm.output if "config removed" in x]), 1)
+        self.assertEqual(len([x for x in cm.output if "entry removed" in x]), 1)
 
     def test_off_controller_with_op_in_flight_is_not_retired(self):
         # a start is `off` until the create — retiring it then would orphan the instance
         m = self.m
         fc = _FakeCtl("tc")
         fc.op = "starting"
-        m.host_controllers = {"thunder-tc": fc}
+        m.host_controllers = {"tc": fc}
         m.backends = []
         with self.assertLogs("main", "WARNING"):
             m.sync_host_controllers()
-        self.assertIs(m.host_controllers.get("thunder-tc"), fc)
+        self.assertIs(m.host_controllers.get("tc"), fc)
         fc.op = None
         m.sync_host_controllers()
         self.assertEqual(m.host_controllers, {})
@@ -3719,11 +3728,11 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         m = self.m
         fc = _FakeCtl("tc")
         fc.state.pending_snapshot = "s7"
-        m.host_controllers = {"thunder-tc": fc}
+        m.host_controllers = {"tc": fc}
         m.backends = []
         with self.assertLogs("main", "WARNING") as cm:
             m.sync_host_controllers()
-        self.assertIs(m.host_controllers.get("thunder-tc"), fc)
+        self.assertIs(m.host_controllers.get("tc"), fc)
         self.assertIn("s7", "\n".join(cm.output))
         fc.state.pending_snapshot = ""
         m.sync_host_controllers()
@@ -3731,39 +3740,45 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
 
     def test_config_backend_entry_is_json_safe(self):
         # an unquoted YAML date is a datetime.date: the store's json.dumps raised on
-        # every enable/disable — a Thunder start and stop included
+        # every enable/disable
         import datetime
         m = self.m
         b = {"name": "n", "type": "comfyui", "note": datetime.date(2026, 9, 28),
-             "thunder": {"since": datetime.datetime(2026, 9, 28, 12, 0)}}
+             "extra": {"since": datetime.datetime(2026, 9, 28, 12, 0)}}
         e = m._config_backend_entry(b)
         self.assertEqual(e["note"], "2026-09-28")
-        self.assertEqual(e["thunder"]["since"], "2026-09-28 12:00:00")
+        self.assertEqual(e["extra"]["since"], "2026-09-28 12:00:00")
         json.dumps(e)
 
     async def test_real_controller_refusal_comes_back_as_text(self):
-        # pins the contract thunder_action relies on: Controller.stop() refuses BEFORE
+        # pins the contract host_action relies on: Controller.stop() refuses BEFORE
         # its first await, so the refusal is the answer — not a background log line
         m = self.m
+        self._host()
         m.backends = [self._tb()]
         m.sync_host_controllers()
-        c = m.host_controllers["thunder-tc"]
+        c = m.host_controllers["tc"]
         self.assertIsInstance(c, hostctl.Controller)
         self.assertEqual(c.state.phase, "off")
         with self.assertNoLogs("main", "WARNING"):          # answered, not logged twice
+            self.assertEqual(await m.host_action("tc", "stop"), "stop refused: not running")
             self.assertEqual(await m.thunder_action("tc", "stop"),
                              "stop refused: not running")
             self.assertEqual(await m.thunder_action("tc", "restart"),
                              "ComfyUI restart refused: no running instance to restart "
                              "ComfyUI on (off)")
+            self.assertEqual(await m.host_action("tc", "resetup", bid="comfyui:tc"),
+                             "setup re-run of comfyui:tc refused: no running instance (off)")
             await asyncio.sleep(0)                          # let the done-callbacks run
         self.assertIsNone(c.op)
 
     def test_deps_wiring(self):
         m = self.m
+        self._host()
+        self._host("tb")
         m.backends = [self._tb(), self._tb("tb")]
         m.sync_host_controllers()
-        deps = m.host_controllers["thunder-tc"].deps
+        deps = m.host_controllers["tc"].deps
         self.assertEqual(deps.datadir, self.tmp)
         self.assertIs(deps.set_enabled, m.set_backend_enabled)
         self.assertIs(deps.begin_drain, m.begin_drain)
@@ -3775,16 +3790,16 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(deps.is_draining("comfyui:tc"))
         self.assertFalse(deps.is_draining("comfyui:tb"))
         # persistence: one settings key, one entry per HOST name, others untouched
-        deps.save_state("thunder-tc", {"phase": "ready", "uuid": "u1"})
-        deps.save_state("thunder-tb", {"phase": "off"})
+        deps.save_state("tc", {"phase": "ready", "uuid": "u1"})
+        deps.save_state("tb", {"phase": "off"})
         self.assertEqual(self.store.get_setting("host_state"),
-                         {"thunder-tc": {"phase": "ready", "uuid": "u1"},
-                          "thunder-tb": {"phase": "off"}})
-        self.assertEqual(deps.load_state("thunder-tc"), {"phase": "ready", "uuid": "u1"})
+                         {"tc": {"phase": "ready", "uuid": "u1"},
+                          "tb": {"phase": "off"}})
+        self.assertEqual(deps.load_state("tc"), {"phase": "ready", "uuid": "u1"})
         self.assertIsNone(deps.load_state("nope"))
         # every controller's uuid is known (orphans = instances nobody owns)
-        m.host_controllers["thunder-tc"].state.uuid = "u1"
-        m.host_controllers["thunder-tb"].state.uuid = "u2"
+        m.host_controllers["tc"].state.uuid = "u1"
+        m.host_controllers["tb"].state.uuid = "u2"
         self.assertEqual(deps.known_uuids(), {"u1", "u2"})
         # the repo files
         self.assertTrue(deps.bootstrap_script().startswith(b"#!"))
@@ -3819,10 +3834,11 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         m.image_models = {"cfgalias": [{"backend": "tc", "workflow": path}],
                           "img": [{"backend": "tc", "workflow_json": {}}]}   # store wins
         try:
+            self._host()
             m.backends = [self._tb()]
             m.sync_host_controllers()
-            deps = m.host_controllers["thunder-tc"].deps
-            self.assertIs(deps.alias_needs, m.thunder_alias_needs)
+            deps = m.host_controllers["tc"].deps
+            self.assertIs(deps.alias_needs, m.service_alias_needs)
             # called with the ComfyUI service's backend id; any other type needs nothing
             self.assertEqual(deps.alias_needs("openai:tc"), [])
             needs = {n.alias: n for n in deps.alias_needs("comfyui:tc")}
@@ -3872,12 +3888,13 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
     def test_unreadable_setting_is_never_overwritten(self):
         m = self.m
         self.store.set_settings({"host_state": ["garbage"]})
+        self._host()
         m.backends = [self._tb()]
         m.sync_host_controllers()
-        c = m.host_controllers["thunder-tc"]
+        c = m.host_controllers["tc"]
         self.assertTrue(c.persist_blocked)          # load failed → no start, no save
         with self.assertRaises(ValueError):
-            c.deps.save_state("thunder-tc", {"phase": "off"})
+            c.deps.save_state("tc", {"phase": "off"})
         self.assertEqual(self.store.get_setting("host_state"), ["garbage"])
 
     async def test_probe_comfy(self):
@@ -3915,7 +3932,7 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
     async def test_actions_run_in_background_and_refusals_are_text(self):
         m = self.m
         c = _FakeCtl("tc", refuse={"stop": "not running"})
-        m.host_controllers = {"thunder-tc": c}
+        m.host_controllers = {"tc": c}
         msg = await m.thunder_action("tc", "start")
         self.assertIn("start", msg)
         self.assertEqual(c.calls, ["start"])
@@ -3934,31 +3951,37 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         c.gate.set()
         await asyncio.sleep(0)
 
-    async def test_thunder_view_and_names(self):
+    async def test_host_view_and_names(self):
+        # the Thunder card's binds read managed hosts (card name = host name) until
+        # Task 7 replaces the card
         m = self.m
         c = _FakeCtl("tc", phase="ready")
-        m.host_controllers = {"thunder-tc": c}
-        self.assertEqual(m.thunder_view("tc")["phase"], "ready")
-        self.assertIsNone(m.thunder_view("nope"))
+        m.host_controllers = {"tc": c}
+        self.assertEqual(m.host_view("tc")["phase"], "ready")
+        self.assertIsNone(m.host_view("nope"))
         import admin
         self.assertEqual(admin._thunder_names(), ["tc"])
-        self.assertIs(admin._thunder_view, m.thunder_view)
+        self.assertIs(admin._thunder_view, m.host_view)
         self.assertIs(admin._thunder_action, m.thunder_action)
 
     async def test_boot_resumes_and_runs_each_controller_and_shutdown_closes(self):
         m = self.m
         a, b = _FakeCtl("a", phase="ready"), _FakeCtl("b")
-        m.host_controllers = {"thunder-a": a, "thunder-b": b}
+        self._host("a")
+        self._host("b")
+        m.host_controllers = {"a": a, "b": b}
         m._hosts_boot()
         await asyncio.sleep(0)
         self.assertEqual(sorted(a.calls), ["resume", "run_forever"])
         self.assertEqual(sorted(b.calls), ["resume", "run_forever"])
-        # a controller that appears later (backend added in the console) is started too
+        # a controller that appears later (host added in the console) is started too
+        self._host("late")
         m.backends = [self._tb("late")]
         m.sync_host_controllers()
-        late = m.host_controllers["thunder-late"]
-        self.assertEqual(len(m._host_tasks["thunder-late"]), 2)
-        for t in m._host_tasks["thunder-late"]:
+        self.assertIs(m.host_controllers["a"], a)          # kept, handed the new lists
+        late = m.host_controllers["late"]
+        self.assertEqual(len(m._host_tasks["late"]), 2)
+        for t in m._host_tasks["late"]:
             t.cancel()
         await m._hosts_shutdown()
         self.assertIn("aclose", a.calls)
@@ -3969,14 +3992,17 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("stop", a.calls)
         self.assertEqual(late.state.phase, "off")
 
-    async def test_health_carries_thunder_block_in_full_view(self):
+    async def test_health_carries_hosts_managed_in_full_view(self):
         m = self.m
         tb = self._tb()
         m.backends = [tb, {"name": "k12", "type": "comfyui", "url": "http://10.0.0.1:8188"}]
-        m.host_controllers = {"thunder-tc": _FakeCtl("tc", phase="ready")}
+        m.host_controllers = {"tc": _FakeCtl("tc", phase="ready")}
         h = await m.health(verbose=False)
-        self.assertEqual(h["backends"]["comfyui:tc"]["thunder"],
-                         {"phase": "ready", "uptime_s": 42, "cost_per_h": 0.57})
+        self.assertEqual(h["hosts_managed"],
+                         {"tc": {"provider": "thunder", "phase": "ready", "uptime_s": 42,
+                                 "cost_per_h": 0.57, "services": {"comfyui:tc": "up"}}})
+        # the per-backend Thunder block is gone (spec "main.py")
+        self.assertNotIn("thunder", h["backends"]["comfyui:tc"])
         self.assertNotIn("thunder", h["backends"]["comfyui:k12"])
 
     def test_host_fault_pseudo_backend_is_recorded(self):

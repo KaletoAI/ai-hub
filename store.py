@@ -641,6 +641,56 @@ def set_host(name: str, entry) -> None:
     set_settings({"hosts": m})
 
 
+# ── Managed hosts (machines the gateway starts and stops: hostctl.py) ───────────
+# One settings dict {name: {provider, options, api_key}}. `set_settings` encrypts only
+# STRING values of `_SECRET_SETTINGS` keys, so a dict holding a provider token would be
+# stored in plaintext — and every reader of `get_settings()` (the Server tab, the
+# startup overlay) would see it. These two helpers are the only writers/readers: the
+# token is encrypted per entry on the way in and decrypted on the way out (R-W10).
+
+_MANAGED_HOSTS_KEY = "managed_hosts"
+
+
+def get_managed_hosts() -> dict:
+    """{name: entry} with each entry's `api_key` DECRYPTED (a copy per call — the
+    caller may keep or change it). A value that is no dict reads as {} (logged): a
+    settings row nobody can parse must not take the backend rebuild down with it."""
+    raw = get_setting(_MANAGED_HOSTS_KEY)
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        logger.warning(f"store: setting {_MANAGED_HOSTS_KEY} is a {type(raw).__name__}, "
+                       "not a dict — read as empty")
+        return {}
+    out = {}
+    for name, e in raw.items():
+        if not isinstance(e, dict):
+            continue
+        e = json.loads(json.dumps(e))
+        if isinstance(e.get("api_key"), str) and e["api_key"]:
+            e["api_key"] = decrypt_secret(e["api_key"])
+        out[str(name)] = e
+    return out
+
+
+def set_managed_host(name: str, entry) -> None:
+    """Upsert (dict) or delete (None) one managed host. Stores what it is given — the
+    console decides what a blank token field means — with `api_key` encrypted, so the
+    raw settings row never holds the plaintext."""
+    raw = get_setting(_MANAGED_HOSTS_KEY)
+    m = dict(raw) if isinstance(raw, dict) else {}
+    if entry is None:
+        if name not in m:
+            return
+        del m[name]
+    else:
+        e = json.loads(json.dumps(entry))
+        tok = e.get("api_key")
+        e["api_key"] = encrypt_secret(tok) if isinstance(tok, str) and tok else ""
+        m[str(name)] = e
+    set_settings({_MANAGED_HOSTS_KEY: m})
+
+
 # ── Reasoning rules (normalized thinking toggle) ────────────────────────────────
 # Ordered list of {match, backends[], adapter, param} — see reasoning.py. Stored as
 # one settings entry; first matching rule (model-glob × backend-set) wins.
