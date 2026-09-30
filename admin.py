@@ -3373,6 +3373,9 @@ def _svc_table(k: str, name: str, v: dict) -> str:
         if bid in wj:
             n = _nbytes(wj[bid])
             status += f" ⏳ {n} job{'s' if n != 1 else ''} waiting"
+        # the listener check (Ruling M6): reachable from outside the VM
+        warn = (f'<span class="warn" data-k="{_esc(k)}-svcwarn-{_esc(bid)}">⚠ '
+                f"{_esc(s['warning'])}</span>" if s.get("warning") else "")
         rp, lp = s.get("remote_port"), s.get("local_port")
         ports = (f"VM :{_esc(rp) if rp is not None else '?'} → "
                  f"local :{_esc(lp) if lp is not None else '?'}")
@@ -3386,7 +3389,8 @@ def _svc_table(k: str, name: str, v: dict) -> str:
                                           "says), then restart it"))
         rows += (f'<tr data-k="{_esc(k)}-svc-{_esc(bid)}"><td>{_esc(s.get("name") or bid)}</td>'
                  f"<td>{_type_badge(s.get('type') or 'openai')}</td><td>{ports}</td>"
-                 f"<td>{status}</td><td>{_esc(s.get('error') or '')}</td><td>{acts}</td></tr>")
+                 f"<td>{status}</td><td>{_esc(s.get('error') or '')}{warn}</td>"
+                 f"<td>{acts}</td></tr>")
     if not rows:
         return (f'<p class="hint" data-k="{_esc(k)}-nosvc">No backend attached — set a '
                 f"backend's <b>host</b> to <code>{_esc(name)}</code> to run it here.</p>")

@@ -290,3 +290,61 @@ class RealShell(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExposureCheck(unittest.TestCase):
+    """Ruling M6: `ss -ltnH` on the VM → the listeners on a service's port that are NOT
+    loopback. A miss is silent — an unauthenticated vLLM on 0.0.0.0 looks exactly like
+    one on 127.0.0.1 through the tunnel."""
+
+    SS = ("LISTEN 0      4096         0.0.0.0:8000       0.0.0.0:*\n"
+          "LISTEN 0      4096       127.0.0.1:8188       0.0.0.0:*    users:((\"python\",pid=9,fd=3))\n"
+          "LISTEN 0      128             [::]:8000          [::]:*\n"
+          "LISTEN 0      128    127.0.0.53%lo:53         0.0.0.0:*\n"
+          "LISTEN 0      128            [::1]:8001          [::]:*\n"
+          "LISTEN 0      128        127.0.0.1:8001       0.0.0.0:*\n"
+          "LISTEN 0      128         10.1.2.3:8002       0.0.0.0:*\n"
+          "LISTEN 0      128                *:8003             *:*\n"
+          "LISTEN 0      128   [::ffff:127.0.0.1]:8004        [::]:*\n"
+          "LISTEN 0      128   [fe80::1%eth0]:8005          [::]:*\n"
+          "LISTEN 0      128            [::]:18000          [::]:*\n")
+
+    def test_command_has_no_admin_text(self):
+        self.assertEqual(services.LISTEN_CMD, "ss -ltnH")
+
+    def test_wildcards_are_exposed(self):
+        self.assertEqual(services.exposed_listeners(self.SS, 8000),
+                         ["0.0.0.0:8000", "[::]:8000"])
+        self.assertEqual(services.exposed_listeners(self.SS, 8003), ["*:8003"])
+
+    def test_loopback_is_not(self):
+        for port in (8188, 8001, 8004, 53):
+            with self.subTest(port=port):
+                self.assertEqual(services.exposed_listeners(self.SS, port), [])
+
+    def test_a_specific_address_is_exposed(self):
+        self.assertEqual(services.exposed_listeners(self.SS, 8002), ["10.1.2.3:8002"])
+        self.assertEqual(services.exposed_listeners(self.SS, 8005), ["[fe80::1%eth0]:8005"])
+
+    def test_port_must_match_exactly(self):
+        self.assertEqual(services.exposed_listeners(self.SS, 800), [])
+        self.assertEqual(services.exposed_listeners(self.SS, 18000), ["[::]:18000"])
+        self.assertEqual(services.exposed_listeners(self.SS, 1800), [])
+
+    def test_unreadable_input(self):
+        hdr = "State Recv-Q Send-Q Local Address:Port Peer Address:Port Process\n"
+        self.assertEqual(services.exposed_listeners(hdr + self.SS, 8002), ["10.1.2.3:8002"])
+        self.assertEqual(services.exposed_listeners(self.SS.encode(), 8002), ["10.1.2.3:8002"])
+        for bad in ("", None, "garbage\n", "LISTEN 0 1 nocolon x\n"):
+            self.assertEqual(services.exposed_listeners(bad, 8000), [])
+        self.assertEqual(services.exposed_listeners(self.SS, None), [])
+        dup = "LISTEN 0 1 0.0.0.0:8000 0.0.0.0:*\n" * 2
+        self.assertEqual(services.exposed_listeners(dup, 8000), ["0.0.0.0:8000"])
+
+    def test_warning_text(self):
+        self.assertEqual(services.exposure_warning([]), "")
+        self.assertEqual(services.exposure_warning(["0.0.0.0:8000"]),
+                         "listening on all interfaces (0.0.0.0:8000) — reachable from "
+                         "outside the VM; bind to 127.0.0.1")
+        self.assertIn("a non-loopback address (10.1.2.3:8002)",
+                      services.exposure_warning(["10.1.2.3:8002"]))

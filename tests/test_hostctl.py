@@ -6254,6 +6254,52 @@ class CommandServices(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_cmds(fake, n)[-1], services.COMMAND.restart_cmd(vllm))
         self.assertEqual(holds, [])
 
+    async def test_listener_check_warns_on_a_non_loopback_bind(self):
+        # Ruling M6: after a command service is up, `ss -ltnH` on the VM; a listener on
+        # its port bound to anything but loopback → a visible warning, nothing killed
+        fake = FakeThunder()
+        vllm = _cmdsvc()
+        ss = [(0, b"LISTEN 0 4096 0.0.0.0:8000 0.0.0.0:*\n"
+                  b"LISTEN 0 4096 127.0.0.1:8188 0.0.0.0:*\n", b"")]
+        c, saved, _, _ = make(fake, services=[COMFY, vllm],
+                              ssh_script={services.LISTEN_CMD: ss})
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        self.assertEqual(c.view()["services"]["openai:vllm"]["warning"], "")
+        n = len(fake.calls)
+        await c._check_exposures()
+        self.assertEqual(_cmds(fake, n), [services.LISTEN_CMD])      # ComfyUI not checked
+        w = c.view()["services"]["openai:vllm"]["warning"]
+        self.assertEqual(w, "listening on all interfaces (0.0.0.0:8000) — reachable from "
+                            "outside the VM; bind to 127.0.0.1")
+        self.assertEqual(c.view()["services"][BID]["warning"], "")
+        self.assertEqual(saved["thunder"]["services"]["openai:vllm"]["warning"], w)
+        self.assertEqual(_sv(c, "openai:vllm")["status"], "up")      # still up, not killed
+        self.assertFalse([p for p in _cmds(fake, n) if "kill" in p])
+        self.assertTrue([ln for ln in c.state.log if "reachable from outside" in ln])
+        n = len(fake.calls)
+        await c._check_exposures()                                   # once per up
+        self.assertEqual(_cmds(fake, n), [])
+        # restarted with a loopback bind: the warning goes with the restart, and the
+        # check after it finds nothing
+        ss[0] = (0, b"LISTEN 0 4096 127.0.0.1:8000 0.0.0.0:*\n", b"")
+        await c.restart_service("openai:vllm")
+        await c._check_exposures()
+        self.assertEqual(c.view()["services"]["openai:vllm"]["warning"], "")
+        self.assertNotIn("warning", saved["thunder"]["services"]["openai:vllm"])
+
+    async def test_listener_check_runs_in_the_tick_and_survives_a_failure(self):
+        fake = FakeThunder()
+        vllm = _cmdsvc()
+        c, _, _, _ = make(fake, services=[COMFY, vllm],
+                          ssh_script={services.LISTEN_CMD: (127, b"", b"ss: not found\n")})
+        await c.start()
+        await _one_round(c)
+        self.assertEqual(len([p for p in _cmds(fake) if p == services.LISTEN_CMD]), 1)
+        self.assertTrue([ln for ln in c.state.log if "listener check failed (rc 127)" in ln])
+        self.assertEqual(c.view()["services"]["openai:vllm"]["warning"], "")
+        self.assertEqual(_sv(c, "openai:vllm")["status"], "up")
+
 
 class ProviderNeutralTexts(unittest.TestCase):
     """A host's option errors name the HOST OPTION (the form field), never a

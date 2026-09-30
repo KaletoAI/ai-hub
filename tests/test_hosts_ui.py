@@ -1934,6 +1934,26 @@ class ServiceTable(_Base):
         m = re.search(r'<main[^>]*>(.*)</main>', html, re.S)
         self.assertNotIn("<script", m.group(1))
 
+    def test_listener_warning_and_restart_pending(self):
+        # Ruling M6: a service reachable from outside the VM says so on its row; an
+        # automatic restart waiting for requests is `restart pending` (warn)
+        self.views = {"tc": _view(phase="ready", uuid="u1", services=_svcs(**{
+            "openai:vllm": {"name": "vllm", "type": "openai", "local_port": 18101,
+                            "remote_port": 8000, "status": "up", "error": "",
+                            "warning": "listening on all interfaces (0.0.0.0:8000) — "
+                                       "reachable from outside the VM; bind to 127.0.0.1"},
+            "openai:emb": {"name": "emb", "type": "openai", "local_port": 18102,
+                           "remote_port": 8001, "status": "restart pending",
+                           "error": "2 request(s) in flight"}}))}
+        html = self.page()
+        v = self.row(html, "openai:vllm")
+        self.assertIn('<span class="warn" data-k="host-tc-svcwarn-openai:vllm">⚠ listening '
+                      "on all interfaces (0.0.0.0:8000) — reachable from outside the VM; "
+                      "bind to 127.0.0.1</span>", v)
+        self.assertNotIn("svcwarn", self.row(html, "comfyui:tc"))
+        self.assertIn('<span class="badge warn">restart pending</span>',
+                      self.row(html, "openai:emb"))
+
     def test_no_buttons_without_a_running_instance(self):
         self.views = {"tc": _view(phase="off", services=_svcs())}
         html = self.page()

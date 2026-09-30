@@ -1335,6 +1335,7 @@ class Controller:
         self._attached: dict = {}
         self._attached_svcs: dict = {}
         self._problem_bids: set = set()                # services marked down by _problems
+        self._expose_due: set = set()                  # command services to check (ss)
         self._fwd_retry: dict = {}                     # (lport, rport) → (next try, delay, why)
         self._fwd_lock = asyncio.Lock()                # one reconcile at a time
         self._svc_retry_at = 0.0                       # a postponed attach waits till then
@@ -1565,9 +1566,67 @@ class Controller:
         cur = dict(cur) if isinstance(cur, dict) else {}
         new = dict(cur, status=status, error=str(error or ""))
         new.setdefault("setup_hash", "")
+        if status != "up":
+            # the listener warning describes a RUNNING service; the next up checks again
+            new.pop("warning", None)
+            self._expose_due.discard(bid)
+        elif cur.get("status") != "up":
+            self._due_exposure(svc)
         if new != cur:
             self.state.services[bid] = new
             self._log(f"service {bid}: {status}" + (f" — {error}" if error else ""))
+            self._persist()
+
+    def _due_exposure(self, svc: dict) -> None:
+        """A command service that just came up gets its listeners checked by the next
+        tick (`_check_exposures`)."""
+        if services.profile_for(svc) is services.COMMAND:
+            self._expose_due.add(service_bid(svc))
+
+    async def _check_exposures(self) -> None:
+        """The tick's listener check (Ruling M6): for each command service that came up
+        since the last round, `ss -ltnH` on the VM, and a service whose remote port has a
+        listener on anything but loopback gets a `warning` — the admin's start command
+        (`--host 0.0.0.0`) made an unauthenticated server reachable from outside the VM,
+        which the tunnel never shows. Shown on the card, logged; nothing is killed. A
+        failed check is logged once and not retried every 5 s."""
+        s = self.state
+        if (not self._expose_due or s.phase not in _SYNC_PHASES or self._stopping()
+                or not (s.ip and s.port)):
+            return
+        cur = {service_bid(x): x for x in self.services}
+        self._expose_due.intersection_update(cur)
+        due = sorted(self._expose_due)
+        if not due:
+            return
+        try:
+            rc, out, err = await self._exec(services.LISTEN_CMD, timeout=30)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            rc, out, err = -1, b"", _errtext(e).encode()
+        self._expose_due.difference_update(due)
+        if rc != 0:
+            self._log(f"listener check failed (rc {rc}): " + " | ".join(_tail(err, 2)))
+            return
+        changed = False
+        for bid in due:
+            st = s.services.get(bid)
+            p = self._ports(cur[bid])
+            if not isinstance(st, dict) or st.get("status") != "up" or not p:
+                continue
+            warn = services.exposure_warning(services.exposed_listeners(out, p[1]))
+            if str(st.get("warning") or "") == warn:
+                continue
+            new = dict(st)
+            if warn:
+                new["warning"] = warn
+                self._log(f"service {bid}: {warn}")
+            else:
+                new.pop("warning", None)
+            s.services[bid] = new
+            changed = True
+        if changed:
             self._persist()
 
     def _services_view(self) -> dict:
@@ -1581,7 +1640,8 @@ class Controller:
                         "local_port": p[0] if p else x.get("local_port"),
                         "remote_port": p[1] if p else x.get("remote_port"),
                         "status": str(st.get("status") or "down"),
-                        "error": str(st.get("error") or "")}
+                        "error": str(st.get("error") or ""),
+                        "warning": str(st.get("warning") or "")}
         return out
 
     async def aclose(self) -> None:
@@ -4555,6 +4615,7 @@ class Controller:
                 await self._bring_up(svc, restart=True)
             elif await self._probe_briefly(svc):
                 self._svc_set(svc, "up")
+                self._due_exposure(svc)         # a gateway restart checks again
                 self._note_attached(svc)
             else:
                 dead.append(svc)
@@ -4745,6 +4806,7 @@ class Controller:
                         and (self._fwd_task is None or self._fwd_task.done())):
                     await self.reconcile_forwards()     # (backing off per forward)
                 self._reconcile_services()              # attach/detach: a background op
+                await self._check_exposures()           # a service up since: its listeners
                 await self._sync_tick()
             except asyncio.CancelledError:
                 raise

@@ -36,6 +36,7 @@ Covered by tests/test_services.py (pure + a real-shell run of the wrapper)."""
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import re
 from typing import Optional
 
@@ -287,3 +288,73 @@ def profile_for(backend) -> Optional[object]:
     if t is None:
         t = "openai"
     return {"comfyui": COMFY, "openai": COMMAND}.get(t)
+
+
+# ── exposure check (Ruling M6) ────────────────────────────────────────────────
+# A command service's start command is the admin's text: `vllm serve … --host 0.0.0.0`
+# (a copy-paste from any tutorial) makes an UNAUTHENTICATED server reachable by whoever
+# can reach the VM, and everything still looks fine — the tunnel reaches it either way.
+# After such a service is up, the controller lists the VM's TCP listeners and marks the
+# service with a warning when one on its port is bound to anything but loopback. No kill:
+# a warning line, the admin decides.
+
+LISTEN_CMD = "ss -ltnH"         # TCP, listening, numeric, no header; no admin text in it
+
+
+def _listen_addr(tok: str):
+    """`ss`'s local address column → (host, port), None when unreadable. Forms:
+    `127.0.0.1:8000`, `0.0.0.0:8000`, `*:8000`, `[::]:8000`, `[::1]:8000`,
+    `127.0.0.53%lo:53`, `[fe80::1%eth0]:22`, `[::ffff:127.0.0.1]:8000`."""
+    host, sep, port = tok.rpartition(":")
+    if not sep or not port.isdigit() or not host:
+        return None
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    return host.split("%", 1)[0], int(port)
+
+
+def _is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False                    # `*` and anything unreadable: not loopback
+    mapped = getattr(ip, "ipv4_mapped", None)
+    return bool((mapped or ip).is_loopback)
+
+
+def exposed_listeners(ss_out, port) -> list:
+    """The listeners in `ss -ltnH` output (`LISTEN_CMD`) on TCP port `port` that are NOT
+    bound to loopback — each as `ss` printed its local address (`0.0.0.0:8000`,
+    `[::]:8000`, `10.1.2.3:8000`), in output order, without duplicates. A line that
+    cannot be read is skipped (a header an older `ss` prints despite -H included)."""
+    if isinstance(ss_out, bytes):
+        ss_out = ss_out.decode("utf-8", "replace")
+    try:
+        want = int(port)
+    except (TypeError, ValueError):
+        return []
+    out: list = []
+    for line in str(ss_out or "").splitlines():
+        cols = line.split()
+        if len(cols) < 5:
+            continue
+        a = _listen_addr(cols[3])
+        if a is None or a[1] != want or _is_loopback(a[0]):
+            continue
+        if cols[3] not in out:
+            out.append(cols[3])
+    return out
+
+
+def exposure_warning(addrs) -> str:
+    """The service's warning for `exposed_listeners`' result ("" when none)."""
+    addrs = [str(x) for x in (addrs or [])]
+    if not addrs:
+        return ""
+    wild = any(_listen_addr(a) and _listen_addr(a)[0] in ("0.0.0.0", "*", "::")
+               for a in addrs)
+    where = "all interfaces" if wild else "a non-loopback address"
+    return (f"listening on {where} ({', '.join(addrs)}) — reachable from outside the VM; "
+            "bind to 127.0.0.1")
