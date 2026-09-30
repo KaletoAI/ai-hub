@@ -3781,6 +3781,7 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         self.assertIs(deps.set_enabled, m.set_backend_enabled)
         self.assertIs(deps.begin_drain, m.begin_drain)
         self.assertIs(deps.cancel_drain, m.cancel_drain)
+        self.assertIs(deps.hold_routing, m._hold_routing)
         self.assertIs(deps.note_fault, m._note_fault)
         m.backend_inflight = {"comfyui:tc": 2}
         m._draining = {"comfyui:tc"}
@@ -3885,6 +3886,37 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(bid, m._draining)
         live = next(b for b in m.backends if b["name"] == "gpu")
         self.assertFalse(m.is_draining(live))
+
+    def test_hold_routing_never_disables(self):
+        # an automatic restart's hold: routing skips the backend, its last request
+        # ending does NOT disable it, and the release gives routing back; a real
+        # take-offline meanwhile wins (the release leaves that drain alone)
+        m = self.m
+        self._saved["_drain_host"] = dict(m._drain_host)
+        self._saved["_drain_hold"] = set(m._drain_hold)
+        m._drain_host, m._drain_hold = {}, set()
+        m._draining, m.backend_inflight = set(), {}
+        self._host("tc")
+        self.store.upsert_backend(self._tb("gpu", host="tc"))
+        m.rebuild_backends()
+        bid = "comfyui:gpu"
+        live = lambda: next(b for b in m.backends if b["name"] == "gpu")
+        m._inflight_inc(bid)
+        self.assertTrue(m._hold_routing(bid, True))
+        self.assertTrue(m.is_draining(live()))
+        self.assertFalse(m._hold_routing(bid, True))        # already held
+        m._inflight_dec(bid)
+        self.assertIsNot(self.store.get_backend("gpu", "comfyui").get("enabled"), False)
+        self.assertTrue(m._hold_routing(bid, False))
+        self.assertFalse(m.is_draining(live()))
+        # take-offline during a hold
+        m._inflight_inc(bid)
+        self.assertTrue(m._hold_routing(bid, True))
+        self.assertTrue(m.begin_drain(bid))
+        self.assertFalse(m._hold_routing(bid, False))
+        self.assertTrue(m.is_draining(live()))
+        m._inflight_dec(bid)
+        self.assertIs(self.store.get_backend("gpu", "comfyui")["enabled"], False)
 
     def test_finalize_still_disables_a_backend_on_its_host(self):
         # the console's take-offline (and a host's own stop) keep disabling
@@ -6117,6 +6149,109 @@ class CommandServices(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_setups(fake), [])
 
 
+    async def test_health_path_change_only_reprobes(self):
+        # the health path is probe-only: a changed one must not restart a serving service
+        fake = FakeThunder()
+        vllm = _cmdsvc()
+        asked = []
+
+        async def probe(url):
+            asked.append(url)
+            return 200
+        c, _, _, _ = make(fake, services=[COMFY, vllm], probe_http=probe)
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        new = dict(vllm, svc_health="/v1/models")
+        c.set_services([COMFY, new])
+        n = len(fake.calls)
+        await c._reconcile_services()
+        self.assertEqual(_cmds(fake, n), [])                 # nothing stopped or started
+        self.assertEqual(asked[-1], "http://127.0.0.1:18200/v1/models")
+        self.assertEqual(_sv(c, "openai:vllm")["status"], "up")
+        self.assertIsNone(c._reconcile_services())          # recorded: no second probe
+
+    async def test_config_change_restart_waits_for_requests_in_flight(self):
+        # an AUTOMATIC restart holds routing back, waits for the requests in flight
+        # (shown as `restart pending`), restarts, and gives routing back
+        fake = FakeThunder()
+        vllm = _cmdsvc()
+        c, _, _, _ = make(fake, services=[COMFY, vllm])
+        await c.start()
+        holds, seen = [], []
+        c.deps.hold_routing = lambda bid, on: holds.append((bid, on)) or True
+        busy = [2, 2, 1]
+        c.deps.inflight = lambda bid: (busy.pop(0) if busy else 0) \
+            if bid == "openai:vllm" else 0
+        sleep = c.deps.sleep
+
+        async def sleeping(sec):
+            seen.append((_sv(c, "openai:vllm")["status"], _sv(c, "openai:vllm")["error"],
+                         services.COMMAND.restart_cmd(new) in _cmds(fake, n), list(holds)))
+            await sleep(sec)
+        c.deps.sleep = sleeping
+        new = dict(vllm, svc_start=SECRET_START + " --v2")
+        c.set_services([COMFY, new])
+        n = len(fake.calls)
+        await c._reconcile_services()
+        pending = [x for x in seen if x[0] == "restart pending"]
+        self.assertEqual(len(pending), 3)                   # 2, 2, 1 in flight
+        self.assertEqual(seen[:3], pending)
+        for status, err, restarted, h in pending:
+            self.assertEqual(status, "restart pending")
+            self.assertFalse(restarted)                     # not while requests run
+            self.assertEqual(h, [("openai:vllm", True)])
+        self.assertEqual(seen[0][1][:22], "2 request(s) in flight")
+        self.assertEqual(_cmds(fake, n)[-1], services.COMMAND.restart_cmd(new))
+        self.assertEqual(holds, [("openai:vllm", True), ("openai:vllm", False)])
+        self.assertEqual(_sv(c, "openai:vllm")["status"], "up")
+
+    async def test_config_change_restart_wait_is_bounded(self):
+        fake = FakeThunder()
+        vllm = _cmdsvc()
+        c, _, _, _ = make(fake, services=[COMFY, vllm])
+        await c.start()
+        c.deps.hold_routing = lambda bid, on: True
+        c.deps.inflight = lambda bid: 1 if bid == "openai:vllm" else 0
+        t0 = c.h.clock[0]
+        new = dict(vllm, svc_start=SECRET_START + " --v2")
+        c.set_services([COMFY, new])
+        n = len(fake.calls)
+        await c._reconcile_services()
+        self.assertEqual(_cmds(fake, n)[-1], services.COMMAND.restart_cmd(new))
+        self.assertGreaterEqual(c.h.clock[0] - t0, hostctl._RESTART_WAIT_MAX_S)
+        self.assertLess(c.h.clock[0] - t0, hostctl._RESTART_WAIT_MAX_S + 60)
+
+    async def test_stop_during_a_pending_restart_gives_routing_back(self):
+        fake = FakeThunder()
+        vllm = _cmdsvc()
+        c, _, _, _ = make(fake, services=[COMFY, vllm])
+        await c.start()
+        holds, drained = [], []
+        c.deps.hold_routing = lambda bid, on: holds.append((bid, on)) or True
+        c.deps.begin_drain = lambda bid: drained.append((bid, list(holds))) or True
+        c.deps.inflight = lambda bid: 1 if bid == "openai:vllm" and not drained else 0
+        c.set_services([COMFY, dict(vllm, svc_start=SECRET_START + " --v2")])
+        c._reconcile_services()
+        self.assertTrue(await _until(lambda: _sv(c, "openai:vllm")["status"]
+                                     == "restart pending"))
+        await c.stop()
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        # released BEFORE the stop's own drain began
+        self.assertEqual(drained[0][1], [("openai:vllm", True), ("openai:vllm", False)])
+
+    async def test_restart_button_is_immediate(self):
+        fake = FakeThunder()
+        vllm = _cmdsvc()
+        c, _, _, _ = make(fake, services=[COMFY, vllm])
+        await c.start()
+        holds = []
+        c.deps.hold_routing = lambda bid, on: holds.append((bid, on)) or True
+        c.deps.inflight = lambda bid: 3
+        n = len(fake.calls)
+        await c.restart_service("openai:vllm")
+        self.assertEqual(_cmds(fake, n)[-1], services.COMMAND.restart_cmd(vllm))
+        self.assertEqual(holds, [])
+
 class LegacyBootstrapState(unittest.TestCase):
     """A record written before the split has no host flag: the one-piece bootstrap did
     the host part too, so its verdict carries over — and what it marked incomplete may
@@ -6154,7 +6289,8 @@ class DepsContract(unittest.TestCase):
              "sleep": 1, "ssh": 1, "spawn": None, "known_uuids": 0, "keygen": 1,
              "default_nodes": 0, "alias_needs": 1, "alias_signature": 1, "source_index": 0,
              "url_catalog": 0, "hf_token": 0, "lan": None, "pipe": 3, "control": 5,
-             "host_bootstrap_script": 0, "probe_http": 1, "cancel_drain": 1}
+             "host_bootstrap_script": 0, "probe_http": 1, "cancel_drain": 1,
+             "hold_routing": 2}
     KWARGS = {"ssh": ("stdin", "timeout"), "pipe": ("timeout_idle",), "control": ("timeout",)}
 
     def test_every_field_provided_with_the_called_arity(self):

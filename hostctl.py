@@ -191,6 +191,9 @@ _SVC_OP_PREFIXES = ("updating services", "restarting ", "re-running setup of ")
 
 # stop path / background timing
 _DRAIN_POLL_S = 2               # inflight check while draining (no timeout: a job may finish)
+# a restart the TICK decides (a changed setup/start command, port or type) waits this
+# long for the requests in flight — the Restart button does not wait
+_RESTART_WAIT_MAX_S = 600
 _DELETE_POLL_S = 10             # /instances/list after the delete …
 _DELETE_WAIT_S = 5 * 60         # … until the instance is gone, else failed(deleting)
 _DU_TIMEOUT_S = 10 * 60         # `du` over the home directory (a venv has 100k files)
@@ -433,6 +436,11 @@ class Deps:
     # moved to another host during a stop leaves this host's drain (R-K2) — left in it,
     # routing kept skipping it on its NEW host and its drain-finalize disabled it there
     cancel_drain: Callable[[str], bool] = field(default=lambda bid: False)
+    # (bid, on) → routing held back from / given back to a backend WITHOUT a drain's
+    # finalize (main._hold_routing): an automatic restart waits for the requests in
+    # flight while no new ones arrive — a drain would disable the backend once idle.
+    # → False when it could not hold (unknown, disabled, or already draining).
+    hold_routing: Callable[[str, bool], bool] = field(default=lambda bid, on: False)
 
 
 # ── bootstrap output ─────────────────────────────────────────────────────────
@@ -2348,15 +2356,20 @@ class Controller:
     # on its backend) — never the host's: the other services on the VM run on.
     def _svc_sig(self, svc: dict) -> tuple:
         """What a running service was brought up with: (what needs a restart when it
-        changes, the local port — a moved forward needs only a probe)."""
+        changes, what needs only a probe — the local port of a moved forward, the health
+        path)."""
         prof = services.profile_for(svc)
         p = self._ports(svc)
         run: tuple = (str(svc.get("type") or "openai"), p[1] if p else None,
                       self._problems().get(service_bid(svc), ""))
+        # the health path is PROBE-only: a changed one re-probes, it never restarts a
+        # serving service (and kills what it was answering)
+        probe: tuple = (p[0] if p else None,)
         if prof is services.COMMAND:
             w = prof.wrapper_script(svc)
-            run += (prof.setup_hash(svc), hashlib.sha256(w).hexdigest(), prof.probe_path(svc))
-        return run, (p[0] if p else None)
+            run += (prof.setup_hash(svc), hashlib.sha256(w).hexdigest())
+            probe += (prof.probe_path(svc),)
+        return run, probe
 
     def _note_attached(self, svc: dict) -> None:
         bid = service_bid(svc)
@@ -2636,14 +2649,49 @@ class Controller:
                 # new — or one that could not run until now: never enabled, never started
                 await self._attach(svc)
             elif old[0] == new[0]:
-                # only the forward moved (reconcile_forwards did it): a probe says up
+                # only the forward moved (reconcile_forwards did it) or the health path
+                # changed: a probe says up
                 up = await self._probe(svc)
                 self._svc_set(svc, "up" if up else "down",
                               "" if up else f"does not answer on {self._svc_url(svc)}")
                 self._note_attached(svc)
             else:
                 self._log(f"{bid}: configuration changed — setting up / restarting it")
-                await self._bring_up(svc, restart=True)
+                await self._restart_when_idle(svc)
+
+    async def _restart_when_idle(self, svc: dict) -> None:
+        """A restart the tick decided (a config change): routing is held back from the
+        service first (no new requests), then it waits for the ones in flight — up to
+        `_RESTART_WAIT_MAX_S`, shown as `restart pending` — and restarts. A restart on
+        a config save used to kill whatever the service was answering. Routing comes
+        back whatever happens (a stop aborting the op included: its own drain follows).
+        The card's Restart button does not come through here: it is immediate."""
+        bid = service_bid(svc)
+        try:
+            held = bool(self.deps.hold_routing(bid, True))
+        except Exception as e:
+            held = False
+            self._log(f"{bid}: routing not held back for the restart: {_errtext(e)}")
+        try:
+            deadline = self.deps.now() + _RESTART_WAIT_MAX_S
+            while True:
+                n = int(self.deps.inflight(bid) or 0)
+                if n <= 0:
+                    break
+                if self.deps.now() >= deadline:
+                    self._log(f"{bid}: still {n} request(s) in flight after "
+                              f"{_RESTART_WAIT_MAX_S // 60} min — restarting anyway")
+                    break
+                self._svc_set(svc, "restart pending", f"{n} request(s) in flight — "
+                              "restarts once they are done, new ones are held back")
+                await self.deps.sleep(_DRAIN_POLL_S)
+            await self._bring_up(svc, restart=True)
+        finally:
+            if held:
+                try:
+                    self.deps.hold_routing(bid, False)
+                except Exception as e:
+                    self._log(f"{bid}: routing not given back: {_errtext(e)}")
 
     async def _attach(self, svc: dict) -> None:
         """A service attached to the running host: its backend enabled (Start does that

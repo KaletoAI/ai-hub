@@ -379,6 +379,9 @@ _draining: set = set()                  # backend ids currently draining
 # backend still on that host: one moved to another managed host (or a plain URL) during
 # a host's stop belongs to its new host now (R-K2), which may have enabled it already.
 _drain_host: dict = {}
+# backend ids in `_draining` only for a managed host's automatic restart (hostctl
+# `hold_routing`): routing skips them, but they are never finalized (disabled)
+_drain_hold: set = set()
 
 
 def is_draining(backend: dict) -> bool:
@@ -391,7 +394,8 @@ def _inflight_inc(name: str) -> None:
 
 def _inflight_dec(name: str) -> None:
     backend_inflight[name] = max(0, backend_inflight.get(name, 0) - 1)
-    if name in _draining and backend_inflight.get(name, 0) <= 0:
+    if (name in _draining and name not in _drain_hold
+            and backend_inflight.get(name, 0) <= 0):
         _finalize_drain(name)            # last in-flight request finished → go offline
     _notify_slot_free()
 
@@ -5803,6 +5807,7 @@ def begin_drain(bid: str) -> bool:
     if b is None or not is_enabled(b):
         return False
     _draining.add(bid)
+    _drain_hold.discard(bid)             # a real drain takes over a restart's hold
     _drain_host[bid] = _host_name_of(b)
     n = backend_inflight.get(bid, 0)
     logger.info(f"[{b['name']}] draining — {n} in-flight; goes offline when idle")
@@ -5815,6 +5820,7 @@ def begin_drain(bid: str) -> bool:
 def cancel_drain(bid: str) -> bool:
     """Abort a drain → the backend rejoins rotation. False if it wasn't draining."""
     _drain_host.pop(bid, None)
+    _drain_hold.discard(bid)
     if bid not in _draining:
         return False
     _draining.discard(bid)
@@ -5855,6 +5861,28 @@ def set_backend_enabled(bid: str, on: bool) -> bool:
     store.upsert_backend(entry)
     logger.info(f"[{b['name']}] {'enabled' if on else 'disabled'} via console")
     apply_backend_change()
+    return True
+
+
+def _hold_routing(bid: str, on: bool) -> bool:
+    """A managed host's automatic restart (hostctl `hold_routing`): `on` keeps new
+    requests off an enabled backend while its in-flight ones finish — `_draining` for
+    routing, without the finalize that would disable it. False when it could not hold
+    (unknown, disabled, already draining — a real drain is left alone). `off` gives
+    routing back, only if it is still this hold (a take-offline meanwhile wins)."""
+    if on:
+        b = next((x for x in backends if backend_id(x) == bid), None)
+        if b is None or not is_enabled(b) or bid in _draining:
+            return False
+        _draining.add(bid)
+        _drain_hold.add(bid)
+        _notify_slot_free()
+        return True
+    if bid not in _drain_hold:
+        return False
+    _drain_hold.discard(bid)
+    _draining.discard(bid)
+    _notify_slot_free()
     return True
 
 
@@ -6338,6 +6366,7 @@ def _host_deps() -> "hostctl.Deps":
         client_factory=lambda: httpx.AsyncClient(),
         load_state=_host_load_state, save_state=_host_save_state,
         set_enabled=set_backend_enabled, begin_drain=begin_drain, cancel_drain=cancel_drain,
+        hold_routing=_hold_routing,
         inflight=lambda bid: backend_inflight.get(bid, 0),
         is_draining=lambda bid: bid in _draining,
         note_fault=_note_fault,

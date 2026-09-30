@@ -3126,7 +3126,8 @@ async def backend_enable(request: Request):
 _HOST_LOG_LINES = 200                        # = hostctl._LOG_MAX: the whole ring
 _HOST_PHASE_KIND = {"off": "muted", "ready": "ok", "failed": "bad", "draining": "warn",
                     "pruning": "warn", "snapshotting": "warn", "deleting": "warn"}
-_SVC_STATUS_KIND = {"up": "ok", "starting": "warn", "setup failed": "bad"}
+_SVC_STATUS_KIND = {"up": "ok", "starting": "warn", "restart pending": "warn",
+                    "setup failed": "bad"}
 
 
 def _provider_name(kind) -> str:
