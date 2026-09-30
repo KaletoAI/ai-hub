@@ -3780,6 +3780,7 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(deps.datadir, self.tmp)
         self.assertIs(deps.set_enabled, m.set_backend_enabled)
         self.assertIs(deps.begin_drain, m.begin_drain)
+        self.assertIs(deps.cancel_drain, m.cancel_drain)
         self.assertIs(deps.note_fault, m._note_fault)
         m.backend_inflight = {"comfyui:tc": 2}
         m._draining = {"comfyui:tc"}
@@ -3812,6 +3813,93 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         cl = deps.client_factory()
         self.assertIsNot(cl, m.http_client)
         self.assertIsNot(cl, deps.client_factory())
+
+    async def _moved_during_stop(self, job_ends_at_move):
+        """H1 (a real Controller on the stub API) stops while a long job runs on its
+        backend; during the drain the backend moves to H2 and H2 enables it — with
+        main's REAL begin_drain / _finalize_drain / cancel_drain. Returns (controller,
+        backend id)."""
+        m = self.m
+        self._saved["_drain_host"] = dict(m._drain_host)
+        m._drain_host = {}
+        m._draining = set()
+        m.backend_inflight = {}
+
+        async def no_refresh(*a, **k):          # apply_backend_change's discovery
+            return None
+        with mock.patch.object(m, "refresh_backend", no_refresh):
+            self._host("tc")
+            self._host("tb")
+            self.store.upsert_backend(self._tb("gpu", host="tc"))
+            m.rebuild_backends()
+            live = next(b for b in m.backends if b["name"] == "gpu")
+            bid = m.backend_id(live)
+            c, _, _, _ = make(FakeThunder(), host_name="tc", services=[live])
+            c.deps.set_enabled = m.set_backend_enabled
+            c.deps.begin_drain = m.begin_drain
+            c.deps.cancel_drain = m.cancel_drain
+            c.deps.inflight = lambda x: m.backend_inflight.get(x, 0)
+            c.deps.is_draining = lambda x: x in m._draining
+            await c.start()
+            self.assertEqual(c.state.phase, "ready", c.state.error)
+            self.assertIs(self.store.get_backend("gpu", "comfyui")["enabled"], True)
+            m._inflight_inc(bid)                                # the long job
+            sleep, polls, moved = c.deps.sleep, [], []
+
+            async def sleeping(sec):
+                if c.state.phase == "draining":
+                    polls.append(1)
+                    self.assertLess(len(polls), 50, "the stop waits on a moved backend")
+                    if not moved:
+                        moved.append(1)
+                        e = dict(self.store.get_backend("gpu", "comfyui"), host="tb")
+                        self.store.upsert_backend(e)
+                        m.rebuild_backends()                    # main hands the lists over
+                        c.set_services([])
+                        self.assertTrue(m.set_backend_enabled(bid, True))   # H2 start
+                        if job_ends_at_move:
+                            m._inflight_dec(bid)
+                await sleep(sec)
+            c.deps.sleep = sleeping
+            await c.stop()
+            self.assertEqual(c.state.phase, "off", c.state.error)
+            if not job_ends_at_move:
+                m._inflight_dec(bid)                            # the job ends after all
+        return c, bid
+
+    async def test_backend_moved_during_a_stop_stays_enabled_when_its_job_ends(self):
+        # R-K2 through main's drain-finalize: the job through H1 ends right after the
+        # move (before H1's next poll) — _finalize_drain must not disable it for H2
+        m = self.m
+        c, bid = await self._moved_during_stop(job_ends_at_move=True)
+        self.assertIs(self.store.get_backend("gpu", "comfyui")["enabled"], True)
+        self.assertNotIn(bid, m._draining)
+        self.assertEqual(m._drain_host, {})
+
+    async def test_backend_moved_during_a_stop_leaves_the_drain(self):
+        # … and with the job still running: H1 stops waiting on it and cancels its
+        # drain, so routing reaches it on H2; its job ending later disables nothing
+        m = self.m
+        c, bid = await self._moved_during_stop(job_ends_at_move=False)
+        self.assertIs(self.store.get_backend("gpu", "comfyui")["enabled"], True)
+        self.assertNotIn(bid, m._draining)
+        live = next(b for b in m.backends if b["name"] == "gpu")
+        self.assertFalse(m.is_draining(live))
+
+    def test_finalize_still_disables_a_backend_on_its_host(self):
+        # the console's take-offline (and a host's own stop) keep disabling
+        m = self.m
+        self._saved["_drain_host"] = dict(m._drain_host)
+        m._drain_host, m._draining, m.backend_inflight = {}, set(), {}
+        self._host("tc")
+        self.store.upsert_backend(self._tb("gpu", host="tc"))
+        m.rebuild_backends()
+        bid = "comfyui:gpu"
+        m._inflight_inc(bid)
+        self.assertTrue(m.begin_drain(bid))
+        m._inflight_dec(bid)
+        self.assertIs(self.store.get_backend("gpu", "comfyui")["enabled"], False)
+        self.assertNotIn(bid, m._draining)
 
     def test_model_sync_deps(self):
         m = self.m
@@ -6066,7 +6154,7 @@ class DepsContract(unittest.TestCase):
              "sleep": 1, "ssh": 1, "spawn": None, "known_uuids": 0, "keygen": 1,
              "default_nodes": 0, "alias_needs": 1, "alias_signature": 1, "source_index": 0,
              "url_catalog": 0, "hf_token": 0, "lan": None, "pipe": 3, "control": 5,
-             "host_bootstrap_script": 0, "probe_http": 1}
+             "host_bootstrap_script": 0, "probe_http": 1, "cancel_drain": 1}
     KWARGS = {"ssh": ("stdin", "timeout"), "pipe": ("timeout_idle",), "control": ("timeout",)}
 
     def test_every_field_provided_with_the_called_arity(self):

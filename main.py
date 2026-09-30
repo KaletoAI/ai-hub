@@ -375,6 +375,10 @@ def backend_busy(backend: dict) -> bool:
 # in-flight requests finish; once in-flight hits 0 it is disabled (persisted) — so a
 # backend can be pulled for maintenance without aborting running requests.
 _draining: set = set()                  # backend ids currently draining
+# backend id → the `host` it named when its drain began. The finalize disables only a
+# backend still on that host: one moved to another managed host (or a plain URL) during
+# a host's stop belongs to its new host now (R-K2), which may have enabled it already.
+_drain_host: dict = {}
 
 
 def is_draining(backend: dict) -> bool:
@@ -5799,6 +5803,7 @@ def begin_drain(bid: str) -> bool:
     if b is None or not is_enabled(b):
         return False
     _draining.add(bid)
+    _drain_host[bid] = _host_name_of(b)
     n = backend_inflight.get(bid, 0)
     logger.info(f"[{b['name']}] draining — {n} in-flight; goes offline when idle")
     _notify_slot_free()                  # parked calls re-evaluate: this backend is out now
@@ -5809,6 +5814,7 @@ def begin_drain(bid: str) -> bool:
 
 def cancel_drain(bid: str) -> bool:
     """Abort a drain → the backend rejoins rotation. False if it wasn't draining."""
+    _drain_host.pop(bid, None)
     if bid not in _draining:
         return False
     _draining.discard(bid)
@@ -5852,9 +5858,21 @@ def set_backend_enabled(bid: str, on: bool) -> bool:
     return True
 
 
+def _host_name_of(b: dict) -> str:
+    return str(b.get("host") or "").strip()
+
+
 def _finalize_drain(bid: str) -> None:
-    """Backend is idle → take it offline (persist enabled=false) and rebuild."""
+    """Backend is idle → take it offline (persist enabled=false) and rebuild — unless
+    it moved to another host since its drain began (R-K2): the old host's stop must not
+    disable a backend its new host already enabled."""
     _draining.discard(bid)
+    began_on = _drain_host.pop(bid, None)
+    b = next((x for x in backends if backend_id(x) == bid), None)
+    if b is not None and began_on is not None and _host_name_of(b) != began_on:
+        logger.info(f"[{b['name']}] drain ended after a move to host "
+                    f"{_host_name_of(b) or '(none)'} — left enabled")
+        return
     set_backend_enabled(bid, False)
     logger.info(f"backends changed → {len(backends)} effective")
 
@@ -6319,7 +6337,7 @@ def _host_deps() -> "hostctl.Deps":
         # not compete with proxied traffic for the shared pool, nor outlive a closed one
         client_factory=lambda: httpx.AsyncClient(),
         load_state=_host_load_state, save_state=_host_save_state,
-        set_enabled=set_backend_enabled, begin_drain=begin_drain,
+        set_enabled=set_backend_enabled, begin_drain=begin_drain, cancel_drain=cancel_drain,
         inflight=lambda bid: backend_inflight.get(bid, 0),
         is_draining=lambda bid: bid in _draining,
         note_fault=_note_fault,

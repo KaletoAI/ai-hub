@@ -429,6 +429,10 @@ class Deps:
     # GET <url> → the HTTP status (0 = no answer): a command service's health probe
     # (services.CommandProfile.probe_ok: 200/401/403 = up, R-W9)
     probe_http: Callable[[str], Awaitable[int]] = _no_http_probe
+    # abort a drain → the backend rejoins rotation (main.cancel_drain): a backend that
+    # moved to another host during a stop leaves this host's drain (R-K2) — left in it,
+    # routing kept skipping it on its NEW host and its drain-finalize disabled it there
+    cancel_drain: Callable[[str], bool] = field(default=lambda bid: False)
 
 
 # ── bootstrap output ─────────────────────────────────────────────────────────
@@ -3279,6 +3283,7 @@ class Controller:
         await self._stop_transfers()
         last = None
         while True:
+            svcs = self._leave_moved(svcs)
             waiting: dict = {}
             for svc in svcs:
                 bid = service_bid(svc)
@@ -3296,6 +3301,30 @@ class Controller:
             self._drain_waiting = waiting
             await self.deps.sleep(_DRAIN_POLL_S)
         self._drain_waiting = None
+
+    def _leave_moved(self, svcs: list) -> list:
+        """The drained services still attached here. One the list handed over during
+        the stop no longer names moved to another host (or to a plain URL) or was
+        detached: it is not this host's any more (R-K2) — its drain is cancelled and the
+        stop no longer waits on it. Left in the drain, routing would go on skipping it on
+        its NEW host, and main's drain-finalize would disable it there once its last
+        request through this host ended."""
+        pend = self._pending_services
+        if pend is None:
+            return svcs
+        now = {service_bid(x) for x in pend}
+        keep = []
+        for svc in svcs:
+            bid = service_bid(svc)
+            if bid in now:
+                keep.append(svc)
+                continue
+            try:
+                self.deps.cancel_drain(bid)
+            except Exception as e:
+                self._log(f"drain: cancelling the drain of {bid} failed: {_errtext(e)}")
+            self._log(f"drain: {bid} left this host — no longer drained or waited on")
+        return keep
 
     async def _prune(self) -> None:
         """Step 2: the model prune (`_before_snapshot`), then `base_bytes` (everything
