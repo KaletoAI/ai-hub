@@ -4558,7 +4558,8 @@ class LanSourceUnit(unittest.IsolatedAsyncioTestCase):
         sh = FakeShare()
         lan = _lan(sh, self.d, self.clock)
         a = lan.cat_argv("models/loras/my 'odd' lora.safetensors", 17)
-        self.assertEqual(a[:3], ["ssh", "-i", os.path.join(self.d, "modelsrc.key")])
+        self.assertEqual(a[:5], ["ssh", "-F", "/dev/null", "-i",
+                                 os.path.join(self.d, "modelsrc.key")])
         self.assertIn("StrictHostKeyChecking=yes", a)
         self.assertIn(f"UserKnownHostsFile={os.path.join(self.d, 'modelsrc-known_hosts')}", a)
         self.assertEqual(a[-3:-1], ["--", _SRCHOST])

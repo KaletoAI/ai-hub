@@ -36,6 +36,17 @@ class Argv(unittest.TestCase):
         self.assertEqual(a[-3:], ["--", "ubuntu@1.2.3.4", cmd])
         self.assertEqual(cmd, "cat 'models/a b;rm -rf ~'")
 
+    def test_no_ssh_config_is_read(self):
+        # a `Host *` LocalForward/ProxyCommand in ~/.ssh/config or /etc/ssh/ssh_config
+        # must not reach the privileged tunnel or an exec: -F /dev/null, right after ssh
+        for a in (sshrun.ssh_base("/k", "/kh"),
+                  sshrun.exec_argv("/k", "/kh", "ubuntu@h", 22, "true"),
+                  sshrun.tunnel_argv("/k", "/kh", "ubuntu@h", 22, [(1, 2)], "/d/x"),
+                  sshrun.control_argv("/d/ctl/x", "ubuntu@h", "forward", 1, 2)):
+            with self.subTest(a=a[:6]):
+                self.assertEqual(a[:3], ["ssh", "-F", "/dev/null"])
+                self.assertEqual(a.count("-F"), 1)
+
     def test_no_port_no_dash_p(self):
         self.assertNotIn("-p", sshrun.ssh_base("/k", "/kh"))
 
@@ -89,7 +100,7 @@ class ControlMaster(unittest.TestCase):
             with self.subTest(op=op):
                 self.assertEqual(
                     sshrun.control_argv("/d/ctl/x", self.H, op, 18000, 8000),
-                    ["ssh", "-S", "/d/ctl/x", "-O", op,
+                    ["ssh", "-F", "/dev/null", "-S", "/d/ctl/x", "-O", op,
                      "-L", "127.0.0.1:18000:127.0.0.1:8000", "--", self.H])
 
     def test_control_unknown_op_refused(self):

@@ -56,10 +56,13 @@ _PIPE_CHUNK = 1 << 20           # bytes per read of a LAN stream (one chunk in m
 
 def ssh_base(key: str, known_hosts: str, strict: str = "accept-new",
              port: Optional[int] = None) -> list[str]:
-    """The options every ssh call shares. BatchMode: never prompt (a prompt would hang
-    a subprocess nobody can answer); IdentitiesOnly: offer ONLY `key`, not whatever an
-    agent holds (a server with MaxAuthTries gives up before reaching the right one)."""
-    argv = ["ssh", "-i", key,
+    """The options every ssh call shares. `-F /dev/null`: no user or system ssh_config
+    is read — a `Host *` block there could add a LocalForward/RemoteForward, a
+    ProxyCommand or another identity to the gateway's privileged tunnel and execs.
+    BatchMode: never prompt (a prompt would hang a subprocess nobody can answer);
+    IdentitiesOnly: offer ONLY `key`, not whatever an agent holds (a server with
+    MaxAuthTries gives up before reaching the right one)."""
+    argv = ["ssh", "-F", "/dev/null", "-i", key,
             "-o", "BatchMode=yes",
             "-o", "IdentitiesOnly=yes",
             "-o", f"UserKnownHostsFile={known_hosts}",
@@ -158,11 +161,13 @@ def control_argv(ctl_path: str, host: str, op: str, lport: int, rport: int) -> l
     """`ssh -S <ctl_path> -O forward|cancel -L … -- host`: add or remove ONE forward on
     a running master. Only these two ops — `exit`/`stop` would end the master (every
     service's tunnel) from a call meant for one service. The host is required by
-    ssh's syntax; the master's own connection is what carries the forward."""
+    ssh's syntax; the master's own connection is what carries the forward. `-F
+    /dev/null` like `ssh_base`: no ssh_config reaches the master's session."""
     check_ctl_path(ctl_path)
     if op not in _CONTROL_OPS:
         raise ValueError(f"unknown control op {op!r}")
-    return ["ssh", "-S", ctl_path, "-O", op, "-L", _fwd(lport, rport), "--", host]
+    return ["ssh", "-F", "/dev/null", "-S", ctl_path, "-O", op, "-L", _fwd(lport, rport),
+            "--", host]
 
 
 def prepare_ctl_path(ctl_path: str) -> str:
