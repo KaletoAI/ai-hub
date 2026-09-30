@@ -1200,7 +1200,7 @@ A **managed host** is a GPU machine rented on demand that the gateway **starts a
 stops** for you — image, 3D mesh, video or LLM work on a big GPU for an evening, without
 paying for it around the clock. The machine and what runs on it are two levels:
 
-- the **host** carries the **Steuerung** — the provider whose API creates, snapshots and
+- the **host** carries the **provider** — the company whose API creates, snapshots and
   deletes the machine (today **Thunder Compute**, <https://www.thundercompute.com>;
   RunPod is planned and plugs into the same seam), its options and the API token;
 - **backends attach to it** by naming it as their `host`. The backend keeps its own
@@ -1249,9 +1249,9 @@ own autostart off). No new dependency — the system `ssh`, `ssh-keygen` and
   (`aihub-<name>-<stamp>`), its state record and its tunnel socket are named after it, so
   it **cannot be renamed**. A name that is already a managed host, a key of the
   *Hosts · GPU policy* table, or the host any backend derives today (from its `host`
-  field or its URL — `http://k12:8188` counts as host `k12`) is refused, or two boxes
+  field or its URL — `http://gpu-a:8188` counts as host `gpu-a`) is refused, or two boxes
   would share one host policy.
-- **Steuerung** — the provider (today only *Thunder Compute*). Fixed once saved: the
+- **Provider** — today only *Thunder Compute*. Fixed once saved: the
   host's state and snapshots belong to it.
 - the provider's **options** (Thunder):
 
@@ -1302,6 +1302,12 @@ In the backend form (*Backends → Add/Edit*, General tab) choose the host in
   - **health path** (default `/v1/models`) — probed through the tunnel; `200`, `401` or
     `403` count as up (a server with its own API key answers `401` and is running).
 
+  Once a command service is up, the gateway lists the VM's listeners (`ss -ltnH`); one on
+  the service's remote port bound to anything but loopback (`--host 0.0.0.0` copied from
+  a tutorial) puts a **warning** on its row — *listening on all interfaces — reachable
+  from outside the VM; bind to 127.0.0.1* — because through the tunnel it looks exactly
+  like a loopback bind. Nothing is stopped; fix the start command.
+
   **No tokens in the setup script or start command** — both are stored in plain text.
   The Hugging Face token belongs in the HF-token setting (Managed hosts →
   *Model-sync catalog and HF token*).
@@ -1326,11 +1332,15 @@ attached at that moment.
 a new service gets its forward added to the running ssh master (`ssh -O forward`), the
 port check, its setup if needed, its start and its probe; a detached one gets its
 process ended and its forward cancelled; a changed start command, setup script or
-remote port restarts that one service. Other services keep serving throughout — a
+remote port restarts that one service — **after its requests in flight finished**: new
+ones go elsewhere meanwhile, and its row shows `restart pending` (at most 10 min, then it
+restarts anyway). A changed health path only re-probes. Other services keep serving
+throughout — a
 stream in flight on the vLLM is not cut because a ComfyUI was attached. A forward that
 cannot be added (the local port is busy) marks only that service `down` with ssh's
 reason and is retried with a backoff. Changes made while a Stop runs wait until the host
-is `off`.
+is `off` — except that a backend moved to another host (or detached) leaves the stop's
+drain at once: it is not waited for and is never disabled by the old host.
 
 **Per-service setup (command services).** The setup script is streamed over SSH on
 stdin (`bash -s`, never on a command line), its output goes to the card log and to
@@ -1355,7 +1365,8 @@ model sync alone; LLM weights never appear there, so the sync never lists them a
 The host's **card** (Backends tab → Managed hosts; live while an instance runs) shows the
 phase, the provider, costs, the snapshot, the log — and the **service table**: one row
 per attached backend with its type, `VM :<remote> → local :<local>`, status
-(`starting`, `up`, `setup failed`, `down`), the last error, and per service **Restart**
+(`starting`, `up`, `restart pending`, `setup failed`, `down`), the last error or
+warning, and per service **Restart**
 and **Re-run setup** (while the host runs and no operation is in flight).
 
 - **Start** (asks first) is refused without an API token ("no Thunder Compute API token
@@ -1396,8 +1407,9 @@ and **Re-run setup** (while the host runs and no operation is in flight).
   before any bootstrap ran: deleted without a snapshot). A snapshot taken before a
   bootstrap finished is marked, and the next start from it runs that bootstrap again.
 - **Restart** (service table) restarts one service on the running instance: its loop is
-  ended and started fresh on its port (so a changed start command takes effect). For
-  ComfyUI this is also the way out of a failed start once the cause is fixed on the box;
+  ended and started fresh on its port (so a changed start command takes effect) at once,
+  without waiting for requests in flight. For ComfyUI this is also the way out of a
+  failed ComfyUI service start once the cause is fixed on the box;
   the ⟳ restart via ComfyUI-Manager works too (`start-comfy.sh` is a loop).
 - There is **no auto-stop**: an instance runs, and bills, until Stop. A gateway restart
   does not touch it — the state (`host_state` store setting, one record per host name)
@@ -1409,8 +1421,10 @@ and **Re-run setup** (while the host runs and no operation is in flight).
 
 **Deleting a host** (*Delete* on its card, asks first) is allowed only while it is `off`
 with no operation in flight, no snapshot still settling, and **no backend naming it**
-(re-point or delete those first). Its state goes; the snapshots it left behind then show
-as *foreign* (listed with their $/month, never deleted automatically).
+(re-point or delete those first). Its state goes; its READY snapshots **bill on** at the
+provider until you delete them there by hand — another host's card lists them as
+*foreign* (with their $/month), but nothing deletes them automatically, and with the last
+host gone nothing lists them at all.
 
 ### Model sync (ComfyUI services)
 
@@ -1578,8 +1592,7 @@ backend — sources `lifecycle` and `sync`.
   to `/tmp/ai-hub-<uid>-ctl/` (0700, private to the service under `PrivateTmp`). A path
   that fits neither leaves the tunnel down, and the card says so ("Tunnel will not come
   up: …").
-- Editing a running command service's health path restarts it; a running service that
-  a later edit makes unrunnable (e.g. its remote port now collides) shows `down` but keeps
+- A running service that a later edit makes unrunnable (e.g. its remote port now collides) shows `down` but keeps
   running on the VM until the next Stop.
 - A failed setup script's last output line is shown on the card and in the fault log —
   one more reason to keep secrets out of it.
@@ -1604,7 +1617,7 @@ session cookie is marked `Secure`. Tabs:
 | Tab | What |
 |---|---|
 | **Dashboard** | live per-backend status (a down backend names its cause) + in-flight, a **backend faults · 24h** card, column and panel (see [Backend fault log](#backend-fault-log)), parked calls, media-job counts/recent, recent LLM calls |
-| **Backends** | add/edit/remove backends (LLM, ComfyUI, Meshy, Tripo), incl. the `paid` cost tier; the editor is split into **General** (name, type, url, host, cost tier, concurrency, credential — never shown again once stored: blank keeps it, *clear* removes it), **Models** (whitelist/blacklist, discovery filters, bare-id listing, context windows), **Behavior** (prompt-cache passthrough, sampling defaults, self-retries) and one tab named after the type (**ComfyUI** / **Cloud task API** / **Anthropic**); the **Hosts · GPU policy** panel below the list edits the per-box VRAM flags (see [Hosts & VRAM policy](#hosts--vram-policy)); the **Managed hosts** section below the list adds a rented GPU machine (**+ Managed host**: name, **Steuerung** = provider, its options, API token) and carries one lifecycle card per host (Start/Stop, costs, service table with Restart / Re-run setup, model sync, log), the LAN model source and the model-sync catalog + HF token; a backend attaches through the **managed host** select in its General tab (see [Managed hosts](#managed-hosts-thunder-compute-runpod-later)) |
+| **Backends** | add/edit/remove backends (LLM, ComfyUI, Meshy, Tripo), incl. the `paid` cost tier; the editor is split into **General** (name, type, url, host, cost tier, concurrency, credential — never shown again once stored: blank keeps it, *clear* removes it), **Models** (whitelist/blacklist, discovery filters, bare-id listing, context windows), **Behavior** (prompt-cache passthrough, sampling defaults, self-retries) and one tab named after the type (**ComfyUI** / **Cloud task API** / **Anthropic**); the **Hosts · GPU policy** panel below the list edits the per-box VRAM flags (see [Hosts & VRAM policy](#hosts--vram-policy)); the **Managed hosts** section below the list adds a rented GPU machine (**+ Managed host**: name, **Provider**, its options, API token) and carries one lifecycle card per host (Start/Stop, costs, service table with Restart / Re-run setup, model sync, log), the LAN model source and the model-sync catalog + HF token; a backend attaches through the **managed host** select in its General tab (see [Managed hosts](#managed-hosts-thunder-compute-runpod-later)) |
 | **Input & Routing** | sub-tabs **Input** (what clients can call — chat aliases, generation models, endpoints), **LLM models**, **Image models**, **LoRAs** — all searchable |
 | **Aliases** | sub-tabs **Chat** and **Media** — the alias list on the left; with nothing picked the right column is the LIVE overview (chat: alias → backend · model · status + alias/model collisions; media: alias → backends, or pick a backend to see everything mapped onto it); pick an alias for its editor. Chat editor: per-alias `park_s`, reasoning/voice/sampling defaults, backends — plus that alias's live routes. Media editor: register a ComfyUI workflow, wire its node mapping, pin values (a cloud alias — Meshy, Tripo — needs no workflow: one schema-driven editor renders its endpoint + option defaults instead). Old `/ui/mapping?…` and `/ui/routing?sub=chat|gen` links redirect here. |
 | **Reasoning** | the normalized-thinking rule list (model glob × backend set → adapter) + test resolver |

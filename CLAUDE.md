@@ -1232,19 +1232,18 @@ via injected callables, staying hot-reload-safe.
   top of `2026-09-27-thunder-comfyui-design.md`, both local only; the rulings R-K*/R-W*
   and the ledger's M1–M5 are cited below). The MACHINE is its own level: a *managed
   host* (store setting `managed_hosts` = `{name: {provider, options, api_key}}`) carries a
-  **provider** ("Steuerung": Thunder Compute today, RunPod later), and ANY backend attaches
+  **provider** (Thunder Compute today, RunPod later), and ANY backend attaches
   to it by naming it as its `host` — a VM can carry several services (one ComfyUI plus
   vLLM/llama-swap …). Six modules share the work: `thunder.py` (the provider's pure
   half), `hostapi.py` (its HTTP half + the registry), `services.py` (what runs a backend
   on the VM, by type), `hostctl.py` (one lifecycle controller per host), `sshrun.py`
   (argv, tunnel, streams) and `modelsync.py` (which model files a ComfyUI alias needs).
-  It replaced the per-backend `thunder` block (a checkbox fieldset at the bottom of the
-  ComfyUI tab nobody found — and one that could not carry a vLLM next to it); no stored
-  block existed, so there is no migration, and the old `thunder_state` key is never read.
+  It replaced the per-backend `thunder` block (none was ever stored: no migration; the old
+  `thunder_state` key is never read).
 - **`thunder.py`** — the PURE half of the **Thunder Compute** provider and the shape of
   the PROVIDER INTERFACE a second provider copies (duck-typed modules like
   `meshy.py`/`tripo.py`, no ABC): `KIND` (`thunder`, the registry key and the key-file
-  prefix), `NAME` (shown in the Steuerung select, the card and the refusal texts),
+  prefix), `NAME` (shown in the Provider select, the card and the refusal texts),
   `SSH_USER` (`ubuntu`), `STOP_MODE` (`snapshot` = stop is snapshot + delete; a RunPod-like
   `native` stop that keeps the volume is NOT built — `hostctl._stop_run` is the one
   place it would branch), `DEFAULT_TEMPLATE_NO_COMFY` (`base`), and the host form as
@@ -1281,7 +1280,7 @@ via injected callables, staying hot-reload-safe.
   snapshot named after a pre-split BACKEND is foreign too). `test_thunder.py`.
 - **`hostapi.py`** — the HTTP half of a provider and the registry.
   `PROVIDERS = {"thunder": (thunder, ThunderApi)}` + `provider(kind)` (→ tuple or None,
-  a non-string is None) is the ONE place the console (the Steuerung select, the option
+  a non-string is None) is the ONE place the console (the Provider select, the option
   form) and the controller look a provider up — a second list would let the form offer
   a provider the controller cannot drive. `ProviderApi` holds every rule a REST client
   of a billing API gets wrong silently: `httpx.Timeout(30, connect=10)`; ANY 2xx is
@@ -1324,12 +1323,20 @@ via injected callables, staying hot-reload-safe.
   process long gone, or to a stranger by now; restart = stop + fresh loop, so a
   rewritten wrapper (changed `svc_start`) actually runs. `slug(name)` = `[a-z0-9-]`, ≤ 48
   chars, unique per host (R-W8). `validate` refuses with FIXED texts only (the admin's
-  text never echoes into an error). `test_services.py` (pure + a real `bash -c` run of
-  the wrapper against a temp HOME).
+  text never echoes into an error). **Exposure check** (Ruling M6): `LISTEN_CMD`
+  (`ss -ltnH`) + `exposed_listeners(out, port)` (loopback = `127/8`, `::1`, v4-mapped
+  loopback; `0.0.0.0`/`*`/`::`/any other address is exposed) + `exposure_warning`; the
+  controller marks a command service due when its status turns `up` (and on resume's
+  probe) and the next tick's `_check_exposures` sets the service's `warning` — a
+  `--host 0.0.0.0` vLLM is unauthenticated and reachable from outside the VM, yet looks
+  exactly like a loopback bind through the tunnel; shown on the card's row, never killed.
+  `test_services.py` (pure + a real `bash -c` run of the wrapper against a temp HOME).
 - **`sshrun.py`** — system-`ssh` plumbing (no asyncssh/paramiko: no new dependency, and
   OpenSSH already gives forwards that die loudly on `ExitOnForwardFailure`, keepalives,
   a known_hosts file per instance and ControlMaster multiplexing). Pure argv builders:
-  `ssh_base` (BatchMode — a prompt would hang a subprocess nobody answers —
+  `ssh_base` (`-F /dev/null` — no user/system ssh_config can add a LocalForward,
+  ProxyCommand or identity to the privileged tunnel; `control_argv` passes it too —
+  BatchMode — a prompt would hang a subprocess nobody answers —
   IdentitiesOnly, the caller's known_hosts, keepalives, ConnectTimeout), `tunnel_argv(key,
   kh, host, port, forwards, ctl_path)` — ONE ControlMaster per host (`-N -M -S <ctl>
   -o ControlPersist=no -o ExitOnForwardFailure=yes`, one `-L 127.0.0.1:<l>:127.0.0.1:<r>`
@@ -1363,10 +1370,11 @@ via injected callables, staying hot-reload-safe.
   keeps the local port bound and the next tunnel exits at once. `running` means "an ssh
   is alive right now", never "supervision active" and never "port free". Processes end
   by pid (`_signal`), never `proc.kill()`. `test_sshrun.py`.
-- **`hostctl.py`** — one `Controller(host, services, deps)` per MANAGED HOST (the file
-  was `thunderctl.py`; history follows the rename): the lifecycle, the tunnel, the
+- **`hostctl.py`** — one `Controller(host, services, deps)` per MANAGED HOST (formerly
+  `thunderctl.py`): the lifecycle, the tunnel, the
   services, the model sync. Never imports `main` — everything arrives in `Deps` (store
-  I/O, `set_enabled`, `begin_drain`/`inflight`/`is_draining`, the fault log, the probes
+  I/O, `set_enabled`, `begin_drain`/`cancel_drain`/`hold_routing`/`inflight`/
+  `is_draining`, the fault log, the probes
   `probe_comfy`/`probe_http`, both bootstrap scripts, ssh `run`/`control`/`pipe`/`spawn`,
   the model-sync callables taking a SERVICE bid). The provider module and API class come
   from `hostapi.provider(host["provider"])` (unknown → `ValueError`); every provider
@@ -1451,10 +1459,16 @@ via injected callables, staying hot-reload-safe.
   them, checked INSIDE the start op, so a stop during the check aborts it — *Forget
   unreconciled* is the operator's reset.
   **Attach/detach while running** (`_reconcile_services`, the 5-s tick): `_attached`
-  (bid → signature: type, remote port, problem, setup hash, wrapper hash, health path;
-  local port apart) is diffed against the current list and ONE op "updating services"
-  runs (abortable by a stop): new → enable, forward, port guard, setup if needed, start,
-  probe; changed → setup if needed + restart; local-port-only → probe; detached → the
+  (bid → signature: type, remote port, problem, setup hash, wrapper hash; local port and
+  health path apart — they only re-probe) is diffed against the current list and ONE op
+  "updating services" runs (abortable by a stop): new → enable, forward, port guard,
+  setup if needed, start, probe; changed → setup if needed + restart, but only once idle
+  (`_restart_when_idle`: `deps.hold_routing(bid, True)` — main's `_hold_routing` puts it
+  in `_draining` WITHOUT the finalize that would disable it — then waits for
+  `inflight == 0` up to `_RESTART_WAIT_MAX_S` (600 s) as status `restart pending`, and
+  gives routing back in a `finally`, a stop's abort included; a restart on every config
+  save killed what the service was answering; the Restart button stays immediate);
+  local-port/health-path-only → probe; detached → the
   profile's `stop_cmd` (+ transfers ended for ComfyUI), forward cancelled, and NEVER
   `set_enabled(False)` (R-K2: `enabled` belongs to the host the backend is on NOW — a
   backend moved H1 → H2 or to a real URL is not H1's to switch off). A ComfyUI attached
@@ -1477,7 +1491,11 @@ via injected callables, staying hot-reload-safe.
   the services attached AT THAT MOMENT. A service list handed over during a stop (Ruling
   M4 a) is kept in `_pending_services` — the drain's list stands, nothing attaches into a
   stopping host — and applied at `off` BEFORE the disable (so a backend moved away
-  meanwhile is left alone). `watch_snapshots()` settles the pending snapshot: READY →
+  meanwhile is left alone). A backend that list no longer names also LEAVES the drain at
+  the next poll (`_leave_moved`: `deps.cancel_drain`, no longer waited on) — left in it,
+  routing skipped it on its new host — and main's `_finalize_drain` disables only a
+  backend still on the host it named when its drain began (`_drain_host`), so a last H1
+  request ending after H2 enabled it cannot switch it off (R-K2). `watch_snapshots()` settles the pending snapshot: READY →
   `rotation`; FAILED → fault `lifecycle`/`snapshot_failed` and the previous READY one
   stays the template. `resume()` after a gateway restart reconciles with the list (an
   interrupted stop runs on; a live instance gets its tunnel back with every forward,
@@ -1547,7 +1565,7 @@ via injected callables, staying hot-reload-safe.
   controller). `managed_host_refusal(name, entry, new)`: name `[a-z0-9-]` 1–40, not
   starting/ending with `-`; a NEW name collides with nothing (R-W6) — no managed host or
   retained controller, no key of the `hosts` map, no backend's `backend_host()` (a URL
-  hostname without a dot counts: `http://k12:8188` is host `k12`) — or two boxes would
+  hostname without a dot counts: `http://gpu-a:8188` is host `gpu-a`) — or two boxes would
   share one host policy; the provider known and never changed; `options_of` clean.
   `save_managed_host` stores the NORMALIZED options; the token is written by
   `store.set_managed_host` with `encrypt_secret` and read by `get_managed_hosts` with
@@ -1639,14 +1657,15 @@ via injected callables, staying hot-reload-safe.
   in the URL, no provider name; the host travels as field/query `host`, a service as
   `bid`): the Backends tab's **Managed hosts** section (`_managed_hosts_section`,
   `data-sk="mhosts"`, below the backend list) with "+ Managed host" → the host form
-  (`_managed_host_form`, `?mhost_new=1` / `?mhost=<name>`: name + **Steuerung** select
+  (`_managed_host_form`, `?mhost_new=1` / `?mhost=<name>`: name + **Provider** select
   from `hostapi.PROVIDERS`, then the provider's OWN `OPTION_FIELDS` as `opt__<key>` — a
   hand-kept copy drifts, which is exactly how the old `_THUNDER_*` constants had to be
   pinned by a test; a new Thunder host's nodes pre-filled from the default list; an
   existing host has no name field and a fixed provider; the token a password field
   never rendered, blank keeps, `api_key_clear` clears); `managed_host_save` hands the
   typed options to `main.save_managed_host` and answers a refusal with 400 + the form
-  as typed (never the token). One keyed card per host (`_host_card`, `data-k=
+  as typed (never the token) — also a blank token when the stored entry could not be
+  READ ("blank keeps" would otherwise store an empty token). One keyed card per host (`_host_card`, `data-k=
   "host-<name>"`: provider + phase badges, the 24 h banner, errors, `tunnel_error`,
   per-service drain lines, GPU/vCPU from `options`, costs, snapshot, bootstrap notes,
   unreconciled uuids, orphans, template models/nodes, the **service table**
