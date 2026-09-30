@@ -4752,6 +4752,11 @@ class LanSourceUnit(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(lan.configured())
         self.assertFalse(lan.usable())
         self.assertEqual(lan.view()["problem"], want)
+        # a pin left from an earlier host is pinned for NOBODY: the card must not read
+        # "pinned · List now" beside "not configured" (prod's state after the upgrade)
+        self.assertFalse(lan.pinned())
+        self.assertFalse(lan.view()["pinned"])
+        self.assertEqual(lan.view()["pinned_fp"], "")
         await lan.refresh(force=True)
         with self.assertRaises(ValueError) as cm:
             await lan.scan()
@@ -4762,6 +4767,15 @@ class LanSourceUnit(unittest.IsolatedAsyncioTestCase):
         # a whitespace-only setting is no host either
         lan2 = _lan(sh, self.d, self.clock, pinned=False, host="   ")
         self.assertEqual(lan2.problem(), want)
+        self.assertFalse(lan2.pinned())
+        # nor for a host that is no plain [user@]host
+        bad = _lan(sh, self.d, self.clock, pinned=False, host="a;b")
+        self.assertFalse(bad.pinned())
+        self.assertFalse(bad.view()["pinned"])
+        with self.assertRaises(ValueError) as cm:
+            bad.cat_argv("models/vae/a.st", 0)
+        self.assertTrue(str(cm.exception).startswith("LAN source not configured: "))
+        self.assertEqual(sh.calls, [])
         # a host that is set but not pinned keeps the short "not configured"
         lan3 = _lan(sh, self.d, self.clock, pinned=False)
         os.remove(lan3.known_hosts_path)               # the first one's pin, same datadir

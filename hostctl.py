@@ -1015,7 +1015,11 @@ class LanSource:
         return pn if (pn and name and pn != name) else ""
 
     def _pinned(self, raw: str) -> bool:
-        return bool(self._pin_parts()) and not self._stale_pin(raw)
+        """Pinned FOR THIS host: a pin with no (plain) host configured belongs to nobody —
+        after the no-default upgrade a blank setting sits next to the old default's pin,
+        and reading that as "pinned" offered List now beside "not configured"."""
+        return (bool(self._plain(raw)) and bool(self._pin_parts())
+                and not self._stale_pin(raw))
 
     def pinned(self) -> bool:
         """A key is pinned FOR THE CONFIGURED HOST (a pin for the previous host is none)."""
@@ -1036,7 +1040,7 @@ class LanSource:
         old = self._stale_pin(raw)
         if old:
             return f"pinned for {old}, not {host.rsplit('@', 1)[-1]} — fetch its key"
-        if not host or not self._pinned(raw):
+        if not self._pinned(raw):
             return "not configured"
         if self._error:
             return self._error
@@ -1046,7 +1050,7 @@ class LanSource:
 
     def _unusable(self, raw: str) -> str:
         p = self._problem(raw)
-        return p if p.startswith("LAN ") else f"LAN source {p}"
+        return p if p == SRC_UNSET else f"LAN source {p}"
 
     def problem(self) -> str:
         """Why LAN transfers wait ("" = they may run) — the text inside "waiting for LAN

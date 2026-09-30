@@ -3698,9 +3698,11 @@ def _modelsrc_block(refused: Optional[tuple] = None) -> str:
                "already mounts the model share: its existing user, no new user, no root. "
                "Copy the script to that user's <code>~/bin/modelsrc-serve</code> and "
                "append ONE line to its <code>~/.ssh/authorized_keys</code> "
-               "(<code>restrict</code> = no pty, forwarding, agent, X11 or user rc; the key "
-               "can run only the read-only script; the user needs a real login shell — "
-               "sshd runs the forced command through it):</p>"
+               "(<code>restrict</code> = no pty, forwarding, agent, X11 or user rc, OpenSSH "
+               "≥ 7.2; the key can run only the read-only script; the user needs a real "
+               "login shell — sshd runs the forced command through it; a mount path with "
+               "spaces is single-quoted inside: <code>MODELSRC_ROOT='/mnt/my share'</code>):"
+               "</p>"
                f'<pre class="tlog" data-k="{k}-install">'
                f"{_esc(_MODELSRC_INSTALL_VM.format(pub=pub_or))}</pre>"
                f'<p class="hint" data-k="{k}-then">Then set the share host below to '
@@ -3728,9 +3730,13 @@ def _modelsrc_block(refused: Optional[tuple] = None) -> str:
     else:
         facts = [f"host key <code>{_esc(mv.get('pinned_fp') or '?')}</code> pinned"]
         if mv.get("listed_at"):
+            # the absolute time as a title: with every host off the tab is static, and
+            # "0 s ago" would otherwise look fresh until the next reload
+            at = time.strftime("%H:%M:%S", time.localtime(float(mv["listed_at"])))
             age = _ago_text(time.time() - float(mv["listed_at"]))
             facts.append(f"listed {_nbytes(mv.get('files'))} files, "
-                         f"{_nbytes(mv.get('links'))} links · {age}")
+                         f"{_nbytes(mv.get('links'))} links · "
+                         f'<span title="listed at {at}">{age}</span>')
         else:
             facts.append("not listed yet — press List now or start a host")
         if problem and problem != "not listed yet":

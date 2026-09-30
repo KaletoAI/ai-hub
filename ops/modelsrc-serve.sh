@@ -12,8 +12,10 @@
 #   share: a dedicated user on the share host (see README "LAN model source"). Either
 #   way the user's login shell must be a real shell (/bin/bash) — sshd runs a forced
 #   command THROUGH it, nologin runs nothing.
-#   Share root: env MODELSRC_ROOT (default /mnt/xfs/shared/comfyui-models); the HF
-#   cache is expected as a real directory `hf-cache/` inside it.
+#   Share root: env MODELSRC_ROOT — set it in the authorized_keys `command=` (the
+#   built-in ROOT_DEFAULT below is only the original install's path, kept so an
+#   existing key line without it keeps working); the HF cache is expected as a real
+#   directory `hf-cache/` inside it.
 #
 # The request comes from SSH_ORIGINAL_COMMAND (never from "$@"), in the quoting the
 # gateway's shlex.quote produces: bare words of [A-Za-z0-9@%+=:,./_-], '…' single-

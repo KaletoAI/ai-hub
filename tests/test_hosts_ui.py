@@ -1303,7 +1303,8 @@ class LanSourceListNow(_LanBlock):
         self.assertEqual(len(self.lists), 1)
         self.assertEqual(self.lists[0][-1], "list")
         b = self.block()
-        self.assertRegex(b, r"listed 2 files, 1 links · \d+ s ago")
+        self.assertRegex(b, r"listed 2 files, 1 links · <span title=\"listed at "
+                            r"\d\d:\d\d:\d\d\">\d+ s ago</span>")
         self.assertNotIn("not listed yet", b)
         # forced: a second press lists again inside the 10-min cache
         self.post("/ui/hosts/managed/modelsrc-list")
@@ -1315,6 +1316,21 @@ class LanSourceListNow(_LanBlock):
         self.assertIn("not listed", msg)
         self.assertIn("unreachable: ssh: connect to host x port 22: No route", msg)
         self.assertIn("unreachable", self.block())
+
+    def test_blank_host_with_a_leftover_pin_is_not_set_up(self):
+        """After the upgrade a gateway that relied on the old default has host "" and
+        the old host's pin on disk: that pin belongs to nobody — no "pinned", no List
+        now, the install text instead."""
+        self.lan._host_fn = lambda: ""
+        b = self.block()
+        self.assertIn("LAN model source not configured — enter the share host below", b)
+        self.assertIn("not set up", b)
+        self.assertNotIn("</code> pinned", b)             # no "host key SHA256:… pinned"
+        self.assertNotIn(self.fp, b)
+        self.assertNotIn("modelsrc-list", b)
+        self.assertNotIn("modelsrc-scan", b)              # no host: nothing to fetch
+        self.assertIn("restrict,command=&quot;MODELSRC_ROOT=", b)
+        self.assertEqual(self.lists, [])
 
     def test_not_configured_lists_nothing(self):
         self.lan._host_fn = lambda: ""
@@ -1483,6 +1499,7 @@ class ModelsrcHostField(Actions):
         self.assertIn('placeholder="kai@gpu-vm"', page)
         self.assertIn(hostctl.SRC_UNSET, page)
         self.assertNotIn("192.168.8.24", page)
+        self.assertNotIn("modelsrc-scan", page)           # no host: no Fetch host key
 
     def test_valid_host_saved(self):
         r = self.post(modelsrc_host=" src@10.0.0.2 ")
