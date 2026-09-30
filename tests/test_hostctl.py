@@ -4738,6 +4738,51 @@ class LanSourceUnit(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(sh.lists()), 3)
         self.assertTrue(lan.usable())
 
+    async def test_no_default_host_means_not_configured_and_no_ssh(self):
+        """There is no default share host: a baked-in LAN address sent the operator to
+        create a user on a hypervisor. Empty = "not configured", and nothing — no list,
+        no keyscan, no argv — ever reaches ssh; even a leftover pin changes nothing."""
+        self.assertFalse(hasattr(hostctl, "MODELSRC_HOST_DEFAULT"))
+        sh = FakeShare()
+        sh.files["vae/a.st"] = b"x"
+        lan = _lan(sh, self.d, self.clock, pinned=True, host="")
+        want = "LAN model source not configured — enter the share host below"
+        self.assertEqual(hostctl.SRC_UNSET, want)
+        self.assertEqual(lan.problem(), want)
+        self.assertFalse(lan.configured())
+        self.assertFalse(lan.usable())
+        self.assertEqual(lan.view()["problem"], want)
+        await lan.refresh(force=True)
+        with self.assertRaises(ValueError) as cm:
+            await lan.scan()
+        self.assertIn("not configured", str(cm.exception))
+        with self.assertRaises(ValueError):
+            lan.cat_argv("models/vae/a.st", 0)
+        self.assertEqual(sh.calls, [])
+        # a whitespace-only setting is no host either
+        lan2 = _lan(sh, self.d, self.clock, pinned=False, host="   ")
+        self.assertEqual(lan2.problem(), want)
+        # a host that is set but not pinned keeps the short "not configured"
+        lan3 = _lan(sh, self.d, self.clock, pinned=False)
+        os.remove(lan3.known_hosts_path)               # the first one's pin, same datadir
+        self.assertEqual(lan3.problem(), "not configured")
+
+    async def test_forced_refresh_lists_now_and_counts(self):
+        """"List now" = refresh(force=True): lists inside the TTL, and the view carries
+        what the last listing held."""
+        sh = FakeShare()
+        sh.files["vae/a.st"] = b"x"
+        sh.files["hf-cache/hub/m/blobs/b1"] = b"yy"
+        sh.links["hf-cache/hub/m/snapshots/r/w.st"] = "../../blobs/b1"
+        lan = _lan(sh, self.d, self.clock)
+        v = lan.view()
+        self.assertEqual((v["files"], v["links"], v["listed_at"]), (0, 0, 0.0))
+        await lan.refresh()
+        await lan.refresh(force=True)
+        self.assertEqual(len(sh.lists()), 2)
+        v = lan.view()
+        self.assertEqual((v["files"], v["links"], v["listed_at"]), (2, 1, 1000.0))
+
 
 if __name__ == "__main__":
     unittest.main()

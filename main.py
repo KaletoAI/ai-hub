@@ -6266,16 +6266,16 @@ _modelsrc_key_task: Optional[asyncio.Task] = None
 
 
 def _modelsrc_host() -> str:
-    """Store setting `modelsrc_host` (default modelsrc@192.168.8.24). Returned raw: the
+    """Store setting `modelsrc_host`, "" when unset — there is no default share host
+    ("" = not configured, and the LanSource then never reaches ssh). Returned raw: the
     LanSource holds it to plain characters (the `_VOICE_HOST_RE` rule) before any argv."""
     v = store.get_setting("modelsrc_host") if store.is_active() else None
-    v = str(v or "").strip()
-    return v or hostctl.MODELSRC_HOST_DEFAULT
+    return str(v or "").strip()
 
 
 def save_modelsrc_host(value: str) -> str:
     """The console's `modelsrc_host` Save → the refusal ("" = saved). Blank stores ""
-    (= the default); anything else must be a plain `[user@]host` (`_VOICE_HOST_RE`, the
+    (= no LAN source); anything else must be a plain `[user@]host` (`_VOICE_HOST_RE`, the
     rule LanSource holds it to before any ssh argv). The LanSource notices the change on
     its next look and drops the old share's listing (`LanSource._follow_host`)."""
     v = str(value or "").strip()
@@ -6354,7 +6354,22 @@ async def modelsrc_pin(fingerprint: str) -> str:
         fp = modelsrc().pin(str(fingerprint or "").strip())
     except (ValueError, OSError) as e:
         return f"host key not pinned: {e}"
-    return f"host key {fp} pinned — the LAN source is listed with the next model sync"
+    return f"host key {fp} pinned — press List now to list the share"
+
+
+async def modelsrc_list() -> str:
+    """The console's "List now": list the share at once (`LanSource.refresh(force=True)`
+    — one async ssh call, the cache's own lock). It needs the share only, no running
+    instance: without it the card said "not listed yet" until the next model sync of a
+    RUNNING host, which read as "the pin did not work"."""
+    lan = modelsrc()
+    if not lan.configured():
+        return f"not listed: {lan.problem()}"
+    await lan.refresh(force=True)
+    v = lan.view()
+    if v.get("error") or not v.get("listed_at"):
+        return f"not listed: {v.get('problem') or v.get('error') or 'no answer'}"
+    return f"listed {v['files']} files and {v['links']} links from {lan.host()}"
 
 
 def _host_deps() -> "hostctl.Deps":
@@ -7139,7 +7154,8 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
            managed_host_delete_refusal=managed_host_delete_refusal,
            thunder_default_nodes=_thunder_default_nodes,
            modelsrc_view=modelsrc_view, modelsrc_scan=modelsrc_scan,
-           modelsrc_pin=modelsrc_pin, save_modelsrc_host=save_modelsrc_host,
+           modelsrc_pin=modelsrc_pin, modelsrc_list=modelsrc_list,
+           save_modelsrc_host=save_modelsrc_host,
            save_hf_token=save_hf_token, hf_token_set=hf_token_set,
            thunder_orphan_snapshots=thunder_orphan_snapshots,
            modelsync_catalog=_modelsync_catalog, save_modelsync_catalog=save_modelsync_catalog,

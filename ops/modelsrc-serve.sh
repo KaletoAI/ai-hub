@@ -3,12 +3,15 @@
 # The gateway's LAN transfer key may do exactly what this script lets through and
 # nothing else — it is the whole security boundary of that key.
 #
-# Install (operator, on the share host):
-#   install -m 0755 ops/modelsrc-serve.sh /usr/local/bin/modelsrc-serve
-#   user `modelsrc`, read access to the share (group/ACL); its login shell must be a
-#   real shell (/bin/bash) — sshd runs a forced command THROUGH it, nologin runs nothing.
-#   ~modelsrc/.ssh/authorized_keys:
-#     command="/usr/local/bin/modelsrc-serve",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ssh-ed25519 AAAA… ai-hub
+# Install (operator) — recommended on a VM/container that already mounts the share,
+# as the user that can read it (no new user, no root):
+#   install -D -m 0755 modelsrc-serve.sh ~/bin/modelsrc-serve
+#   ONE line appended to that user's ~/.ssh/authorized_keys:
+#     restrict,command="MODELSRC_ROOT=<share mount path> /home/<user>/bin/modelsrc-serve" ssh-ed25519 AAAA… ai-hub
+#   (`restrict` = no pty, forwarding, agent, X11 or user rc.) Only if no VM mounts the
+#   share: a dedicated user on the share host (see README "LAN model source"). Either
+#   way the user's login shell must be a real shell (/bin/bash) — sshd runs a forced
+#   command THROUGH it, nologin runs nothing.
 #   Share root: env MODELSRC_ROOT (default /mnt/xfs/shared/comfyui-models); the HF
 #   cache is expected as a real directory `hf-cache/` inside it.
 #

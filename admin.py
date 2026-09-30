@@ -209,11 +209,12 @@ _thunder_default_nodes: Callable[[], str] = lambda: ""
 _modelsync_catalog: Callable[[], list] = lambda: []
 _save_modelsync_catalog: Callable[[list], list] = lambda cat: ["catalog store not available"]
 # The LAN model source (main.modelsrc*): its view (hostctl.LanSource.view — no
-# network), "Fetch host key" (async → message) and "Confirm fingerprint" (async
-# (fingerprint) → message).
+# network), "Fetch host key" (async → message), "Confirm fingerprint" (async
+# (fingerprint) → message) and "List now" (async → message; lists the share by ssh).
 _modelsrc_view: Callable[[], Optional[dict]] = lambda: None
 _modelsrc_scan: Callable = None
 _modelsrc_pin: Callable = None
+_modelsrc_list: Callable = None
 # The LAN share's host (save → refusal text, "" = saved), the HF token (save →
 # refusal, "" = saved; "" as the value removes it — the console never shows it, only
 # whether one is set) and the `aihub-` snapshots no managed host owns (from the
@@ -932,7 +933,7 @@ _POST_ACTIONS = frozenset((
     "/ui/hosts/managed/sync", "/ui/hosts/managed/delete-unknown",
     "/ui/hosts/managed/catalog", "/ui/hosts/managed/hf-token",
     "/ui/hosts/managed/modelsrc-scan", "/ui/hosts/managed/modelsrc-pin",
-    "/ui/hosts/managed/modelsrc-host",
+    "/ui/hosts/managed/modelsrc-list", "/ui/hosts/managed/modelsrc-host",
     "/ui/chat/badd", "/ui/chat/bdel", "/ui/chat/delete",
     "/ui/mapping/field-add", "/ui/mapping/field-map", "/ui/mapping/field-clear",
     "/ui/mapping/field-del", "/ui/mapping/cand-add", "/ui/mapping/cand-del",
@@ -3627,26 +3628,49 @@ def _catalog_editor(refused: Optional[tuple] = None, hf_refused: Optional[str] =
             "</form>" + _hf_token_form(hf_refused) + "</details>")
 
 
-# What the operator runs on the share host (ops/modelsrc-serve.sh's header, Task 14):
-# the user needs a REAL login shell — sshd runs the forced command through it, and
-# /usr/sbin/nologin would run nothing (every list then fails as "unreachable").
+# What the operator runs for the LAN source. RECOMMENDED: a VM (or container) that
+# already mounts the model share — its existing user, the script in ~/bin and ONE
+# appended authorized_keys line (`restrict` = no pty/forwarding/agent/X11/user-rc, the
+# key can run only the read-only script): no new user, no root, nothing on a
+# hypervisor. The share user needs a REAL login shell — sshd runs the forced command
+# through it, and /usr/sbin/nologin would run nothing (every list then fails as
+# "unreachable").
+_MODELSRC_INSTALL_VM = (
+    "# copy ops/modelsrc-serve.sh from the gateway to the VM (e.g. scp to /tmp), then\n"
+    "# on the VM, as the user that can read the share (<user>):\n"
+    "install -D -m 0755 /tmp/modelsrc-serve.sh ~/bin/modelsrc-serve\n"
+    "mkdir -p -m 0700 ~/.ssh\n"
+    "echo 'restrict,command=\"MODELSRC_ROOT=<share mount path> "
+    "/home/<user>/bin/modelsrc-serve\" {pub}' >> ~/.ssh/authorized_keys\n"
+    "chmod 600 ~/.ssh/authorized_keys")
+# The alternative, only where no VM mounts the share: a dedicated system user on the
+# share host itself, read access by ACL (setfacl comes with the `acl` package).
 _MODELSRC_INSTALL = (
-    "install -m 0755 ops/modelsrc-serve.sh /usr/local/bin/modelsrc-serve\n"
+    "install -m 0755 /tmp/modelsrc-serve.sh /usr/local/bin/modelsrc-serve\n"
     "useradd --system --home /var/lib/modelsrc --shell /bin/bash modelsrc\n"
-    "setfacl -R -m u:modelsrc:rX /mnt/xfs/shared/comfyui-models\n"
-    "setfacl -R -d -m u:modelsrc:rX /mnt/xfs/shared/comfyui-models\n"
+    "setfacl -R -m u:modelsrc:rX <share path>\n"
+    "setfacl -R -d -m u:modelsrc:rX <share path>\n"
     "install -d -m 0700 -o modelsrc /var/lib/modelsrc/.ssh\n"
-    "echo 'command=\"/usr/local/bin/modelsrc-serve\",no-port-forwarding,no-X11-forwarding,"
-    "no-agent-forwarding,no-pty {pub}' > /var/lib/modelsrc/.ssh/authorized_keys\n"
+    "echo 'restrict,command=\"MODELSRC_ROOT=<share path> /usr/local/bin/modelsrc-serve\" "
+    "{pub}' > /var/lib/modelsrc/.ssh/authorized_keys\n"
     "chown modelsrc /var/lib/modelsrc/.ssh/authorized_keys && "
     "chmod 600 /var/lib/modelsrc/.ssh/authorized_keys")
 
 
+def _ago_text(s) -> str:
+    """Seconds → "5 s ago" / "3 min ago" / "2 h ago" (the LAN listing's age)."""
+    s = max(0, int(s or 0))
+    return (f"{s} s ago" if s < 60 else f"{s // 60} min ago" if s < 3600
+            else f"{s // 3600} h ago")
+
+
 def _modelsrc_block(refused: Optional[tuple] = None) -> str:
     """The LAN model source (one for every managed host): not set up → the public key
-    and the install command; the host-key pin as two POSTs — "Fetch host key" shows the
-    fingerprint (kept in memory only), "Confirm fingerprint" asks with that fingerprint
-    and pins it; pinned → the listing's state. Never takes the tab down."""
+    and the install instructions (a VM that mounts the share first, the dedicated-user
+    variant as the marked alternative); the host-key pin as two POSTs — "Fetch host
+    key" shows the fingerprint (kept in memory only), "Confirm fingerprint" asks with
+    that fingerprint and pins it; pinned → the last listing's counts and age and "List
+    now". Never takes the tab down."""
     try:
         mv = _modelsrc_view()
     except Exception as e:                              # noqa: BLE001 — a card, not the tab
@@ -3659,62 +3683,92 @@ def _modelsrc_block(refused: Optional[tuple] = None) -> str:
     problem = str(mv.get("problem") or "")
     pub = str(mv.get("public_key") or "")
     pinned = bool(mv.get("pinned"))
+    # "not set up" = nothing to connect to yet: no host, or a host without its pin
+    unset = not host or (not pinned and problem == "not configured")
     badge = (_badge("ready", "ok") if not problem
-             else _badge("not set up", "warn") if (not pinned and problem == "not configured")
+             else _badge("not set up", "warn") if unset
              else _badge(problem[:80], "bad" if mv.get("error") else "warn", problem))
     rows = [f'<div class="item-title" data-k="{k}-head"><b>LAN model source</b> '
-            f"<code>{_esc(host)}</code> {badge}</div>"]
+            + (f"<code>{_esc(host)}</code> " if host else "") + f"{badge}</div>"]
     key_html = (f'<pre class="tlog" data-k="{k}-pub">{_esc(pub)}</pre>' if pub else
                 f'<p class="hint" data-k="{k}-nopub">The key <code>modelsrc.key</code> is '
                 "generated when the gateway starts a host controller — reload shortly.</p>")
-    install = (f'<pre class="tlog" data-k="{k}-install">'
-               f'{_esc(_MODELSRC_INSTALL.format(pub=pub or "<public key above>"))}</pre>')
-    if not pinned and problem and problem != "not configured":
+    pub_or = pub or "<public key above>"
+    install = (f'<p class="hint" data-k="{k}-howto">Recommended — a VM (or container) that '
+               "already mounts the model share: its existing user, no new user, no root. "
+               "Copy the script to that user's <code>~/bin/modelsrc-serve</code> and "
+               "append ONE line to its <code>~/.ssh/authorized_keys</code> "
+               "(<code>restrict</code> = no pty, forwarding, agent, X11 or user rc; the key "
+               "can run only the read-only script; the user needs a real login shell — "
+               "sshd runs the forced command through it):</p>"
+               f'<pre class="tlog" data-k="{k}-install">'
+               f"{_esc(_MODELSRC_INSTALL_VM.format(pub=pub_or))}</pre>"
+               f'<p class="hint" data-k="{k}-then">Then set the share host below to '
+               "<code>&lt;user&gt;@&lt;vm&gt;</code>, press <i>Fetch host key</i>, compare "
+               "the fingerprint with <code>ssh-keygen -lf "
+               "/etc/ssh/ssh_host_ed25519_key.pub</code> on that machine, and "
+               "<i>Confirm</i>.</p>"
+               f'<details data-k="{k}-alt"><summary>Alternative — only if no VM mounts the '
+               "share (not on a hypervisor if avoidable): a dedicated user on the share "
+               "host</summary>"
+               '<p class="hint">As root on the share host, after copying the script to '
+               "<code>/tmp</code> (the <code>modelsrc</code> user needs a real login shell; "
+               "<code>setfacl</code> comes with the <code>acl</code> package):</p>"
+               f'<pre class="tlog" data-k="{k}-install-alt">'
+               f"{_esc(_MODELSRC_INSTALL.format(pub=pub_or))}</pre></details>")
+    if not pinned and problem and not unset:
         # a pin for the PREVIOUS host, or a host that is no plain [user@]host: say so,
         # or every list fails as "unreachable" and points at the network
         rows.append(f'<p class="bad" data-k="{k}-problem">{_esc(problem)}</p>')
     if not pinned:
-        rows.append(f'<p class="hint" data-k="{k}-setup">LAN source: not set up — model files '
-                    "only the LAN share has wait until its host key is pinned. This "
-                    "gateway's public key for the share host:</p>" + key_html
-                    + f'<p class="hint" data-k="{k}-howto">Install on the share host (as root; '
-                    "the <code>modelsrc</code> user needs a real login shell, sshd runs the "
-                    "forced command through it):</p>" + install)
+        lead = (f"{_esc(problem)}." if not host else "LAN source: not set up —")
+        rows.append(f'<p class="hint" data-k="{k}-setup">{lead} Model files only the LAN '
+                    "share has wait until its host key is pinned. This gateway's public "
+                    "key for the share host:</p>" + key_html + install)
     else:
         facts = [f"host key <code>{_esc(mv.get('pinned_fp') or '?')}</code> pinned"]
         if mv.get("listed_at"):
-            facts.append(f"{_nbytes(mv.get('files'))} files, {_nbytes(mv.get('links'))} links "
-                         "listed at " + _esc(time.strftime("%H:%M:%S",
-                                                           time.localtime(mv["listed_at"]))))
-        if problem:
+            age = _ago_text(time.time() - float(mv["listed_at"]))
+            facts.append(f"listed {_nbytes(mv.get('files'))} files, "
+                         f"{_nbytes(mv.get('links'))} links · {age}")
+        else:
+            facts.append("not listed yet — press List now or start a host")
+        if problem and problem != "not listed yet":
             facts.append(f'<span class="bad">{_esc(problem)}</span>')
         rows.append(f'<div class="tfacts" data-k="{k}-facts">{" · ".join(facts)}</div>')
-        rows.append(f'<details data-k="{k}-keys"><summary>public key and install command'
-                    f"</summary>{key_html}{install}</details>")
+        rows.append(f'<details data-k="{k}-keys"><summary>public key and install '
+                    f"instructions</summary>{key_html}{install}</details>")
     fp = str(mv.get("scanned_fp") or "")
     if fp:
         rows.append(f'<p class="hint" data-k="{k}-scanned">Fetched host key of '
                     f"<code>{_esc(host)}</code>: <code>{_esc(fp)}</code> — compare it with "
                     "<code>ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub</code> on the share "
                     "host before confirming.</p>")
-    acts = _btn("Fetch host key", "/ui/hosts/managed/modelsrc-scan", "secondary", sm=True,
-                title="ssh-keyscan the share host and show its fingerprint (nothing is "
-                      "trusted yet)")
+    acts = ""
+    if host:
+        acts += _btn("Fetch host key", "/ui/hosts/managed/modelsrc-scan", "secondary", sm=True,
+                     title="ssh-keyscan the share host and show its fingerprint (nothing is "
+                           "trusted yet)")
     if fp:
         acts += _btn("Confirm fingerprint", f"/ui/hosts/managed/modelsrc-pin?fp={_q(fp)}", sm=True,
                      confirm=f"Pin {host}'s host key {fp}? Only if the share host shows exactly "
                              "this fingerprint — the gateway then trusts it for every model "
                              "transfer.",
                      title="Trust this host key for the LAN source")
-    rows.append(f'<div class="tacts" data-k="{k}-acts">{acts}</div>')
+    if pinned:
+        acts += _btn("List now", "/ui/hosts/managed/modelsrc-list", "secondary", sm=True,
+                     title="List the share now (needs only the share host, no running "
+                           "instance)")
+    if acts:
+        rows.append(f'<div class="tacts" data-k="{k}-acts">{acts}</div>')
     typed = refused[0] if refused is not None else host
     rows.append(f'<form method="post" action="/ui/hosts/managed/modelsrc-host" data-k="{k}-hostform" '
                 "data-guard>" + (_form_err(refused[1]) if refused is not None else "")
-                + _field("share host", _inp("modelsrc_host", typed,
-                                            placeholder="modelsrc@192.168.8.24"),
-                         hint="<code>[user@]host</code> of the LAN model share (blank = the "
-                              "default). A new host needs its key fetched and confirmed "
-                              "again; the old listing is dropped at once.")
+                + _field("share host", _inp("modelsrc_host", typed, placeholder="kai@gpu-vm"),
+                         hint="<code>[user@]host</code> of the machine serving the LAN model "
+                              "share (blank = no LAN source). A new host needs its key "
+                              "fetched and confirmed again; the old listing is dropped at "
+                              "once.")
                 + f'<div class="tacts">{_btn("Save host", submit=True, sm=True)}</div></form>')
     return f'<div class="tcard" data-k="{k}">{"".join(rows)}</div>'
 
@@ -4032,6 +4086,20 @@ async def hosts_modelsrc_pin(request: Request):
     return _hosts_msg(msg)
 
 
+async def hosts_modelsrc_list(request: Request):
+    """"List now": list the LAN share at once (it needs the share host only, not a
+    running instance); the counts or the reason come back as the message."""
+    if _modelsrc_list is None:
+        msg = "LAN source is not available"
+    else:
+        try:
+            msg = str(await _modelsrc_list())
+        except Exception as e:                          # noqa: BLE001 — say it, don't 500
+            msg = f"not listed: {type(e).__name__}: {e}"
+    logger.info(f"ui: LAN source list → {msg}")
+    return _hosts_msg(msg)
+
+
 async def hosts_catalog_save(request: Request):
     """Save the model-sync catalog. JSON the parser or `modelsync.validate_catalog`
     refuses is a 400 with the textarea exactly as typed — never a partial save: a
@@ -4087,10 +4155,11 @@ async def hosts_modelsrc_host(request: Request):
         err = f"modelsrc_host not saved: {type(e).__name__}: {e}"
     if err:
         return await _backends_view(request.query_params, modelsrc_refused=(v, err), status=400)
-    msg = (f"modelsrc_host saved: {v.strip()}" if v.strip()
-           else "modelsrc_host reset to the default")
+    msg = (f"modelsrc_host saved: {v.strip()} — fetch and confirm its host key, then "
+           "List now" if v.strip()
+           else "modelsrc_host cleared — no LAN source is configured")
     logger.info(f"ui: {msg}")
-    return _hosts_msg(msg + " — the LAN source is listed again with the next model sync")
+    return _hosts_msg(msg)
 
 
 # ── Tab: Input ──────────────────────────────────────────────────────────────────
@@ -9545,6 +9614,7 @@ def register(app) -> None:
                       methods=["POST"])
     app.add_api_route("/ui/hosts/managed/modelsrc-scan", hosts_modelsrc_scan, methods=["POST"])
     app.add_api_route("/ui/hosts/managed/modelsrc-pin", hosts_modelsrc_pin, methods=["POST"])
+    app.add_api_route("/ui/hosts/managed/modelsrc-list", hosts_modelsrc_list, methods=["POST"])
     app.add_api_route("/ui/hosts/managed/catalog", hosts_catalog_save, methods=["POST"])
     app.add_api_route("/ui/hosts/managed/modelsrc-host", hosts_modelsrc_host, methods=["POST"])
     app.add_api_route("/ui/hosts/managed/hf-token", hosts_hf_token, methods=["POST"])

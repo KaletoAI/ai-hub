@@ -1127,11 +1127,8 @@ class FaultSources(unittest.TestCase):
 _ED_B64 = "AAAAC3NzaC1lZDI1NTE5AAAAIHm4E0tb6VPU5qn5zKm6c1tJ4HQ1Pdu6Wf7k6o7V3tJ2"
 
 
-class LanSourcePanel(Actions):
-    """Task 15: the LAN model source's block and its host-key pin. A pin written by a GET
-    (a prefetch), or one that trusts a key the operator never saw, is a man in the
-    middle of every model transfer; an install command with a nologin shell runs
-    nothing on the share host and every list then fails as "unreachable"."""
+class _LanBlock(Actions):
+    """The LAN block's page scaffolding (a LanSource bound into main)."""
 
     def setUp(self):
         super().setUp()
@@ -1174,17 +1171,56 @@ class LanSourcePanel(Actions):
         self.assertEqual(r.status_code, 303)
         return parse_qs(urlparse(r.headers["location"]).query)["msg"][0]
 
+
+class LanSourcePanel(_LanBlock):
+    """Task 15: the LAN model source's block and its host-key pin. A pin written by a GET
+    (a prefetch), or one that trusts a key the operator never saw, is a man in the
+    middle of every model transfer; an install command with a nologin shell runs
+    nothing on the share host and every list then fails as "unreachable"."""
+
     def test_not_set_up_shows_key_and_install_command(self):
         b = self.block()
         self.assertIn("LAN source: not set up", b)
         self.assertIn("ssh-ed25519 AAAAgatewaykey ai-hub", b)
+        # recommended first: a VM that already mounts the share, its existing user, one
+        # restricted authorized_keys line — no new user, no root, no hypervisor
+        vm = ("restrict,command=&quot;MODELSRC_ROOT=&lt;share mount path&gt; "
+              "/home/&lt;user&gt;/bin/modelsrc-serve&quot; ssh-ed25519 AAAAgatewaykey ai-hub")
+        self.assertIn(vm, b)
+        self.assertIn("~/bin/modelsrc-serve", b)
+        self.assertIn("&gt;&gt; ~/.ssh/authorized_keys", b)      # appended, never replaced
+        self.assertIn("&lt;user&gt;@&lt;vm&gt;", b)
+        self.assertIn("ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub", b)
+        # the dedicated-user variant only as the marked alternative, after it
+        self.assertIn("only if no VM mounts the share", b)
+        self.assertLess(b.index(vm), b.index("useradd"))
+        self.assertLess(b.index("only if no VM mounts the share"), b.index("useradd"))
         self.assertIn("--shell /bin/bash modelsrc", b)
         self.assertNotIn("nologin", b)
-        self.assertIn("command=&quot;/usr/local/bin/modelsrc-serve&quot;,no-port-forwarding,"
-                      "no-X11-forwarding,no-agent-forwarding,no-pty ssh-ed25519 AAAAgatewaykey", b)
+        self.assertIn("restrict,command=&quot;MODELSRC_ROOT=&lt;share path&gt; "
+                      "/usr/local/bin/modelsrc-serve&quot; ssh-ed25519 AAAAgatewaykey", b)
+        for private in ("pveK12", "/mnt/xfs"):     # (the host shown is the fixture's)
+            self.assertNotIn(private, b)
         self.assertRegex(b, r'formaction="/ui/hosts/managed/modelsrc-scan"')
         self.assertNotIn("modelsrc-pin", b)               # nothing fetched: nothing to confirm
+        self.assertNotIn("modelsrc-list", b)              # nothing pinned: nothing to list
         self.assertNotRegex(b, r'<a[^>]*href="/ui/hosts/managed/')
+
+    def test_no_private_lan_address_in_the_console_or_readme_install(self):
+        with open(admin.__file__, encoding="utf-8") as f:
+            src = f.read()
+        for private in ("192.168.8.24", "pveK12"):
+            self.assertNotIn(private, src)
+        with open(os.path.join(os.path.dirname(admin.__file__), "README.md"),
+                  encoding="utf-8") as f:
+            readme = f.read()
+        i = readme.index("**LAN model source.**")
+        sec = readme[i:readme.index("### Costs, warnings and orphans", i)]
+        self.assertNotIn("192.168.8.24", sec)
+        self.assertNotIn("pveK12", sec)
+        vm = sec.index("restrict,command=\"MODELSRC_ROOT=")
+        self.assertLess(vm, sec.index("useradd"))
+        self.assertIn("List now", sec)
 
     def test_pin_flow_is_post_and_writes_known_hosts(self):
         for p in ("/ui/hosts/managed/modelsrc-scan", "/ui/hosts/managed/modelsrc-pin"):
@@ -1221,6 +1257,77 @@ class LanSourcePanel(Actions):
         self.assertNotIn("hosts-modelsrc", self.page())
 
 
+class LanSourceListNow(_LanBlock):
+    """"List now": after the pin the card said "not listed yet" until a RUNNING
+    instance's next model sync — read as "still broken". The share needs no VM, so the
+    operator can list it on demand (a POST: it runs ssh), and the block says what the
+    last listing held and how old it is."""
+
+    def setUp(self):
+        super().setUp()
+        import hostctl
+        self.lists = []
+        self.list_rc = 0
+
+        async def ssh(argv, stdin=None, timeout=60):
+            self.lists.append(list(argv))
+            if self.list_rc:
+                return (self.list_rc, b"", b"ssh: connect to host x port 22: No route")
+            return (0, b"F\tvae/a.st\t5\nF\thf-cache/hub/m/blobs/b1\t7\n"
+                       b"L\thf-cache/hub/m/snapshots/r/w.st\t../../blobs/b1\n", b"")
+
+        async def keygen(path):
+            return "ssh-ed25519 AAAAgatewaykey ai-hub"
+        self.lan = hostctl.LanSource(self.d.name, host=lambda: "kai@gpu-vm", ssh=ssh,
+                                        keygen=keygen)
+        with open(self.lan.known_hosts_path, "w") as f:
+            f.write(f"gpu-vm ssh-ed25519 {_ED_B64}\n")
+        main._modelsrc_obj = self.lan
+        self.addCleanup(setattr, admin, "_modelsrc_list", admin._modelsrc_list)
+        admin._modelsrc_list = main.modelsrc_list
+
+    def test_bound_and_post_only(self):
+        self.assertIs(admin._modelsrc_list, main.modelsrc_list)
+        self.assertIn("/ui/hosts/managed/modelsrc-list", admin._POST_ACTIONS)
+        r = self.c.get("/ui/hosts/managed/modelsrc-list", headers=SAME, follow_redirects=False)
+        self.assertEqual(r.status_code, 405)
+        self.assertEqual(self.lists, [])
+
+    def test_block_before_and_after_a_listing(self):
+        b = self.block()
+        self.assertIn("not listed yet — press List now or start a host", b)
+        self.assertRegex(b, r'<button[^>]*formaction="/ui/hosts/managed/modelsrc-list"')
+        self.assertEqual(self.lists, [])                  # a render lists nothing
+        msg = self.post("/ui/hosts/managed/modelsrc-list")
+        self.assertEqual(msg, "listed 2 files and 1 links from kai@gpu-vm")
+        self.assertEqual(len(self.lists), 1)
+        self.assertEqual(self.lists[0][-1], "list")
+        b = self.block()
+        self.assertRegex(b, r"listed 2 files, 1 links · \d+ s ago")
+        self.assertNotIn("not listed yet", b)
+        # forced: a second press lists again inside the 10-min cache
+        self.post("/ui/hosts/managed/modelsrc-list")
+        self.assertEqual(len(self.lists), 2)
+
+    def test_failure_says_why(self):
+        self.list_rc = 255
+        msg = self.post("/ui/hosts/managed/modelsrc-list")
+        self.assertIn("not listed", msg)
+        self.assertIn("unreachable: ssh: connect to host x port 22: No route", msg)
+        self.assertIn("unreachable", self.block())
+
+    def test_not_configured_lists_nothing(self):
+        self.lan._host_fn = lambda: ""
+        msg = self.post("/ui/hosts/managed/modelsrc-list")
+        self.assertIn("LAN model source not configured — enter the share host below", msg)
+        self.assertEqual(self.lists, [])
+
+    def test_age_text(self):
+        self.assertEqual(admin._ago_text(5), "5 s ago")
+        self.assertEqual(admin._ago_text(180), "3 min ago")
+        self.assertEqual(admin._ago_text(7300), "2 h ago")
+
+
 class LanSourceWiring(CatalogWiring):
     def test_bound_and_deps(self):
         import hostctl
@@ -1229,7 +1336,7 @@ class LanSourceWiring(CatalogWiring):
         self.assertIs(admin._modelsrc_pin, main.modelsrc_pin)
         # the host rule is main's ship-target rule (plain [user@]host characters)
         self.assertEqual(hostctl._SRC_HOST_RE.pattern, main._VOICE_HOST_RE.pattern)
-        self.assertEqual(main._modelsrc_host(), "modelsrc@192.168.8.24")
+        self.assertEqual(main._modelsrc_host(), "")          # no default share host
         store.set_settings({"modelsrc_host": "src@10.0.0.2"})
         self.assertEqual(main._modelsrc_host(), "src@10.0.0.2")
         saved = main.jobs_cfg
@@ -1369,9 +1476,13 @@ class ModelsrcHostField(Actions):
         self.assertEqual(r.status_code, 405)
 
     def test_field_shows_the_current_host(self):
+        import hostctl
         page = self.page()
         self.assertRegex(page, r'<form method="post" action="/ui/hosts/managed/modelsrc-host"')
-        self.assertRegex(page, r'name="modelsrc_host" value="modelsrc@192.168.8.24"')
+        self.assertRegex(page, r'name="modelsrc_host" value=""')
+        self.assertIn('placeholder="kai@gpu-vm"', page)
+        self.assertIn(hostctl.SRC_UNSET, page)
+        self.assertNotIn("192.168.8.24", page)
 
     def test_valid_host_saved(self):
         r = self.post(modelsrc_host=" src@10.0.0.2 ")
@@ -1379,8 +1490,11 @@ class ModelsrcHostField(Actions):
         self.assertEqual(store.get_setting("modelsrc_host"), "src@10.0.0.2")
         self.assertEqual(main.modelsrc().host(), "src@10.0.0.2")
         self.assertRegex(self.page(), r'name="modelsrc_host" value="src@10.0.0.2"')
-        self.post(modelsrc_host="")                             # blank = the default
-        self.assertEqual(main._modelsrc_host(), "modelsrc@192.168.8.24")
+        r = self.post(modelsrc_host="")                         # blank = no LAN source
+        self.assertIn("cleared", parse_qs(urlparse(r.headers["location"]).query)["msg"][0])
+        self.assertEqual(main._modelsrc_host(), "")
+        self.assertEqual(main.modelsrc().problem(),
+                         "LAN model source not configured — enter the share host below")
 
     def test_invalid_host_is_400_with_the_form_as_typed(self):
         store.set_settings({"modelsrc_host": "src@10.0.0.2"})
@@ -1398,6 +1512,7 @@ class ModelsrcHostField(Actions):
         self.assertIn('name="modelsrc_host" value="a;b"', r.text)
 
     def test_changed_host_names_the_stale_pin(self):
+        store.set_settings({"modelsrc_host": "modelsrc@192.168.8.24"})
         lan = main.modelsrc()
         with open(lan.known_hosts_path, "w") as f:
             f.write(f"192.168.8.24 ssh-ed25519 {_ED_B64}\n")

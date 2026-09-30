@@ -255,8 +255,10 @@ _MANIFEST = ".gw-modelsync.json"
 _ROOT_MAP = (("models/", "ComfyUI/models/"), ("hf-cache/", "hf-cache/"))
 _LAN_WAIT = "waiting for LAN source (not configured)"
 _NOT_IN_SOURCE = "not in source: "
-# the LAN model share (spec "Quell-Runner (LAN)", "Übertragung LAN")
-MODELSRC_HOST_DEFAULT = "modelsrc@192.168.8.24"
+# the LAN model share (spec "Quell-Runner (LAN)", "Übertragung LAN"). There is NO
+# default share host: a baked-in LAN address told every operator to set up a user on
+# one particular (hypervisor) box. Empty = not configured, and nothing reaches ssh.
+SRC_UNSET = "LAN model source not configured — enter the share host below"
 # = main._VOICE_HOST_RE (pinned by a test): `[user@]host` of plain characters — no
 # leading `-`, no spaces or quotes; it reaches an ssh argv (after `--`, but still)
 _SRC_HOST_RE = re.compile(r"^(?:[A-Za-z0-9_][A-Za-z0-9._-]*@)?[A-Za-z0-9_][A-Za-z0-9._-]*$")
@@ -1026,8 +1028,10 @@ class LanSource:
         return self._configured(self._look())
 
     def _problem(self, raw: str) -> str:
+        if not raw:
+            return SRC_UNSET
         host = self._plain(raw)
-        if raw and not host:
+        if not host:
             return f"not configured: modelsrc_host {raw!r} is not a plain [user@]host"
         old = self._stale_pin(raw)
         if old:
@@ -1039,6 +1043,10 @@ class LanSource:
         if self._index is None:
             return "not listed yet"
         return ""
+
+    def _unusable(self, raw: str) -> str:
+        p = self._problem(raw)
+        return p if p.startswith("LAN ") else f"LAN source {p}"
 
     def problem(self) -> str:
         """Why LAN transfers wait ("" = they may run) — the text inside "waiting for LAN
@@ -1076,7 +1084,7 @@ class LanSource:
         raw = self._look()
         host = self._plain(raw)
         if not host:
-            raise ValueError(f"LAN source {self._problem(raw)}")
+            raise ValueError(self._unusable(raw))
         return sshrun.ssh_base(self.key_path, self.known_hosts_path, strict="yes") + [
             "--", host, " ".join(sshrun.q(w) for w in words)]
 
@@ -1155,7 +1163,7 @@ class LanSource:
         raw = self._look()
         host = self._plain(raw)
         if not host:
-            raise ValueError(f"LAN source {self._problem(raw)}")
+            raise ValueError(self._unusable(raw))
         name = host.rsplit("@", 1)[-1]
         rc, out, err = await self._ssh(["ssh-keyscan", "-t", "ed25519", "--", name],
                                        timeout=_KEYSCAN_TIMEOUT_S)
@@ -3713,11 +3721,17 @@ class Controller:
         lan = self.deps.lan
         return lan is not None and lan.usable()
 
-    def _lan_wait(self) -> str:
-        """"waiting for LAN source (<why>)" — not configured, unreachable, …"""
+    def _lan_why(self) -> str:
+        """Why the LAN source is not usable, for alias status / 503 texts. The card's
+        "enter the share host below" means nothing in an API answer, so a blank host
+        reads "not configured" here."""
         lan = self.deps.lan
         why = lan.problem() if lan is not None else ""
-        return f"waiting for LAN source ({why or 'not configured'})"
+        return "not configured" if why in ("", SRC_UNSET) else why
+
+    def _lan_wait(self) -> str:
+        """"waiting for LAN source (<why>)" — not configured, unreachable, …"""
+        return f"waiting for LAN source ({self._lan_why()})"
 
     def _invalidate_source(self) -> None:
         if self.deps.lan is not None:
@@ -4371,7 +4385,7 @@ class Controller:
         path, want = e["path"], e.get("size")
         lan = self.deps.lan
         if lan is None or not lan.usable():
-            return f"LAN source unavailable ({lan.problem() if lan else 'not configured'})", False
+            return f"LAN source unavailable ({self._lan_why()})", False
         try:
             _parts(path)
             lan.cat_argv(path, 0)
