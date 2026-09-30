@@ -1532,7 +1532,9 @@ via injected callables, staying hot-reload-safe.
   carrying the fingerprint `scan()` showed; `modelsrc_host` held to `_VOICE_HOST_RE`
   before any argv and WITHOUT a default — blank is `hostctl.SRC_UNSET` ("LAN model
   source not configured — enter the share host below") and never reaches ssh (a
-  baked-in LAN address sent operators to create a user on a hypervisor); a pin for a
+  baked-in LAN address sent operators to create a user on a hypervisor; a leftover pin
+  next to a blank or non-plain host is pinned for NOBODY — `_pinned` needs a plain host —
+  so the card shows the install text, not "pinned · List now"); a pin for a
   PREVIOUS host names itself instead of failing as "unreachable"; listing cached 10 min,
   re-read at every start, on Sync now and on the card's *List now* —
   `main.modelsrc_list` = `refresh(force=True)`, which needs the share only, no running
