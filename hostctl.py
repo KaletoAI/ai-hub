@@ -2728,30 +2728,37 @@ class Controller:
         The card's Restart button does not come through here: it is immediate."""
         bid = service_bid(svc)
         try:
-            held = bool(self.deps.hold_routing(bid, True))
-        except Exception as e:
-            held = False
-            self._log(f"{bid}: routing not held back for the restart: {_errtext(e)}")
-        try:
-            deadline = self.deps.now() + _RESTART_WAIT_MAX_S
-            while True:
-                n = int(self.deps.inflight(bid) or 0)
-                if n <= 0:
-                    break
-                if self.deps.now() >= deadline:
-                    self._log(f"{bid}: still {n} request(s) in flight after "
-                              f"{_RESTART_WAIT_MAX_S // 60} min — restarting anyway")
-                    break
-                self._svc_set(svc, "restart pending", f"{n} request(s) in flight — "
-                              "restarts once they are done, new ones are held back")
-                await self.deps.sleep(_DRAIN_POLL_S)
-            await self._bring_up(svc, restart=True)
+            # a changed setup runs FIRST, while the old process still serves (as
+            # `_bring_up` would); a failing one leaves that process running
+            if not await self._setup_service(svc):
+                return
+            try:
+                held = bool(self.deps.hold_routing(bid, True))
+            except Exception as e:
+                held = False
+                self._log(f"{bid}: routing not held back for the restart: {_errtext(e)}")
+            try:
+                deadline = self.deps.now() + _RESTART_WAIT_MAX_S
+                while True:
+                    n = int(self.deps.inflight(bid) or 0)
+                    if n <= 0:
+                        break
+                    if self.deps.now() >= deadline:
+                        self._log(f"{bid}: still {n} request(s) in flight after "
+                                  f"{_RESTART_WAIT_MAX_S // 60} min — restarting anyway")
+                        break
+                    self._svc_set(svc, "restart pending", f"{n} request(s) in flight — "
+                                  "restarts once they are done, new ones are held back")
+                    await self.deps.sleep(_DRAIN_POLL_S)
+                await self._run_service(svc, restart=True)
+            finally:
+                if held:
+                    try:
+                        self.deps.hold_routing(bid, False)
+                    except Exception as e:
+                        self._log(f"{bid}: routing not given back: {_errtext(e)}")
         finally:
-            if held:
-                try:
-                    self.deps.hold_routing(bid, False)
-                except Exception as e:
-                    self._log(f"{bid}: routing not given back: {_errtext(e)}")
+            self._note_attached(svc)            # like `_bring_up`: not retried every 5 s
 
     async def _attach(self, svc: dict) -> None:
         """A service attached to the running host: its backend enabled (Start does that

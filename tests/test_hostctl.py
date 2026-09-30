@@ -6207,6 +6207,48 @@ class CommandServices(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(holds, [("openai:vllm", True), ("openai:vllm", False)])
         self.assertEqual(_sv(c, "openai:vllm")["status"], "up")
 
+    async def test_changed_setup_runs_before_routing_is_held(self):
+        # the setup runs while the old process still serves; only the restart waits
+        fake = FakeThunder()
+        vllm = _cmdsvc()
+        c, _, _, _ = make(fake, services=[COMFY, vllm])
+        await c.start()
+        order = []
+        c.deps.hold_routing = lambda bid, on: order.append(("hold", on)) or True
+        ssh = c.deps.ssh
+
+        async def spy(argv, stdin=None, timeout=60):
+            if "gw-svc-vllm.setup.log" in argv[-1]:
+                order.append(("setup", None))
+            return await ssh(argv, stdin=stdin, timeout=timeout)
+        c.deps.ssh = spy
+        new = dict(vllm, svc_setup="pip install other\n")
+        c.set_services([COMFY, new])
+        n = len(fake.calls)
+        await c._reconcile_services()
+        self.assertEqual(order, [("setup", None), ("hold", True), ("hold", False)])
+        self.assertEqual(_cmds(fake, n)[-1], services.COMMAND.restart_cmd(new))
+        self.assertIsNone(c._reconcile_services())          # recorded
+        # a FAILING setup: no hold, no restart — the old process serves on
+        order.clear()
+        c.deps.ssh = ssh
+        bad = dict(vllm, svc_setup="exit 3\n")
+        fake2_n = len(fake.calls)
+        orig = c.deps.ssh
+
+        async def failing(argv, stdin=None, timeout=60):
+            if "gw-svc-vllm.setup.log" in argv[-1]:
+                fake.calls.append(("SSH", argv[-1], stdin))
+                return (3, b"", b"boom")
+            return await orig(argv, stdin=stdin, timeout=timeout)
+        c.deps.ssh = failing
+        c.set_services([COMFY, bad])
+        await c._reconcile_services()
+        self.assertEqual(order, [])
+        self.assertNotIn(services.COMMAND.restart_cmd(bad), _cmds(fake, fake2_n))
+        self.assertEqual(_sv(c, "openai:vllm")["status"], "setup failed")
+        self.assertIsNone(c._reconcile_services())
+
     async def test_config_change_restart_wait_is_bounded(self):
         fake = FakeThunder()
         vllm = _cmdsvc()
