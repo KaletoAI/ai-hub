@@ -24,9 +24,10 @@ because each one fails silently or costs money when it drifts:
 - `_cached`: price lists change rarely; one fetch per hour, and `cached()` hands the
   last body to a synchronous view that must not wait on the network.
 
-`ThunderApi` moved here unchanged from hostctl.py (which re-exports it until the
-controller module is renamed). No `main`/`adapters` imports. Covered by
-test_hostapi.py.
+`ThunderApi` moved here unchanged from the former thunderctl.py; hostctl.py reaches it
+only through `PROVIDERS`. "Ruling N" below refers to the Thunder integration's decision
+ledger (`docs/superpowers/plans/2026-09-27-thunder-comfyui-ledger.md`, kept outside the
+repository). No `main`/`adapters` imports. Covered by test_hostapi.py.
 """
 from __future__ import annotations
 
