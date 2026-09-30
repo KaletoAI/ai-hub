@@ -1530,8 +1530,14 @@ via injected callables, staying hot-reload-safe.
   `LanSource` (ONE per gateway, `main.modelsrc()`: `modelsrc.key`, the host key pinned in
   `modelsrc-known_hosts` with `StrictHostKeyChecking=yes` — pinned only by a POST
   carrying the fingerprint `scan()` showed; `modelsrc_host` held to `_VOICE_HOST_RE`
-  before any argv; a pin for a PREVIOUS host names itself instead of failing as
-  "unreachable"; listing cached 10 min, re-read at every start and on Sync now) streams
+  before any argv and WITHOUT a default — blank is `hostctl.SRC_UNSET` ("LAN model
+  source not configured — enter the share host below") and never reaches ssh (a
+  baked-in LAN address sent operators to create a user on a hypervisor); a pin for a
+  PREVIOUS host names itself instead of failing as "unreachable"; listing cached 10 min,
+  re-read at every start, on Sync now and on the card's *List now* —
+  `main.modelsrc_list` = `refresh(force=True)`, which needs the share only, no running
+  instance: without it a fresh pin read "not listed yet" until a RUNNING host's next
+  sync, i.e. "still broken") streams
   exactly ONE file per host through the gateway (`pipe`: the share's `cat <rel>
   <offset>` into `flock -n … cat >> <rel>.part` — a second appender exits 75), resumed
   from the `.part`'s size, sha256 on both sides; the HF cache's snapshot symlinks are
@@ -1649,9 +1655,13 @@ via injected callables, staying hot-reload-safe.
   `hf-cache/hub/…`, and any path whose `realpath -e` is not itself; cat/sha256 then read
   ONLY from fd 3, re-verified via `/proc/self/fd/3` (no swap after the check can redirect
   the read); L lines never cross `models/`↔`hf-cache/`; exit 1 = "list incomplete"
-  (discard the listing) or a symlinked `hf-cache/`. Its user needs a REAL login shell
-  (`/bin/bash`: sshd runs the forced command through it, `nologin` runs nothing) and
-  `hf-cache/` must be a real directory in the share. `test_modelsrc_serve.py`,
+  (discard the listing) or a symlinked `hf-cache/`. Recommended install: a VM that
+  already MOUNTS the share, its existing user, the script in `~/bin/modelsrc-serve` and
+  ONE `restrict,command="MODELSRC_ROOT=<mount> /home/<user>/bin/modelsrc-serve"` line in
+  its `authorized_keys` (no new user, no root, nothing on a hypervisor); the dedicated
+  `modelsrc` user on the share host is the marked alternative. Its user needs a REAL
+  login shell (`/bin/bash`: sshd runs the forced command through it, `nologin` runs
+  nothing) and `hf-cache/` must be a real directory in the share. `test_modelsrc_serve.py`,
   `test_thunder_scripts.py`.
   Console side (`admin.py`, routes under `/ui/hosts/managed/*` — Ruling M1: the concept
   in the URL, no provider name; the host travels as field/query `host`, a service as
@@ -1674,7 +1684,8 @@ via injected callables, staying hot-reload-safe.
   with no op, mirroring the controller's refusals — `not_attachable` lines, the model
   sync, the log ring), Start hidden for an undriven host, Delete only when
   `managed_host_delete_refusal` is None (else a hint naming why); then the orphaned
-  snapshots, the LAN card (public key, install command, the Fetch → Confirm pin) and the
+  snapshots, the LAN card (public key, install instructions — VM variant first — the
+  Fetch → Confirm pin, *List now* and the last listing's counts and age) and the
   catalog editor + HF token (`hf_token` in `store._SECRET_SETTINGS`). `_hosts_panel`
   lists EVERY managed host (also one without ComfyUI or without any backend), and
   `_dash_hosts` puts the long-run banner on the Dashboard. The backend form attaches: a
@@ -1695,7 +1706,8 @@ via injected callables, staying hot-reload-safe.
   127.0.0.1 port nothing forwards looks healthy-ish and is dead); `svc_*` stay on an
   `openai` row (a detach does not throw away a script). Every action is a POST in
   `_POST_ACTIONS` (`save, delete, start, stop, forget, restart-service, resetup, sync,
-  delete-unknown, catalog, hf-token, modelsrc-scan, modelsrc-pin, modelsrc-host`),
+  delete-unknown, catalog, hf-token, modelsrc-scan, modelsrc-pin, modelsrc-list,
+  modelsrc-host`),
   Start/Stop/Forget/Delete with `data-confirm`; the Backends tab is live (3 s) while a
   host phase ≠ `off` or an op runs, static for the forms and refusals; `_FAULT_SOURCE`
   labels `lifecycle` "host lifecycle" and `sync` "model sync". The key files
