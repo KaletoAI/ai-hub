@@ -49,6 +49,7 @@ import re
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from urllib.parse import urlencode, parse_qs, urlparse
 
 _here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1697,6 +1698,28 @@ class HostSave(_HostSaveBase):
         self.post(_host_form(new=False, api_key="th-X", api_key_clear="1"))
         self.assertEqual(self.saved_hosts[-1][1]["api_key"], "th-X")
         self.assertEqual({x[2] for x in self.saved_hosts}, {False})
+
+    def test_blank_token_with_an_unreadable_store_is_refused(self):
+        # "blank keeps it" cannot keep a token it could not read: refused, not cleared
+        store.set_managed_host("gpu-a", {"provider": "thunder", "options": {},
+                                         "api_key": "th-OLD"})
+        self.views = {"gpu-a": _view(api_key_set=True)}
+        real, calls = store.get_managed_hosts, []
+
+        def flaky():                    # the save's own read fails, the re-render reads
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("db")
+            return real()
+        with mock.patch.object(store, "get_managed_hosts", side_effect=flaky):
+            r = self.post(_host_form(new=False, opt__vcpus="24"), status=400)
+            self.assertIn("could not read the stored host — token not changed", r.text)
+            self.assertIn('name="opt__vcpus" value="24"', r.text)     # the form as typed
+            self.assertEqual(self.saved_hosts, [])
+            # a typed token (or the clear box) needs no read: saved
+            calls.clear()
+            self.post(_host_form(new=False, api_key="th-NEW"))
+        self.assertEqual(self.saved_hosts[-1][1]["api_key"], "th-NEW")
 
     def test_refused_save_is_400_with_the_form_as_typed(self):
         self.save_refusal = "vcpus: 'lots' is not a whole number ≥ 1"

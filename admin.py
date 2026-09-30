@@ -3869,10 +3869,12 @@ async def managed_host_save(request: Request):
     name = (f.get("host") or "").strip()
     kind = (f.get("provider") or "").strip()
     cur = {}
+    unread = False
     if not new and store.is_active():
         try:
             cur = store.get_managed_hosts().get(name) or {}
         except Exception as e:                          # noqa: BLE001 — refused, not a 500
+            unread = True
             logger.warning(f"ui: managed hosts unreadable: {type(e).__name__}: {e}")
     opts = {k[len("opt__"):]: v for k, v in f.items() if k.startswith("opt__")}
     tok = (f.get("api_key") or "").strip()
@@ -3883,7 +3885,11 @@ async def managed_host_save(request: Request):
     else:
         api_key = str(cur.get("api_key") or "")
     entry = {"provider": kind, "options": opts, "api_key": api_key}
-    if _save_managed_host is None:
+    if unread and not tok and not f.get("api_key_clear"):
+        # "blank keeps the token" cannot keep what could not be read: saving would
+        # store an EMPTY token and every provider call after it would be a 401
+        why = "could not read the stored host — token not changed; nothing saved"
+    elif _save_managed_host is None:
         why = "managed hosts cannot be saved here"
     else:
         try:
