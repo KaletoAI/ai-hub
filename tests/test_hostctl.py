@@ -4903,7 +4903,8 @@ class FinalReviewFixes(unittest.IsolatedAsyncioTestCase):
         await c.refresh_account()
         self.assertEqual(len(vanished()), 1)               # once per disappearance
         self.assertEqual((c.state.phase, c.state.uuid), ("ready", "u0"))
-        self.assertTrue([ln for ln in c.state.log if "no longer listed" in ln])
+        self.assertTrue([ln for ln in c.state.log
+                         if "no longer listed at Thunder Compute (" in ln])
         _inst(fake)                                        # listed again: reset
         await c.refresh_account()
         self.assertEqual(c._own_absent, 0)
@@ -4924,7 +4925,7 @@ class FinalReviewFixes(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError) as cm:
             await c.start()
         self.assertIn("no Thunder Compute API token set", str(cm.exception))
-        self.assertIn("API key field", str(cm.exception))
+        self.assertIn("put it into the host's API token field", str(cm.exception))
         self.assertEqual(fake.calls, [])
         self.assertEqual(enabled, {})
         self.assertEqual(c.state.phase, "off")
@@ -6251,6 +6252,37 @@ class CommandServices(unittest.IsolatedAsyncioTestCase):
         await c.restart_service("openai:vllm")
         self.assertEqual(_cmds(fake, n)[-1], services.COMMAND.restart_cmd(vllm))
         self.assertEqual(holds, [])
+
+
+class ProviderNeutralTexts(unittest.TestCase):
+    """A host's option errors name the HOST OPTION (the form field), never a
+    `thunder.<key>` block that no longer exists — and a provider is named by its NAME."""
+
+    def _c(self, **opts):
+        c, _, _, _ = make(FakeThunder())
+        c.host = dict(c.host, options=dict(c.cfg, **opts))
+        return c
+
+    def test_option_errors_name_the_host_option(self):
+        with self.assertRaisesRegex(hostctl._PreCreate,
+                                    r"^host option vcpus is not a number: 'lots'$"):
+            self._c(vcpus="lots")._cfg_int("vcpus", 1)
+        c = self._c(nodes=[])
+        c.deps.default_nodes = lambda: ""
+        with self.assertRaisesRegex(hostctl._PreCreate, r"\(host option nodes is empty"):
+            c._node_list()
+        with self.assertRaisesRegex(RuntimeError, r"^host option comfy_commit must be"):
+            self._c(comfy_commit="main")._commit()
+        for c in (self._c(vcpus="lots"), self._c(nodes=[]), self._c(comfy_commit="x")):
+            for fn in (lambda: c._cfg_int("vcpus", 1), c._commit):
+                try:
+                    fn()
+                except Exception as e:
+                    self.assertNotIn("thunder.", str(e))
+
+    def test_no_token_names_the_form_field(self):
+        self.assertEqual(hostctl._NO_TOKEN.format(name="X"),
+                         "no X API token set — put it into the host's API token field")
 
 class LegacyBootstrapState(unittest.TestCase):
     """A record written before the split has no host flag: the one-piece bootstrap did

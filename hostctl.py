@@ -212,7 +212,7 @@ _ABSENT_CONFIRM = 2
 _ABSENT_RECHECK_S = 5
 _RESUME_PROBE_S = 30            # a freshly started tunnel needs a moment before ComfyUI answers
 # a Start without a token is refused before any call (each would be the provider's 401)
-_NO_TOKEN = "no {name} API token set — put it into the API key field"
+_NO_TOKEN = "no {name} API token set — put it into the host's API token field"
 # a Start without a service creates a machine that serves nothing and bills anyway
 _NO_SERVICE = "no backend is attached to managed host {host} — nothing to start"
 _STOP_STEPS = ("draining", "pruning", "snapshotting", "deleting")
@@ -1906,7 +1906,7 @@ class Controller:
             return
         self._own_absent += 1
         if self._own_absent == _ABSENT_CONFIRM:
-            msg = (f"instance {uuid} is no longer listed at Thunder (phase "
+            msg = (f"instance {uuid} is no longer listed at {self._prov.NAME} (phase "
                    f"{self.state.phase}) — deleted outside the gateway? Stop clears it")
             self._log(msg)
             self._fault(None, "lifecycle", "instance_vanished", msg)
@@ -2031,7 +2031,7 @@ class Controller:
         try:
             return int(v) if v is not None and v != "" else default
         except (TypeError, ValueError):
-            raise _PreCreate(f"thunder.{key} is not a number: {v!r}")
+            raise _PreCreate(f"host option {key} is not a number: {v!r}")
 
     async def _required_bytes_hint(self, snapshot_id: str = "") -> int:
         """Bytes the aliases' models need on the new disk (spec "Start" 2): a plan
@@ -2067,8 +2067,8 @@ class Controller:
         if not text.strip():
             text = str(self.deps.default_nodes() or "")
         if not any(ln.strip() and not ln.strip().startswith("#") for ln in text.splitlines()):
-            raise _PreCreate("no custom-node list to bootstrap with (thunder.nodes is "
-                             "empty and there is no default list)")
+            raise _PreCreate("no custom-node list to bootstrap with (host option nodes "
+                             "is empty and there is no default list)")
         return text if text.endswith("\n") else text + "\n"
 
     def _commit(self) -> str:
@@ -2076,8 +2076,8 @@ class Controller:
         c = "" if c is None else str(c).strip()
         if not _COMMIT_RE.fullmatch(c):
             # the bootstrap exits 2 on anything else — after an instance was paid for
-            raise RuntimeError(f"thunder.comfy_commit must be a full 40-hex commit sha, "
-                               f"got {c!r}")
+            raise RuntimeError(f"host option comfy_commit must be a full 40-hex commit "
+                               f"sha, got {c!r}")
         return c
 
     def _find_ours(self, items: list[dict]) -> Optional[dict]:
@@ -2984,7 +2984,7 @@ class Controller:
         s, cfg = self.state, self.cfg
         for k in ("gpu_type", "vcpus"):
             if not cfg.get(k):
-                raise _PreCreate(f"thunder.{k} is not set")
+                raise _PreCreate(f"host option {k} is not set")
         num_gpus = self._cfg_int("num_gpus", 1)
         snaps = await self.api.snapshots()
         self._snaps = snaps
