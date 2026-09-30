@@ -3557,9 +3557,8 @@ def _host_card(name: str, v: dict) -> str:
                         f"{_esc(why)}</p>")
         else:
             acts += _btn("Delete", f"/ui/hosts/managed/delete?host={q}", "danger", sm=True,
-                         confirm=f"Delete the managed host {name}? Its state goes; snapshots "
-                                 "it left behind are listed as foreign and bill on until "
-                                 f"deleted at {prov}.",
+                         confirm=f"Delete the managed host {name}? Its state goes; its "
+                                 f"READY snapshots bill on at {prov} until deleted by hand.",
                          title="Remove this host (only while off and no backend names it)")
     rows.append(f'<div class="tacts" data-k="{_esc(k)}-acts">{acts}</div>{del_note}')
     log = [str(x) for x in (v.get("log") or [])][-_HOST_LOG_LINES:]
@@ -3754,7 +3753,7 @@ def _managed_hosts_section(views: list, catalog_refused: Optional[tuple] = None,
     cards = "".join(_host_card(n, v) for n, v in views)
     intro = ("" if views else
              "<p class='hint'>A managed host is a rented GPU machine the gateway starts and "
-             "stops for you (its <b>Steuerung</b>: a provider such as Thunder Compute). "
+             "stops for you (its <b>provider</b>, such as Thunder Compute). "
              "Backends run on it by naming it as their host.</p>")
     extra = ""
     if views or modelsrc_refused is not None:
@@ -3793,7 +3792,7 @@ def _option_control(fld: dict, value) -> str:
 
 def _managed_host_form(name: str = "", new: bool = True, provider: str = "",
                        typed: Optional[dict] = None, err: str = "") -> str:
-    """The managed-host form. New: name, **Steuerung** (a provider of hostapi.PROVIDERS)
+    """The managed-host form. New: name, **Provider** (one of hostapi.PROVIDERS)
     and its options; an existing host has neither a name field (R-W5: the name is the
     identity of its state and snapshots) nor a provider choice (its state belongs to the
     provider). Options are the provider's OWN `OPTION_FIELDS` as `opt__<key>` — `typed`
@@ -3820,12 +3819,12 @@ def _managed_host_form(name: str = "", new: bool = True, provider: str = "",
                        hint="a-z, 0-9 and <code>-</code>. It names the host's snapshots and "
                             "state, so it cannot be changed later; backends run here by "
                             "naming it as their <b>host</b>.")
-                + _field("Steuerung", _select("provider",
+                + _field("Provider", _select("provider",
                                               [(k, _provider_name(k)) for k in kinds], kind),
                          hint="The provider that creates, stops and bills the machine."))
     else:
         out += (f'<input type="hidden" name="provider" value="{_esc(kind)}">'
-                + _field("Steuerung", f"<span>{_esc(_provider_name(kind))}</span>",
+                + _field("Provider", f"<span>{_esc(_provider_name(kind))}</span>",
                          hint="Fixed: the host's state and snapshots belong to it."))
     if prov is None:
         out += _form_err(f"unknown provider {kind!r} — this host cannot be driven; delete "

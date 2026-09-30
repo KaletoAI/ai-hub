@@ -48,6 +48,7 @@ import os
 import re
 import sys
 import tempfile
+import html as html_mod
 import unittest
 from unittest import mock
 from urllib.parse import urlencode, parse_qs, urlparse
@@ -1607,7 +1608,11 @@ class HostForm(_Base):
                 + ["api_key", "api_key_clear"])
         self.assertEqual(sorted(names), sorted(want))             # each field exactly once
         self.assertEqual(len(names), len(set(names)))
-        # "Steuerung": the providers of hostapi.PROVIDERS, by their display NAME
+        # "Provider": the providers of hostapi.PROVIDERS, by their display NAME — an
+        # English console, the label too (Ruling M6)
+        self.assertRegex(f, r'<label[^>]*>Provider</label>')
+        self.assertNotIn("Steuerung", self.page({"mhost_new": "1"}))
+        self.assertNotIn("Steuerung", self.page({}))
         sel = re.search(r'<select name="provider"[^>]*>.*?</select>', f, re.S).group(0)
         for kind, (mod, _api) in hostapi.PROVIDERS.items():
             self.assertIn(f'<option value="{kind}" selected>{mod.NAME}</option>', sel)
@@ -1819,6 +1824,11 @@ class HostDelete(Actions):
         m = re.search(r'<button[^>]*formaction="/ui/hosts/managed/delete\?host=tc"[^>]*>', html)
         self.assertIsNotNone(m)
         self.assertIn("data-confirm=", m.group(0))
+        # the snapshots it left bill on at the provider until deleted by hand — never
+        # "listed as foreign": with the LAST host gone nothing lists them any more
+        conf = html_mod.unescape(re.search(r'data-confirm="([^"]*)"', m.group(0)).group(1))
+        self.assertEqual(conf, "Delete the managed host tc? Its state goes; its READY "
+                               "snapshots bill on at Thunder Compute until deleted by hand.")
         r = self.delete("tc")
         self.assertIn("deleted", parse_qs(urlparse(r.headers["location"]).query)["msg"][0])
         self.assertEqual(self.deleted_hosts, ["tc"])
