@@ -6663,7 +6663,12 @@ def host_view(name: str) -> Optional[dict]:
         # on the same list `Controller.start()` raises from
         try:
             v["start_blockers"] = c.start_blockers()
-            v["checklist"] = c.checklist()
+            st = c.state
+            # the card shows the checklist only while startable — and its LAN item
+            # reads the store, per host per tick while a host runs
+            if c.op is None and (st.phase == "off" or (st.phase == "failed" and not st.uuid
+                                                       and not st.index)):
+                v["checklist"] = c.checklist()
         except Exception as e:              # the card's courtesy, never the card
             logger.warning(f"[host {name}] start check unavailable: {type(e).__name__}: {e}")
     v["managed"] = h is not None               # False: entry deleted, controller kept
@@ -6974,6 +6979,15 @@ def save_provider_token(kind: str, token: str) -> str:
                   or any(not ch.isprintable() or ch.isspace() for ch in token)):
         return ("the API token may hold only printable characters without spaces "
                 f"(at most {_PROVIDER_TOKEN_MAX}) — not saved")
+    if not token:
+        # clearing reaches EVERY host of this provider at once: a running one's next
+        # provider call — its stop's snapshot and delete — would be a 401, leaving it
+        # `failed` with the instance kept and billing. A new token (rotation) is fine.
+        busy = sorted(n for n, c in host_controllers.items()
+                      if getattr(c, "kind", None) == kind and not _host_idle_off(c))
+        if busy:
+            return (f"{_provider_display(kind)} hosts are not off ({', '.join(busy)}) — "
+                    "stop them first, or enter a new token instead of clearing it")
     if not store.is_active():
         return "the store is not active — not saved"
     store.set_provider_token(kind, token)
@@ -6981,18 +6995,38 @@ def save_provider_token(kind: str, token: str) -> str:
     return ""
 
 
+def _provider_display(kind: str) -> str:
+    p = hostapi.provider(kind)
+    return str(getattr(p[0], "NAME", kind)) if p else str(kind)
+
+
+def _record_names_instance(name: str) -> bool:
+    """Does the stored state record of host `name` name an instance (a uuid/index, or a
+    phase other than off)? An unreadable state setting answers False (no preference)."""
+    try:
+        rec = _host_load_state(name)
+    except Exception:
+        return False
+    return isinstance(rec, dict) and bool(rec.get("uuid") or rec.get("index")
+                                          or (rec.get("phase") or "off") != "off")
+
+
 def migrate_provider_tokens() -> None:
     """Startup, idempotent: before tokens were per provider, every managed host carried
-    its own `api_key`. A provider without a token takes the first READABLE one of its
-    hosts (by name), then every entry loses its copy. A provider token that is already
-    set is never overwritten. One log line per moved token — never the token."""
+    its own `api_key`. A provider without a token takes a READABLE one of its hosts —
+    that of a host whose state record names an instance first (that instance must stay
+    stoppable), else by host name — then every entry loses its copy. A provider token
+    that is already set is never overwritten. A dropped per-host token that DIFFERS from
+    the provider token is warned about by host name (a second account's host would
+    otherwise first say so as a 401 at its stop). Never logs a token."""
     if not store.is_active():
         return
     hosts = store.get_managed_hosts()
     legacy = sorted(n for n, e in hosts.items() if "api_key" in e)
     if not legacy:
         return
-    for name in legacy:
+    live = {n for n in legacy if _record_names_instance(n)}
+    for name in sorted(legacy, key=lambda n: (n not in live, n)):
         e = hosts[name]
         kind, tok = str(e.get("provider") or ""), str(e.get("api_key") or "")
         if not tok or not _PROVIDER_KIND_RE.fullmatch(kind) or provider_token(kind):
@@ -7001,7 +7035,14 @@ def migrate_provider_tokens() -> None:
         logger.info(f"managed hosts: the API token of host {name} is now the {kind} "
                     "provider token (one per provider)")
     for name in legacy:
-        store.set_managed_host(name, hosts[name])       # drops `api_key`
+        e = hosts[name]
+        kind, tok = str(e.get("provider") or ""), str(e.get("api_key") or "")
+        if tok and tok != provider_token(kind):
+            logger.warning(f"managed hosts: host {name}'s API token differs from the "
+                           f"{kind} provider token and is dropped — if {name} runs on "
+                           "another account, enter that token before starting or "
+                           "stopping it")
+        store.set_managed_host(name, e)                 # drops `api_key`
     logger.info(f"managed hosts: per-host API tokens removed from {len(legacy)} "
                 "entr" + ("y" if len(legacy) == 1 else "ies"))
 

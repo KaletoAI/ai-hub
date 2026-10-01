@@ -2176,6 +2176,26 @@ class ProviderTokenUI(Actions):
         self.assertEqual(store.get_provider_token("thunder"), "")
         self.assertIsNone(self.raw())
 
+    def test_clearing_while_a_host_runs_is_a_400_with_the_row(self):
+        import types
+        saved = main.host_controllers
+        self.addCleanup(setattr, main, "host_controllers", saved)
+        main.host_controllers = {"tc": types.SimpleNamespace(
+            kind="thunder", op=None, state=types.SimpleNamespace(phase="ready",
+                                                                  pending_snapshot=""))}
+        store.set_provider_token("thunder", "th-KEEP")
+        r = self.post(400, provider="thunder", api_key="", api_key_clear="1")
+        self.assertIn("Thunder Compute hosts are not off (tc) — stop them first, or enter "
+                      "a new token instead of clearing it", r.text)
+        self.assertIn('data-k="hosts-ptoken-thunder"', r.text)         # the row again
+        self.assertNotIn("th-KEEP", r.text)
+        self.assertEqual(store.get_provider_token("thunder"), "th-KEEP")
+        self.assertEqual(self.applied, [])
+
+    def test_password_inputs_are_not_autofilled(self):
+        self.assertRegex(self.row(), r'<input type="password" name="api_key" value=""[^>]*'
+                                     r'autocomplete="new-password"')
+
     def test_refusals_are_400_and_never_echo_the_value(self):
         r = self.post(400, provider="runpod", api_key="rp-SECRET")
         self.assertIn("unknown provider", r.text)
@@ -2290,6 +2310,21 @@ class CardChecklist(_Base):
         self.assertIn("✓ Thunder Compute API token set", ck)
         self.assertIn("✗ no backend attached — add one below", ck)
         self.assertIn("– LAN model source not usable", ck)
+
+    def test_disabled_button_looks_disabled(self):
+        self.assertIn(".btn[disabled]{opacity:.55;cursor:not-allowed}", admin._CSS)
+
+    def test_unreconciled_uuids_hint_under_start(self):
+        # not a blocker (Start re-checks them against a fresh list), but said beforehand
+        ok = [dict(i, ok=True) for i in self.CHECK]
+        self.views = {"tc": _view(checklist=ok, start_blockers=[],
+                                  unreconciled_uuids=["u-x"])}
+        html = self.page()
+        self.assertIn('data-k="host-tc-startrecheck"', html)
+        self.assertIn("Start re-checks the instances above first; forget them if none is "
+                      "this host&#x27;s", html)
+        self.views = {"tc": _view(checklist=ok, start_blockers=[])}
+        self.assertNotIn("startrecheck", self.page())
 
     def test_ready_to_start_is_a_post_button(self):
         ok = [dict(i, ok=True) for i in self.CHECK]

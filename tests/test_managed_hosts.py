@@ -717,6 +717,12 @@ class ProviderTokens(_StoreCase):
         self.assertTrue(v["api_key_set"])
         self.assertNotIn(TOKEN, json.dumps(v, default=str))
         self.assertNotIn(TOKEN, json.dumps(main.provider_tokens_info()))
+        # the checklist only where the card shows it (it reads the store per host)
+        self.assertIn("checklist", v)
+        main.host_controllers["vm1"].state.phase = "ready"
+        v = main.host_view("vm1")
+        self.assertNotIn("checklist", v)
+        self.assertIn("start_blockers", v)
         h = asyncio.run(main.health(verbose=True))
         self.assertNotIn(TOKEN, json.dumps(h, default=str))
         self.assertNotIn(TOKEN, json.dumps(main.gateway_info(), default=str))
@@ -734,7 +740,14 @@ class ProviderTokens(_StoreCase):
                          ["a-broken", "b-one", "c-two", "d-none"])
         out = "\n".join(cm.output)
         self.assertNotIn("tok-A-SECRET", out)
+        self.assertNotIn("tok-B-SECRET", out)
         self.assertIn("thunder", out)
+        # c-two's DIFFERENT token is dropped — said by host name, never by value: if
+        # c-two runs on another account, its instance must not become unstoppable
+        # without a trace
+        warn = [x for x in cm.output if x.startswith("WARNING")]
+        self.assertTrue(any("c-two" in x and "differs" in x for x in warn), warn)
+        self.assertFalse(any("b-one" in x for x in warn), warn)
         # idempotent: nothing left to move, nothing rewritten, nothing logged
         before = self.raw_hosts()
         with self.assertNoLogs("main", "INFO"):
@@ -744,9 +757,56 @@ class ProviderTokens(_StoreCase):
 
     def test_migration_never_overwrites_a_provider_token(self):
         self.legacy({"vm1": "old-host-tok"})
-        main.migrate_provider_tokens()
+        with self.assertLogs("main", "WARNING") as cm:
+            main.migrate_provider_tokens()
         self.assertEqual(store.get_provider_token("thunder"), TOKEN)
         self.assertNotIn("api_key", self.raw_hosts())
+        self.assertTrue(any("vm1" in x and "differs" in x for x in cm.output))
+        self.assertNotIn("old-host-tok", "\n".join(cm.output))
+
+    def test_migration_prefers_the_host_whose_record_names_an_instance(self):
+        # the token that must survive is the one able to STOP a billing instance —
+        # alphabetical order would pick a-idle's
+        store.set_provider_token("thunder", "")
+        self.legacy({"a-idle": "tok-IDLE", "z-live": "tok-LIVE"})
+        store.set_settings({"host_state": {"a-idle": {"phase": "off"},
+                                           "z-live": {"phase": "ready", "uuid": "u-1"}}})
+        with self.assertLogs("main", "INFO") as cm:
+            main.migrate_provider_tokens()
+        self.assertEqual(store.get_provider_token("thunder"), "tok-LIVE")
+        self.assertTrue(any("a-idle" in x and "differs" in x for x in cm.output
+                            if x.startswith("WARNING")))
+        # an unreadable state setting: no preference, never a crash
+        store.set_provider_token("thunder", "")
+        self.legacy({"a-idle": "tok-IDLE", "z-live": "tok-LIVE"})
+        store.set_settings({"host_state": ["garbage"]})
+        with self.assertLogs("main", "INFO"):
+            main.migrate_provider_tokens()
+        self.assertEqual(store.get_provider_token("thunder"), "tok-IDLE")
+
+    def test_clearing_refused_while_a_host_of_that_provider_is_not_off(self):
+        # clearing reaches EVERY host of the provider at once: a running one's next
+        # snapshot/delete would be a 401 → failed, instance kept, billing on
+        store.set_managed_host("vm1", _host())
+        store.set_managed_host("vm2", _host())
+        main.sync_host_controllers()
+        c = main.host_controllers["vm1"]
+        c.state.phase = "ready"
+        why = main.save_provider_token("thunder", "")
+        self.assertEqual(why, "Thunder Compute hosts are not off (vm1) — stop them first, "
+                              "or enter a new token instead of clearing it")
+        self.assertEqual(store.get_provider_token("thunder"), TOKEN)
+        self.assertEqual(c.host["api_key"], TOKEN)
+        # rotation stays possible
+        self.assertEqual(main.save_provider_token("thunder", "tok-rotated"), "")
+        self.assertEqual(c.host["api_key"], "tok-rotated")
+        # an op in flight or a snapshot still being taken counts as not off too
+        c.state.phase = "off"
+        c.state.pending_snapshot = "snap-1"
+        self.assertIn("(vm1)", main.save_provider_token("thunder", ""))
+        c.state.pending_snapshot = ""
+        self.assertEqual(main.save_provider_token("thunder", ""), "")
+        self.assertEqual(store.get_provider_token("thunder"), "")
 
 
 class DeleteHost(_StoreCase):

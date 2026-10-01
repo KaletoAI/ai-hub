@@ -324,6 +324,7 @@ input:focus-visible,select:focus-visible,textarea:focus-visible{border-color:var
 input[type=checkbox]:focus-visible{outline:2px solid var(--focus);outline-offset:1px}
 .ckbox{display:inline-flex;align-items:center;margin-right:18px;color:#cdd5de;font-size:13px;cursor:pointer;white-space:nowrap}
 .ckbox code{margin:0}
+.btn[disabled]{opacity:.55;cursor:not-allowed}
 .btn{height:36px;padding:0 18px;background:var(--btn);color:#fff;border:0;border-radius:7px;font:inherit;font-weight:500;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;text-decoration:none;white-space:nowrap}
 .btn:hover{background:var(--btn-hover)}
 .btn.secondary{background:var(--line-4)}.btn.secondary:hover{background:#343c49}
@@ -1051,8 +1052,11 @@ def _inp(name: str, value="", placeholder: str = "", typ: str = "text", step: st
     # disabled input is not submitted, and backend_save reads absent as cleared.
     st = f' step="{_esc(step)}"' if step else ""
     ro = " readonly" if readonly else ""
+    # a secret field is never pre-filled, and a browser must not fill in (or offer to
+    # save) the admin's login password there — a Save would store THAT as the token
+    ac = ' autocomplete="new-password"' if typ == "password" else ""
     return (f'<input type="{typ}" name="{_esc(name)}" value="{_esc(value)}" '
-            f'placeholder="{_esc(placeholder)}"{st}{ro}>')
+            f'placeholder="{_esc(placeholder)}"{st}{ro}{ac}>')
 
 
 def _textarea(name: str, value="", rows: int = 3, placeholder: str = "") -> str:
@@ -3613,6 +3617,12 @@ def _host_card(name: str, v: dict) -> str:
             why_html = (f'<p class="hint" data-k="{_esc(k)}-startwhy">Start: '
                         f"{_esc(blockers[0])}</p>")
         else:
+            if uu:
+                # not a blocker (Start re-checks them against a fresh list inside the
+                # op), but said BEFORE the press instead of after it
+                why_html = (f'<p class="hint" data-k="{_esc(k)}-startrecheck">'
+                            + _esc("Start re-checks the instances above first; forget them "
+                                   "if none is this host's.") + "</p>")
             acts += _btn("Start", f"/ui/hosts/managed/start?host={q}", sm=True,
                          confirm=f"Start the {prov} host {name}? It bills per hour until "
                                  "you stop it.",
