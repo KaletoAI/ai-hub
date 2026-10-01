@@ -2884,7 +2884,7 @@ def _sync_make(aliases=None, catalog=None, src=None, token=_TOKEN, **kw):
                 if f"comfyui:{cand.get('backend')}" == bid]
     c.deps.alias_needs = needs
     c.deps.alias_signature = lambda name: json.dumps(box, sort_keys=True)
-    c.deps.url_catalog = lambda: ms.url_catalog(box["catalog"])
+    c.deps.url_catalog = lambda src: ms.url_catalog(box["catalog"], src)
     c.deps.source_index = lambda: dict(src or {})
     c.deps.hf_token = lambda: token
     vm.wrap(c)
@@ -3042,7 +3042,7 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
         c.deps.alias_needs = lambda n: [ms.alias_need(
             "img", ms.refs_for(box["img"], box["img"]["workflow_json"], []), cat)]
         c.deps.alias_signature = lambda n: "sig1"
-        c.deps.url_catalog = lambda: ms.url_catalog(cat)
+        c.deps.url_catalog = lambda src: ms.url_catalog(cat, src)
         vm.wrap(c)
         # a curl the previous gateway process started is still running on the box
         vm.sizes[url] = 30
@@ -4383,13 +4383,13 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([r.value for r in needs["cfgalias"].refs], ["t5.safetensors"])
             self.assertEqual(deps.alias_needs("comfyui:k12")[0].refs[0].value, "k.st")
             # the catalog: defaults while unset, the setting once set, [] when garbage
-            self.assertEqual(deps.url_catalog(), {})
+            self.assertEqual(deps.url_catalog({}), {})
             cat = [{"file": "models/vae/ae.safetensors", "url": "https://hf.co/x/ae.safetensors"},
                    {"match": {"alias": "img"}, "paths": ["models/loras/"]}]
             sig0 = deps.alias_signature("comfyui:tc")
             self.assertEqual(sig0, deps.alias_signature("comfyui:tc"))          # stable
             self.store.set_settings({"modelsync_catalog": cat})
-            self.assertEqual(deps.url_catalog(), {"models/vae/ae.safetensors":
+            self.assertEqual(deps.url_catalog({}), {"models/vae/ae.safetensors":
                                                   {"url": "https://hf.co/x/ae.safetensors"}})
             self.assertEqual(needs["img"].catalog, [])
             self.assertEqual({n.alias: n for n in deps.alias_needs("comfyui:tc")}["img"].catalog,
@@ -4411,7 +4411,7 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
             os.utime(path, (1, 1))
             self.assertNotEqual(deps.alias_signature("comfyui:tc"), sig1)
             self.store.set_settings({"modelsync_catalog": {"not": "a list"}})
-            self.assertEqual(deps.url_catalog(), {})
+            self.assertEqual(deps.url_catalog({}), {})
             self.assertEqual(deps.source_index(), {})
             self.assertEqual(deps.hf_token(), "")
             self.store.set_settings({"hf_token": "hf_x"})
@@ -4705,6 +4705,31 @@ class LanTransfer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((man["source"], man["size"]),  ("lan", 10))
         self.assertEqual(man["sha256"], hashlib.sha256(b"0123456789").hexdigest())
         self.assertEqual(len(pipe.log), 1)
+
+    async def test_catalog_entry_judged_against_the_listing_the_plan_uses(self):
+        """model sources: a sized catalog entry the share has outgrown (the file was
+        replaced) is dropped against the SAME listing the plan is built from — the
+        share's copy syncs over the LAN; an entry that still matches downloads by URL."""
+        path = _dm("a.safetensors")
+        for size, via in ((9, "lan"), (10, "url")):
+            with self.subTest(size=size):
+                sh = self.share(a=b"0123456789")
+                entry = dict(_url("a.safetensors"), size=size)
+                fake, vm, c, lan, pipe = _lan_make({"img": _cand("a.safetensors")}, sh,
+                                                   catalog=[entry])
+                vm.sizes[entry["url"]] = 10
+                listings, seen = [], []
+                real_src, real_urls = c.deps.source_index, c.deps.url_catalog
+                c.deps.source_index = lambda: (listings.append(real_src()), listings[-1])[1]
+                c.deps.url_catalog = lambda src: (seen.append(src), real_urls(src))[1]
+                await c.start()
+                self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")),
+                                c.state.log[-8:])
+                self.assertEqual(json.loads(vm.manifest)[path]["source"], via)
+                self.assertEqual(len(pipe.log), 1 if via == "lan" else 0)
+                self.assertEqual(len(vm.started), 0 if via == "lan" else 1)
+                listed = [s for s in seen if s]
+                self.assertTrue(listed and all(any(s is x for x in listings) for s in listed))
 
     async def test_sha_mismatch_restarts_and_counts(self):
         sh = self.share(a=b"abcdef")
@@ -7123,7 +7148,7 @@ class DepsContract(unittest.TestCase):
              "datadir": None, "probe_comfy": 1, "bootstrap_script": 0, "log": 1, "now": 0,
              "sleep": 1, "ssh": 1, "spawn": None, "known_uuids": 0, "keygen": 1,
              "default_nodes": 0, "alias_needs": 1, "alias_signature": 1, "source_index": 0,
-             "url_catalog": 0, "hf_token": 0, "lan": None, "pipe": 3, "control": 5,
+             "url_catalog": 1, "hf_token": 0, "lan": None, "pipe": 3, "control": 5,
              "host_bootstrap_script": 0, "probe_http": 1, "cancel_drain": 1,
              "hold_routing": 2}
     KWARGS = {"ssh": ("stdin", "timeout"), "pipe": ("timeout_idle",), "control": ("timeout",)}

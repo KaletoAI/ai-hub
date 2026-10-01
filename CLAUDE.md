@@ -1756,7 +1756,36 @@ via injected callables, staying hot-reload-safe.
   catalog never expands a whole root (`hf-cache/hub/` itself is refused);
   `DEFAULT_CATALOG` holds public hub/base models ONLY — never a private model or LoRA
   name in the repo — and `main._modelsync_catalog` copies it into the setting ONCE
-  (`store.setdefault_setting`), after which an emptied catalog stays empty. `plan`:
+  (`store.setdefault_setting`), after which an emptied catalog stays empty.
+  **Public download sources** (model sources, spec 2026-10-01; a share file synced over
+  the operator's uplink at ~15 MB/s is often public on Hugging Face, where the instance
+  pulls hundreds of MB/s). Three catalog entry shapes, exactly one per entry, unknown keys
+  refused: `{match, paths}`; the per-file source `{file, url, sha256?, size?}` (`size` =
+  the share file's at Check & save, int ≥ 1 — old entries without it stay valid and are
+  never outdated); the directory source `{dir, repo, rev, files}` (`dir` a `models/…/`
+  directory, `repo` an `org/name` HF id — no `--`/`..`, `rev` the 40-hex COMMIT, never a
+  branch, `files` = `{relpath: [size, sha256|null, provisional]}`, what the check
+  verified; `provisional` = the sha is HF's `X-Linked-Etag`, the share's not known yet).
+  `derived_urls(source_index)` is Stage 1, pure and stored nowhere: a snapshot link
+  `hf-cache/hub/models--<org>--<name>/snapshots/<40-hex rev>/<path>` that `link_target`
+  resolves to `blobs/<oid>` of the SAME repo (a nested path has more `../` — never
+  pattern-match the target text) makes that BLOB a download from
+  `huggingface.co/<org>/<name>/resolve/<rev>/<quote(path)>`; a 64-hex oid is the content
+  sha256, a 40-hex one the git sha1 (size only), anything else, a non-commit rev,
+  `datasets--`/`spaces--`, an unlisted blob or a link leaving its repo derives nothing; a
+  regular file under `snapshots/<rev>/` (`HF_HUB_DISABLE_SYMLINKS`) is its own download,
+  size only. `source_kinds(catalog, source_index, share_sha=None)` is the ONE place the
+  rules live (plan input, overview, card badge): per path `kind` `url` (origin
+  `file`/`dir`) | `hf-auto` | `outdated`, absent = `lan`; precedence per-file entry >
+  dir entry > derivation (an operator's mirror wins), a later entry wins within a shape,
+  and an entry whose stored `size` ≠ the share LISTING's is OUTDATED and yields to the
+  next source — a listing comparison, never a share hash on the plan path (with
+  `share_sha`, the persistent `{path: [size, sha256]}` cache, a sha that differs at the
+  listed size is outdated too). `url_catalog(catalog, source_index)` is its plan view
+  (`{path: {url, sha256?, origin?}}`, outdated dropped; one argument = the old helper:
+  explicit entries, nothing derived or outdated); hostctl's `Deps.url_catalog(src)` is
+  handed the SAME listing the plan is built from. `plan`'s url fetch entries carry
+  `origin` `hf-auto`|`catalog` — a display label, no plan state. `plan`:
   present = the destination holds the file at the SOURCE's size (the manifest's where the
   source does not list it), a `.part` never; `prune` = manifest files only (never a file
   we did not put there), applied only at stop; `unknown` = everything else nobody needs,

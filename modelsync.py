@@ -37,7 +37,9 @@ here guards a failure that looks like a working sync:
   class+value entries for nodes that fetch their own model (hub ids), alias entries for
   aliases without any loader reference (`paths: []` says explicitly "needs nothing" —
   an EMPTY reference set is otherwise not "complete", it is "unknown"), and
-  `file`+`url` entries for a public download source. `validate_catalog` refuses it out
+  `file`+`url` entries (and `dir`+`repo` directory entries) for a public download
+  source — beside `derived_urls`, which needs no entry for the share's own Hugging Face
+  cache (see "public download sources" below). `validate_catalog` refuses it out
   loud: a typo'd key would otherwise be ignored, and the alias it was meant for stays
   blocked with no hint why. `catalog_paths`/`url_catalog` drop every entry the
   validator would refuse, so an unvalidated catalog can never expand a whole root.
@@ -65,6 +67,7 @@ from __future__ import annotations
 
 import copy
 import re
+from urllib.parse import quote
 from dataclasses import dataclass, field
 from typing import Union
 
@@ -351,14 +354,222 @@ def catalog_paths(refs, alias: str, catalog) -> tuple[list[str], bool]:
     return paths, explicit
 
 
-def url_catalog(catalog) -> dict:
-    """`{path: {"url", "sha256"?}}` from the catalog's valid `file`+`url` entries — the
-    public download sources the plan prefers over the LAN (a later entry for the same
-    file wins, as a later line in the editor would be expected to)."""
+# --- public download sources: catalog entries + the HF cache (model sources) ----------
+# A share file can come from a public URL instead of the operator's uplink. Three ways to
+# know one, in this precedence (an operator's mirror wins over a derivation):
+#   1. a per-file catalog entry `{file, url, sha256?, size?}`,
+#   2. a directory entry `{dir, repo, rev, files}` (one Hugging Face repo → one share dir),
+#   3. `derived_urls`: the share's own Hugging Face cache, by its path alone (Stage 1).
+# An entry whose stored `size` differs from the share listing's is OUTDATED (the file was
+# replaced since Check & save) and is dropped: the plan then syncs the share's copy. That
+# is a LISTING comparison — no share hash on the plan path. `source_kinds` is the one place
+# these rules live; `url_catalog` is its plan-shaped view.
+
+HF_BASE = "https://huggingface.co/"
+_HEX40 = re.compile(r"[0-9a-f]{40}")
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+_SHA256 = re.compile(r"[0-9a-fA-F]{64}")
+# One part of a Hugging Face repo id (huggingface_hub `validate_repo_id`, ASCII only): word
+# characters, `.`, `-`, ≤ 96, starting and ending on a word character; `--` and `..` are
+# refused separately — which is what makes splitting `models--<org>--<name>` on `--` safe.
+_HF_PART = re.compile(r"[A-Za-z0-9_](?:[A-Za-z0-9_.-]{0,94}[A-Za-z0-9_])?")
+
+
+def hf_repo_error(repo) -> str:
+    """Why `repo` is no `org/name` Hugging Face model id ('' = valid)."""
+    if not isinstance(repo, str):
+        return f"repo {repo!r} is not a string"
+    parts = repo.split("/")
+    if (len(parts) != 2 or not all(_HF_PART.fullmatch(x) for x in parts)
+            or "--" in repo or ".." in repo or repo.endswith(".git")):
+        return f"repo {repo!r} must be a Hugging Face id org/name"
+    return ""
+
+
+def hf_resolve_url(repo: str, rev: str, relpath: str) -> str:
+    """`https://huggingface.co/<repo>/resolve/<rev>/<relpath>`, the path percent-encoded
+    (a space would otherwise fail `_url_error` and the entry would vanish silently)."""
+    return f"{HF_BASE}{repo}/resolve/{rev}/{quote(relpath, safe='/')}"
+
+
+def _hf_snapshot(path: str):
+    """`(repo_dir, "org/name", rev, relpath)` for a path inside a Hugging Face cache
+    snapshot — `hf-cache/hub/models--<org>--<name>/snapshots/<40-hex commit>/<relpath>` —
+    else None. huggingface_hub always names the snapshot dir after the commit, so any
+    other name is a layout we do not understand; datasets/spaces are not model repos."""
+    if not isinstance(path, str) or not path.startswith(_HF_HUB) or not _usable(path):
+        return None
+    segs = path[len(_HF_HUB):].split("/")
+    if len(segs) < 4 or segs[1] != "snapshots" or not _HEX40.fullmatch(segs[2]):
+        return None
+    kind, sep, rest = segs[0].partition("--")
+    org, sep2, name = rest.partition("--")
+    if kind != "models" or not sep or not sep2:
+        return None
+    repo = f"{org}/{name}"
+    if hf_repo_error(repo):
+        return None
+    return f"{_HF_HUB}{segs[0]}/", repo, segs[2], "/".join(segs[3:])
+
+
+def _int_size(v):
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+
+def derived_urls(source_index) -> dict:
+    """Stage 1: `{path: {"url", "sha256"?}}` for every Hugging Face cache file of the
+    share, from its path alone. Pure; nothing is stored — recomputed with the plan.
+
+    A snapshot LINK (`snapshots/<rev>/<relpath>` → `blobs/<oid>`, resolved by
+    `link_target`, so a nested path's extra `../` count) makes its BLOB the downloaded
+    file: the key is the blob path (the plan fetches blobs and recreates the links), the
+    URL `resolve/<rev>/<relpath>`. The blob must be a FILE the share lists, in the same
+    repo dir. Its name is huggingface_hub's etag: 64 hex = the content sha256 (LFS/Xet) →
+    `sha256`; 40 hex = the git blob sha1 (a hash over a header + content, NO content
+    hash) → size only; anything else → not this layout, nothing derived. Several links
+    onto one blob name the same bytes: the lexicographically first link's URL is used.
+    A regular FILE under `snapshots/<rev>/` (`HF_HUB_DISABLE_SYMLINKS`, no blob) is its own
+    download: URL from the path, size only. A URL that fails `_url_error` derives nothing."""
+    idx = source_index if isinstance(source_index, dict) else {}
     out: dict = {}
+    for k in sorted(k for k in idx if isinstance(k, str)):
+        snap = _hf_snapshot(k)
+        if snap is None or _is_part(k):
+            continue
+        repo_dir, repo, rev, rel = snap
+        url = hf_resolve_url(repo, rev, rel)
+        if _url_error(url):
+            continue
+        target = link_of(idx[k])
+        if target is None:
+            if _int_size(idx[k]) is not None:
+                out.setdefault(k, {"url": url})
+            continue
+        blob = link_target(k, target)
+        blobs = repo_dir + "blobs/"
+        if blob is None or not blob.startswith(blobs) or _int_size(idx.get(blob)) is None:
+            continue
+        oid = blob[len(blobs):]
+        if _HEX64.fullmatch(oid):
+            out.setdefault(blob, {"url": url, "sha256": oid})
+        elif _HEX40.fullmatch(oid):
+            out.setdefault(blob, {"url": url})
+    return out
+
+
+def _valid_entries(catalog, key):
     for e in catalog if isinstance(catalog, list) else []:
-        if isinstance(e, dict) and "file" in e and not validate_catalog([e]):
-            out[e["file"]] = {"url": e["url"], **({"sha256": e["sha256"]} if "sha256" in e else {})}
+        if isinstance(e, dict) and key in e and not validate_catalog([e]):
+            yield e
+
+
+def _share_sha(share_sha, path, size):
+    """The share's sha256 of `path` from the persistent cache (`{path: [size, sha256]}`),
+    only when it was taken at `size`; None otherwise or on junk."""
+    rec = share_sha.get(path) if isinstance(share_sha, dict) else None
+    if (isinstance(rec, (list, tuple)) and len(rec) == 2 and _int_size(rec[0]) == size
+            and isinstance(rec[1], str) and _SHA256.fullmatch(rec[1])):
+        return rec[1].lower()
+    return None
+
+
+def _outdated(info: dict, listing: dict, share_sha) -> str:
+    """Why a catalog source no longer describes the share's file ('' = it does). Only an
+    entry that stored a `size` can be outdated (old entries never are); no listing size
+    (the share does not list the file, or lists a link) keeps it."""
+    size = info.get("size")
+    have = _int_size(listing.get(info["path"]))
+    if size is None or have is None:
+        return ""
+    if have != size:
+        return f"size differs: share {have} bytes, entry {size} bytes"
+    known = _share_sha(share_sha, info["path"], have)
+    if known and info.get("sha256") and info["sha256"].lower() != known:
+        return "hash differs: the share's copy is not the one the URL serves"
+    return ""
+
+
+def source_kinds(catalog, source_index=None, share_sha=None) -> dict:
+    """How each share/catalog file with a public source would be fetched — the ONE place
+    the rules live (plan input, overview, card badge). `{path: info}`, sorted, where info
+    carries `kind`:
+
+    - `url` — an explicit catalog source that is not outdated; `origin` `file` (per-file
+      entry) or `dir` (a directory entry's `files` row, `provisional` = its sha256 is
+      HF's `X-Linked-Etag`, the share's not known yet);
+    - `hf-auto` — `derived_urls` (origin `hf-auto`), when no valid explicit entry names
+      the path; `outdated_entry` = the reason, when an outdated explicit one did;
+    - `outdated` — explicit entries only, all outdated, nothing derived: the plan syncs
+      the share's copy (`reason`).
+
+    Plus `url`, `sha256` (when known; the expected content hash of the download) and
+    `size` (an explicit entry's stored size, None for an old entry). A path absent from
+    the result is `lan`. Precedence: per-file entry > directory entry > derivation; within
+    one shape a later entry wins. An outdated entry yields to the next valid source.
+
+    `source_index` None = no listing: no derivation and nothing outdated (the old
+    one-argument behaviour). `share_sha` (`{path: [size, sha256]}`, the persistent
+    share-hash cache) makes a sized entry whose sha256 differs from the share's at the
+    listed size outdated — how a provisional HF sha that the share disagrees with turns
+    `outdated`. Entries `validate_catalog` refuses are dropped one by one."""
+    listing = source_index if isinstance(source_index, dict) else {}
+    files: dict = {}
+    for e in _valid_entries(catalog, "file"):
+        info = {"path": e["file"], "url": e["url"], "origin": "file",
+                "size": e.get("size"), "provisional": False}
+        if "sha256" in e:
+            info["sha256"] = e["sha256"]
+        files[e["file"]] = info
+    dirs: dict = {}
+    for e in _valid_entries(catalog, "dir"):
+        for rel, (size, sha, prov) in e["files"].items():
+            p = e["dir"] + rel
+            info = {"path": p, "url": hf_resolve_url(e["repo"], e["rev"], rel), "origin": "dir",
+                    "size": size, "provisional": prov}
+            if sha:
+                info["sha256"] = sha
+            dirs[p] = info
+    derived = derived_urls(source_index) if isinstance(source_index, dict) else {}
+    out: dict = {}
+    for p in sorted(set(files) | set(dirs) | set(derived)):
+        stale = None
+        for info in (files.get(p), dirs.get(p)):
+            if info is None:
+                continue
+            why = _outdated(info, listing, share_sha)
+            if not why:
+                out[p] = dict(info, kind="url")
+                break
+            stale = stale or dict(info, kind="outdated", reason=why)
+        else:
+            if p in derived:
+                out[p] = dict(derived[p], path=p, kind="hf-auto", origin="hf-auto",
+                              size=None, provisional=False)
+                if stale:
+                    out[p]["outdated_entry"] = stale["reason"]
+            elif stale:
+                out[p] = stale
+    for info in out.values():
+        info.pop("path", None)
+    return out
+
+
+def url_catalog(catalog, source_index=None, share_sha=None) -> dict:
+    """`{path: {"url", "sha256"?, "origin"?}}` — the public download sources the plan
+    prefers over the LAN: `source_kinds` minus the outdated ones. A derived entry carries
+    `origin: "hf-auto"` (the plan copies it onto its fetch entry as a display label); an
+    explicit one carries none (the plan labels it `catalog`). Called with the catalog
+    alone it is the old helper: explicit entries only, never outdated."""
+    out: dict = {}
+    for p, info in source_kinds(catalog, source_index, share_sha).items():
+        if info["kind"] == "outdated":
+            continue
+        e = {"url": info["url"]}
+        if info.get("sha256"):
+            e["sha256"] = info["sha256"]
+        if info["kind"] == "hf-auto":
+            e["origin"] = "hf-auto"
+        out[p] = e
     return out
 
 
@@ -392,8 +603,74 @@ def _url_error(u) -> str:
     return ""
 
 
+_FILE_KEYS = {"file", "url", "sha256", "size"}
+_DIR_KEYS = {"dir", "repo", "rev", "files"}
+_MATCH_SHAPE = {"match", "paths"}
+
+
+def _size_ok(v) -> bool:
+    return _int_size(v) is not None and v >= 1
+
+
+def _dir_entry_errors(e: dict, where: str) -> list[str]:
+    """A directory entry `{dir, repo, rev, files}`: `dir` a `models/…` directory (trailing
+    `/`, not a whole root), `repo` an `org/name` Hugging Face id, `rev` the 40-hex commit
+    the check resolved (never a branch — the URL must be immutable), and `files` the
+    non-empty map of what the check verified, `{relpath: [size, sha256|null,
+    provisional]}`: relpath a file under `dir`, size an int ≥ 1, sha256 64 hex or null,
+    provisional a bool (True = the sha is HF's `X-Linked-Etag`, the share's not known yet;
+    never True without a sha)."""
+    errs: list[str] = []
+    for k in ("dir", "repo", "rev", "files"):
+        if k not in e:
+            errs.append(f"{where}: a directory entry needs {k}")
+    d = e.get("dir")
+    if "dir" in e:
+        msg = _root_path_error(d, True)
+        if msg:
+            errs.append(f"{where}: {msg}")
+        elif not d.startswith("models/") or not d.endswith("/"):
+            errs.append(f"{where}: dir {d!r} must be a models/… directory ending in /")
+    if "repo" in e:
+        msg = hf_repo_error(e["repo"])
+        if msg:
+            errs.append(f"{where}: {msg}")
+    if "rev" in e and not (isinstance(e["rev"], str) and _HEX40.fullmatch(e["rev"])):
+        errs.append(f"{where}: rev must be the 40-hex commit (lower case), not a branch")
+    if "files" in e:
+        fm = e["files"]
+        if not isinstance(fm, dict) or not fm:
+            errs.append(f"{where}: files must be a non-empty object")
+            fm = {}
+        base = d if isinstance(d, str) and d.endswith("/") else "models/x/"
+        for rel, row in fm.items():
+            if not isinstance(rel, str) or not rel or rel.startswith("/") or rel.endswith("/"):
+                errs.append(f"{where}: files key {rel!r} must be a file path relative to dir")
+            else:
+                msg = _root_path_error(base + rel, False)
+                if msg:
+                    errs.append(f"{where}: files key {rel!r}: {msg}")
+            if not (isinstance(row, list) and len(row) == 3):
+                errs.append(f"{where}: files[{rel!r}] must be [size, sha256|null, provisional]")
+                continue
+            size, sha, prov = row
+            if not _size_ok(size):
+                errs.append(f"{where}: files[{rel!r}] size must be an integer ≥ 1")
+            if sha is not None and not (isinstance(sha, str) and _SHA256.fullmatch(sha)):
+                errs.append(f"{where}: files[{rel!r}] sha256 must be 64 hex characters or null")
+            if not isinstance(prov, bool):
+                errs.append(f"{where}: files[{rel!r}] provisional must be true or false")
+            elif prov and sha is None:
+                errs.append(f"{where}: files[{rel!r}] is provisional without a sha256")
+    return errs
+
+
 def validate_catalog(obj) -> list[str]:
-    """Every problem of a catalog, as readable lines (empty = valid)."""
+    """Every problem of a catalog, as readable lines (empty = valid). Three entry shapes,
+    exactly one per entry: `{match, paths}`, the per-file source `{file, url, sha256?,
+    size?}` (`size` = the share file's at Check & save, int ≥ 1; absent on old entries)
+    and the directory source `{dir, repo, rev, files}` (`_dir_entry_errors`). Unknown keys
+    are refused — a typo'd key would otherwise be ignored silently."""
     if not isinstance(obj, list):
         return ["catalog must be a JSON list"]
     errs: list[str] = []
@@ -403,11 +680,20 @@ def validate_catalog(obj) -> list[str]:
             errs.append(f"{where}: not an object")
             continue
         keys = set(e)
-        if keys & {"match", "paths"} and keys & {"file", "url", "sha256"}:
-            errs.append(f"{where}: either match+paths or file+url, not both")
+        shapes = [n for n, ks in (("match+paths", _MATCH_SHAPE), ("file+url", _FILE_KEYS),
+                                  ("dir+repo", _DIR_KEYS)) if keys & ks]
+        if len(shapes) > 1:
+            errs.append(f"{where}: an entry is exactly one of match+paths, file+url or "
+                        f"dir+repo, not {' and '.join(shapes)}")
             continue
-        if keys & {"file", "url", "sha256"}:
-            extra = keys - {"file", "url", "sha256"}
+        if keys & _DIR_KEYS:
+            extra = keys - _DIR_KEYS
+            if extra:
+                errs.append(f"{where}: unknown key(s) {sorted(extra)}")
+            errs += _dir_entry_errors(e, where)
+            continue
+        if keys & _FILE_KEYS:
+            extra = keys - _FILE_KEYS
             if extra:
                 errs.append(f"{where}: unknown key(s) {sorted(extra)}")
             if "file" not in e or "url" not in e:
@@ -421,10 +707,12 @@ def validate_catalog(obj) -> list[str]:
                 if msg:
                     errs.append(f"{where}: {msg}")
             if "sha256" in e and not (isinstance(e["sha256"], str)
-                                      and re.fullmatch(r"[0-9a-fA-F]{64}", e["sha256"])):
+                                      and _SHA256.fullmatch(e["sha256"])):
                 errs.append(f"{where}: sha256 must be 64 hex characters")
+            if "size" in e and not _size_ok(e["size"]):
+                errs.append(f"{where}: size must be an integer ≥ 1")
             continue
-        extra = keys - {"match", "paths"}
+        extra = keys - _MATCH_SHAPE
         if extra:
             errs.append(f"{where}: unknown key(s) {sorted(extra)}")
         m = e.get("match")
@@ -808,6 +1096,8 @@ def plan(needs, source_index: dict, dest_index: dict, manifest: dict, url_catalo
                 continue
             e = {"path": p, "size": size_of(p), "source": "url" if p in urls else "lan"}
             if p in urls:
+                # a display label only (the card's `HF auto` badge) — no plan state
+                e["origin"] = "hf-auto" if urls[p].get("origin") == "hf-auto" else "catalog"
                 e["url"] = urls[p]["url"]
                 if urls[p].get("sha256"):
                     e["sha256"] = urls[p]["sha256"]

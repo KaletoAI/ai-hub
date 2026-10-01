@@ -448,11 +448,14 @@ class Deps:
     # service's BACKEND ID), a hash of exactly that input (candidates + catalog), the
     # source's files, the public download sources and the Hugging Face token. The two
     # alias readers are blocking store reads — the controller calls them in a worker
-    # thread.
+    # thread. `url_catalog` is handed the SAME source index the plan is built from
+    # (`modelsync.url_catalog(catalog, source_index)`): it drops entries the listing has
+    # outgrown and derives the share's Hugging Face cache files — a second read of the
+    # listing could judge them against another one.
     alias_needs: Callable[[str], list] = field(default=lambda bid: [])
     alias_signature: Callable[[str], str] = field(default=lambda bid: "")
     source_index: Callable[[], dict] = field(default=lambda: {})
-    url_catalog: Callable[[], dict] = field(default=lambda: {})
+    url_catalog: Callable[[dict], dict] = field(default=lambda src: {})
     hf_token: Callable[[], str] = field(default=lambda: "")
     # the LAN model share (P3): `LanSource` (main: one per gateway; its `cached` is
     # `source_index`) and the stream runner. None = no LAN source.
@@ -2300,8 +2303,8 @@ class Controller:
             man = normalize_manifest(self.state.manifests.get(snapshot_id) or {})
             dest = {k: v["size"] for k, v in man.items() if isinstance(v.get("size"), int)}
             def inputs():                       # blocking store reads: off the loop
-                return (self.deps.alias_needs(bid) or [], self.deps.source_index() or {},
-                        self.deps.url_catalog() or {})
+                src = self.deps.source_index() or {}
+                return self.deps.alias_needs(bid) or [], src, self.deps.url_catalog(src) or {}
             needs, src, urls = await asyncio.to_thread(inputs)
             p = modelsync.plan(needs, self._with_head_sizes(src, urls), dest, man, urls)
             return int(p["need_total"])
@@ -4196,8 +4199,8 @@ class Controller:
         man.update(copy.deepcopy(self._unsaved))
 
         def inputs():
-            return (self.deps.alias_needs(bid) or [], self.deps.source_index() or {},
-                    self.deps.url_catalog() or {})
+            src = self.deps.source_index() or {}
+            return self.deps.alias_needs(bid) or [], src, self.deps.url_catalog(src) or {}
         needs, src, urls = await asyncio.to_thread(inputs)
         self._plan_inputs = (needs, src, dest, man, urls)
         return modelsync.plan(needs, self._with_head_sizes(src, urls), dest, man, urls), man

@@ -432,11 +432,12 @@ class Plan(unittest.TestCase):
         by = {f["path"]: f for f in p["fetch"]}
         self.assertEqual(by["models/vae/v.safetensors"],
                          {"path": "models/vae/v.safetensors", "size": 100, "source": "url",
-                          "url": "https://e/v", "sha256": "a" * 64, "aliases": ["x"]})
+                          "origin": "catalog", "url": "https://e/v", "sha256": "a" * 64,
+                          "aliases": ["x"]})
         # a URL-only file resolves too; its size is unknown until it was downloaded once
         self.assertEqual(by["models/upscale_models/u.pth"],
                          {"path": "models/upscale_models/u.pth", "size": None, "source": "url",
-                          "url": "https://e/u", "aliases": ["x"]})
+                          "origin": "catalog", "url": "https://e/u", "aliases": ["x"]})
         self.assertEqual(by["models/loras/L.safetensors"]["source"], "lan")
         self.assertNotIn("url", by["models/loras/L.safetensors"])
         # once downloaded, the manifest's size is what "present" is measured against
@@ -903,6 +904,331 @@ class Links(unittest.TestCase):
         rows = {f["path"]: f for f in p["per_alias"]["hf"]["files"]}
         self.assertEqual(rows[_SNAP]["size"], 7)
         self.assertNotIn("link", rows[_SNAP])
+
+
+# --- model sources: catalog shapes, "outdated", Stage 1 derivation ----------------------
+
+REV = "0123456789abcdef0123456789abcdef01234567"
+REV2 = "fedcba9876543210fedcba9876543210fedcba98"
+SHA = "ab" * 32
+SHA_B = "cd" * 32
+SHA1 = "ef" * 20
+HFR = "hf-cache/hub/models--org--repo/"
+HF_URL = "https://huggingface.co/org/repo/resolve/" + REV + "/"
+
+
+def snap(rel, rev=REV, repo=HFR):
+    return f"{repo}snapshots/{rev}/{rel}"
+
+
+class DerivedUrls(unittest.TestCase):
+    """Stage 1: an HF-cache file on the share is a public download by its path alone.
+    Every miss here is silent — a wrong URL or a sha that is no content hash makes the
+    instance download, fail the check and fall back to the uplink; a derivation for a
+    layout we do not understand downloads the wrong bytes."""
+
+    def test_top_level_snapshot_link(self):
+        src = {HFR + "blobs/" + SHA: 100, snap("model.safetensors"): {"link": "../../blobs/" + SHA}}
+        self.assertEqual(ms.derived_urls(src), {
+            HFR + "blobs/" + SHA: {"url": HF_URL + "model.safetensors", "sha256": SHA}})
+
+    def test_nested_snapshot_link_goes_through_link_target(self):
+        src = {HFR + "blobs/" + SHA: 100,
+               snap("text_encoder/model.safetensors"): {"link": "../../../blobs/" + SHA}}
+        self.assertEqual(ms.derived_urls(src), {
+            HFR + "blobs/" + SHA: {"url": HF_URL + "text_encoder/model.safetensors",
+                                   "sha256": SHA}})
+        # the two-level target text of a top-level file, written under a nested path,
+        # names snapshots/<rev>/blobs/… — no blob of this repo: nothing derived
+        src = {HFR + "blobs/" + SHA: 100,
+               snap("text_encoder/model.safetensors"): {"link": "../../blobs/" + SHA}}
+        self.assertEqual(ms.derived_urls(src), {})
+
+    def test_git_sha1_blob_is_size_only(self):
+        src = {HFR + "blobs/" + SHA1: 3, snap("config.json"): {"link": "../../blobs/" + SHA1}}
+        self.assertEqual(ms.derived_urls(src), {HFR + "blobs/" + SHA1: {"url": HF_URL + "config.json"}})
+
+    def test_blob_name_neither_sha1_nor_sha256_is_no_layout_we_know(self):
+        for oid in ("abc123", "AB" * 32, SHA + "0", "ab" * 20 + "x"):
+            with self.subTest(oid=oid):
+                src = {HFR + "blobs/" + oid: 3, snap("x.bin"): {"link": "../../blobs/" + oid}}
+                self.assertEqual(ms.derived_urls(src), {})
+
+    def test_revision_must_be_a_40_hex_commit(self):
+        for rev in ("main", REV[:39], REV + "0", REV.upper(), "refs"):
+            with self.subTest(rev=rev):
+                src = {HFR + "blobs/" + SHA: 1, snap("x.bin", rev=rev): {"link": "../../blobs/" + SHA},
+                       snap("y.bin", rev=rev): 5}
+                self.assertEqual(ms.derived_urls(src), {})
+
+    def test_datasets_and_spaces_are_skipped(self):
+        for kind in ("datasets", "spaces"):
+            with self.subTest(kind=kind):
+                r = f"hf-cache/hub/{kind}--org--repo/"
+                src = {r + "blobs/" + SHA: 1, snap("x.bin", repo=r): {"link": "../../blobs/" + SHA},
+                       snap("y.bin", repo=r): 5}
+                self.assertEqual(ms.derived_urls(src), {})
+
+    def test_repo_dir_name_must_split_into_org_and_name(self):
+        for d in ("models--repo", "models--a--b--c", "models--org--re..po", "models--org--",
+                  "models----repo", "models--org--re po", "models--.org--repo", "models--org--repo-",
+                  "model--org--repo"):
+            with self.subTest(d=d):
+                r = f"hf-cache/hub/{d}/"
+                src = {r + "blobs/" + SHA: 1, snap("x.bin", repo=r): {"link": "../../blobs/" + SHA},
+                       snap("y.bin", repo=r): 5}
+                self.assertEqual(ms.derived_urls(src), {})
+        # dots, dashes and underscores inside are fine
+        r = "hf-cache/hub/models--Org_1--Re.po-2/"
+        self.assertEqual(ms.derived_urls({snap("y.bin", repo=r): 5}), {
+            snap("y.bin", repo=r): {"url": f"https://huggingface.co/Org_1/Re.po-2/resolve/{REV}/y.bin"}})
+
+    def test_path_is_percent_encoded_and_passes_url_error(self):
+        rel = "sub dir/my model (v2)#1.safetensors"
+        src = {HFR + "blobs/" + SHA: 9, snap(rel): {"link": "../../../blobs/" + SHA}}
+        got = ms.derived_urls(src)[HFR + "blobs/" + SHA]["url"]
+        self.assertEqual(got, HF_URL + "sub%20dir/my%20model%20%28v2%29%231.safetensors")
+        self.assertEqual(ms._url_error(got), "")
+
+    def test_no_symlink_cache_layout(self):
+        """HF_HUB_DISABLE_SYMLINKS: the snapshot entry is the file itself — URL from the
+        path, no oid to take a sha from."""
+        src = {snap("unet/w.safetensors"): 7, HFR + "refs/main": 40}
+        self.assertEqual(ms.derived_urls(src), {
+            snap("unet/w.safetensors"): {"url": HF_URL + "unet/w.safetensors"}})
+
+    def test_a_link_leaving_its_repo_is_ignored(self):
+        other = "hf-cache/hub/models--o--n/blobs/" + SHA
+        src = {other: 1, snap("x.bin"): {"link": "../../../models--o--n/blobs/" + SHA},
+               HFR + "refs/main": 40, snap("y.bin"): {"link": "../../refs/main"}}
+        self.assertEqual(ms.derived_urls(src), {})
+
+    def test_a_dangling_link_derives_nothing(self):
+        self.assertEqual(ms.derived_urls({snap("x.bin"): {"link": "../../blobs/" + SHA}}), {})
+        # the blob listed as a LINK is no file either
+        self.assertEqual(ms.derived_urls({snap("x.bin"): {"link": "../../blobs/" + SHA},
+                                          HFR + "blobs/" + SHA: {"link": "x"}}), {})
+
+    def test_two_links_onto_one_blob_take_the_first_path(self):
+        src = {HFR + "blobs/" + SHA: 1,
+               snap("b.bin"): {"link": "../../blobs/" + SHA},
+               snap("a.bin", rev=REV2): {"link": "../../blobs/" + SHA},
+               snap("a.bin"): {"link": "../../blobs/" + SHA}}
+        self.assertEqual(ms.derived_urls(src)[HFR + "blobs/" + SHA]["url"], HF_URL + "a.bin")
+
+    def test_only_the_hub_cache_and_no_unusable_paths(self):
+        src = {"models/models--org--repo/snapshots/" + REV + "/x.bin": 5,      # not the HF cache
+               "hf-cache/models--org--repo/snapshots/" + REV + "/x.bin": 5,
+               snap(".cache/x.bin"): 5, snap("x.bin.part"): 5,
+               HFR + "snapshots/" + REV: 5}                                    # no file under rev
+        self.assertEqual(ms.derived_urls(src), {})
+
+    def test_junk_inputs(self):
+        self.assertEqual(ms.derived_urls(None), {})
+        self.assertEqual(ms.derived_urls({snap("x.bin"): "big", snap("y.bin"): True,
+                                          snap("z.bin"): None}), {})
+
+
+DIR = "models/org/thing/"
+
+
+def dir_entry(files, rev=REV, d=DIR, repo="org/thing"):
+    return {"dir": d, "repo": repo, "rev": rev, "files": files}
+
+
+class UrlCatalogSources(unittest.TestCase):
+    """`url_catalog(catalog, source_index)` is what the plan downloads from. An entry
+    the share has outgrown that still counts makes the instance download the OLD file
+    and fail the check; one dropped by mistake syncs gigabytes over the uplink."""
+
+    F = "models/vae/v.safetensors"
+
+    def test_outdated_by_size_is_dropped(self):
+        cat = [{"file": self.F, "url": "https://e/v", "sha256": SHA, "size": 100}]
+        self.assertEqual(ms.url_catalog(cat, {self.F: 100}),
+                         {self.F: {"url": "https://e/v", "sha256": SHA}})
+        self.assertEqual(ms.url_catalog(cat, {self.F: 90}), {})
+        k = ms.source_kinds(cat, {self.F: 90})[self.F]
+        self.assertEqual(k["kind"], "outdated")
+        self.assertIn("size differs", k["reason"])
+
+    def test_no_listing_size_keeps_the_entry(self):
+        cat = [{"file": self.F, "url": "https://e/v", "size": 100}]
+        for idx in ({}, None, {self.F: {"link": "x"}}):
+            with self.subTest(idx=idx):
+                self.assertEqual(ms.url_catalog(cat, idx), {self.F: {"url": "https://e/v"}})
+
+    def test_old_entries_without_size_are_never_outdated(self):
+        cat = [{"file": self.F, "url": "https://e/v", "sha256": SHA}]
+        self.assertEqual(ms.url_catalog(cat, {self.F: 1}), {self.F: {"url": "https://e/v", "sha256": SHA}})
+        self.assertEqual(ms.url_catalog(cat, {self.F: 1}, {self.F: [1, SHA_B]}),
+                         {self.F: {"url": "https://e/v", "sha256": SHA}})
+        self.assertEqual(ms.source_kinds(cat, {self.F: 1})[self.F]["kind"], "url")
+
+    def test_one_arg_call_keeps_the_old_behaviour(self):
+        cat = [{"file": self.F, "url": "https://e/v", "size": 5},
+               dir_entry({"a.bin": [10, None, False]})]
+        self.assertEqual(ms.url_catalog(cat), {
+            self.F: {"url": "https://e/v"},
+            DIR + "a.bin": {"url": f"https://huggingface.co/org/thing/resolve/{REV}/a.bin"}})
+
+    def test_dir_entry_expands_per_file(self):
+        cat = [dir_entry({"a.bin": [10, SHA, False], "sub/b c.json": [5, None, False],
+                          "c.safetensors": [7, SHA_B, True]})]
+        base = f"https://huggingface.co/org/thing/resolve/{REV}/"
+        idx = {DIR + "a.bin": 10, DIR + "sub/b c.json": 5, DIR + "c.safetensors": 7}
+        self.assertEqual(ms.url_catalog(cat, idx), {
+            DIR + "a.bin": {"url": base + "a.bin", "sha256": SHA},
+            DIR + "sub/b c.json": {"url": base + "sub/b%20c.json"},
+            DIR + "c.safetensors": {"url": base + "c.safetensors", "sha256": SHA_B}})
+        kinds = ms.source_kinds(cat, idx)
+        self.assertEqual(kinds[DIR + "c.safetensors"]["provisional"], True)
+        self.assertEqual(kinds[DIR + "a.bin"]["provisional"], False)
+        self.assertEqual({k["origin"] for k in kinds.values()}, {"dir"})
+        # one row outdated: only that file drops out
+        idx[DIR + "a.bin"] = 11
+        got = ms.url_catalog(cat, idx)
+        self.assertNotIn(DIR + "a.bin", got)
+        self.assertEqual(len(got), 2)
+        # a share file under the dir that `files` does not name is no catalog file (lan)
+        idx[DIR + "new.bin"] = 3
+        self.assertNotIn(DIR + "new.bin", ms.source_kinds(cat, idx))
+
+    def test_file_entry_beats_dir_entry_and_falls_back_to_it_when_outdated(self):
+        p = DIR + "a.bin"
+        cat = [{"file": p, "url": "https://mirror/a", "size": 10},
+               dir_entry({"a.bin": [10, SHA, False]})]
+        self.assertEqual(ms.url_catalog(cat, {p: 10}), {p: {"url": "https://mirror/a"}})
+        self.assertEqual(ms.source_kinds(cat, {p: 10})[p]["origin"], "file")
+        cat[0]["size"] = 9                                   # the mirror entry is outdated
+        self.assertEqual(ms.url_catalog(cat, {p: 10})[p]["url"],
+                         f"https://huggingface.co/org/thing/resolve/{REV}/a.bin")
+
+    def test_later_entry_wins_within_a_shape(self):
+        cat = [{"file": self.F, "url": "https://e/1"}, {"file": self.F, "url": "https://e/2"}]
+        self.assertEqual(ms.url_catalog(cat, {})[self.F]["url"], "https://e/2")
+
+    def test_derived_urls_merged_under_explicit_entries(self):
+        blob = HFR + "blobs/" + SHA
+        idx = {blob: 100, snap("m.safetensors"): {"link": "../../blobs/" + SHA},
+               HFR + "blobs/" + SHA1: 3, snap("c.json"): {"link": "../../blobs/" + SHA1}}
+        got = ms.url_catalog([], idx)
+        self.assertEqual(got[blob], {"url": HF_URL + "m.safetensors", "sha256": SHA, "origin": "hf-auto"})
+        self.assertEqual(ms.source_kinds([], idx)[blob]["kind"], "hf-auto")
+        # an operator's mirror beats the derivation
+        cat = [{"file": blob, "url": "https://mirror/m", "size": 100}]
+        self.assertEqual(ms.url_catalog(cat, idx)[blob], {"url": "https://mirror/m"})
+        self.assertEqual(ms.source_kinds(cat, idx)[blob]["kind"], "url")
+        # ... unless it is outdated: then the derivation serves, and says what it replaced
+        cat[0]["size"] = 99
+        self.assertEqual(ms.url_catalog(cat, idx)[blob]["origin"], "hf-auto")
+        k = ms.source_kinds(cat, idx)[blob]
+        self.assertEqual(k["kind"], "hf-auto")
+        self.assertIn("size differs", k["outdated_entry"])
+
+    def test_share_sha_turns_a_differing_entry_outdated(self):
+        p = DIR + "c.safetensors"
+        cat = [dir_entry({"c.safetensors": [7, SHA_B, True]})]
+        self.assertIn(p, ms.url_catalog(cat, {p: 7}, {p: [7, SHA_B]}))          # confirmed
+        self.assertIn(p, ms.url_catalog(cat, {p: 7}, {p: [7, SHA_B.upper()]}))  # case-blind
+        self.assertNotIn(p, ms.url_catalog(cat, {p: 7}, {p: [7, SHA]}))         # share differs
+        k = ms.source_kinds(cat, {p: 7}, {p: [7, SHA]})[p]
+        self.assertEqual(k["kind"], "outdated")
+        self.assertIn("hash differs", k["reason"])
+        # a cached hash of another size describes another file: ignored
+        self.assertIn(p, ms.url_catalog(cat, {p: 7}, {p: [8, SHA]}))
+        # a size-only row has nothing to compare; junk caches are ignored
+        cat = [dir_entry({"c.safetensors": [7, None, False]})]
+        self.assertIn(p, ms.url_catalog(cat, {p: 7}, {p: [7, SHA]}))
+        for junk in (None, [], {p: "x"}, {p: [7]}, {p: [7, 3]}):
+            self.assertIn(p, ms.url_catalog(cat, {p: 7}, junk))
+
+    def test_invalid_entries_are_dropped(self):
+        cat = [{"file": self.F, "url": "https://e/v", "size": 0},
+               dir_entry({"../x": [1, None, False]}),
+               dir_entry({"a.bin": [1, None, False]}, rev="main"), "junk", None]
+        self.assertEqual(ms.url_catalog(cat, {}), {})
+        self.assertEqual(ms.source_kinds(cat, {}), {})
+        self.assertEqual(ms.url_catalog(None, None), {})
+
+    def test_plan_labels_the_origin(self):
+        blob = HFR + "blobs/" + SHA
+        idx = {blob: 100, snap("m.safetensors"): {"link": "../../blobs/" + SHA},
+               HFR + "refs/main": 40, "models/vae/v.safetensors": 5}
+        cat = [{"file": "models/vae/v.safetensors", "url": "https://e/v", "size": 5}]
+        urls = ms.url_catalog(cat, idx)
+        n = ms.alias_need("x", [ms.Ref("3", "VAELoader", "vae_name", "v.safetensors")],
+                          [{"match": {"alias": "x"}, "paths": [HFR]}])
+        p = ms.plan([n], idx, {}, {}, urls)
+        by = {e["path"]: e for e in p["fetch"]}
+        self.assertEqual(by[blob], {"path": blob, "size": 100, "source": "url", "origin": "hf-auto",
+                                    "url": HF_URL + "m.safetensors", "sha256": SHA, "aliases": ["x"]})
+        self.assertEqual(by["models/vae/v.safetensors"]["origin"], "catalog")
+        self.assertEqual(by[HFR + "refs/main"]["source"], "lan")
+        self.assertNotIn("origin", by[HFR + "refs/main"])
+        self.assertEqual(by[snap("m.safetensors")]["source"], "link")
+        self.assertTrue(ms.ready(ms.plan([n], idx, {blob: 100, HFR + "refs/main": 40,
+                                                    "models/vae/v.safetensors": 5,
+                                                    snap("m.safetensors"): {"link": "../../blobs/" + SHA}},
+                                         {}, urls), "x"))
+
+
+class CatalogShapes(unittest.TestCase):
+    """The validator is the gate for both writers of the catalog: a shape it lets through
+    wrongly reaches curl and the plan; one it refuses wrongly blocks a Check & save."""
+
+    def test_new_shapes_accepted(self):
+        ok = [{"file": "models/vae/v.safetensors", "url": "https://e/v", "sha256": SHA, "size": 1},
+              {"file": "models/vae/w.safetensors", "url": "https://e/w", "size": 10 ** 12},
+              dir_entry({"a.bin": [1, None, False], "sub/b.json": [2, SHA, True],
+                         "c d.bin": [3, SHA.upper(), False]}),
+              dir_entry({"x": [1, None, False]}, d="models/a/b/c/", repo="O-1/n_2.v3")]
+        self.assertEqual(ms.validate_catalog(ok), [])
+
+    def test_bad_size(self):
+        for size in (0, -1, "5", 1.0, True, None):
+            with self.subTest(size=size):
+                self.assertTrue(ms.validate_catalog(
+                    [{"file": "models/x", "url": "https://e/x", "size": size}]))
+
+    def test_bad_dir_entries(self):
+        good = {"a.bin": [1, None, False]}
+        bad = {
+            "no files": {"dir": DIR, "repo": "org/thing", "rev": REV},
+            "empty files": dir_entry({}),
+            "files not a map": dir_entry([["a.bin", 1, None, False]]),
+            "no repo": {"dir": DIR, "rev": REV, "files": good},
+            "no rev": {"dir": DIR, "repo": "org/thing", "files": good},
+            "no trailing slash": dir_entry(good, d="models/org/thing"),
+            "hf-cache dir": dir_entry(good, d="hf-cache/hub/models--org--thing/"),
+            "a whole root": dir_entry(good, d="models/"),
+            "escaping dir": dir_entry(good, d="models/../x/"),
+            "dot dir": dir_entry(good, d="models/.cache/"),
+            "token": dir_entry(good, d="hf-cache/token/"),
+            "rev 39 hex": dir_entry(good, rev=REV[:39]),
+            "rev main": dir_entry(good, rev="main"),
+            "rev upper": dir_entry(good, rev=REV.upper()),
+            "unknown key": dict(dir_entry(good), size=5),
+            "mixed with file": dict(dir_entry(good), file="models/x", url="https://e/x"),
+            "mixed with match": dict(dir_entry(good), match={"alias": "a"}, paths=[]),
+        }
+        for repo in ("org", "org/na--me", "org/../x", "-org/x", "org/x.", "org/x/y", "org/x y",
+                     "/x", "org/", 5, "org/x.git", "o" * 97 + "/x"):
+            bad[f"repo {repo!r}"] = dir_entry(good, repo=repo)
+        for rel in ("../x", "/x", "a/", ".hidden/x", "a/.cache/x", "a//b", "", "a\\b", "a\nb"):
+            bad[f"relpath {rel!r}"] = dir_entry({rel: [1, None, False]})
+        for row in ([1, None], [1, None, False, 0], [0, None, False], [1, "abc", False],
+                    [1, None, "no"], [1, None, True], ["1", None, False], [True, None, False],
+                    (1, None, False), {"size": 1}, None):
+            bad[f"row {row!r}"] = dir_entry({"a.bin": row})
+        for why, e in bad.items():
+            with self.subTest(why=why):
+                self.assertTrue(ms.validate_catalog([e]), why)
+
+    def test_dir_entry_errors_name_the_problem(self):
+        errs = ms.validate_catalog([dir_entry({"../x": [1, None, False]}, rev="main")])
+        self.assertTrue(any("rev" in e for e in errs), errs)
+        self.assertTrue(any("../x" in e for e in errs), errs)
 
 
 if __name__ == "__main__":

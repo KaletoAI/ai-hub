@@ -6400,7 +6400,9 @@ def _host_deps() -> "hostctl.Deps":
         # the LAN share's last good listing ({} until pinned and listed), and the share
         # itself for its refresh, the stream and the sha256
         source_index=lan.cached, lan=lan,
-        url_catalog=lambda: modelsync.url_catalog(_modelsync_catalog()),
+        # the catalog's URL sources judged against the SAME listing the plan uses
+        # (outdated entries dropped) plus the share's HF cache derived (Stage 1)
+        url_catalog=lambda src: modelsync.url_catalog(_modelsync_catalog(), src),
         hf_token=_thunder_hf_token, control=sshrun.control)
 
 

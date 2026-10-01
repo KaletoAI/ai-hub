@@ -3834,8 +3834,14 @@ def _catalog_editor(refused: Optional[tuple] = None) -> str:
             "(a node that loads its own model — a hub id needs class AND value), "
             "<code>{\"match\": {\"alias\": …}, \"paths\": []}</code> (an alias without "
             "loader references; <code>[]</code> = needs nothing), "
-            "<code>{\"file\": …, \"url\": \"https://…\", \"sha256\": …}</code> (a "
-            "public download source). Paths start with <code>models/</code> or "
+            "<code>{\"file\": …, \"url\": \"https://…\", \"sha256\": …, \"size\": …}</code> (a "
+            "public download source; <code>size</code> = the share file's, an entry the "
+            "share has outgrown is ignored), "
+            "<code>{\"dir\": \"models/…/\", \"repo\": \"org/name\", \"rev\": "
+            "&lt;40-hex commit&gt;, \"files\": {relpath: [size, sha256|null, provisional]}}</code> "
+            "(a share directory that is one Hugging Face repo). Files in the share's "
+            "Hugging Face cache need no entry: they download from huggingface.co by "
+            "themselves. Paths start with <code>models/</code> or "
             "<code>hf-cache/</code>; a trailing <code>/</code> is a whole directory.</p>"
             + _textarea("catalog", text, rows=16)
             + f'<div class="tacts">{_btn("Save catalog", submit=True, sm=True)}</div>'
