@@ -1601,14 +1601,19 @@ via injected callables, staying hot-reload-safe.
   tab and the startup overlay never see it) — read/written only by
   `store.get_provider_token`/`set_provider_token` ("" deletes the row) and
   `main.provider_token`/`save_provider_token(kind, token)` (unknown provider or a token
-  with whitespace/control characters refused, then `apply_managed_hosts()` so running
-  controllers get it at once). `sync_host_controllers` hands each controller
+  with whitespace/control characters refused; CLEARING refused while any controller of
+  that kind is not idle-off — it reaches every such host at once, and a running one's
+  stop would 401 into `failed` with the instance billing — rotation stays allowed; then
+  `apply_managed_hosts()` so running controllers get it at once). `sync_host_controllers` hands each controller
   `dict(entry, api_key=<its provider's token>)` — hostctl still reads `host["api_key"]`
   — and redacts that token from a constructor's error. `store.set_managed_host` DROPS an
   `api_key`; `get_managed_hosts` still decrypts a legacy one for
   `main.migrate_provider_tokens()` (lifespan, idempotent): a provider without a token takes
-  the first READABLE per-host token (by host name), never overwriting one, then every
-  entry loses its copy; one log line, never the token. Views, summaries and `/health`
+  a READABLE per-host token — a host whose `host_state` record names an instance first
+  (it must stay stoppable), else by host name — never overwriting one, then every entry
+  loses its copy; a dropped token that DIFFERS from the provider's is a WARNING naming
+  the host (a second account's host would otherwise first say so as a 401 at its stop);
+  never the value. `host_view` computes `checklist` only while the host is startable. Views, summaries and `/health`
   carry `api_key_set` (the provider's token set?) and `provider_tokens_info()` `{kind:
   bool}` only. `suggest_host_name(kind)` → the first `<kind>-<n>` that
   `_host_name_refusal` (the name rule + R-W6, shared with `managed_host_refusal`)

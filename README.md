@@ -1256,9 +1256,12 @@ own autostart off). No new dependency — the system `ssh`, `ssh-keygen` and
   *Managed hosts* — **one token per provider**, used by every host of that provider;
   stored encrypted (store setting `provider_token_thunder`), never rendered back (the row
   says *set* / *not set*), never sent to a service, never in `/health`. Blank keeps it,
-  *clear* removes it, and a Save reaches running hosts at once. A store from before
-  this change is migrated at startup: the first readable per-host token becomes the
-  provider token (unless one is set), and every per-host copy is removed.
+  *clear* removes it (refused while a host of that provider is not off — its stop would
+  fail without a token; entering a new token is always possible), and a Save reaches
+  running hosts at once. A store from before this change is migrated at startup: a
+  readable per-host token becomes the provider token (unless one is set) — that of a
+  host with a running instance first — and every per-host copy is removed; a dropped
+  token that differs is logged as a warning naming the host.
 - `ssh` / `ssh-keygen` / `ssh-keyscan` on the gateway host. The gateway generates its
   instance key `thunder.key` (ed25519, one per provider kind: `<kind>.key`) next to
   `store.db` on first need and hands the public half to every create — there is nothing
