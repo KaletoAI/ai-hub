@@ -31,6 +31,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import types
 import unittest
 
 _here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -655,6 +656,42 @@ class Refusals(_StoreCase):
         main.sync_host_controllers()
         self.assertIn("provider", main.managed_host_refusal(
             "vm1", dict(_host(), provider="other"), new=False))
+
+    def _cache_specs(self, name, specs):
+        """`name`'s controller with `/v2/specs` in its price cache (what its background
+        refresh fetched) — a Save reads the cache only, never the network."""
+        c = main.host_controllers[name]
+        c._api = types.SimpleNamespace(cached=lambda k: specs if k == "specs" else None,
+                                       _token=TOKEN)
+        return c
+
+    def test_vcpus_judged_against_the_cached_specs(self):
+        specs = {"specs": {"l40_x1": {"vcpuOptions": [6, 12, 24]}}}
+        self.assertEqual(main.save_managed_host("vm1", _host(gpu_type="l40"), new=True), "")
+        # unknown specs (nothing cached yet): a Save cannot judge — accepted, the start
+        # re-checks before the create
+        self.assertEqual(main.provider_specs("thunder"), None)
+        self.assertEqual(main.save_managed_host("vm1", _host(gpu_type="l40", vcpus=8),
+                                                new=False), "")
+        self._cache_specs("vm1", specs)
+        self.assertEqual(main.provider_specs("thunder"), specs)
+        self.assertIsNone(main.provider_specs("runpod"))
+        # not offered → refused naming what is, nothing stored
+        why = main.save_managed_host("vm1", _host(gpu_type="l40", vcpus=16), new=False)
+        self.assertEqual(why, "l40 ×1 offers vCPUs 6, 12, 24")
+        self.assertEqual(store.get_managed_hosts()["vm1"]["options"]["vcpus"], 8)
+        # a NEW host is judged by another controller's cache (the specs are the provider's)
+        self.assertEqual(main.managed_host_refusal("vm2", _host(gpu_type="l40", vcpus=16)),
+                         "l40 ×1 offers vCPUs 6, 12, 24")
+        # offered, and the blank / the word "included" (stored as "")
+        self.assertEqual(main.save_managed_host("vm1", _host(gpu_type="l40", vcpus=12),
+                                                new=False), "")
+        self.assertEqual(main.save_managed_host("vm1", _host(gpu_type="l40", vcpus="included"),
+                                                new=False), "")
+        self.assertEqual(store.get_managed_hosts()["vm1"]["options"]["vcpus"], "")
+        # a configuration the specs do not list cannot be judged either
+        self.assertEqual(main.save_managed_host("vm1", _host(gpu_type="h100", vcpus=16),
+                                                new=False), "")
 
     def test_save_helper(self):
         self.assertEqual(main.save_managed_host("vm1", _host(), new=True), "")

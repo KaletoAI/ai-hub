@@ -6916,9 +6916,34 @@ def managed_host_refusal(name: str, entry, new: bool = True) -> Optional[str]:
             return ("the provider of a managed host cannot change (its state and "
                     "snapshots belong to it) — delete the host and create a new one")
     opts = e.get("options") if isinstance(e.get("options"), dict) else {}
-    errs = prov[0].options_of({f"opt__{k}": v for k, v in opts.items()})[1]
+    norm, errs, _ = prov[0].options_of({f"opt__{k}": v for k, v in opts.items()})
     if errs:
         return "; ".join(errs)
+    # what the provider's spec list refuses (a vCPU count the GPU configuration does
+    # not offer) — judged against the CACHED specs only; unknown specs cannot judge,
+    # and the start re-checks before the create
+    check = getattr(prov[0], "options_refusal", None)
+    if check is not None:
+        why = check(norm, provider_specs(prov[0].KIND))
+        if why:
+            return why
+    return None
+
+
+def provider_specs(kind: str):
+    """The provider's spec list (`/v2/specs`) as any of its controllers last fetched it
+    (the specs are the provider's, not a host's), None when none has — never a fetch:
+    the Save and the host form read this, and a page view must not wait on the network."""
+    for c in list(host_controllers.values()):
+        if getattr(c, "kind", None) != kind:
+            continue
+        try:
+            specs = c.specs_cached()
+        except Exception as e:              # a cache read, never the Save
+            logger.warning(f"[host {c.name}] specs cache unreadable: {type(e).__name__}")
+            continue
+        if specs is not None:
+            return specs
     return None
 
 
@@ -7315,7 +7340,7 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
            assign_local_port=assign_local_port,
            delete_managed_host=delete_managed_host,
            managed_host_delete_refusal=managed_host_delete_refusal,
-           suggest_host_name=suggest_host_name,
+           suggest_host_name=suggest_host_name, provider_specs=provider_specs,
            provider_tokens=provider_tokens_info, save_provider_token=save_provider_token,
            thunder_default_nodes=_thunder_default_nodes,
            modelsrc_view=modelsrc_view, modelsrc_scan=modelsrc_scan,

@@ -684,6 +684,25 @@ class Panel(_Base):
         self.assertIn("line 0\n", html)                 # the whole ring (200 lines)
         self.assertRegex(html, r"<details[^>]*>\s*<summary>[^<]*log")
 
+    def test_card_facts_show_the_resolved_vcpus(self):
+        # the view's resolved count (running instance, else what a start would use) —
+        # a card saying "8 vCPU" for an included-default host would be wrong
+        def facts():
+            return re.search(r'<div class="tfacts" data-k="host-tc-facts">(.*?)</div>',
+                             self.page()).group(1)
+        opts = dict(_view()["options"], vcpus="")
+        self.views = {"tc": _view(options=opts, vcpus=6)}
+        self.assertIn("6 vCPU", facts())
+        self.views = {"tc": _view(options=opts, vcpus=None)}        # specs unknown
+        self.assertIn("vCPUs included", facts())
+        self.assertNotIn("? vCPU", facts())
+        self.views = {"tc": _view(vcpus=None)}                      # typed 8, no view count
+        self.assertIn("8 vCPU", facts())
+        v = _view(options=opts)                                     # an undriven host's view
+        v.pop("vcpus", None)
+        self.views = {"tc": v}
+        self.assertIn("vCPUs included", facts())
+
     def test_card_log_shows_the_whole_ring(self):
         log = [f"line {i}" for i in range(hostctl._LOG_MAX + 30)]
         self.views = {"tc": _view(log=log)}
@@ -1761,6 +1780,10 @@ class Task16Wiring(unittest.TestCase):
     def test_bound(self):
         self.assertIs(admin._thunder_orphan_snapshots, main.thunder_orphan_snapshots)
 
+    def test_provider_specs_bound(self):
+        # the host form's included-vCPU placeholder reads main's CACHED specs
+        self.assertIs(admin._provider_specs, main.provider_specs)
+
 
 # ── the managed-host form, its save and delete (Task 7) ──────────────────────────────
 
@@ -1822,9 +1845,35 @@ class HostForm(_Base):
                              [str(c) for c in fld["choices"]], fld["key"])
         # the textareas and ints carry the defaults, the nodes the default node list
         self.assertIn(f'name="opt__comfy_commit" value="{SHA}"', f)
-        self.assertIn('name="opt__vcpus" value="8"', f)
+        # vcpus: blank = included (no cached specs here → the bare word)
+        self.assertIn('name="opt__vcpus" value="" placeholder="included"', f)
         self.assertIn("# defaults\nregistry:x@1.0\n</textarea>", f)
         self.assertIn("40-hex", f)                               # the provider's hints
+
+    def test_vcpus_shows_the_included_count_from_the_cached_specs(self):
+        # the count comes from the provider's CACHED specs (bound from main) — a page
+        # view never fetches; the GPU configuration is the one the form shows
+        specs = {"specs": {"l40_x1": {"vcpuOptions": [12, 6, 24]},
+                           "a6000_x1": {"vcpuOptions": [6, 8]}}}
+        asked = []
+
+        def cached(kind):
+            asked.append(kind)
+            return specs
+        self.addCleanup(setattr, admin, "_provider_specs", admin._provider_specs)
+        admin._provider_specs = cached
+        f = self.form({"mhost_new": "1"})
+        self.assertIn('name="opt__vcpus" value="" placeholder="included (6 for a6000 ×1)"', f)
+        self.assertIn("thunder", asked)
+        self.views = {"tc": _view(api_key_set=True, options=dict(
+            _view()["options"], gpu_type="l40", vcpus=""))}
+        f = self.form({"mhost": "tc"})
+        self.assertIn('placeholder="included (6 for l40 ×1)"', f)
+        self.assertIn("blank/included = the GPU configuration's included vCPUs; more "
+                      "are billed extra", f)
+        # no specs cached for the provider: the bare word, never a guessed count
+        admin._provider_specs = lambda kind: None
+        self.assertIn('placeholder="included"', self.form({"mhost": "tc"}))
 
     def test_template_select_offers_auto_first_and_stores_blank(self):
         # Ruling M5: "auto" first, the stored value "" — a fixed comfy-ui default gave
@@ -1886,6 +1935,25 @@ class HostSave(_HostSaveBase):
         self.assertNotIn("api_key", entry)
         self.assertEqual(entry["options"]["gpu_type"], "h100")
         self.assertEqual(entry["options"]["vcpus"], "16")    # main normalizes (options_of)
+
+    def test_vcpus_included_word_and_refused_count(self):
+        specs = {"specs": {"l40_x1": {"vcpuOptions": [6, 12, 24]}}}
+        self.addCleanup(setattr, admin, "_provider_specs", admin._provider_specs)
+        admin._provider_specs = lambda kind: specs
+        # the word the form may send goes to main as typed (main stores "")
+        self.post(_host_form(opt__vcpus="included", opt__gpu_type="l40", opt__num_gpus="1"))
+        self.assertEqual(self.saved_hosts[-1][1]["options"]["vcpus"], "included")
+        # a refused Save re-renders it as the blank it stands for, with the count
+        self.save_refusal = "disk reserve GB: '-1' is not a whole number ≥ 0"
+        body = self.post(_host_form(opt__vcpus="included", opt__gpu_type="l40",
+                                    opt__num_gpus="1", opt__reserve_gb="-1"), status=400).text
+        self.assertIn('name="opt__vcpus" value="" placeholder="included (6 for l40 ×1)"', body)
+        # a count the configuration does not offer: the 400 names what is, as typed
+        self.save_refusal = "l40 ×1 offers vCPUs 6, 12, 24"
+        body = self.post(_host_form(opt__vcpus="8", opt__gpu_type="l40", opt__num_gpus="1"),
+                         status=400).text
+        self.assertIn("l40 ×1 offers vCPUs 6, 12, 24", body)
+        self.assertIn('name="opt__vcpus" value="8"', body)
 
     def test_refused_save_is_400_with_the_form_as_typed(self):
         self.save_refusal = "vcpus: 'lots' is not a whole number ≥ 1"

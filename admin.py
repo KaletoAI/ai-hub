@@ -212,6 +212,9 @@ _managed_host_delete_refusal: Callable[[str], Optional[str]] = \
 # `<kind>-<n>` by the Save's own rules), the provider tokens as {kind: set?} (never a
 # value) and their Save ((kind, token) → refusal, "" = saved; "" as the token removes it).
 _suggest_host_name: Callable[[str], str] = lambda kind: ""
+# provider kind → its CACHED spec list (main.provider_specs: what a controller last
+# fetched, None = none) — the host form's "included (6 for l40 ×1)"; never a fetch
+_provider_specs: Callable = lambda kind: None
 _provider_tokens: Callable[[], dict] = lambda: {}
 _save_provider_token: Callable = None
 # [(name, view)] of hosts up for more than 24 h — in memory only (the Dashboard polls
@@ -3556,6 +3559,17 @@ def _bootstrap_running_html(k: str, br: dict) -> str:
 _CHECK_LINKS = {"token": "/ui/server?sub=keys", "lan": "/ui/server?sub=models"}
 
 
+def _vcpu_fact(resolved, option) -> str:
+    """The card's vCPU fact: the RESOLVED count (the running instance's, else what a
+    start would use — `Controller.vcpus_view`), else the option as typed; a blank option
+    whose count nobody knows yet reads "vCPUs included", never a made-up number."""
+    if isinstance(resolved, int) and not isinstance(resolved, bool) and resolved > 0:
+        return f"{resolved} vCPU"
+    if option in (None, ""):
+        return "vCPUs included"
+    return f"{_esc(option)} vCPU"
+
+
 def _host_card(name: str, v: dict) -> str:
     """One managed host's lifecycle card: phase, cost, snapshot, the service table, the
     model sync, the log. Every row carries a `data-k` (the live morph matches by key),
@@ -3607,7 +3621,7 @@ def _host_card(name: str, v: dict) -> str:
                         f"{n} job{'s' if n != 1 else ''} to finish before the snapshot.</p>")
     t = v.get("options") if isinstance(v.get("options"), dict) else {}
     gpu = f"{_esc(t.get('gpu_type') or '?')} ×{_esc(t.get('num_gpus') or 1)}"
-    facts = [f"GPU {gpu}", f"{_esc(t.get('vcpus') or '?')} vCPU"]
+    facts = [f"GPU {gpu}", _vcpu_fact(v.get("vcpus"), t.get("vcpus"))]
     if v.get("disk_gb"):
         facts.append(f"disk {_esc(v['disk_gb'])} GB")
     if v.get("uptime_s"):
@@ -4055,20 +4069,39 @@ def _managed_hosts_section(views: list) -> str:
 _OPTION_PREFILL = {("thunder", "nodes"): lambda: _thunder_default_nodes()}
 
 
-def _option_control(fld: dict, value) -> str:
-    """One provider option (`OPTION_FIELDS` entry) as its form control `opt__<key>`."""
+def _option_control(fld: dict, value, blank: str = "") -> str:
+    """One provider option (`OPTION_FIELDS` entry) as its form control `opt__<key>`.
+    `blank` = what an empty field means ("included (6 for l40 ×1)"), the placeholder."""
     name, t = f"opt__{fld['key']}", fld.get("type")
     if isinstance(value, (list, tuple)):
         value = "\n".join(str(x) for x in value)
     value = "" if value is None else str(value)
+    # a typed alias ("auto", "included") shows as the value it stands for ("")
+    value = (fld.get("aliases") or {}).get(value, value)
     if t == "select":
-        # a typed alias ("auto") selects the value it stands for ("")
-        value = (fld.get("aliases") or {}).get(value, value)
         labels = fld.get("choice_labels") or {}
         return _select(name, [(c, labels.get(c, c)) for c in fld.get("choices") or []], value)
     if t == "textarea":
         return _textarea(name, value, rows=6)
-    return _inp(name, value, placeholder=str(fld.get("default", "")))    # int / text
+    ph = blank or fld.get("blank_label") or str(fld.get("default", ""))
+    return _inp(name, value, placeholder=ph)                              # int / text
+
+
+def _blank_labels(kind: str, mod, values: dict) -> dict:
+    """{option key: what its blank means} from the provider's `blank_label` over the
+    CACHED specs (`_provider_specs` — a page view never fetches) and the configuration
+    the form shows; {} when the provider has no such rule or anything fails (the field
+    then says its static `blank_label`)."""
+    fn = getattr(mod, "blank_label", None)
+    if fn is None:
+        return {}
+    try:
+        specs = _provider_specs(kind)
+        norm = mod.options_of({f"opt__{k}": v for k, v in values.items()})[0]
+        return {f["key"]: str(fn(f["key"], norm, specs) or "") for f in mod.OPTION_FIELDS}
+    except Exception as e:                              # noqa: BLE001 — a placeholder
+        logger.warning(f"ui: option placeholder for {kind} failed: {type(e).__name__}: {e}")
+        return {}
 
 
 def _managed_host_form(name: str = "", new: bool = True, provider: str = "",
@@ -4127,6 +4160,7 @@ def _managed_host_form(name: str = "", new: bool = True, provider: str = "",
                          "it once it is off")
     else:
         out += '<div class="grouphdr">What to rent at Start</div>'
+        values = {}
         for fld in prov[0].OPTION_FIELDS:
             key = fld["key"]
             if key in typed:
@@ -4141,7 +4175,12 @@ def _managed_host_form(name: str = "", new: bool = True, provider: str = "",
                     val = fld.get("default")
             else:
                 val = fld.get("default")
-            out += _field(fld.get("label") or key, _option_control(fld, val),
+            values[key] = val
+        blanks = _blank_labels(kind, prov[0], values)
+        for fld in prov[0].OPTION_FIELDS:
+            key = fld["key"]
+            out += _field(fld.get("label") or key,
+                          _option_control(fld, values[key], blanks.get(key, "")),
                           hint=fld.get("hint") or "")
     out += ("<p class='hint'>Label and GPU policy of this box: its row in "
             "<b>Hosts · GPU policy</b>.</p></form>")
