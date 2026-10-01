@@ -1973,7 +1973,7 @@ via injected callables, staying hot-reload-safe.
   drops the blocked aliases — the ones most worth seeing), a link credited to the file it
   points at; per row `kind` from `source_kinds` (absent = `lan`), `entry_key` (what
   `remove_source` takes: the path, or the dir entry whose `files` names it —
-  `_dir_entry_of`), `dir_entry`/`dir_repo` (a LAN file under a dir source whose check
+  `_dir_entries_by_path`, validated once per rebuild), `dir_entry`/`dir_repo` (a LAN file under a dir source whose check
   predates it) and `aliases` `[[alias, blocked reason]]`. BLOCKING and memoised on (the
   ComfyUI backend names, `_overview_alias_key` — ONE alias read and ONE dump over every
   candidate on them, so a memo hit stays cheap — the catalog hash, `lan.generation`,

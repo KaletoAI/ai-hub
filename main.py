@@ -7032,8 +7032,9 @@ def model_sources_view() -> dict:
     file: its alias is credited to the file it points at. Plus `listed` (the share has
     been listed) and `backends` (the ComfyUI backends planned over).
 
-    BLOCKING and memoised on (every ComfyUI backend's alias signature, the catalog hash,
-    the listing generation, the sha-cache generation): call it via `asyncio.to_thread`
+    BLOCKING and memoised on (the ComfyUI backend names, `_overview_alias_key` — one alias
+    read and one dump —, the catalog hash, the listing generation, the sha-cache
+    generation): call it via `asyncio.to_thread`
     (`model_sources_overview`). Never starts a hash or a listing."""
     lan = modelsrc()
     names = _comfy_backend_names()
