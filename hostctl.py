@@ -286,7 +286,7 @@ _NOT_IN_SOURCE = "not in source: "
 # the LAN model share (spec "Quell-Runner (LAN)", "Übertragung LAN"). There is NO
 # default share host: a baked-in LAN address told every operator to set up a user on
 # one particular (hypervisor) box. Empty = not configured, and nothing reaches ssh.
-SRC_UNSET = "LAN model source not configured — enter the share host below"
+SRC_UNSET = "LAN model source not configured — enter the share host under Server → Models"
 # = main._VOICE_HOST_RE (pinned by a test): `[user@]host` of plain characters — no
 # leading `-`, no spaces or quotes; it reaches an ssh argv (after `--`, but still)
 _SRC_HOST_RE = re.compile(r"^(?:[A-Za-z0-9_][A-Za-z0-9._-]*@)?[A-Za-z0-9_][A-Za-z0-9._-]*$")
@@ -3112,7 +3112,8 @@ class Controller:
         """The card's "what a Start needs" list, in the order the operator sets it up:
         `{ok, text, required[, key]}` — the provider token (`key: "token"`, which the
         card links to Server → API Keys), an attached backend that can run, and (only
-        with a ComfyUI service) the LAN model source, which is optional: only
+        with a ComfyUI service) the LAN model source (`key: "lan"`, linked to Server →
+        Models), which is optional: only
         files no URL/catalog entry provides need it. Not part of `view()`: the LAN check
         reads the store, and `view()` runs every few seconds for the Dashboard."""
         name = self._prov.NAME
@@ -3142,7 +3143,8 @@ class Controller:
             except Exception as e:      # a card line, never the card
                 self._log(f"LAN source check failed: {_errtext(e)}")
                 ok = False
-            items.append({"ok": ok, "required": False,
+            # `key: "lan"`: the card links it to Server → Models, where it is set up
+            items.append({"ok": ok, "required": False, "key": "lan",
                           "text": "LAN model source " + ("usable" if ok else "not usable")
                                   + " — only needed for model files that no URL/catalog "
                                     "entry provides"})
@@ -4035,9 +4037,10 @@ class Controller:
         return lan is not None and lan.usable()
 
     def _lan_why(self) -> str:
-        """Why the LAN source is not usable, for alias status / 503 texts. The card's
-        "enter the share host below" means nothing in an API answer, so a blank host
-        reads "not configured" here."""
+        """Why the LAN source is not usable, for alias status / 503 texts. A client of
+        the API cannot act on "enter the share host under Server → Models" (a console
+        place), so a blank host reads "not configured" here — the card links its
+        "waiting for LAN source" badge to that tab instead."""
         lan = self.deps.lan
         why = lan.problem() if lan is not None else ""
         return "not configured" if why in ("", SRC_UNSET) else why

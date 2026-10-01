@@ -85,9 +85,12 @@ DEFAULT_TAB = "dashboard"
 # register here; the parent page dispatches on `sub` and passes
 # _page(..., subnav=_subnav(parent, sub)) so the bar renders under the header.
 SUBTABS = {"playground": [("chat", "Chat"), ("media", "Media"), ("voice", "Voice")],
-           # Server: what applies live, what needs a restart, and every secret the
-           # server holds (master key, provider tokens, HF token) — one form per key.
-           "server": [("runtime", "Runtime"), ("restart", "Restart"), ("keys", "API Keys")],
+           # Server: what applies live, what needs a restart, every secret the server
+           # holds (master key, provider tokens, HF token) — one form per key — and the
+           # gateway-wide model settings (the ONE LAN model source and the model-sync
+           # catalog every managed host of every provider reads).
+           "server": [("runtime", "Runtime"), ("restart", "Restart"), ("keys", "API Keys"),
+                      ("models", "Models")],
            # Aliases = what used to be split over two tabs: the editor (Mapping) and the
            # live alias→route overview (Input & Routing → Chat/Media aliases). The
            # overview is the right column while no alias is picked.
@@ -2278,22 +2281,18 @@ def _host_prefill(qp, binfo: list) -> Optional[dict]:
 
 
 async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
-                         catalog_refused: Optional[tuple] = None,
-                         modelsrc_refused: Optional[tuple] = None,
                          notice: Optional[str] = None) -> HTMLResponse:
     """The Backends tab; `detail` replaces the right column (a refused Save, re-rendered
     — then never live: the page's URL is the POST action, which a GET poll cannot fetch).
-    `catalog_refused` = (text, reasons) of a refused model-sync catalog Save, likewise;
-    `modelsrc_refused` = (host as typed, reason) of a refused `modelsrc_host` Save,
-    `notice` = why a POST action was refused (a managed-host delete), shown on top."""
+    `notice` = why a POST action was refused (a managed-host delete), shown on top. (The
+    LAN model source and the catalog — and their refusals — are Server → Models.)"""
     edit_id = qp.get("edit", "")
     # Captured NOW: every branch below assigns `detail`, so testing it at the end made
     # the tab never live — drain, scan and a running managed host all froze.
     # Live only on the plain list: an open editor (edit/new/host form) or a refused Save
     # stays static — the morph's attribute sync would reset every visibility the type
     # select's handler set (switch to comfyui, and 3 s later its panes vanish).
-    static = (detail is not None or catalog_refused is not None or bool(edit_id)
-              or modelsrc_refused is not None
+    static = (detail is not None or bool(edit_id)
               or notice is not None or bool(qp.get("new")) or bool(qp.get("host"))
               or bool(qp.get("mhost")) or bool(qp.get("mhost_new")))
     binfo = _gateway_info().get("backends", [])
@@ -2401,7 +2400,7 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
                  + msg_html
                  + f"<p class='hint'>Edit a backend to manage it here (editing a config one creates an "
                  f"editable copy that overrides it).</p>{items}"
-                 + _managed_hosts_section(tviews, catalog_refused, modelsrc_refused)
+                 + _managed_hosts_section(tviews)
                  + _hosts_panel(binfo, "" if qp.get("new") else qp.get("host", ""), tviews)
                  + _scan_panel(scan_st))
     hosts = sorted({b["host"] for b in binfo if b.get("host")})
@@ -3252,7 +3251,9 @@ def _sync_status(r: dict) -> str:
     if other:
         return f'<span class="bad">blocked: {_esc("; ".join(other))}</span>'
     if blocked:
-        return _badge("waiting for LAN source", "warn", "; ".join(blocked))
+        # configured in Server → Models (the LAN model source is the gateway's)
+        return ("<a href='/ui/server?sub=models'>"
+                + _badge("waiting for LAN source", "warn", "; ".join(blocked)) + "</a>")
     need, have = _nbytes(r.get("need_bytes")), _nbytes(r.get("have_bytes"))
     pct = min(100, have * 100 // need) if need else 0
     return _badge(f"syncing {pct} %", "warn")
@@ -3550,6 +3551,10 @@ def _bootstrap_running_html(k: str, br: dict) -> str:
     return f'<div data-k="{_esc(k)}-bsrun">' + "".join(out) + "</div>"
 
 
+# a checklist item's `key` (hostctl.Controller.checklist) → where it is set up
+_CHECK_LINKS = {"token": "/ui/server?sub=keys", "lan": "/ui/server?sub=models"}
+
+
 def _host_card(name: str, v: dict) -> str:
     """One managed host's lifecycle card: phase, cost, snapshot, the service table, the
     model sync, the log. Every row carries a `data-k` (the live morph matches by key),
@@ -3691,12 +3696,14 @@ def _host_card(name: str, v: dict) -> str:
     if ck:
         # what a Start needs, in setup order — above the service table and its "add"
         # buttons it points to. ✓ done · ✗ required and missing · – optional and missing
-        # a missing provider token links to where it is entered (Server → API Keys)
+        # a missing item links to where it is set up: the provider token (Server → API
+        # Keys), the LAN model source (Server → Models)
         li = "".join(
             f'<li data-k="{_esc(k)}-check-{n}">'
             f'{"✓" if i.get("ok") else ("✗" if i.get("required") else "–")} '
-            + (f"<a href='/ui/server?sub=keys'>{_esc(i.get('text') or '')}</a>"
-               if i.get("key") == "token" and not i.get("ok") else _esc(i.get('text') or ''))
+            + (f"<a href='{_CHECK_LINKS[i.get('key')]}'>{_esc(i.get('text') or '')}</a>"
+               if i.get("key") in _CHECK_LINKS and not i.get("ok")
+               else _esc(i.get('text') or ''))
             + "</li>" for n, i in enumerate(ck))
         rows.append(f'<ul class="hint" data-k="{_esc(k)}-check" '
                     f'style="list-style:none;padding-left:0;margin:4px 0">{li}</ul>')
@@ -4012,24 +4019,29 @@ _MHOST_GUIDE = ("<a href='/ui/server?sub=keys'>1. Enter the provider's API token
                 "3. Add a backend on the host's card · 4. Start")
 
 
-def _managed_hosts_section(views: list, catalog_refused: Optional[tuple] = None,
-                           modelsrc_refused: Optional[tuple] = None) -> str:
+# The LAN model source and the model-sync catalog are the GATEWAY's (one for every
+# managed host of every provider): they live in Server → Models since 2026-10-01, and
+# the section only points there. A constant, rendered raw (its only markup is the link).
+_MHOST_MODELS = ('<p class="muted" data-k="hosts-models">LAN model source and model '
+                 'catalog: <a href="/ui/server?sub=models">Server → Models</a></p>')
+
+
+def _managed_hosts_section(views: list) -> str:
     """The Hosts area's managed hosts, ALWAYS rendered (the order is token → host, so
     the guide cannot wait for a host): the 4-step guide (step 1 links to Server → API
-    Keys, where the provider tokens and the HF token live), "+ Managed host", one
-    lifecycle card per host, the orphaned snapshots (with hosts), then the LAN model
-    source and the model-sync catalog."""
+    Keys, where the provider tokens and the HF token live), the pointer to Server →
+    Models (LAN model source, catalog), "+ Managed host", one lifecycle card per host
+    and the orphaned snapshots (with hosts) — per-host things only."""
     cards = "".join(_host_card(n, v) for n, v in views)
     intro = ("" if views else
              "<p class='hint'>A managed host is a rented GPU machine the gateway starts and "
              "stops for you (its <b>provider</b>, such as Thunder Compute). "
              "Backends run on it by naming it as their host.</p>")
     extra = _orphan_snaps_block() if views else ""
-    extra += _modelsrc_block(modelsrc_refused)
-    extra += _catalog_editor(catalog_refused)
     # not `.bar`: that one is sticky, and a second sticky bar would slide over the list's
     return ('<div data-sk="mhosts"><div class="grouphdr" style="margin-top:18px">Managed '
             f'hosts</div><p class="hint" data-k="hosts-guide">{_MHOST_GUIDE}</p>'
+            + _MHOST_MODELS
             + '<div style="display:flex;align-items:center;gap:14px;margin-top:10px">'
             '<div style="flex:1"></div>'
             f'{_btn("+ Managed host", "/ui/backends?mhost_new=1", sm=True)}</div>'
@@ -4187,6 +4199,12 @@ def _hosts_msg(msg: str) -> RedirectResponse:
     return RedirectResponse("/ui/backends?msg=" + _q(msg[:600]), status_code=303)
 
 
+def _models_msg(msg: str) -> RedirectResponse:
+    """A LAN-source or catalog action's answer → Server → Models, where those blocks
+    live (the Backends tab only points there since 2026-10-01)."""
+    return RedirectResponse("/ui/server?sub=models&msg=" + _q(msg[:600]), status_code=303)
+
+
 async def _host_post(request: Request, action: str, per_service: bool = False):
     """A card action: the host as form field `host` (or in the query, which is how the
     buttons on the page's action form carry it), a service's backend id as `bid`; the
@@ -4265,7 +4283,7 @@ async def hosts_modelsrc_scan(request: Request):
         except Exception as e:                          # noqa: BLE001 — say it, don't 500
             msg = f"host key not fetched: {type(e).__name__}: {e}"
     logger.info(f"ui: LAN source host-key scan → {msg}")
-    return _hosts_msg(msg)
+    return _models_msg(msg)
 
 
 async def hosts_modelsrc_pin(request: Request):
@@ -4283,7 +4301,7 @@ async def hosts_modelsrc_pin(request: Request):
         except Exception as e:                          # noqa: BLE001
             msg = f"host key not pinned: {type(e).__name__}: {e}"
     logger.info(f"ui: LAN source host-key pin → {msg}")
-    return _hosts_msg(msg)
+    return _models_msg(msg)
 
 
 async def hosts_modelsrc_list(request: Request):
@@ -4297,7 +4315,7 @@ async def hosts_modelsrc_list(request: Request):
         except Exception as e:                          # noqa: BLE001 — say it, don't 500
             msg = f"not listed: {type(e).__name__}: {e}"
     logger.info(f"ui: LAN source list → {msg}")
-    return _hosts_msg(msg)
+    return _models_msg(msg)
 
 
 async def hosts_catalog_save(request: Request):
@@ -4316,10 +4334,9 @@ async def hosts_catalog_save(request: Request):
         except Exception as e:                          # noqa: BLE001 — refused, not a 500
             errs = [f"catalog not saved: {type(e).__name__}: {e}"]
     if errs:
-        return await _backends_view(request.query_params, catalog_refused=(text, errs),
-                                    status=400)
+        return _server_view(request, "models", status=400, catalog_refused=(text, errs))
     logger.info(f"ui: model-sync catalog saved ({len(cat)} entries)")
-    return _hosts_msg(f"model-sync catalog saved ({len(cat)} entries)")
+    return _models_msg(f"model-sync catalog saved ({len(cat)} entries)")
 
 
 async def hosts_modelsrc_host(request: Request):
@@ -4328,18 +4345,18 @@ async def hosts_modelsrc_host(request: Request):
     f = await _form(request)
     v = (f.get("modelsrc_host") or "")
     if _save_modelsrc_host is None:
-        return _hosts_msg("modelsrc_host cannot be saved here")
+        return _models_msg("modelsrc_host cannot be saved here")
     try:
         err = str(_save_modelsrc_host(v) or "")
     except Exception as e:                              # noqa: BLE001 — refused, not a 500
         err = f"modelsrc_host not saved: {type(e).__name__}: {e}"
     if err:
-        return await _backends_view(request.query_params, modelsrc_refused=(v, err), status=400)
+        return _server_view(request, "models", status=400, modelsrc_refused=(v, err))
     msg = (f"modelsrc_host saved: {v.strip()} — fetch and confirm its host key, then "
            "List now" if v.strip()
            else "modelsrc_host cleared — no LAN source is configured")
     logger.info(f"ui: {msg}")
-    return _hosts_msg(msg)
+    return _models_msg(msg)
 
 
 # ── Tab: Input ──────────────────────────────────────────────────────────────────
@@ -9717,12 +9734,28 @@ def _srv_keys_body(st: dict, key_errs: Optional[dict] = None,
             "tab.</p>")
 
 
+def _srv_models_body(catalog_refused: Optional[tuple] = None,
+                     modelsrc_refused: Optional[tuple] = None) -> str:
+    """Server → Models: what the model sync of EVERY managed host reads — the one LAN
+    model source (`_modelsrc_block`) and the model-sync catalog (`_catalog_editor`).
+    Static: each action redirects back here with its answer as the banner (List now
+    shows the fresh listing), and with every host off nothing else moves."""
+    return ('<div class="formbar"><h2>Models</h2></div>'
+            "<p class='hint'>For the model sync of every managed host: model files only "
+            "the LAN share has come from the <b>LAN model source</b>; the <b>catalog</b> "
+            "names what no workflow does. Per-host sync state is on each host's card in "
+            "<a href='/ui/backends'>Backends</a>.</p>"
+            + _modelsrc_block(modelsrc_refused) + _catalog_editor(catalog_refused))
+
+
 def _server_view(request: Request, sub: str = "", status: int = 200,
                  typed: Optional[dict] = None, errs=(), key_errs: Optional[dict] = None,
-                 notice: Optional[str] = None) -> HTMLResponse:
-    """The Server tab: Runtime | Restart | API Keys (`SUBTABS["server"]`, first = default).
-    A refused Save re-renders its own sub-tab with `typed`/`errs` (runtime/restart) or
-    `key_errs`/`notice` (keys) and answers `status` 400."""
+                 notice: Optional[str] = None, catalog_refused: Optional[tuple] = None,
+                 modelsrc_refused: Optional[tuple] = None) -> HTMLResponse:
+    """The Server tab: Runtime | Restart | API Keys | Models (`SUBTABS["server"]`, first
+    = default). A refused Save re-renders its own sub-tab with `typed`/`errs`
+    (runtime/restart), `key_errs`/`notice` (keys) or `catalog_refused`/`modelsrc_refused`
+    (models: the text / host as typed and the reasons) and answers `status` 400."""
     subs = [k for k, _ in SUBTABS["server"]]
     sub = sub if sub in subs else subs[0]
     qp = request.query_params
@@ -9733,6 +9766,11 @@ def _server_view(request: Request, sub: str = "", status: int = 200,
         banner = "<p class='ok-banner'>✓ Saved — runtime settings applied live.</p>"
     elif status == 200 and saved == "restart" and sub == "restart":
         banner = "<p class='ok-banner'>✓ Saved — port/stats/jobs changes need a <b>restart</b> to apply.</p>"
+    elif status == 200 and msg and sub == "models":
+        # a LAN-source/catalog action's answer may be a refusal ("host key not fetched:
+        # …", "not listed: …") — neutral, as it was on the Backends tab, never the ✓ style
+        banner = (f"<p class='hint' role='status' data-k='server-msg'>"
+                  f"<b>{_esc(msg[:600])}</b></p>")
     elif status == 200 and msg:
         banner = (f"<p class='ok-banner' role='status' data-k='server-msg'>"
                   f"{_esc(msg[:600])}</p>")
@@ -9748,6 +9786,8 @@ def _server_view(request: Request, sub: str = "", status: int = 200,
         content = _srv_runtime_form(st, typed, errs)
     elif sub == "restart":
         content = _srv_restart_form(st, typed, errs)
+    elif sub == "models":
+        content = _srv_models_body(catalog_refused, modelsrc_refused)
     else:
         content = _srv_keys_body(st, key_errs, notice)
     # intro/banner live inside the column (not as a sibling before .cols) so the sticky
@@ -9937,10 +9977,18 @@ async def mapping_export_all(request: Request):
 # Where a GET to a POST-only action sends the operator back to, when the parent path
 # is not itself a page.
 _ACTION_BACK = {"/ui/chat": "/ui/aliases?sub=chat", "/ui/ipalias": "/ui/users",
-                "/ui/mapping": "/ui/aliases", "/ui/hosts/managed": "/ui/backends"}
+                "/ui/mapping": "/ui/aliases", "/ui/hosts/managed": "/ui/backends",
+                # these stayed under /ui/hosts/managed/, their page is Server → Models
+                "/ui/hosts/managed/catalog": "/ui/server?sub=models",
+                "/ui/hosts/managed/modelsrc-scan": "/ui/server?sub=models",
+                "/ui/hosts/managed/modelsrc-pin": "/ui/server?sub=models",
+                "/ui/hosts/managed/modelsrc-list": "/ui/server?sub=models",
+                "/ui/hosts/managed/modelsrc-host": "/ui/server?sub=models"}
 
 
 def _action_back(path: str, get_res: list) -> str:
+    if path in _ACTION_BACK:                # an action whose page is not its parent's
+        return _ACTION_BACK[path]
     parent = path.rsplit("/", 1)[0]
     if parent in _ACTION_BACK:
         return _ACTION_BACK[parent]

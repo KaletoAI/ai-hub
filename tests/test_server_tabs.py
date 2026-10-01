@@ -1,5 +1,6 @@
-"""The Server tab: three sub-tabs (Runtime | Restart | API Keys) and every secret the
-server holds in ONE place.
+"""The Server tab: four sub-tabs (Runtime | Restart | API Keys | Models), every secret the
+server holds in ONE place, and the gateway-wide model settings (LAN model source, model
+catalog) in another.
 
 Why this fails SILENTLY:
 - A sub-tab whose form renders on the wrong tab, or a Save that lands on another tab,
@@ -14,6 +15,9 @@ Why this fails SILENTLY:
   the old one leaves a rotated key's console sessions valid for 12 h.
 - A link to "the setting in the Server tab" that opens the DEFAULT sub-tab sends the
   operator looking for a field that is not on the page.
+- The LAN model source and the catalog are one per GATEWAY (every managed host of every
+  provider reads them): an action that still lands on the Backends tab shows its answer
+  where the block no longer is — the operator sees no result and presses again.
 - `server_save` turned "1.5" in an int field (or "abc") into "" = unset, i.e. the
   default — a cap the operator typed silently became no cap.
 """
@@ -113,7 +117,7 @@ class SubTabs(_Fixture):
     def test_registered_in_subtabs_with_runtime_first(self):
         self.assertEqual(admin.SUBTABS["server"],
                          [("runtime", "Runtime"), ("restart", "Restart"),
-                          ("keys", "API Keys")])
+                          ("keys", "API Keys"), ("models", "Models")])
 
     def test_default_is_runtime_and_each_sub_shows_only_its_form(self):
         page = self.get()
@@ -429,6 +433,57 @@ class ApiKeysTab(_Fixture):
             self.assertNotIn(p, admin._POST_ACTIONS)
 
 
+# ── Models ───────────────────────────────────────────────────────────────────────────
+
+class ModelsTab(_Fixture):
+    def setUp(self):
+        super().setUp()
+        # the LAN source keeps its key and pin next to store.db: a temp dir, a fresh one
+        saved = main._modelsrc_obj
+        self.addCleanup(setattr, main, "_modelsrc_obj", saved)
+        main._modelsrc_obj = None
+        main.jobs_cfg["store_path"] = os.path.join(self.tmp.name, "store.db")
+
+    def test_models_tab_holds_the_lan_source_and_the_catalog_only(self):
+        m = self.main_of(self.get("/ui/server?sub=models"))
+        self.assertIn('data-k="hosts-modelsrc"', m)
+        self.assertIn('action="/ui/hosts/managed/modelsrc-host"', m)
+        self.assertIn('data-k="hosts-catalog"', m)
+        self.assertIn('action="/ui/hosts/managed/catalog"', m)
+        self.assertNotIn('name="_form"', m)
+        self.assertNotIn("/ui/server/api-key", m)
+        self.assertIn("These override <code>config.yaml</code>", m)
+        for sub in ("runtime", "restart", "keys"):
+            other = self.main_of(self.get(f"/ui/server?sub={sub}"))
+            self.assertNotIn('data-k="hosts-modelsrc"', other, sub)
+            self.assertNotIn('data-k="hosts-catalog"', other, sub)
+
+    def test_models_tab_is_static(self):
+        # List now redirects back with the fresh state; nothing on it needs a poller
+        page = self.get("/ui/server?sub=models")
+        self.assertNotIn("<main data-live", page)
+
+    def test_catalog_refusal_is_400_on_the_models_tab_and_saves_nothing(self):
+        before = store.get_setting("modelsync_catalog")
+        r = self.post("/ui/hosts/managed/catalog", {"catalog": '[{"x": <typed>}'}, status=400)
+        self.assertRegex(r.text, r'class="on" aria-current="page" href="/ui/server\?sub=models"')
+        self.assertIn("[{&quot;x&quot;: &lt;typed&gt;}", r.text)
+        self.assertIn("not valid JSON", r.text)
+        self.assertEqual(store.get_setting("modelsync_catalog"), before)
+
+    def test_modelsrc_host_save_and_refusal(self):
+        r = self.post("/ui/hosts/managed/modelsrc-host", {"modelsrc_host": "src@10.0.0.2"})
+        path, q = self.loc(r)
+        self.assertEqual((path, q.get("sub")), ("/ui/server", "models"))
+        self.assertIn("src@10.0.0.2", q["msg"])
+        page = self.get(r.headers["location"])
+        self.assertIn('name="modelsrc_host" value="src@10.0.0.2"', page)
+        r = self.post("/ui/hosts/managed/modelsrc-host", {"modelsrc_host": "-oProxy=x"},
+                      status=400)
+        self.assertIn('name="modelsrc_host" value="-oProxy=x"', r.text)
+        self.assertEqual(store.get_setting("modelsrc_host"), "src@10.0.0.2")
+
+
 # ── links into the Server tab ────────────────────────────────────────────────────────
 
 class ServerLinks(unittest.TestCase):
@@ -440,12 +495,13 @@ class ServerLinks(unittest.TestCase):
         hrefs = re.findall(r"""href=\\?['"](/ui/server[^'"\\]*)""", self.src)
         self.assertTrue(hrefs)
         for h in hrefs:
-            self.assertRegex(h, r"^/ui/server\?sub=(runtime|restart|keys)$", h)
+            self.assertRegex(h, r"^/ui/server\?sub=(runtime|restart|keys|models)$", h)
 
     def test_each_setting_link_opens_the_tab_that_holds_it(self):
         # what the text right before a link names decides the tab it must open
         rules = (("scan_cidrs", "runtime"), ("show_user_keys", "runtime"),
-                 ("<b>stats</b>", "restart"), ("master API", "keys"))
+                 ("<b>stats</b>", "restart"), ("master API", "keys"),
+                 ("LAN model source", "models"))
         seen = {sub: 0 for _, sub in rules}
         for m in re.finditer(r"/ui/server\?sub=(\w+)", self.src):
             before = self.src[max(0, m.start() - 160):m.start()]
@@ -454,8 +510,9 @@ class ServerLinks(unittest.TestCase):
                 continue
             self.assertEqual(m.group(1), hit[-1], before[-120:])
             seen[hit[-1]] += 1
-        # scan ×2 + show_user_keys; stats ×3; the master-key refusals + bootstrap banner
-        self.assertEqual(seen, {"runtime": 3, "restart": 3, "keys": 4})
+        # scan ×2 + show_user_keys; stats ×3; the master-key refusals + bootstrap banner;
+        # the Backends pointer and the sync cell's "waiting for LAN source" badge
+        self.assertEqual(seen, {"runtime": 3, "restart": 3, "keys": 4, "models": 2})
 
 
 if __name__ == "__main__":

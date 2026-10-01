@@ -5162,7 +5162,9 @@ class LanSourceUnit(unittest.IsolatedAsyncioTestCase):
         sh = FakeShare()
         sh.files["vae/a.st"] = b"x"
         lan = _lan(sh, self.d, self.clock, pinned=True, host="")
-        want = "LAN model source not configured — enter the share host below"
+        # the LAN source lives in Server → Models (2026-10-01) — "below" was the
+        # Backends tab, where it no longer is
+        want = "LAN model source not configured — enter the share host under Server → Models"
         self.assertEqual(hostctl.SRC_UNSET, want)
         self.assertEqual(lan.problem(), want)
         self.assertFalse(lan.configured())
@@ -6945,6 +6947,7 @@ class StartBlockers(unittest.IsolatedAsyncioTestCase):
         self.assertIn("comfyui:thunder", items[1]["text"])
         self.assertIn("only needed for model files that no URL/catalog entry provides",
                       items[2]["text"])
+        self.assertEqual(items[2]["key"], "lan")         # … and this one to Server → Models
         lan.ok = True
         self.assertTrue(c.checklist()[2]["ok"])
         # no token, no backend: both required items fail; no ComfyUI → no LAN item

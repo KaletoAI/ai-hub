@@ -202,6 +202,35 @@ class _Base(unittest.TestCase):
         r = asyncio.run(admin._backends_view(qp or {}))
         return r.body.decode()
 
+    def models_page(self) -> str:
+        """Server → Models, where the LAN model source and the model-sync catalog live
+        since 2026-10-01 (they are the gateway's, not one host's)."""
+        r = asyncio.run(admin.server_page(_SrvReq("sub=models")))
+        self.assertEqual(r.status_code, 200)
+        return r.body.decode()
+
+
+class _SrvReq(_Req):
+    """A GET of the Server tab: `_srv_state` reads the port the request hit."""
+    def __init__(self, query: str = ""):
+        super().__init__({}, query)
+        self.url = urlparse("http://testserver/ui/server")
+
+
+def _models_loc(r) -> dict:
+    """An action's 303 → Server → Models: its query (asserting the target)."""
+    loc = urlparse(r.headers["location"])
+    assert loc.path == "/ui/server", loc
+    q = {k: v[-1] for k, v in parse_qs(loc.query).items()}
+    assert q.get("sub") == "models", q
+    return q
+
+
+def _on_models_tab(body: str) -> bool:
+    """The page is the Server tab with Models the active sub-tab."""
+    return bool(re.search(r'class="on" aria-current="page" href="/ui/server\?sub=models"',
+                          body))
+
 
 class ManagedSave(_Base):
     """backend_save with a managed host: url/local_port derived, the type and port rules
@@ -907,12 +936,17 @@ class SyncPanel(_Base):
         self.assertEqual(out["r"], [True, True, True])     # every confirm answered "no"
 
     def test_catalog_editor_in_details_with_the_stored_catalog(self):
-        html = self.main_html()
+        # on Server → Models (the catalog is the gateway's, every host's ComfyUI reads it)
+        html = self.models_page()
         det = re.search(r'<details[^>]*data-k="hosts-catalog"[^>]*>.*?</details>', html, re.S)
         self.assertIsNotNone(det)
         self.assertIn('action="/ui/hosts/managed/catalog"', det.group(0))
         self.assertIn('name="catalog"', det.group(0))
         self.assertIn("models/c/", det.group(0))
+        # … and no longer on the Backends tab, which only points there
+        b = self.main_html()
+        self.assertNotIn('data-k="hosts-catalog"', b)
+        self.assertNotIn('action="/ui/hosts/managed/catalog"', b)
 
 
 class SyncActions(Actions):
@@ -953,6 +987,8 @@ class SyncActions(Actions):
         r = self.c.post("/ui/hosts/managed/catalog", headers=SAME, data={"catalog": typed})
         self.assertEqual(r.status_code, 400)
         body = r.text
+        self.assertTrue(_on_models_tab(body))         # the Models tab, re-rendered …
+        self.assertNotIn('data-sk="mhosts"', body)    # … never the Backends page
         self.assertIn("models/&lt;x&gt;/", body)      # the textarea as typed …
         self.assertIn("not valid JSON", body)         # … and why
         self.assertNotIn("<main data-live", body)     # a refused form is never live
@@ -973,11 +1009,11 @@ class SyncActions(Actions):
                         data={"catalog": json.dumps(cat)})
         self.assertEqual(r.status_code, 303)
         self.assertEqual(self.saved_catalogs, [cat])
-        loc = urlparse(r.headers["location"])
-        self.assertEqual(loc.path, "/ui/backends")
-        self.assertIn("catalog saved", parse_qs(loc.query)["msg"][0])
-        page = self.c.get("/ui/backends", headers=SAME).text
+        q = _models_loc(r)
+        self.assertIn("catalog saved", q["msg"])
+        page = self.c.get(r.headers["location"], headers=SAME).text
         self.assertIn("models/org/repo/", page)
+        self.assertIn("model-sync catalog saved (1 entries)", page)     # the banner
 
 
 class MainWiring(unittest.TestCase):
@@ -1166,15 +1202,16 @@ class _LanBlock(Actions):
         self.fp = hostctl.host_key_fingerprint(_ED_B64)
 
     def block(self) -> str:
+        # on Server → Models since 2026-10-01 (one LAN source for every host)
         m = re.search(r'<div class="tcard" data-k="hosts-modelsrc">.*?</div></div>',
-                      self.page(), re.S)
+                      self.models_page(), re.S)
         self.assertIsNotNone(m)
         return m.group(0)
 
     def post(self, path, **data):
         r = self.c.post(path, data=data, headers=SAME, follow_redirects=False)
         self.assertEqual(r.status_code, 303)
-        return parse_qs(urlparse(r.headers["location"]).query)["msg"][0]
+        return _models_loc(r)["msg"]                    # lands on Server → Models
 
 
 class LanSourcePanel(_LanBlock):
@@ -1261,7 +1298,8 @@ class LanSourcePanel(_LanBlock):
         # the setup order is token → host → backend; the LAN source belongs to the same
         # preparation and must not wait for a host to exist
         self.views = {}
-        self.assertIn("hosts-modelsrc", self.page())
+        self.assertIn("hosts-modelsrc", self.models_page())
+        self.assertNotIn("hosts-modelsrc", self.page())      # moved off the Backends tab
 
 
 class LanSourceListNow(_LanBlock):
@@ -1330,7 +1368,7 @@ class LanSourceListNow(_LanBlock):
         now, the install text instead."""
         self.lan._host_fn = lambda: ""
         b = self.block()
-        self.assertIn("LAN model source not configured — enter the share host below", b)
+        self.assertIn("LAN model source not configured — enter the share host under Server → Models", b)
         self.assertIn("not set up", b)
         self.assertNotIn("</code> pinned", b)             # no "host key SHA256:… pinned"
         self.assertNotIn(self.fp, b)
@@ -1342,7 +1380,7 @@ class LanSourceListNow(_LanBlock):
     def test_not_configured_lists_nothing(self):
         self.lan._host_fn = lambda: ""
         msg = self.post("/ui/hosts/managed/modelsrc-list")
-        self.assertIn("LAN model source not configured — enter the share host below", msg)
+        self.assertIn("LAN model source not configured — enter the share host under Server → Models", msg)
         self.assertEqual(self.lists, [])
 
     def test_age_text(self):
@@ -1416,8 +1454,9 @@ class HfToken(Actions):
         page = self.page()
         self.assertNotIn('name="hf_token"', page)
         self.assertNotIn("hf-token", page)
-        # the catalog says where the token is now
-        self.assertIn("<a href='/ui/server?sub=keys'>Server → API Keys</a>", page)
+        # the catalog (Server → Models) says where the token is now
+        self.assertIn("<a href='/ui/server?sub=keys'>Server → API Keys</a>",
+                      self.models_page())
         self.assertIn('action="/ui/server/hf-token"', self.keys())
 
     def test_hf_token_encrypted_at_rest(self):
@@ -1514,7 +1553,7 @@ class ModelsrcHostField(Actions):
 
     def test_field_shows_the_current_host(self):
         import hostctl
-        page = self.page()
+        page = self.models_page()
         self.assertRegex(page, r'<form method="post" action="/ui/hosts/managed/modelsrc-host"')
         self.assertRegex(page, r'name="modelsrc_host" value=""')
         self.assertIn('placeholder="kai@gpu-vm"', page)
@@ -1524,21 +1563,23 @@ class ModelsrcHostField(Actions):
 
     def test_valid_host_saved(self):
         r = self.post(modelsrc_host=" src@10.0.0.2 ")
-        self.assertIn("src@10.0.0.2", parse_qs(urlparse(r.headers["location"]).query)["msg"][0])
+        self.assertIn("src@10.0.0.2", _models_loc(r)["msg"])    # back on Server → Models
         self.assertEqual(store.get_setting("modelsrc_host"), "src@10.0.0.2")
         self.assertEqual(main.modelsrc().host(), "src@10.0.0.2")
-        self.assertRegex(self.page(), r'name="modelsrc_host" value="src@10.0.0.2"')
+        self.assertRegex(self.models_page(), r'name="modelsrc_host" value="src@10.0.0.2"')
         r = self.post(modelsrc_host="")                         # blank = no LAN source
-        self.assertIn("cleared", parse_qs(urlparse(r.headers["location"]).query)["msg"][0])
+        self.assertIn("cleared", _models_loc(r)["msg"])
         self.assertEqual(main._modelsrc_host(), "")
         self.assertEqual(main.modelsrc().problem(),
-                         "LAN model source not configured — enter the share host below")
+                         "LAN model source not configured — enter the share host under Server → Models")
 
     def test_invalid_host_is_400_with_the_form_as_typed(self):
         store.set_settings({"modelsrc_host": "src@10.0.0.2"})
         for bad in ("a;touch /tmp/x", "-oProxyCommand=x", "user@host:22", "a b"):
             with self.subTest(bad=bad):
                 r = self.post(status=400, modelsrc_host=bad)
+                self.assertTrue(_on_models_tab(r.text))        # that tab, as typed
+                self.assertNotIn('data-sk="mhosts"', r.text)
                 self.assertIn("not saved", r.text)
                 self.assertIn(f'name="modelsrc_host" value="{admin._esc(bad)}"', r.text)
                 self.assertEqual(store.get_setting("modelsrc_host"), "src@10.0.0.2")
@@ -1557,7 +1598,7 @@ class ModelsrcHostField(Actions):
         self.assertEqual(lan.problem(), "not listed yet")
         self.post(modelsrc_host="modelsrc@10.0.0.9")
         m = re.search(r'<div class="tcard" data-k="hosts-modelsrc">.*?</div></div>',
-                      self.page(), re.S)
+                      self.models_page(), re.S)
         self.assertIn("pinned for 192.168.8.24, not 10.0.0.9 — fetch its key", m.group(0))
 
 
@@ -2237,11 +2278,12 @@ class ProviderTokenUI(Actions):
 
 class SectionAlwaysThere(_Base):
     """The natural order is token → host: with no managed host yet, the guide (whose
-    step 1 links to Server → API Keys, where the token rows live), "+ Managed host", the
-    LAN block and the catalog must still be there — the section used to render only once
-    a host existed."""
+    step 1 links to Server → API Keys, where the token rows live) and "+ Managed host"
+    must still be there — the section used to render only once a host existed. The LAN
+    block and the catalog are the GATEWAY's (one for every host): they live in Server →
+    Models, and the section only points there."""
 
-    def test_empty_store_renders_guide_token_row_and_lan_block(self):
+    def test_empty_store_renders_guide_and_the_models_pointer(self):
         self.views = {}
         self.addCleanup(setattr, admin, "_modelsrc_view", admin._modelsrc_view)
         admin._modelsrc_view = lambda: {"host": "", "problem": "not configured",
@@ -2251,10 +2293,58 @@ class SectionAlwaysThere(_Base):
         self.assertIn(GUIDE, sec)
         self.assertNotIn("ptoken", sec)                   # the token rows moved away
         self.assertIn('href="/ui/backends?mhost_new=1"', sec)
-        self.assertIn('data-k="hosts-modelsrc"', sec)
-        self.assertIn('action="/ui/hosts/managed/catalog"', sec)
+        self.assertNotIn('data-k="hosts-modelsrc"', sec)  # moved to Server → Models
+        self.assertNotIn("/ui/hosts/managed/catalog", sec)
+        self.assertNotIn("/ui/hosts/managed/modelsrc", sec)
+        self.assertIn('<p class="muted" data-k="hosts-models">LAN model source and model '
+                      'catalog: <a href="/ui/server?sub=models">Server → Models</a></p>', sec)
         # order: the guide, then the "+ Managed host" button
         self.assertLess(sec.index(GUIDE), sec.index("mhost_new=1"))
+        # the Models tab renders both with no managed host at all
+        m = self.models_page()
+        self.assertIn('data-k="hosts-modelsrc"', m)
+        self.assertIn('action="/ui/hosts/managed/catalog"', m)
+        self.assertIn('action="/ui/hosts/managed/modelsrc-host"', m)
+
+
+class ModelsTabMove(Actions):
+    """Every LAN-source and catalog action lands on Server → Models — success, refusal
+    and the 405 page's way back — and no route answers with the Backends page any more.
+    The routes stay under /ui/hosts/managed/ (bookmarks and scripts keep working)."""
+
+    PATHS = ("/ui/hosts/managed/catalog", "/ui/hosts/managed/modelsrc-scan",
+             "/ui/hosts/managed/modelsrc-pin", "/ui/hosts/managed/modelsrc-list",
+             "/ui/hosts/managed/modelsrc-host")
+
+    def test_post_only_and_the_405_page_leads_to_the_models_tab(self):
+        for p in self.PATHS:
+            self.assertIn(p, admin._POST_ACTIONS)
+            r = self.c.get(p, headers=SAME, follow_redirects=False)
+            self.assertEqual(r.status_code, 405, p)
+            self.assertIn("href='/ui/server?sub=models'", r.text, p)
+        self.assertEqual(self.saved_catalogs, [])
+
+    def test_every_answer_is_the_models_tab(self):
+        for p, data in (("/ui/hosts/managed/modelsrc-scan", {}),
+                        ("/ui/hosts/managed/modelsrc-pin", {"fp": ""}),
+                        ("/ui/hosts/managed/modelsrc-list", {}),
+                        ("/ui/hosts/managed/catalog", {"catalog": "[]"})):
+            r = self.c.post(p, data=data, headers=SAME, follow_redirects=False)
+            self.assertEqual(r.status_code, 303, p)
+            self.assertTrue(_models_loc(r)["msg"], p)
+            page = self.c.get(r.headers["location"], headers=SAME)
+            self.assertEqual(page.status_code, 200, p)
+            self.assertTrue(_on_models_tab(page.text), p)
+            self.assertIn("role='status' data-k='server-msg'", page.text, p)  # the answer
+        for p, data in (("/ui/hosts/managed/catalog", {"catalog": "{"}),
+                        ("/ui/hosts/managed/modelsrc-host", {"modelsrc_host": "a;b"})):
+            r = self.c.post(p, data=data, headers=SAME, follow_redirects=False)
+            self.assertEqual(r.status_code, 400, p)
+            self.assertTrue(_on_models_tab(r.text), p)
+            self.assertNotIn('data-sk="mhosts"', r.text, p)
+
+    def test_subtab_registered_last(self):
+        self.assertEqual(admin.SUBTABS["server"][-1], ("models", "Models"))
 
 
 class HostFormFlow(_Base):
@@ -2354,6 +2444,23 @@ class CardChecklist(_Base):
         ck = re.search(r'<ul[^>]*data-k="host-tc-check"[^>]*>.*?</ul>', self.page(),
                        re.S).group(0)
         self.assertNotIn("/ui/server", ck)
+
+    def test_lan_source_not_usable_links_to_the_models_tab(self):
+        lan = dict(self.CHECK[2], key="lan")
+        self.views = {"tc": _view(checklist=self.CHECK[:2] + [lan],
+                                  start_blockers=[self.WHY])}
+        ck = re.search(r'<ul[^>]*data-k="host-tc-check"[^>]*>.*?</ul>', self.page(),
+                       re.S).group(0)
+        self.assertIn("– <a href='/ui/server?sub=models'>LAN model source not usable — "
+                      "only needed for model files that no URL/catalog entry provides</a>",
+                      ck)
+        # usable: nothing to do there, no link
+        self.views = {"tc": _view(checklist=self.CHECK[:2] + [dict(lan, ok=True, text="LAN "
+                                                                   "model source usable")],
+                                  start_blockers=[self.WHY])}
+        ck = re.search(r'<ul[^>]*data-k="host-tc-check"[^>]*>.*?</ul>', self.page(),
+                       re.S).group(0)
+        self.assertNotIn("sub=models", ck)
 
     def test_disabled_button_looks_disabled(self):
         self.assertIn(".btn[disabled]{opacity:.55;cursor:not-allowed}", admin._CSS)
