@@ -5274,6 +5274,70 @@ class UrlFallback(unittest.IsolatedAsyncioTestCase):
                          ["cat", "diffusion_models/a.safetensors", "4"])   # resumed
         self.assertEqual(json.loads(vm.manifest)[self.PATH]["source"], "lan")
 
+    async def _restart_instance(self, c):
+        """Stop (snapshot + delete) and start again: a NEW instance (`_created`)."""
+        await _until(lambda: _idle(c))
+        await c.stop()
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        await c.start()
+        await _until(lambda: _idle(c))
+
+    async def test_transport_fallback_is_forgotten_by_a_new_instance(self):
+        """Task-2 re-review ruling: three TRANSPORT failures are about that session's
+        network — a persisted record must not keep the next instance on the LAN."""
+        sh = self.share()
+        fake, vm, c, lan, pipe = _lan_make({"img": _cand("a.safetensors")}, sh,
+                                           catalog=[_url("a.safetensors")])
+        vm.sizes[self.URL] = 10
+        vm.poll_fail.add(self.PATH)              # attempts run out on unanswered polls
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img"), 30),
+                        c.state.log[-8:])
+        self.assertEqual(c._url_fallback, {self.PATH: self.URL})
+        self.assertEqual(c.state.url_fallback_cause, {self.PATH: "transport"})
+        self.assertEqual(c.h.saved["thunder"]["url_fallback_cause"], {self.PATH: "transport"})
+        await self._restart_instance(c)
+        self.assertEqual(c._url_fallback, {})
+        self.assertEqual(c.state.url_fallback_cause, {})
+        self.assertEqual(c.h.saved["thunder"]["url_fallback"], {})
+        self.assertTrue(any("tried again on this instance" in ln for ln in c.state.log),
+                        c.state.log[-8:])
+
+    async def test_mismatch_fallback_outlives_a_new_instance(self):
+        sh = self.share()
+        fake, vm, c, lan, pipe = _lan_make({"img": _cand("a.safetensors")}, sh,
+                                           catalog=[_url("a.safetensors", sha="ab" * 32)])
+        vm.sizes[self.URL], vm.sha[self.URL] = 10, "cd" * 32
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")),
+                        c.state.log[-8:])
+        self.assertEqual(c.state.url_fallback_cause, {self.PATH: "verdict"})
+        await self._restart_instance(c)
+        self.assertEqual(c._url_fallback, {self.PATH: self.URL})
+        self.assertEqual(c.state.url_fallback_cause, {self.PATH: "verdict"})
+
+    async def test_http_4xx_fallback_outlives_a_new_instance(self):
+        sh = self.share()
+        fake, vm, c, lan, pipe = _lan_make({"img": _cand("a.safetensors")}, sh,
+                                           catalog=[_url("a.safetensors")])
+        vm.fail[self.URL] = "curl: (22) The requested URL returned error: 404\n"
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")),
+                        c.state.log[-8:])
+        self.assertEqual(c.state.url_fallback_cause, {self.PATH: "verdict"})
+        await self._restart_instance(c)
+        self.assertEqual(c._url_fallback, {self.PATH: self.URL})
+
+    def test_a_record_without_a_cause_counts_as_a_verdict(self):
+        st = hostctl.state_from({"url_fallback": {"models/a": "https://x/a"},
+                                 "url_fallback_why": {"models/a": "old"}})
+        self.assertEqual(st.url_fallback_cause, {})
+        fake = FakeThunder()
+        c, saved, enabled, calls = make(fake)
+        c.state = st
+        c._created({"index": "0", "uuid": "u-1"}, 100, None, (False, False))
+        self.assertEqual(c._url_fallback, {"models/a": "https://x/a"})
+
     async def test_sync_now_keeps_a_fallback_whose_lan_transfer_runs(self):
         sh, fake, vm, c, lan, pipe = await self._fallen_back_lan_streaming()
         n = len(vm.started)
@@ -5519,6 +5583,48 @@ class ShareShaCache(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(peak[0], 1)
         self.assertEqual(len(self.sha_calls(sh)), 2)   # the duplicate waited for the first
         self.assertEqual(lan.hash_queue(), [])
+
+    async def test_transfer_hashes_overtake_queued_background_ones(self):
+        """Model sources M-5: a LAN transfer holds the one stream slot until its hash
+        answers — it must not wait behind a queue of Check & save hashes. A background
+        hash that already runs is not interrupted; a cancelled waiter frees its place."""
+        sh = self.share()
+        sh.files["vae/c.st"] = b"ccccc"
+        sh.files["vae/d.st"] = b"dddddd"
+        gates, order = {}, []
+        real = sh.ssh
+
+        async def ssh(argv, stdin=None, timeout=60):
+            words = shlex.split(argv[-1]) if argv[0] != "ssh-keyscan" else [""]
+            if words[0] == "sha256":
+                order.append(words[1])
+                g = gates.setdefault(words[1], asyncio.Event())
+                await g.wait()
+            return await real(argv, stdin, timeout)
+        sh.ssh = ssh
+        lan = self.lan(sh)
+        lan._ssh = ssh
+        lan.sha_files()
+        a = asyncio.ensure_future(lan.sha256(self.PATH, 3, background=True))
+        await asyncio.sleep(0.01)
+        b = asyncio.ensure_future(lan.sha256("models/vae/b.st", 4, background=True))
+        d = asyncio.ensure_future(lan.sha256("models/vae/d.st", 6, background=True))
+        await asyncio.sleep(0.01)
+        c = asyncio.ensure_future(lan.sha256("models/vae/c.st", 5))     # a transfer's
+        await asyncio.sleep(0.01)
+        self.assertEqual(lan.hash_queue(), [self.PATH, "models/vae/c.st", "models/vae/b.st",
+                                            "models/vae/d.st"])
+        d.cancel()                                   # a waiter gone: no hole in the queue
+        await asyncio.sleep(0.01)
+        self.assertEqual(lan.hash_queue(), [self.PATH, "models/vae/c.st", "models/vae/b.st"])
+        for k in ("vae/a.st", "vae/c.st", "vae/b.st", "vae/d.st"):
+            gates.setdefault(k, asyncio.Event()).set()
+        await asyncio.wait_for(asyncio.gather(a, b, c), 5)
+        self.assertEqual(order, ["vae/a.st", "vae/c.st", "vae/b.st"])
+        self.assertEqual(lan.hash_queue(), [])
+        # the slot is free again: the next request runs at once
+        self.assertEqual(await asyncio.wait_for(lan.sha256("models/vae/d.st", 6), 5),
+                         hashlib.sha256(b"dddddd").hexdigest())
 
     async def test_a_hash_answered_after_a_host_change_is_not_kept(self):
         sh = self.share()

@@ -368,6 +368,11 @@ class State:
     # deterministically again and the abandon threw the LAN progress away (review-2 I-1)
     url_fallback: dict = field(default_factory=dict)
     url_fallback_why: dict = field(default_factory=dict)
+    # plan path → what ended the URL: "verdict" (a size/sha mismatch, an HTTP 4xx, an
+    # entry that is no valid source — about the URL, it stays) or "transport" (three
+    # failed attempts: a 5xx, 429, a dead connection — about THAT session; `_created`
+    # drops such records for a new instance). A record without one counts as a verdict.
+    url_fallback_cause: dict = field(default_factory=dict)
     log: list = field(default_factory=list)         # not persisted
     transfers: dict = field(default_factory=dict)   # not persisted
 
@@ -1089,8 +1094,11 @@ class LanSource:
       no longer lists at that size. Every hash is written back at once (every LAN
       transfer hashes, so every file ever LAN-synced has its sha for free).
     - **one hash at a time**: `sha256 <rel>` reads the whole file over the share host's
-      disk; N requests run one after another (`_hash_lock`), and `hash_queue()` shows
-      the paths waiting — the overview's "hashing 2 of 5".
+      disk; N requests run one after another (`_hash_turn`), and `hash_queue()` shows
+      the paths waiting — the overview's "hashing 2 of 5". A LAN transfer's hash goes
+      ahead of every queued `background=True` one (Check & save, model sources M-5): a
+      transfer holds the one LAN stream slot until its hash answers. A background hash
+      that already RUNS is not interrupted — the transfer waits for that one file.
 
     `ssh`/`keygen`/`now`/`load_sha`/`save_sha` are injected (tests; main hands the store
     setting in); nothing here imports `main` or `store`."""
@@ -1119,8 +1127,13 @@ class LanSource:
         self._save_sha = save_sha
         self._sha_for: Optional[str] = None      # the host the persisted record was read for
         self._sha_gen = 0
-        self._hash_lock = asyncio.Lock()
-        self._hash_q: list = []                  # paths waiting for (or in) a hash
+        # one hash at a time, TRANSFER hashes first (model sources M-5): a LAN
+        # transfer's verification waits behind no queued Check & save hash. `_hash_wait`
+        # holds the waiters as (priority, arrival, path, future) — 0 = a transfer's,
+        # 1 = a background (Check & save) one; `_hash_busy` while one runs.
+        self._hash_busy = False
+        self._hash_wait: list = []
+        self._hash_seq = 0
         self._hashing: Optional[str] = None      # the path being hashed right now
         # store writes of the cache: numbered when the record is BUILT, and a record never
         # overwrites a newer one (two writes in two worker threads may finish in either
@@ -1464,13 +1477,46 @@ class LanSource:
         return self._sha_gen
 
     def hash_queue(self) -> list:
-        """The paths waiting for a share hash, the running one first (deduplicated)."""
+        """The paths waiting for a share hash, the running one first, then the waiters in
+        the order they will run (transfer hashes first; deduplicated)."""
         head = [self._hashing] if self._hashing is not None else []
-        return list(dict.fromkeys(head + self._hash_q))
+        waiting = [t[2] for t in sorted(self._hash_wait) if not t[3].done()]
+        return list(dict.fromkeys(head + waiting))
 
-    async def sha256(self, path: str, size: int) -> str:
+    async def _hash_turn(self, path: str, background: bool) -> None:
+        """Wait for THE hash slot (one at a time); a transfer's request (priority 0)
+        overtakes every waiting background one, arrival order within a priority."""
+        if not self._hash_busy and not any(not t[3].done() for t in self._hash_wait):
+            self._hash_busy = True
+            return
+        fut = asyncio.get_running_loop().create_future()
+        self._hash_seq += 1
+        ticket = (1 if background else 0, self._hash_seq, path, fut)
+        self._hash_wait.append(ticket)
+        try:
+            await fut
+        except asyncio.CancelledError:
+            if fut.done() and not fut.cancelled():
+                self._hash_release()            # handed the slot, then cancelled: pass it on
+            raise
+        finally:
+            if ticket in self._hash_wait:
+                self._hash_wait.remove(ticket)
+
+    def _hash_release(self) -> None:
+        """Hand the slot to the next waiter (it stays busy), else free it."""
+        for t in sorted(self._hash_wait):
+            if not t[3].done():
+                self._hash_wait.remove(t)
+                t[3].set_result(None)
+                return
+        self._hash_wait = [t for t in self._hash_wait if not t[3].done()]
+        self._hash_busy = False
+
+    async def sha256(self, path: str, size: int, background: bool = False) -> str:
         """The share's sha256 of `path` (cached per (path, size), persisted). One hash at
         a time: a second request for the same file waits and takes the first's answer.
+        `background=True` (Check & save) queues behind every waiting transfer hash.
         Every failure is a RuntimeError — an unset or non-plain share host and a path
         with no share mapping included (they are ValueErrors underneath)."""
         raw = self._look()
@@ -1483,34 +1529,33 @@ class LanSource:
             argv = self._argv("sha256", share_rel(path))
         except ValueError as e:
             raise RuntimeError(f"source sha256 unavailable: {e}") from e
-        self._hash_q.append(path)
+        await self._hash_turn(path, background)
         try:
-            async with self._hash_lock:
-                hexd = self.known_sha(path, size)       # hashed while this one waited
-                if hexd is not None:
-                    return hexd
-                self._hashing = path
-                try:
-                    rc, out, err = await self._ssh(argv, timeout=_SRC_SHA_TIMEOUT_S)
-                finally:
-                    self._hashing = None
-                if rc != 0:
-                    raise RuntimeError(f"source sha256 failed (rc {rc}): "
-                                       + (" | ".join(_tail(err, 2)) or "no message"))
-                hexd = (out or b"").decode("utf-8", "replace").strip().lower()
-                if not re.fullmatch(r"[0-9a-f]{64}", hexd):
-                    raise RuntimeError(f"source sha256 answered {hexd[:40]!r}")
-                if self._look() != raw:
-                    # another share's answer by now (the `refresh` rule): never cached
-                    raise RuntimeError("the share host changed while hashing")
-                new = dict(self._sha)               # replaced, never mutated in place
-                new[path] = (size, hexd)
-                self._sha = new
-                self._sha_gen += 1
-                await self._store_sha_async(raw)
+            hexd = self.known_sha(path, size)       # hashed while this one waited
+            if hexd is not None:
                 return hexd
+            self._hashing = path
+            try:
+                rc, out, err = await self._ssh(argv, timeout=_SRC_SHA_TIMEOUT_S)
+            finally:
+                self._hashing = None
+            if rc != 0:
+                raise RuntimeError(f"source sha256 failed (rc {rc}): "
+                                   + (" | ".join(_tail(err, 2)) or "no message"))
+            hexd = (out or b"").decode("utf-8", "replace").strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", hexd):
+                raise RuntimeError(f"source sha256 answered {hexd[:40]!r}")
+            if self._look() != raw:
+                # another share's answer by now (the `refresh` rule): never cached
+                raise RuntimeError("the share host changed while hashing")
+            new = dict(self._sha)               # replaced, never mutated in place
+            new[path] = (size, hexd)
+            self._sha = new
+            self._sha_gen += 1
+            await self._store_sha_async(raw)
+            return hexd
         finally:
-            self._hash_q.remove(path)
+            self._hash_release()
 
     def forget_sha(self, path: str, size: int) -> None:
         """A mismatch: the share's file may have changed at the same size — the memory
@@ -1781,6 +1826,15 @@ class Controller:
     @property
     def _url_fallback_why(self) -> dict:
         return self.state.url_fallback_why
+
+    @property
+    def _url_fallback_cause(self) -> dict:
+        return self.state.url_fallback_cause
+
+    def _drop_fallback(self, path: str) -> None:
+        self._url_fallback.pop(path, None)
+        self._url_fallback_why.pop(path, None)
+        self._url_fallback_cause.pop(path, None)
 
     def _load_failed(self, msg: str) -> None:
         """The stored record exists but could not be read. It may name a RUNNING,
@@ -3806,6 +3860,16 @@ class Controller:
             st = dict(st) if isinstance(st, dict) else {"status": "down", "error": ""}
             st["setup_hash"] = str(done.get(bid) or "")
             s.services[bid] = st
+        # a URL given up on TRANSPORT failures (5xx, 429, a dead connection) was about
+        # the last session's network, not about the URL: the new instance tries it again
+        # (a persisted record would otherwise plan `lan` for good, until Sync now). A
+        # mismatch or a 4xx is a verdict about the URL's bytes and stays.
+        gone = [p for p, c in s.url_fallback_cause.items() if c == "transport"]
+        for p in gone:
+            self._drop_fallback(p)
+        if gone:
+            self._log(f"{len(gone)} URL source(s) given up on transport failures are tried "
+                      "again on this instance")
         self._attached.clear()
         self._attached_svcs.clear()
         self._set_phase("creating")
@@ -4487,8 +4551,7 @@ class Controller:
         stale = [p for p, u in self._url_fallback.items()
                  if not isinstance(urls.get(p), dict) or urls[p].get("url") != u]
         for p in stale:
-            del self._url_fallback[p]
-            self._url_fallback_why.pop(p, None)
+            self._drop_fallback(p)
         if stale:
             self._persist()
         return {p: e for p, e in urls.items() if p not in self._url_fallback}
@@ -4594,8 +4657,7 @@ class Controller:
             busy = [p for p in self._url_fallback if p in self._fetches]
             drop = [p for p in self._url_fallback if p not in self._fetches]
             for p in drop:
-                del self._url_fallback[p]
-                self._url_fallback_why.pop(p, None)
+                self._drop_fallback(p)
             if drop:
                 self._log(f"sync requested — {len(drop)} URL source(s) given up for the "
                           "share's copy are tried again")
@@ -4958,7 +5020,7 @@ class Controller:
                 if attempt < _FETCH_ATTEMPTS:
                     await self.deps.sleep(_RETRY_DELAYS_S[min(attempt, len(_RETRY_DELAYS_S)) - 1])
             if why and not lan and self._share_lists(path):
-                why = await self._fall_back(e, why, attempt)
+                why = await self._fall_back(e, why, attempt, final)
             if why:
                 self._failed[path] = why
                 # a transfer is the ComfyUI service's (its models); the host's pseudo
@@ -4997,14 +5059,16 @@ class Controller:
             what = f"{why} ({attempts} attempt{'s' if attempts != 1 else ''})"
         return f"{what} — syncing the share's copy"
 
-    async def _fall_back(self, e: dict, why: str, attempts: int) -> str:
+    async def _fall_back(self, e: dict, why: str, attempts: int, final: bool = True) -> str:
         """Model sources fallback (review I-2): the URL ended final — a mismatch, a 4xx,
         three failed attempts, or an entry that is no valid source/path at all — for a
         file the share also lists. FIRST end the file's curl (an attempt that gave up on unanswered polls
         may have left it running) and discard the shared `.part` (it holds URL bytes the
         LAN stream would resume onto) — then record `{path: url}`, so the next plan says
         `lan`. → "" when switched; else the reason the file gives up as before (never
-        two writers on one `.part`)."""
+        two writers on one `.part`). `final` = the last attempt said retrying is
+        pointless (a verdict about the URL); False = the attempts ran out on transport
+        failures, a cause `_created` forgets for the next instance."""
         path, url = e["path"], str(e.get("url") or "")
         try:
             out = await self._exec_ok(_abandon_cmd(path), timeout=60)
@@ -5015,6 +5079,7 @@ class Controller:
         reason = self._fallback_reason(e, why, attempts)
         self._url_fallback[path] = url
         self._url_fallback_why[path] = reason
+        self._url_fallback_cause[path] = "verdict" if final else "transport"
         self._persist()
         self._log(f"download {path}: URL given up — {reason}")
         self._fault(self._comfy(), "sync", "url_fallback", f"{path}: {reason}")
