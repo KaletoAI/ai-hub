@@ -1573,14 +1573,16 @@ via injected callables, staying hot-reload-safe.
   the services attached AT THAT MOMENT. A service list handed over during a stop (Ruling
   M4 a) is kept in `_pending_services` — the drain's list stands, nothing attaches into a
   stopping host — and applied at `off` BEFORE the disable (so a backend moved away
-  meanwhile is left alone). A list that differs only in `enabled` (`_same_services`, which
-  ignores `enabled` and `_`-keys) is NO change: it is the stop's own drain finalize coming
+  meanwhile is left alone). A list that differs only in `enabled` (`_same_services`: per backend id, in any
+  order — a `priority` edit only re-sorts — ignoring `enabled` and `_`-keys) is NO change: it is the stop's own drain finalize coming
   back through main's rebuild — its fresh dicts are kept, nothing goes pending, nothing is
   logged; once the phase is `off` a list applies at once even while the op is still
-  "stopping"; and `off`'s `_disable()` skips a service whose CURRENT dict is already
-  disabled (the drain did it — thunder-1's first stop disabled it twice and logged "services
+  "stopping"; and `off`'s `_disable()` skips a service whose CURRENT dict says `enabled is False` —
+  only then: absent, None or any other value is disabled again, since a backend left
+  enabled after `off` routes to a dead tunnel (the drain did it — thunder-1's first stop disabled it twice and logged "services
   changed" four times; an explicit list, a failed start undoing its enable, is always
-  disabled). A backend that list no longer names also LEAVES the drain at
+  disabled). A pending list that ends up equal again by `off` logs "services unchanged
+  after all", closing its "while stopping" line. A backend that list no longer names also LEAVES the drain at
   the next poll (`_leave_moved`: `deps.cancel_drain`, no longer waited on) — left in it,
   routing skipped it on its new host — and main's `_finalize_drain` disables only a
   backend still on the host it named when its drain began (`_drain_host`), so a last H1

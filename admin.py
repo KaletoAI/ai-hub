@@ -3252,7 +3252,8 @@ def _sync_status(r: dict) -> str:
         return f'<span class="bad">blocked: {_esc("; ".join(other))}</span>'
     if blocked:
         # configured in Server → Models (the LAN model source is the gateway's)
-        return ("<a href='/ui/server?sub=models'>"
+        return ("<a href='/ui/server?sub=models' title='configure the LAN model source "
+                "in Server → Models'>"
                 + _badge("waiting for LAN source", "warn", "; ".join(blocked)) + "</a>")
     need, have = _nbytes(r.get("need_bytes")), _nbytes(r.get("have_bytes"))
     pct = min(100, have * 100 // need) if need else 0

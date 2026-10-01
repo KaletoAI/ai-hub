@@ -7164,3 +7164,94 @@ class StopServiceEvents(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([hostctl.service_bid(x) for x in c.services],
                          ["comfyui:thunder", "openai:vllm"])
         self.assertIsNone(c._pending_services)
+
+    async def test_off_disables_unless_definitely_disabled(self):
+        # fix round 1 (coordinator): the skip is for `enabled is False` ONLY — an absent,
+        # None or odd value is disabled again; a backend left enabled after `off` is
+        # polled and routed to a dead tunnel, a redundant disable costs one log line
+        for val in ("absent", None, 0, "false", True, False):
+            with self.subTest(enabled=val):
+                fake = FakeThunder()
+                c, _, _, _ = make(fake, services=[dict(COMFY)])
+                await c.start()
+                self.assertEqual(c.state.phase, "ready", c.state.error)
+                svc = dict(COMFY) if val == "absent" else dict(COMFY, enabled=val)
+                c.services = [svc]                      # main's last rebuild said so
+                calls = []
+                c.deps.set_enabled = lambda bid, on: calls.append((bid, on)) or True
+                c.deps.begin_drain = lambda bid: True   # no finalize: off decides
+                await c.stop()
+                self.assertEqual(c.state.phase, "off", c.state.error)
+                want = [] if val is False else [("comfyui:thunder", False)]
+                self.assertEqual(calls, want)
+                self.assertEqual(_sv(c, "comfyui:thunder")["status"], "down")
+
+    async def test_resume_mid_stop_skips_what_the_drain_already_disabled(self):
+        # a gateway restart during the stop: the new controller is BUILT with main's live
+        # dicts (the drain finalize already disabled the service) and finishes the stop —
+        # `off` must not disable it a second time, and still shows it down
+        fake = FakeThunder()
+        fake.status_script = []
+        fake.snaps.append({"id": "s5", "name": "aihub-thunder-20260927t100000z",
+                           "status": "CREATING", "minimumDiskSizeGb": 120, "createdAt": 50})
+        c, _, _, _ = make(fake, services=[dict(COMFY, enabled=False)],
+                          state=_persisted(phase="deleting", pending_snapshot="s5"))
+        logs, calls = [], []
+        c.deps.log = logs.append
+        c.deps.set_enabled = lambda bid, on: calls.append((bid, on)) or True
+        await c.resume()
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        self.assertEqual(calls, [])
+        self.assertEqual(_sv(c, "comfyui:thunder")["status"], "down")
+        self.assertEqual(len([m for m in logs if "comfyui:thunder: down" in m]), 1, logs)
+        self.assertFalse([m for m in logs if "services changed" in m], logs)
+
+    async def test_a_reordered_list_is_no_change(self):
+        # a `priority` edit re-sorts main's list without changing any service
+        fake = FakeThunder()
+        vllm = _cmdsvc()
+        c, _, _, _ = make(fake, services=[dict(COMFY), dict(vllm)])
+        logs, calls, roster, rebuild = self._wire(c)
+        await c.start()
+        n = len(logs)
+        sleep, done = c.deps.sleep, []
+
+        async def sleeping(sec):
+            if c.state.phase == "draining" and not done:
+                roster["svcs"] = [dict(vllm), dict(COMFY)]
+                rebuild()
+                done.append(1)
+            await sleep(sec)
+        c.deps.sleep = sleeping
+        c.deps.inflight = lambda bid, busy=[1]: busy.pop() if busy else 0
+        await c.stop()
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        self.assertEqual(done, [1])
+        self.assertFalse([m for m in logs[n:] if "services changed" in m], logs[n:])
+        self.assertIsNone(c._pending_services)
+
+    async def test_a_change_reverted_before_off_closes_its_log_line(self):
+        # attach X, then detach X, during one stop: "while stopping" is answered at `off`
+        fake = FakeThunder()
+        vllm = _cmdsvc()
+        c, _, _, _ = make(fake, services=[dict(COMFY)])
+        logs, calls, roster, rebuild = self._wire(c)
+        await c.start()
+        n = len(logs)
+        sleep, step = c.deps.sleep, []
+
+        async def sleeping(sec):
+            if c.state.phase == "draining" and len(step) < 2:
+                roster["svcs"] = ([dict(COMFY), dict(vllm)] if not step else [dict(COMFY)])
+                rebuild()
+                step.append(1)
+            await sleep(sec)
+        c.deps.sleep = sleeping
+        c.deps.inflight = lambda bid, busy=[1, 1]: busy.pop() if busy else 0
+        await c.stop()
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        said = logs[n:]
+        self.assertEqual(len([m for m in said if "while stopping" in m]), 1, said)
+        self.assertEqual(len([m for m in said if "unchanged after all" in m]), 1, said)
+        self.assertFalse([m for m in said if "now applied" in m], said)
+        self.assertEqual([hostctl.service_bid(x) for x in c.services], ["comfyui:thunder"])

@@ -1389,13 +1389,16 @@ def _svc_material(svc: dict) -> dict:
 
 
 def _same_services(a: list, b: list) -> bool:
-    """Two attached lists name the same services with the same configuration, in the
-    same order — a change of `enabled` alone is no service change (addendum bug 1,
-    2026-10-01: the stop's own disable came back as "services changed while
-    stopping", was applied again at `off` and disabled the service twice)."""
+    """Two attached lists name the same services (by backend id, in any order — a
+    `priority` edit only re-sorts main's list) with the same configuration — a change
+    of `enabled` alone is no service change (addendum bug 1, 2026-10-01: the stop's own
+    disable came back as "services changed while stopping", was applied again at `off`
+    and disabled the service twice)."""
     a, b = list(a or []), list(b or [])
-    return len(a) == len(b) and all(_svc_material(x) == _svc_material(y)
-                                    for x, y in zip(a, b))
+    ma = {service_bid(x): _svc_material(x) for x in a}
+    mb = {service_bid(x): _svc_material(x) for x in b}
+    # equal lengths too: a list naming one bid twice is never "the same" as one naming it once
+    return len(a) == len(b) and ma == mb
 
 
 # ── controller ───────────────────────────────────────────────────────────────
@@ -1618,6 +1621,10 @@ class Controller:
             self._mark_problems()
             if changed:
                 self._log("services changed during the stop — now applied")
+            else:
+                # handed over as a change, reverted before `off` (attach X, detach X):
+                # close the "while stopping" line instead of leaving it open
+                self._log("services unchanged after all — nothing to apply")
 
     def _problems(self) -> dict:
         """backend id → why this service cannot run on the host (it is shown `down`
@@ -3248,6 +3255,9 @@ class Controller:
         failed start undoing its own enable) holds stale dicts and is always disabled."""
         for svc in list(self.services if svcs is None else svcs):
             bid = service_bid(svc)
+            # skip only when DEFINITELY disabled (the bool False): an absent, None or
+            # odd value is disabled again — a backend left enabled after `off` is
+            # polled and routed to a dead tunnel, a redundant disable costs a log line
             if svcs is not None or svc.get("enabled", True) is not False:
                 try:
                     self.deps.set_enabled(bid, False)
@@ -3665,7 +3675,9 @@ class Controller:
             self._op = None
             self._drain_waiting = None
             if self._pending_services is not None and not self._stopping():
-                # a list handed over after `off` applied the pending one
+                # belt and braces: a list handed over after `off` applies at once
+                # (`set_services`), and `off` applies any pending one — nothing should be
+                # left here; if it is, it is applied rather than lost
                 self._apply_pending_services()
 
     async def _stop_run(self) -> None:

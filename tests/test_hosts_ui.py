@@ -839,6 +839,9 @@ class SyncPanel(_Base):
         self.assertIn("6.0", row("Mesh"))
         self.assertIn("syncing 40 %", row("Mesh"))
         self.assertIn("waiting for LAN source", row("Lan"))
+        # a link to where the LAN source is set up, and the hover says why it is one
+        self.assertIn("<a href='/ui/server?sub=models' title='configure the LAN model "
+                      "source in Server → Models'>", row("Lan"))
         self.assertIn("blocked: unknown hub model org/&lt;repo&gt;", row("Bad"))
         self.assertNotIn("org/<repo>", html)
         # hints, selectable fields, held count and the Thunder-only gate note
