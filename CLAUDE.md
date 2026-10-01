@@ -1258,7 +1258,9 @@ via injected callables, staying hot-reload-safe.
   Thunder block gone; keyed sync rows; "delete unknown" confirming what the TICKED boxes
   hold; a refused catalog saving nothing; a pin only for the fingerprint the operator
   saw; the install command giving the share user a real shell; the 24 h banner on card
-  and Dashboard; unowned snapshots listed, never deleted).
+  and Dashboard; unowned snapshots listed, never deleted; each synced file's source
+  badge — the plan's `source`/`origin`, `outdated` from main's kinds fetched off the
+  loop, `URL failed — LAN` from the fallback).
   `test_model_sources.py` (Check & save, everything stubbed — DNS, HTTP, the LanSource:
   a redirect hop not checked like the first is an SSRF with read-back into the panel, a
   token past the first hop goes wherever the redirect says, a non-identity encoding
@@ -1272,7 +1274,11 @@ via injected callables, staying hot-reload-safe.
   partial acceptance and provisional → confirmed/outdated, one check at a time, remove
   and re-check ending a dir's background confirmation (no further hash, no write, the
   pending flag kept for the newer run), lookalike HF hosts, HF headers from HF hosts
-  only, the hash priorities, the catalog lock and the stale-form refusal).
+  only, the hash priorities, the catalog lock and the stale-form refusal; and the
+  overview: rows from `per_alias[*].files` over every ComfyUI backend incl. blocked
+  aliases, a link as its target, dir rows and a file a dir check predates, a URL-only
+  file, the memo key — each input changes it, nothing else — the build off the loop
+  with the live parts laid over a copy, and the card's kinds).
   `test_server_tabs.py` (the Server tab's Runtime | Restart | API Keys | Models: a form on the
   wrong sub-tab or a Save that lands on another one reads as a setting that "did not
   save", and a pending restart shown only on Restart is never seen from Runtime; an
@@ -1281,7 +1287,12 @@ via injected callables, staying hot-reload-safe.
   end the old key's console sessions; a "Server" link that opens the default sub-tab
   sends the operator looking for a field that is not there; "1.5"/"abc" in a number
   field became "" = the default without a word; and a LAN-source or catalog action that
-  still answered on the Backends tab showed its result where the block no longer is).
+  still answered on the Backends tab showed its result where the block no longer is;
+  Model sources: a worklist whose order, small-file collapse, sums and badges ARE the
+  information, escaped URLs that are never links, the actions per source as POSTs
+  landing on `?sub=models`, the GET filter, live only while a check or hash runs, and
+  the catalog editor's stale-form guard end to end — text kept, current hash handed
+  back, a validation refusal keeping the old one).
   Run them all with `python -m unittest discover -s tests -t .` (no runner dependency).
 - **`openai_image_bridge.py`** — pure request/response plumbing for the OpenAI
   image shims (`multipart_list`, `parse_size`, `coerce_scalar`, `images_uploads`
@@ -1955,6 +1966,23 @@ via injected callables, staying hot-reload-safe.
   is beyond a cancel). Only the NEW entry is validated on a Check &
   save (an unrelated broken entry never blocks it — modelsync drops such entries one by
   one anyway). `test_model_sources.py`.
+  **The overview** (Server → Models → "Model sources"): `model_sources_view()` is the
+  spec's "needed file" list — `service_alias_needs` of EVERY ComfyUI backend
+  (`_comfy_backend_names`, the merged `backends`) through `modelsync.plan(needs,
+  lan.cached(), {}, {}, url_catalog)` and its `per_alias[*].files` (NOT `fetch`, which
+  drops the blocked aliases — the ones most worth seeing), a link credited to the file it
+  points at; per row `kind` from `source_kinds` (absent = `lan`), `entry_key` (what
+  `remove_source` takes: the path, or the dir entry whose `files` names it —
+  `_dir_entry_of`), `dir_entry`/`dir_repo` (a LAN file under a dir source whose check
+  predates it) and `aliases` `[[alias, blocked reason]]`. BLOCKING and memoised on (each
+  ComfyUI backend's `service_alias_signature`, the catalog hash, `lan.generation`,
+  `lan.sha_generation`) in `_msrc_memo`; `model_sources_overview()` (bound into admin)
+  builds it in `asyncio.to_thread` and lays the live parts over a COPY on the loop:
+  every controller's `view()["url_fallback"]`, `source_checks()`, `lan.hash_queue()`,
+  `pending` (= `source_checks_pending()` or a hash queued — the section's live flag),
+  `lan.problem()`. `model_source_kinds()` (BLOCKING, own memo on catalog hash + the two
+  generations) is the host card's `{path: {kind, reason, origin}}`. Never starts a hash
+  or a listing. `test_model_sources.Overview`.
 - **`ops/`** (not Python — runs on other boxes). Both bootstraps are streamed to the
   instance and keep everything inside `main()` called on the LAST line (bash reads a
   piped script as it runs and a child reading stdin would swallow the rest; `main` also
@@ -2039,7 +2067,35 @@ via injected callables, staying hot-reload-safe.
   snapshots. On Server → Models: the LAN card (public key, install instructions — VM
   variant first — the Fetch → Confirm pin, *List now* and the last listing's counts and
   age) and the catalog editor (with a hint linking to the HF token in Server → API Keys;
-  `hf_token` in `store._SECRET_SETTINGS`). `_hosts_panel`
+  `hf_token` in `store._SECRET_SETTINGS`; R-3: its form carries `catalog_hash` — the
+  hash of the very list it renders, `_catalog_hash_of` — and sits under
+  `data-live-skip`, so the morph never swaps that hash under a kept, edited textarea;
+  `hosts_catalog_save` passes it as `expect_hash` (a POST without the field is not
+  judged), and a `_catalog_stale` refusal is a 400 with the text AS TYPED and the
+  CURRENT hash, plus a note while `source_checks_pending()`; a validation refusal keeps
+  the hash the form was opened with), then **Model sources** (`_model_sources_block`,
+  `data-k="msrc"`, from `main.model_sources_overview` awaited by `server_page`/
+  `_models_view`): the summary (`_msrc_summary` — a failed URL counts as LAN only and
+  says so), the share-hash queue, the checks of this session (state, progress, fixed
+  reason, `left_out`/`outdated` per relpath), a GET filter form (`?src=lan|outdated|
+  failed|url|hf`, `_msrc_show`; no script), and one keyed row per needed file
+  (`msrc-f-<path>`) in `_msrc_items` order — LAN only by size, outdated, failed, public;
+  two or more LAN-only files < 1 MB in one dir collapse into `msrc-s-<dir>` — with the
+  badge (`HF auto`, `URL ✓`, `URL ✓ size only`, `outdated — re-check`, `LAN only`,
+  `URL failed this session — LAN` = a public source in some controller's fallback),
+  the aliases (blocked marked, reason as title), the URL as escaped TEXT (never a link:
+  it may carry a token) and the actions — a `source-check` form (path + URL; prefilled
+  for outdated) on LAN/outdated/failed rows, ONE editable `source-check-dir` form (dir +
+  repo) per `models/…` folder with ≥ 2 LAN-only files or a stale dir entry, `remove`
+  (`data-confirm`, the row's `entry_key`) on URL ✓/outdated rows. POST-only, under
+  `/ui/hosts/managed/source-check|source-check-dir|source-remove`, answered on
+  `?sub=models`; `hosts_source_remove` AWAITS `_remove_source` on the loop. The Models
+  sub-tab is live (3 s) only while `pending`, never on a refusal (its URL is the POST).
+  The host card's per-file sync rows carry `_card_src_badge` — the plan view's
+  `source`/`origin` (hostctl `_plan_view` adds them from the url catalog the plan was
+  handed), `outdated` from `_model_source_kinds` (fetched once per Backends render in a
+  worker thread, only when a view has a plan), `URL failed — LAN` from the view's
+  `url_fallback`. `_hosts_panel`
   lists EVERY managed host (also one without ComfyUI or without any backend), and
   `_dash_hosts` puts the long-run banner on the Dashboard. The backend form attaches: a
   `host_managed` select ("(none / free text)" + every store managed host) beside the

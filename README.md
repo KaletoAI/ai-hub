@@ -1613,6 +1613,32 @@ the rest streams from the LAN share. Where the URL comes from:
   next instance; a mismatch or a 4xx stays given up until the entry changes or you press
   *Sync now*.
 
+**Filling in the sources — Server → Models → Model sources.** Below the LAN model
+source and the catalog, the console lists every model file a media alias needs (over
+every ComfyUI backend, blocked aliases included; no running host needed) and where an
+instance would get it:
+
+- a summary — `N files · X GB public (HF auto Y GB · URL Z GB) · W GB LAN only · V GB
+  outdated` — and one row per file: path, size, source badge, the aliases that need it
+  (a blocked one is marked, its reason on hover), the URL (as text, never a link);
+- badges: **HF auto** (from the share's Hugging Face cache), **URL ✓** / **URL ✓ size
+  only** (a catalog source, sha256- or size-verified), **outdated — re-check** (the
+  share's file changed since the check), **LAN only**, **URL failed this session — LAN**
+  (an instance found the URL's bytes wrong or got a 4xx, and synced the share's copy);
+- sorted as a worklist: LAN only (largest first), outdated, failed, public; LAN-only
+  files under 1 MB collapse into one line per directory; the filter boxes narrow it to
+  one or more sources;
+- **how to fill it**: enter a URL in a LAN-only (or outdated) row and press *Check &
+  save*; for a `models/…` directory with several LAN-only files, name its Hugging Face
+  repo (`org/name`) in the row's directory form instead — edit the directory first if
+  the repo's root sits higher. *remove* drops a stored source (it asks first). The
+  section follows a running check or share hash live (state, progress, refusal reason,
+  the files a directory check left out) and is static otherwise. A share that has not
+  been listed yet shows only catalog URLs — press *List now* above.
+
+Each host card's model-sync file list carries the same badge per file (`HF auto`,
+`URL ✓`, `outdated`, `LAN`, `URL failed — LAN`), as that host's plan decided it.
+
 The entries Check & save writes are ordinary catalog entries (you may also write them
 by hand):
 
@@ -1785,7 +1811,7 @@ session cookie is marked `Secure`. Tabs:
 | **Playground** | one tab, sub-tabs **Chat** (default — chat completion through `/v1/chat/completions`), **Media** (generation via `POST /v1/generations` — image/video/audio, upload refs + mesh files, or an earlier job's artifact) and **Voice** (TTS via `POST /v1/audio/speech`, inline player + download) — all as **real API clients** (auth, routing, parking, stats all apply) |
 | **Jobs & Calls** | sub-tabs **LLM Calls** (per-call history with stored request/response bodies — LLM endpoints only), **Media Jobs** (list + detail of generation jobs, inputs + outputs, within TTL, plus the media requests that were refused before they became a job) and **Voice Calls** |
 | **Statistics** | **Backend faults · last 24h** (per backend + every message, bundled — shown even with stats off), then the call-stats dashboard (search, aggregates, drilldown) — empty until `stats.enabled: true` (the example config ships it `false`; set it in `config.yaml` or Server → Restart, then restart — the flag is read at startup only). The same switch feeds the LLM Calls list under Jobs & Calls. |
-| **Server** | sub-tabs **Runtime** (default — applied on Save: caps, park time/queue, `affinity_max_wait_s`, probe interval, scan ranges, flags), **Restart** (port, stats/jobs, TTL/prune — take effect on the next restart; a pending restart is badged on the Restart sub-tab from every sub-tab), **API Keys** (every secret the server holds, each its own Save, never shown again — blank keeps it: the master API key, one API token per managed-host provider, the Hugging Face token; user keys live in Users) and **Models** (what the model sync of every managed host reads: the LAN model source — share host, public key, install instructions, host-key pin, *List now* — and the model-sync catalog; each action comes back to this sub-tab with its answer, a refused Save with the value as typed). A number that does not parse (`1.5` in a whole-number field, `abc`) is refused with the form as typed — blank is the only "default" |
+| **Server** | sub-tabs **Runtime** (default — applied on Save: caps, park time/queue, `affinity_max_wait_s`, probe interval, scan ranges, flags), **Restart** (port, stats/jobs, TTL/prune — take effect on the next restart; a pending restart is badged on the Restart sub-tab from every sub-tab), **API Keys** (every secret the server holds, each its own Save, never shown again — blank keeps it: the master API key, one API token per managed-host provider, the Hugging Face token; user keys live in Users) and **Models** (what the model sync of every managed host reads: the LAN model source — share host, public key, install instructions, host-key pin, *List now* — and the model-sync catalog — whose Save is refused, your text kept, when the catalog changed since the form was opened — and below them **Model sources**, the per-file worklist of public URL vs LAN only with *Check & save* / *remove*, live while a check runs; each action comes back to this sub-tab with its answer, a refused Save with the value as typed). A number that does not parse (`1.5` in a whole-number field, `abc`) is refused with the form as typed — blank is the only "default" |
 | **Users** | multi-user keys, allow-lists, quotas, IP aliases |
 
 **Live views update in place — an update never reloads the page.** Anything that
