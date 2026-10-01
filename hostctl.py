@@ -1382,6 +1382,22 @@ def service_bid(svc: dict) -> str:
     return f'{svc.get("type", "openai")}:{svc["name"]}'
 
 
+def _svc_material(svc: dict) -> dict:
+    """A service dict minus what is not configuration: `enabled` (the lifecycle's own
+    switch — a stop disables, a start enables) and main's `_`-prefixed runtime keys."""
+    return {k: v for k, v in svc.items() if k != "enabled" and not str(k).startswith("_")}
+
+
+def _same_services(a: list, b: list) -> bool:
+    """Two attached lists name the same services with the same configuration, in the
+    same order — a change of `enabled` alone is no service change (addendum bug 1,
+    2026-10-01: the stop's own disable came back as "services changed while
+    stopping", was applied again at `off` and disabled the service twice)."""
+    a, b = list(a or []), list(b or [])
+    return len(a) == len(b) and all(_svc_material(x) == _svc_material(y)
+                                    for x, y in zip(a, b))
+
+
 # ── controller ───────────────────────────────────────────────────────────────
 
 class Controller:
@@ -1566,7 +1582,19 @@ class Controller:
         service attached meanwhile would escape the drain, and one detached meanwhile
         is another host's business already (R-K2)."""
         svcs = [x for x in (services or []) if isinstance(x, dict) and x.get("name")]
-        if self._stopping():
+        if self._stopping() and self.state.phase != "off":
+            # what the stop waits on: the list already handed over, else the drain's
+            base = (self._pending_services if self._pending_services is not None
+                    else self.services)
+            if _same_services(svcs, base):
+                # only `enabled` moved — the stop's OWN disable (drain finalize) coming
+                # back through main's rebuild, or a rebuild for another backend: no news.
+                # The fresh dicts are kept, so `off` sees the flag the drain set.
+                if self._pending_services is not None:
+                    self._pending_services = svcs
+                else:
+                    self.services = svcs
+                return
             if self._pending_services is None:
                 self._log("services changed while stopping — applied once the host is off")
             self._pending_services = svcs
@@ -1585,9 +1613,11 @@ class Controller:
         """`off`: the list handed over during the stop becomes the attached one."""
         pend, self._pending_services = self._pending_services, None
         if pend is not None:
+            changed = not _same_services(pend, self.services)
             self.services = pend
             self._mark_problems()
-            self._log("services changed during the stop — now applied")
+            if changed:
+                self._log("services changed during the stop — now applied")
 
     def _problems(self) -> dict:
         """backend id → why this service cannot run on the host (it is shown `down`
@@ -3209,13 +3239,18 @@ class Controller:
     def _disable(self, svcs: Optional[list] = None) -> None:
         """`off` = disabled (spec "Stop" 1): no discovery against a dead tunnel port —
         for every backend attached AT THIS MOMENT (R-K2: one that moved to another host
-        or a real URL is that one's business now), or just `svcs`."""
+        or a real URL is that one's business now), or just `svcs`. The attached list
+        holds the dicts of main's LAST rebuild, so one already disabled — the stop's
+        drain finalize took it offline the moment it was idle — is not disabled a second
+        time (a store write, a rebuild and a log line each); an explicit `svcs` (a
+        failed start undoing its own enable) holds stale dicts and is always disabled."""
         for svc in list(self.services if svcs is None else svcs):
             bid = service_bid(svc)
-            try:
-                self.deps.set_enabled(bid, False)
-            except Exception as e:
-                self._log(f"disabling backend {bid} failed: {e!r}")
+            if svcs is not None or svc.get("enabled", True) is not False:
+                try:
+                    self.deps.set_enabled(bid, False)
+                except Exception as e:
+                    self._log(f"disabling backend {bid} failed: {e!r}")
             self._svc_set(svc, "down")
 
     async def _start(self) -> None:
@@ -4786,6 +4821,15 @@ class Controller:
                 raise RuntimeError("delete not confirmed by the instance")
             self._log(f"deleted {len(paths)} unknown file(s): " + ", ".join(paths[:10])
                       + (" …" if len(paths) > 10 else ""))
+            # the host bootstrap's template report names the same paths: a deleted
+            # one must leave the card's "Models the template brought along" too (it is
+            # persisted state — a stale entry would survive a gateway restart)
+            s = self.state
+            gone = set(paths) & set(s.bootstrap_unknown)
+            if gone:
+                s.bootstrap_unknown = {p: n for p, n in s.bootstrap_unknown.items()
+                                       if p not in gone}
+                self._persist()
         await self.sync_once()
         return len(paths)
 

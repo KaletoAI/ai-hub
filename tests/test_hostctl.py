@@ -3449,6 +3449,22 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(c.plan["unknown"], [])
         self.assertIn(_dm("x.safetensors"), vm.files)
 
+    async def test_delete_unknown_drops_the_files_from_the_template_report(self):
+        # thunder-1, 2026-10-01 16:32: "delete unknown" removed the template's checkpoint,
+        # and the card went on listing it under "Models the template brought along"
+        tmpl, other = "models/checkpoints/v1-5-pruned.safetensors", "models/vae/kept.pt"
+        fake, vm, c, box, saved = _sync_make(aliases={"img": _cand("x.safetensors")},
+                                             catalog=[_url("x.safetensors")])
+        vm.sizes["https://example.com/x.safetensors"] = 3
+        vm.files = {tmpl: 123, other: 7}
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")))
+        c.state.bootstrap_unknown = {tmpl: 123, other: 7}
+        self.assertEqual(await c.delete_unknown([tmpl]), 1)
+        self.assertEqual(c.state.bootstrap_unknown, {other: 7})
+        self.assertEqual(c.view()["bootstrap_unknown"], {other: 7})
+        self.assertEqual(saved["thunder"]["bootstrap_unknown"], {other: 7})   # persisted
+
     async def test_sync_now_retries_failed_transfers(self):
         """Task 13: "Sync now" — without it a transfer that gave up is retried only when
         the aliases or the catalog change, however the operator fixed the cause."""
@@ -7025,3 +7041,123 @@ class DepsContract(unittest.TestCase):
                                           **{k: None for k in self.KWARGS.get(name, ())})
             except TypeError as e:
                 self.fail(f"Deps.{name}: {e}")
+
+
+class StopServiceEvents(unittest.IsolatedAsyncioTestCase):
+    """Addendum bug 1 (thunder-1, 2026-10-01 16:51): the stop's OWN disable came back
+    through main's rebuild as a "services changed while stopping" event, was applied
+    again at `off` ("now applied"), the service was disabled a second time, and one more
+    "while stopping" line followed after the phase was already `off`. Main is modelled
+    as it behaves: `begin_drain` with nothing in flight finalizes at once (disable), and
+    every `set_enabled` rebuilds and hands the controller FRESH dicts carrying the new
+    `enabled` flag."""
+
+    def _wire(self, c, extra=None):
+        logs, calls = [], []
+        c.deps.log = logs.append
+        live = {}
+        roster = {"svcs": [dict(x) for x in c.services]}
+
+        def rebuild():
+            c.set_services([dict(x, enabled=live.get(hostctl.service_bid(x), True))
+                            for x in roster["svcs"]])
+
+        def set_enabled(bid, on):
+            calls.append((bid, on))     # main logs "disabled via console" on EVERY call
+            live[bid] = on
+            rebuild()
+            return True
+
+        def begin_drain(bid):
+            set_enabled(bid, False)     # idle: main's finalize disables at once
+            return True
+        c.deps.set_enabled = set_enabled
+        c.deps.begin_drain = begin_drain
+        return logs, calls, roster, rebuild
+
+    async def test_the_stops_own_disable_is_no_service_change(self):
+        fake = FakeThunder()
+        c, _, _, _ = make(fake, services=[dict(COMFY)])
+        logs, calls, _, _ = self._wire(c)
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        n = len(logs)
+        calls.clear()
+        await c.stop()
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        said = logs[n:]
+        self.assertFalse([m for m in said if "services changed" in m], said)
+        # disabled ONCE (by the drain's finalize) — `off` does not disable it again
+        self.assertEqual(calls, [("comfyui:thunder", False)])
+        self.assertEqual(_sv(c, "comfyui:thunder")["status"], "down")
+        self.assertIsNone(c._pending_services)
+        self.assertIs(c.services[0].get("enabled"), False)     # the current dicts
+
+    async def test_off_disables_a_service_the_drain_left_enabled(self):
+        # nothing disabled it on the way (a drain that did not finalize): `off` does
+        fake = FakeThunder()
+        c, _, _, _ = make(fake, services=[dict(COMFY)])
+        logs, calls, _, _ = self._wire(c)
+        await c.start()
+        c.deps.begin_drain = lambda bid: True
+        calls.clear()
+        await c.stop()
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        self.assertEqual(calls, [("comfyui:thunder", False)])
+
+    async def test_a_real_change_mid_stop_still_waits_and_is_said_once(self):
+        # Ruling M4 (a) unchanged: an attach during the drain waits for `off`, is logged
+        # once when handed over and once when applied — and nothing after `off` says
+        # "while stopping"
+        fake = FakeThunder()
+        vllm = _cmdsvc()
+        c, _, _, _ = make(fake, services=[dict(COMFY)])
+        logs, calls, roster, rebuild = self._wire(c)
+        await c.start()
+        n = len(logs)
+        sleep, seen = c.deps.sleep, []
+
+        async def sleeping(sec):
+            if c.state.phase == "draining" and not seen:
+                roster["svcs"] = [dict(COMFY), dict(vllm)]
+                rebuild()
+                seen.append([hostctl.service_bid(x) for x in c.services])
+            await sleep(sec)
+        c.deps.sleep = sleeping
+        c.deps.inflight = lambda bid, busy=[1]: busy.pop() if busy else 0
+        await c.stop()
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        self.assertEqual(seen, [["comfyui:thunder"]])           # the drain's list stood
+        said = logs[n:]
+        self.assertEqual(len([m for m in said if "while stopping" in m]), 1, said)
+        self.assertEqual(len([m for m in said if "now applied" in m]), 1, said)
+        off_at = max(i for i, m in enumerate(said) if "services changed" in m)
+        self.assertIn("now applied", said[off_at])              # the last word on it
+        self.assertEqual([hostctl.service_bid(x) for x in c.services],
+                         ["comfyui:thunder", "openai:vllm"])
+        self.assertNotIn(("openai:vllm", True), calls)           # never enabled by a stop
+        self.assertEqual(calls.count(("comfyui:thunder", False)), 1)
+
+    async def test_a_list_handed_over_after_off_applies_at_once(self):
+        # the rebuild that `off`'s own disable triggers arrives while the op is still
+        # "stopping" but the phase is `off`: nothing is waiting for anything any more
+        fake = FakeThunder()
+        vllm = _cmdsvc()
+        c, _, _, _ = make(fake, services=[dict(COMFY)])
+        logs, calls, roster, rebuild = self._wire(c)
+        await c.start()
+        c.deps.begin_drain = lambda bid: True                  # leave it to `off`
+        n = len(logs)
+
+        def set_enabled(bid, on):
+            calls.append((bid, on))
+            roster["svcs"] = [dict(COMFY), dict(vllm)]        # attached meanwhile
+            rebuild()
+            return True
+        c.deps.set_enabled = set_enabled
+        await c.stop()
+        self.assertEqual(c.state.phase, "off", c.state.error)
+        self.assertFalse([m for m in logs[n:] if "services changed" in m], logs[n:])
+        self.assertEqual([hostctl.service_bid(x) for x in c.services],
+                         ["comfyui:thunder", "openai:vllm"])
+        self.assertIsNone(c._pending_services)
