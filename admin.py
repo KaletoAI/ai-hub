@@ -9981,7 +9981,9 @@ def _msrc_size(n) -> str:
 
 def _msrc_badge(row: dict, cat: str, fallback: dict) -> str:
     if cat == "failed":
-        return _badge("URL failed this session — LAN", "bad",
+        # the record is persisted: it holds until Sync now, a new Check & save or a
+        # remove of the entry — not "this session" (final review M-3)
+        return _badge("URL failed — LAN", "bad",
                       str(fallback.get(row.get("path")) or ""))
     if cat == "outdated":
         return _badge("outdated — re-check", "warn", str(row.get("reason") or ""))
@@ -10036,7 +10038,8 @@ def _msrc_summary(rows: list, fallback: dict) -> str:
            f"{g(tot['url'])} GB) · {g(tot['lan'] + tot['failed'])} GB LAN only · "
            f"{g(tot['outdated'])} GB outdated")
     if tot["failed"]:
-        out += f" (LAN only includes {g(tot['failed'])} GB whose URL failed this session)"
+        out += (f" (LAN only includes {g(tot['failed'])} GB whose URL failed — given up "
+                "until Sync now or a new Check & save)")
     return out
 
 

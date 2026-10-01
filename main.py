@@ -6750,6 +6750,7 @@ async def _check_file(path: str, url: str) -> None:
     _src_set(path, state="done", reason="", progress="",
              note="verified by sha256" if verified == "sha256" else "size-verified only")
     logger.info(f"[model sources] {path}: URL source saved ({verified})")
+    _forget_fallbacks([path])
 
 
 async def check_dir_source(dir_: str, repo: str, rev: str = "main") -> str:
@@ -6827,6 +6828,7 @@ async def _check_dir(d: str, repo: str, rev: str) -> None:
     logger.info(f"[model sources] {d}: directory source saved ({len(rows)} of {len(files)} "
                 f"files, commit {commit})")
     _src_stop_confirm(d)
+    _forget_fallbacks([d + rel for rel in rows])
     if todo:
         _src_run_seq[0] += 1
         run = (d, _src_run_seq[0])
@@ -6909,6 +6911,26 @@ def _confirm_row(d: str, repo: str, commit: str, rel: str, size: int, share: str
     return result[0] if not errs else "gone"
 
 
+def _forget_fallbacks(paths) -> None:
+    """After a successful Check & save write or a remove: every host controller forgets
+    its URL-fallback records of `paths` (final review I-1) — in any phase, an `off` host
+    included; otherwise a URL the operator just re-verified stayed "given up" and the
+    next session streamed the file from the LAN. Best-effort: a controller that fails
+    is logged, the others still run."""
+    paths = [p for p in paths if isinstance(p, str)]
+    if not paths:
+        return
+    for name, c in list(host_controllers.items()):
+        try:
+            n = c.forget_fallback(paths)
+        except Exception as e:
+            logger.warning(f"[model sources] host {name}: fallback records not cleared: "
+                           f"{type(e).__name__}: {e}")
+            continue
+        if n:
+            logger.info(f"[model sources] host {name}: {n} URL fallback record(s) cleared")
+
+
 async def remove_source(key: str) -> str:
     """The overview's "remove": drop the per-file source entry (`key` = its path) or
     the directory source (`key` ending in `/`) — and a check of it still waiting, and a
@@ -6927,9 +6949,18 @@ async def remove_source(key: str) -> str:
     if t is not None and not t.done():
         t.cancel()
 
+    covered: list = []
+
     def fn(cat):
-        out = [e for e in cat if not (isinstance(e, dict) and (
-            ("url" in e and e.get("file") == key) or ("repo" in e and e.get("dir") == key)))]
+        out = []
+        for e in cat:
+            if isinstance(e, dict) and "url" in e and e.get("file") == key:
+                covered.append(key)
+            elif isinstance(e, dict) and "repo" in e and e.get("dir") == key:
+                fm = e.get("files")
+                covered.extend(key + rel for rel in (fm if isinstance(fm, dict) else {}))
+            else:
+                out.append(e)
         if len(out) == len(cat):
             return None
         found[0] = True
@@ -6939,6 +6970,7 @@ async def remove_source(key: str) -> str:
         return f"not removed: {errs[0]}"
     if not found[0]:
         return f"no source entry for {key}"
+    _forget_fallbacks(covered)
     logger.info(f"[model sources] {key}: source removed")
     return f"source of {key} removed"
 
@@ -7102,7 +7134,7 @@ def model_sources_view() -> dict:
 async def model_sources_overview() -> dict:
     """The console's "Model sources" section: `model_sources_view()` (built in a worker
     thread, memoised) plus what changes while nothing else does — `fallback` (`{path:
-    "<host>: <reason>[; …]"}` of every controller's "URL failed this session — LAN",
+    "<host>: <reason>[; …]"}` of every controller's "URL failed — LAN",
     `Controller.url_fallback_view` — in memory, not the whole `view()`), `checks`
     (`source_checks()`), `hashing` (the share-hash queue, running first), `pending` (a
     check or a hash still running: the section is live) and `problem` (the LAN source's,

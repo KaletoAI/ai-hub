@@ -1689,8 +1689,10 @@ via injected callables, staying hot-reload-safe.
   with a reason that names a size difference as such ("size differs: the URL's file is
   …, the share's copy … — syncing the share's copy", review M-3). `_compute_plan` hands
   `plan` the URL sources WITHOUT those (`_without_fallbacks`, explicit and derived
-  alike) → the plan says `lan`; keyed on the URL — an entry naming another URL drops the
-  record and is tried by itself; Sync now clears it with `_failed`, EXCEPT for a path whose
+  alike) → the plan says `lan`; keyed on the URL — an entry naming another URL, or a
+  Check & save / remove of the path (`Controller.forget_fallback`, called by main on
+  EVERY controller, an `off` one included, final review I-1), drops the record and it is
+  tried by itself; Sync now clears it with `_failed`, EXCEPT for a path whose
   transfer still runs (the URL's curl would resume onto the LAN's `.part`, fail the same
   way, and the abandon would discard the LAN progress). The record is PERSISTED
   (`State.url_fallback`/`url_fallback_why`) for the same reason: a gateway restart during
@@ -1870,7 +1872,11 @@ via injected callables, staying hot-reload-safe.
   and an entry whose stored `size` ≠ the share LISTING's is OUTDATED and yields to the
   next source — a listing comparison, never a share hash on the plan path (with
   `share_sha`, the persistent `{path: [size, sha256]}` cache, a sha that differs at the
-  listed size is outdated too); a row that replaced an outdated entry keeps its reason as
+  listed size is outdated too). "Outdated" after the fact never re-fetches a file that is
+  PRESENT: `present()` compares sizes, so an instance already holding the URL's bytes at
+  the same size keeps them (and the alias stays ready) — the overview's "outdated —
+  re-check" is about the ENTRY, not about what a running host holds. A row that replaced
+  an outdated entry keeps its reason as
   `outdated_entry` (the dead entry stays in the catalog until re-checked), every row
   carries `listing_size`, and `dir_for(path, catalog)` names the dir entry a share file
   the check never saw falls under (→ `lan`, "re-check the directory"). `url_catalog(catalog, source_index)` is its plan view
@@ -2091,7 +2097,8 @@ via injected callables, staying hot-reload-safe.
   (`msrc-f-<path>`) in `_msrc_items` order — LAN only by size, outdated, failed, public;
   two or more LAN-only files < 1 MB in one dir collapse into `msrc-s-<dir>` — with the
   badge (`HF auto`, `URL ✓`, `URL ✓ size only`, `outdated — re-check`, `LAN only`,
-  `URL failed this session — LAN` = a public source in some controller's fallback),
+  `URL failed — LAN` = a public source in some controller's PERSISTED fallback — until
+  Sync now or a new Check & save, not "this session"),
   the aliases (blocked marked, reason as title), the URL as escaped TEXT (never a link:
   it may carry a token) and the actions — a `source-check` form (path + URL; prefilled
   for outdated) on LAN/outdated/failed rows, ONE editable `source-check-dir` form (dir +
@@ -2107,7 +2114,9 @@ via injected callables, staying hot-reload-safe.
   `source`/`origin` (hostctl `_plan_view` adds them from the url catalog the plan was
   handed), `outdated` from `_model_source_kinds` (fetched once per Backends render in a
   worker thread, only when a view has a plan), `URL failed — LAN` from the view's
-  `url_fallback`. `_hosts_panel`
+  `url_fallback`. The badge is the CURRENT source (where this plan would fetch the file),
+  never its provenance: a present file LAN-synced before its URL entry existed reads
+  `URL ✓`/`HF auto` — the manifest's `source` is shown nowhere. `_hosts_panel`
   lists EVERY managed host (also one without ComfyUI or without any backend), and
   `_dash_hosts` puts the long-run banner on the Dashboard. The backend form attaches: a
   `host_managed` select ("(none / free text)" + every store managed host) beside the

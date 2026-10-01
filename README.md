@@ -1606,12 +1606,14 @@ the rest streams from the LAN share. Where the URL comes from:
   longer matches the share's listing (the file was replaced) is *outdated* and the file
   syncs from the LAN until you check it again.
 - **On the instance**: a download whose size or sha256 does not match is not retried
-  (the same URL serves the same bytes), nor is an HTTP 4xx; for a file the share also
+  (the same URL serves the same bytes), nor is an HTTP 4xx other than 408/429; for a
+  file the share also
   holds, the gateway then ends that download, discards its partial file and syncs the
   share's copy instead (a `url_fallback` entry in the fault log). A URL given up on
   network trouble (5xx, 429, a dead connection — three attempts) is tried again by the
-  next instance; a mismatch or a 4xx stays given up until the entry changes or you press
-  *Sync now*.
+  next instance; a mismatch or a 4xx stays given up until the entry changes, you press
+  *Sync now*, or a new *Check & save* (or a *remove*) of that file clears it — on every
+  host, a stopped one included.
 
 **Filling in the sources — Server → Models → Model sources.** Below the LAN model
 source and the catalog, the console lists every model file a media alias needs (over
@@ -1623,10 +1625,11 @@ instance would get it:
   (a blocked one is marked, its reason on hover), the URL (as text, never a link);
 - badges: **HF auto** (from the share's Hugging Face cache), **URL ✓** / **URL ✓ size
   only** (a catalog source, sha256- or size-verified), **outdated — re-check** (the
-  share's file changed since the check), **LAN only**, **URL failed this session — LAN**
-  (an instance found the URL's bytes wrong or got a 4xx, and synced the share's copy);
-- sorted as a worklist: LAN only (largest first), outdated, failed, public; LAN-only
-  files under 1 MB collapse into one line per directory; the filter boxes narrow it to
+  share's file changed since the check), **LAN only**, **URL failed — LAN** (an
+  instance found the URL's bytes wrong or got a 4xx, and synced the share's copy; it
+  stays so until *Sync now* or a new *Check & save*);
+- sorted as a worklist: LAN only (largest first), outdated, failed, public; two or
+  more LAN-only files under 1 MB in one directory collapse into one line; the filter boxes narrow it to
   one or more sources;
 - **how to fill it**: enter a URL in a LAN-only (or outdated) row and press *Check &
   save*; for a `models/…` directory with several LAN-only files, name its Hugging Face
@@ -1639,7 +1642,12 @@ instance would get it:
   been listed yet shows only catalog URLs — press *List now* above.
 
 Each host card's model-sync file list carries the same badge per file (`HF auto`,
-`URL ✓`, `outdated`, `LAN`, `URL failed — LAN`), as that host's plan decided it.
+`URL ✓`, `outdated`, `LAN`, `URL failed — LAN`), as that host's plan decided it: the
+CURRENT source — where the plan would fetch the file now — not where a file already on
+the disk came from (one LAN-synced before its URL entry existed reads `URL ✓`/`HF
+auto`). A file that turns *outdated* after it was downloaded is not fetched again while
+it is present at the same size; the badge tells you the entry needs a re-check, it does
+not change what a running host holds.
 
 The entries Check & save writes are ordinary catalog entries (you may also write them
 by hand):

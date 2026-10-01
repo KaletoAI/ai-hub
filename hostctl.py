@@ -1794,6 +1794,7 @@ class Controller:
         # with (`_svc_sig`), and the dict it was started from (a detach stops THAT)
         self._attached: dict = {}
         self._attached_svcs: dict = {}
+        self._report_guard_logged = False      # `_prune_template_report` guard, logged once
         self._problem_bids: set = set()                # services marked down by _problems
         self._expose_due: set = set()                  # command services to check (ss)
         self._fwd_retry: dict = {}                     # (lport, rport) → (next try, delay, why)
@@ -1846,6 +1847,23 @@ class Controller:
         self._url_fallback.pop(path, None)
         self._url_fallback_why.pop(path, None)
         self._url_fallback_cause.pop(path, None)
+
+    def forget_fallback(self, paths) -> int:
+        """Drop the URL-fallback records of `paths` and persist — in ANY phase, `off`
+        included: the record is about the catalog's URL, not the instance. main calls it
+        after a successful Check & save (the operator just re-verified that URL — kept,
+        the next session would stream the file from the LAN although the same URL now
+        passes) and after a remove (final review I-1). → how many records went."""
+        gone = [p for p in dict.fromkeys(paths or ()) if isinstance(p, str)
+                and (p in self._url_fallback or p in self._url_fallback_why
+                     or p in self._url_fallback_cause)]
+        for p in gone:
+            self._drop_fallback(p)
+        if gone:
+            self._persist()
+            self._log(f"{len(gone)} URL source(s) given up for the share's copy are tried "
+                      "again (Check & save or remove of the entry)")
+        return len(gone)
 
     def _load_failed(self, msg: str) -> None:
         """The stored record exists but could not be read. It may name a RUNNING,
@@ -4577,6 +4595,14 @@ class Controller:
         s = self.state
         if not s.bootstrap_unknown:
             return
+        if not any(isinstance(k, str) and k.startswith("models/") for k in dest or {}):
+            # no `models/` tree in the index at all (a `~/ComfyUI` link broken or renamed
+            # by hand; find's errors go to /dev/null): nothing to compare against — the
+            # report is written once per disk and must not be dropped on such a listing
+            if not self._report_guard_logged:
+                self._report_guard_logged = True
+                self._log("destination index lists no models/ — template report kept")
+            return
         keep = {p: n for p, n in s.bootstrap_unknown.items() if p in dest}
         if len(keep) != len(s.bootstrap_unknown):
             s.bootstrap_unknown = keep
@@ -4895,6 +4921,9 @@ class Controller:
         urls = (self._plan_inputs or (None,) * 5)[4] or {}
 
         def with_source(f):
+            # the CURRENT source — where this plan would fetch the file — never its
+            # provenance: a present file LAN-synced before a URL entry existed reads
+            # `url`/`hf-auto` (the manifest's `source` is not shown anywhere)
             f = dict(f)
             if f.get("link") is not None:
                 f["source"] = "link"

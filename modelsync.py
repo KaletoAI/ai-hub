@@ -479,7 +479,10 @@ def _share_sha(share_sha, path, size):
 def _outdated(info: dict, listing: dict, share_sha) -> str:
     """Why a catalog source no longer describes the share's file ('' = it does). Only an
     entry that stored a `size` can be outdated (old entries never are); no listing size
-    (the share does not list the file, or lists a link) keeps it."""
+    (the share does not list the file, or lists a link) keeps it. Outdated changes where
+    a MISSING file is fetched from; a file already present at the same size is never
+    fetched again because of it (`plan`'s presence is a size comparison) — the verdict
+    is about the entry, not about the bytes a running host holds."""
     size = info.get("size")
     have = _int_size(listing.get(info["path"]))
     if size is None or have is None:

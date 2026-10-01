@@ -1052,6 +1052,86 @@ class RefusalNeverEchoesTheUrl(_Base):
         self.assertNotIn("SECRET", msg)
 
 
+class ClearsFallbacks(_Base):
+    """Final review I-1: a successful Check & save (file or dir) and a remove make every
+    host controller forget its URL-fallback records of the covered paths — a host that
+    is OFF included — else a URL the operator just re-verified stays "given up" and the
+    next session streams the file from the LAN."""
+    PATH = "models/diffusion_models/m.safetensors"
+    URL = "https://mirror.example/m.safetensors"
+
+    class Stub:
+        def __init__(self, boom=False):
+            self.calls, self.boom = [], boom
+
+        def forget_fallback(self, paths):
+            self.calls.append(sorted(paths))
+            if self.boom:
+                raise RuntimeError("store down")
+            return len(paths)
+
+    def setUp(self):
+        super().setUp()
+        self._hc = main.host_controllers
+        self.addCleanup(setattr, main, "host_controllers", self._hc)
+        self.lan = FakeLan({self.PATH: 10}, share_sha={self.PATH: SHA_A})
+        self.routes[self.URL] = resp(200, content_length=10)
+
+    def real_off_controller(self):
+        from tests import test_hostctl as th
+        from tests.fakes import FakeThunder
+        c, saved, enabled, calls = th.make(FakeThunder())
+        self.assertEqual(c.state.phase, "off")
+        c.state.url_fallback = {self.PATH: self.URL}
+        c.state.url_fallback_why = {self.PATH: "hash differs — syncing the share's copy"}
+        c.state.url_fallback_cause = {self.PATH: "verdict"}
+        return c, saved
+
+    async def test_check_of_the_same_url_clears_an_off_hosts_verdict_record(self):
+        c, saved = self.real_off_controller()
+        boom, other = self.Stub(boom=True), self.Stub()
+        main.host_controllers = {"a": boom, "h": c, "z": other}
+        await self.run_check(main.check_source(self.PATH, self.URL))
+        self.assertEqual(main.source_checks()[self.PATH]["state"], "done")
+        self.assertEqual(c._url_fallback, {})
+        self.assertEqual(saved["thunder"]["url_fallback"], {})
+        self.assertEqual(saved["thunder"]["url_fallback_cause"], {})
+        self.assertEqual(other.calls, [[self.PATH]])     # one failing host stops nobody
+
+    async def test_a_refused_check_clears_nothing(self):
+        c, saved = self.real_off_controller()
+        main.host_controllers = {"h": c}
+        self.routes[self.URL] = resp(200, content_length=11)
+        await self.run_check(main.check_source(self.PATH, self.URL))
+        self.assertEqual(main.source_checks()[self.PATH]["state"], "refused")
+        self.assertEqual(c._url_fallback, {self.PATH: self.URL})
+
+    async def test_remove_clears_the_record(self):
+        c, saved = self.real_off_controller()
+        main.host_controllers = {"h": c}
+        store.set_settings({"modelsync_catalog": [{"file": self.PATH, "url": self.URL}]})
+        self.assertIn("removed", await main.remove_source(self.PATH))
+        self.assertEqual(c._url_fallback, {})
+        self.assertEqual(saved["thunder"]["url_fallback"], {})
+
+    async def test_a_dir_check_and_a_dir_remove_cover_every_row(self):
+        d, repo = "models/org/repo/", "org/repo"
+        self.lan = FakeLan({d + "a.st": 5, d + "b.st": 6, d + "gone.st": 7},
+                           share_sha={d + "a.st": SHA_A, d + "b.st": SHA_B})
+        for rel, n in (("a.st", 5), ("b.st", 6)):
+            self.routes[modelsync.hf_resolve_url(repo, "main" if rel == "a.st" else COMMIT,
+                                                 rel)] = resp(200, content_length=n,
+                                                              x_repo_commit=COMMIT)
+        stub = self.Stub()
+        main.host_controllers = {"h": stub}
+        await self.run_check(main.check_dir_source(d, repo))
+        await self.settle()
+        self.assertEqual(stub.calls, [[d + "a.st", d + "b.st"]])    # the 404 is no row
+        stub.calls.clear()
+        self.assertIn("removed", await main.remove_source(d))
+        self.assertEqual(stub.calls, [[d + "a.st", d + "b.st"]])
+
+
 # ── pure helpers ──────────────────────────────────────────────────────────────────
 class PureRules(unittest.TestCase):
     def test_dir_check_row(self):

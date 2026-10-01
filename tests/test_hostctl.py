@@ -5372,6 +5372,63 @@ class UrlFallback(unittest.IsolatedAsyncioTestCase):
         c._created({"index": "0", "uuid": "u-1"}, 100, None, (False, False))
         self.assertEqual(c._url_fallback, {"models/a": "https://x/a"})
 
+    async def test_forget_fallback_lets_the_next_plan_use_the_url(self):
+        """Final review I-1: a VERDICT record for URL X, then a successful Check & save
+        of the same X (main calls `forget_fallback`): the next plan downloads from X —
+        `_without_fallbacks` alone keeps a record whose entry names the same URL."""
+        sh = self.share()
+        fake, vm, c, lan, pipe = _lan_make({"img": _cand("a.safetensors")}, sh,
+                                           catalog=[_url("a.safetensors", sha="ab" * 32)])
+        vm.sizes[self.URL], vm.sha[self.URL] = 10, "cd" * 32
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")),
+                        c.state.log[-8:])
+        self.assertEqual(c.state.url_fallback_cause, {self.PATH: "verdict"})
+        # the operator fixed the cause; the file is gone from the disk again
+        vm.sha[self.URL] = "ab" * 32
+        vm.files.pop(self.PATH, None)
+        vm.content.pop(self.PATH, None)
+        n = len(vm.started)
+        await c.sync_once()
+        await _until(lambda: _idle(c))
+        self.assertEqual(len(vm.started), n)            # still on the LAN while kept
+        vm.files.pop(self.PATH, None)
+        vm.content.pop(self.PATH, None)
+        self.assertEqual(c.forget_fallback([self.PATH, "models/never/had.st"]), 1)
+        self.assertEqual(c._url_fallback, {})
+        self.assertEqual(c.h.saved["thunder"]["url_fallback"], {})
+        self.assertEqual(c.forget_fallback([self.PATH]), 0)
+        await c.sync_once()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")),
+                        c.state.log[-8:])
+        self.assertEqual(len(vm.started), n + 1)        # downloaded from the URL
+        self.assertEqual(json.loads(vm.manifest)[self.PATH]["source"], "url")
+
+    def test_forget_fallback_while_off_persists(self):
+        fake = FakeThunder()
+        c, saved, enabled, calls = make(fake)
+        self.assertEqual(c.state.phase, "off")
+        c.state.url_fallback = {"models/a": "https://x.example/a"}
+        c.state.url_fallback_why = {"models/a": "hash differs"}
+        c.state.url_fallback_cause = {"models/a": "verdict"}
+        self.assertEqual(c.forget_fallback(["models/a"]), 1)
+        st = hostctl.state_from(saved["thunder"])
+        self.assertEqual((st.url_fallback, st.url_fallback_why, st.url_fallback_cause),
+                         ({}, {}, {}))
+
+    def test_template_report_kept_when_the_index_lists_no_models(self):
+        """Final review M-4: an index without any `models/` path (a broken `~/ComfyUI`
+        link) is no evidence that the template's files are gone."""
+        fake = FakeThunder()
+        c, saved, enabled, calls = make(fake)
+        c.state.bootstrap_unknown = {"models/checkpoints/t.st": 5}
+        c._prune_template_report({"hf-cache/hub/x": 1})
+        self.assertEqual(c.state.bootstrap_unknown, {"models/checkpoints/t.st": 5})
+        c._prune_template_report({})
+        self.assertEqual(c.state.bootstrap_unknown, {"models/checkpoints/t.st": 5})
+        c._prune_template_report({"models/vae/v.st": 1})
+        self.assertEqual(c.state.bootstrap_unknown, {})
+
     async def test_sync_now_keeps_a_fallback_whose_lan_transfer_runs(self):
         sh, fake, vm, c, lan, pipe = await self._fallen_back_lan_streaming()
         n = len(vm.started)

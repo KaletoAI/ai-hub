@@ -604,7 +604,8 @@ class ModelSources(_Fixture):
         sec = self.section()
         self.assertIn("12 files · 9.0 GB public (HF auto 5.0 GB · URL 4.0 GB) · "
                       "18.0 GB LAN only · 4.0 GB outdated", html.unescape(sec))
-        self.assertIn("LAN only includes 6.0 GB whose URL failed this session", sec)
+        self.assertIn("LAN only includes 6.0 GB whose URL failed — given up until Sync "
+                      "now or a new Check &amp; save", sec)
 
     def test_badges_and_notes(self):
         sec = self.section()
@@ -617,7 +618,7 @@ class ModelSources(_Fixture):
         self.assertIn("size differs: share 4, entry 3", row("models/loras/old.safetensors"))
         self.assertIn(">HF auto<", row("hf-cache/hub/models--o--r/blobs/" + "ab" * 32))
         failed = row("hf-cache/hub/models--o--f/blobs/" + "cd" * 32)
-        self.assertIn(">URL failed this session — LAN<", failed)
+        self.assertIn(">URL failed — LAN<", failed)
         # blocked aliases marked, the reason as a hover — escaped
         big = row("models/checkpoints/big.safetensors")
         self.assertIn('title="not in source: &lt;x&gt;">blk (blocked)</span>', big)
@@ -673,7 +674,7 @@ class ModelSources(_Fixture):
         sec = self.section()
         row = re.search(r'<tr data-k="msrc-f-models/vae/v.safetensors">(.*?)</tr>', sec,
                         re.S).group(1)
-        self.assertIn(">URL failed this session — LAN<", row)
+        self.assertIn(">URL failed — LAN<", row)
         self.assertIn('title="tc: HTTP 404 from the URL"', row)          # names the host
         self.assertIn("/ui/hosts/managed/source-remove?key=models%2Fvae%2Fv.safetensors", row)
         self.assertIn("source-check", row)
