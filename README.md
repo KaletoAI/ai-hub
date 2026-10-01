@@ -159,11 +159,12 @@ Two layers, both optional:
   An existing user's key can be **copied again** later: the editor pre-fills it
   (masked; 📋 Copy reveals and copies). Keys are stored encrypted, and the
   pre-fill is a console convenience you can switch off — clear
-  `show_user_keys` in the Server tab and only a key generated right there in the
+  `show_user_keys` in Server → Runtime and only a key generated right there in the
   form is ever shown, as before.
 
 **Bootstrap-open → locked.** With no users *and* no master key, the gateway and
-console are fully open. Add an admin user (or set a master key) to lock it down:
+console are fully open. Add an admin user (or set a master key — Server → API Keys)
+to lock it down:
 from the first user or master key on, the API needs a key AND the console a login.
 The Users tab therefore refuses a first user that is not an admin, and refuses
 deleting, demoting or disabling the last admin while no master key is set — either
@@ -243,7 +244,7 @@ alike:
   id for LLMs (no llama-swap model reload). Only the request the scheduler
   designates may claim that backend; the others stay queued.
 - **Nobody waits on that preference forever.** A request queued longer than
-  `affinity_max_wait_s` (default **120 s**, Server tab, hot-reloaded) counts as
+  `affinity_max_wait_s` (default **120 s**, Server → Runtime, hot-reloaded) counts as
   *overdue* and is served strictly oldest-first by the next free backend that can
   run it.
 
@@ -377,7 +378,7 @@ backend form pre-filled (name from reverse DNS, type, url; `local` ticked). A fi
 already registered says *registered as `name`* instead. Nothing is ever added by
 itself, and nothing is scanned unless someone clicks.
 
-| Setting (Server tab) | Meaning |
+| Setting (Server → Runtime) | Meaning |
 |---|---|
 | `scan_cidrs` | comma-separated ranges; blank = the /24 of every IPv4 address of this host. Capped at **1024** hosts per scan. |
 | `scan_ports` | ports tried on every host; blank = `8080, 8000, 11434, 8188, 1234, 5000`. |
@@ -454,7 +455,7 @@ or a `503` (with `Retry-After`) if the wait runs out.
   `alias_park`): blank = the global default (`park_timeout_s`, **60 s**, Server
   tab), `0` = parking off for that alias (immediate `503` when busy). `max_parked`
   caps the queue. Async generation jobs have their own cap, `max_queued_gen`
-  (Server tab, default **200** queued or running; `0` = none): beyond it a new
+  (Server → Runtime, default **200** queued or running; `0` = none): beyond it a new
   `mode: async` job gets `503` + `Retry-After`. A client's job `ttl_s` is capped at
   `jobs.max_ttl_s` (config, default 7 days).
 - **Fair:** when a slot frees, the scheduler designates one waiter for it —
@@ -471,7 +472,7 @@ or a `503` (with `Retry-After`) if the wait runs out.
   re-resolves its candidates every 2 s — so a returning or newly added backend is
   used the moment it is available. To keep *noticing* it
   fast, unhealthy backends are re-polled every `fast_probe_interval_s` (**3 s**,
-  Server tab; `0` = off) for as long as something is waiting, instead of only once
+  Server → Runtime; `0` = off) for as long as something is waiting, instead of only once
   per `health_check_interval`. Nothing waiting → no extra polling.
 
 Applies to `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`,
@@ -1223,8 +1224,9 @@ For every attached backend the gateway then:
 
 **Setting one up — four steps** (the order the *Managed hosts* section shows on top):
 
-1. **Enter the provider's API token** — the *Thunder Compute API token* row at the top of
-   the section. Once per provider: every host of that provider uses it.
+1. **Enter the provider's API token** — the *Thunder Compute API token* row in
+   **Server → API Keys** (the guide's step 1 links there). Once per provider: every host
+   of that provider uses it.
 2. **+ Managed host** — what to rent (GPU, vCPUs, …). The name is pre-filled
    (`thunder-1`, `thunder-2`, …) and is a label inside AI-Hub only.
 3. **Add a backend on the host's card** — *+ ComfyUI on this host* /
@@ -1252,8 +1254,8 @@ own autostart off). No new dependency — the system `ssh`, `ssh-keygen` and
 **Prerequisites.**
 
 - A Thunder Compute account and an **API token** (Thunder console → API tokens; Thunder
-  shows it only once). It goes into the **Thunder Compute API token** row at the top of
-  *Managed hosts* — **one token per provider**, used by every host of that provider;
+  shows it only once). It goes into the **Thunder Compute API token** row in
+  **Server → API Keys** — **one token per provider**, used by every host of that provider;
   stored encrypted (store setting `provider_token_thunder`), never rendered back (the row
   says *set* / *not set*), never sent to a service, never in `/health`. Blank keeps it,
   *clear* removes it (refused while a host of that provider is not off — its stop would
@@ -1341,8 +1343,7 @@ name (`<host>-comfy` / `<host>-llm`, then `-2`, `-3` …). Or, in any backend fo
   like a loopback bind. Nothing is stopped; fix the start command.
 
   **No tokens in the setup script or start command** — both are stored in plain text.
-  The Hugging Face token belongs in the HF-token setting (Managed hosts →
-  *Model-sync catalog and HF token*).
+  The Hugging Face token belongs in **Server → API Keys** (*Hugging Face token*).
 
 Refused on Save (`400`, the form as typed): a type that cannot run on a managed host
 (`meshy`, `tripo`, `anthropic`), a missing or out-of-range remote port, a remote port
@@ -1402,13 +1403,14 @@ warning, and per service **Restart**
 and **Re-run setup** (while the host runs and no operation is in flight).
 
 - While the host is off, the card shows a **checklist** — ✓ / ✗ for the *Thunder Compute
-  API token* and an attached backend that can run, – for the optional *LAN model source*
+  API token* (a missing one links to Server → API Keys) and an attached backend that can
+  run, – for the optional *LAN model source*
   (only with a ComfyUI attached; needed only for model files no URL/catalog entry
   provides). **Start** is rendered disabled, its first reason as tooltip and as a line
   under the buttons, whenever the controller would refuse it; the refusal itself stays in
   the controller (one list — `start_blockers()` — feeds both the card and `start()`).
 - **Start** (asks first) is refused without the provider's API token ("no Thunder
-  Compute API token set — enter it under Managed hosts → Thunder Compute API token"),
+  Compute API token set — enter it under Server → API Keys"),
   without an attached backend, or when no attached backend can run — before any
   API call; the host stays `off`. Otherwise it enables every attached backend that can run, then
   creates an instance from the host's **newest READY snapshot**
@@ -1526,7 +1528,7 @@ candidates change (checked every 5 s), when the LAN source changes, and on *Sync
   `models for <alias> are blocked on <backend>: <reason>`. Meanwhile its schema, image
   slots and LoRA list read empty (the card notes it).
 
-**Catalog and HF token.** *Backends → Managed hosts → Model-sync catalog and HF token*:
+**Catalog and HF token.** *Backends → Managed hosts → Model-sync catalog*:
 one JSON list for every managed host (store setting `modelsync_catalog`), validated as a
 whole on Save — a refused Save comes back with the text as typed and saves nothing.
 Entries:
@@ -1542,8 +1544,10 @@ Entries:
 Paths start with `models/` or `hf-cache/`; a trailing `/` is a whole directory. The
 catalog is seeded **once** with entries for public hub models some 3D nodes load
 themselves (TRELLIS.2, Pixal3D, StableX normals, Hunyuan3D-2.1's texture stage); after
-that it is yours — emptied, it stays empty. The **HF token** (for gated Hugging Face
-downloads) is stored encrypted, never shown again: blank keeps it, *clear* removes it.
+that it is yours — emptied, it stays empty. The **Hugging Face token** (for gated
+Hugging Face downloads; sent only to `huggingface.co` / `hf.co`) is entered in
+**Server → API Keys**, stored encrypted, never shown again: blank keeps it, *clear*
+removes it.
 
 **LAN model source.** Files without a public URL come from a model share on the LAN,
 served read-only by the SSH forced command `ops/modelsrc-serve.sh` (verbs `list`,
@@ -1692,8 +1696,8 @@ session cookie is marked `Secure`. Tabs:
 | **Reasoning** | the normalized-thinking rule list (model glob × backend set → adapter) + test resolver |
 | **Playground** | one tab, sub-tabs **Chat** (default — chat completion through `/v1/chat/completions`), **Media** (generation via `POST /v1/generations` — image/video/audio, upload refs + mesh files, or an earlier job's artifact) and **Voice** (TTS via `POST /v1/audio/speech`, inline player + download) — all as **real API clients** (auth, routing, parking, stats all apply) |
 | **Jobs & Calls** | sub-tabs **LLM Calls** (per-call history with stored request/response bodies — LLM endpoints only), **Media Jobs** (list + detail of generation jobs, inputs + outputs, within TTL, plus the media requests that were refused before they became a job) and **Voice Calls** |
-| **Statistics** | **Backend faults · last 24h** (per backend + every message, bundled — shown even with stats off), then the call-stats dashboard (search, aggregates, drilldown) — empty until `stats.enabled: true` (the example config ships it `false`; set it in `config.yaml` or the Server tab, then restart — the flag is read at startup only). The same switch feeds the LLM Calls list under Jobs & Calls. |
-| **Server** | runtime + restart-required settings (API key, caps, park time/queue, `affinity_max_wait_s`, stats/jobs, TTL/prune) |
+| **Statistics** | **Backend faults · last 24h** (per backend + every message, bundled — shown even with stats off), then the call-stats dashboard (search, aggregates, drilldown) — empty until `stats.enabled: true` (the example config ships it `false`; set it in `config.yaml` or Server → Restart, then restart — the flag is read at startup only). The same switch feeds the LLM Calls list under Jobs & Calls. |
+| **Server** | sub-tabs **Runtime** (default — applied on Save: caps, park time/queue, `affinity_max_wait_s`, probe interval, scan ranges, flags), **Restart** (port, stats/jobs, TTL/prune — take effect on the next restart; a pending restart is badged on the Restart sub-tab from every sub-tab) and **API Keys** (every secret the server holds, each its own Save, never shown again — blank keeps it: the master API key, one API token per managed-host provider, the Hugging Face token; user keys live in Users). A number that does not parse (`1.5` in a whole-number field, `abc`) is refused with the form as typed — blank is the only "default" |
 | **Users** | multi-user keys, allow-lists, quotas, IP aliases |
 
 **Live views update in place — an update never reloads the page.** Anything that

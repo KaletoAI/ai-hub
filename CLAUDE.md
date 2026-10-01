@@ -34,7 +34,7 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
   restart for backend/alias changes. Read **only at startup**:
   `stats.enabled` and the stats/jobs DB paths.
 - **No linter or build step, and no blanket test suite** — only targeted stdlib
-  `unittest` files for the mechanisms that fail SILENTLY (see the seventy-one listed under
+  `unittest` files for the mechanisms that fail SILENTLY (see the seventy-two listed under
   `anthropic_bridge.py`): `venv/bin/python -m unittest discover -s tests -t .`.
   Everything else is verified by running the server and hitting endpoints with
   `curl` (README "Try it"), `curl -H "Authorization: Bearer <admin key>"
@@ -524,7 +524,26 @@ via injected callables, staying hot-reload-safe.
   `_subnav()` (rendered outside `<main>` via `_page(subnav=…)`; `?sub=` on the
   parent route, first child = default —
   Playground: Chat | Media | Voice, Jobs & Calls: LLM | Media | Voice,
-  Aliases: Chat | Media, Input & Routing: Input | LLM models | Image models | LoRAs).
+  Aliases: Chat | Media, Input & Routing: Input | LLM models | Image models | LoRAs,
+  Server: Runtime | Restart | API Keys; `_subnav(parent, sub, marks)` appends raw HTML
+  to a sub-tab's label — Server badges *Restart* `↻ restart` from every sub-tab while a
+  restart-only value differs from what runs, so a pending restart is never hidden).
+  **Server** (`_server_view`, one renderer for the page and every refused Save):
+  Runtime (`_SRV_RUNTIME` + the three flags), Restart (`_SRV_RESTART`, unit fields in
+  hours/minutes with `step="any"`, stored in seconds) and **API Keys** — every secret
+  the SERVER holds, each row its OWN form (`_srv_key_row`: set/not-set badge, a password
+  input never pre-filled, blank keeps): the master API key (`/ui/server/api-key` →
+  `server_api_key`, `store.set_settings({"api_key"})` + `_apply_server_settings`; no clear,
+  as before; the sessions carry `admin_session_tag`, so a new key ends the old key's
+  sessions), one `<NAME> API token` per `hostapi.PROVIDERS` kind (`/ui/server/provider-
+  token` → `server_provider_token` → `main.save_provider_token`, `api_key_clear`) and the
+  Hugging Face token (`/ui/server/hf-token` → `server_hf_token` → `main.save_hf_token`,
+  `hf_token_clear`); a refusal is a 400 with the keys tab and the reason in THAT row,
+  never the value. `server_save` redirects to `?sub=<its tab>&saved=…` and validates
+  numbers with `_int_field`/`_float_field` (`_SRV_MIN`: port and health interval ≥ 1) —
+  "1.5"/"abc"/"-1" is a 400 with the form as typed, nothing stored; it used to become ""
+  (= the default) silently. Every `/ui/server` link names the sub-tab that holds its
+  setting (`test_server_tabs.py`).
   **Aliases** (`/ui/aliases`, formerly "Mapping") joins what used to be two tabs: the
   alias list + editors, and the live alias→route overviews that were Input & Routing's
   Chat/Media-aliases sub-tabs. With nothing picked the right column IS the overview
@@ -752,7 +771,7 @@ via injected callables, staying hot-reload-safe.
   running the tool. Covered by
   `test_anthropic_bridge.py` (stdlib `unittest` — a streaming tool-call bridge fails
   silently rather than crashing). `ls tests/test_*.py` is the count of record —
-  **seventy-one** files today — and each exists for that same reason: the mechanism it
+  **seventy-two** files today — and each exists for that same reason: the mechanism it
   guards fails SILENTLY, so it is named next to that mechanism above.
   `test_anthropic_bridge.py`, `test_prune_branch.py` (a
   dead-branch prune that cascades one node too far or too few surfaces as an aborted
@@ -1182,9 +1201,10 @@ via injected callables, staying hot-reload-safe.
   `hf-cache/token` leaks the HF credential, a `;id` that reaches a shell is remote code
   execution, and a `list` that drops the HF cache's snapshot links makes a synced cache
   look complete while every HF loader re-downloads);
-  `test_hosts_ui.py` (the console half: the provider-token row never rendered, blank
-  keeping and the box clearing it, POST-only, and the section, guide and LAN block there
-  with no host at all; the host form without a token field, its "AI-Hub rents the
+  `test_hosts_ui.py` (the console half: the provider-token and HF-token rows — now on
+  Server → API Keys — never rendered, blank keeping and the box clearing it, POST-only,
+  gone from the Backends tab, and the section, guide (step 1 linking to the keys tab)
+  and LAN block there with no host at all, the checklist's missing token linking there; the host form without a token field, its "AI-Hub rents the
   machine itself" intro, "What to rent at Start" and the suggested name; the card's
   checklist, a disabled Start naming the controller's first blocker, the `+ … on this
   host` links and the backend form they open, foreign instances named as hand-made; its
@@ -1203,6 +1223,14 @@ via injected callables, staying hot-reload-safe.
   hold; a refused catalog saving nothing; a pin only for the fingerprint the operator
   saw; the install command giving the share user a real shell; the 24 h banner on card
   and Dashboard; unowned snapshots listed, never deleted).
+  `test_server_tabs.py` (the Server tab's Runtime | Restart | API Keys: a form on the
+  wrong sub-tab or a Save that lands on another one reads as a setting that "did not
+  save", and a pending restart shown only on Restart is never seen from Runtime; an
+  API-Keys row that renders its value, clears on blank or touches another row's key
+  locks clients out or 401s every provider call; a master key saved there must still
+  end the old key's console sessions; a "Server" link that opens the default sub-tab
+  sends the operator looking for a field that is not there; and "1.5"/"abc" in a number
+  field became "" = the default without a word).
   Run them all with `python -m unittest discover -s tests -t .` (no runner dependency).
 - **`openai_image_bridge.py`** — pure request/response plumbing for the OpenAI
   image shims (`multipart_list`, `parse_size`, `coerce_scalar`, `images_uploads`
@@ -1438,10 +1466,11 @@ via injected callables, staying hot-reload-safe.
   Start button from, so the two cannot disagree: the state not loaded, an op in flight,
   a phase that is not startable, no service, none that can run (the per-service causes),
   a bad commit (only with a ComfyUI service), no token (`no <NAME> API token set — enter
-  it under Managed hosts → <NAME> API token`); the unreconciled uuids are NOT in it (they
-  are judged by a fresh list inside the op). `checklist()` → `[{ok, text, required}]`
-  (token, a runnable attached backend, and — with a ComfyUI service — the optional LAN
-  source) is NOT part of `view()`: the LAN check reads the store and `view()` runs every
+  it under Server → API Keys`); the unreconciled uuids are NOT in it (they
+  are judged by a fresh list inside the op). `checklist()` →
+  `[{ok, text, required[, key]}]` (the token — `key: "token"`, which the card links to
+  Server → API Keys —, a runnable attached backend, and — with a ComfyUI service — the
+  optional LAN source) is NOT part of `view()`: the LAN check reads the store and `view()` runs every
   few seconds for the Dashboard; main's `host_view` adds both → enable EVERY runnable service (`_enable`; one failing =
   `_PreCreate`, the ones already enabled are disabled again) → newest READY snapshot of
   this host, else the template (`bootstrap_template`, "" = auto, M5) → `choose_disk_gb`
@@ -1714,12 +1743,9 @@ via injected callables, staying hot-reload-safe.
   pinned by a test; a new Thunder host's nodes pre-filled from the default list; an
   existing host has no name field and a fixed provider; NO token field). The section
   is ALWAYS rendered (token → host is the setup order): the 4-step guide
-  (`_MHOST_GUIDE`), one `<NAME> API token` row per provider (`_provider_token_rows`,
-  `data-k="hosts-ptoken-<kind>"`: set/not-set badge, a password input never pre-filled,
-  `api_key_clear`; POST `/ui/hosts/managed/provider-token` → `hosts_provider_token`,
-  blank keeps, a typed value wins over the box, unknown provider / refused value → 400
-  `notice`, never the value), "+ Managed host", the cards, then the LAN block and the
-  catalog even with no host. The host form opens with "AI-Hub rents the machine itself …
+  (`_MHOST_GUIDE`, step 1 a link to `/ui/server?sub=keys` — the provider tokens and the
+  HF token live in Server → API Keys since 2026-10-01, see the admin.py paragraph),
+  "+ Managed host", the cards, then the LAN block and the catalog even with no host. The host form opens with "AI-Hub rents the machine itself …
   Do not create an instance in the <NAME> console", pre-fills a new host's name from
   `main.suggest_host_name` (hint: a label inside AI-Hub only) and puts the options under a
   "What to rent at Start" heading; `managed_host_save` hands the typed options to
@@ -1745,7 +1771,8 @@ via injected callables, staying hot-reload-safe.
   `managed_host_delete_refusal` is None (else a hint naming why); then the orphaned
   snapshots, the LAN card (public key, install instructions — VM variant first — the
   Fetch → Confirm pin, *List now* and the last listing's counts and age) and the
-  catalog editor + HF token (`hf_token` in `store._SECRET_SETTINGS`). `_hosts_panel`
+  catalog editor (with a hint linking to the HF token in Server → API Keys; `hf_token`
+  in `store._SECRET_SETTINGS`). `_hosts_panel`
   lists EVERY managed host (also one without ComfyUI or without any backend), and
   `_dash_hosts` puts the long-run banner on the Dashboard. The backend form attaches: a
   `host_managed` select ("(none / free text)" + every store managed host) beside the
@@ -1753,7 +1780,7 @@ via injected callables, staying hot-reload-safe.
   `data-mhost` fieldset (`_managed_fieldset`, rendered for EVERY backend, only `display`
   switched: `remote_port` pre-filled with the profile default, and for `openai` the
   `svc_setup`/`svc_start`/`svc_health` fields with the "no tokens here — plain text; the
-  HF token belongs in the HF-token setting" and the "stdin-reading commands swallow the
+  HF token belongs in Server → API Keys" and the "stdin-reading commands swallow the
   script" hints) and makes `url` readonly (never disabled). `backend_save` starts from the
   old row, drops any legacy `thunder` key and, with a managed host, refuses (400, form as
   typed) an unknown host, a type without a profile, a config-defined identity (R-K3), a
@@ -1765,8 +1792,8 @@ via injected callables, staying hot-reload-safe.
   127.0.0.1 port nothing forwards looks healthy-ish and is dead); `svc_*` stay on an
   `openai` row (a detach does not throw away a script). Every action is a POST in
   `_POST_ACTIONS` (`save, delete, start, stop, forget, restart-service, resetup, sync,
-  delete-unknown, catalog, hf-token, provider-token, modelsrc-scan, modelsrc-pin,
-  modelsrc-list, modelsrc-host`),
+  delete-unknown, catalog, modelsrc-scan, modelsrc-pin, modelsrc-list, modelsrc-host`;
+  the tokens' `/ui/server/provider-token` and `/ui/server/hf-token` likewise),
   Start/Stop/Forget/Delete with `data-confirm`; the Backends tab is live (3 s) while a
   host phase ≠ `off` or an op runs, static for the forms and refusals; `_FAULT_SOURCE`
   labels `lifecycle` "host lifecycle" and `sync` "model sync". The key files
