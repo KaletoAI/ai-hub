@@ -1054,7 +1054,7 @@ def _task_select(current: str = "text2img", onchange: str = "") -> str:
 
 
 def _inp(name: str, value="", placeholder: str = "", typ: str = "text", step: str = "",
-         readonly: bool = False) -> str:
+         readonly: bool = False, id: str = "") -> str:
     # `step` only matters for type=number: without step="any" a browser rejects
     # decimals like 0.85 (the implicit step is 1). `readonly`, never `disabled`: a
     # disabled input is not submitted, and backend_save reads absent as cleared.
@@ -1063,8 +1063,11 @@ def _inp(name: str, value="", placeholder: str = "", typ: str = "text", step: st
     # a secret field is never pre-filled, and a browser must not fill in (or offer to
     # save) the admin's login password there — a Save would store THAT as the token
     ac = ' autocomplete="new-password"' if typ == "password" else ""
+    # an explicit id: needed where two forms on one page post the same field name (the
+    # derived `fld-<name>` of _field would then repeat)
+    ident = f' id="{_esc(id)}"' if id else ""
     return (f'<input type="{typ}" name="{_esc(name)}" value="{_esc(value)}" '
-            f'placeholder="{_esc(placeholder)}"{st}{ro}{ac}>')
+            f'placeholder="{_esc(placeholder)}"{st}{ro}{ac}{ident}>')
 
 
 def _textarea(name: str, value="", rows: int = 3, placeholder: str = "") -> str:
@@ -9552,8 +9555,8 @@ def _srv_key_row(dk: str, action: str, label: str, is_set: bool, name: str, unse
     # an id per row: two rows post the same field name (`api_key`), and the derived
     # `fld-<name>` would give the page two equal ids (each label then names the first)
     inp = _inp(name, "", typ="password",
-               placeholder=("•••• set — blank keeps it" if is_set else unset_ph))
-    inp = inp[:-1] + f' id="{dk}-input">'
+               placeholder=("•••• set — blank keeps it" if is_set else unset_ph),
+               id=f"{dk}-input")
     ctrl = (badge + " " + inp
             + (_checkbox(clear, False, "clear", "remove the stored value on Save")
                if clear else ""))
@@ -9622,10 +9625,13 @@ def _server_view(request: Request, sub: str = "", status: int = 200,
     elif status == 200 and saved == "restart" and sub == "restart":
         banner = "<p class='ok-banner'>✓ Saved — port/stats/jobs changes need a <b>restart</b> to apply.</p>"
     elif status == 200 and msg:
-        banner = f"<p class='ok-banner'>{_esc(msg[:600])}</p>"
+        banner = (f"<p class='ok-banner' role='status' data-k='server-msg'>"
+                  f"{_esc(msg[:600])}</p>")
     if st["any_restart"] and sub != "restart":
-        banner += ("<p class='bad'>↻ A restart is pending — <a href='/ui/server?sub=restart'>"
-                   "Restart</a> shows what changed.</p>")
+        # a state, not an error: the warn badge, never the red refusal style
+        banner += ("<p class='hint' role='status' data-k='server-restart'>"
+                   + _badge("↻ restart", "warn") + " A restart is pending — "
+                   "<a href='/ui/server?sub=restart'>Restart</a> shows what changed.</p>")
     info = ("<h2>Server</h2><p class='hint'>These override <code>config.yaml</code> and are stored in "
             "the gateway (API key encrypted at rest), so config.yaml only needs backends, aliases and "
             "the launch port.</p>")
@@ -9654,7 +9660,14 @@ async def server_save(request: Request):
     reason — nothing stored (it used to turn silently into "unset"). A unit field (TTL in
     hours, prune in minutes) takes decimals in its unit and is stored in seconds."""
     f = await _form(request)
-    which = "runtime" if f.get("_form") == "runtime" else "restart"
+    which = f.get("_form", "")
+    if which not in ("runtime", "restart"):
+        # read as the Restart form, every field blank, this CLEARED every restart-only
+        # override — a scripted or half-sent POST must not wipe the settings
+        logger.warning("ui: server settings not saved — no valid _form")
+        return _server_view(request, "runtime", status=400,
+                            errs=["not saved: the request names no settings form "
+                                  "(runtime or restart)"])
     spec = _SRV_RUNTIME if which == "runtime" else _SRV_RESTART
     vals, errs, grp = {}, [], ""
     for k, kind, lbl, *_ in spec:
@@ -9692,6 +9705,9 @@ async def server_save(request: Request):
                             status_code=303)
 
 
+_MASTER_KEY_MAX = 1024
+
+
 def _keys_msg(msg: str) -> RedirectResponse:
     return RedirectResponse("/ui/server?sub=keys&msg=" + _q(msg[:600]), status_code=303)
 
@@ -9705,6 +9721,13 @@ async def server_api_key(request: Request):
     ak = (f.get("api_key") or "").strip()
     if not ak:
         return _keys_msg("master API key unchanged (blank keeps it)")
+    # a key with a space or a control character can never match an Authorization
+    # header, and this Save also ends the console session — clients AND the console
+    # would be locked out. Fixed text: the value is never echoed.
+    if len(ak) > _MASTER_KEY_MAX or any(not ch.isprintable() or ch.isspace() for ch in ak):
+        return _server_view(request, "keys", status=400, key_errs={"master": (
+            "the master API key may hold only printable characters without spaces "
+            f"(at most {_MASTER_KEY_MAX}) — not saved")})
     store.set_settings({"api_key": ak})
     _apply_server_settings()
     logger.info("ui: master API key saved (encrypted)")

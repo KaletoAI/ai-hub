@@ -534,7 +534,8 @@ via injected callables, staying hot-reload-safe.
   the SERVER holds, each row its OWN form (`_srv_key_row`: set/not-set badge, a password
   input never pre-filled, blank keeps): the master API key (`/ui/server/api-key` →
   `server_api_key`, `store.set_settings({"api_key"})` + `_apply_server_settings`; no clear,
-  as before; the sessions carry `admin_session_tag`, so a new key ends the old key's
+  as before; a key with a space or control character, or over 1024 chars, is refused —
+  it could never match a header, and the Save also ends the console session; the sessions carry `admin_session_tag`, so a new key ends the old key's
   sessions), one `<NAME> API token` per `hostapi.PROVIDERS` kind (`/ui/server/provider-
   token` → `server_provider_token` → `main.save_provider_token`, `api_key_clear`) and the
   Hugging Face token (`/ui/server/hf-token` → `server_hf_token` → `main.save_hf_token`,
@@ -542,7 +543,8 @@ via injected callables, staying hot-reload-safe.
   never the value. `server_save` redirects to `?sub=<its tab>&saved=…` and validates
   numbers with `_int_field`/`_float_field` (`_SRV_MIN`: port and health interval ≥ 1) —
   "1.5"/"abc"/"-1" is a 400 with the form as typed, nothing stored; it used to become ""
-  (= the default) silently. Every `/ui/server` link names the sub-tab that holds its
+  (= the default) silently; a POST without a valid `_form` is a 400 (read as the Restart
+  form it CLEARED every restart-only override). Every `/ui/server` link names the sub-tab that holds its
   setting (`test_server_tabs.py`).
   **Aliases** (`/ui/aliases`, formerly "Mapping") joins what used to be two tabs: the
   alias list + editors, and the live alias→route overviews that were Input & Routing's

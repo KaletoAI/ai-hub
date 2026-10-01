@@ -156,7 +156,13 @@ class SubTabs(_Fixture):
             nav = page[page.index('<nav class="subnav">'):]
             nav = nav[:nav.index("</nav>")]
             self.assertIn("↻ restart", nav, sub)
-        self.assertIn("A restart is pending", self.main_of(self.get("/ui/server?sub=runtime")))
+        m = self.main_of(self.get("/ui/server?sub=runtime"))
+        self.assertIn("A restart is pending", m)
+        # a state, not an error: warn badge, announced, never the red refusal style
+        banner = re.search(r"<p [^>]*data-k='server-restart'[^>]*>.*?</p>", m).group(0)
+        self.assertIn("role='status'", banner)
+        self.assertIn('<span class="badge warn">↻ restart</span>', banner)
+        self.assertNotIn("class='bad'", banner)
         admin._server_info = lambda: main.server_info()
         page = self.get("/ui/server?sub=runtime")
         self.assertNotIn("↻ restart", page)
@@ -177,6 +183,17 @@ class SaveRedirects(_Fixture):
         self.assertEqual(store.get_setting("stats_retention_days"), 3)
         page = self.get("/ui/server?sub=restart&saved=restart")
         self.assertIn("✓ Saved — port/stats/jobs changes need a <b>restart</b> to apply.", page)
+
+    def test_save_without_a_valid_form_is_refused_and_stores_nothing(self):
+        # read as the Restart form with every field blank, it used to CLEAR every
+        # restart-only override
+        store.set_settings({"stats_db_path": "/keep/me.db", "max_parked": 50})
+        for data in ({"stats_db_path": ""}, {"_form": "bogus", "max_parked": "1"}):
+            r = self.post("/ui/server/save", data, status=400)
+            self.assertIn("names no settings form", r.text)
+            self.assertIn('name="_form" value="runtime"', r.text)
+        self.assertEqual(store.get_setting("stats_db_path"), "/keep/me.db")
+        self.assertEqual(store.get_setting("max_parked"), 50)
 
     def test_runtime_save_never_touches_the_master_key(self):
         store.set_settings({"api_key": "keep-me"})
@@ -311,6 +328,22 @@ class ApiKeysTab(_Fixture):
         self.assertIn("unchanged", self.loc(r)[1]["msg"])
         self.assertEqual(store.get_setting("api_key"), "new-master")
 
+    def test_master_key_with_spaces_or_control_characters_is_refused(self):
+        main.api_key = ""
+        store.set_settings({"api_key": ""})
+        for bad in ("two words", "tab\there", "ctl\x01x", "k" * 1025):
+            with self.subTest(bad=bad[:20]):
+                r = self.post("/ui/server/api-key", {"api_key": bad}, status=400)
+                row = self.row(r.text, "srvkey-master")
+                self.assertIn("the master API key may hold only printable characters "
+                              "without spaces (at most 1024) — not saved", row)
+                self.assertNotIn(bad, r.text)
+                self.assertEqual(store.get_setting("api_key"), "")
+                self.assertEqual(main.api_key, "")
+        # surrounding whitespace (a pasted newline) is trimmed, not refused
+        self.post("/ui/server/api-key", {"api_key": "  good-key\n"})
+        self.assertEqual(store.get_setting("api_key"), "good-key")
+
     def test_master_key_on_the_keys_tab_revokes_old_sessions(self):
         main.api_key = "old-master"
         store.set_settings({"api_key": "old-master"})
@@ -338,6 +371,7 @@ class ApiKeysTab(_Fixture):
         self.assertEqual(self.applied_hosts, [1])
         page = self.get(f"/ui/server?sub=keys&msg={q['msg']}")
         self.assertIn("Thunder Compute API token saved", page)
+        self.assertIn("<p class='ok-banner' role='status' data-k='server-msg'>", page)
 
     def test_provider_token_refusals_are_400_on_the_keys_tab(self):
         import types
