@@ -6308,12 +6308,35 @@ def thunder_orphan_snapshots() -> list:
     return thunder.foreign_snapshots(snaps, list(host_controllers), table)
 
 
+_MODELSRC_SHA_KEY = "modelsrc_sha"
+
+
+def _modelsrc_sha_load():
+    """The persistent share-sha cache (`{"host", "files": {path: [size, sha256]}}`);
+    LanSource holds it to the configured share host (R-2) and validates every row."""
+    return store.get_setting(_MODELSRC_SHA_KEY) if store.is_active() else None
+
+
+def _modelsrc_sha_save(rec: dict) -> None:
+    if store.is_active():
+        store.set_settings({_MODELSRC_SHA_KEY: rec})
+
+
 def modelsrc() -> "hostctl.LanSource":
     global _modelsrc_obj
     d = _thunder_datadir()
     if _modelsrc_obj is None or _modelsrc_obj.datadir != d:
-        _modelsrc_obj = hostctl.LanSource(d, host=_modelsrc_host, log=logger.info)
+        _modelsrc_obj = hostctl.LanSource(d, host=_modelsrc_host, log=logger.info,
+                                          load_sha=_modelsrc_sha_load,
+                                          save_sha=_modelsrc_sha_save)
     return _modelsrc_obj
+
+
+def _share_sha_files() -> dict:
+    """The ONE reader of the share-sha cache for planning and the overview: `{path:
+    [size, sha256]}` of the CONFIGURED share host ({} for a record of another host).
+    Never starts a hash."""
+    return modelsrc().sha_files()
 
 
 def _modelsrc_prepare() -> None:
@@ -6401,8 +6424,10 @@ def _host_deps() -> "hostctl.Deps":
         # itself for its refresh, the stream and the sha256
         source_index=lan.cached, lan=lan,
         # the catalog's URL sources judged against the SAME listing the plan uses
-        # (outdated entries dropped) plus the share's HF cache derived (Stage 1)
-        url_catalog=lambda src: modelsync.url_catalog(_modelsync_catalog(), src),
+        # (outdated entries dropped — by size, and by a confirmed share hash from the
+        # persistent cache) plus the share's HF cache derived (Stage 1)
+        url_catalog=lambda src: modelsync.url_catalog(_modelsync_catalog(), src,
+                                                      _share_sha_files()),
         hf_token=_thunder_hf_token, control=sshrun.control)
 
 

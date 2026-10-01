@@ -2713,6 +2713,7 @@ class FakeVM:
         self.no_length = set()    # urls whose HEAD names no Content-Length
         self.content = {}         # plan path -> bytes of its LAN-streamed .part
         self.links = {}           # plan path -> symlink target text
+        self.poll_fail = set()    # plan paths whose poll the instance never answers
         fake.on_modify = lambda old, new: setattr(self, "avail", self.avail + (new - old) * _GiB)
 
     def wrap(self, c):
@@ -2806,6 +2807,8 @@ class FakeVM:
                 self._start(path, text)
                 out = "GW:STARTED\n"
         elif verb == "gw-poll":
+            if path in self.poll_fail:
+                return (255, b"", b"ssh: connection lost")
             self._advance(path)
             state = "GW:RUN" if self.lockpid.get(path) in self.procs else "GW:END"
             out = f"{state}\n{self.files.get(path + '.part', -1)}\n{self.logs.get(path, '')}"
@@ -2835,6 +2838,16 @@ class FakeVM:
                 self.files.pop(path + suf, None)
             self.lockpid.pop(path, None)
             self.content.pop(path, None)
+        elif verb == "gw-abandon":
+            pid = self.lockpid.get(path)
+            if pid in self.procs:
+                del self.procs[pid]
+                self.killed.append(path)
+            for suf in (".part", ".part.lock", ".part.log"):
+                self.files.pop(path + suf, None)
+            self.lockpid.pop(path, None)
+            self.content.pop(path, None)
+            out = "GW:ABANDONED\n"
         elif verb == "gw-kill":
             for p, pid in list(self.lockpid.items()):
                 if pid in self.procs:
@@ -3102,7 +3115,8 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
         url = "https://example.com/x.safetensors"
         fake, vm, c, box, _ = _sync_make(aliases={"img": _cand("x.safetensors")},
                                          catalog=[_url("x.safetensors")])
-        vm.fail[url] = "curl: (22) The requested URL returned error: 404\n"
+        # a 5xx is the server's trouble, not the URL's: retried (model sources R-5)
+        vm.fail[url] = "curl: (22) The requested URL returned error: 503\n"
         await c.start()
         self.assertTrue(await _until(lambda: _idle(c) and c.plan["per_alias"]["img"]["blocked"]))
         self.assertEqual(len(vm.started), 3)
@@ -3110,7 +3124,7 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
         st = c.alias_status(BID, "img")
         self.assertIn("blocked on thunder", st)
         self.assertIn("transfer failed", st)
-        self.assertIn("404", st)
+        self.assertIn("503", st)
         sync_faults = [f for f in c.h.faults if f[1:3] == ("sync", "transfer")]
         self.assertEqual(len(sync_faults), 1)
         # a transfer is the ComfyUI SERVICE's event (R-K1), not the host's
@@ -3139,7 +3153,11 @@ class ModelSync(unittest.IsolatedAsyncioTestCase):
         self.assertIn("sha256", c.alias_status(BID, "img"))
         self.assertNotIn(_dm("x.safetensors"), vm.files)
         self.assertNotIn(_dm("x.safetensors") + ".part", vm.files)
-        self.assertEqual(len(_gw(fake, "gw-discard")), 3)
+        # deterministic: the same URL serves the same bytes — ONE download, not three
+        # (model sources I-1); the file is on no share, so it gives up and blocks
+        self.assertEqual(len(_gw(fake, "gw-discard")), 1)
+        self.assertEqual(len(vm.started), 1)
+        self.assertEqual(c._url_fallback, {})
         # the right bytes pass and their sha is recorded
         vm.sha[url] = "AB" * 32
         box["catalog"] = [_url("x.safetensors", sha="AB" * 32)]
@@ -3809,6 +3827,31 @@ class RemoteShell(unittest.TestCase):
         rc, out, err = self.sh(hostctl._prune_cmd([]))
         self.assertEqual(out.split(), ["GW:PRUNED"])
 
+    def test_abandon_ends_the_files_curl_and_discards_its_part(self):
+        # model sources fallback: before the LAN takes over a file, the URL's curl (which
+        # may run on after an attempt gave up) is ended and the shared .part removed
+        rel = "models/loras/f b.safetensors"
+        d = os.path.join(self.home, "ComfyUI", "models", "loras")
+        cfg = hostctl.curl_config("https://example.com/f", "")
+        rc, out, err = self.sh(hostctl._fetch_cmd(rel), cfg.encode(), STUB_SLEEP="20")
+        self.assertEqual(out.strip(), "GW:STARTED", err)
+        with open(os.path.join(d, "f b.safetensors.part.lock")) as f:
+            pid = f.read().strip()
+        rc, out, err = self.sh(hostctl._abandon_cmd(rel))
+        self.assertEqual((rc, out.strip()), (0, "GW:ABANDONED"), err)
+        self.assertFalse(os.path.exists(f"/proc/{pid}/comm") and
+                         open(f"/proc/{pid}/comm").read().strip() == "curl")
+        self.assertEqual(os.listdir(d), [])
+        # a lock naming a live process that is no curl: nothing is killed (this test)
+        with open(os.path.join(d, "f b.safetensors.part.lock"), "w") as f:
+            f.write(f"{os.getpid()}\n")
+        rc, out, err = self.sh(hostctl._abandon_cmd(rel))
+        self.assertEqual((rc, out.strip()), (0, "GW:ABANDONED"), err)
+        self.assertEqual(os.listdir(d), [])
+        # nothing there at all: still confirmed
+        rc, out, err = self.sh(hostctl._abandon_cmd("models/none/x.safetensors"))
+        self.assertEqual((rc, out.strip()), (0, "GW:ABANDONED"), err)
+
     def test_started_only_once_the_lock_names_the_curl(self):
         # GW:STARTED used to be echoed before the child had written its pid and exec'd
         # curl: a kill in that window found no curl and the download ran on. Now the
@@ -4419,6 +4462,35 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         finally:
             m.image_models = saved_img
 
+    def test_share_sha_cache_is_the_store_setting_and_feeds_the_plan(self):
+        """Model sources: `modelsrc_sha` is read through ONE accessor (`_share_sha_files`,
+        the host check inside LanSource), handed to `url_catalog` so a confirmed share
+        hash that differs makes the entry outdated, and written back by the LanSource."""
+        m = self.m
+        path, h = "models/vae/a.st", "ab" * 32
+        self.store.set_settings({"modelsrc_host": _SRCHOST})
+        self.store.set_settings({"modelsrc_sha": {"host": _SRCHOST, "files": {path: [3, h]}}})
+        m._modelsrc_obj = None
+        self.assertEqual(m._share_sha_files(), {path: [3, h]})
+        self._host()
+        m.backends = [self._tb()]
+        m.sync_host_controllers()
+        deps = m.host_controllers["tc"].deps
+        entry = {"file": path, "url": "https://example.com/a.st", "sha256": "cd" * 32, "size": 3}
+        self.store.set_settings({"modelsync_catalog": [entry]})
+        self.assertEqual(deps.url_catalog({path: 3}), {})          # the share disagrees
+        self.store.set_settings({"modelsync_catalog": [dict(entry, sha256=h)]})
+        self.assertEqual(deps.url_catalog({path: 3}),
+                         {path: {"url": "https://example.com/a.st", "sha256": h}})
+        # written back through the store; another host's record is no record
+        m.modelsrc().forget_sha(path, 3)
+        self.assertEqual(self.store.get_setting("modelsrc_sha"),
+                         {"host": _SRCHOST, "files": {}})
+        self.store.set_settings({"modelsrc_sha": {"host": "x@y", "files": {path: [3, h]}}})
+        m._modelsrc_obj = None
+        self.assertEqual(m._share_sha_files(), {})
+        m._modelsrc_obj = None
+
     def test_unreadable_setting_is_never_overwritten(self):
         m = self.m
         self.store.set_settings({"host_state": ["garbage"]})
@@ -4978,6 +5050,446 @@ class LanTransfer(unittest.IsolatedAsyncioTestCase):
         await _until(lambda: _idle(c))
         self.assertEqual(vm.links, {})
         self.assertIn("waiting for LAN source (not configured)", c.alias_status(BID, "hf"))
+
+
+class UrlRules(unittest.IsolatedAsyncioTestCase):
+    """Model sources, "Download on the instance": a URL that served the wrong bytes or
+    answered 4xx is FINAL for that URL at once — retrying downloads the same bytes, on a
+    billed instance (review I-1, R-4, R-5); transport, 5xx and 429 keep the attempts."""
+
+    def test_curl_http_status(self):
+        st = hostctl.curl_http_status
+        self.assertEqual(st("curl: (22) The requested URL returned error: 404"), 404)
+        self.assertEqual(st("x\ncurl: (22) The requested URL returned error: 403 Forbidden\n"), 403)
+        self.assertEqual(st("curl: (22) 404 not found"), 404)
+        self.assertEqual(st("curl: (22) The requested URL returned error: 503"), 503)
+        for text in ("curl: (7) Failed to connect", "curl: (28) Operation timed out after "
+                     "300000 milliseconds", "", None, "curl: (56) error 404 in recv",
+                     "curl: (22) no status here"):
+            self.assertIsNone(st(text), text)
+        final = hostctl.http_status_final
+        self.assertTrue(all(final(n) for n in (400, 401, 403, 404, 410, 451)))
+        self.assertFalse(any(final(n) for n in (408, 429, 500, 502, 503, None)))
+
+    async def test_http_4xx_is_final_after_one_download(self):
+        url = "https://example.com/x.safetensors"
+        fake, vm, c, box, _ = _sync_make(aliases={"img": _cand("x.safetensors")},
+                                         catalog=[_url("x.safetensors")],
+                                         src={_dm("other.safetensors"): 5})
+        vm.fail[url] = "curl: (22) The requested URL returned error: 404\n"
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.plan["per_alias"]["img"]["blocked"]))
+        self.assertEqual(len(vm.started), 1)
+        self.assertIn("404", c.alias_status(BID, "img"))
+        self.assertIn(_dm("x.safetensors"), c._failed)
+        # a URL-only file (the share does not list it) gives up and blocks as before
+        self.assertEqual(c._url_fallback, {})
+        kinds = [f[1:3] for f in c.h.faults]
+        self.assertIn(("sync", "transfer"), kinds)
+        self.assertNotIn(("sync", "url_fallback"), kinds)
+
+    async def test_429_is_retried(self):
+        url = "https://example.com/x.safetensors"
+        fake, vm, c, box, _ = _sync_make(aliases={"img": _cand("x.safetensors")},
+                                         catalog=[_url("x.safetensors")])
+        vm.fail[url] = "curl: (22) The requested URL returned error: 429\n"
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.plan["per_alias"]["img"]["blocked"]))
+        self.assertEqual(len(vm.started), 3)
+
+    async def test_size_mismatch_is_final_after_one_download(self):
+        url = "https://example.com/x.safetensors"
+        fake, vm, c, box, _ = _sync_make(aliases={"img": _cand("x.safetensors")},
+                                         catalog=[_url("x.safetensors")])
+        vm.head_len[url] = 10                  # the HEAD names 10, the body has 8
+        vm.sizes[url] = 8
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.plan["per_alias"]["img"]["blocked"]))
+        self.assertEqual(len(vm.started), 1)
+        self.assertEqual(len(_gw(fake, "gw-discard")), 1)
+        self.assertIn("size 8", c._failed[_dm("x.safetensors")])
+
+
+class UrlFallback(unittest.IsolatedAsyncioTestCase):
+    """Model sources, "Fallback" (review I-2): a URL that ended final for a file the
+    share also lists syncs the share's copy instead — after its curl is ended and the
+    shared `.part` discarded, keyed on the URL, cleared by Sync now, Ruling 18 intact."""
+
+    PATH = _dm("a.safetensors")
+    URL = "https://example.com/a.safetensors"
+
+    def share(self, data=b"0123456789"):
+        sh = FakeShare()
+        sh.files["diffusion_models/a.safetensors"] = data
+        return sh
+
+    async def test_hash_mismatch_falls_back_to_the_share_copy(self):
+        sh = self.share()
+        fake, vm, c, lan, pipe = _lan_make({"img": _cand("a.safetensors")}, sh,
+                                           catalog=[_url("a.safetensors", sha="ab" * 32)])
+        vm.sizes[self.URL], vm.sha[self.URL] = 10, "cd" * 32
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")),
+                        c.state.log[-8:])
+        self.assertEqual(len(vm.started), 1)                # ONE download, then the LAN
+        man = json.loads(vm.manifest)
+        self.assertEqual(man[self.PATH]["source"], "lan")
+        self.assertEqual(len(pipe.log), 1)
+        self.assertTrue(pipe.log[0][0][-1].endswith(" 0"), pipe.log[0][0])
+        # the abandon (kill + discard) ran before the LAN attempt's resume offset read
+        ab, part = _gw(fake, "gw-abandon"), _gw(fake, "gw-part")
+        self.assertEqual(len(ab), 1)
+        self.assertLess(ab[0], part[0])
+        self.assertEqual(c._url_fallback, {self.PATH: self.URL})
+        fb = [f for f in c.h.faults if f[1:3] == ("sync", "url_fallback")]
+        self.assertEqual(len(fb), 1)
+        self.assertIn("hash differs", fb[0][3])
+        self.assertIn(self.PATH, fb[0][3])
+        self.assertNotIn(("sync", "transfer"), [f[1:3] for f in c.h.faults])
+        self.assertEqual(sum("syncing the share's copy" in ln for ln in c.state.log), 1)
+        v = c.view()
+        self.assertEqual(list(v["url_fallback"]), [self.PATH])
+        self.assertIn("hash differs", v["url_fallback"][self.PATH])
+        self.assertNotIn(self.URL, json.dumps(v["url_fallback"]))   # a URL may carry a token
+        # the next plans keep it on the LAN: no second curl
+        await c.sync_once()
+        await _until(lambda: _idle(c))
+        self.assertEqual(len(vm.started), 1)
+
+    async def test_size_differs_names_both_sizes_and_syncs_the_share(self):
+        sh = self.share()
+        fake, vm, c, lan, pipe = _lan_make({"img": _cand("a.safetensors")}, sh,
+                                           catalog=[_url("a.safetensors")])
+        vm.sizes[self.URL] = 8                  # the URL's file is not the share's copy
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")),
+                        c.state.log[-8:])
+        self.assertEqual(len(vm.started), 1)
+        why = c.view()["url_fallback"][self.PATH]
+        self.assertIn("size differs", why)
+        self.assertIn("8 bytes", why)
+        self.assertIn("10 bytes", why)
+        self.assertEqual(json.loads(vm.manifest)[self.PATH]["source"], "lan")
+
+    async def test_derived_hf_blob_that_differs_falls_back(self):
+        """Review M-3: a share copy that is not HF's canonical file — the derived URL's
+        bytes have another size; the fallback says so and syncs the share's blob."""
+        sh = FakeShare()
+        rev, oid = "0123456789abcdef0123456789abcdef01234567", "ab" * 32
+        repo = "hf-cache/hub/models--org--repo/"
+        blob, snap = repo + "blobs/" + oid, repo + f"snapshots/{rev}/model.safetensors"
+        sh.files = {blob: b"weights"}
+        sh.links = {snap: "../../blobs/" + oid}
+        fake, vm, c, lan, pipe = _lan_make(
+            {"hf": {"backend": "thunder", "workflow_json": {}}}, sh,
+            catalog=[{"match": {"alias": "hf"}, "paths": [repo]}])
+        url = f"https://huggingface.co/org/repo/resolve/{rev}/model.safetensors"
+        vm.sizes[url], vm.sha[url] = 9, oid
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "hf")),
+                        c.state.log[-8:])
+        self.assertEqual([p for p, _ in vm.started], [blob])
+        self.assertIn("size differs", c.view()["url_fallback"][blob])
+        man = json.loads(vm.manifest)
+        self.assertEqual(man[blob]["source"], "lan")
+        self.assertEqual(vm.links, {snap: "../../blobs/" + oid})
+
+    async def test_fallback_kills_a_live_curl_and_discards_the_part_first(self):
+        sh = self.share()
+        fake, vm, c, lan, pipe = _lan_make({"img": _cand("a.safetensors")}, sh,
+                                           catalog=[_url("a.safetensors")])
+        vm.sizes[self.URL] = 10
+        vm.files[self.PATH + ".part"] = 3        # bytes from the URL, never verified
+        vm.poll_fail.add(self.PATH)              # the instance stops answering polls
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img"), 30),
+                        c.state.log[-8:])
+        # three attempts, each adopting the SAME curl (it ran on), then the fallback
+        self.assertEqual(len(vm.started), 1)
+        self.assertTrue(any("attempt 3/3 failed: the instance did not answer" in ln
+                            for ln in c.state.log), c.state.log)
+        self.assertEqual(vm.killed, [self.PATH])
+        # the LAN stream started from byte 0, not on top of the URL's bytes
+        self.assertEqual(shlex.split(pipe.log[0][0][-1]), ["cat", "diffusion_models/a.safetensors", "0"])
+        self.assertEqual(vm.files[self.PATH], 10)
+        self.assertEqual(json.loads(vm.manifest)[self.PATH]["source"], "lan")
+        self.assertIn("did not answer", c.view()["url_fallback"][self.PATH])
+
+    async def test_failed_abandon_gives_up_instead_of_switching(self):
+        sh = self.share()
+        fake, vm, c, lan, pipe = _lan_make({"img": _cand("a.safetensors")}, sh,
+                                           catalog=[_url("a.safetensors", sha="ab" * 32)])
+        vm.sizes[self.URL], vm.sha[self.URL] = 10, "cd" * 32
+        run = vm.run
+
+        def broken(cmd, stdin):
+            if cmd.startswith(": gw-abandon "):
+                return (255, b"", b"ssh: connection lost")
+            return run(cmd, stdin)
+        vm.run = broken
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.plan["per_alias"]["img"]["blocked"]))
+        self.assertEqual(pipe.log, [])                 # never two writers on one .part
+        self.assertEqual(c._url_fallback, {})
+        self.assertIn("share's copy", c._failed[self.PATH])
+        self.assertIn(("sync", "transfer"), [f[1:3] for f in c.h.faults])
+
+    async def _fallen_back_with_lan_down(self, extra_catalog=()):
+        """A fallback recorded while the LAN source has become unreachable (its last
+        listing kept): the file is `lan` now and waits (Ruling 18)."""
+        sh = self.share()
+        fake, vm, c, lan, pipe = _lan_make(
+            {"img": _cand("a.safetensors")}, sh,
+            catalog=[_url("a.safetensors", sha="ab" * 32)] + list(extra_catalog))
+        vm.sizes[self.URL], vm.sha[self.URL] = 10, "cd" * 32
+        vm.hold.add(self.URL)
+        await c.start()
+        self.assertTrue(await _until(lambda: self.PATH in c._fetches))
+        sh.list_rc = 255
+        lan.invalidate()
+        await lan.refresh()
+        self.assertFalse(lan.usable())
+        self.assertIn(self.PATH, lan.cached())
+        vm.hold.clear()
+        self.assertTrue(await _until(lambda: _idle(c) and self.PATH in c._url_fallback))
+        await _until(lambda: _idle(c))
+        return sh, fake, vm, c, lan, pipe
+
+    async def test_ruling_18_and_a_changed_url_retries_by_itself(self):
+        sh, fake, vm, c, lan, pipe = await self._fallen_back_with_lan_down()
+        st = c.alias_status(BID, "img")
+        self.assertIn("waiting for LAN source", st)
+        self.assertEqual(pipe.log, [])
+        self.assertEqual(c._fetchable(c.plan), [])
+        # Ruling 18: a URL file the alias gains now is withheld while it waits
+        g = _dm("g.safetensors")
+        vm.sizes["https://example.com/g.safetensors"] = 4
+        c.h.box["aliases"]["img"] = _cand("a.safetensors", "g.safetensors")
+        c.h.box["catalog"].append(_url("g.safetensors"))
+        await c._sync_tick()
+        await _until(lambda: _idle(c))
+        self.assertNotIn(g, [p for p, _ in vm.started])
+        self.assertIn("waiting for LAN source", c.alias_status(BID, "img"))
+        # a NEW url for the file (the operator fixed the entry) is tried by itself
+        new = "https://mirror.example/a.safetensors"
+        vm.sizes[new], vm.sha[new] = 10, "ab" * 32
+        c.h.box["catalog"][0] = {"file": self.PATH, "url": new, "sha256": "ab" * 32}
+        await c._sync_tick()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")),
+                        c.state.log[-8:])
+        self.assertIn(new, [re.search(r'url = "(.*)"', cfg).group(1) for _, cfg in vm.started])
+        self.assertEqual(c._url_fallback, {})               # the stale record went with it
+        self.assertEqual(c.view()["url_fallback"], {})
+        self.assertEqual(json.loads(vm.manifest)[self.PATH]["source"], "url")
+        self.assertEqual(pipe.log, [])
+
+    async def test_sync_now_clears_the_fallback(self):
+        sh, fake, vm, c, lan, pipe = await self._fallen_back_with_lan_down()
+        n = len(vm.started)
+        vm.sha[self.URL] = "ab" * 32                    # fixed upstream
+        await c.sync_now()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")),
+                        c.state.log[-8:])
+        self.assertEqual(len(vm.started), n + 1)
+        self.assertEqual(c._url_fallback, {})
+        self.assertEqual(json.loads(vm.manifest)[self.PATH]["source"], "url")
+
+    async def test_template_report_pruned_by_the_destination_index(self):
+        fake, vm, c, box, saved = _sync_make(aliases={"img": _cand("x.safetensors")},
+                                             catalog=[_url("x.safetensors")])
+        vm.sizes["https://example.com/x.safetensors"] = 3
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")))
+        here, gone = "models/checkpoints/here.safetensors", "models/checkpoints/gone.safetensors"
+        vm.files[here] = 5
+        c.state.bootstrap_unknown = {here: 5, gone: 7}
+        await c.sync_once()
+        self.assertEqual(c.state.bootstrap_unknown, {here: 5})
+        self.assertEqual(c.view()["bootstrap_unknown"], {here: 5})
+        self.assertEqual(saved["thunder"]["bootstrap_unknown"], {here: 5})   # persisted
+
+
+class ShareShaCache(unittest.IsolatedAsyncioTestCase):
+    """Model sources, "Persistent share-sha cache" (review I-4, R-2): every share hash
+    is kept in the store setting `modelsrc_sha`, bound to the share host, pruned by the
+    listing, and computed one at a time."""
+
+    PATH = "models/vae/a.st"
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="lan-sha-")
+        self.addCleanup(shutil.rmtree, self.d, True)
+        self.clock = [1000.0]
+        self.box = {"v": None}
+        self.saves = 0
+
+    def lan(self, sh, host=None):
+        hosts = host if isinstance(host, list) else [host or _SRCHOST]
+
+        def save(v):
+            self.saves += 1
+            self.box["v"] = json.loads(json.dumps(v))
+        lan = hostctl.LanSource(self.d, host=lambda: hosts[0], ssh=sh.ssh,
+                                keygen=_fake_keygen, now=lambda: self.clock[0],
+                                load_sha=lambda: self.box["v"], save_sha=save)
+        with open(lan.known_hosts_path, "w") as f:
+            f.write(f"192.168.8.24 ssh-ed25519 {_ED_B64}\n")
+        return lan
+
+    def share(self):
+        sh = FakeShare()
+        sh.files["vae/a.st"] = b"xyz"
+        sh.files["vae/b.st"] = b"bbbb"
+        return sh
+
+    def sha_calls(self, sh):
+        return [a for a in sh.calls if a[0] == "ssh" and shlex.split(a[-1])[0] == "sha256"]
+
+    async def test_persisted_across_a_new_lansource(self):
+        sh = self.share()
+        h = await self.lan(sh).sha256(self.PATH, 3)
+        self.assertEqual(self.box["v"], {"host": _SRCHOST, "files": {self.PATH: [3, h]}})
+        lan2 = self.lan(sh)                           # a gateway restart
+        self.assertEqual(lan2.sha_files(), {self.PATH: [3, h]})
+        self.assertEqual(lan2.known_sha(self.PATH, 3), h)
+        self.assertIsNone(lan2.known_sha(self.PATH, 4))
+        self.assertEqual(await lan2.sha256(self.PATH, 3), h)
+        self.assertEqual(len(self.sha_calls(sh)), 1)  # not hashed again
+
+    async def test_record_of_another_host_is_ignored(self):
+        sh = self.share()
+        self.box["v"] = {"host": "src@10.0.0.9", "files": {self.PATH: [3, "ab" * 32]}}
+        lan = self.lan(sh)
+        self.assertEqual(lan.sha_files(), {})
+        self.assertIsNone(lan.known_sha(self.PATH, 3))
+        h = await lan.sha256(self.PATH, 3)
+        self.assertEqual(h, hashlib.sha256(b"xyz").hexdigest())
+        self.assertEqual(len(self.sha_calls(sh)), 1)
+        self.assertEqual(self.box["v"], {"host": _SRCHOST, "files": {self.PATH: [3, h]}})
+
+    async def test_junk_rows_are_ignored(self):
+        sh = self.share()
+        good = "cd" * 32
+        self.box["v"] = {"host": _SRCHOST, "files": {
+            self.PATH: [3, good], "models/vae/b.st": [True, good], "models/x": [1, "zz"],
+            "models/y": "nope", 7: [1, good], "models/../z": [1, good]}}
+        self.assertEqual(self.lan(sh).sha_files(), {self.PATH: [3, good]})
+        for junk in ("junk", None, [], {"host": _SRCHOST, "files": "x"}):
+            self.box["v"] = junk
+            self.assertEqual(self.lan(sh).sha_files(), {}, junk)
+
+    async def test_dropped_whole_on_a_host_change(self):
+        sh = self.share()
+        hosts = [_SRCHOST]
+        lan = self.lan(sh, hosts)
+        await lan.sha256(self.PATH, 3)
+        gen = lan.sha_generation
+        hosts[0] = "src@10.0.0.9"
+        self.assertEqual(lan.sha_files(), {})
+        self.assertEqual(self.box["v"], {"host": "src@10.0.0.9", "files": {}})
+        self.assertGreater(lan.sha_generation, gen)
+        hosts[0] = _SRCHOST                           # back: the old hashes are gone
+        self.assertEqual(lan.sha_files(), {})
+
+    async def test_forget_drops_both_copies(self):
+        sh = self.share()
+        lan = self.lan(sh)
+        await lan.sha256(self.PATH, 3)
+        lan.forget_sha(self.PATH, 3)
+        self.assertEqual(lan.sha_files(), {})
+        self.assertEqual(self.box["v"]["files"], {})
+        self.assertEqual(self.lan(sh).sha_files(), {})
+        await lan.sha256(self.PATH, 3)
+        self.assertEqual(len(self.sha_calls(sh)), 2)
+
+    async def test_pruned_by_a_fresh_listing(self):
+        sh = self.share()
+        lan = self.lan(sh)
+        ha = await lan.sha256(self.PATH, 3)
+        await lan.sha256("models/vae/b.st", 4)
+        self.box["v"]["files"]["models/vae/gone.st"] = [1, "ab" * 32]   # an older session
+        lan = self.lan(sh)
+        del sh.files["vae/b.st"]                      # removed from the share
+        sh.files["vae/a.st"] = b"xyz"
+        await lan.refresh(force=True)
+        self.assertEqual(lan.sha_files(), {self.PATH: [3, ha]})
+        self.assertEqual(self.box["v"]["files"], {self.PATH: [3, ha]})
+        sh.files["vae/a.st"] = b"wxyz"                 # replaced at another size
+        await lan.refresh(force=True)
+        self.assertEqual(lan.sha_files(), {})
+        self.assertEqual(self.box["v"]["files"], {})
+        # a failed listing prunes nothing
+        await lan.sha256(self.PATH, 4)
+        sh.list_rc = 255
+        await lan.refresh(force=True)
+        self.assertEqual(list(lan.sha_files()), [self.PATH])
+
+    async def test_one_hash_at_a_time_with_a_visible_queue(self):
+        sh = self.share()
+        gate, active, peak = asyncio.Event(), [0], [0]
+        real = sh.ssh
+
+        async def ssh(argv, stdin=None, timeout=60):
+            if argv[0] != "ssh-keyscan" and shlex.split(argv[-1])[0] == "sha256":
+                active[0] += 1
+                peak[0] = max(peak[0], active[0])
+                try:
+                    await gate.wait()
+                    return await real(argv, stdin, timeout)
+                finally:
+                    active[0] -= 1
+            return await real(argv, stdin, timeout)
+        sh.ssh = ssh
+        lan = self.lan(sh)
+        lan._ssh = ssh
+        self.assertEqual(lan.hash_queue(), [])
+        lan.sha_files()                 # the record is read (in a thread on first need)
+        ts = [asyncio.ensure_future(lan.sha256(self.PATH, 3)),
+              asyncio.ensure_future(lan.sha256("models/vae/b.st", 4)),
+              asyncio.ensure_future(lan.sha256(self.PATH, 3))]
+        for _ in range(20):
+            await asyncio.sleep(0)
+        self.assertEqual(lan.hash_queue(), [self.PATH, "models/vae/b.st"])
+        self.assertEqual(active[0], 1)
+        gate.set()
+        res = await asyncio.gather(*ts)
+        self.assertEqual(res[0], res[2])
+        self.assertEqual(peak[0], 1)
+        self.assertEqual(len(self.sha_calls(sh)), 2)   # the duplicate waited for the first
+        self.assertEqual(lan.hash_queue(), [])
+
+    async def test_a_hash_answered_after_a_host_change_is_not_kept(self):
+        sh = self.share()
+        hosts = [_SRCHOST]
+        lan = self.lan(sh, hosts)
+        real = sh.ssh
+
+        async def ssh(argv, stdin=None, timeout=60):
+            res = await real(argv, stdin, timeout)
+            hosts[0] = "src@10.0.0.9"                 # changed while it hashed
+            return res
+        lan._ssh = ssh
+        with self.assertRaises(RuntimeError):
+            await lan.sha256(self.PATH, 3)
+        self.assertEqual(lan.sha_files(), {})
+        self.assertEqual(self.box["v"], {"host": "src@10.0.0.9", "files": {}})
+
+    async def test_memory_only_without_store_callables(self):
+        sh = self.share()
+        lan = _lan(sh, self.d, self.clock)
+        h = await lan.sha256(self.PATH, 3)
+        self.assertEqual(lan.sha_files(), {self.PATH: [3, h]})
+
+    async def test_lan_transfer_hash_lands_in_the_store(self):
+        sh = FakeShare()
+        sh.files["diffusion_models/a.safetensors"] = b"0123456789"
+        fake, vm, c, lan, pipe = _lan_make({"img": _cand("a.safetensors")}, sh)
+        lan._load_sha = lambda: self.box["v"]
+        lan._save_sha = lambda v: self.box.__setitem__("v", json.loads(json.dumps(v)))
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")))
+        self.assertEqual(self.box["v"]["files"],
+                         {_dm("a.safetensors"): [10, hashlib.sha256(b"0123456789").hexdigest()]})
 
 
 class LanSourceUnit(unittest.IsolatedAsyncioTestCase):

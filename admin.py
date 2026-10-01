@@ -8316,6 +8316,7 @@ _FAULT_KIND = {
     "vendor_failed": "⚠ vendor failed the task", "restart": "⟳ restarted",
     "restart_failed": "✖ restart failed", "error": "⚠ error",
     "snapshot_failed": "✖ snapshot failed", "instance_vanished": "⚠ instance vanished",
+    "url_fallback": "⚠ URL given up — share's copy synced",
 }
 _FAULT_SOURCE = {"health": ("health poll", "the discovery poll failed — the backend went DOWN"),
                  "call": ("LLM call", "a chat/completions dispatch failed on this backend "

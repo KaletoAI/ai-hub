@@ -1170,7 +1170,13 @@ via injected callables, staying hot-reload-safe.
   unreadable state never overwritten, the transfers — options on stdin, the HF token
   for HF hosts only, lockfile adoption, resume from the offset, a sha256 mismatch, disk
   growth by `modify`, one LAN stream — held vs pruned files, the token in no log or
-  view; and the host/service split: every service drained before the snapshot and
+  view; the model-source rules (`UrlRules`, `UrlFallback`, `ShareShaCache`): a URL
+  mismatch or 4xx final after ONE download while 5xx/429 retry, the fallback ending a
+  live curl and discarding the shared `.part` before the LAN stream (and not switching
+  when that cannot be confirmed), keyed on the URL, cleared by Sync now, a URL-only file
+  still blocking, Ruling 18, the share-sha cache persisted, host-bound, pruned and one
+  hash at a time, the template report pruned by the destination index; and the
+  host/service split: every service drained before the snapshot and
   disabled at `off`, a DETACH that never disables (R-K2) and a move H1 → H2 H1 never
   touches, a forward added on the running master without a respawn (a respawn cuts the
   other service's stream), a failed forward downing only its service, a list changed
@@ -1629,7 +1635,7 @@ via injected callables, staying hot-reload-safe.
   `plan`/`ready_aliases` are REBOUND whole there and nowhere else (routing reads them from
   a worker thread via `is_alias_ready(bid, alias)`/`alias_status(bid, alias)`). What only
   the controller knows joins an alias's `blocked`: a LAN source that is not usable
-  (`waiting for LAN source (…)`), a transfer that gave up after three attempts (fault
+  (`waiting for LAN source (…)`), a transfer that gave up (fault
   `sync`/`transfer`), a disk that cannot grow within the spec maximum (it grows by
   `modify` otherwise). Ruling 18: an alias still waiting on a LAN file or a failed
   transfer fetches none of its URL files either — nothing that cannot make it ready this
@@ -1640,7 +1646,30 @@ via injected callables, staying hot-reload-safe.
   names the running curl, else `GW:START-FAIL` = a failed attempt — a stop's kill in
   that window missed the curl), and a live lockfile is ADOPTED after a gateway restart,
   never answered with a second curl on the same `.part`. A 2xx HEAD naming length 0 is
-  an unknown size; Sync now re-asks unknown and failed HEADs. LAN files:
+  an unknown size; Sync now re-asks unknown and failed HEADs. A URL download's size or
+  sha256 MISMATCH is final at once (`_finish`: the same URL serves the same bytes — the
+  three attempts were three full downloads on a billed instance), and so is a 4xx
+  (`curl_http_status` reads curl's exit-22 line; `http_status_final`: 408/429 excepted);
+  5xx, 429 and transport failures keep the three attempts, and a LAN transfer's mismatch
+  stays non-final (`forget_sha` → re-hash: the share's file may have changed in place).
+  **URL fallback** (model sources): a URL that ended final — mismatch, 4xx, three
+  failures — for a file the share ALSO lists (its last good listing, `_share_lists`)
+  is given up for the share's copy: `_fall_back` FIRST runs `_abandon_cmd` (the curl the
+  lockfile names gets TERM/KILL — an attempt that gave up on unanswered polls leaves it
+  running — and the SHARED `.part`, holding URL bytes the LAN stream would resume onto,
+  is removed; `GW:ABANDONED` or no switch: the file then gives up as before), then
+  records `_url_fallback[path] = url`, logs once and books fault `sync`/`url_fallback`
+  with a reason that names a size difference as such ("size differs: the URL's file is
+  …, the share's copy … — syncing the share's copy", review M-3). `_compute_plan` hands
+  `plan` the URL sources WITHOUT those (`_without_fallbacks`, explicit and derived
+  alike) → the plan says `lan`; keyed on the URL — an entry naming another URL drops the
+  record and is tried by itself; Sync now clears it with `_failed`. A URL-only file
+  gives up and blocks as before; Ruling 18 holds (a fallen-back file waits for an
+  unusable LAN source like any LAN file). `view()["url_fallback"]` = `{path: reason}`,
+  no URL (a catalog URL may carry a query token). Every plan also drops entries of the
+  host bootstrap's template report (`bootstrap_unknown`, the card's "Models the template
+  brought along") that the fresh destination index lacks (`_prune_template_report`,
+  persisted). LAN files:
   `LanSource` (ONE per gateway, `main.modelsrc()`: `modelsrc.key`, the host key pinned in
   `modelsrc-known_hosts` with `StrictHostKeyChecking=yes` — pinned only by a POST
   carrying the fingerprint `scan()` showed; `modelsrc_host` held to `_VOICE_HOST_RE`
@@ -1657,7 +1686,20 @@ via injected callables, staying hot-reload-safe.
   exactly ONE file per host through the gateway (`pipe`: the share's `cat <rel>
   <offset>` into `flock -n … cat >> <rel>.part` — a second appender exits 75), resumed
   from the `.part`'s size, sha256 on both sides; the HF cache's snapshot symlinks are
-  recreated. Triggers: the start path, a 5-s alias-signature poll in `run_forever`, a
+  recreated. The share's sha256 cache is PERSISTENT (model sources I-4/R-2): store
+  setting `modelsrc_sha` = `{"host": <modelsrc_host>, "files": {path: [size, sha256]}}`,
+  read and written through `LanSource(load_sha=, save_sha=)` (main's
+  `_modelsrc_sha_load/_save`; LanSource imports neither main nor store) — read only when
+  its `host` is the configured one, dropped whole on a host change (with the listing),
+  written after EVERY hash (every LAN transfer hashes, so each LAN-synced file has its
+  sha for free), dropped by `forget_sha` in both copies, and pruned of paths a fresh
+  listing no longer has at that size. Hashes run ONE at a time (`_hash_lock`; a second
+  request for one file takes the first's answer), `hash_queue()` lists the waiting paths
+  (the running one first), `sha_files()`/`known_sha()` read without hashing,
+  `sha_generation` changes with the cache. `_sha` is replaced, never mutated in place —
+  `sha_files()` runs in a worker thread. `main._share_sha_files()` is the ONE reader the
+  plan (`_host_deps`' `url_catalog` → `modelsync.url_catalog(…, share_sha)`) and the
+  overview use. Triggers: the start path, a 5-s alias-signature poll in `run_forever`, a
   changed LAN source, a re-plan when a transfer ends and every 60 s while one runs. A
   sync re-checks the phase after planning: a plan about an instance on its way out
   never grows its disk or replaces the manifest the snapshot records.
