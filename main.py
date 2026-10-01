@@ -6398,16 +6398,22 @@ def _linked_etag(v) -> Optional[str]:
     return s if _HEX64.fullmatch(s) else None
 
 
-async def _head_ref_url(url: str, hf_token_ok: bool = True) -> UrlHead:
+async def _head_ref_url(url: str, hf_token_ok: bool = True,
+                        token: Optional[str] = None) -> UrlHead:
     """HEAD a source URL under the rules above → `UrlHead` (never raises).
     `hf_token_ok` False = never send the HF token (it is sent at most on the first hop,
-    and only to huggingface.co/hf.co)."""
+    and only to huggingface.co/hf.co). `token` = the HF token read once by the caller (a
+    directory check HEADs N files; None = read it here). The HF headers are believed only
+    from an HF host (review-3 M-2): another server's `X-Linked-*` would end the HEAD early
+    or earn "verified by sha256" on that server's word — its file is "size only"."""
     res = UrlHead()
-    token = ""
     first = urlparse(str(url or ""))
-    if hf_token_ok and (first.hostname or "").lower() in hostctl._HF_HOSTS:
-        tok = _thunder_hf_token()
-        token = tok if hostctl.hf_token_ok(tok) else ""
+    hf = (first.hostname or "").lower() in hostctl._HF_HOSTS
+    tok = ""
+    if hf_token_ok and hf:
+        tok = _thunder_hf_token() if token is None else str(token or "")
+        tok = tok if hostctl.hf_token_ok(tok) else ""
+    token = tok
     cur = str(url or "")
     for hop in range(_HEAD_MAX_HOPS + 1):
         u = urlparse(cur)
@@ -6448,7 +6454,7 @@ async def _head_ref_url(url: str, hf_token_ok: bool = True) -> UrlHead:
             return res
         res.hops, res.status = hop + 1, r.status_code
         h = r.headers
-        if hop == 0:
+        if hop == 0 and hf:
             # HF's facts sit on ITS response (the 302 for an LFS file), not the CDN's
             res.size = _head_size(h.get("x-linked-size"))
             res.sha256 = _linked_etag(h.get("x-linked-etag"))
@@ -6465,6 +6471,11 @@ async def _head_ref_url(url: str, hf_token_ok: bool = True) -> UrlHead:
             continue
         if not 200 <= r.status_code < 300:
             res.error = f"HTTP {r.status_code}"
+            if (hop and hf and r.status_code in (401, 403)
+                    and (u.hostname or "").lower() in hostctl._HF_HOSTS):
+                # the token rides on the first hop only (a gated repo behind a rename)
+                res.error += (" after a redirect within Hugging Face — enter the URL the "
+                              "redirect names")
             return res
         if res.size is None:
             res.size = _head_size(h.get("content-length"))
@@ -6483,7 +6494,13 @@ _SRC_PENDING = ("queued", "heading", "hashing")
 _SRC_CHECKS_MAX = 200
 _src_checks: dict = {}
 _src_check_tasks: dict = {}
-_src_confirming: dict = {}                  # plan path → the dir entry's key it confirms
+_src_confirming: dict = {}                  # plan path → (dir key, run token) it confirms
+# the background confirmation of a directory check, per dir key, and the token of the
+# CURRENT run: a re-check or a remove cancels the old task, and a hash that already ran
+# writes nothing for a run that is no longer current (review-3 I-1)
+_src_confirm_tasks: dict = {}
+_src_confirm_run: dict = {}
+_src_run_seq = [0]
 _src_lock_obj: Optional[tuple] = None       # (loop, asyncio.Lock): one per event loop
 
 # Writers of `modelsync_catalog` (Check & save, remove, the console's JSON editor): one
@@ -6530,6 +6547,16 @@ def source_checks_pending() -> bool:
     overview is live while this holds."""
     return (any(s.get("state") in _SRC_PENDING for s in _src_checks.values())
             or bool(_src_confirming))
+
+
+def _src_stop_confirm(key: str) -> None:
+    """End the background confirmation of directory `key` (a re-check, a remove): its
+    queued hashes leave the LanSource queue (the cancel), a running one finishes but
+    writes nothing (`_src_confirm_run` no longer names its token)."""
+    _src_confirm_run.pop(key, None)
+    t = _src_confirm_tasks.pop(key, None)
+    if t is not None and not t.done():
+        t.cancel()
 
 
 def _src_set(key: str, **kw) -> None:
@@ -6595,13 +6622,14 @@ async def _src_listing(key: str):
 
 async def _share_hash(key: str, lan, path: str, size: int) -> Optional[str]:
     """The share's sha256 for a check: the persistent cache, else a hash queued behind
-    every transfer's (`background=True`). None after refusing the check."""
+    every transfer's and ahead of every directory confirmation (priority 1). None after
+    refusing the check."""
     sha = lan.known_sha(path, size)
     if sha is not None:
         return sha
     _src_set(key, state="hashing")
     try:
-        return await lan.sha256(path, size, background=True)
+        return await lan.sha256(path, size, background=1)
     except RuntimeError as e:
         logger.warning(f"[model sources] {path}: share sha256 failed: {e}")
         _src_refuse(key, "the share's sha256 could not be computed — see the gateway log")
@@ -6623,7 +6651,7 @@ def _catalog_write(fn) -> list:
     return []
 
 
-def _put_entry(entry: dict, same) -> list:
+def _put_entry(entry: dict, same, still=None) -> list:
     """Write `entry` in place of the catalog entries `same(e)` names (its position: the
     first of them), else at the end. Only the NEW entry is validated — an unrelated
     broken entry (dropped one by one by modelsync anyway) never blocks a check."""
@@ -6632,6 +6660,8 @@ def _put_entry(entry: dict, same) -> list:
         return [e.removeprefix("entry 1: ") for e in errs]
 
     def fn(cat):
+        if still is not None and not still():
+            return "removed while it was checked"
         out, placed = [], False
         for e in cat:
             if isinstance(e, dict) and same(e):
@@ -6668,7 +6698,7 @@ async def _check_file(path: str, url: str) -> None:
         _src_refuse(path, "the share does not list this file")
         return
     _src_set(path, state="heading")
-    h = await _head_ref_url(url)
+    h = await _head_ref_url(url, token=await asyncio.to_thread(_thunder_hf_token))
     if h.error:
         _src_refuse(path, h.error)
         return
@@ -6685,7 +6715,9 @@ async def _check_file(path: str, url: str) -> None:
         return
     verified = "sha256" if h.sha256 is not None else "size"
     entry = {"file": path, "url": url, "size": size, "sha256": share, "verified": verified}
-    errs = await asyncio.to_thread(_put_entry, entry, lambda e: e.get("file") == path)
+    mine = _src_checks.get(path)
+    errs = await asyncio.to_thread(_put_entry, entry, lambda e: e.get("file") == path,
+                                   lambda: _src_checks.get(path) is mine)
     if errs:
         _src_refuse(path, "not saved: " + errs[0])
         return
@@ -6727,10 +6759,12 @@ async def _check_dir(d: str, repo: str, rev: str) -> None:
     commit = rev if _HEX40.fullmatch(rev) else None
     rows, left = {}, {}
     _src_set(d, state="heading")
+    token = await asyncio.to_thread(_thunder_hf_token)     # once, off the loop (M-4)
     for i, rel in enumerate(sorted(files)):
-        _src_set(d, progress=f"{i + 1} of {len(files)}")
+        _src_set(d, progress=f"{i + 1} of {len(files)} · {rel}")
         size = files[rel]
-        h = await _head_ref_url(modelsync.hf_resolve_url(repo, commit or rev, rel))
+        h = await _head_ref_url(modelsync.hf_resolve_url(repo, commit or rev, rel),
+                                token=token)
         if commit is None:
             if h.commit:
                 commit = h.commit           # ONE commit for the whole entry (R-6 c)
@@ -6752,7 +6786,9 @@ async def _check_dir(d: str, repo: str, rev: str) -> None:
         _src_refuse(d, "no file of this directory verified" + (f" ({first})" if first else ""))
         return
     entry = {"dir": d, "repo": repo, "rev": commit, "files": rows}
-    errs = await asyncio.to_thread(_put_entry, entry, lambda e: e.get("dir") == d)
+    mine = _src_checks.get(d)
+    errs = await asyncio.to_thread(_put_entry, entry, lambda e: e.get("dir") == d,
+                                   lambda: _src_checks.get(d) is mine)
     if errs:
         _src_refuse(d, "not saved: " + errs[0])
         return
@@ -6764,31 +6800,44 @@ async def _check_dir(d: str, repo: str, rev: str) -> None:
              commit=commit)
     logger.info(f"[model sources] {d}: directory source saved ({len(rows)} of {len(files)} "
                 f"files, commit {commit})")
+    _src_stop_confirm(d)
     if todo:
+        _src_run_seq[0] += 1
+        run = (d, _src_run_seq[0])
+        _src_confirm_run[d] = run
         for rel, _ in todo:
-            _src_confirming[d + rel] = d
-        _bg(_confirm_dir_rows(d, repo, commit, todo))
+            _src_confirming[d + rel] = run
+        _src_confirm_tasks[d] = _bg(_confirm_dir_rows(d, repo, commit, todo, run))
 
 
-async def _confirm_dir_rows(d: str, repo: str, commit: str, todo: list) -> None:
+async def _confirm_dir_rows(d: str, repo: str, commit: str, todo: list, run=None) -> None:
     """The background half of a directory check: the share's sha256 of every row that
-    lacks it (queued behind transfer hashes), then the row confirmed — or, for a
-    provisional sha the share disagrees with, left as it is: the persistent share-sha
-    cache now makes `modelsync.source_kinds` call that file outdated."""
+    lacks it (priority 2 — behind transfers AND the next Check & save), then the row
+    confirmed — or, for a provisional sha the share disagrees with, left as it is: the
+    persistent share-sha cache now makes `modelsync.source_kinds` call that file
+    outdated. `run` is this run's token: a newer run or a remove ends this one, and
+    only this run's `_src_confirming` markers are popped."""
     lan = modelsrc()
+    current = lambda: _src_confirm_run.get(d) == run
     try:
         for rel, size in todo:
             path = d + rel
+            if not current():
+                return
             try:
-                share = await lan.sha256(path, size, background=True)
+                share = await lan.sha256(path, size, background=2)
             except RuntimeError as e:
                 logger.warning(f"[model sources] {path}: share sha256 failed: {e}")
                 share = None
+            if not current():
+                return                      # re-checked or removed while it hashed
             verdict = ("failed" if share is None else
-                       await asyncio.to_thread(_confirm_row, d, repo, commit, rel, size, share))
-            _src_confirming.pop(path, None)
+                       await asyncio.to_thread(_confirm_row, d, repo, commit, rel, size,
+                                               share, run))
+            if _src_confirming.get(path) == run:
+                del _src_confirming[path]
             st = _src_checks.get(d)
-            if st is not None and st.get("commit") == commit:
+            if st is not None and current():
                 st["confirming"] = max(0, int(st.get("confirming") or 0) - 1)
                 if verdict == "outdated":
                     st["outdated"][rel] = ("hash differs: the share's copy differs from "
@@ -6798,16 +6847,24 @@ async def _confirm_dir_rows(d: str, repo: str, commit: str, todo: list) -> None:
                 st["at"] = time.time()
     finally:
         for rel, _ in todo:
-            _src_confirming.pop(d + rel, None)
+            if _src_confirming.get(d + rel) == run:
+                del _src_confirming[d + rel]
+        if _src_confirm_tasks.get(d) is asyncio.current_task():
+            del _src_confirm_tasks[d]
+            if current():
+                _src_confirm_run.pop(d, None)
 
 
-def _confirm_row(d: str, repo: str, commit: str, rel: str, size: int, share: str) -> str:
+def _confirm_row(d: str, repo: str, commit: str, rel: str, size: int, share: str,
+                 run=None) -> str:
     """Apply one background share hash to the stored dir entry → "confirmed",
     "outdated" (left provisional; the cache says it differs) or "gone" (the entry or the
-    row changed since — nothing written)."""
+    row changed since, or the run is no longer current — nothing written)."""
     result = ["gone"]
 
     def fn(cat):
+        if run is not None and _src_confirm_run.get(d) != run:
+            return None                     # judged under the lock: a remove won
         for e in cat:
             if not (isinstance(e, dict) and e.get("dir") == d and e.get("repo") == repo
                     and e.get("rev") == commit and isinstance(e.get("files"), dict)):
@@ -6831,6 +6888,10 @@ def remove_source(key: str) -> str:
     the directory source (`key` ending in `/`) — and a check of it still waiting."""
     key = str(key or "").strip()
     found = [False]
+    # an in-flight Check & save write (a worker thread a cancel cannot stop) checks the
+    # status under the catalog lock: gone = removed meanwhile, nothing written (M-6)
+    _src_checks.pop(key, None)
+    _src_stop_confirm(key)
 
     def fn(cat):
         out = [e for e in cat if not (isinstance(e, dict) and (
@@ -6842,6 +6903,7 @@ def remove_source(key: str) -> str:
     errs = _catalog_write(fn)
     if errs:
         return f"not removed: {errs[0]}"
+    _src_stop_confirm(key)
     t = _src_check_tasks.get(key)
     if t is not None and not t.done():
         t.cancel()

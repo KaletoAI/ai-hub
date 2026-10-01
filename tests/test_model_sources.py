@@ -56,7 +56,8 @@ HF = "https://huggingface.co"
 PUBLIC = {"huggingface.co": ["18.1.1.1"], "hf.co": ["18.1.1.2"], "cdn-lfs.hf.co": ["18.2.2.2"],
           "mirror.example": ["93.184.216.34"], "other.example": ["93.184.216.35"],
           "evil.example": ["93.184.216.36"], "lan.example": ["172.16.5.5"],
-          "mixed.example": ["93.184.216.37", "10.0.0.5"]}
+          "mixed.example": ["93.184.216.37", "10.0.0.5"],
+          "huggingface.co.evil.example": ["93.184.216.38"]}
 
 
 def resp(status=200, **headers):
@@ -98,6 +99,7 @@ class FakeLan:
 
     async def sha256(self, path, size, background=False):
         self.background.append(background)
+        self.calls = getattr(self, "calls", []) + [path]
         if self.gate is not None:
             await self.gate.wait()
         if path in self.fail:
@@ -110,7 +112,8 @@ class FakeLan:
 
 class _Base(unittest.IsolatedAsyncioTestCase):
     NAMES = ("http_client", "_resolve_ref_host", "modelsrc", "_thunder_hf_token",
-             "_src_checks", "_src_check_tasks", "_src_confirming")
+             "_src_checks", "_src_check_tasks", "_src_confirming", "_src_confirm_tasks",
+             "_src_confirm_run")
 
     def setUp(self):
         self._saved = {n: getattr(main, n) for n in self.NAMES}
@@ -121,6 +124,7 @@ class _Base(unittest.IsolatedAsyncioTestCase):
         store.init(os.path.join(self.tmp, "store.db"))
         store.set_settings({"modelsync_catalog": []})
         main._src_checks, main._src_check_tasks, main._src_confirming = {}, {}, {}
+        main._src_confirm_tasks, main._src_confirm_run = {}, {}
         self.dns = dict(PUBLIC)
 
         async def resolve(host, port):
@@ -166,7 +170,8 @@ class _Base(unittest.IsolatedAsyncioTestCase):
 
     async def settle(self):
         for _ in range(200):
-            if not main._src_confirming and not main._src_check_tasks:
+            if (not main._src_confirming and not main._src_check_tasks
+                    and not main._src_confirm_tasks):
                 return
             await asyncio.sleep(0.01)
         self.fail("background work did not settle")
@@ -277,6 +282,46 @@ class HeadRules(_Base):
         self.routes["https://hf.co/a/b/resolve/main/m"] = resp(200, content_length=3)
         await main._head_ref_url("https://hf.co/a/b/resolve/main/m")
         self.assertIn("authorization", self.seen[0][1].headers)
+
+    async def test_lookalike_hosts_get_no_token_and_case_does_not_matter(self):
+        """Review-3 M-1: only the exact HF host names (any case) get the token."""
+        for url, host, want in (
+                ("https://huggingface.co.evil.example/a/b/resolve/main/m",
+                 "huggingface.co.evil.example", False),
+                ("https://evil.example/huggingface.co/a/b/resolve/main/m", "evil.example", False),
+                ("https://huggingface.co@evil.example/a/b/resolve/main/m", "evil.example", False),
+                ("https://HUGGINGFACE.CO/a/b/resolve/main/m", "HUGGINGFACE.CO", True)):
+            self.seen.clear()
+            path = url.split(host, 1)[1]
+            self.routes[f"https://{host}{path}"] = resp(200, content_length=3)
+            h = await main._head_ref_url(url)
+            self.assertEqual(h.error, "", url)
+            req = self.seen[0][1]
+            self.assertEqual(req.headers["host"], host)
+            self.assertEqual("authorization" in req.headers, want, url)
+
+    async def test_hf_headers_believed_from_hf_hosts_only(self):
+        """Review-3 M-2: a mirror's `X-Linked-*` neither ends the HEAD early nor names a
+        content sha — its file is size-only, measured on the final hop."""
+        self.routes["https://mirror.example/m"] = resp(
+            302, location="https://other.example/m", x_linked_size=999,
+            x_linked_etag=SHA_A, x_repo_commit=COMMIT)
+        self.routes["https://other.example/m"] = resp(200, content_length=10,
+                                                      x_linked_etag=SHA_A)
+        h = await main._head_ref_url("https://mirror.example/m")
+        self.assertEqual((h.error, h.size, h.sha256, h.commit, h.hops), ("", 10, None, None, 2))
+
+    async def test_401_after_an_hf_internal_redirect_says_why(self):
+        """Review-3 M-7: the token rides on hop 1 only — a gated repo behind a rename
+        answers 401 on hop 2, and the refusal names the way out (fixed text)."""
+        self.routes[f"{HF}/old/r/resolve/main/m"] = resp(307, location="/new/r/resolve/main/m")
+        self.routes[f"{HF}/new/r/resolve/main/m"] = resp(401)
+        h = await main._head_ref_url(f"{HF}/old/r/resolve/main/m")
+        self.assertEqual(h.error, "HTTP 401 after a redirect within Hugging Face — enter the "
+                                  "URL the redirect names")
+        self.routes["https://mirror.example/x"] = resp(401)
+        self.assertEqual((await main._head_ref_url("https://mirror.example/x")).error,
+                         "HTTP 401")
 
     async def test_fixed_refusals_never_echo_a_body(self):
         cases = [
@@ -563,6 +608,72 @@ class CheckDir(_Base):
         self.assertEqual(cat[1], f)                     # a per-file entry stays (it wins)
         await self.settle()
 
+    async def test_remove_stops_the_background_confirmation(self):
+        """Review-3 I-1: a removed directory's share hashes must not keep the queue busy
+        for hours — nor write anything when one was already running."""
+        self.lan.gate = asyncio.Event()
+        await self.run_check(main.check_dir_source(self.D, self.REPO))
+        await asyncio.sleep(0.01)
+        self.assertTrue(main.source_checks_pending())
+        self.assertEqual(len(self.lan.calls), 1)        # the first waits at the gate
+        t = main._src_confirm_tasks[self.D]
+        self.assertIn("removed", main.remove_source(self.D))
+        await asyncio.gather(t, return_exceptions=True)
+        self.assertTrue(t.cancelled())
+        self.lan.gate.set()
+        await asyncio.sleep(0.05)
+        self.assertEqual(len(self.lan.calls), 1)        # no further hash after the remove
+        self.assertFalse(main.source_checks_pending())
+        self.assertEqual(main._src_confirming, {})
+        self.assertEqual(self.catalog(), [])
+
+    async def test_a_recheck_replaces_the_confirmation_and_stays_pending(self):
+        self.lan.gate = asyncio.Event()
+        await self.run_check(main.check_dir_source(self.D, self.REPO))
+        await asyncio.sleep(0.01)
+        first = main._src_confirm_tasks[self.D]
+        await self.run_check(main.check_dir_source(self.D, self.REPO))
+        await asyncio.gather(first, return_exceptions=True)
+        self.assertTrue(first.cancelled())
+        second = main._src_confirm_tasks[self.D]
+        self.assertIsNot(first, second)
+        await asyncio.sleep(0.01)
+        # the old run's end popped none of the new run's markers
+        self.assertEqual(sorted(main._src_confirming),
+                         [self.D + "b.safetensors", self.D + "config.json",
+                          self.D + "sub/x.safetensors"])
+        self.assertTrue(main.source_checks_pending())
+        self.lan.gate.set()
+        await self.settle()
+        self.assertFalse(main.source_checks_pending())
+        self.assertEqual(self.catalog()[0]["files"]["b.safetensors"], [200, SHA_B, False])
+        self.assertEqual(main.source_checks()[self.D]["confirming"], 0)
+
+    async def test_a_stale_run_writes_nothing(self):
+        """A hash that was already running when its run ended finishes, but its result
+        is judged under the catalog lock against the CURRENT run token."""
+        entry = {"dir": self.D, "repo": self.REPO, "rev": COMMIT,
+                 "files": {"b.safetensors": [200, SHA_B, True]}}
+        store.set_settings({"modelsync_catalog": [entry]})
+        main._src_confirm_run[self.D] = (self.D, 2)
+        self.assertEqual(main._confirm_row(self.D, self.REPO, COMMIT, "b.safetensors", 200,
+                                           SHA_B, (self.D, 1)), "gone")
+        self.assertEqual(self.catalog(), [entry])
+        self.assertEqual(main._confirm_row(self.D, self.REPO, COMMIT, "b.safetensors", 200,
+                                           SHA_B, (self.D, 2)), "confirmed")
+        self.assertEqual(self.catalog()[0]["files"]["b.safetensors"], [200, SHA_B, False])
+
+    async def test_confirmations_hash_behind_a_check(self):
+        """Review-3 M-3: priorities — a Check & save (1) before confirmations (2)."""
+        await self.run_check(main.check_dir_source(self.D, self.REPO))
+        await self.settle()
+        self.assertEqual(set(self.lan.background), {2})
+        a = "models/vae/a.st"
+        self.lan.index[a], self.lan.share[a] = 10, SHA_A
+        self.routes["https://mirror.example/a"] = resp(200, content_length=10)
+        await self.run_check(main.check_source(a, "https://mirror.example/a"))
+        self.assertEqual(self.lan.background[-1], 1)
+
     async def test_a_row_changed_meanwhile_is_not_confirmed(self):
         self.lan.gate = asyncio.Event()
         await self.run_check(main.check_dir_source(self.D, self.REPO))
@@ -620,6 +731,14 @@ class RemoveAndLock(_Base):
         finally:
             store.set_settings = real
         self.assertEqual(seen, [True, True, True])
+
+    async def test_a_write_after_a_remove_is_refused(self):
+        """Review-3 M-6: the worker thread a cancel cannot stop re-checks, under the
+        catalog lock, that its check still exists."""
+        e = {"file": "models/vae/a.st", "url": "https://mirror.example/a", "size": 3}
+        self.assertEqual(main._put_entry(e, lambda x: x.get("file") == e["file"],
+                                         lambda: False), ["removed while it was checked"])
+        self.assertEqual(self.catalog(), [])
 
     async def test_editor_save_refused_when_the_catalog_changed(self):
         rendered = main.modelsync_catalog_hash()

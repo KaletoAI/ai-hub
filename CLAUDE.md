@@ -1269,8 +1269,10 @@ via injected callables, staying hot-reload-safe.
   outdated, two checks or two catalog writers interleaving and losing an entry. Pins
   the first-hop headers, ≤ 5 redirects, private hops refused before any connection,
   the token rule, the fixed refusals, the accept/refuse matrix, the dir rules incl.
-  partial acceptance and provisional → confirmed/outdated, one check at a time, remove,
-  the catalog lock and the stale-form refusal).
+  partial acceptance and provisional → confirmed/outdated, one check at a time, remove
+  and re-check ending a dir's background confirmation (no further hash, no write, the
+  pending flag kept for the newer run), lookalike HF hosts, HF headers from HF hosts
+  only, the hash priorities, the catalog lock and the stale-form refusal).
   `test_server_tabs.py` (the Server tab's Runtime | Restart | API Keys | Models: a form on the
   wrong sub-tab or a Save that lands on another one reads as a setting that "did not
   save", and a pending restart shown only on Restart is never seen from Runtime; an
@@ -1717,10 +1719,11 @@ via injected callables, staying hot-reload-safe.
   written after EVERY hash (every LAN transfer hashes, so each LAN-synced file has its
   sha for free), dropped by `forget_sha` in both copies, and pruned of paths a fresh
   listing no longer has at that size. Hashes run ONE at a time (`_hash_turn`; a second
-  request for one file takes the first's answer) and a TRANSFER's hash overtakes every
-  queued `sha256(…, background=True)` — Check & save's (M-5: a LAN transfer holds the one
-  stream slot until its hash answers; a background hash already running is not
-  interrupted), `hash_queue()` lists the waiting paths in the order they will run (the
+  request for one file takes the first's answer) by priority — `sha256(…, background=)`
+  0/False a transfer's, 1/True a Check & save's, 2 a directory check's background
+  confirmation (M-5 / review-3 M-3: a LAN transfer holds the one stream slot until its
+  hash answers, and the next Check & save must not wait behind hours of confirmations;
+  a hash already running is not interrupted), `hash_queue()` lists the waiting paths in the order they will run (the
   running one first), `sha_files()`/`known_sha()` read without hashing,
   `sha_generation` changes with the cache; `sha256` raises RuntimeError only (an unset
   host included). `_sha` is replaced, never mutated in place — `sha_files()` runs in a
@@ -1901,9 +1904,13 @@ via injected callables, staying hot-reload-safe.
   new hop through the same rule, at most `_HEAD_MAX_HOPS` 5, https only —
   `Accept-Encoding: identity` (else a small file's Content-Length is the compressed
   size), and the HF token on the FIRST hop only and only to `hostctl._HF_HOSTS` (a
-  same-host redirect goes without it too: the rule has no exception to get wrong).
+  same-host redirect goes without it too: the rule has no exception to get wrong — a
+  401/403 there says "after a redirect within Hugging Face — enter the URL the redirect
+  names"; the token is read ONCE per check, off the loop, and passed as `token=`).
   `X-Linked-Size`, `X-Linked-Etag` (quotes/`W/` stripped, only `^[0-9a-f]{64}$`) and
-  `X-Repo-Commit` come from the FIRST response — HF's 302 carries them, the CDN's ETag is
+  `X-Repo-Commit` come from the FIRST response, and only when that is an HF host
+  (another server's would end the HEAD early or earn "verified by sha256" on its word —
+  its file is size-only) — HF's 302 carries them, the CDN's ETag is
   no sha256 and `X-Xet-Hash` another hash, both ignored (M-6); the next hop is made only
   while the size is unknown, which then comes from the last `Content-Length` (0 =
   unknown). Refusals are fixed texts ("HTTP 404", "redirect to a private address", …);
@@ -1925,7 +1932,12 @@ via injected callables, staying hot-reload-safe.
   (→ `lan`, `left_out` names why); refused only when NO file verified. The entry
   `{dir, repo, rev: <commit>, files}` replaces the entry of the same `dir`; per-file
   entries under it stay (they win). Rows without the share's sha are confirmed in the
-  BACKGROUND (`_confirm_dir_rows`, queued behind transfer hashes, `_src_confirming`):
+  BACKGROUND (`_confirm_dir_rows`, priority 2, ONE task per dir in
+  `_src_confirm_tasks`, the run's token in `_src_confirm_run`; a re-check or
+  `remove_source` cancels it — its queued hashes leave the LanSource queue — and a hash
+  already running writes nothing, `_confirm_row` judging the token under the catalog
+  lock; `_src_confirming` = `{path: run token}`, a run pops only its own markers, so the
+  pending flag holds while a newer run hashes):
   null → the share's sha, a provisional one that matches → `provisional: false`, one
   that differs is LEFT provisional — the persistent share-sha cache now holds the
   share's hash, and `modelsync.source_kinds` turns that file `outdated` ("the share's
@@ -1935,7 +1947,9 @@ via injected callables, staying hot-reload-safe.
   Check & save, the background confirmations, `remove_source` and the console's
   `save_modelsync_catalog(cat, expect_hash=None)`, which refuses with
   `[CATALOG_STALE]` when `modelsync_catalog_hash()` moved since the form was rendered
-  (the editor's stale-form rule, R-3). Only the NEW entry is validated on a Check &
+  (the editor's stale-form rule, R-3). A Check & save write re-checks under that lock
+  that its check still exists (a remove meanwhile → nothing written: the worker thread
+  is beyond a cancel). Only the NEW entry is validated on a Check &
   save (an unrelated broken entry never blocks it — modelsync drops such entries one by
   one anyway). `test_model_sources.py`.
 - **`ops/`** (not Python — runs on other boxes). Both bootstraps are streamed to the

@@ -1096,7 +1096,7 @@ class LanSource:
     - **one hash at a time**: `sha256 <rel>` reads the whole file over the share host's
       disk; N requests run one after another (`_hash_turn`), and `hash_queue()` shows
       the paths waiting — the overview's "hashing 2 of 5". A LAN transfer's hash goes
-      ahead of every queued `background=True` one (Check & save, model sources M-5): a
+      ahead of every queued `background` one (Check & save, model sources M-5): a
       transfer holds the one LAN stream slot until its hash answers. A background hash
       that already RUNS is not interrupted — the transfer waits for that one file.
 
@@ -1130,7 +1130,8 @@ class LanSource:
         # one hash at a time, TRANSFER hashes first (model sources M-5): a LAN
         # transfer's verification waits behind no queued Check & save hash. `_hash_wait`
         # holds the waiters as (priority, arrival, path, future) — 0 = a transfer's,
-        # 1 = a background (Check & save) one; `_hash_busy` while one runs.
+        # 1 = a Check & save's, 2 = a directory's background confirmation; `_hash_busy`
+        # while one runs.
         self._hash_busy = False
         self._hash_wait: list = []
         self._hash_seq = 0
@@ -1483,7 +1484,7 @@ class LanSource:
         waiting = [t[2] for t in sorted(self._hash_wait) if not t[3].done()]
         return list(dict.fromkeys(head + waiting))
 
-    async def _hash_turn(self, path: str, background: bool) -> None:
+    async def _hash_turn(self, path: str, background) -> None:
         """Wait for THE hash slot (one at a time); a transfer's request (priority 0)
         overtakes every waiting background one, arrival order within a priority."""
         if not self._hash_busy and not any(not t[3].done() for t in self._hash_wait):
@@ -1491,7 +1492,7 @@ class LanSource:
             return
         fut = asyncio.get_running_loop().create_future()
         self._hash_seq += 1
-        ticket = (1 if background else 0, self._hash_seq, path, fut)
+        ticket = (min(max(int(background), 0), 2), self._hash_seq, path, fut)
         self._hash_wait.append(ticket)
         try:
             await fut
@@ -1513,10 +1514,13 @@ class LanSource:
         self._hash_wait = [t for t in self._hash_wait if not t[3].done()]
         self._hash_busy = False
 
-    async def sha256(self, path: str, size: int, background: bool = False) -> str:
+    async def sha256(self, path: str, size: int, background=False) -> str:
         """The share's sha256 of `path` (cached per (path, size), persisted). One hash at
         a time: a second request for the same file waits and takes the first's answer.
-        `background=True` (Check & save) queues behind every waiting transfer hash.
+        `background` is the priority (lower runs first, arrival order within one):
+        False/0 a transfer's, True/1 a Check & save the operator waits for, 2 a
+        directory check's background confirmation — so neither a transfer nor the next
+        Check & save waits behind hours of confirmations (review-3 M-3).
         Every failure is a RuntimeError — an unset or non-plain share host and a path
         with no share mapping included (they are ValueErrors underneath)."""
         raw = self._look()
