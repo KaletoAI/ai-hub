@@ -47,7 +47,9 @@ here guards a failure that looks like a working sync:
 - **The plan** (`plan`, `ready`, `status_text`): present = the destination holds the
   file at the SOURCE's size (the manifest's, where the source does not list it), a
   `.part` never is; `prune` is manifest files only (never a file we did not put there),
-  `unknown` everything else nobody needs — listed, never deleted automatically. A
+  `unknown` everything else nobody needs — listed, never deleted automatically —
+  except what ComfyUI ships itself (`put_*_here` placeholders, empty files, stock
+  `models/configs/*.yaml` under 1 MB), which is neither listed nor deletable. A
   BLOCKED alias fetches nothing (it cannot become ready) but HOLDS the manifest files
   recorded for it (`held`, never pruned) until the block is fixed. An alias is ready only with nothing missing and nothing blocking it; an empty reference
   set without an explicit alias entry is blocked, never "complete".
@@ -588,6 +590,22 @@ def expand_links(prefix: str, links: dict) -> dict:
 # model nor a stranger to delete.
 _PART_SUFFIXES = (".part", ".part.lock", ".part.log")
 
+# What ComfyUI itself ships under models/ is no stranger either: its `put_<x>_here`
+# placeholders (zero bytes, in every model dir), any other empty file, and the stock
+# `models/configs/*.yaml` (a few KB each). Listed, they buried the one real unknown
+# model of a template among 36 of them (2026-10-01). Left out of `unknown` only — they
+# cost nothing, so they are neither listed nor offered for deletion; prune never sees
+# them (it takes manifest files only).
+_STOCK_CONFIG_MAX = 1024 * 1024
+
+
+def _comfy_stock(path: str, size) -> bool:
+    name = path.rsplit("/", 1)[-1]
+    if name.startswith("put_") and name.endswith("_here") or size == 0:
+        return True
+    return (path.startswith("models/configs/") and "/" not in path[len("models/configs/"):]
+            and path.endswith(".yaml") and isinstance(size, int) and size < _STOCK_CONFIG_MAX)
+
 
 @dataclass
 class AliasNeed:
@@ -815,7 +833,8 @@ def plan(needs, source_index: dict, dest_index: dict, manifest: dict, url_catalo
 
     sizes = {p: size_of(p) for p in needed if p not in link_to}
     unknown = [[p, s] for p, s in dest.items()
-               if _usable(p) and not _is_part(p) and p not in man and p not in needed]
+               if _usable(p) and not _is_part(p) and p not in man and p not in needed
+               and not _comfy_stock(p, s)]
     unknown += [[p, 0] for p in dest_links
                 if _usable(p) and p not in man and p not in needed and p not in dest]
     return {

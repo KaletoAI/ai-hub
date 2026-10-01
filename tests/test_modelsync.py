@@ -370,6 +370,34 @@ class Plan(unittest.TestCase):
         p = mk([need("x", [R_VAE])], dest=dest, manifest=manifest)
         self.assertEqual(p["prune"], ["models/vae/gone.safetensors", "models/vae/old.safetensors"])
 
+    def test_comfyui_stock_files_are_no_unknowns(self):
+        """Addendum 2 (thunder-1 on the `comfy-ui` template, 2026-10-01): 36 of 37
+        "unknown files" were ComfyUI's own zero-byte `put_..._here` placeholders and its
+        stock `models/configs/*.yaml` — the one real 2.1 GB model drowned in them. They
+        cost nothing and are ComfyUI's: not listed, so never offered for deletion
+        either (`delete_unknown` judges against this list) and never pruned."""
+        dest = {"models/checkpoints/put_checkpoints_here": 0,
+                "models/vae/put_vae_here": 0,
+                "models/custom/deep/put_anything_here": 0,          # any dir
+                "hf-cache/empty.lock": 0,                           # any 0-byte file
+                "models/configs/v1-inference.yaml": 1_947,
+                "models/configs/anything_v3.yaml": 1_024 * 1024 - 1,
+                "models/configs/huge.yaml": 1_024 * 1024,           # not a stock config
+                "models/other/put_me_here_too.yaml": 5,             # not `put_*_here`
+                "models/checkpoints/v1-5-pruned-emaonly-fp16.safetensors": 2_132_696_762}
+        p = mk([], dest=dest)
+        self.assertEqual(p["unknown"], [
+            ["models/checkpoints/v1-5-pruned-emaonly-fp16.safetensors", 2_132_696_762],
+            ["models/configs/huge.yaml", 1_024 * 1024],
+            ["models/other/put_me_here_too.yaml", 5]])
+        self.assertEqual(p["prune"], [])
+        # the name alone decides for a placeholder (ComfyUI ships them; whatever size)
+        p = mk([], dest={"models/vae/put_vae_here": 12})
+        self.assertEqual(p["unknown"], [])
+        # a 0-byte file a manifest names is still ours to prune (only `unknown` filters)
+        p = mk([], dest={"models/x.bin": 0}, manifest={"models/x.bin": {"size": 0}})
+        self.assertEqual(p["prune"], ["models/x.bin"])
+
     def test_unknown_never_in_prune(self):
         dest = {"models/vae/v.safetensors": 100, "models/vae/old.safetensors": 7,
                 "models/x/stranger.bin": 5, "hf-cache/hub/models--o--r/blobs/abc": 9}
