@@ -3453,6 +3453,88 @@ def _svc_table(k: str, name: str, v: dict) -> str:
             f"{rows}</table>")
 
 
+# The start path as the card's step strip (✓ done · ● current · ○ next) — the host
+# phases a start walks through (hostctl's start(); `restoring` is the create step of a
+# start from a snapshot). Shown only while the host is on that path.
+_START_STEPS = (("creating", "create"), ("connecting", "connect"),
+                ("bootstrapping", "set up"), ("starting", "start services"),
+                ("syncing", "sync models"), ("ready", "ready"))
+# phases of a start before (or in) the bootstrap: `bootstrap_incomplete` is already set
+_BOOTSTRAP_PENDING = ("creating", "restoring", "connecting", "bootstrapping")
+
+
+def _start_steps_html(k: str, phase: str) -> str:
+    """The step strip for a host on the start path, "" otherwise (off, ready, the stop
+    path, failed). Pure server markup — no script, so a later live state needs none."""
+    cur = "creating" if phase == "restoring" else phase
+    order = [p for p, _ in _START_STEPS]
+    if cur not in order or cur == "ready":
+        return ""
+    i = order.index(cur)
+    parts = []
+    for n, (p, label) in enumerate(_START_STEPS):
+        if p == "creating" and phase == "restoring":
+            label = "restore"
+        if n < i:
+            parts.append(f"✓ {label}")
+        elif n == i:
+            parts.append(f"<b>● {label}</b>")
+        else:
+            parts.append(f"<span class=\"muted\">○ {label}</span>")
+    return (f'<div class="tfacts" data-k="{_esc(k)}-steps" aria-label="start progress">'
+            + " → ".join(parts) + "</div>")
+
+
+def _elapsed(s) -> str:
+    """"45 s" / "6 min" / "1 h 05 min" — how long a bootstrap has been running."""
+    s = _nbytes(s)
+    if s < 60:
+        return f"{s} s"
+    if s < 3600:
+        return f"{s // 60} min"
+    return f"{s // 3600} h {s % 3600 // 60:02d} min"
+
+
+def _bootstrap_running_html(k: str, br: dict) -> str:
+    """The running bootstrap/setup (hostctl `bootstrap_running`): what runs, the step of
+    its fixed phase order (the node pack i/N during `nodes`), how long, a bar for the
+    whole script when the phase is a known one, and the log's last line. Every value
+    escaped (the line comes from the instance); no script."""
+    which = br.get("which")
+    phase = str(br.get("phase") or "starting")
+    if which == "comfyui":
+        head = "Setting up ComfyUI on the instance"
+        note = (" (usually 15–30 min on the first start; do not stop it, a stop throws "
+                "the half-done setup away)")
+    elif which == "host":
+        head, note = "Preparing the instance", ""
+    else:
+        head, note = f"Running the setup script of {br.get('service') or 'a service'}", ""
+    step, steps = br.get("step"), br.get("steps")
+    if isinstance(step, int) and isinstance(steps, int):
+        pos = f"step {step}/{steps} {phase}"
+        nd, nt = br.get("nodes_done"), br.get("nodes_total")
+        if isinstance(nd, int) and isinstance(nt, int) and nt:
+            pos += f" {nd}/{nt}"
+    else:
+        pos = f"phase {phase}"
+    text = f"{head} — {pos} · {_elapsed(br.get('elapsed_s'))}{note}"
+    out = [f'<p class="hint" style="margin:4px 0 2px">⏳ {_esc(text)}</p>']
+    frac = br.get("fraction")
+    if isinstance(frac, (int, float)) and not isinstance(frac, bool):
+        pct = max(0, min(100, int(frac * 100)))
+        out.append(
+            f'<div role="progressbar" aria-valuemin="0" aria-valuemax="100" '
+            f'aria-valuenow="{pct}" style="max-width:520px;height:8px;'
+            f'background:var(--line-2);border-radius:4px;overflow:hidden">'
+            f'<div style="width:{pct}%;height:8px;background:var(--link)"></div></div>')
+    line = br.get("line")
+    if line:
+        out.append(f'<p class="muted" style="margin:2px 0 0;white-space:nowrap;'
+                   f'overflow:hidden;text-overflow:ellipsis">{_esc(line)}</p>')
+    return f'<div data-k="{_esc(k)}-bsrun">' + "".join(out) + "</div>"
+
+
 def _host_card(name: str, v: dict) -> str:
     """One managed host's lifecycle card: phase, cost, snapshot, the service table, the
     model sync, the log. Every row carries a `data-k` (the live morph matches by key),
@@ -3466,6 +3548,9 @@ def _host_card(name: str, v: dict) -> str:
                            _HOST_PHASE_KIND.get(phase, "warn"))
             + (" " + _badge(f"⏳ {op}", "warn", "operation in flight") if op else ""))
     rows = [f'<div class="item-title" data-k="{_esc(k)}-head">{head}</div>']
+    steps = _start_steps_html(k, phase)
+    if steps:
+        rows.append(steps)
     if v.get("long_running"):
         rows.append(f'<p class="bad" data-k="{_esc(k)}-longrun">⚠ '
                     f"{_esc(_host_longrun_text(name, v))} — stop it if nothing needs it.</p>")
@@ -3529,9 +3614,18 @@ def _host_card(name: str, v: dict) -> str:
     else:
         rows.append(f'<div class="tfacts" data-k="{_esc(k)}-snap">no snapshot yet — the '
                     "first start bootstraps from the template</div>")
-    if v.get("bootstrap_incomplete"):
-        rows.append(f'<p class="bad" data-k="{_esc(k)}-bsinc">The last bootstrap did not '
-                    "finish — a snapshot of this instance is not a known-good template.</p>")
+    br = v.get("bootstrap_running")
+    if isinstance(br, dict):
+        # a bootstrap/setup RUNS: how far, not a red "did not finish" (thunder-1,
+        # 2026-10-01: read as "stuck", and a Stop there throws the half-done install away)
+        rows.append(_bootstrap_running_html(k, br))
+    elif v.get("bootstrap_incomplete") and not (op and phase in _BOOTSTRAP_PENDING):
+        # the flag is set when the ComfyUI bootstrap BEGINS (and already at a start's
+        # create): only with nothing running — and no start on its way to it — is it news
+        rows.append(f'<p class="bad" data-k="{_esc(k)}-bsinc">The ComfyUI setup did not '
+                    "finish (interrupted or failed) — Re-run setup on the ComfyUI service, "
+                    "or Stop: a snapshot of this state is marked incomplete and the next "
+                    "start sets it up again.</p>")
     uu = [str(x) for x in (v.get("unreconciled_uuids") or [])]
     if uu:
         rows.append(f'<p class="bad" data-k="{_esc(k)}-unrec">Instances seen while the stored '

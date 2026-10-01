@@ -2489,5 +2489,127 @@ class ForeignInstances(_Base):
         self.assertNotIn("delete?", row)
 
 
+
+def _bsrun(**over) -> dict:
+    """A controller's `bootstrap_running` (hostctl.Controller._bootstrap_running_view)."""
+    d = {"which": "comfyui", "service": "", "since": 1, "elapsed_s": 372, "phase": "venv",
+         "line": "Collecting torch==2.11.0", "step": 4, "steps": 9,
+         "fraction": 3 / 9, "nodes_done": None, "nodes_total": None}
+    d.update(over)
+    return d
+
+
+class BootstrapProgressCard(_Base):
+    """Task 2 (thunder-1, 2026-10-01): a normal first-start bootstrap showed a red "did
+    not finish" and nothing that moved for 20 minutes — read as "stuck", and a Stop
+    there throws the half-done install away. The card says what is true and how far."""
+
+    def _card(self, **over):
+        self.views = {"tc": _view(**over)}
+        return self.page()
+
+    def _keyed(self, html, key):
+        """The element keyed `key`, up to the next keyed sibling of the card."""
+        i = html.find(f'data-k="{key}"')
+        if i < 0:
+            return ""
+        i = html.rfind("<", 0, i)
+        j = html.find('data-k="host-tc-', i + len(key) + 10)
+        while j >= 0 and html.startswith(f'data-k="{key}-', j):
+            j = html.find('data-k="host-tc-', j + 1)
+        return html[i:j if j >= 0 else len(html)]
+
+    def test_running_shows_info_not_the_red_note(self):
+        html = self._card(phase="bootstrapping", op="starting", bootstrap_incomplete=True,
+                          bootstrap_running=_bsrun())
+        self.assertNotIn('data-k="host-tc-bsinc"', html)
+        self.assertNotIn("did not finish", html)
+        run = self._keyed(html, "host-tc-bsrun")
+        self.assertIn("Setting up ComfyUI on the instance — step 4/9 venv · 6 min "
+                      "(usually 15–30 min on the first start; do not stop it, a stop "
+                      "throws the half-done setup away)", run)
+        self.assertNotIn('class="bad"', run)
+        self.assertIn("Collecting torch==2.11.0", run)        # the last log line
+        self.assertIn('style="width:33%', run)                # the bar: 3 of 9 phases
+        self.assertNotIn("<script", run)
+
+    def test_nodes_phase_counts_packs(self):
+        html = self._card(phase="bootstrapping", op="starting", bootstrap_running=_bsrun(
+            phase="nodes", step=5, steps=9, nodes_done=5, nodes_total=14,
+            fraction=(4 + 4 / 14) / 9, elapsed_s=545, line="node p5 @ abc"))
+        run = self._keyed(html, "host-tc-bsrun")
+        self.assertIn("step 5/9 nodes 5/14 · 9 min", run)
+        self.assertIn('style="width:47%', run)
+
+    def test_unknown_phase_text_without_bar(self):
+        html = self._card(phase="bootstrapping", op="starting", bootstrap_running=_bsrun(
+            phase="starting", step=None, steps=None, fraction=None, elapsed_s=45, line=""))
+        run = self._keyed(html, "host-tc-bsrun")
+        self.assertIn("Setting up ComfyUI on the instance — phase starting · 45 s", run)
+        self.assertNotIn("width:", run)
+
+    def test_host_bootstrap_and_service_setup_texts(self):
+        html = self._card(phase="bootstrapping", op="starting", bootstrap_running=_bsrun(
+            which="host", phase="autostart", step=2, steps=4, fraction=0.25, elapsed_s=30))
+        run = self._keyed(html, "host-tc-bsrun")
+        self.assertIn("Preparing the instance — step 2/4 autostart · 30 s", run)
+        self.assertNotIn("15–30 min", run)
+        html = self._card(phase="ready", op="updating services", bootstrap_running=_bsrun(
+            which="service", service="openai:<v>", phase="starting", step=None, steps=None,
+            fraction=None, elapsed_s=3700, line="pip <install>"))
+        run = self._keyed(html, "host-tc-bsrun")
+        self.assertIn("Running the setup script of openai:&lt;v&gt; — phase starting · "
+                      "1 h 01 min", run)
+        self.assertIn("pip &lt;install&gt;", run)
+        self.assertNotIn("pip <install>", html)
+
+    def test_incomplete_and_idle_is_the_reworded_red_note(self):
+        html = self._card(phase="ready", bootstrap_incomplete=True)
+        note = self._keyed(html, "host-tc-bsinc")
+        self.assertIn('class="bad"', note)
+        self.assertIn("The ComfyUI setup did not finish (interrupted or failed) — Re-run "
+                      "setup on the ComfyUI service, or Stop: a snapshot of this state is "
+                      "marked incomplete and the next start sets it up again.", note)
+        self.assertNotIn("host-tc-bsrun", html)
+        # a start on its way to the bootstrap (the flag is set before the create) is no
+        # failure either — the step strip says where it is
+        html = self._card(phase="connecting", op="starting", bootstrap_incomplete=True)
+        self.assertNotIn("host-tc-bsinc", html)
+        # a failed start keeps it: nothing runs any more
+        html = self._card(phase="failed", failed_phase="bootstrapping",
+                          bootstrap_incomplete=True, uuid="u1")
+        self.assertIn("host-tc-bsinc", html)
+
+    def test_neither_shows_nothing(self):
+        html = self._card(phase="ready")
+        self.assertNotIn("host-tc-bsinc", html)
+        self.assertNotIn("host-tc-bsrun", html)
+        self.assertNotIn("host-tc-steps", html)
+
+    def test_start_step_strip(self):
+        def strip(phase):
+            html = self._card(phase=phase, op="starting")
+            return self._keyed(html, "host-tc-steps")
+        s = strip("bootstrapping")
+        self.assertIn("✓ create", s)
+        self.assertIn("✓ connect", s)
+        self.assertIn("<b>● set up</b>", s)
+        self.assertIn("○ start services", s)
+        self.assertIn("○ sync models", s)
+        self.assertIn("○ ready", s)
+        s = strip("creating")
+        self.assertIn("<b>● create</b>", s)
+        self.assertIn("○ connect", s)
+        s = strip("restoring")                        # a restore is the create step
+        self.assertIn("<b>● restore</b>", s)
+        self.assertNotIn("create", s)
+        s = strip("syncing")
+        self.assertIn("✓ start services", s)
+        self.assertIn("<b>● sync models</b>", s)
+        for phase in ("off", "ready", "draining", "snapshotting", "failed"):
+            self.assertEqual(strip(phase), "", phase)
+        self.assertNotIn("<script", strip("starting"))
+
+
 if __name__ == "__main__":
     unittest.main()
