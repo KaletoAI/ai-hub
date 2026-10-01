@@ -4883,12 +4883,29 @@ class Controller:
             if n is None and isinstance(man.get(path), dict):
                 n = man[path].get("size")
             return n if isinstance(n, int) and not isinstance(n, bool) else None
+        # each file's source as THIS plan decided it (the card's badge): the url
+        # catalog the plan was handed — fallbacks already filtered out — names it `url`
+        # (`origin` hf-auto | catalog), a link is a `link`, everything else `lan`
+        urls = (self._plan_inputs or (None,) * 5)[4] or {}
+
+        def with_source(f):
+            f = dict(f)
+            if f.get("link") is not None:
+                f["source"] = "link"
+            elif f.get("path") in urls:
+                f["source"] = "url"
+                u = urls[f["path"]]
+                f["origin"] = ("hf-auto" if isinstance(u, dict) and u.get("origin") == "hf-auto"
+                               else "catalog")
+            else:
+                f["source"] = "lan"
+            return f
         return {
             "aliases": {a: {"ready": a in self.ready_aliases, "need_bytes": r["need_bytes"],
                             "have_bytes": r["have_bytes"], "missing": len(r["missing"]),
                             "blocked": list(r["blocked"]), "hints": list(r["hints"]),
                             "held": held.get(a, 0), "selectable": list(r["selectable"]),
-                            "files": [dict(f) for f in r["files"]]}
+                            "files": [with_source(f) for f in r["files"]]}
                         for a, r in p["per_alias"].items()},
             "fetch": [{k: e[k] for k in ("path", "size", "source", "aliases")}
                       for e in p["fetch"]],

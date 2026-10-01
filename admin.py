@@ -226,7 +226,24 @@ _thunder_default_nodes: Callable[[], str] = lambda: ""
 # The model-sync catalog setting: the current list, and a save that answers the
 # validator's refusals ([] = saved).
 _modelsync_catalog: Callable[[], list] = lambda: []
-_save_modelsync_catalog: Callable[[list], list] = lambda cat: ["catalog store not available"]
+_save_modelsync_catalog: Callable = lambda cat, expect_hash=None: ["catalog store not available"]
+# The editor's stale-form guard (R-3): the hash of a catalog (main.modelsync_catalog_hash
+# — the editor renders the hash of the very list it shows), the refusal text a Save gets
+# when the stored catalog changed since, and whether a Check & save still runs (it may
+# write the catalog again — the refusal says so).
+_modelsync_catalog_hash: Callable = lambda cat=None: ""
+_catalog_stale: str = ("the catalog changed since this form was opened — your text is "
+                       "kept below; merge and save again")
+_source_checks_pending: Callable[[], bool] = lambda: False
+# Model sources (main): the overview (async → dict: rows + the live parts, built in a
+# worker thread and memoised), the card's per-path source kinds (BLOCKING — call it
+# through asyncio.to_thread) and the three actions (async → banner text).
+# remove_source cancels asyncio tasks: AWAIT it on the loop, never in a thread.
+_model_sources: Callable = None
+_model_source_kinds: Callable[[], dict] = lambda: {}
+_check_source: Callable = None
+_check_dir_source: Callable = None
+_remove_source: Callable = None
 # The LAN model source (main.modelsrc*): its view (hostctl.LanSource.view — no
 # network), "Fetch host key" (async → message), "Confirm fingerprint" (async
 # (fingerprint) → message) and "List now" (async → message; lists the share by ssh).
@@ -442,6 +459,11 @@ fieldset.tblock>legend{font-size:11px;text-transform:uppercase;letter-spacing:.6
 .tcard .tsync{margin:8px 0;font-size:13px}
 .tcard .tsync details{margin:6px 0}
 .tcard pre.tlog{white-space:pre-wrap;word-break:break-word;background:var(--input);border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin:6px 0;max-height:320px;overflow:auto;font:12px/1.45 ui-monospace,monospace}
+/* Server → Models → Model sources: a fill-in worklist (URL inputs per row) */
+.msrc form.msrc-act{display:flex;flex-wrap:wrap;gap:4px;align-items:center;margin:2px 0}
+.msrc form.msrc-act input[type=text]{min-width:180px;flex:1}
+.msrc code.msrc-url{word-break:break-all}
+.msrc .msrc-note{color:var(--dim);font-size:12px}
 /* Phone / narrow window. Desktop keeps <main> as the scroll container (the fixed
    header + subnav never scroll, see _SCROLL_JS); below 800 px the whole PAGE scrolls
    instead, the master-detail columns stack, a field's label sits above its control,
@@ -954,6 +976,9 @@ _POST_ACTIONS = frozenset((
     "/ui/hosts/managed/catalog",
     "/ui/hosts/managed/modelsrc-scan", "/ui/hosts/managed/modelsrc-pin",
     "/ui/hosts/managed/modelsrc-list", "/ui/hosts/managed/modelsrc-host",
+    # Server → Models → Model sources (Check & save of a URL or a repo, remove)
+    "/ui/hosts/managed/source-check", "/ui/hosts/managed/source-check-dir",
+    "/ui/hosts/managed/source-remove",
     "/ui/chat/badd", "/ui/chat/bdel", "/ui/chat/delete",
     "/ui/mapping/field-add", "/ui/mapping/field-map", "/ui/mapping/field-clear",
     "/ui/mapping/field-del", "/ui/mapping/cand-add", "/ui/mapping/cand-del",
@@ -2390,6 +2415,16 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
     items = items or "<p class='muted'>No backends.</p>"
     scan_st = _scan_status()
     tviews = _host_views()
+    if any(isinstance(v.get("plan"), dict) for _n, v in tviews):
+        # the card's source badges: main's source kinds (memoised there; the first
+        # build is a pass over the share listing — a worker thread, never the loop)
+        try:
+            kinds = await asyncio.to_thread(_model_source_kinds)
+        except Exception as e:                          # noqa: BLE001 — badges, not the tab
+            logger.warning(f"ui: model source kinds unavailable: {type(e).__name__}: {e}")
+            kinds = {}
+        for _n, v in tviews:
+            v["_src_kinds"] = kinds if isinstance(kinds, dict) else {}
     # what a console action answered (the host buttons redirect here with it) — a
     # refusal raised before the op's first await only ever shows up here
     msg = (qp.get("msg", "") or "")[:600]
@@ -3278,13 +3313,37 @@ def _sync_notes(r: dict) -> str:
     return "<br>".join(notes)
 
 
-def _sync_files_row(alias: str, files) -> str:
+def _card_src_badge(f: dict, kinds: dict, fallback: dict) -> str:
+    """Where this host's plan gets one file — the overview's badge vocabulary: `URL
+    failed — LAN` (a URL ended final on this controller, the share's copy syncs), the
+    plan's own `source` (`url` → `HF auto` / `URL ✓` by its `origin`), `outdated` (the
+    plan syncs the share's copy because the catalog entry no longer matches — known from
+    main's source kinds), else `LAN`. A link has no source of its own."""
+    if f.get("link"):
+        return ""
+    p = f.get("path")
+    if p in fallback:
+        return _badge("URL failed — LAN", "bad", str(fallback.get(p) or ""))
+    info = kinds.get(p) if isinstance(kinds.get(p), dict) else {}
+    src = f.get("source")
+    if src == "url" or (src is None and info.get("kind") in ("url", "hf-auto")):
+        hf = (f.get("origin") == "hf-auto") if src == "url" else info.get("kind") == "hf-auto"
+        return _badge("HF auto", "ok") if hf else _badge("URL ✓", "ok")
+    if info.get("kind") == "outdated":
+        return _badge("outdated", "warn", str(info.get("reason") or ""))
+    return _badge("LAN", "muted")
+
+
+def _sync_files_row(alias: str, files, kinds=None, fallback=None) -> str:
     """The expandable per-file rows of one alias: path · size · node <id> (<cls>) ·
-    present. `node` names the loader that needs the file — the one to `bypass` on this
-    candidate when a switch leaves it unused (spec "Doppelte Loader-Zweige")."""
+    present · source (`_card_src_badge`). `node` names the loader that needs the file —
+    the one to `bypass` on this candidate when a switch leaves it unused (spec
+    "Doppelte Loader-Zweige")."""
     fs = [f for f in (files if isinstance(files, list) else []) if isinstance(f, dict)]
     if not fs:
         return ""
+    kinds = kinds if isinstance(kinds, dict) else {}
+    fallback = fallback if isinstance(fallback, dict) else {}
     rows = ""
     for f in fs:
         size = f.get("size")
@@ -3295,10 +3354,12 @@ def _sync_files_row(alias: str, files) -> str:
                  + (f"link → <code>{_esc(f['link'])}</code>" if f.get("link")
                     else f"{_gb1(size)} GB" if size is not None else "size unknown")
                  + "</td>"
-                 f"<td>{node}</td><td>{'✓ present' if f.get('present') else 'missing'}</td></tr>")
+                 f"<td>{node}</td><td>{'✓ present' if f.get('present') else 'missing'}</td>"
+                 f"<td>{_card_src_badge(f, kinds, fallback)}</td></tr>")
     return (f'<tr data-k="ms-{_esc(alias)}-files"><td colspan="6"><details><summary>'
             f"{len(fs)} file{'s' if len(fs) != 1 else ''}</summary><table><tr><th>file</th>"
-            f"<th>size</th><th>needed by</th><th></th></tr>{rows}</table></details></td></tr>")
+            f"<th>size</th><th>needed by</th><th></th><th>source</th></tr>{rows}</table>"
+            "</details></td></tr>")
 
 
 def _host_sync(k: str, name: str, v: dict) -> str:
@@ -3329,7 +3390,8 @@ def _host_sync(k: str, name: str, v: dict) -> str:
                      f'<td data-sv="{need}">{_gb1(need)}</td><td data-sv="{have}">{_gb1(have)}</td>'
                      f'<td data-sv="{max(0, need - have)}">{_gb1(max(0, need - have))}</td>'
                      f"<td>{_sync_status(r)}</td><td>{_sync_notes(r)}</td></tr>"
-                     + _sync_files_row(a, r.get("files")))
+                     + _sync_files_row(a, r.get("files"), v.get("_src_kinds"),
+                                       v.get("url_fallback")))
         out.append(f'<table data-k="{_esc(k)}-aliases"><tr><th>alias</th><th>need GB</th>'
                    "<th>have GB</th><th>missing GB</th><th>status</th><th>notes</th></tr>"
                    f"{rows}</table>")
@@ -3807,13 +3869,30 @@ def _host_card(name: str, v: dict) -> str:
     return f'<div class="tcard" data-k="{_esc(k)}">{"".join(rows)}</div>'
 
 
+def _catalog_hash_of(cat=None) -> str:
+    """main.modelsync_catalog_hash of `cat` (None = the stored catalog); "" when it
+    cannot be computed — a form with "" is refused as stale by main, never saved blind."""
+    try:
+        return str(_modelsync_catalog_hash(cat) or "")
+    except Exception as e:                              # noqa: BLE001 — a field, not the tab
+        logger.warning(f"ui: catalog hash unavailable: {type(e).__name__}: {e}")
+        return ""
+
+
 def _catalog_editor(refused: Optional[tuple] = None) -> str:
     """The model-sync catalog (setting `modelsync_catalog`, one for every managed host's
-    ComfyUI) as a JSON textarea. `refused` = (text as typed, [reasons]): a Save the
-    validator turned down comes back open, with the text exactly as typed. The HF token
-    the catalog's gated downloads need lives in Server → API Keys."""
+    ComfyUI) as a JSON textarea. `refused` = (text as typed, [reasons], hash): a Save
+    turned down comes back open, with the text exactly as typed and the hash the next
+    Save is judged against. The HF token the catalog's gated downloads need lives in
+    Server → API Keys.
+
+    Two writers share the setting (Check & save; this editor), so the form carries the
+    hash of the catalog it was rendered from (`catalog_hash`, from the SAME list it
+    shows) and a Save is refused while the stored one differs (R-3). The form sits under
+    `data-live-skip`: the section is live while a check runs, and the morph must never
+    swap that hidden hash under a kept, edited textarea."""
     if refused is not None:
-        text, errs = refused
+        text, errs, h = refused
         n = "?"
     else:
         try:
@@ -3822,12 +3901,14 @@ def _catalog_editor(refused: Optional[tuple] = None) -> str:
             logger.warning(f"ui: model-sync catalog unreadable: {type(e).__name__}: {e}")
             cat = []
         text, errs = json.dumps(cat, indent=1, ensure_ascii=False), []
+        h = _catalog_hash_of(cat)
         n = str(len(cat)) if isinstance(cat, list) else "?"
     err = "".join(_form_err(e) for e in errs[:30])
     opened = refused is not None
     return (f'<details class="optblock" data-k="hosts-catalog"{" open" if opened else ""}>'
             f"<summary>Model-sync catalog ({n} entries)</summary>"
-            '<form method="post" action="/ui/hosts/managed/catalog" data-guard>' + err
+            '<form method="post" action="/ui/hosts/managed/catalog" data-guard data-live-skip>'
+            + err + f'<input type="hidden" name="catalog_hash" value="{_esc(h)}">'
             + "<p class='hint'>What no workflow names, for every managed host's ComfyUI. "
             "Entries: "
             "<code>{\"match\": {\"class\": …, \"value\": …}, \"paths\": […]}</code> "
@@ -4370,17 +4451,33 @@ async def hosts_catalog_save(request: Request):
     typo'd key would otherwise be dropped silently and its alias stay blocked."""
     f = await _form(request)
     text = f.get("catalog", "")
+    # the hash the form was rendered with (R-3); a POST without the field (a script,
+    # not this form) is not judged — the form always carries it
+    h = f.get("catalog_hash")
     try:
         cat = json.loads(text)
     except ValueError as e:
         errs = [f"catalog is not valid JSON: {e}"]
     else:
         try:
-            errs = list(_save_modelsync_catalog(cat) or [])
+            # on the loop on purpose: main takes a threading lock held only around a
+            # store read+write (ms), and the AST guard of test_ui_post_only must see it
+            errs = list(_save_modelsync_catalog(cat, expect_hash=h) or [])
         except Exception as e:                          # noqa: BLE001 — refused, not a 500
             errs = [f"catalog not saved: {type(e).__name__}: {e}"]
     if errs:
-        return _server_view(request, "models", status=400, catalog_refused=(text, errs))
+        if _catalog_stale in errs:
+            # the text stays as typed; the form now carries the CURRENT hash, so the
+            # merged text saves next time — and says when a check may write again
+            h = _catalog_hash_of()
+            try:
+                busy = bool(_source_checks_pending())
+            except Exception:                           # noqa: BLE001 — a note only
+                busy = False
+            if busy:
+                errs = errs + ["a Check & save is still running and may change the catalog "
+                               "again — wait until Model sources shows it finished"]
+        return await _models_view(request, status=400, catalog_refused=(text, errs, h or ""))
     logger.info(f"ui: model-sync catalog saved ({len(cat)} entries)")
     return _models_msg(f"model-sync catalog saved ({len(cat)} entries)")
 
@@ -4397,11 +4494,58 @@ async def hosts_modelsrc_host(request: Request):
     except Exception as e:                              # noqa: BLE001 — refused, not a 500
         err = f"modelsrc_host not saved: {type(e).__name__}: {e}"
     if err:
-        return _server_view(request, "models", status=400, modelsrc_refused=(v, err))
+        return await _models_view(request, status=400, modelsrc_refused=(v, err))
     msg = (f"modelsrc_host saved: {v.strip()} — fetch and confirm its host key, then "
            "List now" if v.strip()
            else "modelsrc_host cleared — no LAN source is configured")
     logger.info(f"ui: {msg}")
+    return _models_msg(msg)
+
+
+async def hosts_source_check(request: Request):
+    """Model sources: Check & save a public URL for one share file (main.check_source —
+    queued, one check at a time; the section follows it live). The answer is the banner
+    on Server → Models; the URL itself is never logged (it may carry a token)."""
+    f = await _form(request)
+    path, url = (f.get("path") or "").strip(), (f.get("url") or "").strip()
+    if _check_source is None:
+        return _models_msg("model sources are not available here")
+    try:
+        msg = str(await _check_source(path, url))
+    except Exception as e:                              # noqa: BLE001 — say it, don't 500
+        msg = f"not checked: {type(e).__name__}"
+    logger.info(f"ui: source check {path!r} → {msg}")
+    return _models_msg(msg)
+
+
+async def hosts_source_check_dir(request: Request):
+    """Model sources: Check & save a Hugging Face repo for a share directory
+    (main.check_dir_source — every file under it checked by size)."""
+    f = await _form(request)
+    d, repo = (f.get("dir") or "").strip(), (f.get("repo") or "").strip()
+    if _check_dir_source is None:
+        return _models_msg("model sources are not available here")
+    try:
+        msg = str(await _check_dir_source(d, repo))
+    except Exception as e:                              # noqa: BLE001 — say it, don't 500
+        msg = f"not checked: {type(e).__name__}"
+    logger.info(f"ui: source check {d!r} ← {repo!r} → {msg}")
+    return _models_msg(msg)
+
+
+async def hosts_source_remove(request: Request):
+    """Model sources: remove a file's or a directory's catalog source (and a check of
+    it still waiting). main.remove_source cancels asyncio tasks — awaited HERE, on the
+    loop, never in a thread."""
+    f = await _form(request)
+    key = (f.get("key") or request.query_params.get("key") or "").strip()
+    if _remove_source is None:
+        return _models_msg("model sources are not available here")
+    try:
+        msg = str(await _remove_source(key))
+    except Exception as e:                              # noqa: BLE001 — say it, don't 500
+        msg = f"not removed: {type(e).__name__}"
+    logger.info(f"ui: source remove {key!r} → {msg}")
     return _models_msg(msg)
 
 
@@ -9781,24 +9925,356 @@ def _srv_keys_body(st: dict, key_errs: Optional[dict] = None,
             "tab.</p>")
 
 
+# ── Server → Models → "Model sources" ─────────────────────────────────────────────
+# One row per NEEDED file (main.model_sources_overview): where an instance gets it —
+# a public URL (fast, downloaded ON the instance) or only the LAN share (through this
+# gateway's uplink). A fill-in worklist: the big LAN-only files first, each with a URL
+# input whose Check & save verifies the URL against the share before the catalog gets
+# the entry. URLs are TEXT, never links (a catalog URL may carry a query token, and a
+# click would hand the operator's browser to whatever it names).
+_MSRC_SMALL = 1_000_000                     # LAN-only files below this collapse per dir
+# filter values → label, in the order the table sorts them
+_MSRC_CATS = (("lan", "LAN only"), ("outdated", "outdated"), ("failed", "URL failed"),
+              ("url", "URL ✓"), ("hf", "HF auto"))
+_MSRC_ORDER = {"lan": 0, "outdated": 1, "failed": 2, "url": 3, "hf": 3}
+_MSRC_PENDING = ("queued", "heading", "hashing")
+
+
+def _msrc_cat(row: dict, fallback: dict) -> str:
+    """The row's display source: a public source whose URL failed on an instance this
+    session reads `failed` (the share's copy synced instead) — whatever the catalog says."""
+    kind = row.get("kind")
+    if kind in ("url", "hf-auto") and row.get("path") in fallback:
+        return "failed"
+    return {"url": "url", "hf-auto": "hf", "outdated": "outdated"}.get(kind, "lan")
+
+
+def _msrc_size(n) -> str:
+    if not isinstance(n, int) or isinstance(n, bool):
+        return "?"
+    if n >= 10 ** 9:
+        return f"{n / 1e9:.1f} GB"
+    if n >= 10 ** 6:
+        return f"{n / 1e6:.1f} MB"
+    return f"{n / 1e3:.0f} kB" if n >= 10 ** 3 else f"{n} B"
+
+
+def _msrc_badge(row: dict, cat: str, fallback: dict) -> str:
+    if cat == "failed":
+        return _badge("URL failed this session — LAN", "bad",
+                      str(fallback.get(row.get("path")) or ""))
+    if cat == "outdated":
+        return _badge("outdated — re-check", "warn", str(row.get("reason") or ""))
+    if cat == "hf":
+        return _badge("HF auto", "ok", "derived from the share's Hugging Face cache path")
+    if cat == "url":
+        if row.get("verified") == "size":
+            return _badge("URL ✓ size only", "ok", "size-verified only: the URL named no "
+                          "sha256 — the instance checks the share's sha256 after the download")
+        if row.get("provisional"):
+            return _badge("URL ✓", "ok", "sha256 is Hugging Face's — the share's own hash "
+                          "is still pending")
+        return _badge("URL ✓", "ok")
+    return _badge("LAN only", "warn", "only the LAN share has it: it streams through "
+                  "this gateway's uplink")
+
+
+def _msrc_parent(path: str) -> str:
+    return path.rsplit("/", 1)[0] + "/" if "/" in path else ""
+
+
+def _msrc_items(rows: list, fallback: dict) -> list:
+    """The table in display order: `("row", row, cat)` and `("small", dir, [rows])` — two
+    or more LAN-only files under 1 MB in one directory collapse into one line (configs
+    and `refs/main` are noise in a fill-in worklist). LAN only (largest first), then
+    outdated, failed, public."""
+    cats = [(r, _msrc_cat(r, fallback)) for r in rows]
+    small: dict = {}
+    for r, c in cats:
+        n = r.get("size")
+        if c == "lan" and isinstance(n, int) and not isinstance(n, bool) and n < _MSRC_SMALL:
+            small.setdefault(_msrc_parent(r["path"]), []).append(r)
+    small = {d: rs for d, rs in small.items() if len(rs) >= 2}
+    gone = {r["path"] for rs in small.values() for r in rs}
+    items = [((_MSRC_ORDER[c], -(r.get("size") or 0), r["path"]), ("row", r, c))
+             for r, c in cats if r["path"] not in gone]
+    items += [((0, -sum(r.get("size") or 0 for r in rs), d), ("small", d, rs))
+              for d, rs in small.items()]
+    return [it for _k, it in sorted(items, key=lambda x: x[0])]
+
+
+def _msrc_summary(rows: list, fallback: dict) -> str:
+    """"N files · X GB public (HF auto Y GB · URL Z GB) · W GB LAN only · V GB
+    outdated" — a failed URL synced the share's copy, so it counts as LAN only."""
+    tot = {c: 0 for c, _l in _MSRC_CATS}
+    for r in rows:
+        n = r.get("size")
+        tot[_msrc_cat(r, fallback)] += n if isinstance(n, int) and not isinstance(n, bool) else 0
+    g = lambda n: f"{n / 1e9:.1f}"          # noqa: E731
+    out = (f"{len(rows)} file{'s' if len(rows) != 1 else ''} · "
+           f"{g(tot['url'] + tot['hf'])} GB public (HF auto {g(tot['hf'])} GB · URL "
+           f"{g(tot['url'])} GB) · {g(tot['lan'] + tot['failed'])} GB LAN only · "
+           f"{g(tot['outdated'])} GB outdated")
+    if tot["failed"]:
+        out += f" (LAN only includes {g(tot['failed'])} GB whose URL failed this session)"
+    return out
+
+
+def _msrc_chip(st) -> str:
+    """One Check & save's state, for its row / directory form."""
+    if not isinstance(st, dict):
+        return ""
+    state = str(st.get("state") or "")
+    if state in _MSRC_PENDING:
+        prog = f" {st['progress']}" if st.get("progress") else ""
+        return _badge(f"checking: {state}{prog}"[:120], "warn")
+    if state == "done":
+        return _badge("checked ✓", "ok", str(st.get("note") or ""))
+    if state == "refused":
+        return (_badge("refused", "bad") + f' <span class="msrc-note">'
+                f"{_esc(str(st.get('reason') or '')[:300])}</span>")
+    return ""
+
+
+def _msrc_check_form(path: str, url: str = "") -> str:
+    """URL input + Check & save for one share file (POST; the answer lands on ?sub=models)."""
+    return ('<form method="post" action="/ui/hosts/managed/source-check" class="msrc-act">'
+            f'<input type="hidden" name="path" value="{_esc(path)}">'
+            f'<input type="text" name="url" value="{_esc(url)}" placeholder="https://…" '
+            f'aria-label="public URL of {_esc(path)}">'
+            + _btn("Check & save", submit=True, sm=True,
+                   title="HEAD the URL and compare it with the share's file before saving")
+            + "</form>")
+
+
+def _msrc_dir_form(d: str, repo: str, n: int, chip: str) -> str:
+    """"Repo for this directory": one Hugging Face repo for every file under `d` (a dir
+    entry, every file checked by size). The directory is editable — the repo's root may
+    sit higher than the folder these files are in."""
+    return ('<form method="post" action="/ui/hosts/managed/source-check-dir" class="msrc-act">'
+            f'<input type="text" name="dir" value="{_esc(d)}" aria-label="share directory">'
+            f'<input type="text" name="repo" value="{_esc(repo)}" placeholder="org/name" '
+            f'aria-label="Hugging Face repo for {_esc(d)}">'
+            + _btn("Check & save directory", submit=True, sm=True,
+                   title=f"every file under the directory ({n} LAN-only here) checked "
+                         "against the repo at its current commit")
+            + f"</form>{chip}")
+
+
+def _msrc_remove(row: dict) -> str:
+    key = str(row.get("entry_key") or "")
+    if not key:
+        return ""
+    what = (f"the directory source {key} (every file under it then syncs from the LAN "
+            "share again)" if key.endswith("/") else
+            f"the public URL of {key} (it then syncs from the LAN share again)")
+    return _btn("remove", f"/ui/hosts/managed/source-remove?key={_q(key)}", "secondary",
+                sm=True, confirm=f"Remove {what}?", title="Remove this catalog source")
+
+
+def _msrc_aliases(pairs) -> str:
+    out = []
+    for p in pairs if isinstance(pairs, list) else []:
+        if not (isinstance(p, (list, tuple)) and len(p) == 2):
+            continue
+        a, why = str(p[0]), str(p[1] or "")
+        out.append(f'<span class="bad" title="{_esc(why)}">{_esc(a)} (blocked)</span>'
+                   if why else _esc(a))
+    return ", ".join(out) or "—"
+
+
+def _msrc_notes(row: dict, cat: str) -> str:
+    notes = []
+    if cat == "outdated" and row.get("reason"):
+        notes.append(str(row["reason"]))
+    if row.get("outdated_entry"):
+        notes.append(f"a catalog entry for it is outdated: {row['outdated_entry']}")
+    if row.get("dir_entry"):
+        notes.append(f"not in the checked directory {row['dir_entry']} (added after its "
+                     "check) — re-check the directory")
+    if not row.get("in_share"):
+        notes.append("not on the LAN share")
+    return "".join(f'<div class="msrc-note">{_esc(n)}</div>' for n in notes)
+
+
+def _model_sources_block(ov, show) -> str:
+    """The "Model sources" section (spec "The overview"). `ov` = main's overview (None =
+    not bound, `{"error"}` = it failed), `show` = the filter's categories (None = all).
+    Live (`data-live`, set by the caller) only while a check or a share hash runs;
+    nothing here needs a <script>: the filter is a GET form, every action a POST form."""
+    k = "msrc"
+    head = f'<div class="item-title" data-k="{k}-head"><b>Model sources</b>'
+    if not isinstance(ov, dict) or ov.get("error"):
+        why = f": {ov['error']}" if isinstance(ov, dict) else ""
+        return (f'<div class="tcard msrc" data-k="{k}">{head}</div>'
+                f'<p class="hint" data-k="{k}-na">The overview is not available{_esc(why)} '
+                "— see the gateway log.</p></div>")
+    rows = [r for r in (ov.get("rows") or []) if isinstance(r, dict) and r.get("path")]
+    fb = ov.get("fallback") if isinstance(ov.get("fallback"), dict) else {}
+    checks = ov.get("checks") if isinstance(ov.get("checks"), dict) else {}
+    if ov.get("pending"):
+        head += " " + _badge("checking …", "warn", "a Check & save or a share hash runs — "
+                             "this section follows it")
+    out = [head + "</div>",
+           f'<p class="hint" data-k="{k}-intro">Where an instance gets each model file its '
+           "aliases need: a <b>public URL</b> (downloaded on the instance itself, fast) or "
+           "only the <b>LAN share</b> (streamed through this gateway's uplink). Hugging Face "
+           "cache files are public by themselves; for a big LAN-only file enter its URL — "
+           "<i>Check &amp; save</i> compares it with the share's file before the catalog "
+           "gets the entry.</p>"]
+    if not ov.get("listed"):
+        prob = str(ov.get("problem") or "")
+        why = f" ({prob})" if prob and prob != "not listed yet" else ""
+        out.append(f'<p class="hint" data-k="{k}-unlisted">The share is not listed yet'
+                   f"{_esc(why)} — press <i>List now</i> in the LAN model source above (it "
+                   "needs only the share host); until then only catalog URLs show here.</p>")
+    out.append(f'<div class="tfacts" data-k="{k}-sum">{_esc(_msrc_summary(rows, fb))}</div>')
+    hq = [str(x) for x in (ov.get("hashing") or [])]
+    if hq:
+        more = f" · {len(hq) - 1} more waiting" if len(hq) > 1 else ""
+        out.append(f'<div class="tfacts" data-k="{k}-hashing">share hashes: hashing '
+                   f"<code>{_esc(hq[0])}</code>{more}</div>")
+    if checks:
+        lis = ""
+        recent = sorted(checks.items(), key=lambda kv: -float((kv[1] or {}).get("at") or 0)
+                        if isinstance(kv[1], dict) else 0)[:20]
+        for key, st in recent:
+            if not isinstance(st, dict):
+                continue
+            src = (st.get("url") if st.get("kind") == "file"
+                   else f"{st.get('repo') or ''}@{st.get('commit') or st.get('rev') or ''}")
+            detail = ""
+            for sub, label in (("left_out", "left out"), ("outdated", "outdated")):
+                m = st.get(sub) if isinstance(st.get(sub), dict) else {}
+                detail += "".join(f'<div class="msrc-note">{label}: <code>{_esc(r)}</code> — '
+                                  f"{_esc(w)}</div>" for r, w in list(m.items())[:10])
+                if len(m) > 10:
+                    detail += f'<div class="msrc-note">… {len(m) - 10} more {label}</div>'
+            note = str(st.get("note") or "") if st.get("state") == "done" else ""
+            lis += (f'<li data-k="{k}-chk-{_esc(key)}"><code>{_esc(key)}</code> ← '
+                    f'<code class="msrc-url">{_esc(src or "")}</code> {_msrc_chip(st)}'
+                    + (f' <span class="msrc-note">{_esc(note)}</span>' if note else "")
+                    + f"{detail}</li>")
+        out.append(f'<details data-k="{k}-checks"><summary>Checks this session '
+                   f"({len(checks)})</summary><ul>{lis}</ul></details>")
+    shown = set(show) if show else {c for c, _l in _MSRC_CATS}
+    counts = {c: 0 for c, _l in _MSRC_CATS}
+    for r in rows:
+        counts[_msrc_cat(r, fb)] += 1
+    boxes = "".join(
+        f'<label class="ckbox"><input type="checkbox" name="src" value="{c}"'
+        f'{" checked" if c in shown else ""}> {_esc(label)} ({counts[c]})</label>'
+        for c, label in _MSRC_CATS)
+    out.append('<form method="get" action="/ui/server" class="msrc-act" '
+               f'data-k="{k}-filter"><input type="hidden" name="sub" value="models">'
+               f"{boxes}{_btn('Filter', kind='secondary', submit=True, sm=True)}</form>")
+    # "repo for this directory": a models/… folder with several LAN-only files (or one
+    # whose directory source predates a file) gets ONE directory form, on its first row
+    lan_by_dir: dict = {}
+    for r in rows:
+        if _msrc_cat(r, fb) == "lan" and r["path"].startswith("models/"):
+            lan_by_dir.setdefault(_msrc_parent(r["path"]), []).append(r)
+    dir_forms = {}
+    for d, rs in lan_by_dir.items():
+        entry = next((r for r in rs if r.get("dir_entry")), None)
+        if len(rs) >= 2 or entry is not None:
+            dd = entry["dir_entry"] if entry else d
+            dir_forms[d] = _msrc_dir_form(dd, (entry or {}).get("dir_repo") or "", len(rs),
+                                          _msrc_chip(checks.get(dd)))
+    trs = ""
+    for it in _msrc_items(rows, fb):
+        if it[0] == "small":
+            _t, d, rs = it
+            if "lan" not in shown:
+                continue
+            total = sum(r.get("size") or 0 for r in rs)
+            names = "".join(f"<div><code>{_esc(r['path'])}</code></div>" for r in rs)
+            als = sorted({a for r in rs for a, _w in (r.get("aliases") or [])})
+            trs += (f'<tr data-k="{k}-s-{_esc(d)}"><td><details><summary>{len(rs)} small '
+                    f"files, {_esc(_msrc_size(total))} — LAN · <code>{_esc(d)}</code>"
+                    f"</summary>{names}</details></td>"
+                    f'<td data-sv="{total}">{_esc(_msrc_size(total))}</td>'
+                    f"<td>{_badge('LAN only', 'warn')}</td><td>{_esc(', '.join(als)) or '—'}"
+                    f"</td><td>—</td><td>{dir_forms.pop(d, '')}</td></tr>")
+            continue
+        _t, r, cat = it
+        if cat not in shown:
+            continue
+        path = r["path"]
+        act = ""
+        if cat in ("lan", "outdated", "failed"):
+            act += _msrc_check_form(path, (r.get("url") or "") if cat == "outdated" else "")
+            act += _msrc_chip(checks.get(path))
+        if cat in ("url", "outdated"):
+            act += _msrc_remove(r)
+        if cat == "lan":
+            act += dir_forms.pop(_msrc_parent(path), "")
+        url = str(r.get("url") or "")
+        url_html = f'<code class="msrc-url">{_esc(url)}</code>' if url else "—"
+        trs += (f'<tr data-k="{k}-f-{_esc(path)}"><td><code>{_esc(path)}</code>'
+                f"{_msrc_notes(r, cat)}</td>"
+                f'<td data-sv="{r.get("size") or 0}">{_esc(_msrc_size(r.get("size")))}</td>'
+                f"<td>{_msrc_badge(r, cat, fb)}</td><td>{_msrc_aliases(r.get('aliases'))}</td>"
+                f"<td>{url_html}</td>"
+                f"<td>{act}</td></tr>")
+    if rows:
+        out.append(f'<table data-k="{k}-files"><tr><th>file</th><th>size</th><th>source</th>'
+                   "<th>aliases</th><th>URL</th><th></th></tr>"
+                   + (trs or '<tr><td colspan="6" class="muted">nothing matches the filter'
+                      "</td></tr>") + "</table>")
+    elif ov.get("listed"):
+        out.append(f'<p class="muted" data-k="{k}-none">No ComfyUI alias needs a model file '
+                   "from the share.</p>")
+    return f'<div class="tcard msrc" data-k="{k}">{"".join(out)}</div>'
+
+
 def _srv_models_body(catalog_refused: Optional[tuple] = None,
-                     modelsrc_refused: Optional[tuple] = None) -> str:
+                     modelsrc_refused: Optional[tuple] = None, sources=None,
+                     show=None) -> str:
     """Server → Models: what the model sync of EVERY managed host reads — the one LAN
-    model source (`_modelsrc_block`) and the model-sync catalog (`_catalog_editor`).
-    Static: each action redirects back here with its answer as the banner (List now
-    shows the fresh listing), and with every host off nothing else moves."""
+    model source (`_modelsrc_block`), the model-sync catalog (`_catalog_editor`) and the
+    "Model sources" overview below them (`sources`, `show` = its filter). Static unless
+    a Check & save or a share hash runs (`_server_view` makes it live then): each action
+    redirects back here with its answer as the banner."""
     return ('<div class="formbar"><h2>Models</h2></div>'
             "<p class='hint'>For the model sync of every managed host: model files only "
             "the LAN share has come from the <b>LAN model source</b>; the <b>catalog</b> "
             "names what no workflow does. Per-host sync state is on each host's card in "
             "<a href='/ui/backends'>Backends</a>.</p>"
-            + _modelsrc_block(modelsrc_refused) + _catalog_editor(catalog_refused))
+            + _modelsrc_block(modelsrc_refused) + _catalog_editor(catalog_refused)
+            + _model_sources_block(sources, show))
+
+
+async def _models_overview():
+    """main.model_sources_overview() (built off the loop, memoised there); None when
+    not bound, `{"error"}` when it failed — the tab never goes down with it."""
+    if _model_sources is None:
+        return None
+    try:
+        return await _model_sources()
+    except Exception as e:                              # noqa: BLE001 — a section, not the tab
+        logger.warning(f"ui: model sources overview failed: {type(e).__name__}: {e}")
+        return {"error": type(e).__name__}
+
+
+async def _models_view(request: Request, status: int = 200, **kw) -> HTMLResponse:
+    """Server → Models with its overview (the GET, and every refusal re-rendered there)."""
+    return _server_view(request, "models", status=status, sources=await _models_overview(),
+                        **kw)
+
+
+def _msrc_show(qp):
+    """The filter's ticked categories (`?src=lan&src=url…`); None = no filter (all)."""
+    vals = qp.getlist("src") if hasattr(qp, "getlist") else [qp.get("src")]
+    known = {c for c, _l in _MSRC_CATS}
+    got = [v for v in vals if v in known]
+    return got or None
 
 
 def _server_view(request: Request, sub: str = "", status: int = 200,
                  typed: Optional[dict] = None, errs=(), key_errs: Optional[dict] = None,
                  notice: Optional[str] = None, catalog_refused: Optional[tuple] = None,
-                 modelsrc_refused: Optional[tuple] = None) -> HTMLResponse:
+                 modelsrc_refused: Optional[tuple] = None, sources=None) -> HTMLResponse:
     """The Server tab: Runtime | Restart | API Keys | Models (`SUBTABS["server"]`, first
     = default). A refused Save re-renders its own sub-tab with `typed`/`errs`
     (runtime/restart), `key_errs`/`notice` (keys) or `catalog_refused`/`modelsrc_refused`
@@ -9834,19 +10310,29 @@ def _server_view(request: Request, sub: str = "", status: int = 200,
     elif sub == "restart":
         content = _srv_restart_form(st, typed, errs)
     elif sub == "models":
-        content = _srv_models_body(catalog_refused, modelsrc_refused)
+        content = _srv_models_body(catalog_refused, modelsrc_refused, sources,
+                                   _msrc_show(qp))
     else:
         content = _srv_keys_body(st, key_errs, notice)
     # intro/banner live inside the column (not as a sibling before .cols) so the sticky
     # Save bar stays visible — see the Users design-convention note.
     body = f'<div class="cols"><div class="col">{info}{banner}{content}</div></div>'
     marks = {"restart": _srv_mark(True)} if st["any_restart"] else None
-    return HTMLResponse(_page("Server", body, "server", subnav=_subnav("server", sub, marks)),
+    # Models is live only while a Check & save or a share hash runs (the overview then
+    # changes by itself), and never on a refusal: its URL is the POST action, which the
+    # poller's GET cannot fetch
+    live = (3 if sub == "models" and status == 200 and isinstance(sources, dict)
+            and sources.get("pending") else None)
+    return HTMLResponse(_page("Server", body, "server", refresh=live,
+                              subnav=_subnav("server", sub, marks)),
                         status_code=status)
 
 
 async def server_page(request: Request):
-    return _server_view(request, request.query_params.get("sub") or "")
+    sub = request.query_params.get("sub") or ""
+    if sub == "models":
+        return await _models_view(request)
+    return _server_view(request, sub)
 
 
 async def server_save(request: Request):
@@ -10110,6 +10596,10 @@ def register(app) -> None:
     app.add_api_route("/ui/hosts/managed/modelsrc-list", hosts_modelsrc_list, methods=["POST"])
     app.add_api_route("/ui/hosts/managed/catalog", hosts_catalog_save, methods=["POST"])
     app.add_api_route("/ui/hosts/managed/modelsrc-host", hosts_modelsrc_host, methods=["POST"])
+    app.add_api_route("/ui/hosts/managed/source-check", hosts_source_check, methods=["POST"])
+    app.add_api_route("/ui/hosts/managed/source-check-dir", hosts_source_check_dir,
+                      methods=["POST"])
+    app.add_api_route("/ui/hosts/managed/source-remove", hosts_source_remove, methods=["POST"])
     app.add_api_route("/ui/input", input_page, methods=["GET"])
     app.add_api_route("/ui/routing", routing_page, methods=["GET"])
     app.add_api_route("/ui/chat/create", chat_create, methods=["POST"])

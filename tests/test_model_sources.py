@@ -27,6 +27,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import unittest
 
 _here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -767,6 +768,237 @@ class RemoveAndLock(_Base):
         self.assertEqual(self.catalog(), [f])
         self.assertEqual(main.save_modelsync_catalog(mine, expect_hash=main.modelsync_catalog_hash()), [])
         self.assertEqual(self.catalog(), mine)
+
+
+# ── the overview (Server → Models → "Model sources") ──────────────────────────────
+OID = "c3" * 32
+REV = "0123456789abcdef0123456789abcdef01234567"
+HFREPO = "hf-cache/hub/models--org--repo/"
+BLOB = HFREPO + "blobs/" + OID
+SNAP = HFREPO + f"snapshots/{REV}/model.safetensors"
+
+
+class OvLan:
+    """The LanSource surface the overview reads (never hashes, never lists)."""
+
+    def __init__(self, index, sha=None):
+        self.index, self.sha = dict(index), {p: list(r) for p, r in (sha or {}).items()}
+        self.generation, self.sha_generation = 1, 1
+        self.queue, self.prob = [], ""
+        self.reads = 0
+
+    def cached(self):
+        self.reads += 1
+        return dict(self.index)
+
+    def sha_files(self):
+        return {p: list(r) for p, r in self.sha.items()}
+
+    def hash_queue(self):
+        return list(self.queue)
+
+    def problem(self):
+        return self.prob
+
+
+def _wf(**nodes):
+    return {str(i): {"class_type": c, "inputs": {k: v}}
+            for i, (c, k, v) in enumerate(nodes.values(), 1)}
+
+
+class Overview(unittest.IsolatedAsyncioTestCase):
+    """Rows from `per_alias[*].files` over EVERY ComfyUI backend — blocked aliases
+    included (a fetch-based list drops exactly them), a link credited to its target, the
+    kinds from `source_kinds`, memoised and built off the loop."""
+
+    def setUp(self):
+        self._saved = {n: getattr(main, n) for n in (
+            "modelsrc", "backends", "image_models", "host_controllers", "_src_checks",
+            "_src_confirming")}
+        self._saved_store = (store._DB_PATH, store._active, store._MASTER_KEY)
+        self.addCleanup(self.restore)
+        self.tmp = tempfile.mkdtemp(prefix="model-sources-ov-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        store._MASTER_KEY = os.urandom(32)
+        store.init(os.path.join(self.tmp, "store.db"))
+        main._msrc_memo[:] = [None, None]
+        main._msrc_kinds_memo[:] = [None, None]
+        main._src_checks, main._src_confirming = {}, {}
+        main.host_controllers = {}
+        main.image_models = {}
+        main.backends = [{"name": "cx", "type": "comfyui", "url": "http://127.0.0.1:1"},
+                         {"name": "cy", "type": "comfyui", "url": "http://127.0.0.1:2"},
+                         {"name": "llm", "type": "openai", "url": "http://127.0.0.1:3"}]
+        self.lan = OvLan({
+            "models/checkpoints/big.safetensors": 7_000_000_000,
+            "models/vae/v.safetensors": 300_000_000,
+            "models/loras/old.safetensors": 1000,
+            "models/small/a.json": 100, "models/small/b.json": 200,
+            "models/checkpoints/other.safetensors": 2_000_000_000,
+            BLOB: 5_000_000_000, SNAP: {"link": "../../blobs/" + OID},
+            HFREPO + "refs/main": 40})
+        main.modelsrc = lambda: self.lan
+        store.set_settings({"modelsync_catalog": [
+            {"match": {"alias": "img"}, "paths": [HFREPO, "models/loras/old.safetensors",
+                                                   "models/small/"]},
+            {"file": "models/vae/v.safetensors", "url": "https://mirror.example/v?t=1",
+             "sha256": SHA_A, "size": 300_000_000, "verified": "sha256"},
+            {"file": "models/loras/old.safetensors", "url": "https://mirror.example/old",
+             "size": 999}]})
+        store.upsert("img", [{"backend": "cx", "task": "text2img", "workflow_json": _wf(
+            a=("CheckpointLoaderSimple", "ckpt_name", "big.safetensors"),
+            b=("VAELoader", "vae_name", "v.safetensors"))}])
+        store.upsert("blk", [{"backend": "cx", "task": "text2img", "workflow_json": _wf(
+            a=("CheckpointLoaderSimple", "ckpt_name", "big.safetensors"),
+            b=("VAELoader", "vae_name", "missing.safetensors"))}])
+        store.upsert("other", [{"backend": "cy", "task": "text2img", "workflow_json": _wf(
+            a=("CheckpointLoaderSimple", "ckpt_name", "other.safetensors"))}])
+
+    def restore(self):
+        for n, v in self._saved.items():
+            setattr(main, n, v)
+        store._DB_PATH, store._active, store._MASTER_KEY = self._saved_store
+        main._msrc_memo[:] = [None, None]
+        main._msrc_kinds_memo[:] = [None, None]
+
+    def rows(self):
+        return {r["path"]: r for r in main.model_sources_view()["rows"]}
+
+    def test_rows_from_every_backends_aliases_with_kinds(self):
+        rows = self.rows()
+        self.assertEqual(set(rows), {
+            "models/checkpoints/big.safetensors", "models/vae/v.safetensors",
+            "models/loras/old.safetensors", "models/small/a.json", "models/small/b.json",
+            "models/checkpoints/other.safetensors", BLOB, HFREPO + "refs/main"})
+        big = rows["models/checkpoints/big.safetensors"]
+        self.assertEqual((big["kind"], big["size"], big["in_share"], big["url"]),
+                         ("lan", 7_000_000_000, True, ""))
+        # the blocked alias is there, marked with its reason (fetch would drop it)
+        self.assertEqual([a for a, _ in big["aliases"]], ["blk", "img"])
+        self.assertIn("not in source: missing.safetensors", dict(big["aliases"])["blk"])
+        self.assertEqual(dict(big["aliases"])["img"], "")
+        v = rows["models/vae/v.safetensors"]
+        self.assertEqual((v["kind"], v["origin"], v["verified"], v["entry_key"]),
+                         ("url", "file", "sha256", "models/vae/v.safetensors"))
+        old = rows["models/loras/old.safetensors"]
+        self.assertEqual((old["kind"], old["entry_key"]), ("outdated", old["path"]))
+        self.assertIn("size differs", old["reason"])
+        self.assertEqual(rows[BLOB]["kind"], "hf-auto")
+        self.assertIn(f"/resolve/{REV}/model.safetensors", rows[BLOB]["url"])
+        self.assertEqual(rows[BLOB]["entry_key"], "")                # nothing stored
+        # the second backend's alias
+        self.assertEqual(rows["models/checkpoints/other.safetensors"]["aliases"],
+                         [["other", ""]])
+        view = main.model_sources_view()
+        self.assertTrue(view["listed"])
+        self.assertEqual(view["backends"], ["cx", "cy"])
+
+    def test_a_link_is_shown_as_its_target(self):
+        rows = self.rows()
+        self.assertNotIn(SNAP, rows)
+        self.assertEqual(rows[BLOB]["aliases"], [["img", ""]])
+        self.assertEqual(rows[BLOB]["size"], 5_000_000_000)
+
+    def test_dir_rows_and_a_file_the_dir_check_predates(self):
+        cat = store.get_setting("modelsync_catalog") + [
+            {"dir": "models/small/", "repo": "o/r", "rev": REV,
+             "files": {"a.json": [100, None, False]}}]
+        store.set_settings({"modelsync_catalog": cat})
+        rows = self.rows()
+        a, b = rows["models/small/a.json"], rows["models/small/b.json"]
+        self.assertEqual((a["kind"], a["origin"], a["entry_key"]), ("url", "dir", "models/small/"))
+        self.assertEqual((b["kind"], b["dir_entry"], b["dir_repo"]), ("lan", "models/small/", "o/r"))
+
+    def test_not_listed_share(self):
+        self.lan.index = {}
+        view = main.model_sources_view()
+        self.assertFalse(view["listed"])
+        # a URL-only file still shows: the entry's size, not on the share
+        cat = [{"match": {"alias": "img"}, "paths": ["models/vae/v.safetensors"]},
+               {"file": "models/vae/v.safetensors", "url": "https://mirror.example/v",
+                "size": 300}]
+        store.set_settings({"modelsync_catalog": cat})
+        rows = self.rows()
+        v = rows["models/vae/v.safetensors"]
+        self.assertEqual((v["kind"], v["size"], v["in_share"]), ("url", 300, False))
+
+    def test_memoised_on_what_it_reads(self):
+        real = modelsync.plan
+        calls = []
+
+        def spy(*a, **k):
+            calls.append(1)
+            return real(*a, **k)
+        modelsync.plan = spy
+        self.addCleanup(setattr, modelsync, "plan", real)
+        main.model_sources_view()
+        main.model_sources_view()
+        self.assertEqual(len(calls), 1)
+        self.lan.generation += 1                         # a new listing
+        main.model_sources_view()
+        self.assertEqual(len(calls), 2)
+        self.lan.sha_generation += 1                     # a share hash arrived
+        main.model_sources_view()
+        self.assertEqual(len(calls), 3)
+        store.set_settings({"modelsync_catalog": store.get_setting("modelsync_catalog")[:1]})
+        main.model_sources_view()
+        self.assertEqual(len(calls), 4)
+        store.upsert("other", [{"backend": "cy", "task": "text2img", "workflow_json": _wf(
+            a=("CheckpointLoaderSimple", "ckpt_name", "big.safetensors"))}])
+        main.model_sources_view()
+        self.assertEqual(len(calls), 5)
+        main.backends = main.backends[:1]                # a ComfyUI backend gone
+        main.model_sources_view()
+        self.assertEqual(len(calls), 6)
+
+    async def test_overview_is_built_off_the_loop_with_the_live_parts_on_top(self):
+        loop_thread = threading.get_ident()
+        seen = []
+        real = main.model_sources_view
+
+        def spy():
+            seen.append(threading.get_ident())
+            return real()
+        main.model_sources_view = spy
+        self.addCleanup(setattr, main, "model_sources_view", real)
+
+        class Ctl:
+            def __init__(self, fb):
+                self.fb = fb
+
+            def view(self):
+                return {"url_fallback": self.fb}
+
+        class Broken:
+            def view(self):
+                raise RuntimeError("boom")
+        main.host_controllers = {"h1": Ctl({"models/vae/v.safetensors": "hash differs"}),
+                                 "h2": Broken()}
+        self.lan.queue = ["models/checkpoints/big.safetensors"]
+        main._src_checks = {"models/vae/v.safetensors": {"kind": "file", "state": "done"}}
+        ov = await main.model_sources_overview()
+        self.assertEqual(len(seen), 1)
+        self.assertNotEqual(seen[0], loop_thread)
+        self.assertEqual(ov["fallback"], {"models/vae/v.safetensors": "hash differs"})
+        self.assertEqual(ov["hashing"], ["models/checkpoints/big.safetensors"])
+        self.assertTrue(ov["pending"])                   # a hash runs
+        self.assertEqual(ov["checks"]["models/vae/v.safetensors"]["state"], "done")
+        self.assertEqual(ov["problem"], "")
+        self.assertIn("rows", ov)
+        self.lan.queue = []
+        self.assertFalse((await main.model_sources_overview())["pending"])
+        main._src_checks = {"models/x/": {"kind": "dir", "state": "heading"}}
+        self.assertTrue((await main.model_sources_overview())["pending"])
+        # the memoised view is never mutated by the overlay
+        self.assertNotIn("fallback", main.model_sources_view())
+
+    def test_card_kinds(self):
+        kinds = main.model_source_kinds()
+        self.assertEqual(kinds["models/loras/old.safetensors"]["kind"], "outdated")
+        self.assertEqual(kinds[BLOB]["kind"], "hf-auto")
+        self.assertEqual(kinds["models/vae/v.safetensors"]["kind"], "url")
+        self.assertNotIn("models/checkpoints/big.safetensors", kinds)
+        self.assertNotIn("url", kinds[BLOB])            # the badge needs no URL
 
 
 # ── pure helpers ──────────────────────────────────────────────────────────────────

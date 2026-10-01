@@ -6917,6 +6917,167 @@ async def remove_source(key: str) -> str:
     return f"source of {key} removed"
 
 
+# ── model sources: the overview (Server → Models → "Model sources") ─────────────────
+# Which NEEDED files (spec Concepts: `per_alias[*].files` of a plan over every ComfyUI
+# backend's aliases against the share listing — never `fetch`, which drops the blocked
+# aliases, the ones most worth seeing) come from a public URL and which only from the
+# LAN share. No running host needed. Planning reads the store, the workflows and the
+# whole listing, so the view is built in a worker thread (`model_sources_overview`) and
+# memoised on exactly what it reads; the live parts (checks, hash queue, the
+# controllers' fallbacks) are laid over it per call, on the loop.
+_msrc_memo: list = [None, None]             # [key, view]
+_msrc_kinds_memo: list = [None, None]       # [key, source_kinds]
+_msrc_memo_lock = threading.Lock()
+
+
+def _comfy_backend_names() -> list:
+    """Every ComfyUI backend name (config + store: `backends` is the merged list)."""
+    return sorted({str(b.get("name")) for b in list(backends)
+                   if isinstance(b, dict) and b.get("type") == "comfyui" and b.get("name")})
+
+
+def _source_kinds_memo(catalog, cat_hash, lan) -> dict:
+    """`modelsync.source_kinds` of the share listing, memoised on (catalog hash, listing
+    generation, sha-cache generation) — the card's badges read it per Backends tick."""
+    key = (cat_hash, lan.generation, lan.sha_generation)
+    with _msrc_memo_lock:
+        if _msrc_kinds_memo[0] == key:
+            return _msrc_kinds_memo[1]
+    kinds = modelsync.source_kinds(catalog, lan.cached(), lan.sha_files())
+    with _msrc_memo_lock:
+        _msrc_kinds_memo[:] = [key, kinds]
+    return kinds
+
+
+def model_source_kinds() -> dict:
+    """`{path: {"kind", "reason"?}}` for every share/catalog file with a public source
+    (absent = `lan`) — the host card's badge. BLOCKING (store reads, one pass over the
+    listing on a change): call it through `asyncio.to_thread`."""
+    lan = modelsrc()
+    catalog = _modelsync_catalog()
+    kinds = _source_kinds_memo(catalog, modelsync_catalog_hash(catalog), lan)
+    return {p: {k: v for k, v in i.items() if k in ("kind", "reason", "origin")}
+            for p, i in kinds.items()}
+
+
+def _dir_entry_of(path: str, catalog):
+    """The valid directory entry whose `files` names `path` (the last such entry wins,
+    as in `source_kinds`), else None — the key `remove_source` takes for a dir row."""
+    best = None
+    for e in catalog if isinstance(catalog, list) else []:
+        if (isinstance(e, dict) and "repo" in e and isinstance(e.get("dir"), str)
+                and path.startswith(e["dir"]) and isinstance(e.get("files"), dict)
+                and path[len(e["dir"]):] in e["files"] and not modelsync.validate_catalog([e])):
+            best = e
+    return best
+
+
+def model_sources_view() -> dict:
+    """The overview's rows (spec "The overview"): one per NEEDED file — `path`, `size`
+    (the listing's, else the entry's), `in_share`, `kind` (`lan` | `url` | `hf-auto` |
+    `outdated`), `url`, `origin`, `verified`, `provisional`, `reason` (outdated),
+    `outdated_entry`, `entry_key` (what `remove_source` takes for the row's explicit
+    entry, "" = none), `dir_entry`/`dir_repo` (a LAN file under a directory source whose
+    check predates it) and `aliases` (`[[alias, blocked reason or ""]]`). A link is not a
+    file: its alias is credited to the file it points at. Plus `listed` (the share has
+    been listed) and `backends` (the ComfyUI backends planned over).
+
+    BLOCKING and memoised on (every ComfyUI backend's alias signature, the catalog hash,
+    the listing generation, the sha-cache generation): call it via `asyncio.to_thread`
+    (`model_sources_overview`). Never starts a hash or a listing."""
+    lan = modelsrc()
+    names = _comfy_backend_names()
+    catalog = _modelsync_catalog()
+    cat_hash = modelsync_catalog_hash(catalog)
+    key = (tuple((n, service_alias_signature(f"comfyui:{n}")) for n in names), cat_hash,
+           lan.generation, lan.sha_generation)
+    with _msrc_memo_lock:
+        if _msrc_memo[0] == key:
+            return _msrc_memo[1]
+    idx = lan.cached()
+    share_sha = lan.sha_files()
+    needs = []
+    for n in names:
+        needs += service_alias_needs(f"comfyui:{n}")
+    urls = modelsync.url_catalog(catalog, idx, share_sha)
+    p = modelsync.plan(needs, idx, {}, {}, urls)
+    kinds = _source_kinds_memo(catalog, cat_hash, lan)
+    rows: dict = {}
+    for alias, r in sorted(p["per_alias"].items()):
+        why = "; ".join(r["blocked"])
+        for f in r["files"]:
+            path = f["path"]
+            if f.get("link") is not None:
+                path = modelsync.link_target(path, f["link"])
+                if path is None:
+                    continue
+            row = rows.get(path)
+            if row is None:
+                info = kinds.get(path) or {}
+                size = idx.get(path)
+                in_share = isinstance(size, int) and not isinstance(size, bool)
+                kind = info.get("kind", "lan")
+                row = {"path": path, "size": size if in_share else info.get("size"),
+                       "in_share": in_share, "kind": kind, "url": info.get("url", ""),
+                       "origin": info.get("origin", ""), "verified": info.get("verified", ""),
+                       "provisional": bool(info.get("provisional")),
+                       "reason": info.get("reason", ""),
+                       "outdated_entry": info.get("outdated_entry", ""),
+                       "entry_key": "", "dir_entry": "", "dir_repo": "", "aliases": {}}
+                if kind in ("url", "outdated"):
+                    if info.get("origin") == "file":
+                        row["entry_key"] = path
+                    elif info.get("origin") == "dir":
+                        d = _dir_entry_of(path, catalog)
+                        row["entry_key"] = d["dir"] if d else ""
+                if kind == "lan":
+                    d = modelsync.dir_for(path, catalog)
+                    if d is not None:
+                        row["dir_entry"], row["dir_repo"] = d["dir"], d["repo"]
+                rows[path] = row
+            row["aliases"].setdefault(alias, why)
+    out = []
+    for path in sorted(rows):
+        row = rows[path]
+        row["aliases"] = [[a, w] for a, w in sorted(row["aliases"].items())]
+        out.append(row)
+    view = {"rows": out, "listed": bool(idx), "backends": names}
+    with _msrc_memo_lock:
+        _msrc_memo[:] = [key, view]
+    return view
+
+
+async def model_sources_overview() -> dict:
+    """The console's "Model sources" section: `model_sources_view()` (built in a worker
+    thread, memoised) plus what changes while nothing else does — `fallback` (`{path:
+    reason}` of every controller's "URL failed this session — LAN"), `checks`
+    (`source_checks()`), `hashing` (the share-hash queue, running first), `pending` (a
+    check or a hash still running: the section is live) and `problem` (the LAN source's,
+    "" = usable)."""
+    view = dict(await asyncio.to_thread(model_sources_view))
+    fallback: dict = {}
+    for name, c in sorted(host_controllers.items()):
+        try:
+            fb = c.view().get("url_fallback") or {}
+        except Exception as e:              # a courtesy column, never the section
+            logger.warning(f"[model sources] {name}: fallback view unavailable: {e!r}")
+            continue
+        for path, why in fb.items():
+            fallback.setdefault(str(path), str(why or ""))
+    lan = modelsrc()
+    try:
+        hashing = [str(x) for x in lan.hash_queue()]
+    except Exception:                       # noqa: BLE001 — a LanSource without a queue
+        hashing = []
+    try:
+        problem = str(lan.problem() or "")
+    except Exception as e:                  # noqa: BLE001
+        problem = f"{type(e).__name__}"
+    view.update(fallback=fallback, checks=source_checks(), hashing=hashing,
+                pending=source_checks_pending() or bool(hashing), problem=problem)
+    return view
+
+
 def _modelsrc_prepare() -> None:
     """modelsrc.key exists before the console shows it: its public half is what the
     operator installs on the share host FIRST. Generated in the background at boot (and
@@ -7954,6 +8115,12 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
            save_hf_token=save_hf_token, hf_token_set=hf_token_set,
            thunder_orphan_snapshots=thunder_orphan_snapshots,
            modelsync_catalog=_modelsync_catalog, save_modelsync_catalog=save_modelsync_catalog,
+           # model sources: the editor's stale-form guard, the overview, the actions
+           modelsync_catalog_hash=modelsync_catalog_hash, catalog_stale=CATALOG_STALE,
+           source_checks_pending=source_checks_pending,
+           model_sources=model_sources_overview, model_source_kinds=model_source_kinds,
+           check_source=check_source, check_dir_source=check_dir_source,
+           remove_source=remove_source,
            backend_loras=lambda: {b["name"]: sorted(backend_loras.get(backend_id(b), set()))
                                   for b in backends if b.get("type") == "comfyui"})
 

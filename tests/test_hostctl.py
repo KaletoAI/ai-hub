@@ -5041,6 +5041,38 @@ class LanTransfer(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(vm.links, {snap: "../../blobs/" + oid})
         self.assertEqual(man[snap]["source"], "link")
 
+    async def test_plan_view_names_each_files_source(self):
+        """model sources, the card's badge: every file row of the plan view says how THIS
+        plan fetches it — `url` with `origin` hf-auto (derived) or catalog (an entry), a
+        `link`, else `lan`. Without it the card can only guess from the catalog, which
+        the plan may have overruled (an outdated entry, a fallback)."""
+        sh = FakeShare()
+        rev, oid = "0123456789abcdef0123456789abcdef01234567", "ab" * 32
+        repo = "hf-cache/hub/models--org--repo/"
+        blob, snap = repo + "blobs/" + oid, repo + f"snapshots/{rev}/model.safetensors"
+        sh.files = {blob: b"weights", repo + "refs/main": rev.encode(),
+                    "models/x/m.bin": b"0123456789"}
+        sh.links = {snap: "../../blobs/" + oid}
+        cat = [{"match": {"alias": "hf"}, "paths": [repo, "models/x/m.bin"]},
+               {"file": "models/x/m.bin", "url": "https://mirror.example/m.bin", "size": 10}]
+        fake, vm, c, lan, pipe = _lan_make({"hf": {"backend": "thunder", "workflow_json": {}}},
+                                           sh, catalog=cat)
+        vm.sizes[f"https://huggingface.co/org/repo/resolve/{rev}/model.safetensors"] = 7
+        vm.sha[f"https://huggingface.co/org/repo/resolve/{rev}/model.safetensors"] = oid
+        vm.sizes["https://mirror.example/m.bin"] = 10
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "hf")),
+                        c.state.log[-8:])
+        files = {f["path"]: f for f in c.view()["plan"]["aliases"]["hf"]["files"]}
+        self.assertEqual((files[blob]["source"], files[blob]["origin"]), ("url", "hf-auto"))
+        self.assertEqual((files["models/x/m.bin"]["source"], files["models/x/m.bin"]["origin"]),
+                         ("url", "catalog"))
+        self.assertEqual(files[repo + "refs/main"]["source"], "lan")
+        self.assertNotIn("origin", files[repo + "refs/main"])
+        self.assertEqual(files[snap]["source"], "link")
+        # no URL in the view (a catalog URL may carry a query token)
+        self.assertNotIn("mirror.example", json.dumps(c.view()["plan"]))
+
     async def test_links_wait_while_the_lan_source_waits(self):
         sh = FakeShare()
         repo = "hf-cache/hub/models--o--n/"

@@ -53,6 +53,7 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import html as html_mod
 import unittest
 from unittest import mock
@@ -150,7 +151,11 @@ class _Base(unittest.TestCase):
         self.save_refusal = ""
         self.deleted_hosts = []
 
-        def save_cat(cat):
+        self.saved_hashes = []
+
+        def save_cat(cat, expect_hash=None):
+            # main.save_modelsync_catalog's contract incl. the editor's stale-form hash
+            self.saved_hashes.append(expect_hash)
             errs = __import__("modelsync").validate_catalog(cat)
             if not errs:
                 self.saved_catalogs.append(cat)
@@ -969,6 +974,87 @@ class SyncPanel(_Base):
         b = self.main_html()
         self.assertNotIn('data-k="hosts-catalog"', b)
         self.assertNotIn('action="/ui/hosts/managed/catalog"', b)
+
+
+class CardSourceBadges(_Base):
+    """Model sources on the host card: every synced file says where THIS plan gets it,
+    in the overview's words — `HF auto` / `URL ✓` (the plan's `source` + `origin`),
+    `outdated` (main's source kinds: the entry no longer matches the share, so the plan
+    syncs the share's copy), `URL failed — LAN` (the controller's fallback), `LAN`. A
+    badge that says URL for a file that streams through the uplink hides exactly the
+    20 billed minutes this feature exists to remove."""
+
+    def setUp(self):
+        super().setUp()
+        self.live = [{"name": "tc", "type": "comfyui", "url": "http://127.0.0.1:18100",
+                      "host": "tc", "enabled": True, "healthy": True, "models": 0,
+                      "source": "ui"}]
+        f = lambda path, src=None, origin=None, link=None: dict(      # noqa: E731
+            {"path": path, "size": GiB, "node": None, "cls": None, "present": False},
+            **({"source": src} if src else {}), **({"origin": origin} if origin else {}),
+            **({"link": link} if link else {}))
+        files = [f("hf-cache/hub/models--o--r/blobs/" + "ab" * 32, "url", "hf-auto"),
+                 f("models/vae/mirror.safetensors", "url", "catalog"),
+                 f("models/loras/old.safetensors", "lan"),
+                 f("models/x/plain.bin", "lan"),
+                 f("models/x/failed.bin", "lan"),
+                 f("hf-cache/hub/models--o--r/snapshots/" + "1" * 40 + "/m", "link",
+                   link="../../blobs/" + "ab" * 32),
+                 f("models/y/legacy.bin")]                  # an older view: no source
+        plan = _plan()
+        plan["aliases"]["Mesh"]["files"] = files
+        self.views = {"tc": _view(phase="ready", uuid="u1", plan=plan,
+                                  url_fallback={"models/x/failed.bin": "hash differs — "
+                                                "syncing the share's copy"})}
+        self.kind_threads = []
+
+        def kinds():
+            self.kind_threads.append(threading.get_ident())
+            return {"models/loras/old.safetensors": {"kind": "outdated",
+                                                     "reason": "size differs: share 3, entry 2"},
+                    "models/y/legacy.bin": {"kind": "url", "origin": "file"}}
+        self.addCleanup(setattr, admin, "_model_source_kinds", admin._model_source_kinds)
+        admin._model_source_kinds = kinds
+
+    def main_html(self, qp=None) -> str:
+        return re.search(r"<main[^>]*>(.*)</main>", self.page(qp), re.S).group(1)
+
+    def cell(self, html, path):
+        row = re.search(rf'<tr data-k="f-{re.escape(path)}">(.*?)</tr>', html, re.S)
+        self.assertIsNotNone(row, path)
+        return row.group(1).rsplit("<td>", 1)[1]
+
+    def test_each_file_carries_its_badge(self):
+        html = self.main_html()
+        self.assertIn(">HF auto<", self.cell(html, "hf-cache/hub/models--o--r/blobs/" + "ab" * 32))
+        self.assertIn(">URL ✓<", self.cell(html, "models/vae/mirror.safetensors"))
+        old = self.cell(html, "models/loras/old.safetensors")
+        self.assertIn(">outdated<", old)
+        self.assertIn('title="size differs: share 3, entry 2"', old)
+        self.assertIn(">LAN<", self.cell(html, "models/x/plain.bin"))
+        failed = self.cell(html, "models/x/failed.bin")
+        self.assertIn(">URL failed — LAN<", failed)
+        self.assertIn("syncing the share", failed)
+        self.assertNotIn("badge", self.cell(html, "hf-cache/hub/models--o--r/snapshots/"
+                                            + "1" * 40 + "/m"))           # a link
+        self.assertIn(">URL ✓<", self.cell(html, "models/y/legacy.bin"))  # kinds fallback
+        self.assertNotIn("<script", html)
+
+    def test_kinds_built_off_the_loop_and_only_with_a_plan(self):
+        self.main_html()
+        self.assertEqual(len(self.kind_threads), 1)
+        self.assertNotEqual(self.kind_threads[0], threading.get_ident())
+        self.views = {"tc": _view(phase="off", plan=None)}
+        self.main_html()
+        self.assertEqual(len(self.kind_threads), 1)          # no plan, no pass
+
+    def test_kinds_failure_leaves_the_card(self):
+        def boom():
+            raise RuntimeError("store gone")
+        admin._model_source_kinds = boom
+        html = self.main_html()
+        self.assertIn(">LAN<", self.cell(html, "models/loras/old.safetensors"))
+        self.assertIn('data-k="host-tc"', html)
 
 
 class SyncActions(Actions):

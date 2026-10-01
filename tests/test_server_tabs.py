@@ -21,11 +21,13 @@ Why this fails SILENTLY:
 - `server_save` turned "1.5" in an int field (or "abc") into "" = unset, i.e. the
   default — a cap the operator typed silently became no cap.
 """
+import asyncio
 import html
 import os
 import re
 import sys
 import tempfile
+import threading
 import unittest
 from urllib.parse import parse_qs, urlparse
 
@@ -464,7 +466,11 @@ class ModelsTab(_Fixture):
         self.assertNotIn("<main data-live", page)
 
     def test_catalog_refusal_is_400_on_the_models_tab_and_saves_nothing(self):
+        # the tab's first read seeds the default catalog (as the editor always did) —
+        # what must not change is the catalog the refused Save found
+        self.get("/ui/server?sub=models")
         before = store.get_setting("modelsync_catalog")
+        self.assertIsNotNone(before)
         r = self.post("/ui/hosts/managed/catalog", {"catalog": '[{"x": <typed>}'}, status=400)
         self.assertRegex(r.text, r'class="on" aria-current="page" href="/ui/server\?sub=models"')
         self.assertIn("[{&quot;x&quot;: &lt;typed&gt;}", r.text)
@@ -482,6 +488,365 @@ class ModelsTab(_Fixture):
                       status=400)
         self.assertIn('name="modelsrc_host" value="-oProxy=x"', r.text)
         self.assertEqual(store.get_setting("modelsrc_host"), "src@10.0.0.2")
+
+
+# ── Models → Model sources ───────────────────────────────────────────────────────────
+GB = 10 ** 9
+
+
+def _row(path, size, kind="lan", **kw):
+    r = {"path": path, "size": size, "in_share": True, "kind": kind, "url": "",
+         "origin": "", "verified": "", "provisional": False, "reason": "",
+         "outdated_entry": "", "entry_key": "", "dir_entry": "", "dir_repo": "",
+         "aliases": [["img", ""]]}
+    r.update(kw)
+    return r
+
+
+def _overview(**over):
+    rows = [
+        _row("models/checkpoints/small.safetensors", 2 * GB),
+        _row("models/checkpoints/big.safetensors", 7 * GB,
+             aliases=[["blk", "not in source: <x>"], ["img", ""]]),
+        _row("models/vae/v.safetensors", 3 * GB, "url", url="https://mirror.example/v?a=1&b=<2>",
+             origin="file", verified="sha256", entry_key="models/vae/v.safetensors"),
+        _row("models/vae/s.safetensors", 1 * GB, "url", url="https://mirror.example/s",
+             origin="file", verified="size", entry_key="models/vae/s.safetensors"),
+        _row("models/loras/old.safetensors", 4 * GB, "outdated", url="https://mirror.example/o",
+             origin="file", reason="size differs: share 4, entry 3",
+             entry_key="models/loras/old.safetensors"),
+        _row("hf-cache/hub/models--o--r/blobs/" + "ab" * 32, 5 * GB, "hf-auto",
+             url="https://huggingface.co/o/r/resolve/" + "1" * 40 + "/m.safetensors",
+             origin="hf-auto"),
+        _row("hf-cache/hub/models--o--f/blobs/" + "cd" * 32, 6 * GB, "hf-auto",
+             url="https://huggingface.co/o/f/resolve/" + "1" * 40 + "/f.safetensors",
+             origin="hf-auto"),
+        _row("models/cfg/a.json", 100), _row("models/cfg/b.json", 200),
+        _row("models/one/lone.json", 10),
+        _row("models/<odd>&/x.bin", 2 * GB),
+        _row("models/<odd>&/y.bin", 1 * GB),
+    ]
+    ov = {"rows": rows, "listed": True, "backends": ["cx"],
+          "fallback": {"hf-cache/hub/models--o--f/blobs/" + "cd" * 32: "hash differs — "
+                       "syncing the share's copy"},
+          "checks": {}, "hashing": [], "pending": False, "problem": ""}
+    ov.update(over)
+    return ov
+
+
+class ModelSources(_Fixture):
+    """The overview section: a fill-in worklist whose order, collapse, sums and
+    badges ARE the information — and whose actions are POSTs that land on ?sub=models."""
+
+    def setUp(self):
+        super().setUp()
+        self.ov = _overview()
+        self.calls = []
+
+        async def overview():
+            self.calls.append(("overview", threading.get_ident()))
+            return self.ov
+
+        async def check(path, url):
+            self.calls.append(("check", path, url))
+            return f"check of {path} queued"
+
+        async def check_dir(d, repo):
+            self.calls.append(("check_dir", d, repo))
+            return f"check of {d} queued"
+
+        async def remove(key):
+            asyncio.get_running_loop()                  # awaited ON the loop
+            self.calls.append(("remove", key, threading.get_ident()))
+            return f"source of {key} removed"
+        for k, v in (("_model_sources", overview), ("_check_source", check),
+                     ("_check_dir_source", check_dir), ("_remove_source", remove)):
+            self.addCleanup(setattr, admin, k, getattr(admin, k))
+            setattr(admin, k, v)
+
+    def section(self, url="/ui/server?sub=models"):
+        m = self.main_of(self.get(url))
+        start = m.index('data-k="msrc"')
+        return m[m.rindex("<div", 0, start):]
+
+    def order(self, sec):
+        return re.findall(r'<tr data-k="msrc-([fs])-([^"]*)"', sec)
+
+    def test_rows_sorted_lan_outdated_failed_public_with_small_collapsed(self):
+        sec = self.section()
+        got = [(t, html.unescape(p)) for t, p in self.order(sec)]
+        self.assertEqual(got, [
+            ("f", "models/checkpoints/big.safetensors"),
+            ("f", "models/<odd>&/x.bin"),                  # 2 GB each: then by path
+            ("f", "models/checkpoints/small.safetensors"),
+            ("f", "models/<odd>&/y.bin"),
+            ("s", "models/cfg/"),                          # two small ones collapse (300 B)
+            ("f", "models/one/lone.json"),                 # a single small file stays
+            ("f", "models/loras/old.safetensors"),
+            ("f", "hf-cache/hub/models--o--f/blobs/" + "cd" * 32),     # failed
+            ("f", "hf-cache/hub/models--o--r/blobs/" + "ab" * 32),
+            ("f", "models/vae/v.safetensors"), ("f", "models/vae/s.safetensors")])
+        small = re.search(r'<tr data-k="msrc-s-models/cfg/">(.*?)</tr>', sec, re.S).group(1)
+        self.assertIn("2 small files, 300 B — LAN", small)
+        self.assertIn("models/cfg/a.json", small)
+
+    def test_summary_sums(self):
+        sec = self.section()
+        self.assertIn("12 files · 9.0 GB public (HF auto 5.0 GB · URL 4.0 GB) · "
+                      "18.0 GB LAN only · 4.0 GB outdated", html.unescape(sec))
+        self.assertIn("LAN only includes 6.0 GB whose URL failed this session", sec)
+
+    def test_badges_and_notes(self):
+        sec = self.section()
+        row = lambda p: re.search(rf'<tr data-k="msrc-f-{re.escape(p)}">(.*?)</tr>',  # noqa: E731
+                                  sec, re.S).group(1)
+        self.assertIn(">LAN only<", row("models/checkpoints/big.safetensors"))
+        self.assertIn(">URL ✓<", row("models/vae/v.safetensors"))
+        self.assertIn(">URL ✓ size only<", row("models/vae/s.safetensors"))
+        self.assertIn(">outdated — re-check<", row("models/loras/old.safetensors"))
+        self.assertIn("size differs: share 4, entry 3", row("models/loras/old.safetensors"))
+        self.assertIn(">HF auto<", row("hf-cache/hub/models--o--r/blobs/" + "ab" * 32))
+        failed = row("hf-cache/hub/models--o--f/blobs/" + "cd" * 32)
+        self.assertIn(">URL failed this session — LAN<", failed)
+        # blocked aliases marked, the reason as a hover — escaped
+        big = row("models/checkpoints/big.safetensors")
+        self.assertIn('title="not in source: &lt;x&gt;">blk (blocked)</span>', big)
+
+    def test_urls_and_paths_escaped_never_links(self):
+        sec = self.section()
+        self.assertIn('<code class="msrc-url">https://mirror.example/v?a=1&amp;b=&lt;2&gt;</code>',
+                      sec)
+        self.assertNotIn("<2>", sec)
+        self.assertNotIn("<odd>", sec)
+        self.assertIn("models/&lt;odd&gt;&amp;/x.bin", sec)
+        self.assertNotRegex(sec, r'href="https?://')
+        self.assertNotIn("<script", sec)
+
+    def test_actions_per_source(self):
+        sec = self.section()
+        row = lambda p: re.search(rf'<tr data-k="msrc-f-{re.escape(p)}">(.*?)</tr>',  # noqa: E731
+                                  sec, re.S).group(1)
+        lan = row("models/checkpoints/big.safetensors")
+        self.assertIn('action="/ui/hosts/managed/source-check"', lan)
+        self.assertIn('name="path" value="models/checkpoints/big.safetensors"', lan)
+        self.assertIn('name="url" value=""', lan)
+        # a models/… directory with several LAN-only files: ONE repo form, first row
+        self.assertIn('action="/ui/hosts/managed/source-check-dir"', lan)
+        self.assertIn('name="dir" value="models/checkpoints/"', lan)
+        self.assertNotIn("source-check-dir", row("models/checkpoints/small.safetensors"))
+        self.assertEqual(sec.count('name="dir" value="models/checkpoints/"'), 1)
+        self.assertIn('name="dir" value="models/&lt;odd&gt;&amp;/"', sec)
+        self.assertNotIn("source-check-dir", row("models/one/lone.json"))
+        small = re.search(r'<tr data-k="msrc-s-models/cfg/">(.*?)</tr>', sec, re.S).group(1)
+        self.assertIn('name="dir" value="models/cfg/"', small)
+        # outdated: re-check prefilled with its URL, and removable
+        old = row("models/loras/old.safetensors")
+        self.assertIn('name="url" value="https://mirror.example/o"', old)
+        self.assertIn("/ui/hosts/managed/source-remove?key=models%2Floras%2Fold.safetensors", old)
+        # URL ✓: remove (confirmed), no check form; HF auto: nothing stored → no remove
+        ok = row("models/vae/v.safetensors")
+        self.assertRegex(ok, r'formaction="/ui/hosts/managed/source-remove\?key=models%2Fvae'
+                             r'%2Fv\.safetensors"[^>]*data-confirm="Remove the public URL')
+        self.assertNotIn("source-check", ok)
+        hf = row("hf-cache/hub/models--o--r/blobs/" + "ab" * 32)
+        self.assertNotIn("source-remove", hf)
+        self.assertNotIn("source-check", hf)
+        # a URL that failed this session: a new URL may be entered
+        self.assertIn("source-check", row("hf-cache/hub/models--o--f/blobs/" + "cd" * 32))
+
+    def test_filter_is_a_get_form(self):
+        sec = self.section()
+        form = re.search(r'<form method="get" action="/ui/server"[^>]*>(.*?)</form>', sec,
+                         re.S).group(1)
+        self.assertIn('name="sub" value="models"', form)
+        for c in ("lan", "outdated", "failed", "url", "hf"):
+            self.assertIn(f'name="src" value="{c}" checked', form)
+        sec = self.section("/ui/server?sub=models&src=url&src=bogus")
+        got = [html.unescape(p) for _t, p in self.order(sec)]
+        self.assertEqual(got, ["models/vae/v.safetensors", "models/vae/s.safetensors"])
+        self.assertIn('name="src" value="url" checked', sec)
+        self.assertNotIn('name="src" value="lan" checked', sec)
+        sec = self.section("/ui/server?sub=models&src=lan")
+        self.assertIn('data-k="msrc-s-models/cfg/"', sec)
+        self.assertNotIn("models/vae/v.safetensors", sec)
+
+    def test_live_only_while_pending(self):
+        page = self.get("/ui/server?sub=models")
+        self.assertNotIn("<main data-live", page)
+        self.ov = _overview(pending=True, hashing=["models/x/a.bin", "models/x/b.bin"],
+                            checks={"models/checkpoints/big.safetensors":
+                                    {"kind": "file", "url": "https://mirror.example/b",
+                                     "state": "hashing", "at": 2},
+                                    "models/q/": {"kind": "dir", "repo": "o/r", "rev": "main",
+                                                  "state": "refused", "reason": "HTTP 404 <b>",
+                                                  "at": 1,
+                                                  "left_out": {"m.bin": "size differs"}}})
+        page = self.get("/ui/server?sub=models")
+        self.assertIn('<main data-live="3"', page)
+        m = self.main_of(page)
+        self.assertIn("checking: hashing", m)
+        self.assertIn("share hashes: hashing <code>models/x/a.bin</code> · 1 more waiting", m)
+        self.assertIn('data-k="msrc-chk-models/q/"', m)
+        self.assertIn("HTTP 404 &lt;b&gt;", m)
+        self.assertIn("left out: <code>m.bin</code> — size differs", m)
+        # the overview is built by main (off the loop); the page asked for it once
+        self.assertEqual([c[0] for c in self.calls], ["overview", "overview"])
+
+    def test_not_listed_and_unavailable(self):
+        self.ov = _overview(rows=[], listed=False, problem="LAN source unreachable")
+        sec = self.section()
+        self.assertIn("The share is not listed yet (LAN source unreachable)", sec)
+        self.assertIn("List now", sec)
+
+        async def broken():
+            raise RuntimeError("x")
+        admin._model_sources = broken
+        m = self.main_of(self.get("/ui/server?sub=models"))
+        self.assertIn("The overview is not available: RuntimeError", m)
+        self.assertIn('data-k="hosts-catalog"', m)                   # the tab stays
+
+    def test_actions_are_post_only_and_land_on_models(self):
+        for p in ("/ui/hosts/managed/source-check", "/ui/hosts/managed/source-check-dir",
+                  "/ui/hosts/managed/source-remove"):
+            self.assertIn(p, admin._POST_ACTIONS)
+            self.assertEqual(self.c.get(p, headers=SAME, follow_redirects=False).status_code,
+                             405, p)
+        self.assertEqual(self.calls, [])
+        r = self.post("/ui/hosts/managed/source-check",
+                      {"path": "models/a b.bin", "url": "https://x.example/a?t=1"})
+        path, q = self.loc(r)
+        self.assertEqual((path, q["sub"], q["msg"]), ("/ui/server", "models",
+                                                      "check of models/a b.bin queued"))
+        r = self.post("/ui/hosts/managed/source-check-dir", {"dir": "models/d/", "repo": "o/r"})
+        self.assertEqual(self.loc(r)[1]["msg"], "check of models/d/ queued")
+        r = self.post("/ui/hosts/managed/source-remove?key=models%2Fd%2F", {})
+        self.assertEqual(self.loc(r)[1]["msg"], "source of models/d/ removed")
+        self.assertEqual(self.calls[:2], [("check", "models/a b.bin", "https://x.example/a?t=1"),
+                                          ("check_dir", "models/d/", "o/r")])
+        self.assertEqual(self.calls[2][:2], ("remove", "models/d/"))
+
+    def test_action_errors_are_banners_not_500(self):
+        async def boom(*a):
+            raise RuntimeError("secret detail https://x.example/?token=abc")
+        admin._check_source = boom
+        r = self.post("/ui/hosts/managed/source-check", {"path": "p", "url": "u"})
+        self.assertEqual(self.loc(r)[1]["msg"], "not checked: RuntimeError")
+
+
+class CatalogStaleGuard(_Fixture):
+    """R-3: two writers of `modelsync_catalog` — Check & save and the JSON editor. A
+    form opened before a check wrote its entry must not silently overwrite it."""
+
+    def setUp(self):
+        super().setUp()
+        saved = main._modelsrc_obj
+        self.addCleanup(setattr, main, "_modelsrc_obj", saved)
+        main._modelsrc_obj = None
+        main.jobs_cfg["store_path"] = os.path.join(self.tmp.name, "store.db")
+        store.set_settings({"modelsync_catalog": []})
+
+    def form(self, page):
+        f = re.search(r'<form method="post" action="/ui/hosts/managed/catalog"([^>]*)>(.*?)'
+                      r"</form>", page, re.S)
+        self.assertIsNotNone(f)
+        h = re.search(r'name="catalog_hash" value="([0-9a-f]*)"', f.group(2))
+        self.assertIsNotNone(h)
+        return f.group(1), h.group(1), f.group(2)
+
+    def test_editor_form_is_live_skip_and_carries_the_hash_of_what_it_shows(self):
+        attrs, h, _body = self.form(self.get("/ui/server?sub=models"))
+        self.assertIn("data-live-skip", attrs)
+        self.assertEqual(h, main.modelsync_catalog_hash([]))
+
+    def test_stale_save_refused_with_the_text_kept_and_the_current_hash(self):
+        _a, old, _b = self.form(self.get("/ui/server?sub=models"))
+        theirs = [{"file": "models/vae/a.st", "url": "https://mirror.example/a"}]
+        store.set_settings({"modelsync_catalog": theirs})       # Check & save meanwhile
+        mine = '[{"file": "models/vae/b.st", "url": "https://mirror.example/<b>"}]'
+        r = self.post("/ui/hosts/managed/catalog", {"catalog": mine, "catalog_hash": old},
+                      status=400)
+        self.assertIn("the catalog changed since this form was opened — your text is kept "
+                      "below; merge and save again", r.text)
+        self.assertIn(html.escape(mine), r.text)                   # AS TYPED
+        _a, new, _b = self.form(r.text)
+        self.assertEqual(new, main.modelsync_catalog_hash(theirs))
+        self.assertNotIn("<main data-live", r.text)                # a refusal is never live
+        self.assertEqual(store.get_setting("modelsync_catalog"), theirs)
+        # merged and saved with the hash the refusal handed back
+        r = self.post("/ui/hosts/managed/catalog", {"catalog": mine, "catalog_hash": new})
+        self.assertEqual(self.loc(r)[1]["sub"], "models")
+        self.assertEqual(store.get_setting("modelsync_catalog")[0]["file"], "models/vae/b.st")
+
+    def test_validation_refusal_keeps_the_hash_it_was_opened_with(self):
+        _a, old, _b = self.form(self.get("/ui/server?sub=models"))
+        store.set_settings({"modelsync_catalog": [{"file": "models/vae/a.st",
+                                                   "url": "https://mirror.example/a"}]})
+        r = self.post("/ui/hosts/managed/catalog", {"catalog": '[{"bogus": 1}]',
+                                                    "catalog_hash": old}, status=400)
+        _a, kept, _b = self.form(r.text)
+        self.assertEqual(kept, old)     # not refreshed: the next Save must still see the change
+
+    def test_stale_refusal_names_a_running_check(self):
+        _a, old, _b = self.form(self.get("/ui/server?sub=models"))
+        store.set_settings({"modelsync_catalog": [{"file": "models/vae/a.st",
+                                                   "url": "https://mirror.example/a"}]})
+        self.addCleanup(setattr, main, "_src_checks", main._src_checks)
+        main._src_checks = {"models/vae/a.st": {"kind": "file", "state": "hashing"}}
+        r = self.post("/ui/hosts/managed/catalog", {"catalog": "[]", "catalog_hash": old},
+                      status=400)
+        self.assertIn("a Check &amp; save is still running", r.text)
+
+
+class ModelSourcesWiring(_Fixture):
+    """The real chain: admin → main.model_sources_overview → the plan over the store's
+    aliases and a (fake) share listing → the rendered row and its POST action."""
+
+    def setUp(self):
+        super().setUp()
+
+        class Lan:
+            generation = sha_generation = 1
+
+            def cached(self):
+                return {"models/checkpoints/w.safetensors": 3 * GB}
+
+            def sha_files(self):
+                return {}
+
+            def hash_queue(self):
+                return []
+
+            def problem(self):
+                return ""
+        for n in ("modelsrc", "backends", "image_models"):
+            self.addCleanup(setattr, main, n, getattr(main, n))
+        main.modelsrc = lambda: Lan()
+        main.backends = [{"name": "cx", "type": "comfyui", "url": "http://127.0.0.1:1"}]
+        main.image_models = {}
+        main._msrc_memo[:] = [None, None]
+        main._msrc_kinds_memo[:] = [None, None]
+        self.addCleanup(lambda: (main._msrc_memo.__setitem__(slice(None), [None, None]),
+                                 main._msrc_kinds_memo.__setitem__(slice(None), [None, None])))
+        store.set_settings({"modelsync_catalog": []})
+        store.upsert("img", [{"backend": "cx", "task": "text2img", "workflow_json": {
+            "1": {"class_type": "CheckpointLoaderSimple",
+                  "inputs": {"ckpt_name": "w.safetensors"}}}}])
+
+    def test_a_needed_lan_file_renders_with_its_check_form(self):
+        m = self.main_of(self.get("/ui/server?sub=models"))
+        row = re.search(r'<tr data-k="msrc-f-models/checkpoints/w.safetensors">(.*?)</tr>', m,
+                        re.S)
+        self.assertIsNotNone(row, m[-2000:])
+        self.assertIn(">LAN only<", row.group(1))
+        self.assertIn('action="/ui/hosts/managed/source-check"', row.group(1))
+        self.assertIn("1 file · 0.0 GB public", m)
+        self.assertIs(admin._model_sources, main.model_sources_overview)
+        self.assertIs(admin._remove_source, main.remove_source)
+        # remove_source cancels tasks: the console awaits it on the loop, never in a thread
+        with open(admin.__file__) as fh:
+            src = fh.read()
+        self.assertNotRegex(src, r"to_thread\(\s*_remove_source")
+        self.assertIn("await _remove_source(", src)
 
 
 # ── links into the Server tab ────────────────────────────────────────────────────────
