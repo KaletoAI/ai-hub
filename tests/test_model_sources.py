@@ -617,7 +617,7 @@ class CheckDir(_Base):
         self.assertTrue(main.source_checks_pending())
         self.assertEqual(len(self.lan.calls), 1)        # the first waits at the gate
         t = main._src_confirm_tasks[self.D]
-        self.assertIn("removed", main.remove_source(self.D))
+        self.assertIn("removed", await main.remove_source(self.D))
         await asyncio.gather(t, return_exceptions=True)
         self.assertTrue(t.cancelled())
         self.lan.gate.set()
@@ -626,6 +626,23 @@ class CheckDir(_Base):
         self.assertFalse(main.source_checks_pending())
         self.assertEqual(main._src_confirming, {})
         self.assertEqual(self.catalog(), [])
+
+    async def test_remove_cancels_the_confirm_task_on_the_loop(self):
+        """Review-3 RR-1: `remove_source` is a coroutine and cancels ON the loop — a
+        cancel from a worker thread may be lost and the removed dir keeps hashing."""
+        import inspect
+        self.assertTrue(inspect.iscoroutinefunction(main.remove_source))
+        self.lan.gate = asyncio.Event()
+        await self.run_check(main.check_dir_source(self.D, self.REPO))
+        await asyncio.sleep(0.01)
+        t = main._src_confirm_tasks[self.D]
+        self.assertFalse(t.done())
+        await main.remove_source(self.D)
+        # cancelled by the time the remove returns (it awaited its write meanwhile)
+        await asyncio.sleep(0)
+        self.assertTrue(t.cancelled())
+        self.assertNotIn(self.D, main._src_confirm_tasks)
+        self.assertNotIn(self.D, main._src_confirm_run)
 
     async def test_a_recheck_replaces_the_confirmation_and_stays_pending(self):
         self.lan.gate = asyncio.Event()
@@ -691,11 +708,11 @@ class RemoveAndLock(_Base):
              "files": {"m.st": [1, None, False]}}
         m = {"match": {"alias": "z"}, "paths": ["models/vae/a.st"]}
         store.set_settings({"modelsync_catalog": [f, d, m]})
-        self.assertIn("removed", main.remove_source("models/vae/a.st"))
+        self.assertIn("removed", await main.remove_source("models/vae/a.st"))
         self.assertEqual(self.catalog(), [d, m])        # a match entry naming it stays
-        self.assertIn("removed", main.remove_source("models/x/"))
+        self.assertIn("removed", await main.remove_source("models/x/"))
         self.assertEqual(self.catalog(), [m])
-        self.assertIn("no source entry", main.remove_source("models/x/"))
+        self.assertIn("no source entry", await main.remove_source("models/x/"))
 
     async def test_remove_cancels_a_waiting_check(self):
         a = "models/vae/a.st"
@@ -706,7 +723,7 @@ class RemoveAndLock(_Base):
         t = main._src_check_tasks[a]
         for _ in range(20):
             await asyncio.sleep(0)
-        main.remove_source(a)
+        await main.remove_source(a)
         await asyncio.gather(t, return_exceptions=True)
         self.assertTrue(t.cancelled())
         self.assertNotIn(a, main.source_checks())
@@ -726,7 +743,7 @@ class RemoveAndLock(_Base):
             self.lan = FakeLan({a: 10}, share_sha={a: SHA_A})
             self.routes["https://mirror.example/a"] = resp(200, content_length=10)
             await self.run_check(main.check_source(a, "https://mirror.example/a"))
-            main.remove_source(a)
+            await main.remove_source(a)
             self.assertEqual(main.save_modelsync_catalog([]), [])
         finally:
             store.set_settings = real

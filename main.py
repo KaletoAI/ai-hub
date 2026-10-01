@@ -6883,15 +6883,23 @@ def _confirm_row(d: str, repo: str, commit: str, rel: str, size: int, share: str
     return result[0] if not errs else "gone"
 
 
-def remove_source(key: str) -> str:
+async def remove_source(key: str) -> str:
     """The overview's "remove": drop the per-file source entry (`key` = its path) or
-    the directory source (`key` ending in `/`) — and a check of it still waiting."""
+    the directory source (`key` ending in `/`) — and a check of it still waiting, and a
+    directory's background confirmation. ASYNC on purpose (review-3 RR-1): the task
+    cancels must run ON the loop — `Task.cancel()` from a worker thread is not
+    thread-safe and may be lost — so only the catalog write goes to a thread. Await it
+    on the loop; never wrap it in `asyncio.to_thread`."""
     key = str(key or "").strip()
     found = [False]
-    # an in-flight Check & save write (a worker thread a cancel cannot stop) checks the
-    # status under the catalog lock: gone = removed meanwhile, nothing written (M-6)
+    # loop side first: the status goes (an in-flight Check & save write — a worker
+    # thread a cancel cannot stop — re-checks it under the catalog lock and writes
+    # nothing, M-6), the confirmation run ends, the check task is cancelled
     _src_checks.pop(key, None)
     _src_stop_confirm(key)
+    t = _src_check_tasks.get(key)
+    if t is not None and not t.done():
+        t.cancel()
 
     def fn(cat):
         out = [e for e in cat if not (isinstance(e, dict) and (
@@ -6900,14 +6908,9 @@ def remove_source(key: str) -> str:
             return None
         found[0] = True
         return out
-    errs = _catalog_write(fn)
+    errs = await asyncio.to_thread(_catalog_write, fn)
     if errs:
         return f"not removed: {errs[0]}"
-    _src_stop_confirm(key)
-    t = _src_check_tasks.get(key)
-    if t is not None and not t.done():
-        t.cancel()
-    _src_checks.pop(key, None)
     if not found[0]:
         return f"no source entry for {key}"
     logger.info(f"[model sources] {key}: source removed")

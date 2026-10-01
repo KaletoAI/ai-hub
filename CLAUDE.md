@@ -1893,8 +1893,11 @@ via injected callables, staying hot-reload-safe.
   the path, or the dir ending in `/`; `state` queued|heading|hashing|done|refused, a
   FIXED `reason`, `note`, `left_out`/`outdated` `{relpath: reason}`, `confirming`,
   `progress`), `source_checks_pending()` (a check or a dir's background hash still
-  pending — the overview's live flag), `remove_source(key)` drops the per-file or dir
-  entry (and cancels a pending check of it). **The HEAD** (`_head_ref_url(url,
+  pending — the overview's live flag), `await remove_source(key)` drops the per-file
+  or dir entry (and cancels a pending check of it and a dir's confirmation) — a
+  coroutine on purpose: the cancels run ON the loop (`Task.cancel()` from a worker
+  thread is not thread-safe and may be lost), only its catalog write goes to a thread;
+  never wrap it in `asyncio.to_thread` (review-3 RR-1). **The HEAD** (`_head_ref_url(url,
   hf_token_ok=True)` → `UrlHead{error, size, sha256, commit, status, hops}`, never
   raises) is `_fetch_ref_url`'s SSRF rule on EVERY hop (review C-2): each name resolved,
   every address `ref_addr_blocked` (WITHOUT `ref_url_allow_cidrs` — a LAN mirror is
