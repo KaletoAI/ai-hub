@@ -47,6 +47,7 @@ COMFY_COMMIT_DEFAULT = "1d61dcc35c35541388c0001bacc7703db14e8bea"
 GPU_TYPES = ("a6000", "l40", "a100xl", "h100")
 TEMPLATES = ("comfy-ui", "base")
 AUTO_TEMPLATE = ""                     # bootstrap_template "auto" (stored blank)
+VCPUS_INCLUDED = ""                    # vcpus "included" (stored blank, see OPTION_FIELDS)
 
 # The host form as data (read by `options_of`, rendered by the console). `min` bounds an
 # int; every field has a default, which is also what an absent or blank field becomes.
@@ -56,8 +57,13 @@ OPTION_FIELDS: list = [
      "hint": "The GPU of the instance; its price per hour comes from Thunder's price list."},
     {"key": "num_gpus", "label": "gpus", "type": "int", "min": 1, "default": 1,
      "hint": "GPUs per instance; each one includes 100 GB of disk."},
-    {"key": "vcpus", "label": "vcpus", "type": "int", "min": 1, "default": 8,
-     "hint": "vCPUs; every one above the GPU configuration's smallest option is billed "
+    # "" = included: the GPU configuration's smallest `vcpuOptions` entry, resolved at
+    # START from /v2/specs (`resolve_options`) — Thunder bills every vCPU above it, and a
+    # fixed default of 8 paid 2 extra on every l40 (operator 2026-10-01: $0.87/h instead
+    # of $0.79/h). The form may send the word "included"; what is stored is "".
+    {"key": "vcpus", "label": "vcpus", "type": "int", "min": 1, "default": VCPUS_INCLUDED,
+     "aliases": {"included": VCPUS_INCLUDED}, "blank_label": "included",
+     "hint": "blank/included = the GPU configuration's included vCPUs; more are billed "
              "extra."},
     # "" = auto (Ruling M5): the controller picks `comfy-ui` when a ComfyUI service is
     # attached at the first start, else `base` — a fixed `comfy-ui` default handed every
@@ -196,8 +202,12 @@ def slug(s) -> str:
 # ---- create / instances -------------------------------------------------------------
 
 def create_body(cfg: dict, template: str, disk_gb: int, public_key: str) -> dict:
-    """The `POST /instances/create` body. The API wants integers; the backend form
-    stores whatever was typed, so an int() here is what keeps "8" from being a 422."""
+    """The `POST /instances/create` body from RESOLVED options (`resolve_options`: a
+    blank `vcpus` = included is a number by then). The API wants integers; the int()
+    here is what keeps "8" from being a 422 — and a blank `vcpus` a ValueError, never a
+    count this module made up."""
+    if cfg.get("vcpus") in (None, ""):
+        raise ValueError("vcpus not resolved — resolve_options() first")
     return {"cpu_cores": int(cfg["vcpus"]), "disk_size_gb": int(disk_gb),
             "gpu_type": str(cfg["gpu_type"]), "num_gpus": int(cfg.get("num_gpus") or 1),
             "template": str(template), "public_key": str(public_key)}
@@ -388,20 +398,111 @@ def spec_for(specs_obj, gpu_type: str, num_gpus: int) -> Optional[dict]:
     return spec if isinstance(spec, dict) else None
 
 
-def hourly_cost(pricing: dict, gpu_type: str, num_gpus: int, vcpus: int, disk_gb: int,
+def vcpu_options(specs_obj, gpu_type: str, num_gpus: int) -> list[int]:
+    """The vCPU counts Thunder offers for this GPU configuration (`vcpuOptions`, counts
+    may be strings), sorted and positive only — [] when the specs are unknown, do not
+    list the configuration, or list no usable option."""
+    spec = spec_for(specs_obj, gpu_type, num_gpus) or {}
+    raw = spec.get("vcpuOptions")
+    vals = (_int(x) for x in (raw if isinstance(raw, list) else []))
+    return sorted({v for v in vals if v is not None and v > 0})
+
+
+def included_vcpus(specs_obj, gpu_type: str, num_gpus: int) -> Optional[int]:
+    """What `vcpus` blank (= included) means for this GPU configuration: the SMALLEST
+    `vcpuOptions` entry — the count `hourly_cost` bills nothing extra for. None when the
+    specs cannot say (never a guess: the start refuses instead)."""
+    opts = vcpu_options(specs_obj, gpu_type, num_gpus)
+    return opts[0] if opts else None
+
+
+def _cfg_of(options) -> tuple[str, int]:
+    o = options if isinstance(options, dict) else {}
+    return str(o.get("gpu_type") or ""), (_int(o.get("num_gpus")) or 1)
+
+
+def _offers_text(gpu: str, n: int, opts: list[int]) -> str:
+    return f"{gpu} ×{n} offers vCPUs " + ", ".join(str(x) for x in opts)
+
+
+def options_refusal(options, specs_obj) -> Optional[str]:
+    """What the provider's spec list refuses in stored options (the Save's check):
+    a typed `vcpus` the GPU configuration does not offer ("l40 ×1 offers vCPUs 6, 12,
+    24"). None when fine — and when the specs are unknown or do not list the
+    configuration: a Save cannot judge then, the start re-checks (`resolve_options`)."""
+    o = options if isinstance(options, dict) else {}
+    v = o.get("vcpus")
+    if v in (None, VCPUS_INCLUDED):
+        return None
+    gpu, n = _cfg_of(o)
+    opts = vcpu_options(specs_obj, gpu, n)
+    if opts and _int(v) not in opts:
+        return _offers_text(gpu, n, opts)
+    return None
+
+
+def resolve_options(options, specs_obj) -> tuple[Optional[dict], Optional[str]]:
+    """The options a create is built from → `(resolved copy, None)` or `(None, why)`.
+    `vcpus` blank (included) becomes the configuration's smallest `vcpuOptions` entry;
+    when the specs cannot be read or name no option the start is refused with a fixed
+    text instead (never a guessed count). A typed count is refused when the specs know
+    it is not offered, else used as is (typed, not guessed)."""
+    out = dict(options) if isinstance(options, dict) else {}
+    gpu, n = _cfg_of(out)
+    v = out.get("vcpus")
+    if v in (None, VCPUS_INCLUDED):
+        inc = included_vcpus(specs_obj, gpu, n)
+        if inc is None:
+            return None, (f"cannot read Thunder's vCPU options for {gpu} ×{n} — set vcpus "
+                          "explicitly or try again")
+        out["vcpus"] = inc
+        return out, None
+    why = options_refusal(out, specs_obj)
+    if why:
+        return None, why
+    if _int(v) is None:
+        return None, f"host option vcpus is not a number: {v!r}"
+    out["vcpus"] = _int(v)
+    return out, None
+
+
+def effective_vcpus(options, specs_obj) -> Optional[int]:
+    """The vCPU count a start would use, for DISPLAY (card, $/h): a typed count, else
+    the included one from the specs, else None (the card says "included")."""
+    o = options if isinstance(options, dict) else {}
+    v = o.get("vcpus")
+    if v in (None, VCPUS_INCLUDED):
+        gpu, n = _cfg_of(o)
+        return included_vcpus(specs_obj, gpu, n)
+    return _int(v)
+
+
+def blank_label(key: str, options, specs_obj) -> str:
+    """What a BLANK option field means, for the form's placeholder ("" = nothing to
+    say): `vcpus` → "included (6 for l40 ×1)" when the specs know the count, else
+    "included". The console reads cached specs only — a page view never fetches."""
+    if key != "vcpus":
+        return ""
+    gpu, n = _cfg_of(options)
+    inc = included_vcpus(specs_obj, gpu, n)
+    return f"included ({inc} for {gpu} ×{n})" if inc is not None else "included"
+
+
+def hourly_cost(pricing: dict, gpu_type: str, num_gpus: int, vcpus, disk_gb: int,
                 spec: Optional[dict]) -> Optional[float]:
     """$/h of a running instance from `/v2/pricing`: the GPU configuration's rate +
     every vCPU above the SMALLEST option of the spec (that is how Thunder bills them —
     pinned in the test, to verify against a real invoice) + disk per GB·h for what lies
-    BEYOND the 100 GB per GPU Thunder includes. None when the configuration has no
-    price: a made-up number is worse than none."""
+    BEYOND the 100 GB per GPU Thunder includes. `vcpus` is the RESOLVED count
+    (`effective_vcpus`); None/blank = included, nothing extra. None when the
+    configuration has no price: a made-up number is worse than none."""
     rate = (pricing or {}).get(_config_key(gpu_type, num_gpus))
     if rate is None:
         return None
     extra = 0
     opts = [o for o in (_int(x) for x in ((spec or {}).get("vcpuOptions") or [])) if o is not None]
     if opts:
-        extra = max(0, int(vcpus or 0) - min(opts))
+        extra = max(0, (_int(vcpus) or 0) - min(opts))
     billable_gb = max(0, int(disk_gb or 0) - _DISK_PER_GPU_GB * max(1, int(num_gpus or 1)))
     return (float(rate) + extra * float(pricing.get("additional_vcpus") or 0)
             + billable_gb * float(pricing.get("disk_gb") or 0))

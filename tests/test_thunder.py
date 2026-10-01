@@ -183,6 +183,103 @@ class Body(unittest.TestCase):
         self.assertEqual(b, {"cpu_cores": 8, "disk_size_gb": 220, "gpu_type": "a6000", "num_gpus": 1,
                              "template": "comfy-ui", "public_key": "ssh-ed25519 AAA"})
 
+    def test_body_never_guesses_a_blank_vcpus(self):
+        # "" = included is resolved at start (resolve_options); a body built from the
+        # blank would have to invent a number — it refuses instead
+        with self.assertRaises(ValueError):
+            thunder.create_body({"gpu_type": "l40", "num_gpus": 1, "vcpus": ""}, "base", 100, "k")
+
+
+# the three shapes /v2/specs has been seen in: wrapped map, bare map, string counts
+L40 = {"specs": {"l40_x1": {"vcpuOptions": [12, 6, 24], "storageGB": {"min": 100, "max": 500}}}}
+L40_BARE = {"l40_x1": {"vcpuOptions": ["24", "6", "12"]}}
+
+
+class IncludedVcpus(unittest.TestCase):
+    """`vcpus` blank = the GPU configuration's INCLUDED count (the smallest option):
+    Thunder bills every vCPU above it, so a fixed default of 8 paid 2 extra on an l40
+    (operator 2026-10-01: $0.87/h instead of $0.79/h)."""
+
+    def test_field_default_is_included(self):
+        f = {x["key"]: x for x in thunder.OPTION_FIELDS}["vcpus"]
+        self.assertEqual(f["default"], thunder.VCPUS_INCLUDED)
+        self.assertEqual(thunder.VCPUS_INCLUDED, "")
+        self.assertEqual(f["aliases"], {"included": ""})
+        self.assertIn("included", f["hint"])
+        self.assertIn("billed extra", f["hint"])
+        opts, errs, _ = thunder.options_of({})
+        self.assertEqual((opts["vcpus"], errs), ("", []))
+        # the form may send the word; what is stored is the blank
+        opts, errs, typed = thunder.options_of({"opt__vcpus": "included"})
+        self.assertEqual((opts["vcpus"], errs, typed["vcpus"]), ("", [], "included"))
+        # a typed count is still validated as before
+        self.assertEqual(thunder.options_of({"opt__vcpus": "12"})[0]["vcpus"], 12)
+        self.assertTrue(thunder.options_of({"opt__vcpus": "0"})[1])
+        self.assertTrue(thunder.options_of({"opt__vcpus": "6.5"})[1])
+
+    def test_included_over_every_specs_shape(self):
+        self.assertEqual(thunder.included_vcpus(L40, "l40", 1), 6)
+        self.assertEqual(thunder.included_vcpus(L40_BARE, "l40", 1), 6)
+        self.assertEqual(thunder.included_vcpus(SPECS, "a6000", 1), 6)
+        self.assertEqual(thunder.vcpu_options(L40_BARE, "l40", 1), [6, 12, 24])
+        # missing configuration, no options, junk options, no specs at all → None
+        self.assertIsNone(thunder.included_vcpus(L40, "h100", 1))
+        self.assertIsNone(thunder.included_vcpus(L40, "l40", 2))
+        self.assertIsNone(thunder.included_vcpus({"specs": {"l40_x1": {}}}, "l40", 1))
+        self.assertIsNone(thunder.included_vcpus({"specs": {"l40_x1": {"vcpuOptions": ["x"]}}},
+                                                 "l40", 1))
+        self.assertIsNone(thunder.included_vcpus({"specs": {"l40_x1": {"vcpuOptions": [0]}}},
+                                                 "l40", 1))
+        for bad in (None, [], "x", {}):
+            self.assertIsNone(thunder.included_vcpus(bad, "l40", 1))
+            self.assertEqual(thunder.vcpu_options(bad, "l40", 1), [])
+
+    def test_save_refusal(self):
+        opts = {"gpu_type": "l40", "num_gpus": 1}
+        self.assertEqual(thunder.options_refusal(dict(opts, vcpus=8), L40),
+                         "l40 ×1 offers vCPUs 6, 12, 24")
+        self.assertIsNone(thunder.options_refusal(dict(opts, vcpus=12), L40))
+        self.assertIsNone(thunder.options_refusal(dict(opts, vcpus=""), L40))
+        # unknown specs (or a configuration they do not list) cannot judge: the start does
+        self.assertIsNone(thunder.options_refusal(dict(opts, vcpus=8), None))
+        self.assertIsNone(thunder.options_refusal(dict(opts, vcpus=8, gpu_type="h100"), L40))
+
+    def test_resolve_at_start(self):
+        opts = {"gpu_type": "l40", "num_gpus": 1, "vcpus": ""}
+        res, why = thunder.resolve_options(opts, L40)
+        self.assertEqual((res["vcpus"], why), (6, None))
+        self.assertEqual(opts["vcpus"], "")                 # a copy, never the stored dict
+        self.assertEqual(thunder.create_body(res, "base", 100, "k")["cpu_cores"], 6)
+        # never guess: unreadable specs, or a configuration they do not name
+        for specs in (None, {}, {"specs": {"a6000_x1": {"vcpuOptions": [6]}}}):
+            res, why = thunder.resolve_options(opts, specs)
+            self.assertIsNone(res)
+            self.assertEqual(why, "cannot read Thunder's vCPU options for l40 ×1 — set vcpus "
+                                  "explicitly or try again")
+        # a typed count: refused when the specs know it is not offered, else as is
+        res, why = thunder.resolve_options(dict(opts, vcpus=8), L40)
+        self.assertEqual((res, why), (None, "l40 ×1 offers vCPUs 6, 12, 24"))
+        self.assertEqual(thunder.resolve_options(dict(opts, vcpus=12), L40)[0]["vcpus"], 12)
+        self.assertEqual(thunder.resolve_options(dict(opts, vcpus="12"), None)[0]["vcpus"], 12)
+
+    def test_effective_and_label(self):
+        o = {"gpu_type": "l40", "num_gpus": 1, "vcpus": ""}
+        self.assertEqual(thunder.effective_vcpus(o, L40), 6)
+        self.assertIsNone(thunder.effective_vcpus(o, None))
+        self.assertEqual(thunder.effective_vcpus(dict(o, vcpus=12), None), 12)
+        self.assertEqual(thunder.blank_label("vcpus", o, L40), "included (6 for l40 ×1)")
+        self.assertEqual(thunder.blank_label("vcpus", o, None), "included")
+        self.assertEqual(thunder.blank_label("reserve_gb", o, L40), "")
+
+    def test_cost_of_included_is_the_rate(self):
+        # the resolved count bills nothing extra; an unresolved blank neither
+        self.assertAlmostEqual(thunder.hourly_cost(PRICING, "l40", 1, 6, 100,
+                                                   thunder.spec_for(L40, "l40", 1)), 0.79)
+        self.assertAlmostEqual(thunder.hourly_cost(PRICING, "l40", 1, None, 100,
+                                                   thunder.spec_for(L40, "l40", 1)), 0.79)
+        self.assertAlmostEqual(thunder.hourly_cost(PRICING, "l40", 1, 8, 100,
+                                                   thunder.spec_for(L40, "l40", 1)), 0.87)
+
 
 if __name__ == "__main__":
     unittest.main()

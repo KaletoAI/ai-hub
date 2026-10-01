@@ -281,6 +281,10 @@ class Registry(unittest.TestCase):
         self.assertEqual(c._login(), f"{thunder.SSH_USER}@10.0.0.5")
 
 
+# /v2/specs for every GPU type the form offers (a6000 ×1's options as in tests/fakes.py)
+SPECS_A6000 = {"specs": {f"{g}_x1": {"vcpuOptions": [6, 8]} for g in thunder.GPU_TYPES}}
+
+
 class OptionFields(unittest.TestCase):
     def _fields(self):
         return {f["key"]: f for f in thunder.OPTION_FIELDS}
@@ -314,10 +318,14 @@ class OptionFields(unittest.TestCase):
                 return super().get(k, d)
         opts, errs, _ = thunder.options_of({})
         self.assertEqual(errs, [])
+        # the default vcpus is "included", resolved at start from the specs (the
+        # smallest option — what an a6000 ×1 bills nothing extra for)
+        opts, why = thunder.resolve_options(opts, SPECS_A6000)
+        self.assertIsNone(why)
         body = thunder.create_body(Rec(opts), "comfy-ui", 120, "ssh-ed25519 AAAA")
         self.assertTrue(read)
         self.assertLessEqual(read, set(self._fields()))
-        self.assertEqual((body["gpu_type"], body["num_gpus"], body["cpu_cores"]), ("a6000", 1, 8))
+        self.assertEqual((body["gpu_type"], body["num_gpus"], body["cpu_cores"]), ("a6000", 1, 6))
         # and what the controller reads beyond create_body
         self.assertLessEqual({"bootstrap_template", "reserve_gb", "comfy_commit", "nodes"},
                              set(self._fields()))
@@ -329,6 +337,8 @@ class OptionFields(unittest.TestCase):
         self.assertEqual(set(opts), set(f))
         for k, fld in f.items():
             v = opts[k]
+            if fld["type"] == "int" and v == "" and fld["default"] == "":
+                continue            # a blank with a meaning ("included"), resolved at start
             if fld["type"] == "int":
                 self.assertIsInstance(v, int, k)
                 self.assertNotIsInstance(v, bool, k)
@@ -339,7 +349,9 @@ class OptionFields(unittest.TestCase):
                 self.assertIsInstance(v, list, k)
             elif k == "comfy_commit":
                 self.assertRegex(v, r"^[0-9a-fA-F]{40}$")
-        thunder.create_body(opts, opts["bootstrap_template"], 100, "k")   # never raises
+        res, why = thunder.resolve_options(opts, SPECS_A6000)
+        self.assertIsNone(why)
+        thunder.create_body(res, opts["bootstrap_template"], 100, "k")   # never raises
 
     def test_options_of_defaults(self):
         opts, errs, typed = thunder.options_of({})
@@ -403,7 +415,8 @@ class OptionFields(unittest.TestCase):
             self.assertIsInstance(errs, list)
             self.assertIsInstance(typed, dict)
         # an int (a form built by code, not a browser) is read as its string
-        self.assertEqual(thunder.options_of({"opt__vcpus": 8})[:2], (thunder.options_of({})[0], []))
+        self.assertEqual(thunder.options_of({"opt__vcpus": 8})[:2],
+                         (dict(thunder.options_of({})[0], vcpus=8), []))
         self.assertEqual(thunder.options_of({"opt__nodes": ["a", "b"]})[0]["nodes"], ["a", "b"])
         # anything else is validated as its string, never silently the default
         self.assertEqual(len(thunder.options_of({"opt__num_gpus": object()})[1]), 1)
