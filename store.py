@@ -404,6 +404,15 @@ def delete_backend_references(name: str) -> dict:
 # decrypt_secret's legacy-plaintext passthrough and is encrypted on its next save.
 
 _SECRET_SETTINGS = {"api_key", "hf_token"}
+# One managed-host provider's API token per kind (`provider_token_thunder`): a secret
+# setting too, read and written only through get_provider_token/set_provider_token and
+# never part of `get_settings()` — that dict feeds the Server tab and the startup
+# overlay, neither of which has any business holding a billing token.
+PROVIDER_TOKEN_PREFIX = "provider_token_"
+
+
+def _is_secret(key: str) -> bool:
+    return key in _SECRET_SETTINGS or str(key).startswith(PROVIDER_TOKEN_PREFIX)
 
 
 def save_backend_models(bid: str, models) -> None:
@@ -446,8 +455,10 @@ def get_settings() -> dict:
         rows = c.execute("SELECT key, value_json FROM settings").fetchall()
     out = {}
     for r in rows:
+        if str(r["key"]).startswith(PROVIDER_TOKEN_PREFIX):
+            continue                    # get_provider_token is their only reader
         v = json.loads(r["value_json"])
-        if r["key"] in _SECRET_SETTINGS and isinstance(v, str):
+        if _is_secret(r["key"]) and isinstance(v, str):
             v = decrypt_secret(v)
         out[r["key"]] = v
     return out
@@ -460,7 +471,7 @@ def get_setting(key: str, default=None):
     if raw is None:
         return default
     v = json.loads(raw)
-    if key in _SECRET_SETTINGS and isinstance(v, str):
+    if _is_secret(key) and isinstance(v, str):
         v = decrypt_secret(v)
     return v
 
@@ -469,7 +480,7 @@ def set_settings(values: dict) -> None:
     now = int(time.time())
     with _conn() as c:
         for k, v in values.items():
-            if k in _SECRET_SETTINGS and isinstance(v, str) and v:
+            if _is_secret(k) and isinstance(v, str) and v:
                 v = encrypt_secret(v)
             c.execute(
                 "INSERT INTO settings (key, value_json, updated) VALUES (?,?,?) "
@@ -482,7 +493,7 @@ def setdefault_setting(key: str, value):
     """Store `value` under `key` only if the key is absent, and return what is stored
     now — one INSERT … DO NOTHING, so a seed written on first read can never overwrite
     a value an operator saved in the same instant. Not for secret settings."""
-    if key in _SECRET_SETTINGS:
+    if _is_secret(key):
         raise ValueError(f"{key} is a secret setting")
     with _conn() as c:
         c.execute("INSERT INTO settings (key, value_json, updated) VALUES (?,?,?) "
@@ -642,19 +653,22 @@ def set_host(name: str, entry) -> None:
 
 
 # ── Managed hosts (machines the gateway starts and stops: hostctl.py) ───────────
-# One settings dict {name: {provider, options, api_key}}. `set_settings` encrypts only
-# STRING values of `_SECRET_SETTINGS` keys, so a dict holding a provider token would be
-# stored in plaintext — and every reader of `get_settings()` (the Server tab, the
-# startup overlay) would see it. These two helpers are the only writers/readers: the
-# token is encrypted per entry on the way in and decrypted on the way out (R-W10).
+# One settings dict {name: {provider, options}}. The provider's API token is NOT part of
+# an entry: a provider shows its token once, so it is stored once per PROVIDER
+# (`provider_token_<kind>`, below). An entry written before that carried its own
+# `api_key` (encrypted per entry — `set_settings` encrypts only STRING values of secret
+# keys, so a dict would have held it in plaintext, R-W10); `get_managed_hosts` still
+# decrypts such a legacy value so main's startup migration can move it to the provider
+# token, and `set_managed_host` never writes one.
 
 _MANAGED_HOSTS_KEY = "managed_hosts"
 
 
 def get_managed_hosts() -> dict:
-    """{name: entry} with each entry's `api_key` DECRYPTED (a copy per call — the
-    caller may keep or change it). A value that is no dict reads as {} (logged): a
-    settings row nobody can parse must not take the backend rebuild down with it."""
+    """{name: entry} (a copy per call — the caller may keep or change it); a legacy
+    `api_key` is DECRYPTED (only the startup migration reads it). A value that is no
+    dict reads as {} (logged): a settings row nobody can parse must not take the backend
+    rebuild down with it."""
     raw = get_setting(_MANAGED_HOSTS_KEY)
     if raw is None:
         return {}
@@ -674,9 +688,9 @@ def get_managed_hosts() -> dict:
 
 
 def set_managed_host(name: str, entry) -> None:
-    """Upsert (dict) or delete (None) one managed host. Stores what it is given — the
-    console decides what a blank token field means — with `api_key` encrypted, so the
-    raw settings row never holds the plaintext."""
+    """Upsert (dict) or delete (None) one managed host. An `api_key` in the entry is
+    DROPPED: the token belongs to the provider (`set_provider_token`) — a per-host copy
+    would be a second secret to keep in sync, and one nobody shows any more."""
     raw = get_setting(_MANAGED_HOSTS_KEY)
     m = dict(raw) if isinstance(raw, dict) else {}
     if entry is None:
@@ -685,10 +699,27 @@ def set_managed_host(name: str, entry) -> None:
         del m[name]
     else:
         e = json.loads(json.dumps(entry))
-        tok = e.get("api_key")
-        e["api_key"] = encrypt_secret(tok) if isinstance(tok, str) and tok else ""
+        e.pop("api_key", None)
         m[str(name)] = e
     set_settings({_MANAGED_HOSTS_KEY: m})
+
+
+def get_provider_token(kind: str) -> str:
+    """A managed-host provider's API token (decrypted), "" when none is stored or it
+    cannot be decrypted (a wrong secret.key reads as "not set", never as garbage)."""
+    v = get_setting(PROVIDER_TOKEN_PREFIX + str(kind))
+    return v if isinstance(v, str) else ""
+
+
+def set_provider_token(kind: str, token: str) -> None:
+    """Store a provider's API token encrypted; "" (or None) removes it."""
+    key = PROVIDER_TOKEN_PREFIX + str(kind)
+    token = str(token or "")
+    if token:
+        set_settings({key: token})          # a secret key: encrypted by set_settings
+        return
+    with _conn() as c:
+        c.execute("DELETE FROM settings WHERE key = ?", (key,))
 
 
 # ── Reasoning rules (normalized thinking toggle) ────────────────────────────────

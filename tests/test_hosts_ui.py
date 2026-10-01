@@ -3,8 +3,13 @@ with its service table, the model-sync/LAN-source/catalog blocks, the Dashboard 
 and the backend form's managed-host attachment.
 
 Every one of these fails SILENTLY:
-  · the host form: the API token is never rendered (blank keeps it, the box clears it),
-    each provider option comes from the provider's OWN `OPTION_FIELDS` (a hand-kept
+  · the API token is the PROVIDER's (one row per provider, always shown — the setup
+    order is token → host → backend → Start): never rendered, blank keeps it, the box
+    clears it; the host form has no token field and says that AI-Hub creates and deletes
+    the instance itself (an operator made one by hand: unreachable, billing on its own);
+    the card shows what a Start still needs and disables Start with the controller's own
+    first refusal; its "+ … on this host" links open a pre-filled backend form;
+  · the host form: each provider option comes from the provider's OWN `OPTION_FIELDS` (a hand-kept
     copy drifts: a GPU the provider knows but the form does not is unreachable, one the
     form offers but the provider refuses is only noticed at the start), a refused Save
     is a 400 with the form as typed and nothing stored, and a new host's name may not
@@ -1252,9 +1257,11 @@ class LanSourcePanel(_LanBlock):
         self.assertNotIn("not set up", b)
         self.assertIn(f"host key <code>{self.fp}</code> pinned", b)
 
-    def test_no_lan_block_without_thunder_backends(self):
+    def test_lan_block_even_without_managed_hosts(self):
+        # the setup order is token → host → backend; the LAN source belongs to the same
+        # preparation and must not wait for a host to exist
         self.views = {}
-        self.assertNotIn("hosts-modelsrc", self.page())
+        self.assertIn("hosts-modelsrc", self.page())
 
 
 class LanSourceListNow(_LanBlock):
@@ -1702,7 +1709,7 @@ class Task16Wiring(unittest.TestCase):
 def _host_form(name="gpu-a", new=True, **over) -> dict:
     f = {"host": name, "provider": "thunder", "opt__gpu_type": "h100", "opt__num_gpus": "2",
          "opt__vcpus": "16", "opt__bootstrap_template": "", "opt__reserve_gb": "30",
-         "opt__comfy_commit": "", "opt__nodes": "registry:y@2\n", "api_key": ""}
+         "opt__comfy_commit": "", "opt__nodes": "registry:y@2\n"}
     if new:
         f["new"] = "1"
     f.update(over)
@@ -1736,8 +1743,8 @@ class HostForm(_Base):
         import thunder
         f = self.form({"mhost_new": "1"})
         names = self.names(f)
-        want = (["new", "host", "provider"] + [f"opt__{x['key']}" for x in thunder.OPTION_FIELDS]
-                + ["api_key", "api_key_clear"])
+        # no token field: the token is the PROVIDER's (its own row above the hosts)
+        want = (["new", "host", "provider"] + [f"opt__{x['key']}" for x in thunder.OPTION_FIELDS])
         self.assertEqual(sorted(names), sorted(want))             # each field exactly once
         self.assertEqual(len(names), len(set(names)))
         # "Provider": the providers of hostapi.PROVIDERS, by their display NAME — an
@@ -1787,17 +1794,17 @@ class HostForm(_Base):
         self.assertIn('<input type="hidden" name="provider" value="thunder">', f)
         self.assertNotIn('name="new"', f)
         self.assertNotRegex(f, r'<select name="provider"')
-        self.assertIn("set — blank keeps it", f)
+        self.assertNotIn('name="api_key', f)
 
     def test_token_never_rendered(self):
-        store.set_managed_host("tc", {"provider": "thunder", "options": {},
-                                      "api_key": "th-SECRET-TOKEN"})
+        store.set_provider_token("thunder", "th-SECRET-TOKEN")
+        store.set_managed_host("tc", {"provider": "thunder", "options": {}})
         self.views = {"tc": _view(api_key_set=True)}
         for qp in ({}, {"mhost": "tc"}, {"mhost_new": "1"}):
             page = self.page(qp)
             self.assertNotIn("th-SECRET-TOKEN", page, qp)
-        f = self.form({"mhost": "tc"})
-        self.assertRegex(f, r'<input type="password" name="api_key" value=""')
+        for qp in ({"mhost": "tc"}, {"mhost_new": "1"}):
+            self.assertNotIn('name="api_key', self.form(qp))
 
     def test_unknown_host_says_so(self):
         self.assertIn("no managed host named", self.page({"mhost": "nope"}))
@@ -1812,51 +1819,15 @@ class _HostSaveBase(Actions):
 
 
 class HostSave(_HostSaveBase):
-    def test_create_hands_main_the_typed_options_and_token(self):
-        r = self.post(_host_form(api_key="th-TOKEN-1"))
+    def test_create_hands_main_the_typed_options_and_no_token(self):
+        r = self.post(_host_form(api_key="th-TOKEN-1"))     # a stray field is ignored
         self.assertIn("saved", parse_qs(urlparse(r.headers["location"]).query)["msg"][0])
         name, entry, new = self.saved_hosts[-1]
         self.assertEqual((name, new), ("gpu-a", True))
         self.assertEqual(entry["provider"], "thunder")
-        self.assertEqual(entry["api_key"], "th-TOKEN-1")
+        self.assertNotIn("api_key", entry)
         self.assertEqual(entry["options"]["gpu_type"], "h100")
         self.assertEqual(entry["options"]["vcpus"], "16")    # main normalizes (options_of)
-
-    def test_blank_token_keeps_the_stored_one_and_the_box_clears_it(self):
-        store.set_managed_host("gpu-a", {"provider": "thunder", "options": {},
-                                         "api_key": "th-OLD"})
-        self.post(_host_form(new=False))
-        self.assertEqual(self.saved_hosts[-1][1]["api_key"], "th-OLD")
-        self.post(_host_form(new=False, api_key="th-NEW"))
-        self.assertEqual(self.saved_hosts[-1][1]["api_key"], "th-NEW")
-        self.post(_host_form(new=False, api_key_clear="1"))
-        self.assertEqual(self.saved_hosts[-1][1]["api_key"], "")
-        # a typed value next to a ticked box: the value wins (the backend-key rule)
-        self.post(_host_form(new=False, api_key="th-X", api_key_clear="1"))
-        self.assertEqual(self.saved_hosts[-1][1]["api_key"], "th-X")
-        self.assertEqual({x[2] for x in self.saved_hosts}, {False})
-
-    def test_blank_token_with_an_unreadable_store_is_refused(self):
-        # "blank keeps it" cannot keep a token it could not read: refused, not cleared
-        store.set_managed_host("gpu-a", {"provider": "thunder", "options": {},
-                                         "api_key": "th-OLD"})
-        self.views = {"gpu-a": _view(api_key_set=True)}
-        real, calls = store.get_managed_hosts, []
-
-        def flaky():                    # the save's own read fails, the re-render reads
-            calls.append(1)
-            if len(calls) == 1:
-                raise RuntimeError("db")
-            return real()
-        with mock.patch.object(store, "get_managed_hosts", side_effect=flaky):
-            r = self.post(_host_form(new=False, opt__vcpus="24"), status=400)
-            self.assertIn("could not read the stored host — token not changed", r.text)
-            self.assertIn('name="opt__vcpus" value="24"', r.text)     # the form as typed
-            self.assertEqual(self.saved_hosts, [])
-            # a typed token (or the clear box) needs no read: saved
-            calls.clear()
-            self.post(_host_form(new=False, api_key="th-NEW"))
-        self.assertEqual(self.saved_hosts[-1][1]["api_key"], "th-NEW")
 
     def test_refused_save_is_400_with_the_form_as_typed(self):
         self.save_refusal = "vcpus: 'lots' is not a whole number ≥ 1"
@@ -1899,14 +1870,14 @@ class HostSaveMain(_HostSaveBase):
             row = c.execute("SELECT value_json FROM settings WHERE key='managed_hosts'").fetchone()
         return "" if row is None else row[0]
 
-    def test_create_stores_normalized_options_and_an_encrypted_token(self):
+    def test_create_stores_normalized_options_and_no_token(self):
         self.post(_host_form(opt__bootstrap_template="auto", api_key="th-SECRET-9"))
         e = store.get_managed_hosts()["gpu-a"]
         self.assertEqual(e["provider"], "thunder")
-        self.assertEqual(e["api_key"], "th-SECRET-9")
+        self.assertNotIn("api_key", e)                           # the provider's, not the host's
         self.assertEqual((e["options"]["vcpus"], e["options"]["bootstrap_template"]), (16, ""))
         self.assertEqual(e["options"]["nodes"], ["registry:y@2"])
-        self.assertNotIn("th-SECRET-9", self.raw())              # R-W10: encrypted at rest
+        self.assertNotIn("th-SECRET-9", self.raw())
 
     def test_collisions_are_refused_as_typed(self):
         # R-W6: an URL hostname without a dot names a host too
@@ -1934,13 +1905,12 @@ class HostSaveMain(_HostSaveBase):
         self.assertIn("unknown provider", r.text)
         self.assertEqual(store.get_managed_hosts()["gpu-a"]["provider"], "thunder")
 
-    def test_blank_token_keeps_the_stored_one(self):
-        self.post(_host_form(api_key="th-OLD"))
+    def test_a_save_never_touches_the_provider_token(self):
+        store.set_provider_token("thunder", "th-PROV")
+        self.post(_host_form())
         self.post(_host_form(new=False, opt__vcpus="32"))
-        e = store.get_managed_hosts()["gpu-a"]
-        self.assertEqual((e["api_key"], e["options"]["vcpus"]), ("th-OLD", 32))
-        self.post(_host_form(new=False, api_key_clear="1"))
-        self.assertEqual(store.get_managed_hosts()["gpu-a"]["api_key"], "")
+        self.assertEqual(store.get_managed_hosts()["gpu-a"]["options"]["vcpus"], 32)
+        self.assertEqual(store.get_provider_token("thunder"), "th-PROV")
 
 
 class HostDelete(Actions):
@@ -2124,6 +2094,320 @@ class HostsPanel(_Base):
         self.assertIn("vm3", panel)
         self.assertIn("no backend attached", panel)
         self.assertIn('href="/ui/backends?mhost=vm2"', panel)
+
+
+# ── the setup flow (operator test 2026-09-30): token once per provider, a form that
+#    explains itself, a checklist and a Start that says why not, backends added from
+#    the card, hand-made instances named as such ─────────────────────────────────────
+
+GUIDE = ("1. Enter the provider's API token · 2. + Managed host (what to rent) · "
+         "3. Add a backend on the host's card · 4. Start")
+
+
+class ProviderTokenUI(Actions):
+    """One API token per PROVIDER: a provider shows its token once, and asking for it per
+    host made the operator paste it into every host. The row never renders the value,
+    blank keeps it, only the box clears it, and a Save reaches the running controllers."""
+
+    def setUp(self):
+        super().setUp()
+        self.applied = []
+        self.addCleanup(setattr, main, "apply_managed_hosts", main.apply_managed_hosts)
+        main.apply_managed_hosts = lambda: self.applied.append(1)
+        for k, v in {"_save_provider_token": main.save_provider_token,
+                     "_provider_tokens": main.provider_tokens_info}.items():
+            self.addCleanup(setattr, admin, k, getattr(admin, k))
+            setattr(admin, k, v)
+
+    def post(self, status=303, **data):
+        r = self.c.post("/ui/hosts/managed/provider-token", data=data, headers=SAME,
+                        follow_redirects=False)
+        self.assertEqual(r.status_code, status, r.text[-600:])
+        return r
+
+    def row(self) -> str:
+        m = re.search(r'<form[^>]*data-k="hosts-ptoken-thunder"[^>]*>.*?</form>', self.page(),
+                      re.S)
+        self.assertIsNotNone(m)
+        return m.group(0)
+
+    def raw(self):
+        import sqlite3
+        with sqlite3.connect(store._DB_PATH) as c:
+            row = c.execute("SELECT value_json FROM settings WHERE key='provider_token_thunder'"
+                            ).fetchone()
+        return None if row is None else json.loads(row[0])
+
+    def test_bound_and_post_only(self):
+        self.assertIs(admin._save_provider_token, main.save_provider_token)
+        self.assertIs(admin._provider_tokens, main.provider_tokens_info)
+        self.assertIn("/ui/hosts/managed/provider-token", admin._POST_ACTIONS)
+        r = self.c.get("/ui/hosts/managed/provider-token", headers=SAME,
+                       follow_redirects=False)
+        self.assertEqual(r.status_code, 405)
+
+    def test_row_never_renders_the_value(self):
+        f = self.row()
+        self.assertIn("Thunder Compute API token", f)
+        self.assertIn("not set", f)
+        self.assertIn('action="/ui/hosts/managed/provider-token"', f)
+        self.assertIn('<input type="hidden" name="provider" value="thunder">', f)
+        self.assertRegex(f, r'<input type="password" name="api_key" value=""')
+        self.assertIn('name="api_key_clear"', f)
+        self.assertIn("Create it once in the Thunder Compute console (shown only once "
+                      "there); every Thunder Compute host uses it.", f)
+        store.set_provider_token("thunder", "th-SECRET-ROW")
+        page = self.page()
+        self.assertNotIn("th-SECRET-ROW", page)
+        self.assertIn('<span class="badge ok">set</span>', self.row())
+
+    def test_save_blank_keeps_and_the_box_clears(self):
+        self.post(provider="thunder", api_key="th-TOKEN-1")
+        self.assertTrue(str(self.raw()).startswith("enc:"))      # encrypted at rest
+        self.assertEqual(store.get_provider_token("thunder"), "th-TOKEN-1")
+        self.assertEqual(len(self.applied), 1)                    # controllers re-synced
+        r = self.post(provider="thunder", api_key="")
+        self.assertIn("unchanged", parse_qs(urlparse(r.headers["location"]).query)["msg"][0])
+        self.assertEqual(store.get_provider_token("thunder"), "th-TOKEN-1")
+        # a typed value next to a ticked box: the value wins (the backend-key rule)
+        self.post(provider="thunder", api_key="th-TOKEN-2", api_key_clear="1")
+        self.assertEqual(store.get_provider_token("thunder"), "th-TOKEN-2")
+        self.post(provider="thunder", api_key="", api_key_clear="1")
+        self.assertEqual(store.get_provider_token("thunder"), "")
+        self.assertIsNone(self.raw())
+
+    def test_refusals_are_400_and_never_echo_the_value(self):
+        r = self.post(400, provider="runpod", api_key="rp-SECRET")
+        self.assertIn("unknown provider", r.text)
+        self.assertNotIn("rp-SECRET", r.text)
+        r = self.post(400, provider="thunder", api_key="th BAD SECRET")
+        self.assertIn("not saved", r.text)
+        self.assertNotIn("th BAD SECRET", r.text)
+        self.assertEqual(store.get_provider_token("thunder"), "")
+        self.assertEqual(self.applied, [])
+
+
+class SectionAlwaysThere(_Base):
+    """The natural order is token → host: with no managed host yet, the token rows, the
+    guide, "+ Managed host", the LAN block and the catalog must still be there — the
+    section used to render only once a host existed."""
+
+    def test_empty_store_renders_guide_token_row_and_lan_block(self):
+        self.views = {}
+        self.addCleanup(setattr, admin, "_modelsrc_view", admin._modelsrc_view)
+        admin._modelsrc_view = lambda: {"host": "", "problem": "not configured",
+                                         "public_key": "", "pinned": False}
+        html = self.page()
+        sec = html[html.index('data-sk="mhosts"'):]
+        self.assertIn(GUIDE, sec)
+        self.assertIn('data-k="hosts-ptoken-thunder"', sec)
+        self.assertIn('href="/ui/backends?mhost_new=1"', sec)
+        self.assertIn('data-k="hosts-modelsrc"', sec)
+        self.assertIn('action="/ui/hosts/managed/catalog"', sec)
+        # order: guide, token rows, then the "+ Managed host" button
+        self.assertLess(sec.index(GUIDE), sec.index("hosts-ptoken-thunder"))
+        self.assertLess(sec.index("hosts-ptoken-thunder"), sec.index("mhost_new=1"))
+
+
+class HostFormFlow(_Base):
+    """The host form says what happens: AI-Hub CREATES the instance at Start and deletes
+    it at Stop — an operator who made one by hand in the provider console got a machine
+    AI-Hub cannot reach (no ssh key) that billed on its own. The name is a label inside
+    AI-Hub only, pre-filled with a free one."""
+
+    def form(self, qp) -> str:
+        m = re.search(r'<form action="/ui/hosts/managed/save" method="post"[^>]*>.*?</form>',
+                      self.page(qp), re.S)
+        self.assertIsNotNone(m)
+        return m.group(0)
+
+    def test_intro_heading_and_name_suggestion(self):
+        self.addCleanup(setattr, admin, "_suggest_host_name", admin._suggest_host_name)
+        asked = []
+        admin._suggest_host_name = lambda kind: asked.append(kind) or f"{kind}-7"
+        f = self.form({"mhost_new": "1"})
+        self.assertIn("AI-Hub rents the machine itself: Start creates the instance at "
+                      "Thunder Compute, Stop takes a snapshot and deletes it. Do not create "
+                      "an instance in the Thunder Compute console — AI-Hub could not reach "
+                      "it (no ssh key) and it would bill on its own.", f)
+        self.assertLess(f.index("AI-Hub rents the machine itself"), f.index('name="host"'))
+        self.assertIn('name="host" value="thunder-7"', f)
+        self.assertEqual(asked, ["thunder"])
+        self.assertIn("label inside AI-Hub only — snapshots are named after it; you never "
+                      "enter it at Thunder Compute", f)
+        self.assertIn('<div class="grouphdr">What to rent at Start</div>', f)
+        self.assertLess(f.index("What to rent at Start"), f.index('name="opt__'))
+        self.assertNotIn('name="api_key', f)
+        # an existing host: intro and heading too, no suggestion (no name field at all)
+        self.views = {"tc": _view()}
+        e = self.form({"mhost": "tc"})
+        self.assertIn("AI-Hub rents the machine itself", e)
+        self.assertIn("What to rent at Start", e)
+        self.assertNotIn("thunder-7", e)
+
+    def test_a_refused_new_host_keeps_the_typed_name(self):
+        self.addCleanup(setattr, admin, "_suggest_host_name", admin._suggest_host_name)
+        admin._suggest_host_name = lambda kind: "thunder-1"
+        html = admin._managed_host_form("my-box", new=True, provider="thunder", err="x")
+        self.assertIn('name="host" value="my-box"', html)
+        self.assertNotIn("thunder-1", html)
+
+
+
+class FlowWiring(unittest.TestCase):
+    def test_bound(self):
+        self.assertIs(admin._suggest_host_name, main.suggest_host_name)
+        self.assertIs(admin._provider_tokens, main.provider_tokens_info)
+        self.assertIs(admin._save_provider_token, main.save_provider_token)
+
+
+class CardChecklist(_Base):
+    """What a Start needs, on the card, and a Start that says why it would be refused —
+    two presses refused with "no backend is attached" that the card never announced."""
+
+    CHECK = [{"ok": True, "required": True, "text": "Thunder Compute API token set"},
+             {"ok": False, "required": True, "text": "no backend attached — add one below"},
+             {"ok": False, "required": False,
+              "text": "LAN model source not usable — only needed for model files that no "
+                      "URL/catalog entry provides"}]
+    WHY = "no backend is attached to managed host tc — nothing to start"
+
+    def start_tag(self, html):
+        m = re.search(r'<button[^>]*>Start</button>', html)
+        return m.group(0) if m else None
+
+    def test_blocked_start_is_disabled_and_says_why(self):
+        self.views = {"tc": _view(checklist=self.CHECK, start_blockers=[self.WHY])}
+        html = self.page()
+        tag = self.start_tag(html)
+        self.assertIsNotNone(tag)
+        self.assertIn("disabled", tag)
+        self.assertIn(f'title="{self.WHY}"', tag)
+        self.assertNotIn("formaction", tag)
+        self.assertNotIn("/ui/hosts/managed/start", html)
+        self.assertIn(f'<p class="hint" data-k="host-tc-startwhy">Start: {self.WHY}</p>', html)
+        ck = re.search(r'<ul[^>]*data-k="host-tc-check"[^>]*>.*?</ul>', html, re.S).group(0)
+        self.assertIn("✓ Thunder Compute API token set", ck)
+        self.assertIn("✗ no backend attached — add one below", ck)
+        self.assertIn("– LAN model source not usable", ck)
+
+    def test_ready_to_start_is_a_post_button(self):
+        ok = [dict(i, ok=True) for i in self.CHECK]
+        self.views = {"tc": _view(checklist=ok, start_blockers=[])}
+        html = self.page()
+        tag = self.start_tag(html)
+        self.assertIn('formaction="/ui/hosts/managed/start?host=tc"', tag)
+        self.assertNotIn("disabled", tag)
+        self.assertNotIn("host-tc-startwhy", html)
+        self.assertIn("✓ LAN model source", html)
+
+    def test_checklist_only_while_startable(self):
+        self.views = {"tc": _view(phase="ready", uuid="u1", checklist=self.CHECK,
+                                  start_blockers=["already ready (instance u1)"])}
+        html = self.page()
+        self.assertNotIn('data-k="host-tc-check"', html)
+        self.assertIsNone(self.start_tag(html))          # running: no Start, as before
+        self.assertNotIn("host-tc-startwhy", html)
+
+    def test_undriven_host_unchanged(self):
+        # no controller: no checklist, no Start (and no "why" line) — "not driven" says it
+        self.views = {"tc": _view(host_error="unknown provider 'runpod'",
+                                  error="unknown provider 'runpod'")}
+        html = self.page()
+        self.assertIsNone(self.start_tag(html))
+        self.assertNotIn("host-tc-check", html)
+        self.assertNotIn("host-tc-startwhy", html)
+
+    def test_main_view_carries_blockers_and_checklist(self):
+        saved = (main.host_controllers, main.managed_hosts)
+        self.addCleanup(lambda: (setattr(main, "host_controllers", saved[0]),
+                                 setattr(main, "managed_hosts", saved[1])))
+        main.host_controllers = {}
+        main.managed_hosts = {}
+        store.set_managed_host("tc", {"provider": "thunder", "options": {}})
+        main.sync_host_controllers()
+        v = main.host_view("tc")
+        self.assertEqual(v["start_blockers"], main.host_controllers["tc"].start_blockers())
+        self.assertIn("no backend is attached", v["start_blockers"][0])
+        self.assertEqual([i["ok"] for i in v["checklist"]], [False, False])
+
+
+class CardAddBackend(_Base):
+    """"+ ComfyUI on this host" / "+ OpenAI-compatible service on this host": GET links to
+    the new-backend form, pre-filled — never actions."""
+
+    def test_links_on_the_card(self):
+        self.views = {"tc": _view()}
+        html = self.page()
+        self.assertIn('<a class="btn secondary sm" href="/ui/backends?new=1&amp;type=comfyui'
+                      '&amp;host=tc"', html)
+        self.assertIn('href="/ui/backends?new=1&amp;type=openai&amp;host=tc"', html)
+        self.assertIn("+ ComfyUI on this host", html)
+        self.assertIn("+ OpenAI-compatible service on this host", html)
+        # a ComfyUI is attached: one per host, no second link
+        self.views = {"tc": _view(services=_svcs())}
+        html = self.page()
+        self.assertNotIn("type=comfyui&amp;host=tc", html)
+        self.assertIn("type=openai&amp;host=tc", html)
+
+    def test_host_value_goes_through_q(self):
+        html = admin._host_card("a b&c", _view(name="a b&c"))
+        self.assertIn("type=openai&amp;host=a%20b%26c", html)
+
+
+class BackendPrefillFromHost(_Base):
+    """The form the card's links open: type set, the host selected (its service block
+    visible on load, url readonly), the profile's remote port, a free name."""
+
+    def setUp(self):
+        super().setUp()
+        store.set_managed_host("tc", {"provider": "thunder", "options": {}})
+
+    def form(self, qp) -> str:
+        m = re.search(r'<form action="/ui/backends/save" method="post"[^>]*>.*?</form>',
+                      self.page(qp), re.S)
+        self.assertIsNotNone(m)
+        return m.group(0)
+
+    def test_comfyui_prefill(self):
+        f = self.form({"new": "1", "type": "comfyui", "host": "tc"})
+        self.assertRegex(f, r'<select name="type"[^>]*>.*?<option value="comfyui" selected>',)
+        self.assertRegex(f, r'<option value="tc" selected>tc</option>')
+        fs = re.search(r'<fieldset[^>]*data-mhost[^>]*>', f).group(0)
+        self.assertNotIn("display:none", fs)
+        self.assertIn("readonly", re.search(r'<input[^>]*name="url"[^>]*>', f).group(0))
+        self.assertIn('name="remote_port" value="8188"', f)
+        self.assertIn('name="name" value="tc-comfy"', f)
+        self.assertNotIn('name="orig"', f)                     # a new backend
+
+    def test_openai_prefill_and_a_taken_name(self):
+        self.live = [{"name": "tc-llm", "type": "openai", "url": "http://x:1",
+                      "enabled": True, "healthy": True, "models": 0, "source": "ui"}]
+        store.upsert_backend({"name": "tc-llm-2", "type": "comfyui", "url": "http://y:1"})
+        f = self.form({"new": "1", "type": "openai", "host": "tc"})
+        self.assertIn('name="remote_port" value="8000"', f)
+        self.assertIn('name="name" value="tc-llm-3"', f)
+        self.assertRegex(f, r'<option value="tc" selected>tc</option>')
+
+    def test_unknown_host_is_ignored(self):
+        f = self.form({"new": "1", "type": "comfyui", "host": "nope"})
+        self.assertRegex(f, r'<option value="" selected>')
+        self.assertIn('name="name" value=""', f)
+        self.assertIn("display:none", re.search(r'<fieldset[^>]*data-mhost[^>]*>', f).group(0))
+
+
+class ForeignInstances(_Base):
+    def test_hand_made_instances_are_named_as_such(self):
+        self.views = {"tc": _view(orphans=[{"uuid": "u-hand", "index": "3", "status": "RUNNING",
+                                            "template": "base", "gpu_type": "a6000",
+                                            "num_gpus": 1, "cost_per_h": 0.57,
+                                            "created_at": ""}])}
+        html = self.page()
+        row = re.search(r'<tr data-k="host-tc-orphan-u-hand">.*?</tr>', html, re.S).group(0)
+        self.assertIn("not managed by AI-Hub — billing $0.57/h; if you created it by hand, "
+                      "delete it in the Thunder Compute console", row)
+        self.assertNotIn("<button", row)                     # never deleted from here
+        self.assertNotIn("delete?", row)
 
 
 if __name__ == "__main__":

@@ -972,6 +972,10 @@ async def lifespan(app: FastAPI):
             logger.warning(f"store: alias '{_alias}': pinned image 'playground upload' → 8×8 "
                            "placeholder (that option always ran on the placeholder and is gone; "
                            "bind the loader as an image request field instead)")
+    try:
+        migrate_provider_tokens()      # per-host API tokens → one per provider (idempotent)
+    except Exception as e:
+        logger.warning(f"managed hosts: token migration failed: {type(e).__name__}")
     backend_models.update(store.load_backend_models())   # seed last-known models (offline → 503, not 403)
     backend_context.update(store.load_backend_context())  # learned context windows survive a restart
     apply_server_settings()            # overlay UI-managed server settings onto config
@@ -6536,13 +6540,20 @@ def sync_host_controllers() -> None:
     for name in list(_host_errors):
         if name not in managed_hosts:
             _host_errors.pop(name, None)
+    tokens: dict = {}                       # provider kind → its token, read once per sync
     for name, entry in managed_hosts.items():
+        kind = str(entry.get("provider") or "")
+        if kind not in tokens:
+            tokens[kind] = provider_token(kind)
+        # the controller reads the token as its host's `api_key` (hostctl unchanged):
+        # one token per PROVIDER, handed to every host of that provider
+        h = dict(entry, name=name, api_key=tokens[kind])
         try:
-            _sync_one_host(name, dict(entry, name=name), attached[name])
+            _sync_one_host(name, h, attached[name])
         except Exception as e:
-            # the entry holds the provider token, and this text reaches /health and the
-            # console: the token is redacted, the message clipped
-            msg = hostctl._redact(str(e), str(entry.get("api_key") or ""))
+            # the host dict holds the provider token, and this text reaches /health and
+            # the console: the token is redacted, the message clipped
+            msg = hostctl._redact(str(e), tokens[kind])
             msg = msg if len(msg) <= 200 else msg[:200] + "…"
             _host_error(name, f"not driven: {type(e).__name__}: {msg}")
     for hn in [n for n in host_controllers if n not in managed_hosts]:
@@ -6622,8 +6633,9 @@ def _undriven_view(name: str, h: dict) -> dict:
 def host_view(name: str) -> Optional[dict]:
     """A managed host's view for the console: the controller's (plus `gated_only` per
     planned alias, see `_gated_only_aliases`), else the undriven one; with the host's
-    options (never its token — `api_key_set` only), why it is not driven (`error`), and
-    the config backends that name it but are not attached (`not_attachable`, R-K3)."""
+    options (never its provider's token — `api_key_set` only), why it is not driven
+    (`error`), the config backends that name it but are not attached (`not_attachable`,
+    R-K3) and, for a driven host, `start_blockers` + `checklist` (the card's Start)."""
     c = host_controllers.get(name)
     h = managed_hosts.get(name)
     if c is None and h is None:
@@ -6644,7 +6656,16 @@ def host_view(name: str) -> Optional[dict]:
     src = src if isinstance(src, dict) else {}
     opts = src.get("options") if isinstance(src.get("options"), dict) else {}
     v["options"] = copy.deepcopy(opts)
-    v["api_key_set"] = bool(src.get("api_key"))
+    # the PROVIDER's token (one per provider) — whether it is set, never the value
+    v["api_key_set"] = bool(provider_token(str(src.get("provider") or v.get("provider") or "")))
+    if c is not None:
+        # what a Start needs and why it would be refused now — the card disables Start
+        # on the same list `Controller.start()` raises from
+        try:
+            v["start_blockers"] = c.start_blockers()
+            v["checklist"] = c.checklist()
+        except Exception as e:              # the card's courtesy, never the card
+            logger.warning(f"[host {name}] start check unavailable: {type(e).__name__}: {e}")
     v["managed"] = h is not None               # False: entry deleted, controller kept
     err = _host_errors.get(name, "")
     v["host_error"] = err
@@ -6823,6 +6844,46 @@ def hosts_managed_info() -> dict:
     return out
 
 
+_HOST_NAME_RULE = ("host name: 1–40 characters of a-z, 0-9 and '-' (not at either end) — "
+                   "it names the host's snapshots and state and cannot be changed later")
+
+
+def _host_name_refusal(name: str, existing: Optional[dict] = None) -> Optional[str]:
+    """Why `name` cannot be a NEW managed host (None = free): the name rule, then R-W6 —
+    no managed host or retained controller, no key of the Hosts map, no backend's
+    `backend_host()` (a URL hostname without a dot counts)."""
+    if not _HOST_NAME_RE.fullmatch(name):
+        return _HOST_NAME_RULE
+    if existing is None:
+        existing = _load_managed_hosts() if store.is_active() else dict(managed_hosts)
+    if name in existing or name in host_controllers:
+        return f"a managed host named {name!r} already exists"
+    hosts_map = store.get_hosts() if store.is_active() else dict(hosts_meta)
+    if name in hosts_map:
+        return (f"{name!r} is already a host in the Hosts list — pick another name "
+                "(a managed host's label and flags go there once it exists)")
+    b = next((x for x in backends if backend_host(x) == name), None)
+    if b is not None:
+        return (f"backend {backend_id(b)} already runs on a host named {name!r} — "
+                "pick another name")
+    return None
+
+
+def suggest_host_name(kind: str) -> str:
+    """The new-host form's pre-filled name: the first free `<kind>-<n>` (n = 1, 2, …) by
+    the same rules a Save applies — a suggestion the Save then refuses would be worse
+    than none. "" when the kind is no plain word or nothing below 1000 is free."""
+    kind = str(kind or "")
+    if not _PROVIDER_KIND_RE.fullmatch(kind):
+        return ""
+    existing = _load_managed_hosts() if store.is_active() else dict(managed_hosts)
+    for n in range(1, 1000):
+        cand = f"{kind}-{n}"
+        if _host_name_refusal(cand, existing) is None:
+            return cand
+    return ""
+
+
 def managed_host_refusal(name: str, entry, new: bool = True) -> Optional[str]:
     """Why a managed-host Save must be refused (None = fine) — for the console's form.
     The name is `[a-z0-9-]` (it IS the identity: state, snapshots, socket — R-W5) and,
@@ -6831,22 +6892,12 @@ def managed_host_refusal(name: str, entry, new: bool = True) -> Optional[str]:
     provider must be known, never changed on an existing host, and its options must
     pass the provider's own `options_of`."""
     name = str(name or "")
-    if not _HOST_NAME_RE.fullmatch(name):
-        return ("host name: 1–40 characters of a-z, 0-9 and '-' (not at either end) — "
-                "it names the host's snapshots and state and cannot be changed later")
     existing = _load_managed_hosts() if store.is_active() else dict(managed_hosts)
-    if new:
-        if name in existing or name in host_controllers:
-            return f"a managed host named {name!r} already exists"
-        hosts_map = store.get_hosts() if store.is_active() else dict(hosts_meta)
-        if name in hosts_map:
-            return (f"{name!r} is already a host in the Hosts list — pick another name "
-                    "(a managed host's label and flags go there once it exists)")
-        b = next((x for x in backends if backend_host(x) == name), None)
-        if b is not None:
-            return (f"backend {backend_id(b)} already runs on a host named {name!r} — "
-                    "pick another name")
-    elif name not in existing:
+    why = _host_name_refusal(name, existing) if new else (
+        None if _HOST_NAME_RE.fullmatch(name) else _HOST_NAME_RULE)
+    if why:
+        return why
+    if not new and name not in existing:
         return f"unknown managed host {name!r}"
     e = entry if isinstance(entry, dict) else {}
     prov = hostapi.provider(e.get("provider"))
@@ -6867,8 +6918,9 @@ def managed_host_refusal(name: str, entry, new: bool = True) -> Optional[str]:
 
 
 def save_managed_host(name: str, entry: dict, new: bool) -> str:
-    """Store one managed host (token encrypted by the store) and apply it → the refusal,
-    "" = saved. What a blank token field means is the console's business."""
+    """Store one managed host (provider + normalized options) and apply it → the
+    refusal, "" = saved. Tokens are the provider's (`save_provider_token`): an
+    `api_key` in `entry` is never stored."""
     why = managed_host_refusal(name, entry, new=new)
     if why:
         return why
@@ -6879,9 +6931,79 @@ def save_managed_host(name: str, entry: dict, new: bool) -> str:
     prov = hostapi.provider(entry.get("provider"))
     opts = entry.get("options") if isinstance(entry.get("options"), dict) else {}
     norm = prov[0].options_of({f"opt__{k}": v for k, v in opts.items()})[0]
-    store.set_managed_host(name, dict(entry, options=norm))
+    store.set_managed_host(name, {"provider": entry.get("provider"), "options": norm})
     apply_managed_hosts()
     return ""
+
+
+# ── provider API tokens (one per provider kind, `store.set_provider_token`) ─────────
+
+_PROVIDER_KIND_RE = re.compile(r"[a-z0-9_-]{1,40}")
+_PROVIDER_TOKEN_MAX = 1024
+
+
+def provider_token(kind: str) -> str:
+    """The provider's API token ("" = none, unknown, or the store cannot answer)."""
+    kind = str(kind or "")
+    if not store.is_active() or not _PROVIDER_KIND_RE.fullmatch(kind):
+        return ""
+    try:
+        return store.get_provider_token(kind)
+    except Exception as e:
+        logger.warning(f"provider token of {kind} unreadable: {type(e).__name__}")
+        return ""
+
+
+def provider_tokens_info() -> dict:
+    """{kind: token set?} for every provider in `hostapi.PROVIDERS` — the console's
+    token rows. Never the value."""
+    return {k: bool(provider_token(k)) for k in hostapi.PROVIDERS}
+
+
+def save_provider_token(kind: str, token: str) -> str:
+    """The console's provider-token Save: "" removes it, anything else replaces it
+    (encrypted at rest). Every controller of that provider gets it at once (a sync, no
+    restart). → the refusal, "" = saved; a refusal never repeats the value."""
+    kind, token = str(kind or ""), str(token or "")
+    if hostapi.provider(kind) is None:
+        return (f"unknown provider {kind!r} (known: "
+                + ", ".join(sorted(hostapi.PROVIDERS)) + ")")
+    # it goes into an Authorization header: a space, a line break or a control
+    # character would make every provider call fail — refused here, out loud
+    if token and (len(token) > _PROVIDER_TOKEN_MAX
+                  or any(not ch.isprintable() or ch.isspace() for ch in token)):
+        return ("the API token may hold only printable characters without spaces "
+                f"(at most {_PROVIDER_TOKEN_MAX}) — not saved")
+    if not store.is_active():
+        return "the store is not active — not saved"
+    store.set_provider_token(kind, token)
+    apply_managed_hosts()
+    return ""
+
+
+def migrate_provider_tokens() -> None:
+    """Startup, idempotent: before tokens were per provider, every managed host carried
+    its own `api_key`. A provider without a token takes the first READABLE one of its
+    hosts (by name), then every entry loses its copy. A provider token that is already
+    set is never overwritten. One log line per moved token — never the token."""
+    if not store.is_active():
+        return
+    hosts = store.get_managed_hosts()
+    legacy = sorted(n for n, e in hosts.items() if "api_key" in e)
+    if not legacy:
+        return
+    for name in legacy:
+        e = hosts[name]
+        kind, tok = str(e.get("provider") or ""), str(e.get("api_key") or "")
+        if not tok or not _PROVIDER_KIND_RE.fullmatch(kind) or provider_token(kind):
+            continue
+        store.set_provider_token(kind, tok)
+        logger.info(f"managed hosts: the API token of host {name} is now the {kind} "
+                    "provider token (one per provider)")
+    for name in legacy:
+        store.set_managed_host(name, hosts[name])       # drops `api_key`
+    logger.info(f"managed hosts: per-host API tokens removed from {len(legacy)} "
+                "entr" + ("y" if len(legacy) == 1 else "ies"))
 
 
 def managed_host_delete_refusal(name: str) -> Optional[str]:
@@ -6901,8 +7023,8 @@ def managed_host_delete_refusal(name: str) -> Optional[str]:
     c = host_controllers.get(name)
     if c is None:
         # no controller (an unknown provider: never driven) — the stored record is the
-        # ONLY pointer to an instance or a snapshot being taken, and the token leaves
-        # with the entry, so nothing could even list them as orphans afterwards
+        # ONLY pointer to an instance or a snapshot being taken; with no controller of
+        # that provider left, nothing could even list them as orphans afterwards
         try:
             rec = _host_load_state(name)
         except Exception as e:
@@ -7152,6 +7274,8 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
            assign_local_port=assign_local_port,
            delete_managed_host=delete_managed_host,
            managed_host_delete_refusal=managed_host_delete_refusal,
+           suggest_host_name=suggest_host_name,
+           provider_tokens=provider_tokens_info, save_provider_token=save_provider_token,
            thunder_default_nodes=_thunder_default_nodes,
            modelsrc_view=modelsrc_view, modelsrc_scan=modelsrc_scan,
            modelsrc_pin=modelsrc_pin, modelsrc_list=modelsrc_list,

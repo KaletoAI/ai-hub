@@ -3574,8 +3574,10 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         self.store._DB_PATH, self.store._active = self._saved_store
 
     def _host(self, name="tc", token="tok", **opts):
-        """A managed host in the store (its token encrypted there)."""
-        self.store.set_managed_host(name, {"provider": "thunder", "api_key": token,
+        """A managed host in the store; the token is its PROVIDER's (one per provider,
+        encrypted there)."""
+        self.store.set_provider_token("thunder", token)
+        self.store.set_managed_host(name, {"provider": "thunder",
                                            "options": {"gpu_type": "a6000", **opts}})
 
     @staticmethod
@@ -4985,7 +4987,8 @@ class FinalReviewFixes(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError) as cm:
             await c.start()
         self.assertIn("no Thunder Compute API token set", str(cm.exception))
-        self.assertIn("put it into the host's API token field", str(cm.exception))
+        self.assertIn("enter it under Managed hosts → Thunder Compute API token",
+                      str(cm.exception))
         self.assertEqual(fake.calls, [])
         self.assertEqual(enabled, {})
         self.assertEqual(c.state.phase, "off")
@@ -6429,8 +6432,126 @@ class ProviderNeutralTexts(unittest.TestCase):
                     self.assertNotIn("thunder.", str(e))
 
     def test_no_token_names_the_form_field(self):
+        # the token is the PROVIDER's (one per provider, entered once at the top of the
+        # Managed hosts section) — the text must send the operator there
         self.assertEqual(hostctl._NO_TOKEN.format(name="X"),
-                         "no X API token set — put it into the host's API token field")
+                         "no X API token set — enter it under Managed hosts → X API token")
+
+
+class StartBlockers(unittest.IsolatedAsyncioTestCase):
+    """`start_blockers()` is what the card shows BEFORE Start is pressed (the button is
+    disabled with the first one as its title), `start()` raises its first item. Two
+    copies of the refusal rules would drift: a card offering a Start the controller
+    refuses (two presses refused with "no backend attached" that the card never
+    announced — operator test 2026-09-30), or one hiding a Start that would run."""
+
+    def _c(self, **kw):
+        fake = FakeThunder()
+        c, _, enabled, _ = make(fake, **kw)
+        return c, fake, enabled
+
+    async def _refusal(self, c) -> str:
+        with self.assertRaises(RuntimeError) as cm:
+            await c.start()
+        return str(cm.exception)
+
+    async def test_each_refusal_is_the_first_blocker(self):
+        cases = {}
+        c, _, _ = self._c()
+        c.host = dict(c.host, api_key="")
+        cases["token"] = c
+        c, _, _ = self._c(services=[])
+        cases["no service"] = c
+        c, _, _ = self._c(services=[_svc("m", "meshy", 18100, 9000)])
+        cases["none can run"] = c
+        c, _, _ = self._c()
+        c.host = dict(c.host, options=dict(c.cfg, comfy_commit="main"))
+        cases["commit"] = c
+        c, _, _ = self._c(state=_persisted())
+        cases["phase"] = c
+        c, _, _ = self._c()
+        c._op = "syncing models"
+        cases["op"] = c
+        c, _, _ = self._c()
+        c._persist_blocked = True
+        cases["persist"] = c
+        want = {"token": "no Thunder Compute API token set",
+                "no service": "no backend is attached to managed host thunder",
+                "none can run": "no attached service of thunder can run: meshy:m",
+                "commit": "host option comfy_commit must be a full 40-hex",
+                "phase": "already ready (instance u0)",
+                "op": "already syncing models",
+                "persist": "state not loaded"}
+        for k, c in cases.items():
+            b = c.start_blockers()
+            self.assertTrue(b, k)
+            self.assertIn(want[k], b[0], k)
+            self.assertEqual(await self._refusal(c), b[0], k)
+
+    async def test_blockers_are_pure_and_ordered_like_start(self):
+        # no token AND no service: both listed, start() raises the FIRST (its own order)
+        c, fake, enabled = self._c(services=[])
+        c.host = dict(c.host, api_key="")
+        b = c.start_blockers()
+        self.assertEqual(len(b), 2)
+        self.assertIn("no backend is attached", b[0])
+        self.assertIn("API token", b[1])
+        self.assertEqual(await self._refusal(c), b[0])
+        self.assertEqual((fake.calls, enabled, c.state.phase, c._op), ([], {}, "off", None))
+
+    async def test_no_blocker_when_it_can_start(self):
+        c, fake, _ = self._c()
+        self.assertEqual(c.start_blockers(), [])
+        self.assertEqual(fake.calls, [])                 # no provider call to judge it
+        # a ComfyUI-less host never needs the commit
+        c, _, _ = self._c(services=[_svc("vllm", "openai", 18101, 8000)])
+        c.host = dict(c.host, options=dict(c.cfg, comfy_commit=""))
+        self.assertEqual(c.start_blockers(), [])
+        # unreconciled uuids are checked against a FRESH list inside the start op (they
+        # may be gone by now) — not a blocker the card could judge
+        c.state.unreconciled_uuids = ["u-x"]
+        self.assertEqual(c.start_blockers(), [])
+
+    def test_checklist(self):
+        class Lan:
+            ok = False
+
+            def usable(self):
+                return self.ok
+
+            def problem(self):
+                return "" if self.ok else "not set up"
+        fake = FakeThunder()
+        c, _, _, _ = make(fake)
+        lan = c.deps.lan = Lan()
+        items = c.checklist()
+        self.assertEqual([(i["ok"], i["required"]) for i in items],
+                         [(True, True), (True, True), (False, False)])
+        self.assertIn("Thunder Compute API token", items[0]["text"])
+        self.assertIn("comfyui:thunder", items[1]["text"])
+        self.assertIn("only needed for model files that no URL/catalog entry provides",
+                      items[2]["text"])
+        lan.ok = True
+        self.assertTrue(c.checklist()[2]["ok"])
+        # no token, no backend: both required items fail; no ComfyUI → no LAN item
+        c.host = dict(c.host, api_key="")
+        c.set_services([])
+        items = c.checklist()
+        self.assertEqual([(i["ok"], i["required"]) for i in items], [(False, True), (False, True)])
+        self.assertIn("no backend attached — add one below", items[1]["text"])
+        # attached but none can run: the causes are named
+        c.set_services([_svc("m", "meshy", 18100, 9000)])
+        it = c.checklist()[1]
+        self.assertFalse(it["ok"])
+        self.assertIn("meshy:m", it["text"])
+        # a LAN source whose check throws is "not usable", never a broken card
+        c.set_services([_svc("tc", "comfyui", 18100, 8188)])
+
+        class Boom:
+            def usable(self):
+                raise RuntimeError("store")
+        c.deps.lan = Boom()
+        self.assertFalse(c.checklist()[2]["ok"])
 
 class LegacyBootstrapState(unittest.TestCase):
     """A record written before the split has no host flag: the one-piece bootstrap did

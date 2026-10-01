@@ -1,9 +1,12 @@
 """Managed hosts in the store and in main: entries, attached backends, lookups via `host`.
 
 Why this file exists (every case fails SILENTLY):
-- A provider token written through `set_settings` as part of a dict is stored in
-  PLAINTEXT (only string values of secret keys are encrypted) — and every reader of
-  `get_settings()` would see it. Nothing errors; the token just sits in the DB (R-W10).
+- The provider's API token is stored ONCE per provider (`provider_token_<kind>`): a
+  token in PLAINTEXT (a dict through `set_settings` is never encrypted, R-W10) or in
+  `get_settings()` (the Server tab, the startup overlay) just sits there readable;
+  a save that does not reach the running controllers leaves them on the old token; and
+  the startup migration must move the first READABLE per-host token to its provider and
+  strip every per-host copy — once, idempotently.
 - The controller set follows the store: a host whose entry is gone while its instance
   runs must keep its controller (else the instance bills with nobody to stop it), and a
   host with an unknown provider must be SHOWN but never driven — and must not take the
@@ -55,8 +58,7 @@ TOKEN = "thunder-SECRET-token-123"
 
 
 def _host(provider="thunder", **opts):
-    return {"provider": provider, "options": dict({"gpu_type": "a6000"}, **opts),
-            "api_key": TOKEN}
+    return {"provider": provider, "options": dict({"gpu_type": "a6000"}, **opts)}
 
 
 class _StoreCase(unittest.TestCase):
@@ -88,6 +90,7 @@ class _StoreCase(unittest.TestCase):
         m.config_backends = []
         m.backends = []
         m.jobs_cfg = dict(m.jobs_cfg, store_path=os.path.join(self.tmp, "store.db"))
+        store.set_provider_token("thunder", TOKEN)      # once per provider, every host
 
     def tearDown(self):
         for n, v in self._saved.items():
@@ -110,27 +113,39 @@ class _StoreCase(unittest.TestCase):
 
 
 class StoreEncryption(_StoreCase):
-    def test_token_encrypted_at_rest_and_decrypted_on_read(self):
-        store.set_managed_host("vm1", _host())
+    def raw(self, key):
         with sqlite3.connect(store._DB_PATH) as c:
-            raw = c.execute("SELECT value_json FROM settings WHERE key='managed_hosts'"
-                            ).fetchone()[0]
-        self.assertNotIn(TOKEN, raw)
-        self.assertTrue(json.loads(raw)["vm1"]["api_key"].startswith("enc:"))
-        # every reader of ALL settings (Server tab, startup overlay) sees ciphertext only
-        self.assertNotIn(TOKEN, json.dumps(store.get_settings()))
-        self.assertNotIn(TOKEN, json.dumps(store.get_setting("managed_hosts")))
-        got = store.get_managed_hosts()
-        self.assertEqual(got["vm1"]["api_key"], TOKEN)
-        self.assertEqual(got["vm1"]["options"], {"gpu_type": "a6000"})
-        # a copy: a caller changing it writes nothing back
-        got["vm1"]["api_key"] = "x"
-        self.assertEqual(store.get_managed_hosts()["vm1"]["api_key"], TOKEN)
+            row = c.execute("SELECT value_json FROM settings WHERE key=?", (key,)).fetchone()
+        return None if row is None else row[0]
 
-    def test_upsert_blank_token_and_delete(self):
+    def test_provider_token_encrypted_at_rest_and_never_in_get_settings(self):
+        raw = self.raw("provider_token_thunder")
+        self.assertNotIn(TOKEN, raw)
+        self.assertTrue(json.loads(raw).startswith("enc:"))
+        self.assertEqual(store.get_provider_token("thunder"), TOKEN)
+        # the Server tab / startup overlay read ALL settings: no token, not even the key
+        self.assertNotIn(TOKEN, json.dumps(store.get_settings()))
+        self.assertNotIn("provider_token_thunder", store.get_settings())
+        with self.assertRaises(ValueError):          # never seeded like a plain setting
+            store.setdefault_setting("provider_token_x", "t")
+        # "" removes it; an unknown provider has none
+        store.set_provider_token("thunder", "")
+        self.assertIsNone(self.raw("provider_token_thunder"))
+        self.assertEqual(store.get_provider_token("thunder"), "")
+        self.assertEqual(store.get_provider_token("runpod"), "")
+
+    def test_host_entries_carry_no_token(self):
+        store.set_managed_host("vm1", dict(_host(), api_key="per-host-SECRET"))
+        self.assertNotIn("per-host-SECRET", self.raw("managed_hosts"))
+        got = store.get_managed_hosts()
+        self.assertNotIn("api_key", got["vm1"])
+        self.assertEqual(got["vm1"]["options"], {"gpu_type": "a6000"})
+        got["vm1"]["options"]["x"] = 1                # a copy: nothing written back
+        self.assertNotIn("x", store.get_managed_hosts()["vm1"]["options"])
+
+    def test_upsert_and_delete(self):
         store.set_managed_host("vm1", _host())
-        store.set_managed_host("vm2", dict(_host(), api_key=""))
-        self.assertEqual(store.get_managed_hosts()["vm2"]["api_key"], "")
+        store.set_managed_host("vm2", _host())
         store.set_managed_host("vm1", None)
         self.assertEqual(list(store.get_managed_hosts()), ["vm2"])
         store.set_managed_host("gone", None)                 # deleting nothing is fine
@@ -140,16 +155,6 @@ class StoreEncryption(_StoreCase):
         store.set_settings({"managed_hosts": ["garbage"]})
         with self.assertLogs("store", "WARNING"):
             self.assertEqual(store.get_managed_hosts(), {})
-
-    def test_view_and_health_never_carry_the_token(self):
-        store.set_managed_host("vm1", _host())
-        main.sync_host_controllers()
-        v = main.host_view("vm1")
-        self.assertTrue(v["api_key_set"])
-        self.assertNotIn(TOKEN, json.dumps(v, default=str))
-        h = asyncio.run(main.health(verbose=True))
-        self.assertNotIn(TOKEN, json.dumps(h, default=str))
-        self.assertNotIn(TOKEN, json.dumps(main.gateway_info(), default=str))
 
 
 class ControllerSync(_StoreCase):
@@ -179,9 +184,8 @@ class ControllerSync(_StoreCase):
         main.rebuild_backends()
         self.assertIs(main.host_controllers["vm1"], c)
         self.assertTrue(any(x is self.live("comfy") for x in c.services))
-        # a new token reaches the controller
-        store.set_managed_host("vm1", dict(_host(), api_key="new-tok"))
-        main.sync_host_controllers()
+        # a new provider token reaches the running controller at once (no rebuild)
+        self.assertEqual(main.save_provider_token("thunder", "new-tok"), "")
         self.assertEqual(c.host["api_key"], "new-tok")
 
     def test_host_without_backends_and_backend_on_no_managed_host(self):
@@ -607,6 +611,20 @@ class Health(_StoreCase):
 
 
 class Refusals(_StoreCase):
+    def test_name_suggestion_follows_the_save_rules(self):
+        # a suggestion the Save then refuses would be worse than none (R-W6)
+        self.assertEqual(main.suggest_host_name("thunder"), "thunder-1")
+        store.set_managed_host("thunder-1", _host())
+        self.assertEqual(main.suggest_host_name("thunder"), "thunder-2")
+        store.set_host("thunder-2", {"label": "a box"})             # a Hosts-map key
+        self.assertEqual(main.suggest_host_name("thunder"), "thunder-3")
+        main.backends = [{"name": "b", "type": "openai", "url": "http://10.0.0.5:8000",
+                          "host": "thunder-3"},                       # a backend's host
+                         {"name": "c", "type": "comfyui", "url": "http://thunder-4:8188"}]
+        self.assertEqual(main.suggest_host_name("thunder"), "thunder-5")
+        self.assertIsNone(main.managed_host_refusal("thunder-5", _host()))
+        self.assertEqual(main.suggest_host_name("Bad Kind"), "")
+
     def test_name_rule(self):
         for bad in ("", "VM1", "a_b", "-a", "a-", "vm 1", "x" * 41, "ä"):
             self.assertIsNotNone(main.managed_host_refusal(bad, _host()), bad)
@@ -653,7 +671,82 @@ class Refusals(_StoreCase):
                                                    "opt__gpu_type": "a6000"})[0])
         self.assertEqual((opts["vcpus"], opts["num_gpus"], opts["bootstrap_template"]),
                          (16, 2, ""))
-        self.assertEqual(store.get_managed_hosts()["vm1"]["api_key"], TOKEN)
+        self.assertNotIn("api_key", store.get_managed_hosts()["vm1"])
+        self.assertEqual(main.host_controllers["vm1"].host["api_key"], TOKEN)
+
+
+class ProviderTokens(_StoreCase):
+    """One token per provider: saved through main (refusals, controllers updated),
+    shown as set/not set only, and migrated from the per-host tokens of old stores."""
+
+    def legacy(self, entries: dict):
+        """A pre-provider-token store: every entry with its own encrypted api_key."""
+        m = {}
+        for name, tok in entries.items():
+            e = _host()
+            if tok is not None:
+                e["api_key"] = tok if tok.startswith("enc:") else store.encrypt_secret(tok)
+            m[name] = e
+        store.set_settings({"managed_hosts": m})
+
+    def raw_hosts(self) -> str:
+        with sqlite3.connect(store._DB_PATH) as c:
+            return c.execute("SELECT value_json FROM settings WHERE key='managed_hosts'"
+                             ).fetchone()[0]
+
+    def test_save_refusals_and_controllers(self):
+        store.set_managed_host("vm1", _host())
+        store.set_managed_host("vm2", _host())
+        main.sync_host_controllers()
+        self.assertIn("unknown provider", main.save_provider_token("runpod", "x"))
+        self.assertIn("not saved", main.save_provider_token("thunder", "has space"))
+        self.assertEqual(store.get_provider_token("thunder"), TOKEN)   # nothing written
+        self.assertEqual(main.save_provider_token("thunder", "tok-2"), "")
+        for n in ("vm1", "vm2"):
+            self.assertEqual(main.host_controllers[n].host["api_key"], "tok-2")
+        self.assertEqual(main.provider_tokens_info(), {"thunder": True})
+        self.assertEqual(main.save_provider_token("thunder", ""), "")
+        self.assertEqual(main.host_controllers["vm1"].host["api_key"], "")
+        self.assertEqual(main.provider_tokens_info(), {"thunder": False})
+        self.assertFalse(main.host_view("vm1")["api_key_set"])
+
+    def test_view_and_health_never_carry_the_token(self):
+        store.set_managed_host("vm1", _host())
+        main.sync_host_controllers()
+        v = main.host_view("vm1")
+        self.assertTrue(v["api_key_set"])
+        self.assertNotIn(TOKEN, json.dumps(v, default=str))
+        self.assertNotIn(TOKEN, json.dumps(main.provider_tokens_info()))
+        h = asyncio.run(main.health(verbose=True))
+        self.assertNotIn(TOKEN, json.dumps(h, default=str))
+        self.assertNotIn(TOKEN, json.dumps(main.gateway_info(), default=str))
+
+    def test_migration_moves_the_first_readable_token_and_strips_all(self):
+        store.set_provider_token("thunder", "")
+        self.legacy({"a-broken": "enc:v1:AAAA", "b-one": "tok-A-SECRET",
+                     "c-two": "tok-B-SECRET", "d-none": None})
+        with self.assertLogs("main", "INFO") as cm:
+            main.migrate_provider_tokens()
+        self.assertEqual(store.get_provider_token("thunder"), "tok-A-SECRET")
+        raw = self.raw_hosts()
+        self.assertNotIn("api_key", raw)
+        self.assertEqual(sorted(store.get_managed_hosts()),
+                         ["a-broken", "b-one", "c-two", "d-none"])
+        out = "\n".join(cm.output)
+        self.assertNotIn("tok-A-SECRET", out)
+        self.assertIn("thunder", out)
+        # idempotent: nothing left to move, nothing rewritten, nothing logged
+        before = self.raw_hosts()
+        with self.assertNoLogs("main", "INFO"):
+            main.migrate_provider_tokens()
+        self.assertEqual(self.raw_hosts(), before)
+        self.assertEqual(store.get_provider_token("thunder"), "tok-A-SECRET")
+
+    def test_migration_never_overwrites_a_provider_token(self):
+        self.legacy({"vm1": "old-host-tok"})
+        main.migrate_provider_tokens()
+        self.assertEqual(store.get_provider_token("thunder"), TOKEN)
+        self.assertNotIn("api_key", self.raw_hosts())
 
 
 class DeleteHost(_StoreCase):

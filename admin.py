@@ -198,6 +198,12 @@ _assign_local_port: Callable = None
 _delete_managed_host: Callable = None               # (name) → refusal
 _managed_host_delete_refusal: Callable[[str], Optional[str]] = \
     lambda name: "managed hosts are not available"
+# The new-host form's pre-filled name (main.suggest_host_name: the first free
+# `<kind>-<n>` by the Save's own rules), the provider tokens as {kind: set?} (never a
+# value) and their Save ((kind, token) → refusal, "" = saved; "" as the token removes it).
+_suggest_host_name: Callable[[str], str] = lambda kind: ""
+_provider_tokens: Callable[[], dict] = lambda: {}
+_save_provider_token: Callable = None
 # [(name, view)] of hosts up for more than 24 h — in memory only (the Dashboard polls
 # it every 4 s; main.host_view would read the store per alias).
 _host_longrun: Callable[[], list] = lambda: []
@@ -932,6 +938,7 @@ _POST_ACTIONS = frozenset((
     "/ui/hosts/managed/restart-service", "/ui/hosts/managed/resetup",
     "/ui/hosts/managed/sync", "/ui/hosts/managed/delete-unknown",
     "/ui/hosts/managed/catalog", "/ui/hosts/managed/hf-token",
+    "/ui/hosts/managed/provider-token",
     "/ui/hosts/managed/modelsrc-scan", "/ui/hosts/managed/modelsrc-pin",
     "/ui/hosts/managed/modelsrc-list", "/ui/hosts/managed/modelsrc-host",
     "/ui/chat/badd", "/ui/chat/bdel", "/ui/chat/delete",
@@ -1804,7 +1811,7 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
     # _TABS_JS. A pane that were rendered conditionally would drop its fields from the
     # POST, and backend_save reads "absent" as "cleared": switching tabs would silently
     # wipe the settings of every tab you did not visit.
-    src = b or ({**prefill, "local": prefill.get("type", "openai") == "openai"} if prefill else {})
+    src = b or ({"local": prefill.get("type", "openai") == "openai", **prefill} if prefill else {})
     g = lambda k, d="": str(src.get(k) if src.get(k) is not None else d)
     gb = lambda k: bool(src.get(k))
     # orig_id/err/raw: a refused Save shown again — `b` then holds what was typed,
@@ -2224,6 +2231,37 @@ async def backends_page(request: Request):
     return await _backends_view(request.query_params)
 
 
+# The host card's "+ … on this host" links: (type → name suffix). One ComfyUI per host
+# and the OpenAI-compatible command service are the two types a managed host can run.
+_HOST_PREFILL_TYPES = {"comfyui": "comfy", "openai": "llm"}
+
+
+def _host_prefill(qp, binfo: list) -> Optional[dict]:
+    """`?new=1&type=comfyui|openai&host=<managed host>` (the card's links) → the new
+    backend form's prefill: that host selected (its service block shown on load), the
+    type, and the first free `<host>-comfy` / `<host>-llm` (`-2`, `-3` …; free = no
+    backend of ANY type carries it). An unknown host or another type → None (the plain
+    new form) — a select pre-set to a host that does not exist would submit nothing."""
+    host, typ = str(qp.get("host") or ""), str(qp.get("type") or "")
+    if not host or typ not in _HOST_PREFILL_TYPES:
+        return None
+    if host not in (_managed_host_entries() or {}):
+        return None
+    taken = {str(b.get("name") or "") for b in binfo if isinstance(b, dict)}
+    try:
+        taken |= {str(b.get("name") or "") for b in (store.list_backends()
+                                                     if store.is_active() else [])}
+    except Exception as e:                              # noqa: BLE001 — a prefill, not the form
+        logger.warning(f"ui: backend names unreadable: {type(e).__name__}")
+    base = f"{host}-{_HOST_PREFILL_TYPES[typ]}"
+    name, n = base, 1
+    while name in taken:
+        n += 1
+        name = f"{base}-{n}"
+    # `local` stays off: a rented VM is no LAN server (the scan's prefill ticks it)
+    return {"name": name, "type": typ, "url": "", "host": host, "local": False}
+
+
 async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
                          catalog_refused: Optional[tuple] = None,
                          hf_refused: Optional[str] = None,
@@ -2352,7 +2390,7 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
                  f"editable copy that overrides it).</p>{items}"
                  + _managed_hosts_section(tviews, catalog_refused, hf_refused,
                                           modelsrc_refused)
-                 + _hosts_panel(binfo, qp.get("host", ""), tviews)
+                 + _hosts_panel(binfo, "" if qp.get("new") else qp.get("host", ""), tviews)
                  + _scan_panel(scan_st))
     hosts = sorted({b["host"] for b in binfo if b.get("host")})
     edit_host = qp.get("host", "")
@@ -2361,6 +2399,8 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
     elif editing or qp.get("new"):
         prefill = ({"name": qp.get("name", ""), "type": qp.get("type", "openai"), "url": qp.get("url", "")}
                    if (not editing and qp.get("url")) else None)
+        if not editing and prefill is None:
+            prefill = _host_prefill(qp, binfo)
         detail = _backend_form(editing, hosts, prefill=prefill)
     elif qp.get("mhost_new"):
         detail = _managed_host_form(new=True, provider=qp.get("provider", ""))
@@ -3393,8 +3433,9 @@ def _svc_table(k: str, name: str, v: dict) -> str:
                  f"<td>{status}</td><td>{_esc(s.get('error') or '')}{warn}</td>"
                  f"<td>{acts}</td></tr>")
     if not rows:
-        return (f'<p class="hint" data-k="{_esc(k)}-nosvc">No backend attached — set a '
-                f"backend's <b>host</b> to <code>{_esc(name)}</code> to run it here.</p>")
+        return (f'<p class="hint" data-k="{_esc(k)}-nosvc">No backend attached — add one '
+                f"with the buttons below, or set a backend's <b>managed host</b> to "
+                f"<code>{_esc(name)}</code>.</p>")
     return (f'<table data-k="{_esc(k)}-svcs"><tr><th>backend</th><th>type</th>'
             "<th>port VM → local</th><th>status</th><th>error</th><th></th></tr>"
             f"{rows}</table>")
@@ -3459,7 +3500,7 @@ def _host_card(name: str, v: dict) -> str:
     if v.get("ip"):
         facts.append(f"{_esc(v['ip'])}:{_esc(v.get('port') or '')}")
     if not v.get("api_key_set"):
-        facts.append('<span class="bad">no API token</span>')
+        facts.append(f'<span class="bad">no {_esc(prov)} API token</span>')
     rows.append(f'<div class="tfacts" data-k="{_esc(k)}-facts">{" · ".join(facts)}</div>')
     sn = v.get("snapshot") or {}
     if sn.get("id") or sn.get("pending") or sn.get("name"):
@@ -3493,13 +3534,19 @@ def _host_card(name: str, v: dict) -> str:
             f"<td>{_esc(o.get('status') or '')}</td><td>{_esc(o.get('template') or '')}</td>"
             f"<td>{_esc(o.get('gpu_type') or '?')} ×{_esc(o.get('num_gpus') or 1)}</td>"
             f"<td>{(_money(o['cost_per_h']) + '/h') if o.get('cost_per_h') is not None else '—'}</td>"
-            f"<td>{_esc(o.get('created_at') or '')}</td></tr>"
+            f"<td>{_esc(o.get('created_at') or '')}</td>"
+            # the operator test of 2026-09-30 made one by hand: say what it is and where
+            # it goes — never a delete button here (never adopted, never deleted)
+            f"<td>not managed by AI-Hub — billing "
+            f"{(_money(o['cost_per_h']) + '/h') if o.get('cost_per_h') is not None else '(price unknown)'}"
+            f"; if you created it by hand, delete it in the {_esc(prov)} console</td></tr>"
             for i, o in enumerate(orph))
         rows.append(f'<div data-k="{_esc(k)}-orphans"><p class="bad">Instances on this '
                     f"{_esc(prov)} account that no host owns — they bill; never deleted "
                     "automatically:</p>"
                     "<table><tr><th>uuid</th><th>index</th><th>status</th><th>template</th>"
-                    f"<th>GPU</th><th>cost</th><th>created</th></tr>{orows}</table></div>")
+                    f"<th>GPU</th><th>cost</th><th>created</th><th></th></tr>{orows}"
+                    "</table></div>")
     unk = v.get("bootstrap_unknown") or {}
     if unk:
         urows = "".join(
@@ -3513,7 +3560,36 @@ def _host_card(name: str, v: dict) -> str:
     if tn:
         rows.append(f'<div class="tfacts" data-k="{_esc(k)}-tnodes">Node packs the template '
                     f"brought along: {_esc(', '.join(tn))}</div>")
+    # mirrors the controller's refusals: an op in flight refuses Start; `failed` with an
+    # instance (uuid or index) refuses Start; a host that is not driven (an unknown
+    # provider, a broken entry) has no controller to start anything
+    startable = (not op and not v.get("host_error")
+                 and (phase == "off" or (phase == "failed" and not v.get("uuid")
+                                         and not v.get("index"))))
+    ck = [i for i in (v.get("checklist") or []) if isinstance(i, dict)] if startable else []
+    if ck:
+        # what a Start needs, in setup order — above the service table and its "add"
+        # buttons it points to. ✓ done · ✗ required and missing · – optional and missing
+        li = "".join(
+            f'<li data-k="{_esc(k)}-check-{n}">'
+            f'{"✓" if i.get("ok") else ("✗" if i.get("required") else "–")} '
+            f"{_esc(i.get('text') or '')}</li>" for n, i in enumerate(ck))
+        rows.append(f'<ul class="hint" data-k="{_esc(k)}-check" '
+                    f'style="list-style:none;padding-left:0;margin:4px 0">{li}</ul>')
     rows.append(f'<div data-k="{_esc(k)}-svcblock">{_svc_table(k, name, v)}</div>')
+    # GET views (the new-backend form, pre-filled) — never actions; one ComfyUI per host
+    has_comfy = any(isinstance(x, dict) and x.get("type") == "comfyui"
+                    for x in (v.get("services") or {}).values()) \
+        if isinstance(v.get("services"), dict) else False
+    add = ""
+    if not has_comfy:
+        add += _btn("+ ComfyUI on this host",
+                    f"/ui/backends?new=1&type=comfyui&host={_q(name)}", "secondary", sm=True,
+                    title=f"A new ComfyUI backend running on {name}")
+    add += _btn("+ OpenAI-compatible service on this host",
+                f"/ui/backends?new=1&type=openai&host={_q(name)}", "secondary", sm=True,
+                title=f"A new OpenAI-compatible server (vLLM, llama-swap …) running on {name}")
+    rows.append(f'<div class="tacts" data-k="{_esc(k)}-addsvc">{add}</div>')
     for na in (v.get("not_attachable") or []):
         if not isinstance(na, dict) or not na.get("bid"):
             continue
@@ -3525,16 +3601,23 @@ def _host_card(name: str, v: dict) -> str:
         rows.append(f'<div class="tsync" data-k="{_esc(k)}-sync">{sync}</div>')
     q = _q(name)
     acts = ""
-    # mirrors the controller's refusals: an op in flight refuses Start; `failed` with an
-    # instance (uuid or index) refuses Start; a host that is not driven (an unknown
-    # provider, a broken entry) has no controller to start anything
-    if (not op and not v.get("host_error")
-            and (phase == "off" or (phase == "failed" and not v.get("uuid")
-                                    and not v.get("index")))):
-        acts += _btn("Start", f"/ui/hosts/managed/start?host={q}", sm=True,
-                     confirm=f"Start the {prov} host {name}? It bills per hour until "
-                             "you stop it.",
-                     title="Create the instance (from the last snapshot) — it bills from now on")
+    why_html = ""
+    if startable:
+        blockers = [str(b) for b in (v.get("start_blockers") or []) if b]
+        if blockers:
+            # cosmetic: the handler and Controller.start() refuse on their own — this only
+            # says so BEFORE the press (two presses refused with a reason the card never
+            # showed, operator test 2026-09-30)
+            acts += (f'<button type="button" class="btn sm" disabled '
+                     f'title="{_esc(blockers[0])}">Start</button>')
+            why_html = (f'<p class="hint" data-k="{_esc(k)}-startwhy">Start: '
+                        f"{_esc(blockers[0])}</p>")
+        else:
+            acts += _btn("Start", f"/ui/hosts/managed/start?host={q}", sm=True,
+                         confirm=f"Start the {prov} host {name}? It bills per hour until "
+                                 "you stop it.",
+                         title="Create the instance (from the last snapshot) — it bills from "
+                               "now on")
     if phase != "off" or op:
         acts += _btn("Stop", f"/ui/hosts/managed/stop?host={q}", "danger", sm=True,
                      confirm=f"Stop {name}? Running jobs finish first, then the instance is "
@@ -3550,7 +3633,7 @@ def _host_card(name: str, v: dict) -> str:
                              "— a forgotten one of ours bills on unseen.",
                      title="These instances are not this host's")
     acts += _btn("Settings", f"/ui/backends?mhost={q}", "secondary", sm=True,
-                 title="Provider options and API token of this host")
+                 title="Provider options of this host (what to rent at Start)")
     del_note = ""
     if phase == "off" and not op:
         try:
@@ -3565,7 +3648,7 @@ def _host_card(name: str, v: dict) -> str:
                          confirm=f"Delete the managed host {name}? Its state goes; its "
                                  f"READY snapshots bill on at {prov} until deleted by hand.",
                          title="Remove this host (only while off and no backend names it)")
-    rows.append(f'<div class="tacts" data-k="{_esc(k)}-acts">{acts}</div>{del_note}')
+    rows.append(f'<div class="tacts" data-k="{_esc(k)}-acts">{acts}</div>{why_html}{del_note}')
     log = [str(x) for x in (v.get("log") or [])][-_HOST_LOG_LINES:]
     rows.append(f'<details data-k="{_esc(k)}-log"><summary>log (last {len(log)} lines)</summary>'
                 f'<pre class="tlog">{_esc(chr(10).join(log)) or "—"}</pre></details>')
@@ -3692,7 +3775,8 @@ def _modelsrc_block(refused: Optional[tuple] = None) -> str:
             + (f"<code>{_esc(host)}</code> " if host else "") + f"{badge}</div>"]
     key_html = (f'<pre class="tlog" data-k="{k}-pub">{_esc(pub)}</pre>' if pub else
                 f'<p class="hint" data-k="{k}-nopub">The key <code>modelsrc.key</code> is '
-                "generated when the gateway starts a host controller — reload shortly.</p>")
+                "generated once a managed host exists (its controller starts) — reload shortly "
+                "after creating the first one.</p>")
     pub_or = pub or "<public key above>"
     install = (f'<p class="hint" data-k="{k}-howto">Recommended — a VM (or container) that '
                "already mounts the model share: its existing user, no new user, no root. "
@@ -3808,26 +3892,64 @@ def _orphan_snaps_block() -> str:
             f"{trs}</table></div>")
 
 
+# The section's first lines: the setup flow in the order it has to happen (operator
+# test 2026-09-30 — the token is entered ONCE per provider, before any host exists).
+# A constant, rendered raw (no markup in it — and _esc would turn its ' into &#x27;).
+_MHOST_GUIDE = ("1. Enter the provider's API token · 2. + Managed host (what to rent) · "
+                "3. Add a backend on the host's card · 4. Start")
+
+
+def _provider_token_rows() -> str:
+    """One row per provider in `hostapi.PROVIDERS`: `<NAME> API token`, set / not set,
+    a password input that is NEVER pre-filled, a clear box and Save (the backend-key
+    rule: blank keeps, the box clears, a typed value wins). One token per provider —
+    the provider shows it only once, and every host of that provider uses it."""
+    try:
+        state = _provider_tokens() or {}
+    except Exception as e:                              # noqa: BLE001 — a row, not the tab
+        logger.warning(f"ui: provider tokens unreadable: {type(e).__name__}")
+        state = {}
+    out = ""
+    for kind in hostapi.PROVIDERS:
+        name = _provider_name(kind)
+        is_set = bool(state.get(kind))
+        badge = _badge("set", "ok") if is_set else _badge("not set", "warn")
+        out += (f'<form method="post" action="/ui/hosts/managed/provider-token" '
+                f'data-k="hosts-ptoken-{_esc(kind)}" data-guard>'
+                f'<input type="hidden" name="provider" value="{_esc(kind)}">'
+                + _field(f"{name} API token",
+                         badge + " " + _inp("api_key", "", typ="password",
+                                            placeholder=("•••• set — blank keeps it" if is_set
+                                                         else f"the {name} API token"))
+                         + _checkbox("api_key_clear", False, "clear",
+                                     "remove the stored token on Save"),
+                         hint=(f"Create it once in the {_esc(name)} console (shown only once "
+                               f"there); every {_esc(name)} host uses it."))
+                + f'<div class="tacts">{_btn("Save token", submit=True, sm=True)}</div></form>')
+    return out
+
+
 def _managed_hosts_section(views: list, catalog_refused: Optional[tuple] = None,
                            hf_refused: Optional[str] = None,
                            modelsrc_refused: Optional[tuple] = None) -> str:
-    """The Hosts area's managed hosts: "+ Managed host", one lifecycle card per host,
-    then (with at least one host, or a refused Save to show) the orphaned snapshots, the
-    LAN model source and the model-sync catalog + HF token."""
+    """The Hosts area's managed hosts, ALWAYS rendered (the order is token → host, so
+    the token rows cannot wait for a host): the 4-step guide, one API-token row per
+    provider, "+ Managed host", one lifecycle card per host, the orphaned snapshots
+    (with hosts), then the LAN model source and the model-sync catalog + HF token."""
     cards = "".join(_host_card(n, v) for n, v in views)
     intro = ("" if views else
              "<p class='hint'>A managed host is a rented GPU machine the gateway starts and "
              "stops for you (its <b>provider</b>, such as Thunder Compute). "
              "Backends run on it by naming it as their host.</p>")
-    extra = ""
-    if views or modelsrc_refused is not None:
-        extra += _orphan_snaps_block() if views else ""
-        extra += _modelsrc_block(modelsrc_refused)
-    if views or catalog_refused is not None or hf_refused is not None:
-        extra += _catalog_editor(catalog_refused, hf_refused)
+    extra = _orphan_snaps_block() if views else ""
+    extra += _modelsrc_block(modelsrc_refused)
+    extra += _catalog_editor(catalog_refused, hf_refused)
     # not `.bar`: that one is sticky, and a second sticky bar would slide over the list's
-    return ('<div data-sk="mhosts"><div style="display:flex;align-items:center;gap:14px;'
-            'margin-top:18px"><div class="grouphdr" style="flex:1">Managed hosts</div>'
+    return ('<div data-sk="mhosts"><div class="grouphdr" style="margin-top:18px">Managed '
+            f'hosts</div><p class="hint" data-k="hosts-guide">{_MHOST_GUIDE}</p>'
+            + _provider_token_rows()
+            + '<div style="display:flex;align-items:center;gap:14px;margin-top:10px">'
+            '<div style="flex:1"></div>'
             f'{_btn("+ Managed host", "/ui/backends?mhost_new=1", sm=True)}</div>'
             f"{intro}{cards}{extra}</div>")
 
@@ -3860,8 +3982,10 @@ def _managed_host_form(name: str = "", new: bool = True, provider: str = "",
     and its options; an existing host has neither a name field (R-W5: the name is the
     identity of its state and snapshots) nor a provider choice (its state belongs to the
     provider). Options are the provider's OWN `OPTION_FIELDS` as `opt__<key>` — `typed`
-    (as the form sent them) wins, then the stored options, then the field default. The
-    API token is never rendered: blank keeps it, the box clears it."""
+    (as the form sent them) wins, then the stored options, then the field default —
+    under "What to rent at Start". No token field: the token is the PROVIDER's (its row
+    above the cards). The form opens by saying that AI-Hub creates and deletes the
+    instance itself; a new host's name is pre-filled with the first free `<kind>-<n>`."""
     typed = typed or {}
     v = None if new else _host_view(name)
     if not new and v is None:
@@ -3872,17 +3996,30 @@ def _managed_host_form(name: str = "", new: bool = True, provider: str = "",
     prov = hostapi.provider(kind)
     stored = (v or {}).get("options") if isinstance((v or {}).get("options"), dict) else {}
     head = ("New managed host" if new else f"Managed host {name}")
+    pname = _provider_name(kind)
     out = ('<form action="/ui/hosts/managed/save" method="post" data-guard>'
            + ('<input type="hidden" name="new" value="1">' if new else
               f'<input type="hidden" name="host" value="{_esc(name)}">')
            + f'<div class="formbar"><h2>{_esc(head)}</h2>'
            f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/backends", "secondary")}</div>'
-           + _form_err(err))
+           + _form_err(err)
+           # the operator test of 2026-09-30 created the instance by hand first: say who
+           # creates it, before anything else
+           + f'<p class="hint">AI-Hub rents the machine itself: Start creates the instance at '
+             f"{_esc(pname)}, Stop takes a snapshot and deletes it. Do not create an instance "
+             f"in the {_esc(pname)} console — AI-Hub could not reach it (no ssh key) and it "
+             "would bill on its own.</p>")
     if new:
+        if not name and not err:
+            try:
+                name = str(_suggest_host_name(kind) or "")
+            except Exception as e:                      # noqa: BLE001 — a prefill, not the form
+                logger.warning(f"ui: host name suggestion failed: {type(e).__name__}: {e}")
         out += (_field("name", _inp("host", name, placeholder="e.g. gpu-a"),
-                       hint="a-z, 0-9 and <code>-</code>. It names the host's snapshots and "
-                            "state, so it cannot be changed later; backends run here by "
-                            "naming it as their <b>host</b>.")
+                       hint=f"label inside AI-Hub only — snapshots are named after it; you "
+                            f"never enter it at {_esc(pname)}. a-z, 0-9 and <code>-</code>; "
+                            "it cannot be changed later. Backends run here by naming it as "
+                            "their <b>host</b>.")
                 + _field("Provider", _select("provider",
                                               [(k, _provider_name(k)) for k in kinds], kind),
                          hint="The provider that creates, stops and bills the machine."))
@@ -3894,6 +4031,7 @@ def _managed_host_form(name: str = "", new: bool = True, provider: str = "",
         out += _form_err(f"unknown provider {kind!r} — this host cannot be driven; delete "
                          "it once it is off")
     else:
+        out += '<div class="grouphdr">What to rent at Start</div>'
         for fld in prov[0].OPTION_FIELDS:
             key = fld["key"]
             if key in typed:
@@ -3910,13 +4048,6 @@ def _managed_host_form(name: str = "", new: bool = True, provider: str = "",
                 val = fld.get("default")
             out += _field(fld.get("label") or key, _option_control(fld, val),
                           hint=fld.get("hint") or "")
-    is_set = bool((v or {}).get("api_key_set"))
-    out += _field("API token", _inp("api_key", "", typ="password",
-                                    placeholder=("•••• set — blank keeps it" if is_set
-                                                 else "the provider's API token"))
-                  + _checkbox("api_key_clear", False, "clear", "remove the stored token on Save"),
-                  hint="Stored encrypted and never shown again. Without it the host cannot "
-                       "be started.")
     out += ("<p class='hint'>Label and GPU policy of this box: its row in "
             "<b>Hosts · GPU policy</b>.</p></form>")
     return out
@@ -3926,33 +4057,15 @@ async def managed_host_save(request: Request):
     """Create or update a managed host through `main.save_managed_host` (its refusal
     rules: the name, R-W6 collisions, the provider, `options_of`). What the form typed
     goes over as typed — main validates and stores the normalized options — and a
-    refusal is a 400 with the form exactly as typed (never the token)."""
+    refusal is a 400 with the form exactly as typed. No token here: it is the
+    provider's (`hosts_provider_token`)."""
     f = await _form(request)
     new = bool(f.get("new"))
     name = (f.get("host") or "").strip()
     kind = (f.get("provider") or "").strip()
-    cur = {}
-    unread = False
-    if not new and store.is_active():
-        try:
-            cur = store.get_managed_hosts().get(name) or {}
-        except Exception as e:                          # noqa: BLE001 — refused, not a 500
-            unread = True
-            logger.warning(f"ui: managed hosts unreadable: {type(e).__name__}: {e}")
     opts = {k[len("opt__"):]: v for k, v in f.items() if k.startswith("opt__")}
-    tok = (f.get("api_key") or "").strip()
-    if tok:
-        api_key = tok
-    elif f.get("api_key_clear"):
-        api_key = ""
-    else:
-        api_key = str(cur.get("api_key") or "")
-    entry = {"provider": kind, "options": opts, "api_key": api_key}
-    if unread and not tok and not f.get("api_key_clear"):
-        # "blank keeps the token" cannot keep what could not be read: saving would
-        # store an EMPTY token and every provider call after it would be a 401
-        why = "could not read the stored host — token not changed; nothing saved"
-    elif _save_managed_host is None:
+    entry = {"provider": kind, "options": opts}
+    if _save_managed_host is None:
         why = "managed hosts cannot be saved here"
     else:
         try:
@@ -3962,8 +4075,7 @@ async def managed_host_save(request: Request):
     if why:
         form = _managed_host_form(name, new=new, provider=kind, typed=opts, err=why)
         return await _backends_view(request.query_params, detail=form, status=400)
-    logger.info(f"ui: managed host {name!r} {'created' if new else 'saved'} "
-                f"(provider {kind}, token {'set' if api_key else 'none'})")
+    logger.info(f"ui: managed host {name!r} {'created' if new else 'saved'} (provider {kind})")
     return _hosts_msg(f"managed host {name} saved" + (" (new)" if new else ""))
 
 
@@ -4144,6 +4256,32 @@ async def hosts_hf_token(request: Request):
     if err:
         return await _backends_view(request.query_params, hf_refused=err, status=400)
     msg = "HF token saved (encrypted)" if tok else "HF token removed"
+    logger.info(f"ui: {msg}")
+    return _hosts_msg(msg)
+
+
+async def hosts_provider_token(request: Request):
+    """Save a provider's API token (one per provider, every host of it uses it): a typed
+    value replaces it, blank keeps it, the box removes it. Unknown provider or a refused
+    value → 400 naming why — never the value. Main re-syncs the controllers."""
+    f = await _form(request)
+    kind = (f.get("provider") or "").strip()
+    tok = (f.get("api_key") or "").strip()
+    if _save_provider_token is None:
+        return _hosts_msg("provider tokens cannot be saved here")
+    if kind not in hostapi.PROVIDERS:
+        return await _backends_view({}, notice=f"unknown provider {kind[:40]!r} — token "
+                                               "not saved", status=400)
+    name = _provider_name(kind)
+    if not tok and not f.get("api_key_clear"):
+        return _hosts_msg(f"{name} API token unchanged (blank keeps it)")
+    try:
+        err = str(_save_provider_token(kind, tok) or "")
+    except Exception as e:                              # noqa: BLE001 — refused, not a 500
+        err = f"not saved: {type(e).__name__}"
+    if err:
+        return await _backends_view({}, notice=f"{name} API token: {err}", status=400)
+    msg = f"{name} API token saved (encrypted)" if tok else f"{name} API token removed"
     logger.info(f"ui: {msg}")
     return _hosts_msg(msg)
 
@@ -9624,6 +9762,8 @@ def register(app) -> None:
     app.add_api_route("/ui/hosts/managed/catalog", hosts_catalog_save, methods=["POST"])
     app.add_api_route("/ui/hosts/managed/modelsrc-host", hosts_modelsrc_host, methods=["POST"])
     app.add_api_route("/ui/hosts/managed/hf-token", hosts_hf_token, methods=["POST"])
+    app.add_api_route("/ui/hosts/managed/provider-token", hosts_provider_token,
+                      methods=["POST"])
     app.add_api_route("/ui/input", input_page, methods=["GET"])
     app.add_api_route("/ui/routing", routing_page, methods=["GET"])
     app.add_api_route("/ui/chat/create", chat_create, methods=["POST"])

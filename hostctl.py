@@ -211,8 +211,9 @@ _PENDING_MISSES = 3             # rounds a pending snapshot may be absent from t
 _ABSENT_CONFIRM = 2
 _ABSENT_RECHECK_S = 5
 _RESUME_PROBE_S = 30            # a freshly started tunnel needs a moment before ComfyUI answers
-# a Start without a token is refused before any call (each would be the provider's 401)
-_NO_TOKEN = "no {name} API token set — put it into the host's API token field"
+# a Start without a token is refused before any call (each would be the provider's 401);
+# the token is the PROVIDER's — one per provider, entered once in the console
+_NO_TOKEN = "no {name} API token set — enter it under Managed hosts → {name} API token"
 # a Start without a service creates a machine that serves nothing and bills anyway
 _NO_SERVICE = "no backend is attached to managed host {host} — nothing to start"
 _STOP_STEPS = ("draining", "pruning", "snapshotting", "deleting")
@@ -2081,10 +2082,13 @@ class Controller:
                 "orphans": [self._orphan_view(x) for x in self._orphans]}
 
     # lifecycle
+    def _unloaded_text(self) -> str:
+        return (f"state not loaded ({self.state.error or 'unreadable'}) — an instance may "
+                "still be running; resume first")
+
     def _refuse_if_unreconciled(self) -> None:
         if self._persist_blocked:
-            raise RuntimeError(f"state not loaded ({self.state.error or 'unreadable'}) — "
-                               "an instance may still be running; resume first")
+            raise RuntimeError(self._unloaded_text())
 
     def _refuse_if_busy(self) -> None:
         if self._op is not None:
@@ -2829,35 +2833,92 @@ class Controller:
         t.add_done_callback(done)
         return t
 
+    def start_blockers(self) -> list[str]:
+        """Why a Start would be refused RIGHT NOW, in the order `start()` checks them
+        (pure: memory only, no provider call). `start()` raises the first item, so the
+        card's disabled Start and the controller's refusal can never disagree. The
+        unreconciled uuids are not among them: they are checked against a FRESH list
+        inside the start op (they may be gone by now — the card cannot judge that)."""
+        out: list[str] = []
+        s = self.state
+        if self._persist_blocked:
+            out.append(self._unloaded_text())
+        if self._op is not None:
+            out.append(f"already {self._op}")
+        if s.phase != "off" and not (s.phase == "failed" and not s.uuid and not s.index):
+            # `failed` with an index but no uuid still names an instance (Ruling 10)
+            out.append(f"already {s.phase}"
+                       + (f" (instance {s.uuid or s.index})" if s.uuid or s.index else ""))
+        if not self.services:
+            # a machine serving nothing would bill for nothing
+            out.append(_NO_SERVICE.format(host=self.name))
+        else:
+            bad = self._problems()
+            if all(service_bid(x) in bad for x in self.services):
+                out.append(f"no attached service of {self.name} can run: " + "; ".join(
+                    f"{bid}: {why}" for bid, why in bad.items()))
+        if self._comfy() is not None:
+            try:
+                self._commit()          # only the ComfyUI bootstrap pins a commit
+            except RuntimeError as e:
+                out.append(str(e))
+        if not self._token():
+            # every provider call would be a 401; say what to do instead of showing it
+            out.append(_NO_TOKEN.format(name=self._prov.NAME))
+        return out
+
+    def checklist(self) -> list[dict]:
+        """The card's "what a Start needs" list, in the order the operator sets it up:
+        `{ok, text, required}` — the provider token, an attached backend that can run,
+        and (only with a ComfyUI service) the LAN model source, which is optional: only
+        files no URL/catalog entry provides need it. Not part of `view()`: the LAN check
+        reads the store, and `view()` runs every few seconds for the Dashboard."""
+        name = self._prov.NAME
+        tok = bool(self._token())
+        items = [{"ok": tok, "required": True,
+                  "text": (f"{name} API token set" if tok else
+                           f"{name} API token not set — enter it above")}]
+        if not self.services:
+            items.append({"ok": False, "required": True,
+                          "text": "no backend attached — add one below"})
+        else:
+            bad = self._problems()
+            run = [service_bid(x) for x in self.services if service_bid(x) not in bad]
+            if run:
+                text = "backend attached: " + ", ".join(run)
+                if bad:
+                    text += " (cannot run: " + "; ".join(f"{b}: {w}" for b, w in bad.items()) + ")"
+            else:
+                text = "no attached backend can run: " + "; ".join(
+                    f"{b}: {w}" for b, w in bad.items())
+            items.append({"ok": bool(run), "required": True, "text": text})
+        if self._comfy() is not None:
+            lan = self.deps.lan
+            try:
+                ok = bool(lan is not None and lan.usable())
+            except Exception as e:      # a card line, never the card
+                self._log(f"LAN source check failed: {_errtext(e)}")
+                ok = False
+            items.append({"ok": ok, "required": False,
+                          "text": "LAN model source " + ("usable" if ok else "not usable")
+                                  + " — only needed for model files that no URL/catalog "
+                                    "entry provides"})
+        return items
+
     async def start(self) -> None:
         """Spec "Start" 0–6 (`starting` → `syncing` → first plan → `ready`).
 
-        Refusals (unreconciled state, an instance already known, no attached service, a
-        bad commit, a start in flight) RAISE before anything happens. Everything else ends in the
+        Refusals (`start_blockers()`: unreconciled state, a start in flight, an instance
+        already known, no attached service, none that can run, a bad commit, no token)
+        RAISE the first one before anything happens. Everything else ends in the
         state: a failure before `create` → `off` with the reason (nothing bills), a
         failure after it → `failed(<phase>)` with the instance KEPT (diagnosis; the
         stop path removes it). The uuid is persisted before the first wait, so a
         gateway restart during the up to ~30 min to RUNNING still knows the instance.
         A stop() meanwhile aborts it and takes over from the phase it reached."""
-        self._refuse_if_unreconciled()
-        self._refuse_if_busy()
-        s = self.state
-        if s.phase != "off" and not (s.phase == "failed" and not s.uuid and not s.index):
-            # `failed` with an index but no uuid still names an instance (Ruling 10)
-            raise RuntimeError(f"already {s.phase}"
-                               + (f" (instance {s.uuid or s.index})" if s.uuid or s.index else ""))
-        if not self.services:
-            # a machine serving nothing would bill for nothing
-            raise RuntimeError(_NO_SERVICE.format(host=self.name))
-        bad = self._problems()
-        if all(service_bid(x) in bad for x in self.services):
-            raise RuntimeError(f"no attached service of {self.name} can run: " + "; ".join(
-                f"{bid}: {why}" for bid, why in bad.items()))
-        if self._comfy() is not None:
-            self._commit()              # only the ComfyUI bootstrap pins a commit
-        if not self._token():
-            # every provider call would be a 401; say what to do instead of showing it
-            raise RuntimeError(_NO_TOKEN.format(name=self._prov.NAME))
+        blockers = self.start_blockers()
+        if blockers:
+            raise RuntimeError(blockers[0])
         self._abort_note = ""
         await self._run_op("starting", self._checked_start())
 
