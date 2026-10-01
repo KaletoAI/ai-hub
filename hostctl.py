@@ -213,7 +213,7 @@ _ABSENT_RECHECK_S = 5
 _RESUME_PROBE_S = 30            # a freshly started tunnel needs a moment before ComfyUI answers
 # a Start without a token is refused before any call (each would be the provider's 401);
 # the token is the PROVIDER's — one per provider, entered once in the console
-_NO_TOKEN = "no {name} API token set — enter it under Managed hosts → {name} API token"
+_NO_TOKEN = "no {name} API token set — enter it under Server → API Keys"
 # a Start without a service creates a machine that serves nothing and bills anyway
 _NO_SERVICE = "no backend is attached to managed host {host} — nothing to start"
 _STOP_STEPS = ("draining", "pruning", "snapshotting", "deleting")
@@ -2869,15 +2869,17 @@ class Controller:
 
     def checklist(self) -> list[dict]:
         """The card's "what a Start needs" list, in the order the operator sets it up:
-        `{ok, text, required}` — the provider token, an attached backend that can run,
-        and (only with a ComfyUI service) the LAN model source, which is optional: only
+        `{ok, text, required[, key]}` — the provider token (`key: "token"`, which the
+        card links to Server → API Keys), an attached backend that can run, and (only
+        with a ComfyUI service) the LAN model source, which is optional: only
         files no URL/catalog entry provides need it. Not part of `view()`: the LAN check
         reads the store, and `view()` runs every few seconds for the Dashboard."""
         name = self._prov.NAME
         tok = bool(self._token())
-        items = [{"ok": tok, "required": True,
+        # `key` lets the card link the token item to where it is entered
+        items = [{"ok": tok, "required": True, "key": "token",
                   "text": (f"{name} API token set" if tok else
-                           f"{name} API token not set — enter it above")}]
+                           f"{name} API token not set — enter it under Server → API Keys")}]
         if not self.services:
             items.append({"ok": False, "required": True,
                           "text": "no backend attached — add one below"})

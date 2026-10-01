@@ -3,9 +3,9 @@ with its service table, the model-sync/LAN-source/catalog blocks, the Dashboard 
 and the backend form's managed-host attachment.
 
 Every one of these fails SILENTLY:
-  · the API token is the PROVIDER's (one row per provider, always shown — the setup
-    order is token → host → backend → Start): never rendered, blank keeps it, the box
-    clears it; the host form has no token field and says that AI-Hub creates and deletes
+  · the API token is the PROVIDER's (one row per provider in Server → API Keys, which
+    the section's guide links — the setup order is token → host → backend → Start):
+    never rendered, blank keeps it, the box clears it; the host form has no token field and says that AI-Hub creates and deletes
     the instance itself (an operator made one by hand: unreachable, billing on its own);
     the card shows what a Start still needs and disables Start with the controller's own
     first refusal; its "+ … on this host" links open a pre-filled backend form;
@@ -426,7 +426,7 @@ class ManagedForm(_Base):
         self.assertIn('name="svc_health" value="/health"', html)
         self.assertIn("no tokens here", html.lower())
         self.assertIn("plain text", html)
-        self.assertIn("HF-token setting", html)
+        self.assertIn("the HF token belongs in <b>Server → API Keys</b>", html)
         self.assertIn("-y", html)
         self.assertIn("&lt;/dev/null", html)                    # stdin eats the script
         self.assertIn("127.0.0.1", html)                        # where it must listen
@@ -1377,8 +1377,9 @@ class LanSourceWiring(CatalogWiring):
 class HfToken(Actions):
     """Task 16: the HF token is a cloud secret like a backend key — encrypted at rest,
     never rendered back, blank keeps it and only the box clears it. Rendered, it sits in
-    every Backends page a shoulder or a screenshot sees; a blank Save that CLEARED it
-    silently turns every gated HF download into a 401 at the next sync."""
+    every page a shoulder or a screenshot sees; a blank Save that CLEARED it silently
+    turns every gated HF download into a 401 at the next sync. Since 2026-10-01 it lives
+    in Server → API Keys (row `srvkey-hf`), no longer in the Backends tab."""
 
     def setUp(self):
         super().setUp()
@@ -1389,9 +1390,14 @@ class HfToken(Actions):
         self.views = {"tc": _view()}
 
     def post(self, status=303, **data):
-        r = self.c.post("/ui/hosts/managed/hf-token", data=data, headers=SAME, follow_redirects=False)
+        r = self.c.post("/ui/server/hf-token", data=data, headers=SAME, follow_redirects=False)
         self.assertEqual(r.status_code, status, r.text[:300])
         return r
+
+    def keys(self) -> str:
+        r = self.c.get("/ui/server?sub=keys", headers=SAME)
+        self.assertEqual(r.status_code, 200)
+        return r.text
 
     def raw(self):
         import sqlite3
@@ -1402,9 +1408,17 @@ class HfToken(Actions):
     def test_bound(self):
         self.assertIs(admin._save_hf_token, main.save_hf_token)
         self.assertIs(admin._hf_token_set, main.hf_token_set)
-        self.assertIn("/ui/hosts/managed/hf-token", admin._POST_ACTIONS)
-        r = self.c.get("/ui/hosts/managed/hf-token", headers=SAME, follow_redirects=False)
+        self.assertIn("/ui/server/hf-token", admin._POST_ACTIONS)
+        r = self.c.get("/ui/server/hf-token", headers=SAME, follow_redirects=False)
         self.assertEqual(r.status_code, 405)
+
+    def test_moved_off_the_backends_tab(self):
+        page = self.page()
+        self.assertNotIn('name="hf_token"', page)
+        self.assertNotIn("hf-token", page)
+        # the catalog says where the token is now
+        self.assertIn("<a href='/ui/server?sub=keys'>Server → API Keys</a>", page)
+        self.assertIn('action="/ui/server/hf-token"', self.keys())
 
     def test_hf_token_encrypted_at_rest(self):
         self.assertIn("hf_token", store._SECRET_SETTINGS)
@@ -1421,13 +1435,13 @@ class HfToken(Actions):
         self.assertEqual(main._thunder_hf_token(), "hf_legacyPlain")
 
     def test_hf_token_never_rendered(self):
-        page = self.page()
+        page = self.keys()
         self.assertIn('name="hf_token"', page)
         self.assertRegex(page, r'<input type="password" name="hf_token" value=""')
         self.assertIn('name="hf_token_clear"', page)
         self.assertIn("not set", page)
         self.post(hf_token="hf_SecretValue123")
-        page = self.page()
+        page = self.keys()
         self.assertNotIn("hf_SecretValue123", page)
         self.assertNotIn(self.raw(), page)                  # nor its ciphertext
         self.assertRegex(page, r'<input type="password" name="hf_token" value=""')
@@ -1460,7 +1474,7 @@ class HfToken(Actions):
                 self.post(status=400, hf_token=bad)
                 self.assertEqual(main._thunder_hf_token(), "hf_Good1")
         self.assertTrue(hostctl.hf_token_ok("hf_Good1"))
-        self.assertRegex(r.text, r'<details class="optblock" data-k="hosts-catalog" open>')
+        self.assertIn('data-k="srvkey-hf"', r.text)          # the API Keys tab again
 
 
 class ModelsrcHostField(Actions):
@@ -2100,14 +2114,16 @@ class HostsPanel(_Base):
 #    explains itself, a checklist and a Start that says why not, backends added from
 #    the card, hand-made instances named as such ─────────────────────────────────────
 
-GUIDE = ("1. Enter the provider's API token · 2. + Managed host (what to rent) · "
+GUIDE = ("<a href='/ui/server?sub=keys'>1. Enter the provider's API token (Server → "
+         "API Keys)</a> · 2. + Managed host (what to rent) · "
          "3. Add a backend on the host's card · 4. Start")
 
 
 class ProviderTokenUI(Actions):
     """One API token per PROVIDER: a provider shows its token once, and asking for it per
     host made the operator paste it into every host. The row never renders the value,
-    blank keeps it, only the box clears it, and a Save reaches the running controllers."""
+    blank keeps it, only the box clears it, and a Save reaches the running controllers.
+    Since 2026-10-01 the row lives in Server → API Keys (`srvkey-provider-<kind>`)."""
 
     def setUp(self):
         super().setUp()
@@ -2120,14 +2136,19 @@ class ProviderTokenUI(Actions):
             setattr(admin, k, v)
 
     def post(self, status=303, **data):
-        r = self.c.post("/ui/hosts/managed/provider-token", data=data, headers=SAME,
+        r = self.c.post("/ui/server/provider-token", data=data, headers=SAME,
                         follow_redirects=False)
         self.assertEqual(r.status_code, status, r.text[-600:])
         return r
 
-    def row(self) -> str:
-        m = re.search(r'<form[^>]*data-k="hosts-ptoken-thunder"[^>]*>.*?</form>', self.page(),
-                      re.S)
+    def keys(self) -> str:
+        r = self.c.get("/ui/server?sub=keys", headers=SAME)
+        self.assertEqual(r.status_code, 200)
+        return r.text
+
+    def row(self, page=None) -> str:
+        m = re.search(r'<form[^>]*data-k="srvkey-provider-thunder"[^>]*>.*?</form>',
+                      page if page is not None else self.keys(), re.S)
         self.assertIsNotNone(m)
         return m.group(0)
 
@@ -2141,23 +2162,29 @@ class ProviderTokenUI(Actions):
     def test_bound_and_post_only(self):
         self.assertIs(admin._save_provider_token, main.save_provider_token)
         self.assertIs(admin._provider_tokens, main.provider_tokens_info)
-        self.assertIn("/ui/hosts/managed/provider-token", admin._POST_ACTIONS)
-        r = self.c.get("/ui/hosts/managed/provider-token", headers=SAME,
+        self.assertIn("/ui/server/provider-token", admin._POST_ACTIONS)
+        r = self.c.get("/ui/server/provider-token", headers=SAME,
                        follow_redirects=False)
         self.assertEqual(r.status_code, 405)
+
+    def test_not_on_the_backends_tab_any_more(self):
+        page = self.page()
+        self.assertNotIn("ptoken", page)
+        self.assertNotIn("provider-token", page)
+        self.assertNotIn('name="api_key_clear"', page)
 
     def test_row_never_renders_the_value(self):
         f = self.row()
         self.assertIn("Thunder Compute API token", f)
         self.assertIn("not set", f)
-        self.assertIn('action="/ui/hosts/managed/provider-token"', f)
+        self.assertIn('action="/ui/server/provider-token"', f)
         self.assertIn('<input type="hidden" name="provider" value="thunder">', f)
         self.assertRegex(f, r'<input type="password" name="api_key" value=""')
         self.assertIn('name="api_key_clear"', f)
         self.assertIn("Create it once in the Thunder Compute console (shown only once "
-                      "there); every Thunder Compute host uses it.", f)
+                      "there); every Thunder Compute managed host uses it.", f)
         store.set_provider_token("thunder", "th-SECRET-ROW")
-        page = self.page()
+        page = self.keys()
         self.assertNotIn("th-SECRET-ROW", page)
         self.assertIn('<span class="badge ok">set</span>', self.row())
 
@@ -2187,7 +2214,8 @@ class ProviderTokenUI(Actions):
         r = self.post(400, provider="thunder", api_key="", api_key_clear="1")
         self.assertIn("Thunder Compute hosts are not off (tc) — stop them first, or enter "
                       "a new token instead of clearing it", r.text)
-        self.assertIn('data-k="hosts-ptoken-thunder"', r.text)         # the row again
+        self.assertIn('data-k="srvkey-provider-thunder"', r.text)      # the row again
+        self.assertIn('data-k="srvkey-hf"', r.text)                    # on the keys tab
         self.assertNotIn("th-KEEP", r.text)
         self.assertEqual(store.get_provider_token("thunder"), "th-KEEP")
         self.assertEqual(self.applied, [])
@@ -2208,9 +2236,10 @@ class ProviderTokenUI(Actions):
 
 
 class SectionAlwaysThere(_Base):
-    """The natural order is token → host: with no managed host yet, the token rows, the
-    guide, "+ Managed host", the LAN block and the catalog must still be there — the
-    section used to render only once a host existed."""
+    """The natural order is token → host: with no managed host yet, the guide (whose
+    step 1 links to Server → API Keys, where the token rows live), "+ Managed host", the
+    LAN block and the catalog must still be there — the section used to render only once
+    a host existed."""
 
     def test_empty_store_renders_guide_token_row_and_lan_block(self):
         self.views = {}
@@ -2220,13 +2249,12 @@ class SectionAlwaysThere(_Base):
         html = self.page()
         sec = html[html.index('data-sk="mhosts"'):]
         self.assertIn(GUIDE, sec)
-        self.assertIn('data-k="hosts-ptoken-thunder"', sec)
+        self.assertNotIn("ptoken", sec)                   # the token rows moved away
         self.assertIn('href="/ui/backends?mhost_new=1"', sec)
         self.assertIn('data-k="hosts-modelsrc"', sec)
         self.assertIn('action="/ui/hosts/managed/catalog"', sec)
-        # order: guide, token rows, then the "+ Managed host" button
-        self.assertLess(sec.index(GUIDE), sec.index("hosts-ptoken-thunder"))
-        self.assertLess(sec.index("hosts-ptoken-thunder"), sec.index("mhost_new=1"))
+        # order: the guide, then the "+ Managed host" button
+        self.assertLess(sec.index(GUIDE), sec.index("mhost_new=1"))
 
 
 class HostFormFlow(_Base):
@@ -2310,6 +2338,22 @@ class CardChecklist(_Base):
         self.assertIn("✓ Thunder Compute API token set", ck)
         self.assertIn("✗ no backend attached — add one below", ck)
         self.assertIn("– LAN model source not usable", ck)
+
+    def test_missing_token_links_to_the_api_keys_tab(self):
+        miss = [{"ok": False, "required": True, "key": "token",
+                 "text": "Thunder Compute API token not set — enter it under Server → API Keys"}]
+        self.views = {"tc": _view(checklist=miss + self.CHECK[1:], start_blockers=[self.WHY])}
+        ck = re.search(r'<ul[^>]*data-k="host-tc-check"[^>]*>.*?</ul>', self.page(),
+                       re.S).group(0)
+        self.assertIn("✗ <a href='/ui/server?sub=keys'>Thunder Compute API token not set — "
+                      "enter it under Server → API Keys</a>", ck)
+        # a set token is no link (nothing to do there)
+        self.views = {"tc": _view(checklist=[dict(miss[0], ok=True, text="Thunder Compute "
+                                                  "API token set")] + self.CHECK[1:],
+                                  start_blockers=[self.WHY])}
+        ck = re.search(r'<ul[^>]*data-k="host-tc-check"[^>]*>.*?</ul>', self.page(),
+                       re.S).group(0)
+        self.assertNotIn("/ui/server", ck)
 
     def test_disabled_button_looks_disabled(self):
         self.assertIn(".btn[disabled]{opacity:.55;cursor:not-allowed}", admin._CSS)

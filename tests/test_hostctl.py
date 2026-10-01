@@ -4987,8 +4987,7 @@ class FinalReviewFixes(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError) as cm:
             await c.start()
         self.assertIn("no Thunder Compute API token set", str(cm.exception))
-        self.assertIn("enter it under Managed hosts → Thunder Compute API token",
-                      str(cm.exception))
+        self.assertIn("enter it under Server → API Keys", str(cm.exception))
         self.assertEqual(fake.calls, [])
         self.assertEqual(enabled, {})
         self.assertEqual(c.state.phase, "off")
@@ -6432,10 +6431,10 @@ class ProviderNeutralTexts(unittest.TestCase):
                     self.assertNotIn("thunder.", str(e))
 
     def test_no_token_names_the_form_field(self):
-        # the token is the PROVIDER's (one per provider, entered once at the top of the
-        # Managed hosts section) — the text must send the operator there
+        # the token is the PROVIDER's (one per provider, entered once in Server → API
+        # Keys) — the text must send the operator there
         self.assertEqual(hostctl._NO_TOKEN.format(name="X"),
-                         "no X API token set — enter it under Managed hosts → X API token")
+                         "no X API token set — enter it under Server → API Keys")
 
 
 class StartBlockers(unittest.IsolatedAsyncioTestCase):
@@ -6528,6 +6527,7 @@ class StartBlockers(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([(i["ok"], i["required"]) for i in items],
                          [(True, True), (True, True), (False, False)])
         self.assertIn("Thunder Compute API token", items[0]["text"])
+        self.assertEqual(items[0]["key"], "token")       # the card links it to API Keys
         self.assertIn("comfyui:thunder", items[1]["text"])
         self.assertIn("only needed for model files that no URL/catalog entry provides",
                       items[2]["text"])
@@ -6538,6 +6538,8 @@ class StartBlockers(unittest.IsolatedAsyncioTestCase):
         c.set_services([])
         items = c.checklist()
         self.assertEqual([(i["ok"], i["required"]) for i in items], [(False, True), (False, True)])
+        self.assertEqual(items[0]["text"],
+                         "Thunder Compute API token not set — enter it under Server → API Keys")
         self.assertIn("no backend attached — add one below", items[1]["text"])
         # attached but none can run: the causes are named
         c.set_services([_svc("m", "meshy", 18100, 9000)])

@@ -85,6 +85,9 @@ DEFAULT_TAB = "dashboard"
 # register here; the parent page dispatches on `sub` and passes
 # _page(..., subnav=_subnav(parent, sub)) so the bar renders under the header.
 SUBTABS = {"playground": [("chat", "Chat"), ("media", "Media"), ("voice", "Voice")],
+           # Server: what applies live, what needs a restart, and every secret the
+           # server holds (master key, provider tokens, HF token) — one form per key.
+           "server": [("runtime", "Runtime"), ("restart", "Restart"), ("keys", "API Keys")],
            # Aliases = what used to be split over two tabs: the editor (Mapping) and the
            # live alias→route overview (Input & Routing → Chat/Media aliases). The
            # overview is the right column while no alias is picked.
@@ -94,11 +97,15 @@ SUBTABS = {"playground": [("chat", "Chat"), ("media", "Media"), ("voice", "Voice
                        ("image", "Image models"), ("loras", "LoRAs")]}
 
 
-def _subnav(parent: str, active_sub: str) -> str:
+def _subnav(parent: str, active_sub: str, marks: Optional[dict] = None) -> str:
+    """`marks` = {sub: raw HTML} appended to that sub-tab's label (a badge the operator
+    must see from every sibling tab, e.g. Server → Restart's pending restart)."""
     subs = SUBTABS.get(parent) or []
+    marks = marks or {}
     cur = ' class="on" aria-current="page"'
     links = "".join(f'<a{cur if k == active_sub else ""} '
-                    f'href="/ui/{parent}?sub={k}">{_esc(lbl)}</a>' for k, lbl in subs)
+                    f'href="/ui/{parent}?sub={k}">{_esc(lbl)}{marks.get(k, "")}</a>'
+                    for k, lbl in subs)
     return f'<nav class="subnav">{links}</nav>'
 
 
@@ -938,8 +945,7 @@ _POST_ACTIONS = frozenset((
     "/ui/hosts/managed/start", "/ui/hosts/managed/stop", "/ui/hosts/managed/forget",
     "/ui/hosts/managed/restart-service", "/ui/hosts/managed/resetup",
     "/ui/hosts/managed/sync", "/ui/hosts/managed/delete-unknown",
-    "/ui/hosts/managed/catalog", "/ui/hosts/managed/hf-token",
-    "/ui/hosts/managed/provider-token",
+    "/ui/hosts/managed/catalog",
     "/ui/hosts/managed/modelsrc-scan", "/ui/hosts/managed/modelsrc-pin",
     "/ui/hosts/managed/modelsrc-list", "/ui/hosts/managed/modelsrc-host",
     "/ui/chat/badd", "/ui/chat/bdel", "/ui/chat/delete",
@@ -951,6 +957,8 @@ _POST_ACTIONS = frozenset((
     "/ui/playground/voice-ship", "/ui/playground/voice-del",
     "/ui/job/{job_id}/cancel",
     "/ui/users/delete", "/ui/ipalias/delete", "/ui/ipalias/save-resolved",
+    # Server → API Keys: each secret its own small form
+    "/ui/server/api-key", "/ui/server/provider-token", "/ui/server/hf-token",
 ))
 _POST_ACTION_RES = [re.compile("^" + re.sub(r"\\\{[^}]*\\\}", "[^/]+", re.escape(p)) + "$")
                     for p in _POST_ACTIONS]
@@ -1775,8 +1783,8 @@ def _managed_fieldset(src: dict, cur_type: str, managed: bool) -> str:
                                   wide=True,
                                   hint="Optional shell script, run once per host snapshot (again "
                                        "whenever it changes). <b>No tokens here</b> — it is stored "
-                                       "in plain text; the HF token belongs in the <b>HF-token "
-                                       "setting</b>. A command that reads stdin consumes the rest "
+                                       "in plain text; the HF token belongs in <b>Server → API "
+                                       "Keys</b>. A command that reads stdin consumes the rest "
                                        "of the script: use <code>-y</code> or "
                                        "<code>&lt;/dev/null</code>.")
                            + _field("start command", _textarea("svc_start", g("svc_start"), rows=3,
@@ -1787,7 +1795,7 @@ def _managed_fieldset(src: dict, cur_type: str, managed: bool) -> str:
                                          "<code>HF_HOME</code>; it must listen on "
                                          "<code>127.0.0.1:&lt;remote port&gt;</code>. <b>No tokens "
                                          "here</b> — stored in plain text; the HF token belongs in "
-                                         "the <b>HF-token setting</b>.")
+                                         "<b>Server → API Keys</b>.")
                            + _field("health path", _inp("svc_health", g("svc_health"),
                                                         placeholder=services.HEALTH_DEFAULT),
                                     hint="Probed through the tunnel; 200, 401 or 403 = up. "
@@ -2268,13 +2276,11 @@ def _host_prefill(qp, binfo: list) -> Optional[dict]:
 
 async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
                          catalog_refused: Optional[tuple] = None,
-                         hf_refused: Optional[str] = None,
                          modelsrc_refused: Optional[tuple] = None,
                          notice: Optional[str] = None) -> HTMLResponse:
     """The Backends tab; `detail` replaces the right column (a refused Save, re-rendered
     — then never live: the page's URL is the POST action, which a GET poll cannot fetch).
     `catalog_refused` = (text, reasons) of a refused model-sync catalog Save, likewise;
-    `hf_refused` = the reason an HF-token Save was refused (the value is never shown),
     `modelsrc_refused` = (host as typed, reason) of a refused `modelsrc_host` Save,
     `notice` = why a POST action was refused (a managed-host delete), shown on top."""
     edit_id = qp.get("edit", "")
@@ -2284,7 +2290,7 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
     # stays static — the morph's attribute sync would reset every visibility the type
     # select's handler set (switch to comfyui, and 3 s later its panes vanish).
     static = (detail is not None or catalog_refused is not None or bool(edit_id)
-              or hf_refused is not None or modelsrc_refused is not None
+              or modelsrc_refused is not None
               or notice is not None or bool(qp.get("new")) or bool(qp.get("host"))
               or bool(qp.get("mhost")) or bool(qp.get("mhost_new")))
     binfo = _gateway_info().get("backends", [])
@@ -2392,8 +2398,7 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
                  + msg_html
                  + f"<p class='hint'>Edit a backend to manage it here (editing a config one creates an "
                  f"editable copy that overrides it).</p>{items}"
-                 + _managed_hosts_section(tviews, catalog_refused, hf_refused,
-                                          modelsrc_refused)
+                 + _managed_hosts_section(tviews, catalog_refused, modelsrc_refused)
                  + _hosts_panel(binfo, "" if qp.get("new") else qp.get("host", ""), tviews)
                  + _scan_panel(scan_st))
     hosts = sorted({b["host"] for b in binfo if b.get("host")})
@@ -2447,12 +2452,12 @@ def _scan_panel(st: dict) -> str:
     notes = ""
     if st.get("no_range"):
         notes += ("<p class='bad'>No address range: this host reports no IPv4 subnet (no <code>ip</code> "
-                  "command?) and <b>scan_cidrs</b> in the <a href='/ui/server'>Server tab</a> is blank.</p>")
+                  "command?) and <b>scan_cidrs</b> in the <a href='/ui/server?sub=runtime'>Server tab</a> is blank.</p>")
     if st.get("error"):
         notes += f"<p class='bad'>Scan failed: {_esc(st['error'])}</p>"
     if st.get("truncated"):
         notes += ("<p class='bad'>Range cut at 1024 hosts — narrow <b>scan_cidrs</b> "
-                  "(<a href='/ui/server'>Server tab</a>) to scan the rest.</p>")
+                  "(<a href='/ui/server?sub=runtime'>Server tab</a>) to scan the rest.</p>")
     rows = ""
     for f in st.get("findings") or []:
         who = _esc(f.get("hostname") or f["host"])
@@ -3574,10 +3579,13 @@ def _host_card(name: str, v: dict) -> str:
     if ck:
         # what a Start needs, in setup order — above the service table and its "add"
         # buttons it points to. ✓ done · ✗ required and missing · – optional and missing
+        # a missing provider token links to where it is entered (Server → API Keys)
         li = "".join(
             f'<li data-k="{_esc(k)}-check-{n}">'
             f'{"✓" if i.get("ok") else ("✗" if i.get("required") else "–")} '
-            f"{_esc(i.get('text') or '')}</li>" for n, i in enumerate(ck))
+            + (f"<a href='/ui/server?sub=keys'>{_esc(i.get('text') or '')}</a>"
+               if i.get("key") == "token" and not i.get("ok") else _esc(i.get('text') or ''))
+            + "</li>" for n, i in enumerate(ck))
         rows.append(f'<ul class="hint" data-k="{_esc(k)}-check" '
                     f'style="list-style:none;padding-left:0;margin:4px 0">{li}</ul>')
     rows.append(f'<div data-k="{_esc(k)}-svcblock">{_svc_table(k, name, v)}</div>')
@@ -3665,32 +3673,11 @@ def _host_card(name: str, v: dict) -> str:
     return f'<div class="tcard" data-k="{_esc(k)}">{"".join(rows)}</div>'
 
 
-def _hf_token_form(refused: Optional[str] = None) -> str:
-    """The HF token (setting `hf_token`, encrypted at rest) for gated Hugging Face
-    downloads — the backend-key pattern: never rendered back, blank keeps it, the box
-    removes it. A refused Save shows why, never the value."""
-    try:
-        is_set = bool(_hf_token_set())
-    except Exception as e:                              # noqa: BLE001 — a form, not the tab
-        logger.warning(f"ui: HF token state unreadable: {type(e).__name__}: {e}")
-        is_set = False
-    return ('<form method="post" action="/ui/hosts/managed/hf-token" data-k="hosts-hftoken" '
-            'data-guard>' + (_form_err(refused) if refused else "")
-            + _field("HF token", _inp("hf_token", "", typ="password",
-                                      placeholder=("•••• set — blank keeps it" if is_set
-                                                   else "not set — needed for gated repos"))
-                     + _checkbox("hf_token_clear", False, "clear",
-                                 "remove the stored token on Save"),
-                     hint="Sent as the bearer token of Hugging Face catalog downloads on the "
-                          "instance; stored encrypted, never shown again.")
-            + f'<div class="tacts">{_btn("Save token", submit=True, sm=True)}</div></form>')
-
-
-def _catalog_editor(refused: Optional[tuple] = None, hf_refused: Optional[str] = None) -> str:
+def _catalog_editor(refused: Optional[tuple] = None) -> str:
     """The model-sync catalog (setting `modelsync_catalog`, one for every managed host's
-    ComfyUI) as a JSON textarea, and the HF token below it. `refused` = (text as typed,
-    [reasons]): a Save the validator turned down comes back open, with the text exactly
-    as typed; `hf_refused` (a refused token Save) opens it too."""
+    ComfyUI) as a JSON textarea. `refused` = (text as typed, [reasons]): a Save the
+    validator turned down comes back open, with the text exactly as typed. The HF token
+    the catalog's gated downloads need lives in Server → API Keys."""
     if refused is not None:
         text, errs = refused
         n = "?"
@@ -3703,9 +3690,9 @@ def _catalog_editor(refused: Optional[tuple] = None, hf_refused: Optional[str] =
         text, errs = json.dumps(cat, indent=1, ensure_ascii=False), []
         n = str(len(cat)) if isinstance(cat, list) else "?"
     err = "".join(_form_err(e) for e in errs[:30])
-    opened = refused is not None or hf_refused is not None
+    opened = refused is not None
     return (f'<details class="optblock" data-k="hosts-catalog"{" open" if opened else ""}>'
-            f"<summary>Model-sync catalog ({n} entries) and HF token</summary>"
+            f"<summary>Model-sync catalog ({n} entries)</summary>"
             '<form method="post" action="/ui/hosts/managed/catalog" data-guard>' + err
             + "<p class='hint'>What no workflow names, for every managed host's ComfyUI. "
             "Entries: "
@@ -3718,7 +3705,9 @@ def _catalog_editor(refused: Optional[tuple] = None, hf_refused: Optional[str] =
             "<code>hf-cache/</code>; a trailing <code>/</code> is a whole directory.</p>"
             + _textarea("catalog", text, rows=16)
             + f'<div class="tacts">{_btn("Save catalog", submit=True, sm=True)}</div>'
-            "</form>" + _hf_token_form(hf_refused) + "</details>")
+            "</form><p class='hint' data-k=\"hosts-hfhint\">Gated Hugging Face files need the "
+            "<b>Hugging Face token</b> — <a href='/ui/server?sub=keys'>Server → API Keys</a>.</p>"
+            "</details>")
 
 
 # What the operator runs for the LAN source. RECOMMENDED: a VM (or container) that
@@ -3903,49 +3892,21 @@ def _orphan_snaps_block() -> str:
 
 
 # The section's first lines: the setup flow in the order it has to happen (operator
-# test 2026-09-30 — the token is entered ONCE per provider, before any host exists).
-# A constant, rendered raw (no markup in it — and _esc would turn its ' into &#x27;).
-_MHOST_GUIDE = ("1. Enter the provider's API token · 2. + Managed host (what to rent) · "
+# test 2026-09-30 — the token is entered ONCE per provider, before any host exists; it
+# lives in Server → API Keys since 2026-10-01). A constant, rendered raw (its only markup
+# is that link — and _esc would turn its ' into &#x27;).
+_MHOST_GUIDE = ("<a href='/ui/server?sub=keys'>1. Enter the provider's API token (Server → "
+                "API Keys)</a> · 2. + Managed host (what to rent) · "
                 "3. Add a backend on the host's card · 4. Start")
 
 
-def _provider_token_rows() -> str:
-    """One row per provider in `hostapi.PROVIDERS`: `<NAME> API token`, set / not set,
-    a password input that is NEVER pre-filled, a clear box and Save (the backend-key
-    rule: blank keeps, the box clears, a typed value wins). One token per provider —
-    the provider shows it only once, and every host of that provider uses it."""
-    try:
-        state = _provider_tokens() or {}
-    except Exception as e:                              # noqa: BLE001 — a row, not the tab
-        logger.warning(f"ui: provider tokens unreadable: {type(e).__name__}")
-        state = {}
-    out = ""
-    for kind in hostapi.PROVIDERS:
-        name = _provider_name(kind)
-        is_set = bool(state.get(kind))
-        badge = _badge("set", "ok") if is_set else _badge("not set", "warn")
-        out += (f'<form method="post" action="/ui/hosts/managed/provider-token" '
-                f'data-k="hosts-ptoken-{_esc(kind)}" data-guard>'
-                f'<input type="hidden" name="provider" value="{_esc(kind)}">'
-                + _field(f"{name} API token",
-                         badge + " " + _inp("api_key", "", typ="password",
-                                            placeholder=("•••• set — blank keeps it" if is_set
-                                                         else f"the {name} API token"))
-                         + _checkbox("api_key_clear", False, "clear",
-                                     "remove the stored token on Save"),
-                         hint=(f"Create it once in the {_esc(name)} console (shown only once "
-                               f"there); every {_esc(name)} host uses it."))
-                + f'<div class="tacts">{_btn("Save token", submit=True, sm=True)}</div></form>')
-    return out
-
-
 def _managed_hosts_section(views: list, catalog_refused: Optional[tuple] = None,
-                           hf_refused: Optional[str] = None,
                            modelsrc_refused: Optional[tuple] = None) -> str:
     """The Hosts area's managed hosts, ALWAYS rendered (the order is token → host, so
-    the token rows cannot wait for a host): the 4-step guide, one API-token row per
-    provider, "+ Managed host", one lifecycle card per host, the orphaned snapshots
-    (with hosts), then the LAN model source and the model-sync catalog + HF token."""
+    the guide cannot wait for a host): the 4-step guide (step 1 links to Server → API
+    Keys, where the provider tokens and the HF token live), "+ Managed host", one
+    lifecycle card per host, the orphaned snapshots (with hosts), then the LAN model
+    source and the model-sync catalog."""
     cards = "".join(_host_card(n, v) for n, v in views)
     intro = ("" if views else
              "<p class='hint'>A managed host is a rented GPU machine the gateway starts and "
@@ -3953,11 +3914,10 @@ def _managed_hosts_section(views: list, catalog_refused: Optional[tuple] = None,
              "Backends run on it by naming it as their host.</p>")
     extra = _orphan_snaps_block() if views else ""
     extra += _modelsrc_block(modelsrc_refused)
-    extra += _catalog_editor(catalog_refused, hf_refused)
+    extra += _catalog_editor(catalog_refused)
     # not `.bar`: that one is sticky, and a second sticky bar would slide over the list's
     return ('<div data-sk="mhosts"><div class="grouphdr" style="margin-top:18px">Managed '
             f'hosts</div><p class="hint" data-k="hosts-guide">{_MHOST_GUIDE}</p>'
-            + _provider_token_rows()
             + '<div style="display:flex;align-items:center;gap:14px;margin-top:10px">'
             '<div style="flex:1"></div>'
             f'{_btn("+ Managed host", "/ui/backends?mhost_new=1", sm=True)}</div>'
@@ -4068,7 +4028,7 @@ async def managed_host_save(request: Request):
     rules: the name, R-W6 collisions, the provider, `options_of`). What the form typed
     goes over as typed — main validates and stores the normalized options — and a
     refusal is a 400 with the form exactly as typed. No token here: it is the
-    provider's (`hosts_provider_token`)."""
+    provider's (Server → API Keys, `server_provider_token`)."""
     f = await _form(request)
     new = bool(f.get("new"))
     name = (f.get("host") or "").strip()
@@ -4248,52 +4208,6 @@ async def hosts_catalog_save(request: Request):
                                     status=400)
     logger.info(f"ui: model-sync catalog saved ({len(cat)} entries)")
     return _hosts_msg(f"model-sync catalog saved ({len(cat)} entries)")
-
-
-async def hosts_hf_token(request: Request):
-    """Save the HF token: a typed value replaces it, blank keeps it, the box removes it
-    (the backend-key rule). A refused value is a 400 naming why — never the value."""
-    f = await _form(request)
-    tok = (f.get("hf_token") or "").strip()
-    if _save_hf_token is None:
-        return _hosts_msg("the HF token cannot be saved here")
-    if not tok and not f.get("hf_token_clear"):
-        return _hosts_msg("HF token unchanged (blank keeps it)")
-    try:
-        err = str(_save_hf_token(tok) or "")
-    except Exception as e:                              # noqa: BLE001 — refused, not a 500
-        err = f"HF token not saved: {type(e).__name__}"
-    if err:
-        return await _backends_view(request.query_params, hf_refused=err, status=400)
-    msg = "HF token saved (encrypted)" if tok else "HF token removed"
-    logger.info(f"ui: {msg}")
-    return _hosts_msg(msg)
-
-
-async def hosts_provider_token(request: Request):
-    """Save a provider's API token (one per provider, every host of it uses it): a typed
-    value replaces it, blank keeps it, the box removes it. Unknown provider or a refused
-    value → 400 naming why — never the value. Main re-syncs the controllers."""
-    f = await _form(request)
-    kind = (f.get("provider") or "").strip()
-    tok = (f.get("api_key") or "").strip()
-    if _save_provider_token is None:
-        return _hosts_msg("provider tokens cannot be saved here")
-    if kind not in hostapi.PROVIDERS:
-        return await _backends_view({}, notice=f"unknown provider {kind[:40]!r} — token "
-                                               "not saved", status=400)
-    name = _provider_name(kind)
-    if not tok and not f.get("api_key_clear"):
-        return _hosts_msg(f"{name} API token unchanged (blank keeps it)")
-    try:
-        err = str(_save_provider_token(kind, tok) or "")
-    except Exception as e:                              # noqa: BLE001 — refused, not a 500
-        err = f"not saved: {type(e).__name__}"
-    if err:
-        return await _backends_view({}, notice=f"{name} API token: {err}", status=400)
-    msg = f"{name} API token saved (encrypted)" if tok else f"{name} API token removed"
-    logger.info(f"ui: {msg}")
-    return _hosts_msg(msg)
 
 
 async def hosts_modelsrc_host(request: Request):
@@ -7611,7 +7525,7 @@ async def _calls_view_body(request: Request, kind: str) -> str:
     title = "Voice Calls" if kind == "voice" else "LLM Calls"
     if not stats.is_active():
         return (f"<h2>{title}</h2><p class='hint'>Call recording is off. Enable <b>stats</b> in the "
-                "<a href='/ui/server'>Server</a> tab (needs a restart) to log per-call history here.</p>")
+                "<a href='/ui/server?sub=restart'>Server</a> tab (needs a restart) to log per-call history here.</p>")
     user = (request.query_params.get("user") or "").strip() or None
     # Filtered by kind IN SQL: taking the newest 300 of the whole log and filtering
     # afterwards left Voice Calls empty on any busy LLM day.
@@ -8446,7 +8360,7 @@ def _dash_llm(d: dict, now: int, aliases: dict) -> str:
         return head + _calls_table(lr, sk="dash-llm")
     if not d.get("stats_active") and not nrun:
         return (head + "<p class='hint'>Call recording is off — only currently-running calls show here. "
-                "Enable <b>stats</b> in the <a href='/ui/server'>Server</a> tab for the 5-minute history "
+                "Enable <b>stats</b> in the <a href='/ui/server?sub=restart'>Server</a> tab for the 5-minute history "
                 "and the full <a href='/ui/jobs?sub=llm'>LLM Calls</a> log.</p>")
     return head + "<p class='muted'>nothing running or in the last 5 min</p>"
 
@@ -8713,7 +8627,7 @@ async def statistic_page(request: Request):
         # show even when call recording is off, and this is the page they belong on.
         media = await asyncio.to_thread(_media_gen_panel)
         return HTMLResponse(_page("Statistics", "<h2>Statistics</h2><p class='hint'>Call recording is off. "
-            "Enable <b>stats</b> in the <a href='/ui/server'>Server</a> tab (needs a restart) to collect "
+            "Enable <b>stats</b> in the <a href='/ui/server?sub=restart'>Server</a> tab (needs a restart) to collect "
             "per-call stats here.</p>" + fpanel + media + _FILTER_JS, "statistic"))
     user = (request.query_params.get("user") or "").strip() or None
     s = await asyncio.to_thread(stats.summary, user=user)
@@ -9296,7 +9210,7 @@ def _user_form(u: Optional[dict], orig: Optional[str] = None, err: str = "") -> 
                      # editor pre-fills it again next time.
                      hint=("This user's key is filled in and hidden — <b>📋 Copy</b> reveals and "
                            "copies it. Overwrite the field to change the key. Turn off "
-                           "<code>show_user_keys</code> in <a href='/ui/server'>Server</a> to keep "
+                           "<code>show_user_keys</code> in <a href='/ui/server?sub=runtime'>Server</a> to keep "
                            "stored keys out of this page." if show_key else
                            "Generate or paste a key. It is stored encrypted; with "
                            "<code>show_user_keys</code> on (Server tab) it can be copied here again "
@@ -9323,12 +9237,12 @@ def _user_form(u: Optional[dict], orig: Optional[str] = None, err: str = "") -> 
 _USER_REFUSALS = {
     "last_admin": "that would remove the last admin who can sign in — the console would "
                   "open to everyone. Make another user an <b>admin</b> (enabled, with a key) "
-                  "or set a master API key in <a href='/ui/server'>Server</a> first.",
+                  "or set a master API key in <a href='/ui/server?sub=keys'>Server</a> first.",
     "last_admin_open": "that would remove the last admin who can sign in — the console AND the "
                        "API would open to everyone. Set a master API key in "
-                       "<a href='/ui/server'>Server</a> first if that is really what you want.",
+                       "<a href='/ui/server?sub=keys'>Server</a> first if that is really what you want.",
     "no_admin": "the first user must be an enabled <b>admin</b> with a key (or set a master API "
-                "key in <a href='/ui/server'>Server</a>) — a user locks the console, and without "
+                "key in <a href='/ui/server?sub=keys'>Server</a>) — a user locks the console, and without "
                 "an admin nobody could sign in.",
 }
 
@@ -9357,7 +9271,8 @@ async def _users_view(qp, detail: Optional[str] = None, status: int = 200) -> HT
         items += _item(f"{_esc(u['name'])} {role_b}{st} {key_b}", sub, acts, sel=(u["name"] == edit))
     items = items or "<p class='muted'>No users — the gateway is open (bootstrap). Add one to require keys.</p>"
     warn = ("<p class='ok-banner'>Bootstrap mode: no users and no master key → the API and /ui are "
-            "open. Add an <b>admin</b> user first (or set a master API key in Server) to lock it "
+            "open. Add an <b>admin</b> user first (or set a master API key in "
+            "<a href='/ui/server?sub=keys'>Server → API Keys</a>) to lock it "
             "down.</p>" if open_auth else "")
     why = _USER_REFUSALS.get(qp.get("refused", ""))
     if why:
@@ -9546,108 +9461,305 @@ def _srv_runtime_row(k: str, kind: str, lbl: str, note: str, value) -> str:
     typ = "text" if kind == "text" else "number"
     # A list (scan cidrs/ports) gets the column's full width — capped like a number
     # field it cut "8080, 8000, 11434, 8188, 1234, 5000" off mid-list.
-    return _field(lbl, _inp(k, "" if value in (None, "") else value, typ=typ),
+    # a decimal setting needs step="any": with the implicit step 1 the browser refuses
+    # "2.5" and blocks the whole form's Save
+    return _field(lbl, _inp(k, "" if value in (None, "") else value, typ=typ,
+                            step=("any" if kind == "float" else "")),
                   wide=(kind == "text"), hint=_esc(note))
 
 
-async def server_page(request: Request):
+# Lowest accepted value per whole-number setting (blank = the default, always allowed):
+# a 0 s health interval spins the discovery loop, port 0 is no port. Everything else ≥ 0.
+_SRV_MIN = {"port": 1, "health_check_interval": 1}
+_SRV_BOOLS = ("log_per_call", "model_prefix", "show_user_keys")
+
+
+def _srv_state(request: Request) -> dict:
+    """What every Server sub-tab needs: the effective settings and whether a restart is
+    pending (a configured restart-only value differs from what is running)."""
     si = _server_info()
     eff, rt = si.get("effective", {}), si.get("runtime", {})
     running_port = request.url.port      # the port THIS request hit = the gateway port
-    saved = request.query_params.get("saved")
 
     def rdiff(key):                      # configured value differs from what's running
         return key in rt and str(eff.get(key)) != str(rt.get(key))
     port_diff = bool(running_port and str(eff.get("port")) != str(running_port))
     any_restart = port_diff or any(rdiff(k) for k in _SRV_RESTART_KEYS if k != "port")
-    mark = lambda cond: (" " + _badge("↻ restart", "warn")) if cond else ""
+    return {"eff": eff, "rdiff": rdiff, "port_diff": port_diff,
+            "any_restart": any_restart, "running_port": running_port}
 
-    banner = ""
-    if saved == "1":
-        banner = "<p class='ok-banner'>✓ Saved — runtime settings applied live.</p>"
-    elif saved == "restart":
-        banner = "<p class='ok-banner'>✓ Saved — port/stats/jobs changes need a <b>restart</b> to apply.</p>"
 
-    runtime_rows = (
-        _field("API key (client auth)",
-               _inp("api_key", "", placeholder=("•••• set — blank keeps it" if eff.get("api_key_set")
-                                                else "unset — clients need no key")))
-        + "".join(_srv_runtime_row(k, kind, lbl, n, eff.get(k)) for k, kind, lbl, n in _SRV_RUNTIME)
+def _srv_mark(cond) -> str:
+    return (" " + _badge("↻ restart", "warn")) if cond else ""
+
+
+def _srv_runtime_form(st: dict, typed: Optional[dict] = None, errs=()) -> str:
+    """Runtime settings (applied on Save). `typed` = the refused form as sent — every
+    row shows what was typed, not the stored value."""
+    eff = st["eff"]
+    val = (lambda k: typed.get(k, "")) if typed is not None else eff.get
+    flag = ((lambda k: bool(typed.get(k))) if typed is not None else
+            (lambda k: _show_user_keys() if k == "show_user_keys" else bool(eff.get(k))))
+    rows = (
+        "".join(_srv_runtime_row(k, kind, lbl, n, val(k)) for k, kind, lbl, n in _SRV_RUNTIME)
         + _field("flags",
-                 _checkbox("log_per_call", bool(eff.get("log_per_call")), "log_per_call",
+                 _checkbox("log_per_call", flag("log_per_call"), "log_per_call",
                            "one log line per forwarded request")
-                 + _checkbox("model_prefix", bool(eff.get("model_prefix")), "model_prefix",
+                 + _checkbox("model_prefix", flag("model_prefix"), "model_prefix",
                              "list models as backend/model in /v1/models")
-                 + _checkbox("show_user_keys", _show_user_keys(), "show_user_keys",
+                 + _checkbox("show_user_keys", flag("show_user_keys"), "show_user_keys",
                              "let an existing user's API key be copied again in the user "
                              "editor (off: only a key generated right there is shown)")))
-    runtime_form = (
-        '<form action="/ui/server/save" method="post" data-guard><input type="hidden" name="_form" value="runtime">'
-        f'<div class="formbar"><h2>Runtime settings</h2>{_btn("Save", submit=True)}</div>'
-        "<p class='hint'>Applied immediately on Save (no restart).</p>" + runtime_rows + "</form>")
+    return ('<form action="/ui/server/save" method="post" data-guard>'
+            '<input type="hidden" name="_form" value="runtime">'
+            f'<div class="formbar"><h2>Runtime settings</h2>{_btn("Save", submit=True)}</div>'
+            + "".join(_form_err(e) for e in errs)
+            + "<p class='hint'>Applied immediately on Save (no restart).</p>" + rows + "</form>")
 
-    restart_rows = ""
+
+def _srv_restart_form(st: dict, typed: Optional[dict] = None, errs=()) -> str:
+    """Restart-required settings, each with its ↻ badge while configured ≠ running."""
+    eff, rdiff, port_diff = st["eff"], st["rdiff"], st["port_diff"]
+    rows = ""
     for k, kind, lbl, n in _SRV_RESTART:
         if kind == "":                                   # subsection header
-            restart_rows += f'<div class="grouphdr">{_esc(lbl)}</div>'
+            rows += f'<div class="grouphdr">{_esc(lbl)}</div>'
         elif kind == "bool":
-            restart_rows += _field(lbl, _checkbox(k, bool(eff.get(k)), "enabled", n) + mark(rdiff(k)))
+            on = bool(typed.get(k)) if typed is not None else bool(eff.get(k))
+            rows += _field(lbl, _checkbox(k, on, "enabled", n) + _srv_mark(rdiff(k)))
         else:
             d = port_diff if k == "port" else rdiff(k)
-            restart_rows += _field(lbl, _inp(k, _srv_disp(k, eff.get(k, "")), typ=("number" if kind == "int" else "text"))
-                                   + mark(d), hint=_esc(n))
-    restart_form = (
-        '<form action="/ui/server/save" method="post" data-guard><input type="hidden" name="_form" value="restart">'
-        f'<div class="formbar"><h2>Restart-required{mark(any_restart)}</h2>{_btn("Save", submit=True)}</div>'
-        f"<p class='hint'>AI-Hub is listening on port <b>{_esc(running_port or '?')}</b>. "
-        "These take effect on the next restart.</p>" + restart_rows + "</form>")
+            v = typed.get(k, "") if typed is not None else _srv_disp(k, eff.get(k, ""))
+            # a unit field (TTL in hours, prune in minutes) may hold a decimal there
+            rows += _field(lbl, _inp(k, v, typ=("number" if kind == "int" else "text"),
+                                     step=("any" if k in _SRV_UNITS else ""))
+                           + _srv_mark(d), hint=_esc(n))
+    return ('<form action="/ui/server/save" method="post" data-guard>'
+            '<input type="hidden" name="_form" value="restart">'
+            f'<div class="formbar"><h2>Restart-required{_srv_mark(st["any_restart"])}</h2>'
+            f'{_btn("Save", submit=True)}</div>'
+            + "".join(_form_err(e) for e in errs)
+            + f"<p class='hint'>AI-Hub is listening on port <b>{_esc(st['running_port'] or '?')}"
+            "</b>. These take effect on the next restart.</p>" + rows + "</form>")
 
+
+def _srv_key_row(dk: str, action: str, label: str, is_set: bool, name: str, unset_ph: str,
+                 hint: str, hidden: str = "", clear: str = "", err: str = "") -> str:
+    """One API-Keys row = its OWN form (a Save never touches another key): a set / not
+    set badge, a password input that is NEVER pre-filled (blank keeps the stored value),
+    an optional clear box, the hint (raw HTML — callers escape their text)."""
+    badge = _badge("set", "ok") if is_set else _badge("not set", "warn")
+    # an id per row: two rows post the same field name (`api_key`), and the derived
+    # `fld-<name>` would give the page two equal ids (each label then names the first)
+    inp = _inp(name, "", typ="password",
+               placeholder=("•••• set — blank keeps it" if is_set else unset_ph))
+    inp = inp[:-1] + f' id="{dk}-input">'
+    ctrl = (badge + " " + inp
+            + (_checkbox(clear, False, "clear", "remove the stored value on Save")
+               if clear else ""))
+    return (f'<form method="post" action="{action}" data-k="{dk}" data-guard>{hidden}'
+            + _form_err(err) + _field(label, ctrl, hint=hint)
+            + f'<div class="tacts">{_btn("Save", submit=True, sm=True)}</div></form>')
+
+
+def _srv_keys_body(st: dict, key_errs: Optional[dict] = None,
+                   notice: Optional[str] = None) -> str:
+    """Every secret the SERVER holds, one row each: the master API key, one API token per
+    provider in `hostapi.PROVIDERS`, the Hugging Face token. `key_errs` = {row: why a
+    Save was refused} (never the value); `notice` = a refusal no row owns."""
+    key_errs = key_errs or {}
+    rows = _srv_key_row(
+        "srvkey-master", "/ui/server/api-key", "Master API key (client auth)",
+        bool(st["eff"].get("api_key_set")), "api_key", "unset — clients need no key",
+        "Clients send it as <code>Authorization: Bearer</code> or <code>x-api-key</code>; a "
+        "set key also locks this console. Stored encrypted. Saving a new one ends every "
+        "console session opened with the old key.", err=key_errs.get("master", ""))
+    try:
+        ptok = _provider_tokens() or {}
+    except Exception as e:                              # noqa: BLE001 — a row, not the tab
+        logger.warning(f"ui: provider tokens unreadable: {type(e).__name__}")
+        ptok = {}
+    for kind in hostapi.PROVIDERS:
+        name = _provider_name(kind)
+        rows += _srv_key_row(
+            f"srvkey-provider-{_esc(kind)}", "/ui/server/provider-token", f"{name} API token",
+            bool(ptok.get(kind)), "api_key", f"the {name} API token",
+            f"Create it once in the {_esc(name)} console (shown only once there); every "
+            f"{_esc(name)} managed host uses it.",
+            hidden=f'<input type="hidden" name="provider" value="{_esc(kind)}">',
+            clear="api_key_clear", err=key_errs.get(f"provider-{kind}", ""))
+    try:
+        hf_set = bool(_hf_token_set())
+    except Exception as e:                              # noqa: BLE001 — a row, not the tab
+        logger.warning(f"ui: HF token state unreadable: {type(e).__name__}")
+        hf_set = False
+    rows += _srv_key_row(
+        "srvkey-hf", "/ui/server/hf-token", "Hugging Face token", hf_set, "hf_token",
+        "not set — needed for gated repos",
+        "Used by the model sync of managed hosts to download gated Hugging Face files; sent "
+        "only to huggingface.co / hf.co.", clear="hf_token_clear", err=key_errs.get("hf", ""))
+    return ('<div class="formbar"><h2>API Keys</h2></div>' + _form_err(notice or "")
+            + "<p class='hint'>Each key is saved on its own; none is ever shown again — a "
+            "blank field keeps the stored one.</p>" + rows
+            + '<p class="muted">User API keys are managed in the <a href="/ui/users">Users</a> '
+            "tab.</p>")
+
+
+def _server_view(request: Request, sub: str = "", status: int = 200,
+                 typed: Optional[dict] = None, errs=(), key_errs: Optional[dict] = None,
+                 notice: Optional[str] = None) -> HTMLResponse:
+    """The Server tab: Runtime | Restart | API Keys (`SUBTABS["server"]`, first = default).
+    A refused Save re-renders its own sub-tab with `typed`/`errs` (runtime/restart) or
+    `key_errs`/`notice` (keys) and answers `status` 400."""
+    subs = [k for k, _ in SUBTABS["server"]]
+    sub = sub if sub in subs else subs[0]
+    qp = request.query_params
+    st = _srv_state(request)
+    saved, msg = qp.get("saved"), qp.get("msg")
+    banner = ""
+    if status == 200 and saved == "1" and sub == "runtime":
+        banner = "<p class='ok-banner'>✓ Saved — runtime settings applied live.</p>"
+    elif status == 200 and saved == "restart" and sub == "restart":
+        banner = "<p class='ok-banner'>✓ Saved — port/stats/jobs changes need a <b>restart</b> to apply.</p>"
+    elif status == 200 and msg:
+        banner = f"<p class='ok-banner'>{_esc(msg[:600])}</p>"
+    if st["any_restart"] and sub != "restart":
+        banner += ("<p class='bad'>↻ A restart is pending — <a href='/ui/server?sub=restart'>"
+                   "Restart</a> shows what changed.</p>")
     info = ("<h2>Server</h2><p class='hint'>These override <code>config.yaml</code> and are stored in "
             "the gateway (API key encrypted at rest), so config.yaml only needs backends, aliases and "
             "the launch port.</p>")
+    if sub == "runtime":
+        content = _srv_runtime_form(st, typed, errs)
+    elif sub == "restart":
+        content = _srv_restart_form(st, typed, errs)
+    else:
+        content = _srv_keys_body(st, key_errs, notice)
     # intro/banner live inside the column (not as a sibling before .cols) so the sticky
-    # Save bars stay visible — see the Users design-convention note.
-    body = (f'<div class="cols"><div class="col">{info}{banner}{runtime_form}</div>'
-            f'<div class="col">{restart_form}</div></div>')
-    return HTMLResponse(_page("Server", body, "server"))
+    # Save bar stays visible — see the Users design-convention note.
+    body = f'<div class="cols"><div class="col">{info}{banner}{content}</div></div>'
+    marks = {"restart": _srv_mark(True)} if st["any_restart"] else None
+    return HTMLResponse(_page("Server", body, "server", subnav=_subnav("server", sub, marks)),
+                        status_code=status)
+
+
+async def server_page(request: Request):
+    return _server_view(request, request.query_params.get("sub") or "")
 
 
 async def server_save(request: Request):
+    """Save the Runtime or the Restart form (`_form`). Numbers go through
+    `_int_field`/`_float_field`: blank is the ONE unset ("" stored = the default), and
+    "1.5" in a whole-number field, "abc" or "-1" is a 400 with the form as typed and the
+    reason — nothing stored (it used to turn silently into "unset"). A unit field (TTL in
+    hours, prune in minutes) takes decimals in its unit and is stored in seconds."""
     f = await _form(request)
-    which = f.get("_form", "")
+    which = "runtime" if f.get("_form") == "runtime" else "restart"
     spec = _SRV_RUNTIME if which == "runtime" else _SRV_RESTART
-    bools = {"log_per_call", "model_prefix", "show_user_keys"} if which == "runtime" else set()
-    vals = {}
-    for k, kind, *_ in spec:
+    vals, errs, grp = {}, [], ""
+    for k, kind, lbl, *_ in spec:
         if not kind:
+            grp = lbl                                     # subsection: names the error
             continue
+        name = f"{grp} · {lbl}" if grp else lbl
+        raw = (f.get(k, "") or "").strip()
+        err = ""
         if kind == "bool":
             vals[k] = bool(f.get(k))
+        elif kind == "int" and k in _SRV_UNITS:
+            v, err = _float_field(raw, name, "the default")
+            vals[k] = "" if v is None else int(round(v * _SRV_UNITS[k]))
         elif kind == "int":
-            raw = (f.get(k, "") or "").strip()
-            try:                                          # unit fields (TTL/prune) edited in hours/min → store seconds
-                vals[k] = int(round(float(raw) * _SRV_UNITS.get(k, 1)))
-            except ValueError:
-                vals[k] = ""
+            v, err = _int_field(raw, name, "the default", _SRV_MIN.get(k, 0))
+            vals[k] = "" if v is None else v
         elif kind == "float":
-            raw = (f.get(k, "") or "").strip()
-            try:
-                vals[k] = float(raw)
-            except ValueError:
-                vals[k] = ""
+            v, err = _float_field(raw, name, "the default")
+            vals[k] = "" if v is None else v
         else:
-            vals[k] = (f.get(k, "") or "").strip()
+            vals[k] = raw
+        if err:
+            errs.append(err)
     if which == "runtime":
-        for b in bools:
+        for b in _SRV_BOOLS:
             vals[b] = bool(f.get(b))
-        ak = (f.get("api_key", "") or "").strip()
-        if ak:
-            vals["api_key"] = ak
+    if errs:
+        logger.warning(f"ui: server settings not saved ({which}): {'; '.join(errs)[:300]}")
+        return _server_view(request, which, status=400, typed=dict(f), errs=errs)
     store.set_settings(vals)
     _apply_server_settings()
     logger.info(f"ui: server settings saved ({which}: {', '.join(vals)})")
-    return RedirectResponse(f"/ui/server?saved={'1' if which == 'runtime' else 'restart'}",
+    return RedirectResponse(f"/ui/server?sub={which}&saved={'1' if which == 'runtime' else 'restart'}",
                             status_code=303)
+
+
+def _keys_msg(msg: str) -> RedirectResponse:
+    return RedirectResponse("/ui/server?sub=keys&msg=" + _q(msg[:600]), status_code=303)
+
+
+async def server_api_key(request: Request):
+    """Save the master API key (client auth; setting `api_key`, encrypted at rest). Blank
+    keeps it — there is no clear here, as before. Applied live by
+    `_apply_server_settings`; the /ui sessions carry `main.admin_session_tag`, so every
+    session opened with the old key ends with this Save."""
+    f = await _form(request)
+    ak = (f.get("api_key") or "").strip()
+    if not ak:
+        return _keys_msg("master API key unchanged (blank keeps it)")
+    store.set_settings({"api_key": ak})
+    _apply_server_settings()
+    logger.info("ui: master API key saved (encrypted)")
+    return _keys_msg("master API key saved (encrypted) — console sessions opened with the "
+                     "old key have ended")
+
+
+async def server_provider_token(request: Request):
+    """Save a provider's API token (one per provider, every host of it uses it): a typed
+    value replaces it, blank keeps it, the box removes it. Unknown provider or a refused
+    value → 400 with the API Keys tab and the reason — never the value. Main re-syncs
+    the controllers (`main.save_provider_token`, which also refuses a clear while a host
+    of that provider is not idle-off)."""
+    f = await _form(request)
+    kind = (f.get("provider") or "").strip()
+    tok = (f.get("api_key") or "").strip()
+    if _save_provider_token is None:
+        return _keys_msg("provider tokens cannot be saved here")
+    if kind not in hostapi.PROVIDERS:
+        return _server_view(request, "keys", status=400,
+                            notice=f"unknown provider {kind[:40]!r} — token not saved")
+    name = _provider_name(kind)
+    if not tok and not f.get("api_key_clear"):
+        return _keys_msg(f"{name} API token unchanged (blank keeps it)")
+    try:
+        err = str(_save_provider_token(kind, tok) or "")
+    except Exception as e:                              # noqa: BLE001 — refused, not a 500
+        err = f"not saved: {type(e).__name__}"
+    if err:
+        return _server_view(request, "keys", status=400,
+                            key_errs={f"provider-{kind}": f"{name} API token: {err}"})
+    msg = f"{name} API token saved (encrypted)" if tok else f"{name} API token removed"
+    logger.info(f"ui: {msg}")
+    return _keys_msg(msg)
+
+
+async def server_hf_token(request: Request):
+    """Save the HF token (setting `hf_token`, encrypted at rest): a typed value replaces
+    it, blank keeps it, the box removes it (the backend-key rule). A refused value is a
+    400 with the API Keys tab naming why — never the value."""
+    f = await _form(request)
+    tok = (f.get("hf_token") or "").strip()
+    if _save_hf_token is None:
+        return _keys_msg("the HF token cannot be saved here")
+    if not tok and not f.get("hf_token_clear"):
+        return _keys_msg("HF token unchanged (blank keeps it)")
+    try:
+        err = str(_save_hf_token(tok) or "")
+    except Exception as e:                              # noqa: BLE001 — refused, not a 500
+        err = f"HF token not saved: {type(e).__name__}"
+    if err:
+        return _server_view(request, "keys", status=400, key_errs={"hf": err})
+    msg = "HF token saved (encrypted)" if tok else "HF token removed"
+    logger.info(f"ui: {msg}")
+    return _keys_msg(msg)
 
 
 # ── Registration ────────────────────────────────────────────────────────────────
@@ -9771,9 +9883,6 @@ def register(app) -> None:
     app.add_api_route("/ui/hosts/managed/modelsrc-list", hosts_modelsrc_list, methods=["POST"])
     app.add_api_route("/ui/hosts/managed/catalog", hosts_catalog_save, methods=["POST"])
     app.add_api_route("/ui/hosts/managed/modelsrc-host", hosts_modelsrc_host, methods=["POST"])
-    app.add_api_route("/ui/hosts/managed/hf-token", hosts_hf_token, methods=["POST"])
-    app.add_api_route("/ui/hosts/managed/provider-token", hosts_provider_token,
-                      methods=["POST"])
     app.add_api_route("/ui/input", input_page, methods=["GET"])
     app.add_api_route("/ui/routing", routing_page, methods=["GET"])
     app.add_api_route("/ui/chat/create", chat_create, methods=["POST"])
@@ -9834,4 +9943,7 @@ def register(app) -> None:
     app.add_api_route("/ui/ipalias/save-resolved", ipalias_save_resolved, methods=["POST"])
     app.add_api_route("/ui/server", server_page, methods=["GET"])
     app.add_api_route("/ui/server/save", server_save, methods=["POST"])
+    app.add_api_route("/ui/server/api-key", server_api_key, methods=["POST"])
+    app.add_api_route("/ui/server/provider-token", server_provider_token, methods=["POST"])
+    app.add_api_route("/ui/server/hf-token", server_hf_token, methods=["POST"])
     _register_post_only_gets(app)              # LAST: derives its list from the table above
