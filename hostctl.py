@@ -163,6 +163,28 @@ _COMMIT_RE = re.compile(r"[0-9a-fA-F]{40}")
 _BOOTSTRAP_LOG = "~/gw-bootstrap.log"
 _HOST_BOOTSTRAP_LOG = "~/gw-host-bootstrap.log"   # the host bootstrap's own (R-W3)
 _BOOTSTRAP_TAIL = 200
+# The phases each bootstrap walks through, in order — the `phase <name>` calls of
+# ops/host-bootstrap.sh and ops/thunder-bootstrap.sh (a test parses the scripts and pins
+# these, so a script change cannot silently draw a wrong progress bar).
+HOST_BOOTSTRAP_PHASES = ("locate", "autostart", "inventory", "tools")
+COMFY_BOOTSTRAP_PHASES = ("locate", "stop", "checkout", "venv", "nodes", "extensions",
+                          "node-install-scripts", "start-script", "smoke")
+_BOOTSTRAP_PHASE_ORDER = {"host": HOST_BOOTSTRAP_PHASES, "comfyui": COMFY_BOOTSTRAP_PHASES}
+# Live progress (2026-10-01, thunder-1: the card stood still for 20 min of a normal
+# first-start bootstrap, and a Stop there throws the half-done install away): while
+# `_run_script` runs a bootstrap or setup, a side task reads the END of its log on the
+# instance every `_BOOTSTRAP_POLL_S` — display only, its failures are ignored. The
+# command is FIXED text around the one constant log path: a count of the node-pack lines
+# (`node <name> @ <rev>`, the `nodes` phase's i/N) and the last 40 lines.
+_BOOTSTRAP_POLL_S = 15
+_BOOTSTRAP_POLL_TIMEOUT_S = 20
+_BOOTSTRAP_POLL_CMD = ("n=$(grep -c '^node .* @ ' {log} 2>/dev/null); "
+                       "echo \"GW-POLL ${n:-0}\"; tail -n 40 {log}")
+_POLL_LOG_RE = re.compile(r"~/[A-Za-z0-9][A-Za-z0-9._-]*")
+_BS_LINE_MAX = 160
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-_]")
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_PHASE_WORD_RE = re.compile(r"[A-Za-z0-9._-]{1,40}")
 
 
 def _start_cmd(port: int) -> str:
@@ -513,6 +535,80 @@ def bootstrap_verdict(rc: int, rep: dict, err: str, smoke_test: bool = True,
     elif not why and not (smoke == "ok" and rep["done"]):
         why.append(f"bootstrap ended without GW:SMOKE ok / GW:DONE{where}")
     return "; ".join(why)
+
+
+def bootstrap_poll_cmd(logfile: str) -> str:
+    """The poller's remote command: `_BOOTSTRAP_POLL_CMD` around `logfile`, which must be
+    a plain `~/<name>` (the bootstrap logs, a service's `~/gw-svc-<slug>.setup.log`) —
+    anything else is a ValueError, so no admin text can ever reach this command line."""
+    if not isinstance(logfile, str) or not _POLL_LOG_RE.fullmatch(logfile) \
+            or ".." in logfile:
+        raise ValueError(f"not a plain log path: {logfile!r}")
+    return _BOOTSTRAP_POLL_CMD.replace("{log}", logfile)
+
+
+def parse_poll_output(out: str) -> tuple[Optional[int], str]:
+    """(node-pack lines counted, the tail) of a poll's stdout. The count is None when
+    the first line is not the `GW-POLL <n>` the command prints first."""
+    first, _, rest = (out or "").partition("\n")
+    tag, _, n = first.strip().partition(" ")
+    if tag == "GW-POLL" and n.isdigit():
+        return int(n), rest
+    return None, out or ""
+
+
+def _clean_line(line: str) -> str:
+    line = _ANSI_RE.sub("", line).replace("\t", " ")
+    return _CTRL_RE.sub("", line).strip()[:_BS_LINE_MAX]
+
+
+def bootstrap_tail(text: str) -> tuple[str, str]:
+    """(phase, line) of a bootstrap log's end: the value of the LAST `GW:PHASE` line
+    ("starting" before the first), and the last non-blank line that is not a `GW:` one —
+    control characters and ANSI colours removed, clipped to 160 characters. A pip
+    progress line redrawn with `\\r` counts by its last state. Display only: the final
+    `parse_bootstrap` stays the authority."""
+    phase, line = "starting", ""
+    for raw in (text or "").splitlines():
+        if raw.startswith("GW:"):
+            tag, _, rest = raw.partition(" ")
+            if tag == "GW:PHASE":
+                word = _clean_line(rest)
+                if _PHASE_WORD_RE.fullmatch(word):
+                    phase = word
+            continue
+        cleaned = _clean_line(raw)
+        if cleaned:
+            line = cleaned
+    return phase, line
+
+
+def count_node_lines(text: str) -> int:
+    """Entries of a node list: non-blank lines that are no `#` comment — the rule
+    `_node_list` and the bootstrap's `parse_node_line` share."""
+    return sum(1 for ln in (text or "").splitlines()
+               if ln.strip() and not ln.strip().startswith("#"))
+
+
+def bootstrap_progress(which: str, phase: str, nodes_seen: Optional[int] = None,
+                       nodes_total: Optional[int] = None) -> Optional[dict]:
+    """Where a bootstrap is in its fixed phase order: `{step, steps, fraction,
+    nodes_done, nodes_total}` (step 1-based, fraction 0…1 of the whole script), or None
+    for a phase outside the order (before the first `GW:PHASE`, a setup script). During
+    `nodes` the fraction moves with the packs: `nodes_seen` pack lines mean the one
+    before the last has finished; `nodes_done` (the pack being installed) never exceeds
+    the list's length."""
+    order = _BOOTSTRAP_PHASE_ORDER.get(which)
+    if not order or phase not in order:
+        return None
+    i, n = order.index(phase), len(order)
+    frac, done, total = i / n, None, None
+    if phase == "nodes" and nodes_total and nodes_seen is not None:
+        total = int(nodes_total)
+        done = max(0, min(int(nodes_seen), total))
+        frac = (i + max(0, done - 1) / total) / n
+    return {"step": i + 1, "steps": n, "fraction": frac,
+            "nodes_done": done, "nodes_total": total}
 
 
 def _tail(b: bytes, n: int = _STDERR_LOG_LINES) -> list[str]:
@@ -1318,6 +1414,11 @@ class Controller:
         self._pending_misses = 0                       # watcher rounds without the pending row
         self._abort_note = ""                          # why an aborted create is uncertain
         self._nodes_text = ""                          # node list of the pending bootstrap
+        # the bootstrap/setup `_run_script` runs right now, for the card (memory only —
+        # a restart forgets it, like the transfer table) and its log poller
+        self._bs_run: Optional[dict] = None
+        self._bs_task: Optional[asyncio.Task] = None
+        self._poll_sleep = asyncio.sleep               # the poller's own pause (tests: fast)
         # model sync: `plan`/`ready_aliases` are written by sync_once() ONLY
         self.plan: Optional[dict] = None
         self.ready_aliases: set = set()
@@ -2071,6 +2172,7 @@ class Controller:
                 "bootstrap_unknown": dict(s.bootstrap_unknown),
                 "bootstrap_template_nodes": list(s.bootstrap_template_nodes),
                 "bootstrap_incomplete": s.bootstrap_incomplete,
+                "bootstrap_running": self._bootstrap_running_view(),
                 "host_bootstrapped": s.host_bootstrapped,
                 "op": self._op,
                 # {bid: jobs} while a stop drains, else None
@@ -2286,17 +2388,94 @@ class Controller:
                 raise TimeoutError(f"ssh not reachable after {_SSH_READY_S // 60} min: {last}")
             await self.deps.sleep(_SSH_PROBE_S)
 
+    def _bootstrap_running_view(self) -> Optional[dict]:
+        r = self._bs_run
+        if r is None:
+            return None
+        which = r["which"]
+        total = count_node_lines(self._nodes_text) if which == "comfyui" else 0
+        prog = bootstrap_progress(which, r["phase"], r["nodes_seen"], total or None) or {
+            "step": None, "steps": None, "fraction": None, "nodes_done": None,
+            "nodes_total": None}
+        return dict(prog, which=which, service=r["service"], since=r["since"],
+                    elapsed_s=max(0, int(self.deps.now() - r["since"])),
+                    phase=r["phase"], line=r["line"])
+
+    def _apply_poll(self, out: bytes) -> None:
+        """Fold one poll's output into `_bs_run`; a phase seen for the first time in
+        this run goes to the log ring once."""
+        r = self._bs_run
+        if r is None:
+            return
+        n, tail = parse_poll_output((out or b"").decode("utf-8", "replace"))
+        phase, line = bootstrap_tail(tail)
+        if n is not None:
+            r["nodes_seen"] = n
+        if line:
+            r["line"] = line
+        if phase != r["phase"]:
+            r["phase"] = phase
+            if phase not in r["logged"]:
+                r["logged"].add(phase)
+                what = {"host": "host bootstrap", "comfyui": "bootstrap"}.get(
+                    r["which"], f"{r['service']} setup")
+                self._log(f"{what} phase: {phase}")
+
+    async def _bootstrap_poller(self, cmd: str) -> None:
+        """Display only: every `_BOOTSTRAP_POLL_S` the end of the running script's log
+        (one poll at a time, a short timeout). Every failure is ignored — the bootstrap
+        must never slow down or fail because a poll did."""
+        while True:
+            await self._poll_sleep(_BOOTSTRAP_POLL_S)
+            try:
+                rc, out, _ = await asyncio.wait_for(
+                    self._exec(cmd, timeout=_BOOTSTRAP_POLL_TIMEOUT_S),
+                    _BOOTSTRAP_POLL_TIMEOUT_S + 5)
+                if rc == 0:
+                    self._apply_poll(out)
+            except asyncio.CancelledError:
+                raise
+            except Exception:                           # noqa: BLE001 — display only
+                pass
+
     async def _run_script(self, script: bytes, args: str, logfile: str,
                           timeout: int, inner: Optional[str] = None,
-                          prefix: str = "") -> tuple[int, str, bytes]:
+                          prefix: str = "", which: Optional[str] = None,
+                          label: str = "") -> tuple[int, str, bytes]:
         """Stream a script to `bash -s` on the instance, tee'd to `logfile` there (a
         service's setup passes its own `inner` command — `services.CommandProfile.
         setup_cmd` — which does the same). → (rc, stdout text, stderr); the stdout
         comes from the log file when the ssh lost it (a timeout keeps nothing, a dropped
         connection little). Every non-blank line goes to the panel log (`prefix` names
-        the service): that output IS the setup log the operator reads."""
+        the service): that output IS the setup log the operator reads. `which`
+        (`host`/`comfyui`/`service`, `label` = the service's bid) makes the run visible
+        while it lasts: `view()["bootstrap_running"]`, fed by a log poller that is
+        cancelled — and the view cleared — in the `finally`, whatever ends the run."""
         if inner is None:
             inner = f"bash -s --{(' ' + args) if args else ''} 2>&1 | tee {logfile}"
+        if which is None:
+            return await self._run_script_once(inner, script, logfile, timeout, prefix)
+        self._bs_run = {"which": which, "service": label, "since": self.deps.now(),
+                        "phase": "starting", "line": "", "nodes_seen": None,
+                        "logged": set()}
+        try:
+            cmd = bootstrap_poll_cmd(logfile)
+        except ValueError:
+            cmd = None                                  # shown, never polled
+        if cmd is not None:
+            self._bs_task = asyncio.ensure_future(self._bootstrap_poller(cmd))
+        try:
+            return await self._run_script_once(inner, script, logfile, timeout, prefix)
+        finally:
+            task, self._bs_task, self._bs_run = self._bs_task, None, None
+            if task is not None:
+                task.cancel()
+                # reaped (its ssh ends with it); asyncio.wait never raises the task's
+                # own CancelledError, and a second cancel of OURS still propagates
+                await asyncio.wait({task}, timeout=5)
+
+    async def _run_script_once(self, inner: str, script: bytes, logfile: str,
+                               timeout: int, prefix: str) -> tuple[int, str, bytes]:
         rc, out, err = await self._exec(f"bash -o pipefail -c {sshrun.q(inner)}",
                                         stdin=script, timeout=timeout)
         text = (out or b"").decode("utf-8", "replace")
@@ -2316,7 +2495,8 @@ class Controller:
         s = self.state
         self._log("host bootstrap: template autostart, template inventory, tools")
         rc, text, err = await self._run_script(self.deps.host_bootstrap_script(), "",
-                                               _HOST_BOOTSTRAP_LOG, _HOST_BOOTSTRAP_S)
+                                               _HOST_BOOTSTRAP_LOG, _HOST_BOOTSTRAP_S,
+                                               which="host")
         rep = parse_bootstrap(text)
         for line in rep["bad"]:
             self._log(f"host bootstrap: unreadable report line ignored: {line!r}")
@@ -2358,7 +2538,7 @@ class Controller:
         self._log(f"bootstrap: ComfyUI {self._commit()[:12]}, node list uploaded")
         rc, text, err = await self._run_script(self.deps.bootstrap_script(),
                                                sshrun.q(self._commit()), _BOOTSTRAP_LOG,
-                                               _BOOTSTRAP_S)
+                                               _BOOTSTRAP_S, which="comfyui")
         rep = parse_bootstrap(text)
         for line in rep["bad"]:
             self._log(f"bootstrap: unreadable report line ignored: {line!r}")
@@ -2497,7 +2677,8 @@ class Controller:
         try:
             rc, text, err = await self._run_script(script, "", prof.setup_log(svc),
                                                    _SVC_SETUP_S, inner=prof.setup_cmd(svc),
-                                                   prefix=f"{bid} setup: ")
+                                                   prefix=f"{bid} setup: ",
+                                                   which="service", label=bid)
         except asyncio.CancelledError:
             raise
         except Exception as e:
