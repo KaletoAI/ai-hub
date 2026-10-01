@@ -2575,6 +2575,17 @@ class BootstrapProgressCard(_Base):
         # failure either — the step strip says where it is
         html = self._card(phase="connecting", op="starting", bootstrap_incomplete=True)
         self.assertNotIn("host-tc-bsinc", html)
+        # ... nor is the ComfyUI bootstrap's own phase while it may still come
+        html = self._card(phase="bootstrapping", op="starting", bootstrap_incomplete=True)
+        self.assertNotIn("host-tc-bsinc", html)
+        # review M-1: a FAILED ComfyUI bootstrap while the start runs the other services'
+        # setups in `bootstrapping` shows the note at once
+        html = self._card(phase="bootstrapping", op="starting", bootstrap_incomplete=True,
+                          services=_svcs(**{"comfyui:tc": {
+                              "name": "tc", "type": "comfyui", "local_port": 18100,
+                              "remote_port": 8188, "status": "setup failed",
+                              "error": "node packs failed"}}))
+        self.assertIn("host-tc-bsinc", html)
         # a failed start keeps it: nothing runs any more
         html = self._card(phase="failed", failed_phase="bootstrapping",
                           bootstrap_incomplete=True, uuid="u1")

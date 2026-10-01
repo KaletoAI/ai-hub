@@ -3459,8 +3459,22 @@ def _svc_table(k: str, name: str, v: dict) -> str:
 _START_STEPS = (("creating", "create"), ("connecting", "connect"),
                 ("bootstrapping", "set up"), ("starting", "start services"),
                 ("syncing", "sync models"), ("ready", "ready"))
-# phases of a start before (or in) the bootstrap: `bootstrap_incomplete` is already set
-_BOOTSTRAP_PENDING = ("creating", "restoring", "connecting", "bootstrapping")
+# phases of a start before the bootstrap: `bootstrap_incomplete` is already set
+_BOOTSTRAP_PENDING = ("creating", "restoring", "connecting")
+
+
+def _bootstrap_pending(phase: str, v: dict) -> bool:
+    """A start that has not reached — or is still in — the ComfyUI bootstrap. In
+    `bootstrapping` only while the ComfyUI service is not `setup failed`: after a failed
+    ComfyUI bootstrap the start goes on with the OTHER services' setups in that phase
+    (M4 g), and the red note must say so then, not 20 minutes later."""
+    if phase in _BOOTSTRAP_PENDING:
+        return True
+    if phase != "bootstrapping":
+        return False
+    svcs = v.get("services") if isinstance(v.get("services"), dict) else {}
+    return not any(isinstance(x, dict) and x.get("type") == "comfyui"
+                   and x.get("status") == "setup failed" for x in svcs.values())
 
 
 def _start_steps_html(k: str, phase: str) -> str:
@@ -3486,7 +3500,8 @@ def _start_steps_html(k: str, phase: str) -> str:
 
 
 def _elapsed(s) -> str:
-    """"45 s" / "6 min" / "1 h 05 min" — how long a bootstrap has been running."""
+    """"45 s" / "6 min" / "1 h 05 min" — how long a bootstrap has been running (the view
+    always carries `elapsed_s`; a non-number reads as 0 through `_nbytes`)."""
     s = _nbytes(s)
     if s < 60:
         return f"{s} s"
@@ -3619,7 +3634,7 @@ def _host_card(name: str, v: dict) -> str:
         # a bootstrap/setup RUNS: how far, not a red "did not finish" (thunder-1,
         # 2026-10-01: read as "stuck", and a Stop there throws the half-done install away)
         rows.append(_bootstrap_running_html(k, br))
-    elif v.get("bootstrap_incomplete") and not (op and phase in _BOOTSTRAP_PENDING):
+    elif v.get("bootstrap_incomplete") and not (op and _bootstrap_pending(phase, v)):
         # the flag is set when the ComfyUI bootstrap BEGINS (and already at a start's
         # create): only with nothing running — and no start on its way to it — is it news
         rows.append(f'<p class="bad" data-k="{_esc(k)}-bsinc">The ComfyUI setup did not '

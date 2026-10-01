@@ -2279,9 +2279,18 @@ _HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _script_phases(name: str) -> list[str]:
-    """The `phase <name>` calls of an ops script, in the order they appear."""
+    """The `phase <name>` calls of an ops script's `main()` body, in textual order. The
+    pin ASSUMES that order is the execution order: every `phase` call sits in `main()`,
+    in sequence. A `phase` call moved into a helper is outside the slice — the pin then
+    fails loudly instead of trusting a textual order that may no longer hold."""
     with open(os.path.join(_HERE, "ops", name), encoding="utf-8") as f:
-        return re.findall(r"^\s*phase ([A-Za-z0-9-]+)\s*$", f.read(), re.M)
+        text = f.read()
+    m = re.search(r"^main\(\) \{\n(.*?)^\}", text, re.M | re.S)
+    assert m, f"no main() in {name}"
+    calls = re.findall(r"^\s*phase ([A-Za-z0-9-]+)\s*$", m.group(1), re.M)
+    everywhere = re.findall(r"^\s*phase ([A-Za-z0-9-]+)\s*$", text, re.M)
+    assert calls == everywhere, f"{name}: a phase call outside main()"
+    return calls
 
 
 class BootstrapProgressPure(unittest.TestCase):
@@ -2303,8 +2312,8 @@ class BootstrapProgressPure(unittest.TestCase):
 
     def test_tail_last_phase_wins_and_gw_lines_are_skipped(self):
         t = hostctl.bootstrap_tail
-        self.assertEqual(t(""), ("starting", ""))
-        self.assertEqual(t("cloning\n"), ("starting", "cloning"))
+        self.assertEqual(t(""), (None, ""))                 # no marker = unknown, not "starting"
+        self.assertEqual(t("cloning\n"), (None, "cloning"))
         text = ("GW:PHASE checkout\nchecked out abc\nGW:PHASE venv\n"
                 "Collecting torch==2.11.0\n\n   \nGW:NODE_FAIL x y\nGW:SMOKE ok\n")
         self.assertEqual(t(text), ("venv", "Collecting torch==2.11.0"))
@@ -2322,27 +2331,33 @@ class BootstrapProgressPure(unittest.TestCase):
         self.assertEqual(hostctl.bootstrap_tail("a 10%\rb 90%\r\n")[1], "b 90%")
         # a phase name from the log is a word, never markup or a whole sentence
         ph, _ = hostctl.bootstrap_tail("GW:PHASE <b>x</b> y\n")
-        self.assertNotIn("<", ph)
+        self.assertIsNone(ph)
 
     def test_poll_command_is_fixed_text(self):
         for log in (hostctl._BOOTSTRAP_LOG, hostctl._HOST_BOOTSTRAP_LOG):
             cmd = hostctl.bootstrap_poll_cmd(log)
             self.assertEqual(cmd, hostctl._BOOTSTRAP_POLL_CMD.replace("{log}", log))
-            self.assertEqual(cmd.count(log), 2)
-            self.assertNotIn("{", cmd.replace("${n:-0}", ""))
+            self.assertEqual(cmd.count(log), 3)
+            self.assertNotIn("{", cmd.replace("${n:-0}", "").replace("${p#GW:PHASE }", ""))
         # the template itself: a grep count and a tail of the ONE path, nothing else
         self.assertEqual(hostctl._BOOTSTRAP_POLL_CMD,
                          "n=$(grep -c '^node .* @ ' {log} 2>/dev/null); "
-                         "echo \"GW-POLL ${n:-0}\"; tail -n 40 {log}")
+                         "p=$(grep '^GW:PHASE ' {log} 2>/dev/null | tail -n 1); "
+                         "echo \"GW-POLL ${n:-0} ${p#GW:PHASE }\"; tail -n 40 {log}")
         for bad in ("~/x; rm -rf ~", "/etc/passwd", "~/../x", "~/a b", "~/$(id)", ""):
             with self.assertRaises(ValueError):
                 hostctl.bootstrap_poll_cmd(bad)
 
     def test_poll_output(self):
-        n, tail = hostctl.parse_poll_output("GW-POLL 5\nGW:PHASE nodes\nnode x @ 1\n")
-        self.assertEqual((n, tail), (5, "GW:PHASE nodes\nnode x @ 1\n"))
-        self.assertEqual(hostctl.parse_poll_output("GW:PHASE x\n"), (None, "GW:PHASE x\n"))
-        self.assertEqual(hostctl.parse_poll_output("GW-POLL lots\ny\n")[0], None)
+        p = hostctl.parse_poll_output
+        self.assertEqual(p("GW-POLL 5 nodes\nGW:PHASE nodes\nnode x @ 1\n"),
+                         (5, "nodes", "GW:PHASE nodes\nnode x @ 1\n"))
+        self.assertEqual(p("GW-POLL 0 \nx\n"), (0, None, "x\n"))     # no marker yet
+        self.assertEqual(p("GW-POLL 0\nx\n"), (0, None, "x\n"))
+        self.assertEqual(p("GW-POLL 3 venv\r\n"), (3, "venv", ""))
+        self.assertEqual(p("GW-POLL 0 <b>x\n")[1], None)            # not a phase word
+        self.assertEqual(p("GW:PHASE x\n"), (None, None, "GW:PHASE x\n"))
+        self.assertEqual(p("GW-POLL lots venv\ny\n")[:2], (None, None))
 
     def test_progress_values(self):
         p = hostctl.bootstrap_progress
@@ -2365,6 +2380,12 @@ class BootstrapProgressPure(unittest.TestCase):
         self.assertIsNone(p("comfyui", "starting"))     # unknown phase: no bar
         self.assertIsNone(p("comfyui", "tools"))        # another script's phase
         self.assertIsNone(p("service", "venv"))         # a setup script has no order
+
+    def test_node_entry_rule_is_shared(self):
+        # one rule for what _node_list accepts and what the bar counts (M-6)
+        self.assertTrue(hostctl._is_node_entry("  https://x/y@1 "))
+        self.assertFalse(hostctl._is_node_entry("  # c"))
+        self.assertFalse(hostctl._is_node_entry("   "))
 
     def test_node_list_count(self):
         self.assertEqual(hostctl.count_node_lines(
@@ -2416,7 +2437,7 @@ class BootstrapPoller(unittest.IsolatedAsyncioTestCase):
                                                    which=which))
 
     async def test_progress_while_running_then_cleared(self):
-        tail = (b"GW-POLL 2\nGW:PHASE venv\nGW:PHASE nodes\nnode p1 @ 1\n"
+        tail = (b"GW-POLL 2 nodes\nGW:PHASE venv\nGW:PHASE nodes\nnode p1 @ 1\n"
                 b"node p2 @ 2\nCloning into 'p2'...\n")
         c = self._ctl([(0, tail, b"")])
         t = self._run(c)
@@ -2449,9 +2470,9 @@ class BootstrapPoller(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.polls), n)            # the poller is gone
 
     async def test_phase_change_logged_once_each(self):
-        c = self._ctl([(0, b"GW-POLL 0\nGW:PHASE venv\nx\n", b""),
-                       (0, b"GW-POLL 0\nGW:PHASE venv\ny\n", b""),
-                       (0, b"GW-POLL 0\nGW:PHASE venv\nGW:PHASE nodes\n", b"")])
+        c = self._ctl([(0, b"GW-POLL 0 venv\nGW:PHASE venv\nx\n", b""),
+                       (0, b"GW-POLL 0 venv\nGW:PHASE venv\ny\n", b""),
+                       (0, b"GW-POLL 0 nodes\nGW:PHASE venv\nGW:PHASE nodes\n", b"")])
         t = self._run(c)
         await self._until(lambda: len(self.polls) >= 6)
         log = [ln for ln in c.state.log if "bootstrap phase:" in ln]
@@ -2459,8 +2480,61 @@ class BootstrapPoller(unittest.IsolatedAsyncioTestCase):
         self.release.set()
         await t
 
+    async def test_a_verbose_tail_keeps_the_phase(self):
+        # review I-1: `nodes` and `smoke` print more than 40 lines after their marker.
+        # The phase comes from the WHOLE log (the command's own grep) and never moves
+        # backwards: no "phase starting", no bar lost, no bogus ring line.
+        verbose = b"".join(b"smoke: import mod%d ok\n" % i for i in range(60))
+        c = self._ctl([(0, b"GW-POLL 3 nodes\nGW:PHASE nodes\nnode a @ 1\n", b""),
+                       (0, b"GW-POLL 3 \n" + verbose, b""),     # marker unknown to this poll
+                       (0, b"GW-POLL 3\n" + verbose, b""),      # an older header shape
+                       (0, b"GW-POLL lots\n" + verbose, b"")])
+        t = self._run(c)
+        await self._until(lambda: len(self.polls) >= 8)
+        v = c.view()["bootstrap_running"]
+        self.assertEqual(v["phase"], "nodes")
+        self.assertEqual((v["step"], v["steps"]), (5, 9))
+        self.assertIsNotNone(v["fraction"])
+        self.assertEqual(v["line"], "smoke: import mod59 ok")
+        log = [ln for ln in c.state.log if "phase:" in ln]
+        self.assertEqual(len(log), 1, log)
+        self.assertFalse(any("starting" in ln for ln in log))
+        self.release.set()
+        await t
+
+    async def test_header_phase_wins_over_an_older_window(self):
+        # the whole-log phase moves on even when the tail still shows an earlier marker
+        c = self._ctl([(0, b"GW-POLL 0 extensions\nGW:PHASE nodes\nx\n", b"")])
+        t = self._run(c)
+        self.assertTrue(await self._until(
+            lambda: (c.view()["bootstrap_running"] or {}).get("phase") == "extensions"))
+        self.release.set()
+        await t
+
+    async def test_a_straggling_poller_never_writes_into_the_next_run(self):
+        # review M-2: a poll answer that arrives for an earlier run is dropped
+        c = self._ctl([(0, b"GW-POLL 0 venv\n", b"")])
+        c._bs_run = {"id": object(), "which": "comfyui", "service": "", "since": 0,
+                     "phase": "starting", "line": "", "nodes_seen": None,
+                     "nodes_total": None, "logged": set()}
+        c._apply_poll(b"GW-POLL 0 tools\nhost line\n", object())
+        self.assertEqual(c._bs_run["phase"], "starting")
+        self.assertEqual(c._bs_run["line"], "")
+
+    async def test_nodes_total_fixed_at_the_start_of_the_run(self):
+        # review M-3: counted once per run, falling back to the list the bootstrap uploads
+        c = self._ctl([(0, b"GW-POLL 1 nodes\nnode a @ 1\n", b"")])
+        c._nodes_text = ""
+        t = self._run(c)
+        self.assertTrue(await self._until(
+            lambda: (c.view()["bootstrap_running"] or {}).get("phase") == "nodes"))
+        self.assertEqual(c.view()["bootstrap_running"]["nodes_total"],
+                         hostctl.count_node_lines(c._node_list()))
+        self.release.set()
+        await t
+
     async def test_host_bootstrap_label(self):
-        c = self._ctl([(0, b"GW-POLL 0\nGW:PHASE autostart\n", b"")])
+        c = self._ctl([(0, b"GW-POLL 0 autostart\nGW:PHASE autostart\n", b"")])
         t = self._run(c, which="host", log=hostctl._HOST_BOOTSTRAP_LOG)
         self.assertTrue(await self._until(
             lambda: (c.view()["bootstrap_running"] or {}).get("phase") == "autostart"))
@@ -2495,7 +2569,7 @@ class BootstrapPoller(unittest.IsolatedAsyncioTestCase):
                                      for ln in c.state.log))     # silently
 
     async def test_failed_bootstrap_clears_too(self):
-        c = self._ctl([(0, b"GW-POLL 0\nGW:PHASE venv\n", b"")],
+        c = self._ctl([(0, b"GW-POLL 0 venv\nGW:PHASE venv\n", b"")],
                       boot=(1, b"GW:PHASE venv\nboom\n", b"err"))
         t = self._run(c)
         await self._until(lambda: len(self.polls) >= 2)
@@ -2546,7 +2620,7 @@ class BootstrapPoller(unittest.IsolatedAsyncioTestCase):
         async def ssh(argv, stdin=None, timeout=60):
             cmd = argv[-1]
             if "GW-POLL" in cmd:
-                return (0, b"GW-POLL 0\nGW:PHASE venv\n", b"")
+                return (0, b"GW-POLL 0 venv\nGW:PHASE venv\n", b"")
             if "bash -s" in cmd and "gw-bootstrap.log" in cmd:
                 entered.set()
                 await release.wait()

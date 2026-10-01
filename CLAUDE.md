@@ -1490,13 +1490,15 @@ via injected callables, staying hot-reload-safe.
   `GW:NODE_FAIL` fails even after `GW:DONE`, Ruling 9; while either — or a command
   service's setup — runs, `_run_script(which=…)` starts a display-only side task that
   every `_BOOTSTRAP_POLL_S` (15 s) reads the log's end with the FIXED `bootstrap_poll_cmd`
-  — a grep count of `node … @` lines plus `tail -n 40` of the one constant path, 20 s
-  timeout, failures ignored — into `view()["bootstrap_running"]` (phase, last line, step
+  — a grep count of `node … @` lines, the WHOLE log's last `GW:PHASE` (a verbose phase
+  scrolls its marker out of the window) and `tail -n 40` of the one constant path, 20 s
+  timeout, failures ignored; the phase never moves back to unknown, and a poll is applied
+  only to the run it was started for — into `view()["bootstrap_running"]` (phase, last line, step
   of `HOST_BOOTSTRAP_PHASES`/`COMFY_BOOTSTRAP_PHASES` — pinned against the scripts'
   `phase` calls —, node i/N, fraction; memory only, a new phase logged once), cancelled
   and cleared in a `finally`; the card shows it instead of the red `bootstrap_incomplete`
   note, which appears only with nothing running and no start on its way to the
-  bootstrap — 2026-10-01, a normal 20-min first bootstrap read as "stuck") → per service: setup if its hash
+  bootstrap (in `bootstrapping` only until the ComfyUI service is `setup failed`) — 2026-10-01, a normal 20-min first bootstrap read as "stuck") → per service: setup if its hash
   differs, start, probe (command 20 min, ComfyUI 10 min) → sync → `ready`. The host is
   `ready` once the VM runs and the tunnel stands; a service's setup or start failing is
   THAT service's `setup failed`/`down` + a fault on its backend, the instance kept and

@@ -175,11 +175,16 @@ _BOOTSTRAP_PHASE_ORDER = {"host": HOST_BOOTSTRAP_PHASES, "comfyui": COMFY_BOOTST
 # `_run_script` runs a bootstrap or setup, a side task reads the END of its log on the
 # instance every `_BOOTSTRAP_POLL_S` — display only, its failures are ignored. The
 # command is FIXED text around the one constant log path: a count of the node-pack lines
-# (`node <name> @ <rev>`, the `nodes` phase's i/N) and the last 40 lines.
+# (`node <name> @ <rev>`, the `nodes` phase's i/N) and the LAST `GW:PHASE` of the WHOLE
+# log — a phase that prints more than 40 lines after its marker (`nodes`, `smoke`) must
+# not fall back to "unknown" — in one header line, then the last 40 lines.
 _BOOTSTRAP_POLL_S = 15
 _BOOTSTRAP_POLL_TIMEOUT_S = 20
 _BOOTSTRAP_POLL_CMD = ("n=$(grep -c '^node .* @ ' {log} 2>/dev/null); "
-                       "echo \"GW-POLL ${n:-0}\"; tail -n 40 {log}")
+                       "p=$(grep '^GW:PHASE ' {log} 2>/dev/null | tail -n 1); "
+                       "echo \"GW-POLL ${n:-0} ${p#GW:PHASE }\"; tail -n 40 {log}")
+# A plain `~/<name>`; the regex already admits `..` inside a name (`~/a..b`), which the
+# separate check refuses — no path that even LOOKS like a parent step reaches a shell.
 _POLL_LOG_RE = re.compile(r"~/[A-Za-z0-9][A-Za-z0-9._-]*")
 _BS_LINE_MAX = 160
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-_]")
@@ -547,14 +552,21 @@ def bootstrap_poll_cmd(logfile: str) -> str:
     return _BOOTSTRAP_POLL_CMD.replace("{log}", logfile)
 
 
-def parse_poll_output(out: str) -> tuple[Optional[int], str]:
-    """(node-pack lines counted, the tail) of a poll's stdout. The count is None when
-    the first line is not the `GW-POLL <n>` the command prints first."""
+def _phase_word(text: str) -> Optional[str]:
+    word = _clean_line(text)
+    return word if _PHASE_WORD_RE.fullmatch(word) else None
+
+
+def parse_poll_output(out: str) -> tuple[Optional[int], Optional[str], str]:
+    """(node-pack lines counted, the whole log's last phase, the tail) of a poll's
+    stdout. Count and phase are None when the first line is not the `GW-POLL <n>
+    [<phase>]` header the command prints first; the phase is None before the first
+    marker or when it is not a plain word."""
     first, _, rest = (out or "").partition("\n")
-    tag, _, n = first.strip().partition(" ")
-    if tag == "GW-POLL" and n.isdigit():
-        return int(n), rest
-    return None, out or ""
+    parts = first.strip().split(None, 2)
+    if len(parts) >= 2 and parts[0] == "GW-POLL" and parts[1].isdigit():
+        return int(parts[1]), (_phase_word(parts[2]) if len(parts) > 2 else None), rest
+    return None, None, out or ""
 
 
 def _clean_line(line: str) -> str:
@@ -562,20 +574,19 @@ def _clean_line(line: str) -> str:
     return _CTRL_RE.sub("", line).strip()[:_BS_LINE_MAX]
 
 
-def bootstrap_tail(text: str) -> tuple[str, str]:
-    """(phase, line) of a bootstrap log's end: the value of the LAST `GW:PHASE` line
-    ("starting" before the first), and the last non-blank line that is not a `GW:` one —
-    control characters and ANSI colours removed, clipped to 160 characters. A pip
-    progress line redrawn with `\\r` counts by its last state. Display only: the final
-    `parse_bootstrap` stays the authority."""
-    phase, line = "starting", ""
+def bootstrap_tail(text: str) -> tuple[Optional[str], str]:
+    """(phase, line) of a bootstrap log's end: the value of the LAST `GW:PHASE` line in
+    the window (None when it holds none — unknown, never "starting": the caller keeps
+    what it knew), and the last non-blank line that is not a `GW:` one — control
+    characters and ANSI colours removed, clipped to 160 characters. A pip progress line
+    redrawn with `\\r` counts by its last state (`splitlines` splits on `\\r`). Display
+    only: the final `parse_bootstrap` stays the authority."""
+    phase, line = None, ""
     for raw in (text or "").splitlines():
         if raw.startswith("GW:"):
             tag, _, rest = raw.partition(" ")
             if tag == "GW:PHASE":
-                word = _clean_line(rest)
-                if _PHASE_WORD_RE.fullmatch(word):
-                    phase = word
+                phase = _phase_word(rest) or phase
             continue
         cleaned = _clean_line(raw)
         if cleaned:
@@ -583,11 +594,16 @@ def bootstrap_tail(text: str) -> tuple[str, str]:
     return phase, line
 
 
+def _is_node_entry(line: str) -> bool:
+    """A node-list line that names a pack: not blank, no `#` comment — the bootstrap's
+    `parse_node_line` skips the same lines. One rule for `_node_list` and the bar."""
+    t = line.strip()
+    return bool(t) and not t.startswith("#")
+
+
 def count_node_lines(text: str) -> int:
-    """Entries of a node list: non-blank lines that are no `#` comment — the rule
-    `_node_list` and the bootstrap's `parse_node_line` share."""
-    return sum(1 for ln in (text or "").splitlines()
-               if ln.strip() and not ln.strip().startswith("#"))
+    """Entries of a node list (`_is_node_entry`)."""
+    return sum(1 for ln in (text or "").splitlines() if _is_node_entry(ln))
 
 
 def bootstrap_progress(which: str, phase: str, nodes_seen: Optional[int] = None,
@@ -2244,7 +2260,7 @@ class Controller:
         text = "\n".join(str(x) for x in (nodes or []) if str(x).strip())
         if not text.strip():
             text = str(self.deps.default_nodes() or "")
-        if not any(ln.strip() and not ln.strip().startswith("#") for ln in text.splitlines()):
+        if not any(_is_node_entry(ln) for ln in text.splitlines()):
             raise _PreCreate("no custom-node list to bootstrap with (host option nodes "
                              "is empty and there is no default list)")
         return text if text.endswith("\n") else text + "\n"
@@ -2393,35 +2409,39 @@ class Controller:
         if r is None:
             return None
         which = r["which"]
-        total = count_node_lines(self._nodes_text) if which == "comfyui" else 0
-        prog = bootstrap_progress(which, r["phase"], r["nodes_seen"], total or None) or {
+        prog = bootstrap_progress(which, r["phase"], r["nodes_seen"], r["nodes_total"]) or {
             "step": None, "steps": None, "fraction": None, "nodes_done": None,
             "nodes_total": None}
         return dict(prog, which=which, service=r["service"], since=r["since"],
                     elapsed_s=max(0, int(self.deps.now() - r["since"])),
                     phase=r["phase"], line=r["line"])
 
-    def _apply_poll(self, out: bytes) -> None:
-        """Fold one poll's output into `_bs_run`; a phase seen for the first time in
-        this run goes to the log ring once."""
+    def _apply_poll(self, out: bytes, run_id: object) -> None:
+        """Fold one poll's output into `_bs_run` — only into the run that poller was
+        started for (`run_id`: a straggler of the host bootstrap must not write into the
+        ComfyUI one that follows). The phase is the whole log's (the header), else the
+        window's, and never moves BACK to unknown: a window without a marker keeps the
+        last known phase. A phase seen for the first time in this run goes to the log
+        ring once ("starting", the placeholder, never)."""
         r = self._bs_run
-        if r is None:
+        if r is None or r.get("id") is not run_id:
             return
-        n, tail = parse_poll_output((out or b"").decode("utf-8", "replace"))
-        phase, line = bootstrap_tail(tail)
+        n, head_phase, tail = parse_poll_output((out or b"").decode("utf-8", "replace"))
+        tail_phase, line = bootstrap_tail(tail)
+        phase = head_phase or tail_phase
         if n is not None:
             r["nodes_seen"] = n
         if line:
             r["line"] = line
-        if phase != r["phase"]:
+        if phase is not None and phase != r["phase"]:
             r["phase"] = phase
-            if phase not in r["logged"]:
+            if phase not in r["logged"] and phase != "starting":
                 r["logged"].add(phase)
                 what = {"host": "host bootstrap", "comfyui": "bootstrap"}.get(
                     r["which"], f"{r['service']} setup")
                 self._log(f"{what} phase: {phase}")
 
-    async def _bootstrap_poller(self, cmd: str) -> None:
+    async def _bootstrap_poller(self, cmd: str, run_id: object) -> None:
         """Display only: every `_BOOTSTRAP_POLL_S` the end of the running script's log
         (one poll at a time, a short timeout). Every failure is ignored — the bootstrap
         must never slow down or fail because a poll did."""
@@ -2432,7 +2452,7 @@ class Controller:
                     self._exec(cmd, timeout=_BOOTSTRAP_POLL_TIMEOUT_S),
                     _BOOTSTRAP_POLL_TIMEOUT_S + 5)
                 if rc == 0:
-                    self._apply_poll(out)
+                    self._apply_poll(out, run_id)
             except asyncio.CancelledError:
                 raise
             except Exception:                           # noqa: BLE001 — display only
@@ -2455,15 +2475,25 @@ class Controller:
             inner = f"bash -s --{(' ' + args) if args else ''} 2>&1 | tee {logfile}"
         if which is None:
             return await self._run_script_once(inner, script, logfile, timeout, prefix)
-        self._bs_run = {"which": which, "service": label, "since": self.deps.now(),
-                        "phase": "starting", "line": "", "nodes_seen": None,
-                        "logged": set()}
+        total = None
+        if which == "comfyui":
+            # the list the bootstrap installs: counted ONCE per run (the view runs every
+            # few seconds); after a gateway restart `_nodes_text` is empty until the
+            # caller re-reads it — the same fallback `_ensure_comfy_bootstrap` takes
+            try:
+                total = count_node_lines(self._nodes_text or self._node_list()) or None
+            except Exception:                           # noqa: BLE001 — display only
+                total = None
+        run_id = object()
+        self._bs_run = {"id": run_id, "which": which, "service": label,
+                        "since": self.deps.now(), "phase": "starting", "line": "",
+                        "nodes_seen": None, "nodes_total": total, "logged": set()}
         try:
             cmd = bootstrap_poll_cmd(logfile)
         except ValueError:
             cmd = None                                  # shown, never polled
         if cmd is not None:
-            self._bs_task = asyncio.ensure_future(self._bootstrap_poller(cmd))
+            self._bs_task = asyncio.ensure_future(self._bootstrap_poller(cmd, run_id))
         try:
             return await self._run_script_once(inner, script, logfile, timeout, prefix)
         finally:
