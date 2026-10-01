@@ -1317,13 +1317,24 @@ via injected callables, staying hot-reload-safe.
   a stored typo would become the gpu_type, a "0" vcpus a 422 after the start began),
   the refusals, and what was typed for re-rendering the form. Blank is the ONE unset;
   ints are whole digits ≥ `min` (`1.5`/`-1`/`1e3`/`+2` refused), the commit a full
-  40-hex sha. `bootstrap_template` defaults to `AUTO_TEMPLATE = ""` shown as "auto"
+  40-hex sha. `vcpus` defaults to `VCPUS_INCLUDED = ""` shown as "included" (the form may
+  send the word): the GPU configuration's smallest `vcpuOptions` entry — Thunder bills
+  every vCPU above it, and the old fixed 8 paid 2 extra on every l40 ($0.87/h instead of
+  $0.79/h, operator 2026-10-01). `vcpu_options`/`included_vcpus(specs, gpu, n)` read
+  every `/v2/specs` shape (counts as strings; None/[] when unknown); `resolve_options(
+  options, specs)` → `(copy, None)` | `(None, why)` resolves the blank at START (unknown
+  → "cannot read Thunder's vCPU options for <gpu> ×<n> — set vcpus explicitly or try
+  again", never a guess) and refuses a typed count the specs know is not offered
+  ("l40 ×1 offers vCPUs 6, 12, 24"); `options_refusal` is the Save's half (unknown specs
+  cannot judge → None); `effective_vcpus`/`blank_label` feed the card and the form's
+  placeholder ("included (6 for l40 ×1)"); `create_body` raises on an unresolved blank.
+  Stored explicit counts stay (no migration). `bootstrap_template` defaults to `AUTO_TEMPLATE = ""` shown as "auto"
   (Ruling M5): the controller picks `comfy-ui` when a ComfyUI service is attached at
   the first start, else `base` — a fixed `comfy-ui` default gave every vLLM-only host
   the template's ComfyUI and its bundled models. The rest is the API model: Thunder has
   NO stop — "off" is snapshot → delete, "on" a new instance whose `template` is the
   snapshot's name — and IP, ssh port and host key change per instance.
-  `create_body` int()s what the form stored ("8" would be a 422); `parse_instances`
+  `create_body` int()s the RESOLVED options ("8" would be a 422); `parse_instances`
   takes the map OR the list shape, every field optional, counts arriving as STRINGS, and
   an unknown status reads as "not finished yet" (the values are undocumented — the
   controller bounds the wait). `choose_disk_gb` = models + base install + reserve, never
@@ -1497,7 +1508,12 @@ via injected callables, staying hot-reload-safe.
   optional LAN source) is NOT part of `view()`: the LAN check reads the store and `view()` runs every
   few seconds for the Dashboard; main's `host_view` adds both → enable EVERY runnable service (`_enable`; one failing =
   `_PreCreate`, the ones already enabled are disabled again) → newest READY snapshot of
-  this host, else the template (`bootstrap_template`, "" = auto, M5) → `choose_disk_gb`
+  this host, else the template (`bootstrap_template`, "" = auto, M5) → `/v2/specs` and
+  `resolve_options` (a blank vcpus = included; unreadable specs or a count not offered
+  = `_PreCreate`, `off`, no create; a typed count with the specs unreadable still fails
+  the start as before; `State.vcpus` records the created count, `vcpus_view()` = it while
+  the instance runs, else what a start would use — `view()["vcpus"]` and `cost_per_h`
+  read it, the card says "vCPUs included" when it is None) → `choose_disk_gb`
   (from the manifest copy stored for THAT snapshot id) → create → poll (15 min + 8 min
   per 100 GB) → the port guard `_ensure_ports_closed` (`httpPorts` non-empty → removed
   and re-checked; `bootstrapping`/`starting` are never entered with one open, and an
@@ -1666,6 +1682,11 @@ via injected callables, staying hot-reload-safe.
   retained controller, no key of the `hosts` map, no backend's `backend_host()` (a URL
   hostname without a dot counts: `http://gpu-a:8188` is host `gpu-a`) — or two boxes would
   share one host policy; the provider known and never changed; `options_of` clean.
+  `managed_host_refusal` also asks the provider's `options_refusal` against
+  `provider_specs(kind)` — the first CACHED `/v2/specs` of any controller of that kind
+  (the specs are the provider's; never a fetch, also bound into admin for the form's
+  placeholder) — so a vCPU count the configuration does not offer is a 400 at Save when
+  the specs are known.
   `save_managed_host` stores the NORMALIZED options and `{provider, options}` only.
   **The API token is the PROVIDER's** (operator test 2026-09-30: a provider shows its
   token once, and a per-host field made the operator paste it into every host): one
@@ -1802,7 +1823,9 @@ via injected callables, staying hot-reload-safe.
   `main.save_managed_host` and answers a refusal with 400 + the form as typed. One keyed
   card per host (`_host_card`, `data-k=
   "host-<name>"`: provider + phase badges, the 24 h banner, errors, `tunnel_error`,
-  per-service drain lines, GPU/vCPU from `options`, costs, snapshot, bootstrap notes
+  per-service drain lines, GPU from `options` and the RESOLVED vCPU count (`_vcpu_fact`:
+  `view()["vcpus"]`, else the option, "vCPUs included" for an unknown blank), costs,
+  snapshot, bootstrap notes
   — the running bootstrap's line, bar and last log line (`_bootstrap_running_html`) and
   the start step strip (`_start_steps_html`, ✓/●/○), pure markup —,
   unreconciled uuids, orphans, template models/nodes, the **service table**

@@ -1295,7 +1295,7 @@ snapshots and deletes it — do not create one in the provider's console.
   |---|---|---|
   | gpu | `a6000` | Thunder GPU type (`a6000`, `l40`, `a100xl`, `h100`) |
   | gpus | `1` | GPUs per instance; each includes 100 GB of disk |
-  | vcpus | `8` | vCPUs above the GPU's smallest option bill extra (`additional_vcpus`) |
+  | vcpus | *included* (blank) | blank or `included` = the GPU configuration's included vCPUs — the smallest `vcpuOptions` entry of Thunder's `/v2/specs`, resolved at Start (the form shows it, e.g. `included (6 for l40 ×1)`, once the price list was fetched). Every vCPU above it bills extra (`additional_vcpus`), so a typed count costs more; it must be one the configuration offers |
   | template | `auto` | Thunder's image for the **first** start: `auto` = `comfy-ui` when a ComfyUI backend is attached at that start, else `base` (so a vLLM-only host does not inherit the template's ComfyUI and its bundled models) |
   | disk reserve GB | `20` | free space kept on top of the models and the install when the disk is sized |
   | ComfyUI commit | `1d61dcc3…` | the full 40-hex sha the ComfyUI bootstrap pins ComfyUI to |
@@ -1303,7 +1303,14 @@ snapshots and deletes it — do not create one in the provider's console.
 
 An invalid value (a GPU the provider does not know, `1.5` vCPUs, a commit that is no
 full sha) is refused on Save — a `400` with the form as typed, nothing stored — before
-anything can bill. The host's label and GPU flags live in its row of
+anything can bill. So is a vCPU count the GPU configuration does not offer
+(`l40 ×1 offers vCPUs 6, 12, 24`), as far as the cached spec list knows it; with no
+spec list cached yet the Save accepts it and the Start checks it before the create.
+A Start never guesses a vCPU count: when the spec list cannot be read (or names no
+option for that GPU configuration) a blank vcpus ends the Start in `off` with
+*cannot read Thunder's vCPU options for … — set vcpus explicitly or try again*, and no
+instance is created. Hosts saved with an explicit count (the old default was `8`) keep
+it — clear the field to switch to the included count. The host's label and GPU flags live in its row of
 *Hosts · GPU policy*, like any other box; the attached backends group under the host's
 name there. Managed hosts are console-only (store setting `managed_hosts`; the token is
 the provider's, see Prerequisites).
@@ -1639,8 +1646,10 @@ every start and on *Sync now*.
 
 ### Costs, warnings and orphans
 
-The card shows GPU × count, vCPUs, disk, uptime, **$/h** (from Thunder's public price
-list: the GPU rate + the extra vCPUs + disk beyond the included 100 GB per GPU), the
+The card shows GPU × count, vCPUs (the running instance's, else what a Start would
+use; *vCPUs included* while the count is not known yet), disk, uptime, **$/h** (from
+Thunder's public price list: the GPU rate + the extra vCPUs + disk beyond the included
+100 GB per GPU), the
 session total so far, and the snapshot (size, **$/month** while off). Snapshots and the
 account's instance list are re-read every 10 minutes, the price list hourly.
 An instance up for more than **24 h** puts a banner on its card **and** on the
