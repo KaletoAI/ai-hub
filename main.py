@@ -11,12 +11,14 @@ import logging
 import mimetypes
 import re
 import shlex
+import threading
 import time
 from collections import deque
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import httpx
 import yaml
@@ -6155,16 +6157,22 @@ def _modelsync_catalog() -> list:
     return raw
 
 
-def save_modelsync_catalog(cat) -> list:
+def save_modelsync_catalog(cat, expect_hash: Optional[str] = None) -> list:
     """The console's catalog Save: `validate_catalog`'s refusals ([] = saved). Nothing is
     written unless the WHOLE catalog is valid — a partial save would drop the refused
-    entry silently and leave the alias it was meant for blocked without a word."""
+    entry silently and leave the alias it was meant for blocked without a word. Taken
+    under `_catalog_lock` (Check & save writes the same setting); `expect_hash` = the
+    `modelsync_catalog_hash()` the form was rendered with → `[CATALOG_STALE]` when the
+    stored catalog changed since."""
     errs = modelsync.validate_catalog(cat)
     if errs:
         return errs
     if not store.is_active():
         return ["the store is not active — the catalog cannot be saved"]
-    store.set_settings({_MODELSYNC_CATALOG_KEY: cat})
+    with _catalog_lock:                 # never between Check & save's read and write
+        if expect_hash is not None and modelsync_catalog_hash() != expect_hash:
+            return [CATALOG_STALE]
+        store.set_settings({_MODELSYNC_CATALOG_KEY: cat})
     return []
 
 
@@ -6337,6 +6345,511 @@ def _share_sha_files() -> dict:
     [size, sha256]}` of the CONFIGURED share host ({} for a record of another host).
     Never starts a hash."""
     return modelsrc().sha_files()
+
+
+# ── model sources, Stage 3: Check & save (spec "enter a URL once, verified") ─────
+# The operator names a public URL for a share file (or a Hugging Face repo for a share
+# directory); the gateway HEADs it and compares with the share before the catalog
+# entry is written — never on the request path: a task, ONE check at a time.
+#
+# The HEAD is the gateway reaching out on an operator's word, with the HF token: the
+# SSRF rule of `_fetch_ref_url` holds on EVERY hop (review C-2) — each name resolved,
+# every address `ref_addr_blocked`, the connection made to exactly the checked address
+# (original Host + SNI, no second lookup to rebind), no automatic redirects (each
+# `Location` is a new hop through the same rule, ≤ `_HEAD_MAX_HOPS`). The HF token rides
+# on the FIRST hop only and only to `hostctl._HF_HOSTS`. HF's 302 carries the facts
+# (`X-Linked-Size`, `X-Linked-Etag` = the LFS/Xet content sha256, `X-Repo-Commit`); the
+# CDN's final ETag is no sha256 and `X-Xet-Hash` is another hash — both ignored. Refusals
+# are FIXED texts: a response body is never read, let alone echoed.
+_HEAD_MAX_HOPS = 5
+_HEAD_TIMEOUT_S = 20.0
+_HEX40 = re.compile(r"[0-9a-f]{40}")
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+_DIGITS = re.compile(r"[0-9]{1,18}")
+
+
+@dataclass
+class UrlHead:
+    """What a HEAD of a source URL said. `error` "" = answered: `size` (`X-Linked-Size`
+    of the first response, else the last `Content-Length`; None = unknown), `sha256`
+    (the first response's `X-Linked-Etag` when it is a 64-hex content hash),
+    `commit` (`X-Repo-Commit`, 40 hex), `status` of the last response, `hops` made."""
+    error: str = ""
+    size: Optional[int] = None
+    sha256: Optional[str] = None
+    commit: Optional[str] = None
+    status: Optional[int] = None
+    hops: int = 0
+
+
+def _head_size(v) -> Optional[int]:
+    s = str(v or "").strip()
+    n = int(s) if _DIGITS.fullmatch(s) else None
+    return n if n else None                 # 0 = unknown: no model file is empty
+
+
+def _linked_etag(v) -> Optional[str]:
+    """`X-Linked-Etag` → the sha256 it names, else None (a 40-hex sha1 of a non-LFS
+    file, a CDN etag, junk). Quotes and a weak `W/` prefix are stripped."""
+    s = str(v or "").strip()
+    if s.startswith("W/"):
+        s = s[2:].strip()
+    s = s.strip('"')
+    return s if _HEX64.fullmatch(s) else None
+
+
+async def _head_ref_url(url: str, hf_token_ok: bool = True) -> UrlHead:
+    """HEAD a source URL under the rules above → `UrlHead` (never raises).
+    `hf_token_ok` False = never send the HF token (it is sent at most on the first hop,
+    and only to huggingface.co/hf.co)."""
+    res = UrlHead()
+    token = ""
+    first = urlparse(str(url or ""))
+    if hf_token_ok and (first.hostname or "").lower() in hostctl._HF_HOSTS:
+        tok = _thunder_hf_token()
+        token = tok if hostctl.hf_token_ok(tok) else ""
+    cur = str(url or "")
+    for hop in range(_HEAD_MAX_HOPS + 1):
+        u = urlparse(cur)
+        host = u.hostname
+        if u.scheme != "https" or not host:
+            res.error = "redirect to a non-https URL" if hop else "the URL must be https://"
+            return res
+        try:
+            port = u.port or 443
+        except ValueError:
+            res.error = "redirect to an invalid port" if hop else "the URL has an invalid port"
+            return res
+        try:
+            addrs = await _resolve_ref_host(host, port)
+        except (OSError, UnicodeError):
+            addrs = []
+        if not addrs:
+            res.error = ("redirect to a host that does not resolve" if hop
+                         else "the URL's host does not resolve")
+            return res
+        if any(ref_addr_blocked(a) for a in addrs):
+            logger.warning(f"model source check refused: {host} resolves to a non-public "
+                           f"address (hop {hop + 1})")
+            res.error = ("redirect to a private address" if hop
+                         else "the URL's host resolves to a private address")
+            return res
+        ip = addrs[0].split("%", 1)[0]
+        pinned = u._replace(netloc=(f"[{ip}]" if ":" in ip else ip) + f":{port}").geturl()
+        headers = {"Host": u.netloc.rsplit("@", 1)[-1], "Accept-Encoding": "identity"}
+        if hop == 0 and token:
+            headers["Authorization"] = f"Bearer {token}"
+        try:
+            r = await http_client.request("HEAD", pinned, headers=headers,
+                                          extensions={"sni_hostname": host},
+                                          timeout=_HEAD_TIMEOUT_S, follow_redirects=False)
+        except Exception as e:
+            res.error = f"the URL did not answer ({type(e).__name__})"
+            return res
+        res.hops, res.status = hop + 1, r.status_code
+        h = r.headers
+        if hop == 0:
+            # HF's facts sit on ITS response (the 302 for an LFS file), not the CDN's
+            res.size = _head_size(h.get("x-linked-size"))
+            res.sha256 = _linked_etag(h.get("x-linked-etag"))
+            commit = str(h.get("x-repo-commit") or "").strip()
+            res.commit = commit if _HEX40.fullmatch(commit) else None
+        if r.status_code in (301, 302, 303, 307, 308):
+            if res.size is not None:
+                return res                  # the size is known: no further connection
+            loc = h.get("location")
+            if not loc:
+                res.error = "redirect without a Location"
+                return res
+            cur = urljoin(cur, loc)
+            continue
+        if not 200 <= r.status_code < 300:
+            res.error = f"HTTP {r.status_code}"
+            return res
+        if res.size is None:
+            res.size = _head_size(h.get("content-length"))
+        if res.size is None:
+            res.error = "the URL names no size"
+        return res
+    res.error = f"more than {_HEAD_MAX_HOPS} redirects"
+    return res
+
+
+# The checks. `_src_checks` (key = the share path, or the directory ending in `/`) is
+# what the overview reads through `source_checks()`; ONE runs at a time (`_src_lock`),
+# the rest wait as `queued`. A directory's provisional rows are confirmed by background
+# share hashes (`_src_confirming`) after the check itself is done.
+_SRC_PENDING = ("queued", "heading", "hashing")
+_SRC_CHECKS_MAX = 200
+_src_checks: dict = {}
+_src_check_tasks: dict = {}
+_src_confirming: dict = {}                  # plan path → the dir entry's key it confirms
+_src_lock_obj: Optional[tuple] = None       # (loop, asyncio.Lock): one per event loop
+
+# Writers of `modelsync_catalog` (Check & save, remove, the console's JSON editor): one
+# lock, so no read-modify-write interleaves with another (a store write takes ms; the
+# lock is never held across an await).
+_catalog_lock = threading.Lock()
+CATALOG_STALE = ("the catalog changed since this form was opened — your text is kept "
+                 "below; merge and save again")
+
+
+def modelsync_catalog_hash(cat=None) -> str:
+    """The hash the catalog editor renders with and `save_modelsync_catalog(…,
+    expect_hash=)` compares (Task 4's stale-form refusal, R-3)."""
+    cat = _modelsync_catalog() if cat is None else cat
+    try:
+        blob = json.dumps(cat, sort_keys=True, default=str)
+    except TypeError:
+        blob = json.dumps(cat, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _src_lock() -> asyncio.Lock:
+    global _src_lock_obj
+    loop = asyncio.get_running_loop()
+    if _src_lock_obj is None or _src_lock_obj[0] is not loop:
+        _src_lock_obj = (loop, asyncio.Lock())
+    return _src_lock_obj[1]
+
+
+def source_checks() -> dict:
+    """`{key: status}` of the Check & save runs this process knows (the overview's
+    "queued / heading / hashing / done / refused" + reason). A status carries `kind`
+    (file|dir), `url` or `repo` + `rev` (+ `commit` once resolved), `state`, `reason`
+    (refused), `note` (done: "verified by
+    sha256" / "size-verified only" / provisional count), `left_out` ({relpath: reason}
+    — a directory's files that got no row), `outdated` ({relpath: reason} — a
+    provisional row the share's hash disagreed with), `confirming` (rows still waiting
+    for their share hash), `progress` ("3 of 12") and `at`."""
+    return copy.deepcopy(_src_checks)
+
+
+def source_checks_pending() -> bool:
+    """A check queued or running, or a directory's share hash still pending — the
+    overview is live while this holds."""
+    return (any(s.get("state") in _SRC_PENDING for s in _src_checks.values())
+            or bool(_src_confirming))
+
+
+def _src_set(key: str, **kw) -> None:
+    st = _src_checks.get(key)
+    if st is not None:
+        st.update(kw, at=time.time())
+
+
+def _src_refuse(key: str, reason: str) -> None:
+    _src_set(key, state="refused", reason=reason, progress="")
+    logger.info(f"[model sources] {key}: not saved — {reason}")
+
+
+def _src_trim() -> None:
+    while len(_src_checks) > _SRC_CHECKS_MAX:
+        old = next((k for k, s in _src_checks.items() if s.get("state") not in _SRC_PENDING),
+                   None)
+        if old is None:
+            return
+        del _src_checks[old]
+
+
+def _queue_source_check(key: str, info: dict, factory) -> str:
+    cur = _src_checks.get(key)
+    if cur is not None and cur.get("state") in _SRC_PENDING:
+        return f"a check of {key} is already {cur['state']}"
+    _src_checks.pop(key, None)
+    _src_checks[key] = dict(info, state="queued", reason="", note="", left_out={},
+                            outdated={}, confirming=0, progress="", at=time.time())
+    _src_trim()
+    _src_check_tasks[key] = _bg(_run_source_check(key, factory))
+    return f"check of {key} queued"
+
+
+async def _run_source_check(key: str, factory) -> None:
+    try:
+        async with _src_lock():
+            if _src_checks.get(key, {}).get("state") != "queued":
+                return                          # removed while it waited
+            await factory()
+    except asyncio.CancelledError:
+        _src_refuse(key, "cancelled")
+        raise
+    except Exception as e:
+        logger.warning(f"[model sources] check of {key} failed: {type(e).__name__}: {e}")
+        _src_refuse(key, "the check failed — see the gateway log")
+    finally:
+        if _src_check_tasks.get(key) is asyncio.current_task():
+            del _src_check_tasks[key]
+
+
+async def _src_listing(key: str):
+    """(LanSource, the share listing) for a check, else None after refusing it."""
+    lan = modelsrc()
+    await lan.refresh()
+    idx = lan.cached()
+    if not lan.configured() or not idx:
+        _src_refuse(key, f"the share is not usable ({lan.problem() or 'not listed yet'}) — "
+                         "press List now")
+        return None
+    return lan, idx
+
+
+async def _share_hash(key: str, lan, path: str, size: int) -> Optional[str]:
+    """The share's sha256 for a check: the persistent cache, else a hash queued behind
+    every transfer's (`background=True`). None after refusing the check."""
+    sha = lan.known_sha(path, size)
+    if sha is not None:
+        return sha
+    _src_set(key, state="hashing")
+    try:
+        return await lan.sha256(path, size, background=True)
+    except RuntimeError as e:
+        logger.warning(f"[model sources] {path}: share sha256 failed: {e}")
+        _src_refuse(key, "the share's sha256 could not be computed — see the gateway log")
+        return None
+
+
+def _catalog_write(fn) -> list:
+    """Read-modify-write of `modelsync_catalog` under `_catalog_lock`: `fn(copy)` → the
+    new list, or a str refusal. → [] written, else the refusal(s)."""
+    if not store.is_active():
+        return ["the store is not active — the catalog cannot be saved"]
+    with _catalog_lock:
+        cat = copy.deepcopy(_modelsync_catalog())
+        out = fn(cat)
+        if isinstance(out, str):
+            return [out]
+        if out is not None:
+            store.set_settings({_MODELSYNC_CATALOG_KEY: out})
+    return []
+
+
+def _put_entry(entry: dict, same) -> list:
+    """Write `entry` in place of the catalog entries `same(e)` names (its position: the
+    first of them), else at the end. Only the NEW entry is validated — an unrelated
+    broken entry (dropped one by one by modelsync anyway) never blocks a check."""
+    errs = modelsync.validate_catalog([entry])
+    if errs:
+        return [e.removeprefix("entry 1: ") for e in errs]
+
+    def fn(cat):
+        out, placed = [], False
+        for e in cat:
+            if isinstance(e, dict) and same(e):
+                if not placed:
+                    out.append(entry)
+                    placed = True
+                continue
+            out.append(e)
+        return out if placed else out + [entry]
+    return _catalog_write(fn)
+
+
+async def check_source(path: str, url: str) -> str:
+    """Check & save for ONE share file (spec Stage 3): queued, then HEAD → share size
+    compare → share sha256 (cache, else hashed) → accept iff the size is equal AND an
+    LFS sha256 the URL named equals the share's (none named: "size-verified only") →
+    `{file, url, size, sha256: <the SHARE's>, verified}` written in place of the path's
+    entry. → what happened, for the console banner."""
+    path, url = str(path or "").strip(), str(url or "").strip()
+    errs = modelsync.validate_catalog([{"file": path, "url": url}])
+    if errs:
+        return "not checked: " + errs[0].removeprefix("entry 1: ")
+    return _queue_source_check(path, {"kind": "file", "url": url},
+                               lambda: _check_file(path, url))
+
+
+async def _check_file(path: str, url: str) -> None:
+    got = await _src_listing(path)
+    if got is None:
+        return
+    lan, idx = got
+    size = idx.get(path)
+    if not isinstance(size, int) or isinstance(size, bool):
+        _src_refuse(path, "the share does not list this file")
+        return
+    _src_set(path, state="heading")
+    h = await _head_ref_url(url)
+    if h.error:
+        _src_refuse(path, h.error)
+        return
+    if h.size != size:
+        _src_refuse(path, f"size differs: share {modelsync.size_text(size)}, URL "
+                          f"{modelsync.size_text(h.size)}")
+        return
+    share = await _share_hash(path, lan, path, size)
+    if share is None:
+        return
+    if h.sha256 is not None and h.sha256 != share:
+        _src_refuse(path, "hash differs: the URL's sha256 (X-Linked-Etag) is not the share "
+                          "file's")
+        return
+    verified = "sha256" if h.sha256 is not None else "size"
+    entry = {"file": path, "url": url, "size": size, "sha256": share, "verified": verified}
+    errs = await asyncio.to_thread(_put_entry, entry, lambda e: e.get("file") == path)
+    if errs:
+        _src_refuse(path, "not saved: " + errs[0])
+        return
+    _src_set(path, state="done", reason="", progress="",
+             note="verified by sha256" if verified == "sha256" else "size-verified only")
+    logger.info(f"[model sources] {path}: URL source saved ({verified})")
+
+
+async def check_dir_source(dir_: str, repo: str, rev: str = "main") -> str:
+    """Check & save for a share DIRECTORY against a Hugging Face repo (spec Stage 3,
+    R-1/R-6): `rev` resolved ONCE to the commit (`X-Repo-Commit`) and every further HEAD
+    made at `resolve/<commit>/<relpath>`; each share file under `dir_` is accepted on
+    its SIZE (`modelsync.dir_check_row`), a file whose HEAD fails or whose size differs
+    is left OUT (→ LAN, listed with its reason), and the check is refused only when NO
+    file verifies. Rows without the share's sha256 are confirmed by background hashes
+    afterwards (a provisional one the share disagrees with turns that file outdated)."""
+    d, repo, rev = str(dir_ or "").strip(), str(repo or "").strip(), str(rev or "").strip()
+    if d and not d.endswith("/"):
+        d += "/"
+    err = modelsync.dir_source_error(d, repo)
+    if err:
+        return f"not checked: {err}"
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}", rev) or ".." in rev:
+        return f"not checked: rev {rev!r} is no branch, tag or commit name"
+    return _queue_source_check(d, {"kind": "dir", "repo": repo, "rev": rev},
+                               lambda: _check_dir(d, repo, rev))
+
+
+async def _check_dir(d: str, repo: str, rev: str) -> None:
+    got = await _src_listing(d)
+    if got is None:
+        return
+    lan, idx = got
+    files = {p[len(d):]: n for p, n in modelsync.expand_dir(d, idx).items()
+             if isinstance(n, int) and not isinstance(n, bool) and not modelsync._is_part(p)}
+    if not files:
+        _src_refuse(d, "the share lists no file under this directory")
+        return
+    commit = rev if _HEX40.fullmatch(rev) else None
+    rows, left = {}, {}
+    _src_set(d, state="heading")
+    for i, rel in enumerate(sorted(files)):
+        _src_set(d, progress=f"{i + 1} of {len(files)}")
+        size = files[rel]
+        h = await _head_ref_url(modelsync.hf_resolve_url(repo, commit or rev, rel))
+        if commit is None:
+            if h.commit:
+                commit = h.commit           # ONE commit for the whole entry (R-6 c)
+            elif not h.error:
+                _src_refuse(d, "the URL named no commit (X-Repo-Commit) — is it a "
+                               "Hugging Face model repo?")
+                return
+        if h.error:
+            left[rel] = h.error
+            continue
+        row, why = modelsync.dir_check_row(size, h.size, h.sha256, lan.known_sha(d + rel, size))
+        if row is None:
+            left[rel] = why
+        else:
+            rows[rel] = row
+    _src_set(d, left_out=left)
+    if not rows or commit is None:
+        first = next(iter(left.values()), "")
+        _src_refuse(d, "no file of this directory verified" + (f" ({first})" if first else ""))
+        return
+    entry = {"dir": d, "repo": repo, "rev": commit, "files": rows}
+    errs = await asyncio.to_thread(_put_entry, entry, lambda e: e.get("dir") == d)
+    if errs:
+        _src_refuse(d, "not saved: " + errs[0])
+        return
+    todo = [(rel, row[0]) for rel, row in sorted(rows.items()) if row[1] is None or row[2]]
+    note = f"{len(rows)} of {len(files)} files verified by size"
+    if todo:
+        note += f" — {len(todo)} wait for the share's sha256"
+    _src_set(d, state="done", reason="", progress="", note=note, confirming=len(todo),
+             commit=commit)
+    logger.info(f"[model sources] {d}: directory source saved ({len(rows)} of {len(files)} "
+                f"files, commit {commit})")
+    if todo:
+        for rel, _ in todo:
+            _src_confirming[d + rel] = d
+        _bg(_confirm_dir_rows(d, repo, commit, todo))
+
+
+async def _confirm_dir_rows(d: str, repo: str, commit: str, todo: list) -> None:
+    """The background half of a directory check: the share's sha256 of every row that
+    lacks it (queued behind transfer hashes), then the row confirmed — or, for a
+    provisional sha the share disagrees with, left as it is: the persistent share-sha
+    cache now makes `modelsync.source_kinds` call that file outdated."""
+    lan = modelsrc()
+    try:
+        for rel, size in todo:
+            path = d + rel
+            try:
+                share = await lan.sha256(path, size, background=True)
+            except RuntimeError as e:
+                logger.warning(f"[model sources] {path}: share sha256 failed: {e}")
+                share = None
+            verdict = ("failed" if share is None else
+                       await asyncio.to_thread(_confirm_row, d, repo, commit, rel, size, share))
+            _src_confirming.pop(path, None)
+            st = _src_checks.get(d)
+            if st is not None and st.get("commit") == commit:
+                st["confirming"] = max(0, int(st.get("confirming") or 0) - 1)
+                if verdict == "outdated":
+                    st["outdated"][rel] = ("hash differs: the share's copy differs from "
+                                           "the Hugging Face copy")
+                elif verdict == "failed":
+                    st["outdated"][rel] = "the share's sha256 could not be computed"
+                st["at"] = time.time()
+    finally:
+        for rel, _ in todo:
+            _src_confirming.pop(d + rel, None)
+
+
+def _confirm_row(d: str, repo: str, commit: str, rel: str, size: int, share: str) -> str:
+    """Apply one background share hash to the stored dir entry → "confirmed",
+    "outdated" (left provisional; the cache says it differs) or "gone" (the entry or the
+    row changed since — nothing written)."""
+    result = ["gone"]
+
+    def fn(cat):
+        for e in cat:
+            if not (isinstance(e, dict) and e.get("dir") == d and e.get("repo") == repo
+                    and e.get("rev") == commit and isinstance(e.get("files"), dict)):
+                continue
+            row = e["files"].get(rel)
+            if not (isinstance(row, list) and len(row) == 3 and row[0] == size):
+                return None
+            if row[1] is not None and str(row[1]).lower() != share:
+                result[0] = "outdated"
+                return None
+            e["files"][rel] = [size, share, False]
+            result[0] = "confirmed"
+            return cat
+        return None
+    errs = _catalog_write(fn)
+    return result[0] if not errs else "gone"
+
+
+def remove_source(key: str) -> str:
+    """The overview's "remove": drop the per-file source entry (`key` = its path) or
+    the directory source (`key` ending in `/`) — and a check of it still waiting."""
+    key = str(key or "").strip()
+    found = [False]
+
+    def fn(cat):
+        out = [e for e in cat if not (isinstance(e, dict) and (
+            ("url" in e and e.get("file") == key) or ("repo" in e and e.get("dir") == key)))]
+        if len(out) == len(cat):
+            return None
+        found[0] = True
+        return out
+    errs = _catalog_write(fn)
+    if errs:
+        return f"not removed: {errs[0]}"
+    t = _src_check_tasks.get(key)
+    if t is not None and not t.done():
+        t.cancel()
+    _src_checks.pop(key, None)
+    if not found[0]:
+        return f"no source entry for {key}"
+    logger.info(f"[model sources] {key}: source removed")
+    return f"source of {key} removed"
 
 
 def _modelsrc_prepare() -> None:

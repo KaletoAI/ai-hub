@@ -1572,6 +1572,65 @@ Hugging Face downloads; sent only to `huggingface.co` / `hf.co`) is entered in
 **Server → API Keys**, stored encrypted, never shown again: blank keeps it, *clear*
 removes it.
 
+**Public download sources.** A file the instance can download from a public URL is
+fetched there, ON the instance — hundreds of MB/s instead of your uplink — and only
+the rest streams from the LAN share. Where the URL comes from:
+
+- **The share's Hugging Face cache, automatically.** A file under
+  `hf-cache/hub/models--<org>--<name>/snapshots/<commit>/…` is downloaded from
+  `huggingface.co/<org>/<name>/resolve/<commit>/…` (checked against its content
+  sha256 when the blob name is one). Nothing to enter.
+- **A URL you enter once — Check & save.** For a share file under `models/…` that is
+  public somewhere (Hugging Face, a GitHub release, your own mirror), name its URL; for a
+  share **directory** that mirrors a Hugging Face repo, name the repo (`org/name`). The
+  gateway checks before it saves, in the background and one check at a time: it HEADs
+  the URL (each redirect followed by hand, at most 5, every hop refused when it leads
+  to a private address; your Hugging Face token goes only to `huggingface.co`/`hf.co`
+  and only on the first request), compares the size with the share's file, and compares
+  the content sha256 Hugging Face names (`X-Linked-Etag`, LFS files) with the share's
+  own sha256 — hashed on the share once and remembered (`modelsrc_sha`; every LAN
+  transfer stores it too). Accepted entries store the **share's** sha256, so every
+  download is verified against your bytes. A URL that names no sha256 is accepted on
+  its size and marked *size only*. A refusal says why: `size differs: share 7.70 GB
+  (…), URL 7.50 GB (…)`, `hash differs: …`, `HTTP 404`, `redirect to a private
+  address`, … (never the server's answer text). A **directory** is checked file by file
+  at ONE commit (the repo's branch is resolved to its commit and stored, so the URLs
+  never move): each file is accepted on its size, a file the repo lacks or holds at
+  another size is left out (it keeps syncing from the LAN, and the check names why), and
+  the directory is refused only when no file verifies. Its large files carry Hugging
+  Face's sha256 until the share's own hash is known — hashed in the background, after
+  any transfer waiting for one — and a file whose share copy then differs from Hugging
+  Face's is marked *outdated* and syncs from the LAN.
+- **Precedence**: a per-file entry beats a directory entry beats the automatic
+  Hugging Face derivation (a mirror URL you entered wins). An entry whose stored size no
+  longer matches the share's listing (the file was replaced) is *outdated* and the file
+  syncs from the LAN until you check it again.
+- **On the instance**: a download whose size or sha256 does not match is not retried
+  (the same URL serves the same bytes), nor is an HTTP 4xx; for a file the share also
+  holds, the gateway then ends that download, discards its partial file and syncs the
+  share's copy instead (a `url_fallback` entry in the fault log). A URL given up on
+  network trouble (5xx, 429, a dead connection — three attempts) is tried again by the
+  next instance; a mismatch or a 4xx stays given up until the entry changes or you press
+  *Sync now*.
+
+The entries Check & save writes are ordinary catalog entries (you may also write them
+by hand):
+
+```json
+[
+ {"file": "models/vae/x.safetensors", "url": "https://example.org/x.safetensors",
+  "size": 334643268, "sha256": "…", "verified": "sha256"},
+ {"dir": "models/org/repo/", "repo": "org/repo", "rev": "<40-hex commit>",
+  "files": {"model.safetensors": [7700000000, "…", false], "config.json": [512, null, false]}}
+]
+```
+
+`size` is the share file's, `sha256` the share file's (or, with `provisional: true` as
+the third value of a directory row, Hugging Face's until the share's is known),
+`verified` what Check & save proved (`sha256` or `size`). The catalog editor refuses a
+Save when the catalog changed since it was opened (a Check & save meanwhile) — your
+text stays in the form to merge.
+
 **LAN model source.** Files without a public URL come from a model share on the LAN,
 served read-only by the SSH forced command `ops/modelsrc-serve.sh` (verbs `list`,
 `cat <rel> <offset>`, `sha256 <rel>`; no absolute paths, no `..`, no dot files, no

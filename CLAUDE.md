@@ -34,7 +34,7 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
   restart for backend/alias changes. Read **only at startup**:
   `stats.enabled` and the stats/jobs DB paths.
 - **No linter or build step, and no blanket test suite** — only targeted stdlib
-  `unittest` files for the mechanisms that fail SILENTLY (see the seventy-two listed under
+  `unittest` files for the mechanisms that fail SILENTLY (see the seventy-three listed under
   `anthropic_bridge.py`): `venv/bin/python -m unittest discover -s tests -t .`.
   Everything else is verified by running the server and hitting endpoints with
   `curl` (README "Try it"), `curl -H "Authorization: Bearer <admin key>"
@@ -788,7 +788,7 @@ via injected callables, staying hot-reload-safe.
   running the tool. Covered by
   `test_anthropic_bridge.py` (stdlib `unittest` — a streaming tool-call bridge fails
   silently rather than crashing). `ls tests/test_*.py` is the count of record —
-  **seventy-two** files today — and each exists for that same reason: the mechanism it
+  **seventy-three** files today — and each exists for that same reason: the mechanism it
   guards fails SILENTLY, so it is named next to that mechanism above.
   `test_anthropic_bridge.py`, `test_prune_branch.py` (a
   dead-branch prune that cascades one node too far or too few surfaces as an aborted
@@ -1174,8 +1174,10 @@ via injected callables, staying hot-reload-safe.
   mismatch or 4xx final after ONE download while 5xx/429 retry, the fallback ending a
   live curl and discarding the shared `.part` before the LAN stream (and not switching
   when that cannot be confirmed), keyed on the URL, cleared by Sync now, a URL-only file
-  still blocking, Ruling 18, the share-sha cache persisted, host-bound, pruned and one
-  hash at a time, the template report pruned by the destination index; and the
+  still blocking, Ruling 18, a TRANSPORT-caused fallback forgotten by a new instance
+  while a mismatch/4xx one stays, the share-sha cache persisted, host-bound, pruned and
+  one hash at a time with transfer hashes ahead of Check & save's, the template report
+  pruned by the destination index; and the
   host/service split: every service drained before the snapshot and
   disabled at `off`, a DETACH that never disables (R-K2) and a move H1 → H2 H1 never
   touches, a forward added on the running master without a respawn (a respawn cuts the
@@ -1257,6 +1259,18 @@ via injected callables, staying hot-reload-safe.
   hold; a refused catalog saving nothing; a pin only for the fingerprint the operator
   saw; the install command giving the share user a real shell; the 24 h banner on card
   and Dashboard; unowned snapshots listed, never deleted).
+  `test_model_sources.py` (Check & save, everything stubbed — DNS, HTTP, the LanSource:
+  a redirect hop not checked like the first is an SSRF with read-back into the panel, a
+  token past the first hop goes wherever the redirect says, a non-identity encoding
+  makes a small file's size the compressed one, HF's facts read off the CDN's hop take
+  an object ETag or `X-Xet-Hash` for the content sha256, a stored sha taken from the URL
+  instead of the share makes a differing share copy look verified, one 404 refusing a
+  whole repo dir, a provisional sha the share disagrees with that never turns its file
+  outdated, two checks or two catalog writers interleaving and losing an entry. Pins
+  the first-hop headers, ≤ 5 redirects, private hops refused before any connection,
+  the token rule, the fixed refusals, the accept/refuse matrix, the dir rules incl.
+  partial acceptance and provisional → confirmed/outdated, one check at a time, remove,
+  the catalog lock and the stale-form refusal).
   `test_server_tabs.py` (the Server tab's Runtime | Restart | API Keys | Models: a form on the
   wrong sub-tab or a Save that lands on another one reads as a setting that "did not
   save", and a pending restart shown only on Restart is never seen from Runtime; an
@@ -1667,7 +1681,12 @@ via injected callables, staying hot-reload-safe.
   transfer still runs (the URL's curl would resume onto the LAN's `.part`, fail the same
   way, and the abandon would discard the LAN progress). The record is PERSISTED
   (`State.url_fallback`/`url_fallback_why`) for the same reason: a gateway restart during
-  the fallback's LAN transfer must not plan the URL again. A URL-only file
+  the fallback's LAN transfer must not plan the URL again — with its CAUSE
+  (`url_fallback_cause`: `verdict` = mismatch, 4xx, an invalid entry; `transport` = the
+  three attempts ran out on 5xx/429/dead connections; a record without one is a verdict):
+  `_created` drops the `transport` records for a NEW instance (they were about the last
+  session's network — kept, the next session would plan `lan` for good), the verdicts
+  stay. A gateway restart against the SAME instance (`resume`) keeps them all. A URL-only file
   gives up and blocks as before; Ruling 18 holds (a fallen-back file waits for an
   unusable LAN source like any LAN file). `view()["url_fallback"]` = `{path: reason}`,
   no URL (a catalog URL may carry a query token). Every plan also drops entries of the
@@ -1697,9 +1716,12 @@ via injected callables, staying hot-reload-safe.
   its `host` is the configured one, dropped whole on a host change (with the listing),
   written after EVERY hash (every LAN transfer hashes, so each LAN-synced file has its
   sha for free), dropped by `forget_sha` in both copies, and pruned of paths a fresh
-  listing no longer has at that size. Hashes run ONE at a time (`_hash_lock`; a second
-  request for one file takes the first's answer), `hash_queue()` lists the waiting paths
-  (the running one first), `sha_files()`/`known_sha()` read without hashing,
+  listing no longer has at that size. Hashes run ONE at a time (`_hash_turn`; a second
+  request for one file takes the first's answer) and a TRANSFER's hash overtakes every
+  queued `sha256(…, background=True)` — Check & save's (M-5: a LAN transfer holds the one
+  stream slot until its hash answers; a background hash already running is not
+  interrupted), `hash_queue()` lists the waiting paths in the order they will run (the
+  running one first), `sha_files()`/`known_sha()` read without hashing,
   `sha_generation` changes with the cache; `sha256` raises RuntimeError only (an unset
   host included). `_sha` is replaced, never mutated in place — `sha_files()` runs in a
   worker thread — and every store write is numbered when its record is built, written
@@ -1811,9 +1833,10 @@ via injected callables, staying hot-reload-safe.
   **Public download sources** (model sources, spec 2026-10-01; a share file synced over
   the operator's uplink at ~15 MB/s is often public on Hugging Face, where the instance
   pulls hundreds of MB/s). Three catalog entry shapes, exactly one per entry, unknown keys
-  refused: `{match, paths}`; the per-file source `{file, url, sha256?, size?}` (`size` =
-  the share file's at Check & save, int ≥ 1 — old entries without it stay valid and are
-  never outdated); the directory source `{dir, repo, rev, files}` (`dir` a `models/…/`
+  refused: `{match, paths}`; the per-file source `{file, url, sha256?, size?, verified?}`
+  (`size` = the share file's at Check & save, int ≥ 1 — old entries without it stay
+  valid and are never outdated; `verified` = what Check & save proved, `VERIFIED`:
+  `sha256` or `size` — the overview's "size only"); the directory source `{dir, repo, rev, files}` (`dir` a `models/…/`
   directory, `repo` an `org/name` HF id — no `--`/`..`, `rev` the 40-hex COMMIT, never a
   branch, `files` = `{relpath: [size, sha256|null, provisional]}`, what the check
   verified; `provisional` = the sha is HF's `X-Linked-Etag`, the share's not known yet).
@@ -1855,6 +1878,66 @@ via injected callables, staying hot-reload-safe.
   (`resolve_link`): a link is kept only when its target stays in its root and is a file
   the same alias syncs — one that would dangle is dropped, never "present".
   `status_text` is the 503 wording. `test_modelsync.py`.
+- **Model sources** (spec `2026-10-01-model-sources-design.md`, local only): a share
+  file is synced from a PUBLIC URL when the catalog names one — Stage 1 derives the
+  share's Hugging Face cache (`modelsync.derived_urls`, above); Stage 3 is **Check &
+  save** in `main`, the operator naming a URL for a share file, or a Hugging Face repo
+  for a share DIRECTORY, verified against the share BEFORE the entry is written. Never
+  on the request path: `check_source(path, url)` / `check_dir_source(dir, repo,
+  rev="main")` validate the input (an immediate "not checked: …"), then queue a task —
+  ONE check at a time (`_src_lock`, per event loop), a second request for a key that is
+  still pending answered "already queued". `source_checks()` = `{key: status}` (key =
+  the path, or the dir ending in `/`; `state` queued|heading|hashing|done|refused, a
+  FIXED `reason`, `note`, `left_out`/`outdated` `{relpath: reason}`, `confirming`,
+  `progress`), `source_checks_pending()` (a check or a dir's background hash still
+  pending — the overview's live flag), `remove_source(key)` drops the per-file or dir
+  entry (and cancels a pending check of it). **The HEAD** (`_head_ref_url(url,
+  hf_token_ok=True)` → `UrlHead{error, size, sha256, commit, status, hops}`, never
+  raises) is `_fetch_ref_url`'s SSRF rule on EVERY hop (review C-2): each name resolved,
+  every address `ref_addr_blocked` (WITHOUT `ref_url_allow_cidrs` — a LAN mirror is
+  unreachable from a rented VM, so passing the check would only promise a download that
+  cannot happen), the connection to exactly the checked IP with the original Host and
+  `sni_hostname`, no automatic redirects — each `Location` (relative ones joined) is a
+  new hop through the same rule, at most `_HEAD_MAX_HOPS` 5, https only —
+  `Accept-Encoding: identity` (else a small file's Content-Length is the compressed
+  size), and the HF token on the FIRST hop only and only to `hostctl._HF_HOSTS` (a
+  same-host redirect goes without it too: the rule has no exception to get wrong).
+  `X-Linked-Size`, `X-Linked-Etag` (quotes/`W/` stripped, only `^[0-9a-f]{64}$`) and
+  `X-Repo-Commit` come from the FIRST response — HF's 302 carries them, the CDN's ETag is
+  no sha256 and `X-Xet-Hash` another hash, both ignored (M-6); the next hop is made only
+  while the size is unknown, which then comes from the last `Content-Length` (0 =
+  unknown). Refusals are fixed texts ("HTTP 404", "redirect to a private address", …);
+  a response body is never read. **File check**: the share must list the path as a file
+  (a `lan.refresh()`, cached 10 min, first); HEAD; size ≠ the listing's → refused with
+  both sizes (`modelsync.size_text`); the share's sha256 from the persistent cache, else
+  `lan.sha256(…, background=True)` (state `hashing`); an LFS sha256 the URL named must
+  equal it ("hash differs" otherwise), none named = accepted as `verified: "size"`. The
+  entry written is `{file, url, size, sha256: <the SHARE's>, verified}` — the instance
+  verifies the download against the share's bytes and falls back to the share's copy on
+  a mismatch — in place of every per-file entry of that path. **Directory check**
+  (R-1/R-6, `modelsync.dir_source_error` for the input): every share file under `dir`
+  (no `.part`, no links) gets ONE HEAD; the first answer's `X-Repo-Commit` fixes the
+  commit and every later HEAD goes to `resolve/<commit>/…` (a file failing before a
+  commit is known is left out, an answer WITHOUT one refuses the check: no HF repo);
+  `modelsync.dir_check_row` accepts a file on its SIZE — the row's sha is the cached
+  share sha (an LFS sha that differs → that file left out), else HF's LFS sha
+  `provisional`, else null; a file whose HEAD fails or whose size differs is left OUT
+  (→ `lan`, `left_out` names why); refused only when NO file verified. The entry
+  `{dir, repo, rev: <commit>, files}` replaces the entry of the same `dir`; per-file
+  entries under it stay (they win). Rows without the share's sha are confirmed in the
+  BACKGROUND (`_confirm_dir_rows`, queued behind transfer hashes, `_src_confirming`):
+  null → the share's sha, a provisional one that matches → `provisional: false`, one
+  that differs is LEFT provisional — the persistent share-sha cache now holds the
+  share's hash, and `modelsync.source_kinds` turns that file `outdated` ("the share's
+  copy differs from the Hugging Face copy"); a row changed meanwhile is never touched.
+  **One lock for every writer of `modelsync_catalog`** (`_catalog_lock`, a
+  threading.Lock held only around the store read-modify-write, never across an await):
+  Check & save, the background confirmations, `remove_source` and the console's
+  `save_modelsync_catalog(cat, expect_hash=None)`, which refuses with
+  `[CATALOG_STALE]` when `modelsync_catalog_hash()` moved since the form was rendered
+  (the editor's stale-form rule, R-3). Only the NEW entry is validated on a Check &
+  save (an unrelated broken entry never blocks it — modelsync drops such entries one by
+  one anyway). `test_model_sources.py`.
 - **`ops/`** (not Python — runs on other boxes). Both bootstraps are streamed to the
   instance and keep everything inside `main()` called on the LAST line (bash reads a
   piped script as it runs and a child reading stdin would swallow the rest; `main` also

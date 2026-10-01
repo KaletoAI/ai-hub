@@ -509,7 +509,8 @@ def source_kinds(catalog, source_index=None, share_sha=None) -> dict:
     - `outdated` — explicit entries only, all outdated, nothing derived: the plan syncs
       the share's copy (`reason`).
 
-    Plus `url`, `sha256` (when known; the expected content hash of the download), `size`
+    Plus `url`, `sha256` (when known; the expected content hash of the download),
+    `verified` (a per-file entry Check & save wrote: "sha256" | "size"), `size`
     (an explicit entry's stored size, None for an old entry and hf-auto), `listing_size`
     (the share listing's size, None when unlisted) and — on a `url`/`hf-auto` row that
     replaced an outdated explicit entry (a per-file mirror, or a dir row) —
@@ -528,6 +529,8 @@ def source_kinds(catalog, source_index=None, share_sha=None) -> dict:
     for e in _valid_entries(catalog, "file"):
         info = {"path": e["file"], "url": e["url"], "origin": "file",
                 "size": e.get("size"), "provisional": False}
+        if "verified" in e:
+            info["verified"] = e["verified"]
         if "sha256" in e:
             info["sha256"] = e["sha256"]
         files[e["file"]] = info
@@ -581,6 +584,51 @@ def dir_for(path: str, catalog):
     return best
 
 
+def dir_source_error(d, repo) -> str:
+    """Why `(d, repo)` cannot become a directory source ('' = it can): `d` a `models/…`
+    directory ending in `/` (not a whole root — the dir entry's own rule), `repo` an
+    `org/name` Hugging Face id."""
+    msg = _root_path_error(d, True)
+    if msg:
+        return msg
+    if not d.startswith("models/") or not d.endswith("/"):
+        return f"dir {d!r} must be a models/… directory ending in /"
+    return hf_repo_error(repo)
+
+
+def size_text(n) -> str:
+    """A size in a Check & save refusal: GB (or MB) to read, and the exact bytes when
+    two sizes may differ by a few."""
+    n = _int_size(n)
+    if n is None:
+        return "?"
+    if n >= 10 ** 9:
+        return f"{n / 1e9:.2f} GB ({n} bytes)"
+    if n >= 10 ** 6:
+        return f"{n / 1e6:.1f} MB ({n} bytes)"
+    return f"{n} bytes"
+
+
+def dir_check_row(share_size, url_size, lfs_sha, share_sha):
+    """One share file of a directory check (spec Stage 3, R-1) → `(row, "")` or
+    `(None, reason)`. Accepted on its SIZE; the row's sha256 is the share's when the
+    persistent cache knows it (then an LFS sha256 the URL named must equal it), else
+    the URL's LFS sha256 marked provisional (the share's is hashed in the background),
+    else none yet (`[size, None, False]` — a non-LFS file; the share's sha256 fills it
+    in). `share_sha` is the cached share hash at `share_size` or None."""
+    if url_size != share_size:
+        return None, f"size differs: share {size_text(share_size)}, URL {size_text(url_size)}"
+    lfs = lfs_sha.lower() if isinstance(lfs_sha, str) and _SHA256.fullmatch(lfs_sha) else None
+    share = share_sha.lower() if isinstance(share_sha, str) and _SHA256.fullmatch(share_sha) else None
+    if share is not None:
+        if lfs is not None and lfs != share:
+            return None, "hash differs: the share's copy differs from the Hugging Face copy"
+        return [share_size, share, False], ""
+    if lfs is not None:
+        return [share_size, lfs, True], ""
+    return [share_size, None, False], ""
+
+
 def url_catalog(catalog, source_index=None, share_sha=None) -> dict:
     """`{path: {"url", "sha256"?, "origin"?}}` — the public download sources the plan
     prefers over the LAN: `source_kinds` minus the outdated ones. A derived entry carries
@@ -630,7 +678,11 @@ def _url_error(u) -> str:
     return ""
 
 
-_FILE_KEYS = {"file", "url", "sha256", "size"}
+_FILE_KEYS = {"file", "url", "sha256", "size", "verified"}
+# what Check & save proved about a per-file URL (`main.check_source`): "sha256" = the URL
+# named an LFS sha256 equal to the share file's, "size" = only the size matched (the
+# overview's "URL ✓ size only"). The stored sha256 is the SHARE's either way.
+VERIFIED = ("sha256", "size")
 _DIR_KEYS = {"dir", "repo", "rev", "files"}
 _MATCH_SHAPE = {"match", "paths"}
 
@@ -696,7 +748,8 @@ def validate_catalog(obj) -> list[str]:
     """Every problem of a catalog, as readable lines (empty = valid). Three entry shapes,
     exactly one per entry: `{match, paths}`, the per-file source `{file, url, sha256?,
     size?}` (`size` = the share file's at Check & save, int ≥ 1; absent on old entries)
-    and the directory source `{dir, repo, rev, files}` (`_dir_entry_errors`). Unknown keys
+    and the directory source `{dir, repo, rev, files}` (`_dir_entry_errors`); a per-file
+    entry written by Check & save also carries `verified` (`VERIFIED`). Unknown keys
     are refused — a typo'd key would otherwise be ignored silently."""
     if not isinstance(obj, list):
         return ["catalog must be a JSON list"]
@@ -738,6 +791,8 @@ def validate_catalog(obj) -> list[str]:
                 errs.append(f"{where}: sha256 must be 64 hex characters")
             if "size" in e and not _size_ok(e["size"]):
                 errs.append(f"{where}: size must be an integer ≥ 1")
+            if "verified" in e and e["verified"] not in VERIFIED:
+                errs.append(f"{where}: verified must be one of {', '.join(VERIFIED)}")
             continue
         extra = keys - _MATCH_SHAPE
         if extra:
