@@ -20,6 +20,8 @@ class FakeThunder:
         self.ignore_port_remove = False   # a /ports PATCH that answers 200 and changes nothing
         self.storage = {"min": 100, "max": 500}   # /v2/specs storageGB of a6000_x1
         self.on_modify = None        # callback(old_gb, new_gb) — the VM's disk grows
+        self.vcpu_options = [6, 8]   # /v2/specs vcpuOptions of a6000_x1
+        self.specs_status = 200      # anything else: /v2/specs answers that status
 
     def handler(self, req: httpx.Request) -> httpx.Response:
         p, m = req.url.path, req.method
@@ -75,5 +77,7 @@ class FakeThunder:
         if p == "/v2/pricing":
             return httpx.Response(200, json={"pricing": {"a6000_x1": 0.35, "additional_vcpus": 0.04, "disk_gb": 0.0003, "snapshot_gb": 0.00006849}})
         if p == "/v2/specs":
-            return httpx.Response(200, json={"specs": {"a6000_x1": {"vcpuOptions": [6, 8], "storageGB": dict(self.storage)}}})
+            if self.specs_status != 200:
+                return httpx.Response(self.specs_status, json={"error": "unavailable"})
+            return httpx.Response(200, json={"specs": {"a6000_x1": {"vcpuOptions": list(self.vcpu_options), "storageGB": dict(self.storage)}}})
         return httpx.Response(404)

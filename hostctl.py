@@ -312,6 +312,9 @@ class State:
     port: int = 0
     started_at: float = 0.0
     disk_gb: int = 0
+    # the vCPU count the instance was CREATED with (a blank option = included, resolved
+    # at start); 0 = no instance, or one created before the count was recorded
+    vcpus: int = 0
     base_bytes: int = 0
     snapshot_id: str = ""           # the snapshot the running instance was started from
     pending_snapshot: str = ""      # id of the snapshot taken at the last stop, until READY/FAILED
@@ -2178,15 +2181,33 @@ class Controller:
                              if (gpu and table is not None) else None)
         return out
 
-    def cost_per_h(self) -> Optional[float]:
+    def specs_cached(self):
+        """The cached `/v2/specs` body (any age), None before the first fetch — for
+        views, which never fetch."""
         api = self._api
-        specs = api.cached("specs") if api is not None else None
+        return api.cached("specs") if api is not None else None
+
+    def vcpus_view(self) -> Optional[int]:
+        """The vCPU count to SHOW and price: the one the running instance was created
+        with, else the one a start would use (a typed count, or the included one from the
+        cached specs); None = included, count not known yet."""
+        s = self.state
+        if s.phase != "off" and s.started_at > 0 and s.vcpus > 0:
+            return s.vcpus
+        try:
+            return self._prov.effective_vcpus(self.cfg, self.specs_cached())
+        except Exception:           # a view, never a raise
+            return None
+
+    def cost_per_h(self) -> Optional[float]:
+        specs = self.specs_cached()
         table = self.pricing_table()
         if table is None:
             return None
         cfg = self.cfg
         gpu, n = str(cfg.get("gpu_type") or ""), int(cfg.get("num_gpus") or 1)
-        return self._prov.hourly_cost(table, gpu, n, int(cfg.get("vcpus") or 0),
+        # the RESOLVED count: an included-default host bills no extra vCPU
+        return self._prov.hourly_cost(table, gpu, n, self.vcpus_view(),
                                    self.state.disk_gb, self._prov.spec_for(specs, gpu, n))
 
     def _snapshot_view(self) -> dict:
@@ -2215,7 +2236,7 @@ class Controller:
                 "failed_phase": s.failed_phase, "index": s.index, "uuid": s.uuid,
                 "ip": s.ip, "port": s.port, "started_at": s.started_at,
                 "uptime_s": uptime, "long_running": running and uptime > _LONG_RUN_S,
-                "disk_gb": s.disk_gb, "cost_per_h": cph,
+                "disk_gb": s.disk_gb, "vcpus": self.vcpus_view(), "cost_per_h": cph,
                 "session_cost": (cph * uptime / 3600) if (cph is not None and running) else None,
                 "snapshot": self._snapshot_view(), "log": list(s.log[-_LOG_MAX:]),
                 "transfers": [dict(v) for _, v in sorted(s.transfers.items())],
@@ -3382,10 +3403,23 @@ class Controller:
         snapshot the template is the configured one, else `comfy-ui` with a ComfyUI
         service and the provider's `DEFAULT_TEMPLATE_NO_COMFY` (`base`) without (R-W3)."""
         s, cfg = self.state, self.cfg
-        for k in ("gpu_type", "vcpus"):
-            if not cfg.get(k):
-                raise _PreCreate(f"host option {k} is not set")
+        if not cfg.get("gpu_type"):
+            raise _PreCreate("host option gpu_type is not set")
         num_gpus = self._cfg_int("num_gpus", 1)
+        # the vCPU count FIRST (before any other call): a blank option = included is the
+        # spec's smallest vcpuOptions entry — never guessed. Unreadable specs, or a count
+        # the specs do not offer, end the start in `off` before the create.
+        try:
+            specs = await self.api.specs()
+        except self._Error as e:
+            if cfg.get("vcpus") in (None, ""):
+                self._log(f"/v2/specs unavailable ({e.status or 'transport'}): {e}")
+                specs = None
+            else:
+                raise
+        cfg, why = self._prov.resolve_options(cfg, specs)
+        if why:
+            raise _PreCreate(why)
         snaps = await self.api.snapshots()
         self._snaps = snaps
         snap = self._prov.newest_ready(snaps, self.name)
@@ -3413,7 +3447,7 @@ class Controller:
         self._nodes_text = (self._node_list() if comfy and (comfy_missing or need_host)
                             else "")
         needs = (need_host, comfy_missing)
-        spec = self._prov.spec_for(await self.api.specs(), str(cfg["gpu_type"]), num_gpus)
+        spec = self._prov.spec_for(specs, str(cfg["gpu_type"]), num_gpus)
         storage = (spec or {}).get("storageGB") if isinstance((spec or {}).get("storageGB"), dict) else {}
         if spec is None:
             self._log(f"no /v2/specs entry for {cfg['gpu_type']} x{num_gpus} — disk "
@@ -3426,7 +3460,8 @@ class Controller:
             spec_min=int(storage.get("min") or 0), spec_max=int(storage.get("max") or 0),
             num_gpus=num_gpus)
         pub = await self.deps.keygen(self._key_path())
-        self._log(f"creating instance: template {template}, disk {disk_gb} GB"
+        self._log(f"creating instance: template {template}, disk {disk_gb} GB, "
+                  f"{cfg['vcpus']} vCPUs"
                   + ("" if snap else " (first start: bootstrap follows)"))
         s.created_template, s.create_requested_at = template, self.deps.now()
         if not self._persist():
@@ -3450,12 +3485,12 @@ class Controller:
                 self._abort_note = note
                 self._log(f"create aborted; {note}")
                 raise cancel
-            self._created(created, disk_gb, snap, needs)
+            self._created(created, disk_gb, snap, needs, int(cfg["vcpus"]))
             raise cancel
-        self._created(created, disk_gb, snap, needs)
+        self._created(created, disk_gb, snap, needs, int(cfg["vcpus"]))
 
     def _created(self, created: dict, disk_gb: int, snap: Optional[dict],
-                 needs: tuple) -> None:
+                 needs: tuple, vcpus: int = 0) -> None:
         """`needs` = (host bootstrap needed, ComfyUI install missing). The flags are
         what `_after_create` (also after a gateway restart) runs from, and what a
         snapshot of this instance inherits."""
@@ -3465,6 +3500,7 @@ class Controller:
         s.index, s.uuid = created["index"], created["uuid"]
         s.ip, s.port = "", 0
         s.disk_gb = disk_gb
+        s.vcpus = int(vcpus or 0)
         s.started_at = self.deps.now()
         s.snapshot_id = snap["id"] if snap else ""
         s.host_bootstrapped = not need_host
@@ -3934,6 +3970,7 @@ class Controller:
         await self._stop_tunnel()
         s.index, s.uuid, s.ip, s.port = "", "", "", 0
         s.started_at = 0.0
+        s.vcpus = 0
         s.bootstrap_incomplete = s.comfy_absent = s.host_bootstrapped = False
         self._attached.clear()                  # nothing runs any more
         self._attached_svcs.clear()

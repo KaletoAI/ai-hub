@@ -5410,6 +5410,90 @@ class FinalReviewFixes(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(c._op)
 
 
+class IncludedVcpus(unittest.IsolatedAsyncioTestCase):
+    """`vcpus` blank = the GPU configuration's included count (the smallest
+    `vcpuOptions` entry), resolved at START before the create — never guessed: a count
+    the specs cannot confirm ends the start in `off` with no create call."""
+
+    def _make(self, fake, vcpus):
+        c, saved, enabled, calls = make(fake)
+        c.host["options"]["vcpus"] = vcpus
+        return c, enabled
+
+    async def test_blank_creates_with_the_included_count(self):
+        fake = FakeThunder()
+        fake.vcpu_options = [8, 6, 12]
+        c, _ = self._make(fake, "")
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        self.assertEqual(_creates(fake)[0]["cpu_cores"], 6)
+        self.assertEqual(c.state.vcpus, 6)                  # what the instance has
+        self.assertEqual(c.host["options"]["vcpus"], "")    # the stored option untouched
+        self.assertEqual(c.view()["vcpus"], 6)
+
+    async def test_unreadable_specs_end_in_off_without_a_create(self):
+        for status, opts in ((500, [6, 8]), (200, [])):      # unreadable / no option
+            fake = FakeThunder()
+            fake.specs_status, fake.vcpu_options = status, opts
+            c, enabled = self._make(fake, "")
+            await c.start()
+            self.assertEqual(c.state.phase, "off", status)
+            self.assertEqual(_creates(fake), [], status)
+            self.assertIn("cannot read Thunder's vCPU options for a6000 ×1 — set vcpus "
+                          "explicitly or try again", c.state.error)
+            self.assertNotIn("an instance may exist", c.state.error)
+            self.assertFalse(any(enabled.values()), status)  # its enable undone
+
+    async def test_typed_count_not_offered_is_refused_before_the_create(self):
+        fake = FakeThunder()
+        c, _ = self._make(fake, 12)
+        await c.start()
+        self.assertEqual(c.state.phase, "off")
+        self.assertEqual(_creates(fake), [])
+        self.assertIn("a6000 ×1 offers vCPUs 6, 8", c.state.error)
+
+    async def test_typed_offered_count_is_used_as_is(self):
+        fake = FakeThunder()
+        c, _ = self._make(fake, 8)
+        await c.start()
+        self.assertEqual(c.state.phase, "ready", c.state.error)
+        self.assertEqual(_creates(fake)[0]["cpu_cores"], 8)
+
+    async def test_typed_count_with_unreadable_specs_fails_before_the_create(self):
+        # as before the included default: a specs outage ends the start before the
+        # create (the disk limits come from the same answer) — nothing bills
+        fake = FakeThunder()
+        fake.specs_status = 503
+        c, _ = self._make(fake, 8)
+        await c.start()
+        self.assertEqual(c.state.phase, "off")
+        self.assertEqual(_creates(fake), [])
+        self.assertIn("start failed", c.state.error)
+
+    async def test_view_and_cost_use_the_resolved_count(self):
+        fake = FakeThunder()
+        c, _ = self._make(fake, "")
+        # nothing cached yet: the count is unknown — the card says "included" — and
+        # the $/h of an included count bills no extra vCPU
+        self.assertIsNone(c.view()["vcpus"])
+        await c.refresh_prices()
+        self.assertEqual(c.view()["vcpus"], 6)          # what a start would use
+        self.assertAlmostEqual(c.view()["cost_per_h"], 0.35)
+        c.host["options"]["vcpus"] = 8
+        self.assertEqual(c.view()["vcpus"], 8)
+        self.assertAlmostEqual(c.view()["cost_per_h"], 0.35 + 2 * 0.04)
+        # a running instance: the count it was created with, whatever the options say now
+        c.host["options"]["vcpus"] = ""
+        await c.start()
+        c.host["options"]["vcpus"] = 8
+        self.assertEqual(c.view()["vcpus"], 6)
+        self.assertAlmostEqual(c.view()["cost_per_h"], 0.35)
+        # persisted with the instance and cleared once it is gone
+        self.assertEqual(again(c).state.vcpus, 6)
+        await c.stop()
+        self.assertEqual((c.state.phase, c.state.vcpus), ("off", 0))
+
+
 def _svc(name, typ, lport, rport, **kw):
     """An attached service as main hands it over: the backend dict plus its forward (a
     command service with a start command — the store fields arrive in Task 6)."""
