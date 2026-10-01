@@ -1304,7 +1304,7 @@ snapshots and deletes it — do not create one in the provider's console.
 An invalid value (a GPU the provider does not know, `1.5` vCPUs, a commit that is no
 full sha) is refused on Save — a `400` with the form as typed, nothing stored — before
 anything can bill. So is a vCPU count the GPU configuration does not offer
-(`l40 ×1 offers vCPUs 6, 12, 24`), as far as the cached spec list knows it; with no
+(`l40 ×1 offers vCPUs 6, 8, 12`), as far as the cached spec list knows it; with no
 spec list cached yet the Save accepts it and the Start checks it before the create.
 A Start never guesses a vCPU count: a failing fetch falls back to the last fetched
 spec list (Thunder's own, refreshed hourly), and when there is none (or it names no

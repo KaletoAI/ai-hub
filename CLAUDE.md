@@ -1330,7 +1330,7 @@ via injected callables, staying hot-reload-safe.
   options, specs)` → `(copy, None)` | `(None, why)` resolves the blank at START (unknown
   → "cannot read Thunder's vCPU options for <gpu> ×<n> — set vcpus explicitly or try
   again", never a guess) and refuses a typed count the specs know is not offered
-  ("l40 ×1 offers vCPUs 6, 12, 24"); `options_refusal` is the Save's half (unknown specs
+  ("l40 ×1 offers vCPUs 6, 8, 12"); `options_refusal` is the Save's half (unknown specs
   cannot judge → None); `effective_vcpus`/`blank_label` feed the card and the form's
   placeholder ("included (6 for l40 ×1)"); `create_body` raises on an unresolved blank.
   Stored explicit counts stay (no migration). `bootstrap_template` defaults to `AUTO_TEMPLATE = ""` shown as "auto"
