@@ -1260,7 +1260,9 @@ own autostart off). No new dependency — the system `ssh`, `ssh-keygen` and
   says *set* / *not set*), never sent to a service, never in `/health`. Blank keeps it,
   *clear* removes it (refused while a host of that provider is not off — its stop would
   fail without a token; entering a new token is always possible), and a Save reaches
-  running hosts at once. A store from before this change is migrated at startup: a
+  running hosts at once. (Until 2026-10-01 this row and the HF token sat in the Managed
+  hosts section, `POST /ui/hosts/managed/provider-token|hf-token`; those routes are gone —
+  use `/ui/server/provider-token|hf-token`.) A store from before this change is migrated at startup: a
   readable per-host token becomes the provider token (unless one is set) — that of a
   host with a running instance first — and every per-host copy is removed; a dropped
   token that differs is logged as a warning naming the host.
@@ -1528,7 +1530,7 @@ candidates change (checked every 5 s), when the LAN source changes, and on *Sync
   `models for <alias> are blocked on <backend>: <reason>`. Meanwhile its schema, image
   slots and LoRA list read empty (the card notes it).
 
-**Catalog and HF token.** *Backends → Managed hosts → Model-sync catalog*:
+**Catalog.** *Backends → Managed hosts → Model-sync catalog*:
 one JSON list for every managed host (store setting `modelsync_catalog`), validated as a
 whole on Save — a refused Save comes back with the text as typed and saves nothing.
 Entries:
@@ -1690,7 +1692,7 @@ session cookie is marked `Secure`. Tabs:
 | Tab | What |
 |---|---|
 | **Dashboard** | live per-backend status (a down backend names its cause) + in-flight, a **backend faults · 24h** card, column and panel (see [Backend fault log](#backend-fault-log)), parked calls, media-job counts/recent, recent LLM calls |
-| **Backends** | add/edit/remove backends (LLM, ComfyUI, Meshy, Tripo), incl. the `paid` cost tier; the editor is split into **General** (name, type, url, host, cost tier, concurrency, credential — never shown again once stored: blank keeps it, *clear* removes it), **Models** (whitelist/blacklist, discovery filters, bare-id listing, context windows), **Behavior** (prompt-cache passthrough, sampling defaults, self-retries) and one tab named after the type (**ComfyUI** / **Cloud task API** / **Anthropic**); the **Hosts · GPU policy** panel below the list edits the per-box VRAM flags (see [Hosts & VRAM policy](#hosts--vram-policy)); the **Managed hosts** section below the list adds a rented GPU machine (one **API token per provider** on top, then **+ Managed host**: name, **Provider**, what to rent) and carries one lifecycle card per host (a what-Start-needs checklist, Start/Stop, *+ ComfyUI / + OpenAI-compatible service on this host*, costs, service table with Restart / Re-run setup, model sync, log), the LAN model source and the model-sync catalog + HF token; a backend attaches through the **managed host** select in its General tab (see [Managed hosts](#managed-hosts-thunder-compute-runpod-later)) |
+| **Backends** | add/edit/remove backends (LLM, ComfyUI, Meshy, Tripo), incl. the `paid` cost tier; the editor is split into **General** (name, type, url, host, cost tier, concurrency, credential — never shown again once stored: blank keeps it, *clear* removes it), **Models** (whitelist/blacklist, discovery filters, bare-id listing, context windows), **Behavior** (prompt-cache passthrough, sampling defaults, self-retries) and one tab named after the type (**ComfyUI** / **Cloud task API** / **Anthropic**); the **Hosts · GPU policy** panel below the list edits the per-box VRAM flags (see [Hosts & VRAM policy](#hosts--vram-policy)); the **Managed hosts** section below the list adds a rented GPU machine (the setup guide — step 1 links to **Server → API Keys** for the provider token — then **+ Managed host**: name, **Provider**, what to rent) and carries one lifecycle card per host (a what-Start-needs checklist, Start/Stop, *+ ComfyUI / + OpenAI-compatible service on this host*, costs, service table with Restart / Re-run setup, model sync, log), the LAN model source and the model-sync catalog (the Hugging Face token lives in Server → API Keys); a backend attaches through the **managed host** select in its General tab (see [Managed hosts](#managed-hosts-thunder-compute-runpod-later)) |
 | **Input & Routing** | sub-tabs **Input** (what clients can call — chat aliases, generation models, endpoints), **LLM models**, **Image models**, **LoRAs** — all searchable |
 | **Aliases** | sub-tabs **Chat** and **Media** — the alias list on the left; with nothing picked the right column is the LIVE overview (chat: alias → backend · model · status + alias/model collisions; media: alias → backends, or pick a backend to see everything mapped onto it); pick an alias for its editor. Chat editor: per-alias `park_s`, reasoning/voice/sampling defaults, backends — plus that alias's live routes. Media editor: register a ComfyUI workflow, wire its node mapping, pin values (a cloud alias — Meshy, Tripo — needs no workflow: one schema-driven editor renders its endpoint + option defaults instead). Old `/ui/mapping?…` and `/ui/routing?sub=chat|gen` links redirect here. |
 | **Reasoning** | the normalized-thinking rule list (model glob × backend set → adapter) + test resolver |
