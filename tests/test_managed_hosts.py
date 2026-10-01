@@ -135,6 +135,21 @@ class StoreEncryption(_StoreCase):
         self.assertEqual(store.get_provider_token("thunder"), "")
         self.assertEqual(store.get_provider_token("runpod"), "")
 
+    def test_share_sha_cache_never_in_get_settings(self):
+        """Model sources (review-2 I-2): `modelsrc_sha` grows with the share — one row
+        per hashed file — so the "all settings" readers (Server tab, startup overlay)
+        must not parse it; its own accessor still reads it."""
+        rec = {"host": "src@share", "files": {"models/vae/a.st": [3, "ab" * 32]}}
+        store.set_settings({"modelsrc_host": "src@share", "modelsrc_sha": rec})
+        self.assertNotIn("modelsrc_sha", store.get_settings())
+        self.assertEqual(store.get_settings()["modelsrc_host"], "src@share")
+        self.assertEqual(store.get_setting("modelsrc_sha"), rec)
+        main._modelsrc_obj = None
+        try:
+            self.assertEqual(main._share_sha_files(), rec["files"])
+        finally:
+            main._modelsrc_obj = None
+
     def test_host_entries_carry_no_token(self):
         store.set_managed_host("vm1", dict(_host(), api_key="per-host-SECRET"))
         self.assertNotIn("per-host-SECRET", self.raw("managed_hosts"))

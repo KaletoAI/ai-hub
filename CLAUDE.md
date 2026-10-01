@@ -1663,7 +1663,11 @@ via injected callables, staying hot-reload-safe.
   …, the share's copy … — syncing the share's copy", review M-3). `_compute_plan` hands
   `plan` the URL sources WITHOUT those (`_without_fallbacks`, explicit and derived
   alike) → the plan says `lan`; keyed on the URL — an entry naming another URL drops the
-  record and is tried by itself; Sync now clears it with `_failed`. A URL-only file
+  record and is tried by itself; Sync now clears it with `_failed`, EXCEPT for a path whose
+  transfer still runs (the URL's curl would resume onto the LAN's `.part`, fail the same
+  way, and the abandon would discard the LAN progress). The record is PERSISTED
+  (`State.url_fallback`/`url_fallback_why`) for the same reason: a gateway restart during
+  the fallback's LAN transfer must not plan the URL again. A URL-only file
   gives up and blocks as before; Ruling 18 holds (a fallen-back file waits for an
   unusable LAN source like any LAN file). `view()["url_fallback"]` = `{path: reason}`,
   no URL (a catalog URL may carry a query token). Every plan also drops entries of the
@@ -1696,8 +1700,13 @@ via injected callables, staying hot-reload-safe.
   listing no longer has at that size. Hashes run ONE at a time (`_hash_lock`; a second
   request for one file takes the first's answer), `hash_queue()` lists the waiting paths
   (the running one first), `sha_files()`/`known_sha()` read without hashing,
-  `sha_generation` changes with the cache. `_sha` is replaced, never mutated in place —
-  `sha_files()` runs in a worker thread. `main._share_sha_files()` is the ONE reader the
+  `sha_generation` changes with the cache; `sha256` raises RuntimeError only (an unset
+  host included). `_sha` is replaced, never mutated in place — `sha_files()` runs in a
+  worker thread — and every store write is numbered when its record is built, written
+  off the loop (`forget_sha`/`_follow_host` via the executor) and never overwrites a
+  newer one. `modelsrc_sha` is in `store._BULK_SETTINGS`: read through `get_setting`
+  only, never part of `get_settings()` (the Server tab and startup overlay would parse a
+  record that grows with the share). `main._share_sha_files()` is the ONE reader the
   plan (`_host_deps`' `url_catalog` → `modelsync.url_catalog(…, share_sha)`) and the
   overview use. Triggers: the start path, a 5-s alias-signature poll in `run_forever`, a
   changed LAN source, a re-plan when a transfer ends and every 60 s while one runs. A

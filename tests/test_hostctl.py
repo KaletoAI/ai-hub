@@ -119,7 +119,8 @@ def make(fake, backend=None, ssh_script=None, datadir=None, default_nodes="",
         tunnels.append(t)
         return t
     c._tunnel_factory = tunnel                    # never spawn ssh in tests
-    c.h = types.SimpleNamespace(clock=clock, phases=phases, faults=faults, tunnels=tunnels)
+    c.h = types.SimpleNamespace(clock=clock, phases=phases, faults=faults, tunnels=tunnels,
+                                saved=saved)
     return c, saved, enabled, ssh_calls
 
 
@@ -4472,6 +4473,9 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         self.store.set_settings({"modelsrc_sha": {"host": _SRCHOST, "files": {path: [3, h]}}})
         m._modelsrc_obj = None
         self.assertEqual(m._share_sha_files(), {path: [3, h]})
+        # review-2 I-2: a setting that grows with the share is no "all settings" member
+        self.assertNotIn("modelsrc_sha", self.store.get_settings())
+        self.assertEqual(self.store.get_setting("modelsrc_sha")["files"], {path: [3, h]})
         self._host()
         m.backends = [self._tb()]
         m.sync_host_controllers()
@@ -5141,6 +5145,7 @@ class UrlFallback(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(ab), 1)
         self.assertLess(ab[0], part[0])
         self.assertEqual(c._url_fallback, {self.PATH: self.URL})
+        self.assertEqual(c.h.saved["thunder"]["url_fallback"], {self.PATH: self.URL})
         fb = [f for f in c.h.faults if f[1:3] == ("sync", "url_fallback")]
         self.assertEqual(len(fb), 1)
         self.assertIn("hash differs", fb[0][3])
@@ -5234,6 +5239,55 @@ class UrlFallback(unittest.IsolatedAsyncioTestCase):
         self.assertIn("share's copy", c._failed[self.PATH])
         self.assertIn(("sync", "transfer"), [f[1:3] for f in c.h.faults])
 
+    async def _fallen_back_lan_streaming(self):
+        """A fallback whose LAN transfer is in flight (the stream held at `pipe.gate`)."""
+        sh = self.share()
+        fake, vm, c, lan, pipe = _lan_make({"img": _cand("a.safetensors")}, sh,
+                                           catalog=[_url("a.safetensors", sha="ab" * 32)])
+        vm.sizes[self.URL], vm.sha[self.URL] = 10, "cd" * 32
+        pipe.gate = asyncio.Event()
+        await c.start()
+        self.assertTrue(await _until(lambda: pipe.active == 1), c.state.log[-8:])
+        self.assertEqual(c._url_fallback, {self.PATH: self.URL})
+        return sh, fake, vm, c, lan, pipe
+
+    async def test_fallback_survives_a_gateway_restart_mid_lan_transfer(self):
+        """Review-2 I-1: a restart that forgot the fallback planned the URL again — its
+        curl resumed onto the LAN's `.part`, failed the same way, and the abandon threw
+        the LAN progress away (a stream from zero through the uplink)."""
+        sh, fake, vm, c, lan, pipe = await self._fallen_back_lan_streaming()
+        for t in list(c._fetches.values()):           # the old process dies
+            t.cancel()
+        await _until(lambda: not c._fetches)
+        vm.content[self.PATH] = b"0123"                # what the stream had delivered
+        vm.files[self.PATH + ".part"] = 4
+        n = len(vm.started)
+        c2 = again(c)                                   # same store record, same VM
+        self.assertEqual(c2._url_fallback, {self.PATH: self.URL})
+        self.assertIn("hash differs", c2.view()["url_fallback"][self.PATH])
+        pipe.gate.set()
+        await c2.sync_once()
+        self.assertTrue(await _until(lambda: _idle(c2) and c2.is_alias_ready(BID, "img")),
+                        c2.state.log[-8:])
+        self.assertEqual(len(vm.started), n)            # no curl onto the LAN's .part
+        self.assertEqual(shlex.split(pipe.log[-1][0][-1]),
+                         ["cat", "diffusion_models/a.safetensors", "4"])   # resumed
+        self.assertEqual(json.loads(vm.manifest)[self.PATH]["source"], "lan")
+
+    async def test_sync_now_keeps_a_fallback_whose_lan_transfer_runs(self):
+        sh, fake, vm, c, lan, pipe = await self._fallen_back_lan_streaming()
+        n = len(vm.started)
+        vm.sha[self.URL] = "ab" * 32
+        await c.sync_now()
+        self.assertEqual(c._url_fallback, {self.PATH: self.URL})
+        self.assertTrue(any("stay given up while that copy is transferred" in ln
+                            for ln in c.state.log), c.state.log[-5:])
+        pipe.gate.set()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "img")),
+                        c.state.log[-8:])
+        self.assertEqual(len(vm.started), n)            # no curl started meanwhile
+        self.assertEqual(json.loads(vm.manifest)[self.PATH]["source"], "lan")
+
     async def _fallen_back_with_lan_down(self, extra_catalog=()):
         """A fallback recorded while the LAN source has become unreachable (its last
         listing kept): the file is `lan` now and waits (Ruling 18)."""
@@ -5307,6 +5361,12 @@ class UrlFallback(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(c.state.bootstrap_unknown, {here: 5})
         self.assertEqual(c.view()["bootstrap_unknown"], {here: 5})
         self.assertEqual(saved["thunder"]["bootstrap_unknown"], {here: 5})   # persisted
+
+
+async def _sha_flushed(lan):
+    """The share-sha write a synchronous path scheduled off the loop has landed."""
+    if lan._sha_pending is not None:
+        await lan._sha_pending
 
 
 class ShareShaCache(unittest.IsolatedAsyncioTestCase):
@@ -5386,6 +5446,7 @@ class ShareShaCache(unittest.IsolatedAsyncioTestCase):
         gen = lan.sha_generation
         hosts[0] = "src@10.0.0.9"
         self.assertEqual(lan.sha_files(), {})
+        await _sha_flushed(lan)
         self.assertEqual(self.box["v"], {"host": "src@10.0.0.9", "files": {}})
         self.assertGreater(lan.sha_generation, gen)
         hosts[0] = _SRCHOST                           # back: the old hashes are gone
@@ -5397,6 +5458,7 @@ class ShareShaCache(unittest.IsolatedAsyncioTestCase):
         await lan.sha256(self.PATH, 3)
         lan.forget_sha(self.PATH, 3)
         self.assertEqual(lan.sha_files(), {})
+        await _sha_flushed(lan)
         self.assertEqual(self.box["v"]["files"], {})
         self.assertEqual(self.lan(sh).sha_files(), {})
         await lan.sha256(self.PATH, 3)
@@ -5472,7 +5534,43 @@ class ShareShaCache(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             await lan.sha256(self.PATH, 3)
         self.assertEqual(lan.sha_files(), {})
+        await _sha_flushed(lan)
         self.assertEqual(self.box["v"], {"host": "src@10.0.0.9", "files": {}})
+
+    async def test_synchronous_writes_leave_the_loop_and_never_go_backwards(self):
+        """Review-2 M-2: `forget_sha`/`_follow_host` write the whole record — off the
+        event loop when one runs; and a record built earlier never overwrites a later
+        one, whichever worker thread finishes first."""
+        import threading as _th
+        sh = self.share()
+        lan = self.lan(sh)
+        await lan.sha256(self.PATH, 3)
+        writers = []
+        real = lan._save_sha
+
+        def save(v):
+            writers.append(_th.current_thread() is _th.main_thread())
+            real(v)
+        lan._save_sha = save
+        lan.forget_sha(self.PATH, 3)
+        await _sha_flushed(lan)
+        self.assertEqual(writers, [False])
+        self.assertEqual(self.box["v"]["files"], {})
+        # ordering: the older record arrives last and is dropped
+        old = lan._sha_record(_SRCHOST)
+        new = (old[0] + 1, {"host": _SRCHOST, "files": {self.PATH: [3, "ab" * 32]}})
+        lan._write_sha(*new)
+        lan._write_sha(old[0], {"host": _SRCHOST, "files": {"models/vae/old.st": [1, "cd" * 32]}})
+        self.assertEqual(self.box["v"], new[1])
+
+    async def test_sha256_failures_are_runtime_errors(self):
+        """Review-2 M-3: Check & save catches RuntimeError — an unset host or a path with
+        no share mapping must not escape as a ValueError."""
+        sh = self.share()
+        with self.assertRaises(RuntimeError):
+            await self.lan(sh, [""]).sha256(self.PATH, 3)
+        with self.assertRaises(RuntimeError):
+            await self.lan(sh).sha256("models/hf-cache/x", 3)
 
     async def test_memory_only_without_store_callables(self):
         sh = self.share()

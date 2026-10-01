@@ -409,6 +409,12 @@ _SECRET_SETTINGS = {"api_key", "hf_token"}
 # never part of `get_settings()` — that dict feeds the Server tab and the startup
 # overlay, neither of which has any business holding a billing token.
 PROVIDER_TOKEN_PREFIX = "provider_token_"
+# Settings that grow with DATA, not with operator input — the share-sha cache
+# (`modelsrc_sha`, one row per hashed share file, hundreds of KB on a real share). Read
+# only through get_setting() by their own accessor, never part of `get_settings()`:
+# every "all settings" reader (the Server tab, the startup overlay) would parse and hold
+# them for nothing.
+_BULK_SETTINGS = {"modelsrc_sha"}
 
 
 def _is_secret(key: str) -> bool:
@@ -457,6 +463,8 @@ def get_settings() -> dict:
     for r in rows:
         if str(r["key"]).startswith(PROVIDER_TOKEN_PREFIX):
             continue                    # get_provider_token is their only reader
+        if r["key"] in _BULK_SETTINGS:
+            continue                    # read through get_setting() by their accessor
         v = json.loads(r["value_json"])
         if _is_secret(r["key"]) and isinstance(v, str):
             v = decrypt_secret(v)
