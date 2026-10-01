@@ -1437,6 +1437,15 @@ and **Re-run setup** (while the host runs and no operation is in flight).
   failure of the machine itself before the instance exists ends in `off`; after it in
   `failed (<phase>)` with the instance **kept** for diagnosis — it bills until you press
   Stop. A failed host bootstrap is `failed (bootstrapping)`.
+  **While a bootstrap or a service's setup runs, the card shows it live**: a step strip
+  for the whole start (create → connect → set up → start services → sync models →
+  ready), and for the running script its step in the script's fixed phase order (the
+  node pack *i/N* during `nodes`), a progress bar, the time so far and the log's last
+  line — read from the log on the instance every 15 s. The first ComfyUI setup on a
+  template usually takes 15–30 min; **do not Stop it** — a Stop throws the half-done
+  setup away and the next start does it all again. The red "The ComfyUI setup did not
+  finish" note appears only when nothing runs any more (interrupted or failed): Re-run
+  setup on the ComfyUI service, or Stop (that snapshot is marked incomplete).
 - **Stop** (asks first) drains **every** attached backend (running jobs finish, new ones
   go elsewhere; the card says how many jobs it still waits for, per service), ends
   running transfers, deletes the synced files no selected alias needs any more (see
@@ -1521,7 +1530,9 @@ candidates change (checked every 5 s), when the LAN source changes, and on *Sync
   deleted, until the block is fixed. Files the gateway did not put there and nobody needs
   — models the template brought, a node's own downloads — are listed as **unknown** with
   their size and deleted only when you tick them in the card. Delete template models
-  before the first Stop, or every snapshot carries them.
+  before the first Stop, or every snapshot carries them. What ComfyUI ships itself is
+  not listed (nor deletable there): its `put_…_here` placeholders, any empty file, and
+  the stock `models/configs/*.yaml` under 1 MB.
 - **Routing waits for the sync.** Until all of an alias's files are present and nothing
   blocks it, the managed candidate is out of routing **and** of the queue — other
   candidates of the alias are unaffected. An alias that runs **only** there answers at
@@ -1659,7 +1670,8 @@ backend — sources `lifecycle` and `sync`.
   its weights twice (`.bin` and `.safetensors`, ~4.5 GB extra), and the TRELLIS.2
   directory ~1.5 GB of checkpoints only another pipeline loads. The catalog cannot
   exclude single files inside a directory yet.
-- A bootstrap's or setup script's log reaches the card when it ends, not line by line.
+- While a bootstrap or setup script runs, the card shows its phase and LAST log line
+  (polled every 15 s); the whole output reaches the card's log only when it ends.
 - One LAN stream per host: the first sync of a large alias set is bounded by the share
   host's uplink.
 - The tunnel's control socket path must fit a Unix socket (at most 86 bytes). It lives in

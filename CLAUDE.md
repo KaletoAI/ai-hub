@@ -1487,7 +1487,16 @@ via injected callables, staying hot-reload-safe.
   `~/.gw-nodes.txt` is uploaded BEFORE the host bootstrap so its template-pack report
   skips our own packs; an empty list uploads `ops/thunder-nodes.default.txt`), both
   judged by their `GW:` lines BY TAG (`parse_bootstrap`/`bootstrap_verdict`: any
-  `GW:NODE_FAIL` fails even after `GW:DONE`, Ruling 9) → per service: setup if its hash
+  `GW:NODE_FAIL` fails even after `GW:DONE`, Ruling 9; while either — or a command
+  service's setup — runs, `_run_script(which=…)` starts a display-only side task that
+  every `_BOOTSTRAP_POLL_S` (15 s) reads the log's end with the FIXED `bootstrap_poll_cmd`
+  — a grep count of `node … @` lines plus `tail -n 40` of the one constant path, 20 s
+  timeout, failures ignored — into `view()["bootstrap_running"]` (phase, last line, step
+  of `HOST_BOOTSTRAP_PHASES`/`COMFY_BOOTSTRAP_PHASES` — pinned against the scripts'
+  `phase` calls —, node i/N, fraction; memory only, a new phase logged once), cancelled
+  and cleared in a `finally`; the card shows it instead of the red `bootstrap_incomplete`
+  note, which appears only with nothing running and no start on its way to the
+  bootstrap — 2026-10-01, a normal 20-min first bootstrap read as "stuck") → per service: setup if its hash
   differs, start, probe (command 20 min, ComfyUI 10 min) → sync → `ready`. The host is
   `ready` once the VM runs and the tunnel stands; a service's setup or start failing is
   THAT service's `setup failed`/`down` + a fault on its backend, the instance kept and
@@ -1690,7 +1699,10 @@ via injected callables, staying hot-reload-safe.
   present = the destination holds the file at the SOURCE's size (the manifest's where the
   source does not list it), a `.part` never; `prune` = manifest files only (never a file
   we did not put there), applied only at stop; `unknown` = everything else nobody needs,
-  listed, deleted only by the operator (`delete_unknown`, judged against a FRESH plan);
+  listed, deleted only by the operator (`delete_unknown`, judged against a FRESH plan) —
+  minus what ComfyUI ships itself (`_comfy_stock`: `put_*_here` placeholders, empty
+  files, stock `models/configs/*.yaml` under 1 MB), which buried a template's one real
+  model among 36 of them;
   a BLOCKED alias fetches nothing but HOLDS its manifest files (`held`, never pruned —
   Ruling 16); fetch order = aliases by fewest missing bytes, big files first. Symlinks
   (`resolve_link`): a link is kept only when its target stays in its root and is a file
@@ -1754,7 +1766,9 @@ via injected callables, staying hot-reload-safe.
   `main.save_managed_host` and answers a refusal with 400 + the form as typed. One keyed
   card per host (`_host_card`, `data-k=
   "host-<name>"`: provider + phase badges, the 24 h banner, errors, `tunnel_error`,
-  per-service drain lines, GPU/vCPU from `options`, costs, snapshot, bootstrap notes,
+  per-service drain lines, GPU/vCPU from `options`, costs, snapshot, bootstrap notes
+  — the running bootstrap's line, bar and last log line (`_bootstrap_running_html`) and
+  the start step strip (`_start_steps_html`, ✓/●/○), pure markup —,
   unreconciled uuids, orphans, template models/nodes, the **service table**
   `_svc_table` — backend, type, `VM :<remote> → local :<local>`, status, error, and
   Restart / Re-run setup carrying the BACKEND id, rendered only while the host runs
