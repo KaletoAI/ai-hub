@@ -6157,6 +6157,19 @@ def _modelsync_catalog() -> list:
     return raw
 
 
+def _modelsync_catalog_view() -> list:
+    """`_modelsync_catalog()` for VIEWS: the same list, but an absent setting is answered
+    with the default IN MEMORY — a page view (the console's editor, the Model sources
+    overview, a 400 re-render of them) never writes the store. The seed lands on the
+    controller's first plan or the editor's first Save, as before."""
+    if not store.is_active():
+        return copy.deepcopy(modelsync.DEFAULT_CATALOG)
+    raw = store.get_setting(_MODELSYNC_CATALOG_KEY)
+    if raw is None:
+        return copy.deepcopy(modelsync.DEFAULT_CATALOG)
+    return raw if isinstance(raw, list) else []
+
+
 def save_modelsync_catalog(cat, expect_hash: Optional[str] = None) -> list:
     """The console's catalog Save: `validate_catalog`'s refusals ([] = saved). Nothing is
     written unless the WHOLE catalog is valid — a partial save would drop the refused
@@ -6207,14 +6220,16 @@ def _comfy_name_of(bid: str) -> Optional[str]:
     return name if sep and kind == "comfyui" else None
 
 
-def service_alias_needs(bid: str) -> list:
+def service_alias_needs(bid: str, catalog=None) -> list:
     """`modelsync.AliasNeed` per alias candidate on the ComfyUI service `bid` (built by
     `modelsync.alias_need`, the only builder that fills `covered`). Blocking store
-    read — the controller calls it in a worker thread."""
+    read — the controller calls it in a worker thread. `catalog` = the list to match
+    against (the overview hands in the one it already read); None = the setting."""
     name = _comfy_name_of(bid)
     if name is None:
         return []
-    catalog = _modelsync_catalog()
+    if catalog is None:
+        catalog = _modelsync_catalog()
     return [modelsync.alias_need(alias, modelsync.refs_for(
                 cand, adapters.cand_workflow(cand), _mapping_fields(cand)), catalog)
             for alias, cand in _comfy_alias_cands(name)]
@@ -6513,8 +6528,9 @@ CATALOG_STALE = ("the catalog changed since this form was opened — your text i
 
 def modelsync_catalog_hash(cat=None) -> str:
     """The hash the catalog editor renders with and `save_modelsync_catalog(…,
-    expect_hash=)` compares (Task 4's stale-form refusal, R-3)."""
-    cat = _modelsync_catalog() if cat is None else cat
+    expect_hash=)` compares (Task 4's stale-form refusal, R-3). The stored catalog is read
+    without seeding (the default's hash equals the seeded default's)."""
+    cat = _modelsync_catalog_view() if cat is None else cat
     try:
         blob = json.dumps(cat, sort_keys=True, default=str)
     except TypeError:
@@ -6674,6 +6690,10 @@ def _put_entry(entry: dict, same, still=None) -> list:
     return _catalog_write(fn)
 
 
+SRC_URL_REFUSED = ("the URL must start with https:// and contain no whitespace, quote or "
+                   "control character")
+
+
 async def check_source(path: str, url: str) -> str:
     """Check & save for ONE share file (spec Stage 3): queued, then HEAD → share size
     compare → share sha256 (cache, else hashed) → accept iff the size is equal AND an
@@ -6681,9 +6701,15 @@ async def check_source(path: str, url: str) -> str:
     `{file, url, size, sha256: <the SHARE's>, verified}` written in place of the path's
     entry. → what happened, for the console banner."""
     path, url = str(path or "").strip(), str(url or "").strip()
+    # the answer becomes the banner — a `?msg=` redirect (browser history, the access
+    # log) — so it never carries the typed URL, whose query may hold a token: a FIXED
+    # text for a refused URL, and the path's own refusal only when the URL is fine
+    if modelsync._url_error(url):
+        return "not checked: " + SRC_URL_REFUSED
     errs = modelsync.validate_catalog([{"file": path, "url": url}])
     if errs:
-        return "not checked: " + errs[0].removeprefix("entry 1: ")
+        msg = errs[0].removeprefix("entry 1: ")
+        return "not checked: " + (SRC_URL_REFUSED if url in msg else msg)
     return _queue_source_check(path, {"kind": "file", "url": url},
                                lambda: _check_file(path, url))
 
@@ -6954,22 +6980,46 @@ def model_source_kinds() -> dict:
     (absent = `lan`) — the host card's badge. BLOCKING (store reads, one pass over the
     listing on a change): call it through `asyncio.to_thread`."""
     lan = modelsrc()
-    catalog = _modelsync_catalog()
+    catalog = _modelsync_catalog_view()
     kinds = _source_kinds_memo(catalog, modelsync_catalog_hash(catalog), lan)
     return {p: {k: v for k, v in i.items() if k in ("kind", "reason", "origin")}
             for p, i in kinds.items()}
 
 
-def _dir_entry_of(path: str, catalog):
-    """The valid directory entry whose `files` names `path` (the last such entry wins,
-    as in `source_kinds`), else None — the key `remove_source` takes for a dir row."""
-    best = None
+def _dir_entries_by_path(catalog) -> dict:
+    """`{path: dir entry}` over the valid directory entries' `files` (a later entry wins,
+    as in `source_kinds`) — the key `remove_source` takes for a dir row. Each entry is
+    validated ONCE (`validate_catalog` walks its whole `files` map)."""
+    out: dict = {}
     for e in catalog if isinstance(catalog, list) else []:
         if (isinstance(e, dict) and "repo" in e and isinstance(e.get("dir"), str)
-                and path.startswith(e["dir"]) and isinstance(e.get("files"), dict)
-                and path[len(e["dir"]):] in e["files"] and not modelsync.validate_catalog([e])):
-            best = e
-    return best
+                and isinstance(e.get("files"), dict) and not modelsync.validate_catalog([e])):
+            for rel in e["files"]:
+                out[e["dir"] + rel] = e
+    return out
+
+
+def _overview_alias_key(names) -> str:
+    """One hash over exactly what the overview's needs read besides the catalog: every
+    alias candidate on one of these ComfyUI backends (a path workflow's CONTENT too).
+    ONE alias read and ONE dump for all backends — a memo hit stays cheap (the catalog
+    is keyed by its own hash)."""
+    wanted = set(names)
+    merged = dict(image_models or {})
+    if store.is_active():
+        merged.update(store.list_aliases())
+    parts = []
+    for alias in sorted(merged):
+        for cand in merged[alias] or []:
+            if (isinstance(cand, dict) and cand.get("backend") in wanted
+                    and adapters.cand_kind(cand) == "comfyui"):
+                wf = None if "workflow_json" in cand else adapters.cand_workflow(cand)
+                parts.append([alias, cand, wf])
+    try:
+        blob = json.dumps(parts, sort_keys=True, default=str)
+    except TypeError:                       # mixed key types (a YAML workflow's int ids)
+        blob = json.dumps(parts, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
 def model_sources_view() -> dict:
@@ -6987,10 +7037,10 @@ def model_sources_view() -> dict:
     (`model_sources_overview`). Never starts a hash or a listing."""
     lan = modelsrc()
     names = _comfy_backend_names()
-    catalog = _modelsync_catalog()
+    catalog = _modelsync_catalog_view()
     cat_hash = modelsync_catalog_hash(catalog)
-    key = (tuple((n, service_alias_signature(f"comfyui:{n}")) for n in names), cat_hash,
-           lan.generation, lan.sha_generation)
+    key = (tuple(names), _overview_alias_key(names), cat_hash, lan.generation,
+           lan.sha_generation)
     with _msrc_memo_lock:
         if _msrc_memo[0] == key:
             return _msrc_memo[1]
@@ -6998,10 +7048,11 @@ def model_sources_view() -> dict:
     share_sha = lan.sha_files()
     needs = []
     for n in names:
-        needs += service_alias_needs(f"comfyui:{n}")
+        needs += service_alias_needs(f"comfyui:{n}", catalog)
     urls = modelsync.url_catalog(catalog, idx, share_sha)
     p = modelsync.plan(needs, idx, {}, {}, urls)
     kinds = _source_kinds_memo(catalog, cat_hash, lan)
+    dir_rows = _dir_entries_by_path(catalog)
     rows: dict = {}
     for alias, r in sorted(p["per_alias"].items()):
         why = "; ".join(r["blocked"])
@@ -7028,7 +7079,7 @@ def model_sources_view() -> dict:
                     if info.get("origin") == "file":
                         row["entry_key"] = path
                     elif info.get("origin") == "dir":
-                        d = _dir_entry_of(path, catalog)
+                        d = dir_rows.get(path)
                         row["entry_key"] = d["dir"] if d else ""
                 if kind == "lan":
                     d = modelsync.dir_for(path, catalog)
@@ -7050,20 +7101,25 @@ def model_sources_view() -> dict:
 async def model_sources_overview() -> dict:
     """The console's "Model sources" section: `model_sources_view()` (built in a worker
     thread, memoised) plus what changes while nothing else does — `fallback` (`{path:
-    reason}` of every controller's "URL failed this session — LAN"), `checks`
+    "<host>: <reason>[; …]"}` of every controller's "URL failed this session — LAN",
+    `Controller.url_fallback_view` — in memory, not the whole `view()`), `checks`
     (`source_checks()`), `hashing` (the share-hash queue, running first), `pending` (a
     check or a hash still running: the section is live) and `problem` (the LAN source's,
     "" = usable)."""
     view = dict(await asyncio.to_thread(model_sources_view))
+    # per HOST: a URL that failed on one instance may download fine on another, so
+    # the row names every host it failed on (`"<host>: <reason>"`)
     fallback: dict = {}
     for name, c in sorted(host_controllers.items()):
         try:
-            fb = c.view().get("url_fallback") or {}
+            fb = c.url_fallback_view() or {}
         except Exception as e:              # a courtesy column, never the section
             logger.warning(f"[model sources] {name}: fallback view unavailable: {e!r}")
             continue
         for path, why in fb.items():
-            fallback.setdefault(str(path), str(why or ""))
+            line = f"{name}: {why or 'URL given up'}"
+            fallback[str(path)] = (f"{fallback[str(path)]}; {line}" if str(path) in fallback
+                                   else line)
     lan = modelsrc()
     try:
         hashing = [str(x) for x in lan.hash_queue()]
@@ -8114,7 +8170,9 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
            save_modelsrc_host=save_modelsrc_host,
            save_hf_token=save_hf_token, hf_token_set=hf_token_set,
            thunder_orphan_snapshots=thunder_orphan_snapshots,
-           modelsync_catalog=_modelsync_catalog, save_modelsync_catalog=save_modelsync_catalog,
+           # views read the catalog WITHOUT seeding it (a GET never writes the store)
+           modelsync_catalog=_modelsync_catalog_view,
+           save_modelsync_catalog=save_modelsync_catalog,
            # model sources: the editor's stale-form guard, the overview, the actions
            modelsync_catalog_hash=modelsync_catalog_hash, catalog_stale=CATALOG_STALE,
            source_checks_pending=source_checks_pending,

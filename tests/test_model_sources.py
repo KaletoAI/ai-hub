@@ -966,20 +966,26 @@ class Overview(unittest.IsolatedAsyncioTestCase):
             def __init__(self, fb):
                 self.fb = fb
 
-            def view(self):
-                return {"url_fallback": self.fb}
+            def url_fallback_view(self):
+                return dict(self.fb)
+
+            def view(self):                 # the whole view is NOT what the overview reads
+                raise AssertionError("view() called")
 
         class Broken:
-            def view(self):
+            def url_fallback_view(self):
                 raise RuntimeError("boom")
         main.host_controllers = {"h1": Ctl({"models/vae/v.safetensors": "hash differs"}),
-                                 "h2": Broken()}
+                                 "h2": Broken(),
+                                 "h3": Ctl({"models/vae/v.safetensors": "HTTP 404"})}
         self.lan.queue = ["models/checkpoints/big.safetensors"]
         main._src_checks = {"models/vae/v.safetensors": {"kind": "file", "state": "done"}}
         ov = await main.model_sources_overview()
         self.assertEqual(len(seen), 1)
         self.assertNotEqual(seen[0], loop_thread)
-        self.assertEqual(ov["fallback"], {"models/vae/v.safetensors": "hash differs"})
+        # per host: a URL that failed on h1 and h3 names both (it may work elsewhere)
+        self.assertEqual(ov["fallback"], {"models/vae/v.safetensors":
+                                          "h1: hash differs; h3: HTTP 404"})
         self.assertEqual(ov["hashing"], ["models/checkpoints/big.safetensors"])
         self.assertTrue(ov["pending"])                   # a hash runs
         self.assertEqual(ov["checks"]["models/vae/v.safetensors"]["state"], "done")
@@ -992,6 +998,33 @@ class Overview(unittest.IsolatedAsyncioTestCase):
         # the memoised view is never mutated by the overlay
         self.assertNotIn("fallback", main.model_sources_view())
 
+    def test_a_memo_hit_reads_the_aliases_once(self):
+        main.model_sources_view()
+        real = store.list_aliases
+        n = []
+
+        def spy():
+            n.append(1)
+            return real()
+        store.list_aliases = spy
+        self.addCleanup(setattr, store, "list_aliases", real)
+        main.model_sources_view()                       # two ComfyUI backends, a hit
+        self.assertEqual(len(n), 1)
+
+    def test_a_view_never_seeds_the_catalog(self):
+        store.set_settings({"modelsync_catalog": None})
+        main._msrc_memo[:] = [None, None]
+        main.model_sources_view()
+        main.model_source_kinds()
+        main.modelsync_catalog_hash()
+        self.assertIsNone(store.get_setting("modelsync_catalog"))
+        self.assertEqual(main._modelsync_catalog_view(), modelsync.DEFAULT_CATALOG)
+        # the seeded default hashes like the unseeded one: a form opened before the seed
+        # is not refused as stale
+        h = main.modelsync_catalog_hash()
+        main._modelsync_catalog()                       # the controller's read seeds
+        self.assertEqual(main.modelsync_catalog_hash(), h)
+
     def test_card_kinds(self):
         kinds = main.model_source_kinds()
         self.assertEqual(kinds["models/loras/old.safetensors"]["kind"], "outdated")
@@ -999,6 +1032,24 @@ class Overview(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kinds["models/vae/v.safetensors"]["kind"], "url")
         self.assertNotIn("models/checkpoints/big.safetensors", kinds)
         self.assertNotIn("url", kinds[BLOB])            # the badge needs no URL
+
+
+class RefusalNeverEchoesTheUrl(_Base):
+    """Review-4 I-1: `check_source`'s answer becomes the console banner — a `?msg=`
+    redirect, i.e. browser history and the access log. A typed URL may carry a token in
+    its query, so a refusal is a FIXED text and never names the URL."""
+
+    async def test_refused_urls_give_a_fixed_text(self):
+        for url in ("http://h.example/m?token=SECRETabc", "https://h.example/a b?token=SECRETabc",
+                    'https://h.example/"?token=SECRETabc', "ftp://x/?token=SECRETabc", ""):
+            msg = await main.check_source("models/vae/a.st", url)
+            self.assertEqual(msg, "not checked: " + main.SRC_URL_REFUSED, url)
+            self.assertNotIn("SECRET", msg)
+        self.assertEqual(main._src_check_tasks, {})
+        # a bad PATH with a fine URL says what is wrong with the path, never the URL
+        msg = await main.check_source("../etc/passwd", "https://h.example/m?token=SECRETabc")
+        self.assertTrue(msg.startswith("not checked: "), msg)
+        self.assertNotIn("SECRET", msg)
 
 
 # ── pure helpers ──────────────────────────────────────────────────────────────────

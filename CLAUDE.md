@@ -1974,11 +1974,18 @@ via injected callables, staying hot-reload-safe.
   points at; per row `kind` from `source_kinds` (absent = `lan`), `entry_key` (what
   `remove_source` takes: the path, or the dir entry whose `files` names it —
   `_dir_entry_of`), `dir_entry`/`dir_repo` (a LAN file under a dir source whose check
-  predates it) and `aliases` `[[alias, blocked reason]]`. BLOCKING and memoised on (each
-  ComfyUI backend's `service_alias_signature`, the catalog hash, `lan.generation`,
-  `lan.sha_generation`) in `_msrc_memo`; `model_sources_overview()` (bound into admin)
+  predates it) and `aliases` `[[alias, blocked reason]]`. BLOCKING and memoised on (the
+  ComfyUI backend names, `_overview_alias_key` — ONE alias read and ONE dump over every
+  candidate on them, so a memo hit stays cheap — the catalog hash, `lan.generation`,
+  `lan.sha_generation`) in `_msrc_memo`; the catalog is read through
+  `_modelsync_catalog_view` (NO seeding: a view never writes the store — the console's
+  editor is bound to it too; `modelsync_catalog_hash()` reads it the same way, the
+  default hashing like the seeded default) and handed to `service_alias_needs(bid,
+  catalog)`; `model_sources_overview()` (bound into admin)
   builds it in `asyncio.to_thread` and lays the live parts over a COPY on the loop:
-  every controller's `view()["url_fallback"]`, `source_checks()`, `lan.hash_queue()`,
+  every controller's `url_fallback_view()` (in memory, not the whole `view()`; per HOST —
+  `"<host>: <reason>; …"`, a URL that failed on one instance may work on another),
+  `source_checks()`, `lan.hash_queue()`,
   `pending` (= `source_checks_pending()` or a hash queued — the section's live flag),
   `lan.problem()`. `model_source_kinds()` (BLOCKING, own memo on catalog hash + the two
   generations) is the host card's `{path: {kind, reason, origin}}`. Never starts a hash
@@ -2070,10 +2077,12 @@ via injected callables, staying hot-reload-safe.
   `hf_token` in `store._SECRET_SETTINGS`; R-3: its form carries `catalog_hash` — the
   hash of the very list it renders, `_catalog_hash_of` — and sits under
   `data-live-skip`, so the morph never swaps that hash under a kept, edited textarea;
-  `hosts_catalog_save` passes it as `expect_hash` (a POST without the field is not
-  judged), and a `_catalog_stale` refusal is a 400 with the text AS TYPED and the
-  CURRENT hash, plus a note while `source_checks_pending()`; a validation refusal keeps
-  the hash the form was opened with), then **Model sources** (`_model_sources_block`,
+  `hosts_catalog_save` passes it as `expect_hash` (a POST WITHOUT the field — a tab
+  opened before the deploy, a script — is judged stale), and a `_catalog_stale` refusal
+  is a 400 with the text AS TYPED, the CURRENT hash and the stored catalog read-only
+  beside it (`hosts-catalog-current`, outside the form) to merge from, plus a note while
+  `source_checks_pending()`; a validation refusal keeps the hash the form was opened
+  with), then **Model sources** (`_model_sources_block`,
   `data-k="msrc"`, from `main.model_sources_overview` awaited by `server_page`/
   `_models_view`): the summary (`_msrc_summary` — a failed URL counts as LAN only and
   says so), the share-hash queue, the checks of this session (state, progress, fixed
@@ -2087,9 +2096,12 @@ via injected callables, staying hot-reload-safe.
   it may carry a token) and the actions — a `source-check` form (path + URL; prefilled
   for outdated) on LAN/outdated/failed rows, ONE editable `source-check-dir` form (dir +
   repo) per `models/…` folder with ≥ 2 LAN-only files or a stale dir entry, `remove`
-  (`data-confirm`, the row's `entry_key`) on URL ✓/outdated rows. POST-only, under
+  (`data-confirm`, the row's `entry_key`) on URL ✓/outdated/failed rows. POST-only, under
   `/ui/hosts/managed/source-check|source-check-dir|source-remove`, answered on
-  `?sub=models`; `hosts_source_remove` AWAITS `_remove_source` on the loop. The Models
+  `?sub=models`; `hosts_source_remove` AWAITS `_remove_source` on the loop. The banner is
+  a `?msg=` redirect (browser history, access log): `main.check_source` refuses a bad URL
+  with the FIXED `SRC_URL_REFUSED` (never the URL — its query may hold a token), and
+  `hosts_source_check` logs the path only, never the answer. The Models
   sub-tab is live (3 s) only while `pending`, never on a refusal (its URL is the POST).
   The host card's per-file sync rows carry `_card_src_badge` — the plan view's
   `source`/`origin` (hostctl `_plan_view` adds them from the url catalog the plan was

@@ -466,16 +466,26 @@ class ModelsTab(_Fixture):
         self.assertNotIn("<main data-live", page)
 
     def test_catalog_refusal_is_400_on_the_models_tab_and_saves_nothing(self):
-        # the tab's first read seeds the default catalog (as the editor always did) —
-        # what must not change is the catalog the refused Save found
-        self.get("/ui/server?sub=models")
+        # a catalog of its own (not the default): a refused Save that re-wrote the
+        # default, or anything else, would change it
+        store.set_settings({"modelsync_catalog": [{"match": {"alias": "mine"}, "paths": []}]})
         before = store.get_setting("modelsync_catalog")
-        self.assertIsNotNone(before)
         r = self.post("/ui/hosts/managed/catalog", {"catalog": '[{"x": <typed>}'}, status=400)
         self.assertRegex(r.text, r'class="on" aria-current="page" href="/ui/server\?sub=models"')
         self.assertIn("[{&quot;x&quot;: &lt;typed&gt;}", r.text)
         self.assertIn("not valid JSON", r.text)
         self.assertEqual(store.get_setting("modelsync_catalog"), before)
+
+    def test_a_view_never_seeds_the_catalog(self):
+        # rendering the tab (editor + overview) reads the catalog without writing it:
+        # a GET changes no state — the default is shown, and stored by the first Save
+        self.assertIsNone(store.get_setting("modelsync_catalog"))
+        m = self.main_of(self.get("/ui/server?sub=models"))
+        self.assertIn("Trellis2LoadModel", m)                     # the default, shown
+        self.assertIsNone(store.get_setting("modelsync_catalog"))
+        r = self.post("/ui/hosts/managed/catalog", {"catalog": "[{", "catalog_hash": ""},
+                      status=400)
+        self.assertIsNone(store.get_setting("modelsync_catalog"))   # a 400 re-render neither
 
     def test_modelsrc_host_save_and_refusal(self):
         r = self.post("/ui/hosts/managed/modelsrc-host", {"modelsrc_host": "src@10.0.0.2"})
@@ -651,8 +661,22 @@ class ModelSources(_Fixture):
         hf = row("hf-cache/hub/models--o--r/blobs/" + "ab" * 32)
         self.assertNotIn("source-remove", hf)
         self.assertNotIn("source-check", hf)
-        # a URL that failed this session: a new URL may be entered
-        self.assertIn("source-check", row("hf-cache/hub/models--o--f/blobs/" + "cd" * 32))
+        # a URL that failed this session: a new URL may be entered; an HF-auto one has
+        # nothing stored to remove
+        failed = row("hf-cache/hub/models--o--f/blobs/" + "cd" * 32)
+        self.assertIn("source-check", failed)
+        self.assertNotIn("source-remove", failed)
+
+    def test_a_failed_explicit_mirror_can_be_removed(self):
+        # review-4 M-7: an entry whose URL failed on an instance may be dropped right here
+        self.ov["fallback"]["models/vae/v.safetensors"] = "tc: HTTP 404 from the URL"
+        sec = self.section()
+        row = re.search(r'<tr data-k="msrc-f-models/vae/v.safetensors">(.*?)</tr>', sec,
+                        re.S).group(1)
+        self.assertIn(">URL failed this session — LAN<", row)
+        self.assertIn('title="tc: HTTP 404 from the URL"', row)          # names the host
+        self.assertIn("/ui/hosts/managed/source-remove?key=models%2Fvae%2Fv.safetensors", row)
+        self.assertIn("source-check", row)
 
     def test_filter_is_a_get_form(self):
         sec = self.section()
@@ -661,6 +685,7 @@ class ModelSources(_Fixture):
         self.assertIn('name="sub" value="models"', form)
         for c in ("lan", "outdated", "failed", "url", "hf"):
             self.assertIn(f'name="src" value="{c}" checked', form)
+        self.assertIn("none ticked = all", form)
         sec = self.section("/ui/server?sub=models&src=url&src=bogus")
         got = [html.unescape(p) for _t, p in self.order(sec)]
         self.assertEqual(got, ["models/vae/v.safetensors", "models/vae/s.safetensors"])
@@ -777,6 +802,36 @@ class CatalogStaleGuard(_Fixture):
         self.assertEqual(self.loc(r)[1]["sub"], "models")
         self.assertEqual(store.get_setting("modelsync_catalog")[0]["file"], "models/vae/b.st")
 
+    def test_the_stale_refusal_shows_the_stored_catalog_read_only(self):
+        _a, old, _b = self.form(self.get("/ui/server?sub=models"))
+        theirs = [{"file": "models/vae/<a>.st", "url": "https://mirror.example/a"}]
+        store.set_settings({"modelsync_catalog": theirs})
+        r = self.post("/ui/hosts/managed/catalog", {"catalog": "[]", "catalog_hash": old},
+                      status=400)
+        cur = re.search(r'<pre class="tlog" data-k="hosts-catalog-current"[^>]*>(.*?)</pre>',
+                        r.text, re.S)
+        self.assertIsNotNone(cur)
+        self.assertIn("models/vae/&lt;a&gt;.st", cur.group(1))
+        self.assertNotIn("<a>.st", r.text)
+        # it is not a second editor: outside the form, no field
+        f = re.search(r'action="/ui/hosts/managed/catalog".*?</form>', r.text, re.S).group(0)
+        self.assertNotIn("hosts-catalog-current", f)
+        # a validation refusal shows no such block
+        r = self.post("/ui/hosts/managed/catalog",
+                      {"catalog": "[{", "catalog_hash": main.modelsync_catalog_hash()},
+                      status=400)
+        self.assertNotIn("hosts-catalog-current", r.text)
+
+    def test_a_post_without_the_hash_is_stale(self):
+        # review-4 M-1: no form of this release lacks the field — a tab opened before
+        # the deploy or a script; refused, and handed the current hash to save with
+        r = self.post("/ui/hosts/managed/catalog", {"catalog": "[]"}, status=400)
+        self.assertIn("the catalog changed since this form was opened", r.text)
+        _a, h, _b = self.form(r.text)
+        self.assertEqual(h, main.modelsync_catalog_hash())
+        self.post("/ui/hosts/managed/catalog", {"catalog": "[]", "catalog_hash": h})
+        self.assertEqual(store.get_setting("modelsync_catalog"), [])
+
     def test_validation_refusal_keeps_the_hash_it_was_opened_with(self):
         _a, old, _b = self.form(self.get("/ui/server?sub=models"))
         store.set_settings({"modelsync_catalog": [{"file": "models/vae/a.st",
@@ -831,6 +886,19 @@ class ModelSourcesWiring(_Fixture):
         store.upsert("img", [{"backend": "cx", "task": "text2img", "workflow_json": {
             "1": {"class_type": "CheckpointLoaderSimple",
                   "inputs": {"ckpt_name": "w.safetensors"}}}}])
+
+    def test_a_refused_url_reaches_neither_the_redirect_nor_the_log(self):
+        # review-4 I-1: the banner is a ?msg= redirect (history, access log)
+        with self.assertLogs("admin", "INFO") as logs:
+            r = self.post("/ui/hosts/managed/source-check",
+                          {"path": "models/checkpoints/w.safetensors",
+                           "url": "http://mirror.example/w?token=SECRETabc"})
+        loc = r.headers["location"]
+        self.assertNotIn("SECRET", loc)
+        self.assertNotIn("SECRET", html.unescape(self.loc(r)[1]["msg"]))
+        self.assertIn("must start with https://", self.loc(r)[1]["msg"])
+        self.assertFalse([x for x in logs.output if "SECRET" in x], logs.output)
+        self.assertTrue([x for x in logs.output if "source check" in x])
 
     def test_a_needed_lan_file_renders_with_its_check_form(self):
         m = self.main_of(self.get("/ui/server?sub=models"))

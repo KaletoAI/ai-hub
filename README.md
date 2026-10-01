@@ -1631,7 +1631,9 @@ instance would get it:
 - **how to fill it**: enter a URL in a LAN-only (or outdated) row and press *Check &
   save*; for a `models/…` directory with several LAN-only files, name its Hugging Face
   repo (`org/name`) in the row's directory form instead — edit the directory first if
-  the repo's root sits higher. *remove* drops a stored source (it asks first). The
+  the repo's root sits higher. *remove* drops a stored source (it asks first) — also
+  one whose URL failed on an instance. A refused URL is answered with a fixed text,
+  never echoed (a URL may carry a token). The
   section follows a running check or share hash live (state, progress, refusal reason,
   the files a directory check left out) and is static otherwise. A share that has not
   been listed yet shows only catalog URLs — press *List now* above.
@@ -1655,7 +1657,9 @@ by hand):
 the third value of a directory row, Hugging Face's until the share's is known),
 `verified` what Check & save proved (`sha256` or `size`). The catalog editor refuses a
 Save when the catalog changed since it was opened (a Check & save meanwhile) — your
-text stays in the form to merge.
+text stays in the form, with the catalog as stored now shown read-only beside it to
+merge from. Viewing the tab never writes the catalog: until the first Save (or a
+host's first plan) the default is shown from memory.
 
 **LAN model source.** Files without a public URL come from a model share on the LAN,
 served read-only by the SSH forced command `ops/modelsrc-serve.sh` (verbs `list`,

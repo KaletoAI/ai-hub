@@ -1835,6 +1835,13 @@ class Controller:
     def _url_fallback_cause(self) -> dict:
         return self.state.url_fallback_cause
 
+    def url_fallback_view(self) -> dict:
+        """`{path: why}` of the URLs given up for the share's copy — no URL (a catalog URL
+        may carry a query token). Cheap and in memory: the Model sources overview reads it
+        per call instead of building the whole `view()`."""
+        return {p: str(self._url_fallback_why.get(p, "") or "")
+                for p in sorted(self._url_fallback)}
+
     def _drop_fallback(self, path: str) -> None:
         self._url_fallback.pop(path, None)
         self._url_fallback_why.pop(path, None)
@@ -2573,8 +2580,7 @@ class Controller:
                 "plan": self._plan_view(), "ready_aliases": sorted(self.ready_aliases),
                 # {path: why its URL was given up for the share's copy} — no URL (a
                 # catalog URL may carry a query token, the `_plan_view` rule)
-                "url_fallback": {p: self._url_fallback_why.get(p, "")
-                                 for p in sorted(self._url_fallback)},
+                "url_fallback": self.url_fallback_view(),
                 "sync_error": self._sync_error, "persist_blocked": self._persist_blocked,
                 "persist_error": self._persist_error,
                 "bootstrap_unknown": dict(s.bootstrap_unknown),

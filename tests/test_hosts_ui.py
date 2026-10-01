@@ -1146,7 +1146,8 @@ class CatalogWiring(unittest.TestCase):
         store.init(os.path.join(self.tmp.name, "store.db"))
 
     def test_bound(self):
-        self.assertIs(admin._modelsync_catalog, main._modelsync_catalog)
+        # views read the catalog without seeding it (a GET writes nothing)
+        self.assertIs(admin._modelsync_catalog, main._modelsync_catalog_view)
         self.assertIs(admin._save_modelsync_catalog, main.save_modelsync_catalog)
         # the card's actions go through main.host_action — the Thunder wrappers are gone
         self.assertIs(admin._host_action, main.host_action)

@@ -5203,6 +5203,8 @@ class UrlFallback(unittest.IsolatedAsyncioTestCase):
                         c.state.log[-8:])
         self.assertEqual(len(vm.started), 1)
         why = c.view()["url_fallback"][self.PATH]
+        # the overview's cheap accessor answers the same, without the whole view
+        self.assertEqual(c.url_fallback_view(), c.view()["url_fallback"])
         self.assertIn("size differs", why)
         self.assertIn("8 bytes", why)
         self.assertIn("10 bytes", why)

@@ -3891,8 +3891,10 @@ def _catalog_editor(refused: Optional[tuple] = None) -> str:
     shows) and a Save is refused while the stored one differs (R-3). The form sits under
     `data-live-skip`: the section is live while a check runs, and the morph must never
     swap that hidden hash under a kept, edited textarea."""
+    current = None
     if refused is not None:
-        text, errs, h = refused
+        text, errs, h = refused[:3]
+        current = refused[3] if len(refused) > 3 else None
         n = "?"
     else:
         try:
@@ -3926,7 +3928,13 @@ def _catalog_editor(refused: Optional[tuple] = None) -> str:
             "<code>hf-cache/</code>; a trailing <code>/</code> is a whole directory.</p>"
             + _textarea("catalog", text, rows=16)
             + f'<div class="tacts">{_btn("Save catalog", submit=True, sm=True)}</div>'
-            "</form><p class='hint' data-k=\"hosts-hfhint\">Gated Hugging Face files need the "
+            "</form>"
+            + ("" if current is None else
+               '<p class="hint" data-k="hosts-catalog-now">The catalog as stored NOW '
+               "(read-only) — merge its changes into your text above, then save:</p>"
+               f'<pre class="tlog" data-k="hosts-catalog-current" style="white-space:pre-wrap;'
+               f'max-height:320px;overflow:auto">{_esc(current)}</pre>')
+            + "<p class='hint' data-k=\"hosts-hfhint\">Gated Hugging Face files need the "
             "<b>Hugging Face token</b> — <a href='/ui/server?sub=keys'>Server → API Keys</a>.</p>"
             "</details>")
 
@@ -4451,9 +4459,10 @@ async def hosts_catalog_save(request: Request):
     typo'd key would otherwise be dropped silently and its alias stay blocked."""
     f = await _form(request)
     text = f.get("catalog", "")
-    # the hash the form was rendered with (R-3); a POST without the field (a script,
-    # not this form) is not judged — the form always carries it
-    h = f.get("catalog_hash")
+    # the hash the form was rendered with (R-3). A POST WITHOUT the field is no form of
+    # this release — a tab opened before the deploy, a hand-rolled script: judged as
+    # stale ("" never matches), and the 400 hands back the current hash
+    h = f.get("catalog_hash", "")
     try:
         cat = json.loads(text)
     except ValueError as e:
@@ -4466,10 +4475,17 @@ async def hosts_catalog_save(request: Request):
         except Exception as e:                          # noqa: BLE001 — refused, not a 500
             errs = [f"catalog not saved: {type(e).__name__}: {e}"]
     if errs:
+        current = None
         if _catalog_stale in errs:
             # the text stays as typed; the form now carries the CURRENT hash, so the
-            # merged text saves next time — and says when a check may write again
+            # merged text saves next time — and says when a check may write again —
+            # and the catalog as stored now is shown read-only beside it (M-2: "merge"
+            # needs the other side)
             h = _catalog_hash_of()
+            try:
+                current = json.dumps(_modelsync_catalog(), indent=1, ensure_ascii=False)
+            except Exception as e:                      # noqa: BLE001 — a courtesy view
+                logger.warning(f"ui: stored catalog unreadable: {type(e).__name__}")
             try:
                 busy = bool(_source_checks_pending())
             except Exception:                           # noqa: BLE001 — a note only
@@ -4477,7 +4493,8 @@ async def hosts_catalog_save(request: Request):
             if busy:
                 errs = errs + ["a Check & save is still running and may change the catalog "
                                "again — wait until Model sources shows it finished"]
-        return await _models_view(request, status=400, catalog_refused=(text, errs, h or ""))
+        return await _models_view(request, status=400,
+                                  catalog_refused=(text, errs, h or "", current))
     logger.info(f"ui: model-sync catalog saved ({len(cat)} entries)")
     return _models_msg(f"model-sync catalog saved ({len(cat)} entries)")
 
@@ -4505,7 +4522,8 @@ async def hosts_modelsrc_host(request: Request):
 async def hosts_source_check(request: Request):
     """Model sources: Check & save a public URL for one share file (main.check_source —
     queued, one check at a time; the section follows it live). The answer is the banner
-    on Server → Models; the URL itself is never logged (it may carry a token)."""
+    on Server → Models — main's fixed texts, never the URL (it may carry a token); the
+    log line names the path only."""
     f = await _form(request)
     path, url = (f.get("path") or "").strip(), (f.get("url") or "").strip()
     if _check_source is None:
@@ -4514,7 +4532,9 @@ async def hosts_source_check(request: Request):
         msg = str(await _check_source(path, url))
     except Exception as e:                              # noqa: BLE001 — say it, don't 500
         msg = f"not checked: {type(e).__name__}"
-    logger.info(f"ui: source check {path!r} → {msg}")
+    # never the answer: a typed URL may carry a token, and only main's FIXED texts may
+    # reach the banner — the log names the path alone
+    logger.info(f"ui: source check {path!r} requested")
     return _models_msg(msg)
 
 
@@ -10167,7 +10187,8 @@ def _model_sources_block(ov, show) -> str:
         for c, label in _MSRC_CATS)
     out.append('<form method="get" action="/ui/server" class="msrc-act" '
                f'data-k="{k}-filter"><input type="hidden" name="sub" value="models">'
-               f"{boxes}{_btn('Filter', kind='secondary', submit=True, sm=True)}</form>")
+               f"{boxes}{_btn('Filter', kind='secondary', submit=True, sm=True)}"
+               '<span class="msrc-note">none ticked = all</span></form>')
     # "repo for this directory": a models/… folder with several LAN-only files (or one
     # whose directory source predates a file) gets ONE directory form, on its first row
     lan_by_dir: dict = {}
@@ -10205,7 +10226,9 @@ def _model_sources_block(ov, show) -> str:
         if cat in ("lan", "outdated", "failed"):
             act += _msrc_check_form(path, (r.get("url") or "") if cat == "outdated" else "")
             act += _msrc_chip(checks.get(path))
-        if cat in ("url", "outdated"):
+        if cat in ("url", "outdated", "failed"):
+            # a failed explicit mirror may be dropped here too (an HF-auto row has no
+            # entry_key: nothing stored, nothing to remove)
             act += _msrc_remove(r)
         if cat == "lan":
             act += dir_forms.pop(_msrc_parent(path), "")
