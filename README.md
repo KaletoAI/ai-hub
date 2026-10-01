@@ -1270,7 +1270,8 @@ own autostart off). No new dependency — the system `ssh`, `ssh-keygen` and
   instance key `thunder.key` (ed25519, one per provider kind: `<kind>.key`) next to
   `store.db` on first need and hands the public half to every create — there is nothing
   to install on Thunder's side.
-- For ComfyUI models that have no public download URL: the **LAN model source** below.
+- For ComfyUI models that have no public download URL: the **LAN model source** below
+  (set up in **Server → Models** — one for the whole gateway, every host uses it).
 
 ### Creating a managed host
 
@@ -1408,7 +1409,7 @@ and **Re-run setup** (while the host runs and no operation is in flight).
   API token* (a missing one links to Server → API Keys) and an attached backend that can
   run, – for the optional *LAN model source*
   (only with a ComfyUI attached; needed only for model files no URL/catalog entry
-  provides). **Start** is rendered disabled, its first reason as tooltip and as a line
+  provides; while it is not usable the item links to Server → Models). **Start** is rendered disabled, its first reason as tooltip and as a line
   under the buttons, whenever the controller would refuse it; the refusal itself stays in
   the controller (one list — `start_blockers()` — feeds both the card and `start()`).
 - **Start** (asks first) is refused without the provider's API token ("no Thunder
@@ -1541,7 +1542,8 @@ candidates change (checked every 5 s), when the LAN source changes, and on *Sync
   `models for <alias> are blocked on <backend>: <reason>`. Meanwhile its schema, image
   slots and LoRA list read empty (the card notes it).
 
-**Catalog.** *Backends → Managed hosts → Model-sync catalog*:
+**Catalog.** *Server → Models → Model-sync catalog* (the Managed hosts section of the
+Backends tab only points there — it is the gateway's, not one host's):
 one JSON list for every managed host (store setting `modelsync_catalog`), validated as a
 whole on Save — a refused Save comes back with the text as typed and saves nothing.
 Entries:
@@ -1570,9 +1572,12 @@ else is refused). The
 share root is env `MODELSRC_ROOT` (set in the key's `command=`, see below); share
 path `<x>` is `models/<x>`, and the Hugging Face cache must be a **real directory**
 `hf-cache/` inside the share (a symlinked one makes `list` fail with exit 1 — it
-would otherwise silently lack the HF half of the share). The share host is set in `modelsrc_host` (field at the end of the LAN card). There is
+would otherwise silently lack the HF half of the share). The LAN card lives in **Server → Models** (one LAN source for every managed host of
+every provider; the Backends tab's Managed hosts section only points there, a host card's
+checklist links there, and so does the sync table's *waiting for LAN source* badge). The
+share host is set in `modelsrc_host` (field at the end of the LAN card). There is
 **no default**: while it is blank the LAN source is simply not configured (the card
-says *LAN model source not configured — enter the share host below*) and the gateway
+says *LAN model source not configured — enter the share host under Server → Models*) and the gateway
 never opens an ssh connection for it. **Upgrading from a build that had the
 `modelsrc@…` default:** enter the host explicitly — blank is now *not configured*, and
 aliases that need LAN files just wait (a pin left from the old default is ignored until
@@ -1704,14 +1709,14 @@ session cookie is marked `Secure`. Tabs:
 | Tab | What |
 |---|---|
 | **Dashboard** | live per-backend status (a down backend names its cause) + in-flight, a **backend faults · 24h** card, column and panel (see [Backend fault log](#backend-fault-log)), parked calls, media-job counts/recent, recent LLM calls |
-| **Backends** | add/edit/remove backends (LLM, ComfyUI, Meshy, Tripo), incl. the `paid` cost tier; the editor is split into **General** (name, type, url, host, cost tier, concurrency, credential — never shown again once stored: blank keeps it, *clear* removes it), **Models** (whitelist/blacklist, discovery filters, bare-id listing, context windows), **Behavior** (prompt-cache passthrough, sampling defaults, self-retries) and one tab named after the type (**ComfyUI** / **Cloud task API** / **Anthropic**); the **Hosts · GPU policy** panel below the list edits the per-box VRAM flags (see [Hosts & VRAM policy](#hosts--vram-policy)); the **Managed hosts** section below the list adds a rented GPU machine (the setup guide — step 1 links to **Server → API Keys** for the provider token — then **+ Managed host**: name, **Provider**, what to rent) and carries one lifecycle card per host (a what-Start-needs checklist, Start/Stop, *+ ComfyUI / + OpenAI-compatible service on this host*, costs, service table with Restart / Re-run setup, model sync, log), the LAN model source and the model-sync catalog (the Hugging Face token lives in Server → API Keys); a backend attaches through the **managed host** select in its General tab (see [Managed hosts](#managed-hosts-thunder-compute-runpod-later)) |
+| **Backends** | add/edit/remove backends (LLM, ComfyUI, Meshy, Tripo), incl. the `paid` cost tier; the editor is split into **General** (name, type, url, host, cost tier, concurrency, credential — never shown again once stored: blank keeps it, *clear* removes it), **Models** (whitelist/blacklist, discovery filters, bare-id listing, context windows), **Behavior** (prompt-cache passthrough, sampling defaults, self-retries) and one tab named after the type (**ComfyUI** / **Cloud task API** / **Anthropic**); the **Hosts · GPU policy** panel below the list edits the per-box VRAM flags (see [Hosts & VRAM policy](#hosts--vram-policy)); the **Managed hosts** section below the list adds a rented GPU machine (the setup guide — step 1 links to **Server → API Keys** for the provider token — then **+ Managed host**: name, **Provider**, what to rent) and carries one lifecycle card per host (a what-Start-needs checklist, Start/Stop, *+ ComfyUI / + OpenAI-compatible service on this host*, costs, service table with Restart / Re-run setup, model sync, log) — per-host things only: a line points to **Server → Models** for the LAN model source and the model-sync catalog; a backend attaches through the **managed host** select in its General tab (see [Managed hosts](#managed-hosts-thunder-compute-runpod-later)) |
 | **Input & Routing** | sub-tabs **Input** (what clients can call — chat aliases, generation models, endpoints), **LLM models**, **Image models**, **LoRAs** — all searchable |
 | **Aliases** | sub-tabs **Chat** and **Media** — the alias list on the left; with nothing picked the right column is the LIVE overview (chat: alias → backend · model · status + alias/model collisions; media: alias → backends, or pick a backend to see everything mapped onto it); pick an alias for its editor. Chat editor: per-alias `park_s`, reasoning/voice/sampling defaults, backends — plus that alias's live routes. Media editor: register a ComfyUI workflow, wire its node mapping, pin values (a cloud alias — Meshy, Tripo — needs no workflow: one schema-driven editor renders its endpoint + option defaults instead). Old `/ui/mapping?…` and `/ui/routing?sub=chat|gen` links redirect here. |
 | **Reasoning** | the normalized-thinking rule list (model glob × backend set → adapter) + test resolver |
 | **Playground** | one tab, sub-tabs **Chat** (default — chat completion through `/v1/chat/completions`), **Media** (generation via `POST /v1/generations` — image/video/audio, upload refs + mesh files, or an earlier job's artifact) and **Voice** (TTS via `POST /v1/audio/speech`, inline player + download) — all as **real API clients** (auth, routing, parking, stats all apply) |
 | **Jobs & Calls** | sub-tabs **LLM Calls** (per-call history with stored request/response bodies — LLM endpoints only), **Media Jobs** (list + detail of generation jobs, inputs + outputs, within TTL, plus the media requests that were refused before they became a job) and **Voice Calls** |
 | **Statistics** | **Backend faults · last 24h** (per backend + every message, bundled — shown even with stats off), then the call-stats dashboard (search, aggregates, drilldown) — empty until `stats.enabled: true` (the example config ships it `false`; set it in `config.yaml` or Server → Restart, then restart — the flag is read at startup only). The same switch feeds the LLM Calls list under Jobs & Calls. |
-| **Server** | sub-tabs **Runtime** (default — applied on Save: caps, park time/queue, `affinity_max_wait_s`, probe interval, scan ranges, flags), **Restart** (port, stats/jobs, TTL/prune — take effect on the next restart; a pending restart is badged on the Restart sub-tab from every sub-tab) and **API Keys** (every secret the server holds, each its own Save, never shown again — blank keeps it: the master API key, one API token per managed-host provider, the Hugging Face token; user keys live in Users). A number that does not parse (`1.5` in a whole-number field, `abc`) is refused with the form as typed — blank is the only "default" |
+| **Server** | sub-tabs **Runtime** (default — applied on Save: caps, park time/queue, `affinity_max_wait_s`, probe interval, scan ranges, flags), **Restart** (port, stats/jobs, TTL/prune — take effect on the next restart; a pending restart is badged on the Restart sub-tab from every sub-tab), **API Keys** (every secret the server holds, each its own Save, never shown again — blank keeps it: the master API key, one API token per managed-host provider, the Hugging Face token; user keys live in Users) and **Models** (what the model sync of every managed host reads: the LAN model source — share host, public key, install instructions, host-key pin, *List now* — and the model-sync catalog; each action comes back to this sub-tab with its answer, a refused Save with the value as typed). A number that does not parse (`1.5` in a whole-number field, `abc`) is refused with the form as typed — blank is the only "default" |
 | **Users** | multi-user keys, allow-lists, quotas, IP aliases |
 
 **Live views update in place — an update never reloads the page.** Anything that

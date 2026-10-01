@@ -525,7 +525,7 @@ via injected callables, staying hot-reload-safe.
   parent route, first child = default —
   Playground: Chat | Media | Voice, Jobs & Calls: LLM | Media | Voice,
   Aliases: Chat | Media, Input & Routing: Input | LLM models | Image models | LoRAs,
-  Server: Runtime | Restart | API Keys; `_subnav(parent, sub, marks)` appends raw HTML
+  Server: Runtime | Restart | API Keys | Models; `_subnav(parent, sub, marks)` appends raw HTML
   to a sub-tab's label — Server badges *Restart* `↻ restart` from every sub-tab while a
   restart-only value differs from what runs, so a pending restart is never hidden).
   **Server** (`_server_view`, one renderer for the page and every refused Save):
@@ -544,8 +544,23 @@ via injected callables, staying hot-reload-safe.
   numbers with `_int_field`/`_float_field` (`_SRV_MIN`: port and health interval ≥ 1) —
   "1.5"/"abc"/"-1" is a 400 with the form as typed, nothing stored; it used to become ""
   (= the default) silently; a POST without a valid `_form` is a 400 (read as the Restart
-  form it CLEARED every restart-only override). Every `/ui/server` link names the sub-tab that holds its
-  setting (`test_server_tabs.py`).
+  form it CLEARED every restart-only override). **Models** (`_srv_models_body`, since
+  2026-10-01 — the operator's question was whether the LAN source is Thunder-specific; it
+  is not): what the model sync of EVERY managed host of every provider reads — the ONE
+  LAN model source (`_modelsrc_block`) and the model-sync catalog (`_catalog_editor`),
+  moved unchanged from the Backends tab, whose Managed hosts section keeps per-host things
+  only and points here with one muted line (`_MHOST_MODELS`). Their routes STAYED under
+  `/ui/hosts/managed/` (`catalog`, `modelsrc-scan|pin|list|host` — bookmarks and scripts
+  keep working, nothing was removed); only the answers moved: `_models_msg` redirects to
+  `?sub=models&msg=…` (shown as a neutral hint there — a refusal like "host key not
+  fetched" must not get the ✓ banner), a refused catalog or share host is a 400 with
+  `_server_view(…, "models", catalog_refused=/modelsrc_refused=)` — that tab, as typed —
+  and the 405 page of a GET leads back there (`_ACTION_BACK` is checked by exact path
+  first). Static: every action redirects back with its answer (*List now* shows the
+  fresh listing). The card's checklist item `key: "lan"` and the sync table's *waiting
+  for LAN source* badge link to it (`_CHECK_LINKS`), and `hostctl.SRC_UNSET` says
+  "enter the share host under Server → Models". Every `/ui/server` link names the
+  sub-tab that holds its setting (`test_server_tabs.py`).
   **Aliases** (`/ui/aliases`, formerly "Mapping") joins what used to be two tabs: the
   alias list + editors, and the live alias→route overviews that were Input & Routing's
   Chat/Media-aliases sub-tabs. With nothing picked the right column IS the overview
@@ -1154,7 +1169,10 @@ via injected callables, staying hot-reload-safe.
   disabled at `off`, a DETACH that never disables (R-K2) and a move H1 → H2 H1 never
   touches, a forward added on the running master without a respawn (a respawn cuts the
   other service's stream), a failed forward downing only its service, a list changed
-  mid-stop waiting until `off`, the bootstrap split — a vLLM-only host gets `base` and
+  mid-stop waiting until `off` — and the stop's OWN disable (the drain finalize coming
+  back through main's rebuild) being no change at all: no "while stopping"/"now applied"
+  line, no second disable at `off`, nothing deferred once the phase is `off`
+  (`StopServiceEvents`, the journal of thunder-1's first stop) — the bootstrap split — a vLLM-only host gets `base` and
   the host bootstrap only, a ComfyUI attached later is bootstrapped from a no-ComfyUI
   snapshot — the setup hash per disk (same script → no setup, changed → setup + restart,
   a template re-runs it), a failed setup downing only that service while the host stays
@@ -1205,8 +1223,11 @@ via injected callables, staying hot-reload-safe.
   look complete while every HF loader re-downloads);
   `test_hosts_ui.py` (the console half: the provider-token and HF-token rows — now on
   Server → API Keys — never rendered, blank keeping and the box clearing it, POST-only,
-  gone from the Backends tab, and the section, guide (step 1 linking to the keys tab)
-  and LAN block there with no host at all, the checklist's missing token linking there; the host form without a token field, its "AI-Hub rents the
+  gone from the Backends tab, and the section and guide (step 1 linking to the keys tab)
+  there with no host at all, the checklist's missing token linking there; the LAN block
+  and the catalog on Server → Models (also with no host), gone from the Backends tab
+  (one pointer line), every one of their actions answering there — redirect, 400 as typed,
+  the 405 page's way back — and the checklist's unusable LAN source linking there; the host form without a token field, its "AI-Hub rents the
   machine itself" intro, "What to rent at Start" and the suggested name; the card's
   checklist, a disabled Start naming the controller's first blocker, the `+ … on this
   host` links and the backend form they open, foreign instances named as hand-made; its
@@ -1225,14 +1246,15 @@ via injected callables, staying hot-reload-safe.
   hold; a refused catalog saving nothing; a pin only for the fingerprint the operator
   saw; the install command giving the share user a real shell; the 24 h banner on card
   and Dashboard; unowned snapshots listed, never deleted).
-  `test_server_tabs.py` (the Server tab's Runtime | Restart | API Keys: a form on the
+  `test_server_tabs.py` (the Server tab's Runtime | Restart | API Keys | Models: a form on the
   wrong sub-tab or a Save that lands on another one reads as a setting that "did not
   save", and a pending restart shown only on Restart is never seen from Runtime; an
   API-Keys row that renders its value, clears on blank or touches another row's key
   locks clients out or 401s every provider call; a master key saved there must still
   end the old key's console sessions; a "Server" link that opens the default sub-tab
-  sends the operator looking for a field that is not there; and "1.5"/"abc" in a number
-  field became "" = the default without a word).
+  sends the operator looking for a field that is not there; "1.5"/"abc" in a number
+  field became "" = the default without a word; and a LAN-source or catalog action that
+  still answered on the Backends tab showed its result where the block no longer is).
   Run them all with `python -m unittest discover -s tests -t .` (no runner dependency).
 - **`openai_image_bridge.py`** — pure request/response plumbing for the OpenAI
   image shims (`multipart_list`, `parse_size`, `coerce_scalar`, `images_uploads`
@@ -1551,7 +1573,14 @@ via injected callables, staying hot-reload-safe.
   the services attached AT THAT MOMENT. A service list handed over during a stop (Ruling
   M4 a) is kept in `_pending_services` — the drain's list stands, nothing attaches into a
   stopping host — and applied at `off` BEFORE the disable (so a backend moved away
-  meanwhile is left alone). A backend that list no longer names also LEAVES the drain at
+  meanwhile is left alone). A list that differs only in `enabled` (`_same_services`, which
+  ignores `enabled` and `_`-keys) is NO change: it is the stop's own drain finalize coming
+  back through main's rebuild — its fresh dicts are kept, nothing goes pending, nothing is
+  logged; once the phase is `off` a list applies at once even while the op is still
+  "stopping"; and `off`'s `_disable()` skips a service whose CURRENT dict is already
+  disabled (the drain did it — thunder-1's first stop disabled it twice and logged "services
+  changed" four times; an explicit list, a failed start undoing its enable, is always
+  disabled). A backend that list no longer names also LEAVES the drain at
   the next poll (`_leave_moved`: `deps.cancel_drain`, no longer waited on) — left in it,
   routing skipped it on its new host — and main's `_finalize_drain` disables only a
   backend still on the host it named when its drain began (`_drain_host`), so a last H1
@@ -1591,7 +1620,7 @@ via injected callables, staying hot-reload-safe.
   `modelsrc-known_hosts` with `StrictHostKeyChecking=yes` — pinned only by a POST
   carrying the fingerprint `scan()` showed; `modelsrc_host` held to `_VOICE_HOST_RE`
   before any argv and WITHOUT a default — blank is `hostctl.SRC_UNSET` ("LAN model
-  source not configured — enter the share host below") and never reaches ssh (a
+  source not configured — enter the share host under Server → Models") and never reaches ssh (a
   baked-in LAN address sent operators to create a user on a hypervisor; a leftover pin
   next to a blank or non-plain host is pinned for NOBODY — `_pinned` needs a plain host —
   so the card shows the install text, not "pinned · List now"); a pin for a
@@ -1701,7 +1730,9 @@ via injected callables, staying hot-reload-safe.
   present = the destination holds the file at the SOURCE's size (the manifest's where the
   source does not list it), a `.part` never; `prune` = manifest files only (never a file
   we did not put there), applied only at stop; `unknown` = everything else nobody needs,
-  listed, deleted only by the operator (`delete_unknown`, judged against a FRESH plan) —
+  listed, deleted only by the operator (`delete_unknown`, judged against a FRESH plan;
+  the deleted paths also leave the persisted template report `bootstrap_unknown`, or the
+  card's "Models the template brought along" kept naming files that are gone) —
   minus what ComfyUI ships itself (`_comfy_stock`: `put_*_here` placeholders, empty
   files, stock `models/configs/*.yaml` under 1 MB), which buried a template's one real
   model among 36 of them;
@@ -1761,7 +1792,8 @@ via injected callables, staying hot-reload-safe.
   is ALWAYS rendered (token → host is the setup order): the 4-step guide
   (`_MHOST_GUIDE`, step 1 a link to `/ui/server?sub=keys` — the provider tokens and the
   HF token live in Server → API Keys since 2026-10-01, see the admin.py paragraph),
-  "+ Managed host", the cards, then the LAN block and the catalog even with no host. The host form opens with "AI-Hub rents the machine itself …
+  the pointer line to Server → Models (`_MHOST_MODELS` — the LAN block and the catalog
+  live there since 2026-10-01, see the admin.py paragraph), "+ Managed host", the cards. The host form opens with "AI-Hub rents the machine itself …
   Do not create an instance in the <NAME> console", pre-fills a new host's name from
   `main.suggest_host_name` (hint: a label inside AI-Hub only) and puts the options under a
   "What to rent at Start" heading; `managed_host_save` hands the typed options to
@@ -1775,8 +1807,9 @@ via injected callables, staying hot-reload-safe.
   `_svc_table` — backend, type, `VM :<remote> → local :<local>`, status, error, and
   Restart / Re-run setup carrying the BACKEND id, rendered only while the host runs
   with no op, mirroring the controller's refusals — `not_attachable` lines, the model
-  sync, the log ring); while startable, the `checklist` (✓ / ✗ / – optional) above the
-  service table, two GET links `+ ComfyUI on this host` (no ComfyUI attached yet) /
+  sync, the log ring); while startable, the `checklist` (✓ / ✗ / – optional; a missing
+  item with a `key` links to where it is set up — `_CHECK_LINKS`: token → Server → API
+  Keys, lan → Server → Models) above the service table, two GET links `+ ComfyUI on this host` (no ComfyUI attached yet) /
   `+ OpenAI-compatible service on this host` → `/ui/backends?new=1&type=…&host=<_q>`,
   which `_host_prefill` turns into the new-backend prefill (host selected so the
   `data-mhost` fieldset renders visible and `url` readonly server-side, the profile's
@@ -1787,10 +1820,10 @@ via injected callables, staying hot-reload-safe.
   you created it by hand, delete it in the <NAME> console" (no button); Start hidden for
   an undriven host, Delete only when
   `managed_host_delete_refusal` is None (else a hint naming why); then the orphaned
-  snapshots, the LAN card (public key, install instructions — VM variant first — the
-  Fetch → Confirm pin, *List now* and the last listing's counts and age) and the
-  catalog editor (with a hint linking to the HF token in Server → API Keys; `hf_token`
-  in `store._SECRET_SETTINGS`). `_hosts_panel`
+  snapshots. On Server → Models: the LAN card (public key, install instructions — VM
+  variant first — the Fetch → Confirm pin, *List now* and the last listing's counts and
+  age) and the catalog editor (with a hint linking to the HF token in Server → API Keys;
+  `hf_token` in `store._SECRET_SETTINGS`). `_hosts_panel`
   lists EVERY managed host (also one without ComfyUI or without any backend), and
   `_dash_hosts` puts the long-run banner on the Dashboard. The backend form attaches: a
   `host_managed` select ("(none / free text)" + every store managed host) beside the
@@ -1810,8 +1843,9 @@ via injected callables, staying hot-reload-safe.
   127.0.0.1 port nothing forwards looks healthy-ish and is dead); `svc_*` stay on an
   `openai` row (a detach does not throw away a script). Every action is a POST in
   `_POST_ACTIONS` (`save, delete, start, stop, forget, restart-service, resetup, sync,
-  delete-unknown, catalog, modelsrc-scan, modelsrc-pin, modelsrc-list, modelsrc-host`;
-  the tokens' `/ui/server/provider-token` and `/ui/server/hf-token` likewise),
+  delete-unknown, catalog, modelsrc-scan, modelsrc-pin, modelsrc-list, modelsrc-host` —
+  the last five answer on Server → Models; the tokens' `/ui/server/provider-token` and
+  `/ui/server/hf-token` likewise),
   Start/Stop/Forget/Delete with `data-confirm`; the Backends tab is live (3 s) while a
   host phase ≠ `off` or an op runs, static for the forms and refusals; `_FAULT_SOURCE`
   labels `lifecycle` "host lifecycle" and `sync` "model sync". The key files
