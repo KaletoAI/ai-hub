@@ -1119,7 +1119,8 @@ via injected callables, staying hot-reload-safe.
   frees the lock, a restart runs a REWRITTEN wrapper);
   `test_hostctl.py` (the controller against a stubbed
   provider API and a fake ssh — the biggest file, because every mistake here bills or
-  deletes: the uuid persisted before the first wait, a mutating call only on an item
+  deletes: `start_blockers()` naming exactly what `start()` raises, case by case, with
+  no provider call; the uuid persisted before the first wait, a mutating call only on an item
   found by uuid in a FRESH list (never a stored, reusable index), `off` only after two
   lists without the instance, the port guard before `bootstrapping`/`starting` and
   before an attach, `GW:NODE_FAIL` read by tag, a stop aborting a start, the stop order
@@ -1139,7 +1140,11 @@ via injected callables, staying hot-reload-safe.
   `ready`, admin text on stdin only across every path, host faults on the pseudo
   backend, snapshots named after the HOST, and main's wiring incl. the deploy excludes);
   `test_managed_hosts.py` (the store and main half: a token put into `set_settings` as
-  part of a dict is stored in PLAINTEXT and every `get_settings()` reader sees it (R-W10);
+  part of a dict is stored in PLAINTEXT and every `get_settings()` reader sees it (R-W10)
+  — the provider token encrypted, absent from `get_settings()`, reaching running
+  controllers on Save, and migrated once from the per-host tokens (first readable,
+  never over a set one, every copy stripped, idempotent); the name suggestion following
+  the Save's own R-W6 rules;
   a host whose entry is gone while its instance runs must keep its controller, and one
   with an unknown provider must be shown but never driven — nor take the rebuild down;
   a config backend naming a managed host must not be attached (R-K3); a `local_port`
@@ -1177,8 +1182,13 @@ via injected callables, staying hot-reload-safe.
   `hf-cache/token` leaks the HF credential, a `;id` that reaches a shell is remote code
   execution, and a `list` that drops the HF cache's snapshot links makes a synced cache
   look complete while every HF loader re-downloads);
-  `test_hosts_ui.py` (the console half: the host form's token
-  never rendered, blank keeping and the box clearing it; its options taken from the
+  `test_hosts_ui.py` (the console half: the provider-token row never rendered, blank
+  keeping and the box clearing it, POST-only, and the section, guide and LAN block there
+  with no host at all; the host form without a token field, its "AI-Hub rents the
+  machine itself" intro, "What to rent at Start" and the suggested name; the card's
+  checklist, a disabled Start naming the controller's first blocker, the `+ … on this
+  host` links and the backend form they open, foreign instances named as hand-made; its
+  options taken from the
   provider's OWN `OPTION_FIELDS` — a hand-kept copy offers a GPU the provider refuses at
   the start — and a refused Save a 400 with the form as typed and nothing stored; a new
   name colliding with a Hosts-map key or a backend's host (an URL hostname included) —
@@ -1231,8 +1241,9 @@ via injected callables, staying hot-reload-safe.
 - **Managed hosts** (spec `docs/superpowers/specs/2026-09-29-managed-hosts-design.md` on
   top of `2026-09-27-thunder-comfyui-design.md`, both local only; the rulings R-K*/R-W*
   and the ledger's M1–M5 are cited below). The MACHINE is its own level: a *managed
-  host* (store setting `managed_hosts` = `{name: {provider, options, api_key}}`) carries a
-  **provider** (Thunder Compute today, RunPod later), and ANY backend attaches
+  host* (store setting `managed_hosts` = `{name: {provider, options}}`) carries a
+  **provider** (Thunder Compute today, RunPod later) — whose API token is stored ONCE per
+  provider (`provider_token_<kind>`, below), not per host — and ANY backend attaches
   to it by naming it as its `host` — a VM can carry several services (one ComfyUI plus
   vLLM/llama-swap …). Six modules share the work: `thunder.py` (the provider's pure
   half), `hostapi.py` (its HTTP half + the registry), `services.py` (what runs a backend
@@ -1422,9 +1433,16 @@ via injected callables, staying hot-reload-safe.
   any odd 2xx body as `[]`, and one bad answer must not make the controller forget (and
   stop deleting) what bills; one that stays is `failed(deleting)`, and only a
   confirmed-gone instance clears the ids and `started_at` (the session cost stops there).
-  **Start** (`start()`): refused before any call without a token (`no <NAME> API token
-  set …`), without a service, or with none that can run; the commit is checked only
-  with a ComfyUI service → enable EVERY runnable service (`_enable`; one failing =
+  **Start** (`start()`): refused before any call — it raises the FIRST item of
+  `start_blockers()`, the pure list (memory only, no provider call) the card disables its
+  Start button from, so the two cannot disagree: the state not loaded, an op in flight,
+  a phase that is not startable, no service, none that can run (the per-service causes),
+  a bad commit (only with a ComfyUI service), no token (`no <NAME> API token set — enter
+  it under Managed hosts → <NAME> API token`); the unreconciled uuids are NOT in it (they
+  are judged by a fresh list inside the op). `checklist()` → `[{ok, text, required}]`
+  (token, a runnable attached backend, and — with a ComfyUI service — the optional LAN
+  source) is NOT part of `view()`: the LAN check reads the store and `view()` runs every
+  few seconds for the Dashboard; main's `host_view` adds both → enable EVERY runnable service (`_enable`; one failing =
   `_PreCreate`, the ones already enabled are disabled again) → newest READY snapshot of
   this host, else the template (`bootstrap_template`, "" = auto, M5) → `choose_disk_gb`
   (from the manifest copy stored for THAT snapshot id) → create → poll (15 min + 8 min
@@ -1575,11 +1593,27 @@ via injected callables, staying hot-reload-safe.
   retained controller, no key of the `hosts` map, no backend's `backend_host()` (a URL
   hostname without a dot counts: `http://gpu-a:8188` is host `gpu-a`) — or two boxes would
   share one host policy; the provider known and never changed; `options_of` clean.
-  `save_managed_host` stores the NORMALIZED options; the token is written by
-  `store.set_managed_host` with `encrypt_secret` and read by `get_managed_hosts` with
-  `decrypt_secret` (R-W10: `set_settings` only encrypts STRING values, so a dict holding
-  a token would sit in plaintext, and every raw `get_settings()` reader would see it);
-  views, summaries and `/health` carry `api_key_set` only. `delete_managed_host` (and
+  `save_managed_host` stores the NORMALIZED options and `{provider, options}` only.
+  **The API token is the PROVIDER's** (operator test 2026-09-30: a provider shows its
+  token once, and a per-host field made the operator paste it into every host): one
+  STRING setting per kind, `provider_token_<kind>`, which `store._is_secret` treats as a
+  secret (encrypted by `set_settings`, R-W10) and `store.get_settings()` OMITS (the Server
+  tab and the startup overlay never see it) — read/written only by
+  `store.get_provider_token`/`set_provider_token` ("" deletes the row) and
+  `main.provider_token`/`save_provider_token(kind, token)` (unknown provider or a token
+  with whitespace/control characters refused, then `apply_managed_hosts()` so running
+  controllers get it at once). `sync_host_controllers` hands each controller
+  `dict(entry, api_key=<its provider's token>)` — hostctl still reads `host["api_key"]`
+  — and redacts that token from a constructor's error. `store.set_managed_host` DROPS an
+  `api_key`; `get_managed_hosts` still decrypts a legacy one for
+  `main.migrate_provider_tokens()` (lifespan, idempotent): a provider without a token takes
+  the first READABLE per-host token (by host name), never overwriting one, then every
+  entry loses its copy; one log line, never the token. Views, summaries and `/health`
+  carry `api_key_set` (the provider's token set?) and `provider_tokens_info()` `{kind:
+  bool}` only. `suggest_host_name(kind)` → the first `<kind>-<n>` that
+  `_host_name_refusal` (the name rule + R-W6, shared with `managed_host_refusal`)
+  accepts — the new-host form's pre-filled name. `host_view` of a driven host carries
+  `start_blockers` and `checklist`. `delete_managed_host` (and
   `managed_host_delete_refusal`, which the card asks) refuses unless the host is `off`,
   no op, no pending snapshot, **no backend names it** (it would point at a dead forward
   and keep the name taken via R-W6), and — without a controller — the stored record is
@@ -1673,18 +1707,36 @@ via injected callables, staying hot-reload-safe.
   from `hostapi.PROVIDERS`, then the provider's OWN `OPTION_FIELDS` as `opt__<key>` — a
   hand-kept copy drifts, which is exactly how the old `_THUNDER_*` constants had to be
   pinned by a test; a new Thunder host's nodes pre-filled from the default list; an
-  existing host has no name field and a fixed provider; the token a password field
-  never rendered, blank keeps, `api_key_clear` clears); `managed_host_save` hands the
-  typed options to `main.save_managed_host` and answers a refusal with 400 + the form
-  as typed (never the token) — also a blank token when the stored entry could not be
-  READ ("blank keeps" would otherwise store an empty token). One keyed card per host (`_host_card`, `data-k=
+  existing host has no name field and a fixed provider; NO token field). The section
+  is ALWAYS rendered (token → host is the setup order): the 4-step guide
+  (`_MHOST_GUIDE`), one `<NAME> API token` row per provider (`_provider_token_rows`,
+  `data-k="hosts-ptoken-<kind>"`: set/not-set badge, a password input never pre-filled,
+  `api_key_clear`; POST `/ui/hosts/managed/provider-token` → `hosts_provider_token`,
+  blank keeps, a typed value wins over the box, unknown provider / refused value → 400
+  `notice`, never the value), "+ Managed host", the cards, then the LAN block and the
+  catalog even with no host. The host form opens with "AI-Hub rents the machine itself …
+  Do not create an instance in the <NAME> console", pre-fills a new host's name from
+  `main.suggest_host_name` (hint: a label inside AI-Hub only) and puts the options under a
+  "What to rent at Start" heading; `managed_host_save` hands the typed options to
+  `main.save_managed_host` and answers a refusal with 400 + the form as typed. One keyed
+  card per host (`_host_card`, `data-k=
   "host-<name>"`: provider + phase badges, the 24 h banner, errors, `tunnel_error`,
   per-service drain lines, GPU/vCPU from `options`, costs, snapshot, bootstrap notes,
   unreconciled uuids, orphans, template models/nodes, the **service table**
   `_svc_table` — backend, type, `VM :<remote> → local :<local>`, status, error, and
   Restart / Re-run setup carrying the BACKEND id, rendered only while the host runs
   with no op, mirroring the controller's refusals — `not_attachable` lines, the model
-  sync, the log ring), Start hidden for an undriven host, Delete only when
+  sync, the log ring); while startable, the `checklist` (✓ / ✗ / – optional) above the
+  service table, two GET links `+ ComfyUI on this host` (no ComfyUI attached yet) /
+  `+ OpenAI-compatible service on this host` → `/ui/backends?new=1&type=…&host=<_q>`,
+  which `_host_prefill` turns into the new-backend prefill (host selected so the
+  `data-mhost` fieldset renders visible and `url` readonly server-side, the profile's
+  remote port, the first free `<host>-comfy`/`<host>-llm` over every backend name; an
+  unknown host or type = the plain form); Start rendered `disabled` with the first
+  `start_blockers` item as title plus a `-startwhy` line — cosmetic, the handler and
+  `start()` still refuse; foreign instances say "not managed by AI-Hub — billing $/h; if
+  you created it by hand, delete it in the <NAME> console" (no button); Start hidden for
+  an undriven host, Delete only when
   `managed_host_delete_refusal` is None (else a hint naming why); then the orphaned
   snapshots, the LAN card (public key, install instructions — VM variant first — the
   Fetch → Confirm pin, *List now* and the last listing's counts and age) and the
@@ -1708,8 +1760,8 @@ via injected callables, staying hot-reload-safe.
   127.0.0.1 port nothing forwards looks healthy-ish and is dead); `svc_*` stay on an
   `openai` row (a detach does not throw away a script). Every action is a POST in
   `_POST_ACTIONS` (`save, delete, start, stop, forget, restart-service, resetup, sync,
-  delete-unknown, catalog, hf-token, modelsrc-scan, modelsrc-pin, modelsrc-list,
-  modelsrc-host`),
+  delete-unknown, catalog, hf-token, provider-token, modelsrc-scan, modelsrc-pin,
+  modelsrc-list, modelsrc-host`),
   Start/Stop/Forget/Delete with `data-confirm`; the Backends tab is live (3 s) while a
   host phase ≠ `off` or an op runs, static for the forms and refusals; `_FAULT_SOURCE`
   labels `lifecycle` "host lifecycle" and `sync` "model sync". The key files

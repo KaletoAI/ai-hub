@@ -1202,7 +1202,8 @@ paying for it around the clock. The machine and what runs on it are two levels:
 
 - the **host** carries the **provider** — the company whose API creates, snapshots and
   deletes the machine (today **Thunder Compute**, <https://www.thundercompute.com>;
-  RunPod is planned and plugs into the same seam), its options and the API token;
+  RunPod is planned and plugs into the same seam) — and its options (what to rent);
+  the provider's **API token** is entered once per provider, not per host;
 - **backends attach to it** by naming it as their `host`. The backend keeps its own
   type: a `comfyui` backend is set up, started and model-synced fully automatically; an
   `openai` backend (vLLM, llama-swap, any OpenAI-compatible server) brings a **setup
@@ -1220,6 +1221,24 @@ For every attached backend the gateway then:
 - for ComfyUI, copies onto the machine **exactly the model files** the aliases that name
   this backend need — every GB on that disk bills, running or snapshotted.
 
+**Setting one up — four steps** (the order the *Managed hosts* section shows on top):
+
+1. **Enter the provider's API token** — the *Thunder Compute API token* row at the top of
+   the section. Once per provider: every host of that provider uses it.
+2. **+ Managed host** — what to rent (GPU, vCPUs, …). The name is pre-filled
+   (`thunder-1`, `thunder-2`, …) and is a label inside AI-Hub only.
+3. **Add a backend on the host's card** — *+ ComfyUI on this host* /
+   *+ OpenAI-compatible service on this host* open the backend form with the host
+   selected, the port and a name filled in.
+4. **Start** — the card's checklist says what is still missing; Start stays disabled,
+   naming the reason, until nothing is.
+
+**Never create the instance in the provider's console.** AI-Hub rents the machine
+itself: Start creates the instance (with AI-Hub's ssh key), Stop takes a snapshot and
+deletes it. An instance made by hand in the Thunder console cannot be reached by AI-Hub
+(no ssh key) and bills on its own — the card lists it as *not managed by AI-Hub* with
+its $/h; delete it in the Thunder console.
+
 **Why SSH only.** Thunder's own port forwarding (`https://<uuid>-<port>.thundercompute.net`)
 is public **without authentication** — ComfyUI behind it is code execution (the Manager)
 and file read (`/view`) for anyone who finds the URL, and an LLM server is free compute
@@ -1232,9 +1251,14 @@ own autostart off). No new dependency — the system `ssh`, `ssh-keygen` and
 
 **Prerequisites.**
 
-- A Thunder Compute account and an **API token** (Thunder console → API tokens). It goes
-  into the host's **API token** field — stored encrypted, never rendered back, never sent
-  to a service, never in `/health`.
+- A Thunder Compute account and an **API token** (Thunder console → API tokens; Thunder
+  shows it only once). It goes into the **Thunder Compute API token** row at the top of
+  *Managed hosts* — **one token per provider**, used by every host of that provider;
+  stored encrypted (store setting `provider_token_thunder`), never rendered back (the row
+  says *set* / *not set*), never sent to a service, never in `/health`. Blank keeps it,
+  *clear* removes it, and a Save reaches running hosts at once. A store from before
+  this change is migrated at startup: the first readable per-host token becomes the
+  provider token (unless one is set), and every per-host copy is removed.
 - `ssh` / `ssh-keygen` / `ssh-keyscan` on the gateway host. The gateway generates its
   instance key `thunder.key` (ed25519, one per provider kind: `<kind>.key`) next to
   `store.db` on first need and hands the public half to every create — there is nothing
@@ -1243,9 +1267,13 @@ own autostart off). No new dependency — the system `ssh`, `ssh-keygen` and
 
 ### Creating a managed host
 
-*Backends* tab → **Managed hosts** (below the backend list) → **+ Managed host**:
+*Backends* tab → **Managed hosts** (below the backend list) → **+ Managed host**. The form
+opens by saying what happens: Start creates the instance at the provider, Stop
+snapshots and deletes it — do not create one in the provider's console.
 
-- **name** — `a-z`, `0-9` and `-`. It is the host's identity: its snapshots
+- **name** — pre-filled with the first free `<provider>-<n>` (`thunder-1`, …); a label
+  inside AI-Hub only (you never enter it at the provider). `a-z`, `0-9` and `-`. It is
+  the host's identity: its snapshots
   (`aihub-<name>-<stamp>`), its state record and its tunnel socket are named after it, so
   it **cannot be renamed**. A name that is already a managed host, a key of the
   *Hosts · GPU policy* table, or the host any backend derives today (from its `host`
@@ -1253,7 +1281,7 @@ own autostart off). No new dependency — the system `ssh`, `ssh-keygen` and
   would share one host policy.
 - **Provider** — today only *Thunder Compute*. Fixed once saved: the
   host's state and snapshots belong to it.
-- the provider's **options** (Thunder):
+- **What to rent at Start** — the provider's **options** (Thunder):
 
   | Field | Default | What |
   |---|---|---|
@@ -1265,19 +1293,20 @@ own autostart off). No new dependency — the system `ssh`, `ssh-keygen` and
   | ComfyUI commit | `1d61dcc3…` | the full 40-hex sha the ComfyUI bootstrap pins ComfyUI to |
   | custom nodes | `ops/thunder-nodes.default.txt` | one pack per line: `<git-url>@<commit>` or `registry:<id>@<version>`; `#` comments allowed; empty = the default list (a new host's field is pre-filled with it) |
 
-- **API token** — blank keeps the stored one, *clear* removes it. Without it the host
-  cannot be started.
-
 An invalid value (a GPU the provider does not know, `1.5` vCPUs, a commit that is no
 full sha) is refused on Save — a `400` with the form as typed, nothing stored — before
 anything can bill. The host's label and GPU flags live in its row of
 *Hosts · GPU policy*, like any other box; the attached backends group under the host's
-name there. Managed hosts are console-only (store setting `managed_hosts`, the token
-encrypted).
+name there. Managed hosts are console-only (store setting `managed_hosts`; the token is
+the provider's, see Prerequisites).
 
 ### Attaching backends
 
-In the backend form (*Backends → Add/Edit*, General tab) choose the host in
+From the host's card: **+ ComfyUI on this host** (shown while no ComfyUI is attached —
+one per host) or **+ OpenAI-compatible service on this host** open the new-backend form
+with the type set, the host selected, the remote port at the type's default and a free
+name (`<host>-comfy` / `<host>-llm`, then `-2`, `-3` …). Or, in any backend form
+(*Backends → Add/Edit*, General tab), choose the host in
 **managed host** (the free-text **host** field is for ordinary boxes: pick
 *(none / free text)* to use it). A **Service on the managed host** block appears:
 
@@ -1369,8 +1398,15 @@ per attached backend with its type, `VM :<remote> → local :<local>`, status
 warning, and per service **Restart**
 and **Re-run setup** (while the host runs and no operation is in flight).
 
-- **Start** (asks first) is refused without an API token ("no Thunder Compute API token
-  set …"), without an attached backend, or when no attached backend can run — before any
+- While the host is off, the card shows a **checklist** — ✓ / ✗ for the *Thunder Compute
+  API token* and an attached backend that can run, – for the optional *LAN model source*
+  (only with a ComfyUI attached; needed only for model files no URL/catalog entry
+  provides). **Start** is rendered disabled, its first reason as tooltip and as a line
+  under the buttons, whenever the controller would refuse it; the refusal itself stays in
+  the controller (one list — `start_blockers()` — feeds both the card and `start()`).
+- **Start** (asks first) is refused without the provider's API token ("no Thunder
+  Compute API token set — enter it under Managed hosts → Thunder Compute API token"),
+  without an attached backend, or when no attached backend can run — before any
   API call; the host stays `off`. Otherwise it enables every attached backend that can run, then
   creates an instance from the host's **newest READY snapshot**
   (`aihub-<host name>-<YYYYmmdd>t<HHMMSS>z`, all lowercase). With none yet, the **first
@@ -1584,7 +1620,8 @@ session total so far, and the snapshot (size, **$/month** while off). Snapshots 
 account's instance list are re-read every 10 minutes, the price list hourly.
 An instance up for more than **24 h** puts a banner on its card **and** on the
 Dashboard. Instances in the account that no managed host owns are listed on the card
-with their $/h, and `aihub-…` snapshots no host owns (a deleted host leaves them behind)
+with their $/h — *not managed by AI-Hub; if you created it by hand, delete it in the
+Thunder Compute console* — and `aihub-…` snapshots no host owns (a deleted host leaves them behind)
 with their $/month — **neither is ever deleted automatically**.
 `/health` (full view) carries
 `hosts_managed: {<host>: {provider, phase, uptime_s, cost_per_h, services: {<backend id>: <status>}}}`
@@ -1646,7 +1683,7 @@ session cookie is marked `Secure`. Tabs:
 | Tab | What |
 |---|---|
 | **Dashboard** | live per-backend status (a down backend names its cause) + in-flight, a **backend faults · 24h** card, column and panel (see [Backend fault log](#backend-fault-log)), parked calls, media-job counts/recent, recent LLM calls |
-| **Backends** | add/edit/remove backends (LLM, ComfyUI, Meshy, Tripo), incl. the `paid` cost tier; the editor is split into **General** (name, type, url, host, cost tier, concurrency, credential — never shown again once stored: blank keeps it, *clear* removes it), **Models** (whitelist/blacklist, discovery filters, bare-id listing, context windows), **Behavior** (prompt-cache passthrough, sampling defaults, self-retries) and one tab named after the type (**ComfyUI** / **Cloud task API** / **Anthropic**); the **Hosts · GPU policy** panel below the list edits the per-box VRAM flags (see [Hosts & VRAM policy](#hosts--vram-policy)); the **Managed hosts** section below the list adds a rented GPU machine (**+ Managed host**: name, **Provider**, its options, API token) and carries one lifecycle card per host (Start/Stop, costs, service table with Restart / Re-run setup, model sync, log), the LAN model source and the model-sync catalog + HF token; a backend attaches through the **managed host** select in its General tab (see [Managed hosts](#managed-hosts-thunder-compute-runpod-later)) |
+| **Backends** | add/edit/remove backends (LLM, ComfyUI, Meshy, Tripo), incl. the `paid` cost tier; the editor is split into **General** (name, type, url, host, cost tier, concurrency, credential — never shown again once stored: blank keeps it, *clear* removes it), **Models** (whitelist/blacklist, discovery filters, bare-id listing, context windows), **Behavior** (prompt-cache passthrough, sampling defaults, self-retries) and one tab named after the type (**ComfyUI** / **Cloud task API** / **Anthropic**); the **Hosts · GPU policy** panel below the list edits the per-box VRAM flags (see [Hosts & VRAM policy](#hosts--vram-policy)); the **Managed hosts** section below the list adds a rented GPU machine (one **API token per provider** on top, then **+ Managed host**: name, **Provider**, what to rent) and carries one lifecycle card per host (a what-Start-needs checklist, Start/Stop, *+ ComfyUI / + OpenAI-compatible service on this host*, costs, service table with Restart / Re-run setup, model sync, log), the LAN model source and the model-sync catalog + HF token; a backend attaches through the **managed host** select in its General tab (see [Managed hosts](#managed-hosts-thunder-compute-runpod-later)) |
 | **Input & Routing** | sub-tabs **Input** (what clients can call — chat aliases, generation models, endpoints), **LLM models**, **Image models**, **LoRAs** — all searchable |
 | **Aliases** | sub-tabs **Chat** and **Media** — the alias list on the left; with nothing picked the right column is the LIVE overview (chat: alias → backend · model · status + alias/model collisions; media: alias → backends, or pick a backend to see everything mapped onto it); pick an alias for its editor. Chat editor: per-alias `park_s`, reasoning/voice/sampling defaults, backends — plus that alias's live routes. Media editor: register a ComfyUI workflow, wire its node mapping, pin values (a cloud alias — Meshy, Tripo — needs no workflow: one schema-driven editor renders its endpoint + option defaults instead). Old `/ui/mapping?…` and `/ui/routing?sub=chat|gen` links redirect here. |
 | **Reasoning** | the normalized-thinking rule list (model glob × backend set → adapter) + test resolver |
