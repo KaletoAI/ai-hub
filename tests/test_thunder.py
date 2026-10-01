@@ -191,7 +191,12 @@ class Body(unittest.TestCase):
 
 
 # the three shapes /v2/specs has been seen in: wrapped map, bare map, string counts
-L40 = {"specs": {"l40_x1": {"vcpuOptions": [12, 6, 24], "storageGB": {"min": 100, "max": 500}}}}
+# L40 is the LIVE answer (GET /v2/specs, read 2026-10-01: l40 ×1 offers 6, 8, 12 —
+# thunder-1 runs an l40 with a stored 8, which must stay valid); the other two are the
+# tolerated variants (unsorted, bare map, string counts)
+L40 = {"specs": {"l40_x1": {"vcpuOptions": [6, 8, 12], "gpuCount": 1,
+                            "storageGB": {"min": 100, "max": 500}},
+                 "l40_x2": {"vcpuOptions": [12, 16, 20], "gpuCount": 2}}}
 L40_BARE = {"l40_x1": {"vcpuOptions": ["24", "6", "12"]}}
 
 
@@ -224,7 +229,8 @@ class IncludedVcpus(unittest.TestCase):
         self.assertEqual(thunder.vcpu_options(L40_BARE, "l40", 1), [6, 12, 24])
         # missing configuration, no options, junk options, no specs at all → None
         self.assertIsNone(thunder.included_vcpus(L40, "h100", 1))
-        self.assertIsNone(thunder.included_vcpus(L40, "l40", 2))
+        self.assertEqual(thunder.included_vcpus(L40, "l40", 2), 12)
+        self.assertIsNone(thunder.included_vcpus(L40, "l40", 4))
         self.assertIsNone(thunder.included_vcpus({"specs": {"l40_x1": {}}}, "l40", 1))
         self.assertIsNone(thunder.included_vcpus({"specs": {"l40_x1": {"vcpuOptions": ["x"]}}},
                                                  "l40", 1))
@@ -236,9 +242,13 @@ class IncludedVcpus(unittest.TestCase):
 
     def test_save_refusal(self):
         opts = {"gpu_type": "l40", "num_gpus": 1}
-        self.assertEqual(thunder.options_refusal(dict(opts, vcpus=8), L40),
-                         "l40 ×1 offers vCPUs 6, 12, 24")
+        self.assertEqual(thunder.options_refusal(dict(opts, vcpus=7), L40),
+                         "l40 ×1 offers vCPUs 6, 8, 12")
         self.assertIsNone(thunder.options_refusal(dict(opts, vcpus=12), L40))
+        # thunder-1's stored 8 on an l40 ×1 is offered — its next Save is accepted
+        self.assertIsNone(thunder.options_refusal(dict(opts, vcpus=8), L40))
+        self.assertEqual(thunder.options_refusal(dict(opts, vcpus=8, num_gpus=2), L40),
+                         "l40 ×2 offers vCPUs 12, 16, 20")
         self.assertIsNone(thunder.options_refusal(dict(opts, vcpus=""), L40))
         # unknown specs (or a configuration they do not list) cannot judge: the start does
         self.assertIsNone(thunder.options_refusal(dict(opts, vcpus=8), None))
@@ -257,8 +267,11 @@ class IncludedVcpus(unittest.TestCase):
             self.assertEqual(why, "cannot read Thunder's vCPU options for l40 ×1 — set vcpus "
                                   "explicitly or try again")
         # a typed count: refused when the specs know it is not offered, else as is
-        res, why = thunder.resolve_options(dict(opts, vcpus=8), L40)
-        self.assertEqual((res, why), (None, "l40 ×1 offers vCPUs 6, 12, 24"))
+        res, why = thunder.resolve_options(dict(opts, vcpus=7), L40)
+        self.assertEqual((res, why), (None, "l40 ×1 offers vCPUs 6, 8, 12"))
+        # thunder-1 (l40 ×1, stored 8): its next start creates with 8, as it runs today
+        self.assertEqual(thunder.resolve_options(dict(opts, vcpus=8), L40),
+                         (dict(opts, vcpus=8), None))
         self.assertEqual(thunder.resolve_options(dict(opts, vcpus=12), L40)[0]["vcpus"], 12)
         self.assertEqual(thunder.resolve_options(dict(opts, vcpus="12"), None)[0]["vcpus"], 12)
 

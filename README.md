@@ -1306,7 +1306,8 @@ full sha) is refused on Save — a `400` with the form as typed, nothing stored 
 anything can bill. So is a vCPU count the GPU configuration does not offer
 (`l40 ×1 offers vCPUs 6, 12, 24`), as far as the cached spec list knows it; with no
 spec list cached yet the Save accepts it and the Start checks it before the create.
-A Start never guesses a vCPU count: when the spec list cannot be read (or names no
+A Start never guesses a vCPU count: a failing fetch falls back to the last fetched
+spec list (Thunder's own, refreshed hourly), and when there is none (or it names no
 option for that GPU configuration) a blank vcpus ends the Start in `off` with
 *cannot read Thunder's vCPU options for … — set vcpus explicitly or try again*, and no
 instance is created. Hosts saved with an explicit count (the old default was `8`) keep

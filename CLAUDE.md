@@ -1128,7 +1128,9 @@ via injected callables, staying hot-reload-safe.
   anyone noticing, and a status Thunder renamed must read "not finished yet", never
   "gone". Pins the parsers — map/list, string counts, missing fields — `choose_disk_gb`,
   `hourly_cost`, the snapshot name and ownership shape, `rotation` and
-  `foreign_snapshots`);
+  `foreign_snapshots`; and `IncludedVcpus` — the blank vcpus resolved from the LIVE
+  `/v2/specs` shape (l40 ×1 = `[6, 8, 12]`: blank → 6, thunder-1's stored 8 accepted, 7
+  refused), never guessed when the specs cannot say);
   `test_sshrun.py` (the ssh argv: a host without `--` before it is parsed as an OPTION,
   a secret in argv is world-readable, a tunnel not bound to loopback on both ends puts
   a service on the LAN, a `safe_rel` that lets `..` or a dot segment through reads files
@@ -1156,7 +1158,10 @@ via injected callables, staying hot-reload-safe.
   `test_hostctl.py` (the controller against a stubbed
   provider API and a fake ssh — the biggest file, because every mistake here bills or
   deletes: `start_blockers()` naming exactly what `start()` raises, case by case, with
-  no provider call; the uuid persisted before the first wait, a mutating call only on an item
+  no provider call; `IncludedVcpus` — a blank vcpus created with the included count,
+  unreadable specs without a cache ending in `off` with no create call, a specs blip
+  answered from the cached list, a count not offered refused before the create, the
+  running instance's count on the card and in $/h; the uuid persisted before the first wait, a mutating call only on an item
   found by uuid in a FRESH list (never a stored, reusable index), `off` only after two
   lists without the instance, the port guard before `bootstrapping`/`starting` and
   before an attach, `GW:NODE_FAIL` read by tag, a stop aborting a start, the stop order
@@ -1509,9 +1514,11 @@ via injected callables, staying hot-reload-safe.
   few seconds for the Dashboard; main's `host_view` adds both → enable EVERY runnable service (`_enable`; one failing =
   `_PreCreate`, the ones already enabled are disabled again) → newest READY snapshot of
   this host, else the template (`bootstrap_template`, "" = auto, M5) → `/v2/specs` and
-  `resolve_options` (a blank vcpus = included; unreadable specs or a count not offered
-  = `_PreCreate`, `off`, no create; a typed count with the specs unreadable still fails
-  the start as before; `State.vcpus` records the created count, `vcpus_view()` = it while
+  `resolve_options` (a blank vcpus = included; a failing fresh fetch falls back to the
+  provider's last CACHED list — its own list, not a guess; no cache, or a count not
+  offered = `_PreCreate`, `off`, no create; a typed count with no specs at all still fails
+  the start as before, and the "(an instance may exist anyway …)" note is added only once
+  the create was POSTed — `_create_posted`; `State.vcpus` records the created count, `vcpus_view()` = it while
   the instance runs, else what a start would use — `view()["vcpus"]` and `cost_per_h`
   read it, the card says "vCPUs included" when it is None) → `choose_disk_gb`
   (from the manifest copy stored for THAT snapshot id) → create → poll (15 min + 8 min

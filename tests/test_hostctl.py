@@ -5469,6 +5469,37 @@ class IncludedVcpus(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(c.state.phase, "off")
         self.assertEqual(_creates(fake), [])
         self.assertIn("start failed", c.state.error)
+        # nothing was POSTed: no orphan-list hint for an instance that cannot exist
+        self.assertNotIn("an instance may exist", c.state.error)
+
+    async def test_specs_blip_falls_back_to_the_cached_list(self):
+        # the provider's own list from the last fetch (what the card and the form just
+        # showed) is no guess: a failing fresh fetch uses it, for a blank and a typed count
+        for vcpus, want in (("", 6), (8, 8)):
+            fake = FakeThunder()
+            c, _ = self._make(fake, vcpus)
+            await c.refresh_prices()                        # the cache the card reads
+            fake.specs_status = 500
+            c.api._cache = {k: (-1e12, v) for k, (_, v) in c.api._cache.items()}  # expired
+            await c.start()
+            self.assertEqual(c.state.phase, "ready", c.state.error)
+            self.assertEqual(_creates(fake)[0]["cpu_cores"], want)
+            self.assertTrue([ln for ln in c.state.log if "using the cached list" in ln])
+
+    async def test_create_transport_error_still_names_the_orphan_list(self):
+        # the note stays where it is true: a create POST without an answer
+        fake = FakeThunder()
+        c, _ = self._make(fake, "")
+        orig = fake.handler
+
+        def handler(req):
+            if req.url.path == "/instances/create":
+                raise httpx.ConnectError("boom")
+            return orig(req)
+        fake.handler = handler
+        await c.start()
+        self.assertEqual(c.state.phase, "off")
+        self.assertIn("an instance may exist anyway", c.state.error)
 
     async def test_view_and_cost_use_the_resolved_count(self):
         fake = FakeThunder()

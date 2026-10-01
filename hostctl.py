@@ -1427,6 +1427,7 @@ class Controller:
         self.deps = deps
         self.services: list = []
         self._api = None
+        self._create_posted = False     # the current start's create POST went out
         self._client: Optional[httpx.AsyncClient] = None
         self._tunnel = None
         # what the running master carries: set per spawn from its argv (the forwards it
@@ -3288,12 +3289,15 @@ class Controller:
 
     async def _start(self) -> None:
         enabled: list = []
+        self._create_posted = False
         try:
             self._enable(enabled)
             await self._create()
         except Exception as e:
             msg = _errtext(e)
-            if isinstance(e, self._Error) and e.status is None:
+            # only once the create was POSTed: a specs or snapshot list failing before it
+            # cannot have made an instance, and the note would send the operator looking
+            if isinstance(e, self._Error) and e.status is None and self._create_posted:
                 msg += " (an instance may exist anyway — check the orphan list)"
             self._set_phase("off", f"start failed: {msg}")
             if enabled:
@@ -3409,13 +3413,16 @@ class Controller:
         # the vCPU count FIRST (before any other call): a blank option = included is the
         # spec's smallest vcpuOptions entry — never guessed. Unreadable specs, or a count
         # the specs do not offer, end the start in `off` before the create.
+        # A failing fresh fetch falls back to the provider's last CACHED list (what the
+        # card and the form show; refreshed hourly) — its own list, not a guess. Without
+        # one a blank still ends in `off` (resolve_options), a typed count fails as before.
         try:
             specs = await self.api.specs()
         except self._Error as e:
-            if cfg.get("vcpus") in (None, ""):
-                self._log(f"/v2/specs unavailable ({e.status or 'transport'}): {e}")
-                specs = None
-            else:
+            specs = self.api.cached("specs")
+            self._log(f"/v2/specs unavailable ({e.status or 'transport'}): {e}"
+                      + (" — using the cached list" if specs is not None else ""))
+            if specs is None and cfg.get("vcpus") not in (None, ""):
                 raise
         cfg, why = self._prov.resolve_options(cfg, specs)
         if why:
@@ -3469,8 +3476,10 @@ class Controller:
             # gateway restart could not find (nor stop) it while it bills
             raise _PreCreate(f"state could not be saved ({self._persist_error or 'blocked'}) "
                              "— not creating an instance nobody could find after a restart")
-        fut = asyncio.ensure_future(
-            self.api.create(self._prov.create_body(cfg, template, disk_gb, pub)))
+        body = self._prov.create_body(cfg, template, disk_gb, pub)
+        # from here on a transport error may hide an instance that exists and bills
+        self._create_posted = True
+        fut = asyncio.ensure_future(self.api.create(body))
         try:
             created = await asyncio.shield(fut)
         except asyncio.CancelledError as cancel:
