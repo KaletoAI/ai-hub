@@ -44,3 +44,4 @@ skills-lock.json.bak
 sample_comfyui_workflows/*.pdf
 # Planning notes (specs/plans) stay local — not part of the public repo
 docs/superpowers/
+.superpowers/

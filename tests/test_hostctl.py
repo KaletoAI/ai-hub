@@ -4938,6 +4938,33 @@ class LanTransfer(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(repo + "blobs/abc", vm.files)
         self.assertEqual(json.loads(vm.manifest), {})
 
+    async def test_derived_hf_blob_downloads_by_url_and_its_link_is_made(self):
+        """model sources Stage 1 end to end: a share HF-cache blob with a 64-hex name is
+        fetched from huggingface.co by curl (checked against that sha), its snapshot link
+        recreated, and only the tiny `refs/main` crosses the LAN (review M-4)."""
+        sh = FakeShare()
+        rev, oid = "0123456789abcdef0123456789abcdef01234567", "ab" * 32
+        repo = "hf-cache/hub/models--org--repo/"
+        blob, snap = repo + "blobs/" + oid, repo + f"snapshots/{rev}/model.safetensors"
+        sh.files = {blob: b"weights", repo + "refs/main": rev.encode()}
+        sh.links = {snap: "../../blobs/" + oid}
+        cat = [{"match": {"alias": "hf"}, "paths": [repo]}]
+        fake, vm, c, lan, pipe = _lan_make({"hf": {"backend": "thunder", "workflow_json": {}}},
+                                           sh, catalog=cat)
+        url = f"https://huggingface.co/org/repo/resolve/{rev}/model.safetensors"
+        vm.sizes[url], vm.sha[url] = 7, oid
+        await c.start()
+        self.assertTrue(await _until(lambda: _idle(c) and c.is_alias_ready(BID, "hf")),
+                        c.state.log[-8:])
+        self.assertEqual([p for p, _ in vm.started], [blob])
+        self.assertIn(url, vm.started[0][1])
+        man = json.loads(vm.manifest)
+        self.assertEqual((man[blob]["source"], man[blob]["size"]), ("url", 7))
+        self.assertEqual(man[repo + "refs/main"]["source"], "lan")
+        self.assertEqual(len(pipe.log), 1)
+        self.assertEqual(vm.links, {snap: "../../blobs/" + oid})
+        self.assertEqual(man[snap]["source"], "link")
+
     async def test_links_wait_while_the_lan_source_waits(self):
         sh = FakeShare()
         repo = "hf-cache/hub/models--o--n/"

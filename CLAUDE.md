@@ -1774,14 +1774,18 @@ via injected callables, staying hot-reload-safe.
   sha256, a 40-hex one the git sha1 (size only), anything else, a non-commit rev,
   `datasets--`/`spaces--`, an unlisted blob or a link leaving its repo derives nothing; a
   regular file under `snapshots/<rev>/` (`HF_HUB_DISABLE_SYMLINKS`) is its own download,
-  size only. `source_kinds(catalog, source_index, share_sha=None)` is the ONE place the
+  size only (by rule a blob linked only from a dot file — `.gitattributes` — and an
+  org-less legacy repo stay LAN). `source_kinds(catalog, source_index, share_sha=None)` is the ONE place the
   rules live (plan input, overview, card badge): per path `kind` `url` (origin
   `file`/`dir`) | `hf-auto` | `outdated`, absent = `lan`; precedence per-file entry >
   dir entry > derivation (an operator's mirror wins), a later entry wins within a shape,
   and an entry whose stored `size` ≠ the share LISTING's is OUTDATED and yields to the
   next source — a listing comparison, never a share hash on the plan path (with
   `share_sha`, the persistent `{path: [size, sha256]}` cache, a sha that differs at the
-  listed size is outdated too). `url_catalog(catalog, source_index)` is its plan view
+  listed size is outdated too); a row that replaced an outdated entry keeps its reason as
+  `outdated_entry` (the dead entry stays in the catalog until re-checked), every row
+  carries `listing_size`, and `dir_for(path, catalog)` names the dir entry a share file
+  the check never saw falls under (→ `lan`, "re-check the directory"). `url_catalog(catalog, source_index)` is its plan view
   (`{path: {url, sha256?, origin?}}`, outdated dropped; one argument = the old helper:
   explicit entries, nothing derived or outdated); hostctl's `Deps.url_catalog(src)` is
   handed the SAME listing the plan is built from. `plan`'s url fetch entries carry

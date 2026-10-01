@@ -1103,6 +1103,33 @@ class UrlCatalogSources(unittest.TestCase):
         cat[0]["size"] = 9                                   # the mirror entry is outdated
         self.assertEqual(ms.url_catalog(cat, {p: 10})[p]["url"],
                          f"https://huggingface.co/org/thing/resolve/{REV}/a.bin")
+        # ... and the dead mirror entry stays visible, so it can be re-checked (review I-1)
+        k = ms.source_kinds(cat, {p: 10})[p]
+        self.assertEqual((k["kind"], k["origin"]), ("url", "dir"))
+        self.assertIn("size differs", k["outdated_entry"])
+        cat[0]["size"] = 10
+        self.assertNotIn("outdated_entry", ms.source_kinds(cat, {p: 10})[p])
+
+    def test_listing_size_on_every_row(self):
+        blob = HFR + "blobs/" + SHA
+        idx = {blob: 100, snap("m.safetensors"): {"link": "../../blobs/" + SHA}}
+        cat = [{"file": self.F, "url": "https://e/v", "size": 5}, dir_entry({"a.bin": [3, None, False]})]
+        k = ms.source_kinds(cat, dict(idx, **{self.F: 5}))
+        self.assertEqual((k[blob]["listing_size"], k[blob]["size"]), (100, None))
+        self.assertEqual(k[self.F]["listing_size"], 5)
+        self.assertIsNone(k[DIR + "a.bin"]["listing_size"])               # not listed
+
+    def test_dir_for(self):
+        outer = dir_entry({"a.bin": [1, None, False]}, d="models/org/")
+        inner = dir_entry({"a.bin": [1, None, False]})
+        later = dir_entry({"b.bin": [1, None, False]})
+        cat = [inner, outer, {"file": self.F, "url": "https://e/v"}]
+        self.assertIs(ms.dir_for(DIR + "new.bin", cat), inner)          # most specific
+        self.assertIs(ms.dir_for("models/org/other.bin", cat), outer)
+        self.assertIs(ms.dir_for(DIR + "x", cat + [later]), later)      # later wins a tie
+        self.assertIsNone(ms.dir_for(self.F, cat))
+        self.assertIsNone(ms.dir_for(DIR + "x", [dir_entry({"a": [1, None, False]}, rev="main")]))
+        self.assertIsNone(ms.dir_for(DIR + "x", None))
 
     def test_later_entry_wins_within_a_shape(self):
         cat = [{"file": self.F, "url": "https://e/1"}, {"file": self.F, "url": "https://e/2"}]
@@ -1135,6 +1162,14 @@ class UrlCatalogSources(unittest.TestCase):
         k = ms.source_kinds(cat, {p: 7}, {p: [7, SHA]})[p]
         self.assertEqual(k["kind"], "outdated")
         self.assertIn("hash differs", k["reason"])
+        self.assertIn("Hugging Face copy", k["reason"])                         # provisional
+        # a confirmed (share) sha the cache now contradicts: the SHARE changed in place
+        conf = [dir_entry({"c.safetensors": [7, SHA_B, False]})]
+        self.assertIn("changed since Check & save",
+                      ms.source_kinds(conf, {p: 7}, {p: [7, SHA]})[p]["reason"])
+        f = [{"file": p, "url": "https://e/c", "sha256": SHA_B, "size": 7}]
+        self.assertIn("changed since Check & save",
+                      ms.source_kinds(f, {p: 7}, {p: [7, SHA]})[p]["reason"])
         # a cached hash of another size describes another file: ignored
         self.assertIn(p, ms.url_catalog(cat, {p: 7}, {p: [8, SHA]}))
         # a size-only row has nothing to compare; junk caches are ignored

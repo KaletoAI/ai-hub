@@ -429,7 +429,10 @@ def derived_urls(source_index) -> dict:
     hash) → size only; anything else → not this layout, nothing derived. Several links
     onto one blob name the same bytes: the lexicographically first link's URL is used.
     A regular FILE under `snapshots/<rev>/` (`HF_HUB_DISABLE_SYMLINKS`, no blob) is its own
-    download: URL from the path, size only. A URL that fails `_url_error` derives nothing."""
+    download: URL from the path, size only. A URL that fails `_url_error` derives nothing.
+    Known gaps, by rule: a blob whose only link is a dot file (`.gitattributes`, in every
+    repo — dot segments are never usable) and org-less legacy repos (`models--gpt2`) stay
+    LAN; both are small or rare, and a dir entry cannot cover `hf-cache/…`."""
     idx = source_index if isinstance(source_index, dict) else {}
     out: dict = {}
     for k in sorted(k for k in idx if isinstance(k, str)):
@@ -485,7 +488,11 @@ def _outdated(info: dict, listing: dict, share_sha) -> str:
         return f"size differs: share {have} bytes, entry {size} bytes"
     known = _share_sha(share_sha, info["path"], have)
     if known and info.get("sha256") and info["sha256"].lower() != known:
-        return "hash differs: the share's copy is not the one the URL serves"
+        # both cases on purpose: a provisional sha is HF's and the share disagrees with
+        # it; a confirmed one WAS the share's, so the share file changed in place
+        if info.get("provisional"):
+            return "hash differs: the share's copy differs from the Hugging Face copy"
+        return "hash differs: the share's file changed since Check & save"
     return ""
 
 
@@ -498,13 +505,17 @@ def source_kinds(catalog, source_index=None, share_sha=None) -> dict:
       entry) or `dir` (a directory entry's `files` row, `provisional` = its sha256 is
       HF's `X-Linked-Etag`, the share's not known yet);
     - `hf-auto` — `derived_urls` (origin `hf-auto`), when no valid explicit entry names
-      the path; `outdated_entry` = the reason, when an outdated explicit one did;
+      the path;
     - `outdated` — explicit entries only, all outdated, nothing derived: the plan syncs
       the share's copy (`reason`).
 
-    Plus `url`, `sha256` (when known; the expected content hash of the download) and
-    `size` (an explicit entry's stored size, None for an old entry). A path absent from
-    the result is `lan`. Precedence: per-file entry > directory entry > derivation; within
+    Plus `url`, `sha256` (when known; the expected content hash of the download), `size`
+    (an explicit entry's stored size, None for an old entry and hf-auto), `listing_size`
+    (the share listing's size, None when unlisted) and — on a `url`/`hf-auto` row that
+    replaced an outdated explicit entry (a per-file mirror, or a dir row) —
+    `outdated_entry`, that entry's reason: it stays in the catalog until re-checked. A
+    path absent from the result is `lan` (`dir_for` says whether a dir entry should have
+    named it). Precedence: per-file entry > directory entry > derivation; within
     one shape a later entry wins. An outdated entry yields to the next valid source.
 
     `source_index` None = no listing: no derivation and nothing outdated (the old
@@ -539,6 +550,8 @@ def source_kinds(catalog, source_index=None, share_sha=None) -> dict:
             why = _outdated(info, listing, share_sha)
             if not why:
                 out[p] = dict(info, kind="url")
+                if stale:                   # a dead mirror entry must stay visible
+                    out[p]["outdated_entry"] = stale["reason"]
                 break
             stale = stale or dict(info, kind="outdated", reason=why)
         else:
@@ -549,9 +562,23 @@ def source_kinds(catalog, source_index=None, share_sha=None) -> dict:
                     out[p]["outdated_entry"] = stale["reason"]
             elif stale:
                 out[p] = stale
-    for info in out.values():
+    for p, info in out.items():
         info.pop("path", None)
+        info["listing_size"] = _int_size(listing.get(p))
     return out
+
+
+def dir_for(path: str, catalog):
+    """The valid directory entry whose `dir` contains `path` (the most specific one; a
+    later entry wins a tie), else None — whether or not its `files` names the path. A
+    share file under a dir entry that `files` lacks was added after the check: it syncs
+    from the LAN (`source_kinds` leaves it out) and the directory wants a re-check."""
+    best = None
+    for e in _valid_entries(catalog, "dir"):
+        if isinstance(path, str) and path.startswith(e["dir"]) and (
+                best is None or len(e["dir"]) >= len(best["dir"])):
+            best = e
+    return best
 
 
 def url_catalog(catalog, source_index=None, share_sha=None) -> dict:
