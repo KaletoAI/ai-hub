@@ -1052,5 +1052,47 @@ class HealthAndLoras(unittest.TestCase):
         self.assertEqual(loras.get("rp"), ["style.safetensors"])
 
 
+
+class InputNamesAndWorkerErrors(unittest.TestCase):
+    """Item 11b/c (final review): `upload_slot_name` keeps every `isalnum` character, so a
+    param with a unicode letter built a name the worker's NAME_RE refuses — only AFTER
+    /run was billed; and a COMPLETED job whose output was the worker's own `{"error": …}`
+    surfaced as "the worker returned no outputs", hiding the diagnosis."""
+
+    def test_a_name_the_worker_would_refuse_is_refused_before_run(self):
+        rp = _RunPod([DONE])
+        req = _req(node_mapping={"bild_ä": {"node": "1", "field": "image"}},
+                   upload_images={"bild_ä": PNG})
+        with self.assertRaises(RuntimeError) as cm:
+            _run(rp, lambda: _adapter().generate(req))
+        self.assertIn("parameter 'bild_ä'", str(cm.exception))
+        self.assertEqual(rp.runs, [])
+        self.assertNotIn("runpod_job_id", req.cloud_trace)     # nothing billed → failover ok
+
+    def test_a_file_param_is_checked_too(self):
+        rp = _RunPod([DONE])
+        req = _req(node_mapping={"image": {"node": "1", "field": "image"},
+                                 "mesh_ü": {"node": "1", "field": "mesh"}},
+                   upload_files={"mesh_ü": ("m.glb", b"glTF")})
+        with self.assertRaises(RuntimeError) as cm:
+            _run(rp, lambda: _adapter().generate(req))
+        self.assertIn("parameter 'mesh_ü'", str(cm.exception))
+        self.assertEqual(rp.runs, [])
+
+    def test_plain_names_still_pass(self):
+        io = adapters.RunpodIO(_adapter())
+        self.assertIsNone(io.name_refusal("gw_job1_image.png", "image"))
+        self.assertIsNotNone(io.name_refusal("gw_job1_x..png", "x"))
+        self.assertIsNone(adapters.ComfyIO.name_refusal(None, "gw_ä.png", "ä"))
+
+    def test_completed_with_a_worker_error_keeps_its_text(self):
+        bad = {"status": "COMPLETED", "executionTime": 10,
+               "output": {"error": "node 4 (KSampler): CUDA out of memory"}}
+        with self.assertRaises(RuntimeError) as cm:
+            _run(_RunPod([bad]), lambda: _adapter().generate(_req()))
+        self.assertIn("CUDA out of memory", str(cm.exception))
+        self.assertIn("RunPod job rp1", str(cm.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

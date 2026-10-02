@@ -2867,6 +2867,11 @@ class GenIO:
         """Why client files cannot be placed on this backend, None when they can."""
         return None
 
+    def name_refusal(self, name: str, param: str) -> Optional[str]:
+        """Why input file `name` (for request param `param`) cannot be placed on this
+        backend, None when it can — asked BEFORE anything is sent."""
+        return None
+
     def input_ref(self, stored: str) -> str:
         raise NotImplementedError
 
@@ -3304,6 +3309,9 @@ class ComfyUIAdapter(BackendAdapter):
             data = uploads.get(p)
             if data:
                 slot = upload_slot_name(prefix, p)
+                why = io.name_refusal(slot, p)
+                if why:
+                    raise RuntimeError(why)
                 name = await io.put_image(slot, bytes(data))   # raises → job fails
                 used.append(slot)
             else:
@@ -3357,6 +3365,9 @@ class ComfyUIAdapter(BackendAdapter):
                                f"node {nid}.{fld} is pinned by the alias")
                 continue
             slot = upload_slot_name(prefix, p, os.path.splitext(name or "")[1] or "bin")
+            why = io.name_refusal(slot, p)
+            if why:
+                raise RuntimeError(why)
             stored = await io.put_file(slot, bytes(data))   # raises → job fails with the reply
             used.append(slot)
             wf.setdefault(nid, {}).setdefault("inputs", {})[fld] = io.input_ref(stored)
@@ -4687,6 +4698,8 @@ _RP_URL_RE = re.compile(r"^https://api\.runpod\.ai/v2/([A-Za-z0-9]+)/?$")
 _RP_INPUT_MAX = 9 * 1024 * 1024          # /run takes 10 MB; leave room for the envelope
 _RP_TERMINAL = ("COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT")
 _RP_VENDOR = "RunPod"
+# = ops/runpod/handler.py NAME_RE — the worker refuses every other input name
+_RP_INPUT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,200}$")
 
 
 def _rp_json(r) -> Optional[dict]:
@@ -4718,6 +4731,15 @@ class RunpodIO(GenIO):
 
     async def put_file(self, name: str, data: bytes) -> str:
         return await self.put_image(name, data)
+
+    def name_refusal(self, name: str, param: str) -> Optional[str]:
+        # The worker writes only names its NAME_RE accepts (ops/runpod/handler.py);
+        # upload_slot_name keeps any `isalnum` character — unicode letters included — so
+        # such a param would only fail inside the worker, after /run was billed.
+        if _RP_INPUT_NAME_RE.match(name) and ".." not in name:
+            return None
+        return (f"parameter '{param}' cannot be sent to RunPod: its input file name "
+                f"'{name[:80]}' holds characters the worker refuses (A-Z a-z 0-9 . _ - only)")
 
     async def placeholder(self) -> str:
         return _PLACEHOLDER_NAME
@@ -5143,6 +5165,10 @@ class RunpodAdapter(ComfyUIAdapter):
                 if self._rp_jobs.get(req.job_id) == (url, rp_id):
                     self._rp_jobs.pop(req.job_id, None)
         out = st.get("output") or {}
+        if isinstance(out, dict) and out.get("error") and not isinstance(out.get("outputs"), dict):
+            # the worker's own refusal (a ComfyUI node error, an oversized output) — the
+            # text is the diagnosis; "no outputs" would hide it
+            raise RuntimeError(f"RunPod job {rp_id}: {str(out['error'])[:4000]}")
         if not isinstance(out, dict) or not isinstance(out.get("outputs"), dict):
             raise RuntimeError(f"RunPod job {rp_id}: the worker returned no outputs")
         manifest = out.get("manifest") or {}

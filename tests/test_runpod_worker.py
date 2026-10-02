@@ -291,5 +291,9 @@ class Handler(unittest.TestCase):
         self.assertTrue(all(v is None for v in others.values()), others)
 
 
+    def test_gateway_refuses_exactly_what_the_worker_refuses(self):
+        self.assertEqual(adapters._RP_INPUT_NAME_RE.pattern, handler.NAME_RE.pattern)
+
+
 if __name__ == "__main__":
     unittest.main()
