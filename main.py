@@ -2194,6 +2194,16 @@ def _cost_usd(bid: str, model_id: Optional[str], in_tok: int, out_tok: int,
 # Services handed to every backend adapter so it stays import-cycle-free and
 # hot-reload-safe (the log flag is read per-call via a callable, never cached).
 
+def _note_job_meta(job_id: str, meta: dict) -> None:
+    """Best effort: a failed write (sqlite locked) must not end a job whose RunPod run
+    already started — the poll and the cancel handling still have to happen."""
+    try:
+        if jobs._active:
+            jobs.merge_meta(job_id, meta)
+    except Exception as e:
+        logger.warning(f"note_job_meta {job_id}: {type(e).__name__}: {e}")
+
+
 def _runpod_probe_save(name: str, rec: dict) -> None:
     """Store a RunPod probe record under its backend name (worker thread)."""
     if not store.is_active():
@@ -2218,7 +2228,7 @@ adapter_ctx = AdapterContext(
     apply_reasoning=_reasoning_apply,
     http_client=lambda: http_client,   # shared pool; callable so adapters never cache it
     loras_of=lambda bid: backend_loras.get(bid, set()),
-    note_job_meta=lambda job_id, meta: jobs.merge_meta(job_id, meta) if jobs._active else None,
+    note_job_meta=_note_job_meta,
     runpod_probe_load=lambda name: (store.get_setting("runpod_probe") or {}).get(name)
         if store.is_active() else None,
     runpod_probe_save=_runpod_probe_save,
@@ -3445,11 +3455,11 @@ def _billed_cloud_task(cand: dict, trace: dict, e: BaseException,
         # A RunPod run of a WORKFLOW candidate (cloud_kind is None for it). The adapter
         # sets `runpod_settled` only once RunPod confirms the job is no longer running —
         # anything else may still be billing, and a re-run would pay for it twice.
-        rp = trace.get("runpod_job_id")
-        if rp and rp != prior_task and not trace.get("runpod_settled"):
-            return f"RunPod job {rp}"
-        if not rp and trace.get("create_unconfirmed"):
+        if trace.get("create_unconfirmed"):
             return "a RunPod job (the /run request was sent but its answer was lost)"
+        rp = trace.get("runpod_job_id")
+        if rp and not trace.get("runpod_settled"):
+            return f"RunPod job {rp}"
         return None
     if not adapters.cloud_kind(cand) or isinstance(e, adapters.CloudTaskRetryable):
         return None
@@ -3921,15 +3931,18 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req,
                     _record_gen_attempt(bid, conn_fail=False, exec_fail=True)
                     _note_fault(backend, "job", "execution", f"{alias}: {_err_text(e)}")
                     cloud_trace = _cloud_trace_of(req) or cloud_trace
-                    if adapters.cloud_kind(cand) or _billed_cloud_task(cand, _cloud_trace_of(req), e):
+                    billed_x = _billed_cloud_task(cand, _cloud_trace_of(req), e)
+                    if adapters.cloud_kind(cand) or billed_x:
                         # A cloud task is BILLED (and a RunPod job that is not settled may
                         # still be running). Whatever failed here may have happened
                         # after the paid task was created, and re-running the job on the
                         # next candidate would buy the same mesh twice — the invariant
                         # tripo.py/adapters.py go out of their way to preserve. Final.
                         logger.warning(f"✗ job {job_id} [{backend['name']}] failed: {_err_text(e)}")
-                        await asyncio.to_thread(jobs.fail, job_id, _err_text(e),
-                                                _gen_fail_meta(attempts, cloud_trace))
+                        await asyncio.to_thread(
+                            jobs.fail, job_id,
+                            _billed_final_msg(e, billed_x) if billed_x else _err_text(e),
+                            _gen_fail_meta(attempts, cloud_trace))
                         return True
                     exec_faults.append((bid, backend["name"], e))
                     last = e
@@ -5811,15 +5824,21 @@ async def _cancel_orphaned_runpod(orphans: list) -> int:
         rp = (meta or {}).get("runpod_job_id")
         if not rp:
             continue
-        b = next((x for x in backends if x.get("name") == bname and x.get("type") == "runpod"), None)
-        ad = backend_adapters.get(backend_id(b)) if b else None
-        if ad is None:
-            continue
-        n += 1
-        ok = await ad.cancel_runpod_id(rp)
-        await asyncio.to_thread(jobs.merge_meta, job_id, {"runpod_cancelled_at_restart": ok})
-        logger.warning(f"startup: RunPod job {rp} of orphaned job {job_id} "
-                       f"{'cancelled' if ok else 'cancel UNCONFIRMED — check the RunPod console'}")
+        try:
+            b = next((x for x in backends if x.get("name") == bname and x.get("type") == "runpod"), None)
+            ad = backend_adapters.get(backend_id(b)) if b else None
+            if ad is None:
+                logger.warning(f"startup: orphaned job {job_id} names RunPod job {rp} but "
+                               f"'{bname}' is no runpod backend now — check the RunPod console")
+                continue
+            n += 1
+            ok = await ad.cancel_runpod_id(rp)
+            logger.warning(f"startup: RunPod job {rp} of orphaned job {job_id} "
+                           f"{'cancelled' if ok else 'cancel UNCONFIRMED — check the RunPod console'}")
+            await asyncio.to_thread(jobs.merge_meta, job_id, {"runpod_cancelled_at_restart": ok})
+        except Exception as e:
+            logger.warning(f"startup: RunPod job {rp} of orphaned job {job_id}: "
+                           f"{type(e).__name__}: {e} — check the RunPod console")
     return n
 
 

@@ -4872,6 +4872,10 @@ class RunpodAdapter(ComfyUIAdapter):
         tr = req.cloud_trace
         tr.setdefault("backend", self.name)
         tr["runpod"] = True
+        # A request is reused across self-retries (the chain): each attempt's trace must
+        # describe only that attempt, or a settled earlier job hides a lost answer now.
+        for k in ("runpod_job_id", "runpod_settled", "create_unconfirmed"):
+            tr.pop(k, None)
         mb = len(raw) / (1024 * 1024)
         try:
             r = await client.post(

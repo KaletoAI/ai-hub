@@ -440,6 +440,12 @@ class BilledPredicate(unittest.TestCase):
         self.assertIn("answer was lost",
                       self.main._billed_cloud_task({"backend": "rp"}, tr, ConnectionError("x")))
 
+    def test_stale_settled_id_does_not_hide_a_lost_answer(self):
+        tr = {"runpod": True, "runpod_job_id": "rp1", "runpod_settled": True,
+              "create_unconfirmed": True}
+        self.assertIn("answer was lost",
+                      self.main._billed_cloud_task({"backend": "rp"}, tr, ConnectionError("x")))
+
     def test_a_refused_create_is_not_billed(self):
         self.assertIsNone(self.main._billed_cloud_task({"backend": "rp"}, {"runpod": True},
                                                        ConnectionError("x")))
@@ -455,6 +461,56 @@ class BilledPredicate(unittest.TestCase):
             self.assertTrue(next(b for b in m.backends if b["name"] == "rp")["paid"])
         finally:
             m.backends[:] = saved[0]
+
+
+class SubmitTrace(unittest.TestCase):
+    def test_submit_clears_the_previous_attempts_keys(self):
+        ad = _adapter()
+        req = _req()
+        req.cloud_trace.update({"runpod_job_id": "rp1", "runpod_settled": True,
+                                "create_unconfirmed": True})
+        rp = _RunPod([DONE], run_status=400)
+
+        async def go():
+            async with httpx.AsyncClient(transport=httpx.MockTransport(rp.handler)) as c:
+                with self.assertRaises(RuntimeError):
+                    await ad._submit(c, URL, b"{}", req)
+        asyncio.run(go())
+        tr = req.cloud_trace
+        self.assertNotIn("runpod_job_id", tr)
+        self.assertNotIn("runpod_settled", tr)
+        self.assertNotIn("create_unconfirmed", tr)
+
+
+class StartupCancelRobust(unittest.TestCase):
+    def test_one_failing_row_does_not_abort_the_rest_and_missing_backend_is_logged(self):
+        m = _main()
+        cancelled = []
+
+        class _Ad:
+            async def cancel_runpod_id(self, rp_id):
+                if rp_id == "bad":
+                    raise RuntimeError("boom")
+                cancelled.append(rp_id)
+                return True
+        b = {"name": "rp", "type": "runpod", "url": URL}
+        with unittest.mock.patch.object(m, "backends", [b]), \
+                unittest.mock.patch.dict(m.backend_adapters, {m.backend_id(b): _Ad()}), \
+                unittest.mock.patch.object(m.jobs, "merge_meta", lambda *a: None), \
+                unittest.mock.patch.object(m.logger, "warning") as warn:
+            asyncio.run(m._cancel_orphaned_runpod(
+                [("j0", "gone", {"runpod_job_id": "rp0"}), ("j1", "rp", {"runpod_job_id": "bad"}),
+                 ("j2", "rp", {"runpod_job_id": "rp2"})]))
+        self.assertEqual(cancelled, ["rp2"])
+        text = "\n".join(str(c.args[0]) for c in warn.call_args_list)
+        self.assertIn("rp0", text)
+        self.assertIn("boom", text)
+
+    def test_note_job_meta_never_raises(self):
+        m = _main()
+        with unittest.mock.patch.object(m.jobs, "_active", True), \
+                unittest.mock.patch.object(m.jobs, "merge_meta", side_effect=RuntimeError("locked")):
+            m._note_job_meta("j", {"a": 1})
 
 
 class StartupCancel(unittest.TestCase):
