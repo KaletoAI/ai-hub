@@ -190,6 +190,51 @@ class Handler(unittest.TestCase):
             handler.OUT_MAX_B64 = old
         self.assertIn("output too large", out["error"])
 
+    def test_over_budget_file_is_never_read(self):
+        import builtins
+        (self.dirs["output"] / "huge.png").write_bytes(b"x" * 300)
+        outputs = {"9": {"images": [{"filename": "huge.png", "type": "output"}]}}
+        real, opened = builtins.open, []
+
+        def spy(f, *a, **k):
+            opened.append(str(f))
+            return real(f, *a, **k)
+        builtins.open = spy
+        try:
+            with self.assertRaises(handler.HandlerError):
+                handler.build_manifest(outputs, [], {k: str(v) for k, v in self.dirs.items()}, 100)
+        finally:
+            builtins.open = real
+        self.assertFalse([o for o in opened if o.endswith("huge.png")])
+
+    def test_dead_comfyui_is_an_error_not_a_hang(self):
+        _ComfyStub.history = {}
+        out = handler.run_prompt({"op": "prompt", "workflow": {}, "inputs": []}, self.base,
+                                 {k: str(v) for k, v in self.dirs.items()},
+                                 report=lambda p: None, poll_s=0.01, alive=lambda: False)
+        self.assertIn("died", out["error"])
+
+    def test_comfyui_gone_after_submit_is_an_error(self):
+        _ComfyStub.history = {}
+        calls = []
+
+        def alive():
+            calls.append(1)
+            if len(calls) == 2:
+                self.srv.shutdown()
+                self.srv.server_close()
+            return True
+        out = handler.run_prompt({"op": "prompt", "workflow": {}, "inputs": []}, self.base,
+                                 {k: str(v) for k, v in self.dirs.items()},
+                                 report=lambda p: None, poll_s=0.01, alive=alive)
+        self.assertIn("error", out)
+        self.srv = _serve()[0]          # tearDown shuts a live one down
+
+    def test_malformed_inputs_are_errors(self):
+        for bad in ([{"name": "ok.png", "b64": "***not base64***"}], ["notadict"]):
+            out = self._run({"op": "prompt", "workflow": {}, "inputs": bad})
+            self.assertIn("error", out, bad)
+
     def test_node_errors_and_execution_errors_pass_through(self):
         _ComfyStub.prompt_reply = {"error": {"message": "bad"}, "node_errors": {"4": {"x": 1}}}
         self.assertIn("node_errors", self._run({"op": "prompt", "workflow": {}, "inputs": []})["error"])

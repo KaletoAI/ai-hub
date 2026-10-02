@@ -10,6 +10,7 @@ Apache-2.0). The contract (adapters.RunpodAdapter reads it):
 Everything but `main()` is plain functions over a base URL, testable without the runpod
 SDK and without a GPU (tests/test_runpod_worker.py)."""
 import base64
+import binascii
 import glob
 import gzip
 import hashlib
@@ -134,11 +135,13 @@ def build_manifest(outputs: dict, sibling_exts: list, dirs: dict, max_b64: int) 
         if not os.path.isfile(path):
             man[key] = None
             return
+        n = os.path.getsize(path)
+        need = total + 4 * ((n + 2) // 3)       # base64 size, judged BEFORE reading
+        if need > max_b64:
+            raise HandlerError(f"output too large ({need / 1048576:.1f} MB base64) — "
+                               "milestone 1 returns base64 only (≤ 7 MB)")
         e = _entry(path)
         total += len(e["b64"])
-        if total > max_b64:
-            raise HandlerError(f"output too large ({total / 1048576:.1f} MB base64) — "
-                               "milestone 1 returns base64 only (≤ 7 MB)")
         man[key] = e
 
     for out in (outputs or {}).values():
@@ -207,7 +210,8 @@ def _follow_progress(base: str, client_id: str, prompt_id: str, report, stop: th
         return
 
 
-def run_prompt(job_input: dict, base: str, dirs: dict, report, poll_s: float = 1.0) -> dict:
+def run_prompt(job_input: dict, base: str, dirs: dict, report, poll_s: float = 1.0,
+               alive=lambda: True) -> dict:
     try:
         write_inputs(job_input.get("inputs") or [], dirs["input"])
         client_id = f"gw-{uuid.uuid4().hex[:12]}"
@@ -225,6 +229,8 @@ def run_prompt(job_input: dict, base: str, dirs: dict, report, poll_s: float = 1
                          daemon=True).start()
         try:
             while True:
+                if not alive():
+                    return {"error": "ComfyUI died during the prompt"}
                 time.sleep(poll_s)
                 st, body = _http("GET", f"{base}/history/{pid}")
                 if st != 200:
@@ -244,6 +250,8 @@ def run_prompt(job_input: dict, base: str, dirs: dict, report, poll_s: float = 1
         return {"outputs": outputs, "manifest": man, "worker_version": _worker_version()}
     except HandlerError as e:
         return {"error": str(e)}
+    except (OSError, ValueError, binascii.Error, AttributeError, TypeError) as e:
+        return {"error": f"{type(e).__name__}: {e}"[:4000]}
 
 
 def run_info(base: str, roots: dict) -> dict:
@@ -280,7 +288,8 @@ def main() -> None:
             return run_info(COMFY, MODEL_ROOTS)
         if inp.get("op") == "prompt":
             return run_prompt(inp, COMFY, DIRS,
-                              report=lambda p: runpod.serverless.progress_update(job, p))
+                              report=lambda p: runpod.serverless.progress_update(job, p),
+                              alive=lambda: proc.poll() is None)
         return {"error": f"unknown op {inp.get('op')!r}"}
 
     runpod.serverless.start({"handler": handle})
