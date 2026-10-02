@@ -4717,6 +4717,15 @@ def runpod_endpoint_id(url: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def _rp_check_url(url: str) -> None:
+    """The RunPod API key travels as a bearer header: it may only ever go to
+    api.runpod.ai. A url the endpoint rule does not accept (a config typo, a hand-edited
+    store row — the console refuses those) is refused before any request is made."""
+    if not runpod_endpoint_id(url):
+        raise RuntimeError("url must be https://api.runpod.ai/v2/<endpoint id> — "
+                           "nothing sent (the API key goes to api.runpod.ai only)")
+
+
 class RunpodIO(GenIO):
     """Inputs go INTO the /run payload (base64) instead of onto a box; the placeholder
     is baked into the worker image; node types come from the probe snapshot."""
@@ -4891,6 +4900,7 @@ class RunpodAdapter(ComfyUIAdapter):
         self.probe_state = {**prev, "state": "running", "started": int(time.time())}
         req = NormalizedRequest(alias="(probe)")
         try:
+            _rp_check_url(url)
             max_wait = float(b.get("max_wait", 600))
             raw = json.dumps({"input": {"op": "info"},
                               "policy": {"executionTimeout": int(max_wait * 1000),
@@ -4938,8 +4948,10 @@ class RunpodAdapter(ComfyUIAdapter):
 
     async def cancel_runpod_id(self, rp_id: str, url: str = "") -> bool:
         try:
+            u = (url or self.backend["url"]).rstrip("/")
+            _rp_check_url(u)
             async with _pooled_client(self.ctx) as c:
-                return await self._cancel_rp(c, (url or self.backend["url"]).rstrip("/"), rp_id)
+                return await self._cancel_rp(c, u, rp_id)
         except Exception:
             return False
 
@@ -5133,6 +5145,7 @@ class RunpodAdapter(ComfyUIAdapter):
     async def _execute(self, req: NormalizedRequest, built: BuiltPrompt, client):
         b = self.backend
         url = b["url"].rstrip("/")
+        _rp_check_url(url)                       # before a byte of the request is sent
         poll_interval = float(b.get("poll_interval", 2.0))
         max_wait = float(b.get("max_wait", 600))
         queue_max = float(b.get("queue_max_s", 300))

@@ -1094,5 +1094,30 @@ class InputNamesAndWorkerErrors(unittest.TestCase):
         self.assertIn("RunPod job rp1", str(cm.exception))
 
 
+
+class KeyStaysAtRunPod(unittest.TestCase):
+    """Item 12a (final review): only discovery checked the url. A config-defined runpod
+    backend with a typo'd or foreign url sent its RunPod API key — and the job's inputs —
+    to that host on a probe, a job or a cancel."""
+
+    BAD = ("https://evil.example/v2/ep1", "http://api.runpod.ai/v2/ep1",
+           "https://api.runpod.ai.evil.example/v2/ep1")
+
+    def test_nothing_is_sent_to_a_foreign_url(self):
+        for bad in self.BAD:
+            rp = _RunPod([INFO])
+            ad = _adapter(url=bad)
+            real = httpx.AsyncClient
+            ad.ctx.http_client = lambda: real(transport=httpx.MockTransport(rp.handler))
+            st = asyncio.run(ad.probe())
+            self.assertEqual(st["state"], "failed", bad)
+            self.assertIn("api.runpod.ai only", st["error"])
+            with self.assertRaises(RuntimeError):
+                _run(rp, lambda: ad.generate(_req()))
+            self.assertFalse(_run(rp, lambda: ad.cancel_runpod_id("rp1")))
+            self.assertFalse(_run(rp, lambda: _adapter().cancel_runpod_id("rp1", url=bad)))
+            self.assertEqual(rp.paths, [], bad)
+
+
 if __name__ == "__main__":
     unittest.main()
