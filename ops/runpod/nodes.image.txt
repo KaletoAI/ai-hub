@@ -1,0 +1,9 @@
+# Image profile of the RunPod worker — Qwen-Image 2.1. Every line is copied VERBATIM from
+# ops/thunder-nodes.default.txt (tests/test_runpod_worker.py pins that), chosen from the
+# workflow's classes via k12-gpu's /object_info python_module (2026-10-02):
+#   UnetLoaderGGUF → ComfyUI-GGUF, ClipLoaderGGUF → gguf, ColorMatchV2 → ComfyUI-KJNodes,
+#   Lora Loader Stack / Any Switch (rgthree) → rgthree-comfy; the rest is ComfyUI core.
+https://github.com/leejet/ComfyUI-GGUF@cee9bb157560e17708d93f2716e51a1a30d24f0b
+https://github.com/kijai/ComfyUI-KJNodes@e8e88f7c88e3f6205b122f5de87e69a09fbce5ac
+https://github.com/rgthree/rgthree-comfy.git@27b4f4cdcf3b127c29d5d8135ac1536ecbd4c383
+registry:gguf@2.9.8

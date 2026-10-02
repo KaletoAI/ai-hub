@@ -1,0 +1,16 @@
+# ComfyUI reads models from the RunPod network volume (mounted at /runpod-volume)
+# in addition to /comfyui/models inside the image. Layout on the volume:
+#   /runpod-volume/models/<folder>/<file> — the same tree as ComfyUI/models.
+runpod_volume:
+  base_path: /runpod-volume/models
+  checkpoints: checkpoints
+  diffusion_models: diffusion_models
+  unet: unet
+  text_encoders: text_encoders
+  clip: clip
+  clip_vision: clip_vision
+  vae: vae
+  loras: loras
+  upscale_models: upscale_models
+  controlnet: controlnet
+  embeddings: embeddings

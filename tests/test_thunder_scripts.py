@@ -251,9 +251,11 @@ class SplitScripts(unittest.TestCase):
             self.assertNotIn(needle, h, needle)
 
     def test_node_parser_copies_are_identical(self):
-        # a script streamed over ssh cannot source a shared file; the two copies must
-        # not drift (the template report and the install would disagree on a name)
+        # a script streamed over ssh cannot source a shared file; the copies must not
+        # drift (the template report, the install and the RunPod image would disagree)
+        rp = pathlib.Path("ops/runpod/install-nodes.sh")
         self.assertEqual(_func(HOST, "parse_node_line"), _func(P, "parse_node_line"))
+        self.assertEqual(_func(rp, "parse_node_line"), _func(P, "parse_node_line"))
         self.assertEqual(_parse("registry:gguf@2.9.8", HOST)[:3], (0, "registry", "gguf"))
 
 
