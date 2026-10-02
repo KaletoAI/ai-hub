@@ -525,5 +525,86 @@ class Api(_Fixture):
         self.assertIn("never edits the prompt", j["loras"]["trigger_words"])
 
 
+class Console(_Fixture):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        main.backends = [dict(BK)]
+        main.backend_loras = {main.backend_id(BK): {"a.safetensors"}}
+        self.lan.files = {PA: A}
+        evil = version(["<script>alert(1)</script>", "fine word"])
+        evil["model"]["name"] = "<img src=x onerror=alert(2)>"
+        self.civ.answers[sha_of(A)] = (200, evil, {})
+        await self.drain()
+        self.c = TestClient(main.app)
+
+    def page(self, **kw):
+        r = self.c.get("/ui/routing?sub=loras", headers=SAME, **kw)
+        self.assertEqual(r.status_code, 200, r.text[-400:])
+        return r.text
+
+    def post(self, url, data=None, status=303):
+        r = self.c.post(url, data=data or {}, headers=SAME, follow_redirects=False)
+        self.assertEqual(r.status_code, status, r.text[-600:])
+        return r
+
+    def test_row_escapes_civitai_text_and_links_from_ids(self):
+        main.lora_meta[sha_of(A)]["civitai"]["url"] = "javascript:alert(3)"   # never used
+        h = self.page()
+        self.assertIn('data-k="lora-a.safetensors"', h)
+        self.assertNotIn("<script>alert(1)", h)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", h)
+        self.assertNotIn("<img src=x", h)
+        self.assertIn('href="https://civitai.com/models/11?modelVersionId=22"', h)
+        self.assertNotIn("javascript:alert(3)", h)
+        self.assertIn("Flux.1 D", h)
+
+    def test_curate_save_clear_and_stale(self):
+        r = self.post("/ui/loras/curate", {"sha": sha_of(A), "name": "a.safetensors",
+                                           "words": "one\ntwo, three\n"})
+        self.assertIn("sub=loras", r.headers["location"])
+        self.assertEqual(main.lora_meta[sha_of(A)]["curated"], ["one", "two, three"])
+        self.post("/ui/loras/curate", {"sha": sha_of(A), "name": "a.safetensors",
+                                       "words": "x", "act": "clear"})
+        self.assertIsNone(main.lora_meta[sha_of(A)]["curated"])
+        r = self.post("/ui/loras/curate", {"sha": "9" * 64, "name": "a.safetensors",
+                                           "words": "x"}, status=400)
+        self.assertIn("changed", r.text)
+        self.assertNotIn("9" * 64, main.lora_meta)
+
+    def test_curate_crlf_and_blank(self):
+        # Review Focus 4: CRLF, trailing blanks, whitespace only → [] (deliberately none)
+        self.post("/ui/loras/curate", {"sha": sha_of(A), "name": "a.safetensors",
+                                       "words": "a\r\n b \r\n\r\n"})
+        self.assertEqual(main.lora_meta[sha_of(A)]["curated"], ["a", "b"])
+        self.post("/ui/loras/curate", {"sha": sha_of(A), "name": "a.safetensors",
+                                       "words": "  \r\n \r\n"})
+        self.assertEqual(main.lora_meta[sha_of(A)]["curated"], [])
+        self.assertIn("deliberately none", self.page())
+
+    def test_refresh_actions(self):
+        r = self.post("/ui/loras/refresh-all")
+        self.assertIn("sub=loras", r.headers["location"])
+        self.assertIn(sha_of(A), main._lm_refetch)
+        self.post("/ui/loras/refresh?name=a.safetensors")
+        self.assertNotIn(PA, main._lm_state["shas"])
+
+    def test_actions_are_post_only(self):
+        for u in ("/ui/loras/curate", "/ui/loras/refresh", "/ui/loras/refresh-all"):
+            self.assertTrue(admin._is_post_action(u), u)
+            self.assertEqual(self.c.get(u, headers=SAME).status_code, 405, u)
+
+    def test_live_only_while_busy(self):
+        # `data-live` also appears inside _LIVE_JS — check the <main> attribute itself
+        self.assertNotIn("<main data-live", self.page())
+        self.lan.files[PB] = B                                    # a new LoRA appears
+        main._lm_state["share"] = loratags.share_loras(self.lan.cached())
+        self.assertIn('<main data-live="5"', self.page())
+
+    def test_no_share_says_where_to_set_it_up(self):
+        main._lm_state = main._lm_initial_state()
+        h = self.page()
+        self.assertIn("/ui/server?sub=models", h)
+
+
 if __name__ == "__main__":
     unittest.main()

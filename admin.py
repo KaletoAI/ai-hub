@@ -193,6 +193,14 @@ _voice_dir_ok: Callable[[str], bool] = lambda d: True
 _apply_hosts: Callable[[], None] = lambda: None           # refresh main's hosts_meta cache
 # ComfyUI backend name → sorted installed LoRA filenames (discovery, verbatim).
 _backend_loras: Callable[[], dict] = lambda: {}
+# LoRA trigger words (main.lora_*; spec 2026-10-02): the LoRAs tab's view (memory only,
+# None = not available), the curate save (async (sha, words | None) → refusal, "" =
+# saved) and the two refreshes (async → banner text). Information only — nothing here
+# edits a prompt.
+_lora_meta_view: Callable[[], Optional[dict]] = lambda: None
+_lora_curate: Callable = None
+_lora_refresh: Callable = None
+_lora_refresh_all: Callable = None
 # Managed hosts (main.host_*): the names the console shows, a host's view (the
 # controller's view + options/api_key_set/managed/not_attachable; None = no such host)
 # and the async console action (name, action, bid=None, paths=None) → message — always
@@ -979,6 +987,8 @@ _POST_ACTIONS = frozenset((
     # Server → Models → Model sources (Check & save of a URL or a repo, remove)
     "/ui/hosts/managed/source-check", "/ui/hosts/managed/source-check-dir",
     "/ui/hosts/managed/source-remove",
+    # Input & Routing → LoRAs: trigger words (curate, refresh one, refresh all)
+    "/ui/loras/curate", "/ui/loras/refresh", "/ui/loras/refresh-all",
     "/ui/chat/badd", "/ui/chat/bdel", "/ui/chat/delete",
     "/ui/mapping/field-add", "/ui/mapping/field-map", "/ui/mapping/field-clear",
     "/ui/mapping/field-del", "/ui/mapping/cand-add", "/ui/mapping/cand-del",
@@ -4811,33 +4821,137 @@ def _routing_gen_body(bmeta: dict, sel: Optional[str] = None) -> str:
                if grows else "<p class='muted'>No generation aliases configured.</p>"))
 
 
-def _routing_loras_body(bmeta: dict) -> str:
-    """LoRA → hosting ComfyUI backends (from discovery) — searchable, so a client
-    string can be checked byte-for-byte against what the backends really expose."""
+_LORA_STATUS = {"curated": ("curated", "ok"), "civitai": ("Civitai", "ok"),
+                "not_on_civitai": ("not on Civitai", "muted"),
+                "pending": ("not determined yet", "warn"),
+                "not_on_share": ("not on the share", "muted"),
+                "unavailable": ("no LAN share", "muted")}
+
+
+def _civitai_link(civ: dict) -> str:
+    """The Civitai page of a row, built from its integer ids ONLY — the stored `url` is
+    third-party-derived text and is never put into an href."""
+    mid, vid = civ.get("model_id"), civ.get("version_id")
+    if isinstance(mid, int) and not isinstance(mid, bool) and mid > 0:
+        link = f"https://civitai.com/models/{mid}"
+        if isinstance(vid, int) and not isinstance(vid, bool) and vid > 0:
+            link += f"?modelVersionId={vid}"
+        return link
+    return ""
+
+
+def _lora_words_cell(it: dict) -> str:
+    """Curated entries first (bold; an empty list says so), then Civitai's raw entries,
+    muted — one entry per line, every one escaped (third-party text)."""
+    cur = it.get("curated")
+    raw = (it.get("civitai") or {}).get("trained_words") or []
+    out = ""
+    if cur is not None:
+        out += ("".join(f"<div><b>{_esc(w)}</b></div>" for w in cur)
+                or "<div class='muted'><i>deliberately none</i></div>")
+    if raw:
+        out += ("<div class='muted' style='margin-top:4px'>Civitai:</div>" if cur is not None else "")
+        out += "".join(f"<div class='muted'>{_esc(w)}</div>" for w in raw)
+    return out or "<span class='muted'>—</span>"
+
+
+def _lora_editor(it: dict) -> str:
+    """The curate form of a row with a sha: one entry per line (entries may hold commas);
+    Save stores the lines (blank = deliberately none), *Use Civitai list* drops the
+    curated list. Carries the sha it SHOWS — a file changed since is refused."""
+    sha = it.get("sha256")
+    if not sha:
+        return ""
+    cur = it.get("curated")
+    text = "\n".join(cur) if cur is not None else ""
+    refresh = _btn("Refresh", "/ui/loras/refresh?name=" + _q(it["name"]), "secondary",
+                   sm=True, title="re-hash this file and ask Civitai again")
+    return ("<details><summary class='muted'>edit trigger words</summary>"
+            "<form method='post' action='/ui/loras/curate' data-guard>"
+            f"<input type='hidden' name='sha' value='{_esc(sha)}'>"
+            f"<input type='hidden' name='name' value='{_esc(it['name'])}'>"
+            f"<textarea name='words' rows='4' class='box' style='width:100%' "
+            f"placeholder='one entry per line — blank = deliberately none'>{_esc(text)}</textarea>"
+            f"<div>{_btn('Save', submit=True, sm=True)} "
+            "<button type='submit' name='act' value='clear' class='btn secondary sm'>"
+            f"Use Civitai list</button> {refresh}</div></form></details>")
+
+
+def _lora_status_line(v: dict) -> str:
+    if not v.get("configured"):
+        return ("<p class='hint' data-k='lora-meta-status'>Trigger words: no LAN model "
+                "share set up — enter the share host under "
+                "<a href='/ui/server?sub=models'>Server → Models</a>. Until then every LoRA "
+                "reads “no LAN share”.</p>")
+    c = v.get("counts") or {}
+    if v.get("problem"):
+        parts = [f"LAN share: {_esc(v['problem'])}"]
+    else:
+        parts = [f"hashed {c.get('hashed', 0)} / {c.get('files', 0)}",
+                 f"Civitai: {c.get('found', 0)} found · {c.get('not_found', 0)} not on "
+                 f"Civitai · {c.get('civitai_pending', 0)} open"]
+        if v.get("hashing"):
+            parts.append(f"hashing {_esc(v['hashing'])}")
+        if v.get("pause_until"):
+            parts.append("Civitai paused until " + _esc(
+                time.strftime("%H:%M:%S", time.localtime(v["pause_until"]))))
+    if v.get("last_error"):
+        parts.append(f"<span class='bad'>last error: {_esc(v['last_error'])}</span>")
+    if v.get("last_run"):
+        parts.append(f"last pass {_ago_text(time.time() - v['last_run'])}")
+    btn = _btn("Refresh all from Civitai", "/ui/loras/refresh-all", "secondary", sm=True,
+               confirm="Ask Civitai again for every LoRA hash, including ones not found "
+                       "before? Curated lists stay.")
+    return f"<p class='hint' data-k='lora-meta-status'>{' · '.join(parts)} {btn}</p>"
+
+
+def _routing_loras_body(bmeta: dict, view: Optional[dict] = None, msg: str = "",
+                        detail: str = "") -> str:
+    """LoRA → hosting ComfyUI backends (from discovery) plus each LoRA's trigger words
+    (spec 2026-10-02): curated and Civitai's raw list, status, base model, Civitai link
+    and the curate editor. Information only — the gateway never edits a prompt."""
+    v = view if view is not None else (_lora_meta_view() or {"configured": False, "rows": []})
     per_backend = _backend_loras()
-    hosts: dict = {}
-    for bn, loras in per_backend.items():
-        for name in loras:
-            hosts.setdefault(name, []).append(bn)
-    if not hosts:
-        return ("<h2>LoRAs → backends</h2><p class='muted'>No LoRAs discovered — no ComfyUI "
-                "backend up, or none installed.</p>")
+    banner = (f"<p class='hint' role='status' data-k='loras-msg'><b>{_esc(msg[:600])}</b></p>"
+              if msg else "")
+    if detail:
+        banner += f"<p class='bad' role='alert' data-k='loras-refused'>{_esc(detail[:600])}</p>"
+    head = "<h2>LoRAs → backends · trigger words</h2>" + banner + _lora_status_line(v)
+    if not v.get("rows"):
+        return head + ("<p class='muted'>No LoRAs discovered — no ComfyUI backend up, none "
+                       "installed, and none on the LAN share.</p>")
     rows = ""
-    for name in sorted(hosts):
+    for it in v["rows"]:
         chips = " ".join(
             f'<span class="badge {"ok" if (bmeta.get(bn) or {}).get("healthy") else "bad"}">{_esc(bn)}</span>'
-            for bn in sorted(hosts[name]))
-        rows += f'<tr><td><code>{_esc(name)}</code></td><td>{chips}</td></tr>'
-    search = (f"<input id='sf' autocomplete='off' oninput='sfRun()' placeholder='filter LoRAs…' "
-              f"class='box' style='min-width:260px;max-width:420px'>")
-    counts = " · ".join(f"{_esc(bn)}: {len(v)}" for bn, v in sorted(per_backend.items()))
-    return ("<h2>LoRAs → backends</h2>"
-            "<p class='hint'>Installed LoRAs per ComfyUI backend (from discovery, verbatim incl. "
-            "subfolder prefixes — requests must match these strings exactly). "
-            f"<span class='muted'>{counts}</span></p>"
-            f"<div style='margin:6px 0 10px'>{search}</div>"
-            "<table class='filterable sortable' data-sk='routing-loras'>"
-            f"<tr><th>lora</th><th>on backends</th></tr>{rows}</table>"
+            for bn in it.get("backends") or []) or "<span class='muted'>share only</span>"
+        label, kind = _LORA_STATUS.get(it["status"], (it["status"], "muted"))
+        civ = it.get("civitai") or {}
+        url = _civitai_link(civ)
+        link = ((f'<a href="{_esc(url)}" rel="noopener noreferrer" target="_blank">'
+                 f"{_esc(civ.get('model_name') or 'Civitai')}</a>"
+                 + (f"<div class='muted'>{_esc(civ['version_name'])}</div>"
+                    if civ.get("version_name") else ""))
+                if url else "<span class='muted'>—</span>")
+        rows += (f'<tr data-k="lora-{_esc(it["name"])}">'
+                 f'<td data-sv="{_esc(it["name"])}"><code>{_esc(it["name"])}</code>'
+                 f'{_lora_editor(it)}</td><td>{chips}</td>'
+                 f'<td data-sv="{_esc(it["status"])}">{_badge(label, kind, title=it.get("error") or "")}</td>'
+                 f'<td>{_lora_words_cell(it)}</td>'
+                 f'<td>{_esc(civ.get("base_model") or "")}</td><td>{link}</td></tr>')
+    search = ("<input id='sf' autocomplete='off' oninput='sfRun()' placeholder='filter LoRAs…' "
+              "class='box' style='min-width:260px;max-width:420px'>")
+    counts = " · ".join(f"{_esc(bn)}: {len(names)}" for bn, names in sorted(per_backend.items()))
+    return (head
+            + "<p class='hint'>Installed LoRAs per ComfyUI backend (from discovery, verbatim "
+              "incl. subfolder prefixes — requests must match these strings exactly) and every "
+              "LoRA on the LAN share. Trigger words come from Civitai by the file's sha256; a "
+              "curated list replaces them for clients. The gateway never edits a prompt. "
+              f"<span class='muted'>{counts}</span></p>"
+            + f"<div style='margin:6px 0 10px'>{search}</div>"
+            + "<table class='filterable sortable' data-sk='routing-loras'>"
+              "<tr><th>lora</th><th>on backends</th><th>status</th><th>trigger words</th>"
+              f"<th>base model</th><th>Civitai</th></tr>{rows}</table>"
             + _FILTER_JS)
 
 
@@ -4853,6 +4967,7 @@ async def routing_page(request: Request):
         return RedirectResponse(f"/ui/aliases?{urlencode(qs)}", status_code=307)
     info = _gateway_info()
     bmeta = {b["name"]: b for b in info.get("backends", []) if b.get("type") in adapters.GEN_TYPES}
+    refresh = None
     if sub == "llm":
         snap = _routing_snapshot()
         on_llm = [m for m in snap.get("models", [])
@@ -4878,10 +4993,58 @@ async def routing_page(request: Request):
             "backends (e.g. flux.* on localai — matched by name, no type metadata).</p>"
             + _models_table(img_models + img_on_llm))
     elif sub == "loras":
-        title, body = "LoRAs", _routing_loras_body(bmeta)
+        v = _lora_meta_view()
+        title = "LoRAs"
+        body = _routing_loras_body(bmeta, view=v, msg=request.query_params.get("msg", ""))
+        refresh = 5 if (v or {}).get("busy") else None
     else:
         sub, title, body = "input", "Input", _input_body()
-    return HTMLResponse(_page(title, body, "routing", subnav=_subnav("routing", sub)))
+    return HTMLResponse(_page(title, body, "routing", refresh=refresh,
+                              subnav=_subnav("routing", sub)))
+
+
+def _loras_msg(msg: str) -> RedirectResponse:
+    return RedirectResponse("/ui/routing?sub=loras&msg=" + _q(msg[:600]), status_code=303)
+
+
+def _loras_refused(detail: str) -> HTMLResponse:
+    """A refused curate: 400 with the tab re-rendered and the reason — never a write."""
+    info = _gateway_info()
+    bmeta = {b["name"]: b for b in info.get("backends", []) if b.get("type") in adapters.GEN_TYPES}
+    return HTMLResponse(_page("LoRAs", _routing_loras_body(bmeta, detail=detail), "routing",
+                              subnav=_subnav("routing", "loras")), status_code=400)
+
+
+async def loras_curate(request: Request):
+    """LoRAs tab: save a LoRA file's curated trigger words (one entry per line; blank =
+    deliberately none) or drop them (`act=clear` → Civitai's list again)."""
+    f = await _form(request)
+    sha, name = (f.get("sha") or "").strip(), (f.get("name") or "").strip()
+    if f.get("act") == "clear":
+        words = None
+    else:
+        words = (f.get("words") or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if _lora_curate is None:
+        return _loras_msg("trigger words are not available here")
+    refusal = await _lora_curate(sha, words)
+    if refusal:
+        return _loras_refused(refusal)
+    return _loras_msg(f"trigger words of {name}: "
+                      + ("back to Civitai's list" if words is None else "saved"))
+
+
+async def loras_refresh(request: Request):
+    f = await _form(request)
+    name = (f.get("name") or request.query_params.get("name") or "").strip()
+    if _lora_refresh is None:
+        return _loras_msg("trigger words are not available here")
+    return _loras_msg(str(await _lora_refresh(name)))
+
+
+async def loras_refresh_all(request: Request):
+    if _lora_refresh_all is None:
+        return _loras_msg("trigger words are not available here")
+    return _loras_msg(str(await _lora_refresh_all()))
 
 
 # ── Tab: Chat (LLM alias management) ────────────────────────────────────────────
@@ -10628,6 +10791,9 @@ def register(app) -> None:
     app.add_api_route("/ui/hosts/managed/source-remove", hosts_source_remove, methods=["POST"])
     app.add_api_route("/ui/input", input_page, methods=["GET"])
     app.add_api_route("/ui/routing", routing_page, methods=["GET"])
+    app.add_api_route("/ui/loras/curate", loras_curate, methods=["POST"])
+    app.add_api_route("/ui/loras/refresh", loras_refresh, methods=["POST"])
+    app.add_api_route("/ui/loras/refresh-all", loras_refresh_all, methods=["POST"])
     app.add_api_route("/ui/chat/create", chat_create, methods=["POST"])
     app.add_api_route("/ui/chat/save", chat_save, methods=["POST"])
     app.add_api_route("/ui/chat/badd", chat_badd, methods=["POST"])

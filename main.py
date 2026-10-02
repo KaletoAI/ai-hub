@@ -8573,7 +8573,9 @@ admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comf
            check_source=check_source, check_dir_source=check_dir_source,
            remove_source=remove_source,
            backend_loras=lambda: {b["name"]: sorted(backend_loras.get(backend_id(b), set()))
-                                  for b in backends if b.get("type") == "comfyui"})
+                                  for b in backends if b.get("type") == "comfyui"},
+           lora_meta_view=lora_meta_view, lora_curate=lora_curate,
+           lora_refresh=lora_refresh, lora_refresh_all=lora_refresh_all)
 
 
 def _health_full_allowed(request: Request, authorization: Optional[str],
