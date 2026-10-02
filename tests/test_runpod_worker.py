@@ -72,3 +72,145 @@ class BuildContext(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+import base64  # noqa: E402
+import hashlib  # noqa: E402
+import json  # noqa: E402
+import tempfile  # noqa: E402
+import threading  # noqa: E402
+from http.server import BaseHTTPRequestHandler, HTTPServer  # noqa: E402
+
+sys.path.insert(0, str(RP))
+import handler  # noqa: E402
+
+
+class _ComfyStub(BaseHTTPRequestHandler):
+    """POST /prompt → prompt id (or node_errors); GET /history/<id> → `history`."""
+    history: dict = {}
+    prompt_reply: dict = {"prompt_id": "p1"}
+    prompts: list = []
+
+    def log_message(self, *a):
+        pass
+
+    def _json(self, code, obj):
+        b = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        _ComfyStub.prompts.append(json.loads(self.rfile.read(n)))
+        self._json(200, _ComfyStub.prompt_reply)
+
+    def do_GET(self):
+        if self.path.startswith("/history/"):
+            return self._json(200, _ComfyStub.history)
+        if self.path == "/object_info":
+            return self._json(200, {"KSampler": {"input": {}, "output": ["LATENT"]}})
+        self._json(404, {})
+
+
+def _serve():
+    srv = HTTPServer(("127.0.0.1", 0), _ComfyStub)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, f"http://127.0.0.1:{srv.server_address[1]}"
+
+
+class Handler(unittest.TestCase):
+    def setUp(self):
+        self.t = tempfile.TemporaryDirectory()
+        root = pathlib.Path(self.t.name)
+        self.dirs = {k: root / k for k in ("input", "output", "temp")}
+        for d in self.dirs.values():
+            d.mkdir()
+        self.srv, self.base = _serve()
+        _ComfyStub.prompts = []
+        _ComfyStub.prompt_reply = {"prompt_id": "p1"}
+
+    def tearDown(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+        self.t.cleanup()
+
+    def _run(self, job_input):
+        return handler.run_prompt(job_input, self.base, {k: str(v) for k, v in self.dirs.items()},
+                                  report=lambda p: None, poll_s=0.01)
+
+    def test_view_key_matches_gateway_view_params(self):
+        items = [{"filename": "a.png", "subfolder": "", "type": "output"},
+                 {"filename": "b.png", "subfolder": "x/y", "type": "temp"},
+                 "/comfyui/output/sub/m.glb", "/comfyui/temp/p.glb", "rel/dir/q.fbx",
+                 "/abs/elsewhere/r.glb", True, "not a file"]
+        for it in items:
+            mine = handler.view_params(it)
+            theirs = adapters._view_params(it)
+            self.assertEqual(mine, theirs, it)
+
+    def test_inputs_written_and_names_held_to_plain_characters(self):
+        handler.write_inputs([{"name": "gw_j_image.png", "b64": base64.b64encode(b"x").decode()}],
+                             str(self.dirs["input"]))
+        self.assertEqual((self.dirs["input"] / "gw_j_image.png").read_bytes(), b"x")
+        with self.assertRaises(handler.HandlerError):
+            handler.write_inputs([{"name": "../etc/x", "b64": ""}], str(self.dirs["input"]))
+
+    def test_manifest_has_files_siblings_temp_and_null_for_missing(self):
+        (self.dirs["output"] / "o_00001_.png").write_bytes(b"png")
+        (self.dirs["output"] / "m.fbx").write_bytes(b"fbx")
+        (self.dirs["output"] / "m.glb").write_bytes(b"glb")
+        (self.dirs["temp"] / "prev.glb").write_bytes(b"tmp")
+        _ComfyStub.history = {"p1": {"status": {"status_str": "success"}, "outputs": {
+            "9": {"images": [{"filename": "o_00001_.png", "subfolder": "", "type": "output"},
+                             {"filename": "gone.png", "subfolder": "", "type": "output"}]},
+            "10": {"result": [str(self.dirs["temp"] / "prev.glb"), "m.fbx"]}}}}
+        out = self._run({"op": "prompt", "workflow": {"1": {}}, "inputs": [],
+                         "deliver": {"sibling_exts": ["glb"]}})
+        man = out["manifest"]
+        self.assertEqual(base64.b64decode(man["output/o_00001_.png"]["b64"]), b"png")
+        self.assertEqual(man["output/o_00001_.png"]["sha256"], hashlib.sha256(b"png").hexdigest())
+        self.assertIsNone(man["output/gone.png"])
+        self.assertEqual(base64.b64decode(man["temp/prev.glb"]["b64"]), b"tmp")
+        self.assertEqual(base64.b64decode(man["output/m.glb"]["b64"]), b"glb")
+        self.assertIn("outputs", out)
+        self.assertEqual(_ComfyStub.prompts[0]["prompt"], {"1": {}})
+
+    def test_output_over_the_cap_is_an_error(self):
+        (self.dirs["output"] / "big.png").write_bytes(b"x" * 300)
+        _ComfyStub.history = {"p1": {"status": {"status_str": "success"}, "outputs": {
+            "9": {"images": [{"filename": "big.png", "type": "output"}]}}}}
+        old = handler.OUT_MAX_B64
+        handler.OUT_MAX_B64 = 100
+        try:
+            out = self._run({"op": "prompt", "workflow": {}, "inputs": []})
+        finally:
+            handler.OUT_MAX_B64 = old
+        self.assertIn("output too large", out["error"])
+
+    def test_node_errors_and_execution_errors_pass_through(self):
+        _ComfyStub.prompt_reply = {"error": {"message": "bad"}, "node_errors": {"4": {"x": 1}}}
+        self.assertIn("node_errors", self._run({"op": "prompt", "workflow": {}, "inputs": []})["error"])
+        _ComfyStub.prompt_reply = {"prompt_id": "p1"}
+        _ComfyStub.history = {"p1": {"status": {"status_str": "error", "messages": [
+            ["execution_error", {"node_id": "4", "exception_message": "CUDA out of memory"}]]},
+            "outputs": {}}}
+        self.assertIn("CUDA out of memory",
+                      self._run({"op": "prompt", "workflow": {}, "inputs": []})["error"])
+
+    def test_info_returns_gzipped_object_info_and_model_index(self):
+        m = pathlib.Path(self.t.name, "models", "unet")
+        m.mkdir(parents=True)
+        (m / "q.gguf").write_bytes(b"1234")
+        out = handler.run_info(self.base, {"image": str(pathlib.Path(self.t.name, "models")),
+                                           "volume": str(pathlib.Path(self.t.name, "none"))})
+        import gzip
+        oi = json.loads(gzip.decompress(base64.b64decode(out["object_info_gz"])))
+        self.assertIn("KSampler", oi)
+        self.assertEqual(out["models"]["image"], {"models/unet/q.gguf": 4})
+        self.assertEqual(out["models"]["volume"], {})
+
+    def test_artifact_extensions_equal_the_gateways(self):
+        self.assertEqual(set(handler.ARTIFACT_EXTS), set(adapters._MIME_BY_EXT))
