@@ -218,6 +218,222 @@ class CivitaiClient(_Fixture):
                          ("error", "invalid sha256"))
         self.assertEqual(self.civ.calls, [])
 
+    async def test_pathological_answers_never_raise(self):
+        s = "a1" * 32
+        self.civ.answers[s] = (200, "[" * 100000, {})
+        self.assertEqual(await main._civitai_lookup(s), ("error", "unparsable answer"))
+        s2 = "b2" * 32
+        self.civ.answers[s2] = (429, {}, {"Retry-After": "\u00b2".encode()})
+        res = await main._civitai_lookup(s2)
+        self.assertIsInstance(res, tuple)
+        self.assertEqual(res[0], "busy", res)
+        self.assertIsNone(res[1])
+
+
+A, B = b"lora-a-bytes", b"lora-b-bytes-longer"
+PA, PB = "models/loras/a.safetensors", "models/loras/b.safetensors"
+
+
+class Worker(_Fixture):
+    async def test_no_share_does_nothing(self):
+        main._modelsrc_host = lambda: ""
+
+        def boom():
+            raise AssertionError("LanSource touched without a share")
+        main.modelsrc = boom
+        self.assertIsNone(await main.lora_meta_pass())
+        self.assertEqual(self.civ.calls, [])
+        self.assertEqual(main.lora_meta_view()["rows"], [])
+        self.assertFalse(main._lm_snapshot()["configured"])
+
+    async def test_share_not_usable_is_pending_not_a_verdict(self):
+        self.lan.files = {PA: A}
+        self.lan.problem_text = "not listed yet"
+        self.assertIsNone(await main.lora_meta_pass())
+        self.assertEqual(self.lan.hashed, [])
+        self.assertEqual(loratags.lookup("a.safetensors", main._lm_snapshot())["status"],
+                         "pending")
+
+    async def test_hash_priority_3_one_at_a_time_then_civitai_before_next_hash(self):
+        self.lan.files = {PA: A, PB: B}
+        self.civ.answers[sha_of(A)] = (200, version(["wa"]), {})
+        pause = await main.lora_meta_pass()
+        self.assertGreaterEqual(pause, main._LM_HASH_PAUSE_MIN_S)
+        self.assertEqual(self.lan.hashed, [(PA, 3)])            # ONE hash, priority 3
+        await self.drain()
+        self.assertEqual(self.log, [("hash", PA), ("civitai", sha_of(A)),
+                                    ("hash", PB), ("civitai", sha_of(B))])
+        self.assertEqual(main.lora_meta[sha_of(A)]["civitai"]["trained_words"], ["wa"])
+        self.assertEqual(main.lora_meta[sha_of(B)]["civitai"]["status"], "not_found")
+        self.assertEqual(store.lora_meta_all()[sha_of(B)]["civitai"]["status"], "not_found")
+
+    async def test_backend_offered_loras_first(self):
+        self.lan.files = {PA: A, PB: B}
+        main.backend_loras = {"comfyui:k": {"b.safetensors"}}
+        await main.lora_meta_pass()
+        self.assertEqual(self.lan.hashed, [(PB, 3)])
+
+    async def test_404_persisted_and_not_asked_again(self):
+        self.lan.files = {PA: A}
+        await self.drain()
+        await self.drain()
+        self.assertEqual(self.civ.calls, [URL + sha_of(A)])
+
+    async def test_only_the_hash_leaves(self):
+        self.lan.files = {"models/loras/Private-Name.safetensors": A}
+        await self.drain()
+        self.assertEqual(self.civ.calls, [URL + sha_of(A)])
+        self.assertNotIn("Private", " ".join(self.civ.calls))
+
+    async def test_429_pauses_everything_and_persists_nothing(self):
+        self.lan.files = {PA: A, PB: B}
+        self.lan.sha = {PA: (len(A), sha_of(A)), PB: (len(B), sha_of(B))}
+        self.civ.answers[sha_of(A)] = (429, {}, {"Retry-After": "120"})
+        self.civ.answers[sha_of(B)] = (429, {}, {"Retry-After": "120"})
+        t0 = time.time()
+        await main.lora_meta_pass()
+        self.assertEqual(len(self.civ.calls), 1)                # the second is not asked
+        self.assertGreaterEqual(main._lm_state["pause_until"], t0 + 119)
+        await main.lora_meta_pass()
+        self.assertEqual(len(self.civ.calls), 1)                # still paused
+        self.assertEqual(store.lora_meta_all(), {})
+        self.assertIn("429", main.lora_meta_view()["last_error"])
+
+    async def test_5xx_backs_off_per_sha_memory_only(self):
+        self.lan.files = {PA: A}
+        self.lan.sha = {PA: (len(A), sha_of(A))}
+        self.civ.answers[sha_of(A)] = (503, "busy", {})
+        await main.lora_meta_pass()
+        err = main._lm_errors[sha_of(A)]
+        self.assertEqual((err["error"], err["backoff_s"]), ("Civitai: HTTP 503", 300.0))
+        self.assertEqual(store.lora_meta_all(), {})
+        await main.lora_meta_pass()
+        self.assertEqual(len(self.civ.calls), 1)                # not before next_try
+        it = loratags.lookup("a.safetensors", main._lm_snapshot())
+        self.assertEqual((it["status"], it["error"]), ("pending", "Civitai: HTTP 503"))
+        main._lm_errors[sha_of(A)]["next_try"] = 0              # time passed
+        await main.lora_meta_pass()
+        self.assertEqual(main._lm_errors[sha_of(A)]["backoff_s"], 600.0)   # doubled
+
+    async def test_identical_copies_share_one_request(self):
+        # Review Focus 3
+        self.lan.files = {PA: A, "models/loras/copy.safetensors": A}
+        self.civ.answers[sha_of(A)] = (200, version(["w"]), {})
+        await self.drain()
+        self.assertEqual(self.civ.calls, [URL + sha_of(A)])
+        snap = main._lm_snapshot()
+        for n in ("a.safetensors", "copy.safetensors"):
+            self.assertEqual(loratags.lookup(n, snap)["trigger_words"], ["w"], n)
+
+    async def test_hash_failure_retried_later(self):
+        self.lan.files = {PA: A}
+        self.lan.fail = {PA}
+        await main.lora_meta_pass()
+        self.assertGreaterEqual(main._lm_errors[PA]["next_try"], time.time() + 590)
+        await main.lora_meta_pass()
+        self.assertEqual(len(self.lan.hashed), 1)
+
+    async def test_rename_keeps_civitai_and_curated(self):
+        self.lan.files = {PA: A}
+        self.civ.answers[sha_of(A)] = (200, version(["w"]), {})
+        await self.drain()
+        self.assertEqual(await main.lora_curate(sha_of(A), ["mine"]), "")
+        self.lan.files = {"models/loras/sub/renamed.safetensors": A}
+        await self.drain()
+        self.assertEqual(len(self.civ.calls), 1)                # same sha: not asked again
+        it = loratags.lookup("sub/renamed.safetensors", main._lm_snapshot())
+        self.assertEqual((it["status"], it["trigger_words"]), ("curated", ["mine"]))
+
+    async def test_size_change_is_new_content(self):
+        self.lan.files = {PA: A}
+        await self.drain()
+        self.lan.files = {PA: A + b"-v2"}
+        await self.drain()
+        self.assertEqual([p for p, _ in self.lan.hashed], [PA, PA])
+        self.assertEqual(self.civ.calls, [URL + sha_of(A), URL + sha_of(A + b"-v2")])
+
+    async def test_refresh_all_keeps_curated_and_reasks_not_found(self):
+        self.lan.files = {PA: A}
+        await self.drain()                                      # 404
+        self.assertEqual(await main.lora_curate(sha_of(A), ["keep"]), "")
+        self.civ.answers[sha_of(A)] = (200, version(["now found"]), {})
+        self.assertIn("1", await main.lora_refresh_all())
+        await self.drain()
+        rec = main.lora_meta[sha_of(A)]
+        self.assertEqual(rec["curated"], ["keep"])
+        self.assertEqual(rec["civitai"]["trained_words"], ["now found"])
+        self.assertEqual(store.lora_meta_all()[sha_of(A)]["curated"], ["keep"])
+
+    async def test_refresh_one_rehashes_and_reasks(self):
+        self.lan.files = {PA: A}
+        await self.drain()
+        msg = await main.lora_refresh("a.safetensors")
+        self.assertIn("a.safetensors", msg)
+        await self.drain()
+        self.assertEqual([p for p, _ in self.lan.hashed], [PA, PA])
+        self.assertEqual(len(self.civ.calls), 2)
+        self.assertIn("not refreshed", await main.lora_refresh("nope.safetensors"))
+
+    async def test_curate_states_and_stale_sha(self):
+        self.lan.files = {PA: A}
+        await self.drain()
+        self.assertEqual(await main.lora_curate(sha_of(A), ["", "  a ", "a"]), "")
+        self.assertEqual(main.lora_meta[sha_of(A)]["curated"], ["a"])
+        self.assertEqual(await main.lora_curate(sha_of(A), []), "")
+        self.assertEqual(main.lora_meta[sha_of(A)]["curated"], [])
+        self.assertEqual(await main.lora_curate(sha_of(A), None), "")
+        self.assertIsNone(main.lora_meta[sha_of(A)]["curated"])
+        self.assertIn("changed", await main.lora_curate("9" * 64, ["x"]))
+        self.assertNotIn("9" * 64, main.lora_meta)
+
+    async def test_boot_loads_store_and_starts_pending(self):
+        store.lora_meta_put(sha_of(A), {"curated": ["x"]})
+        main.lora_meta = {}
+        main.lora_meta_boot()
+        self.assertEqual(main.lora_meta[sha_of(A)]["curated"], ["x"])
+        self.assertEqual(main._lm_state["problem"], "not listed yet")
+        self.assertEqual(loratags.lookup("a.safetensors", main._lm_snapshot())["status"],
+                         "pending")
+
+    async def test_view_rows_counts_busy(self):
+        main.backends = [{"name": "k", "type": "comfyui", "url": "http://k"}]
+        main.backend_loras = {main.backend_id(main.backends[0]): {"a.safetensors",
+                                                                  "local.safetensors"}}
+        self.lan.files = {PA: A, PB: B}
+        await main.lora_meta_pass()
+        v = main.lora_meta_view()
+        self.assertTrue(v["busy"])
+        self.assertEqual([r["name"] for r in v["rows"]],
+                         ["a.safetensors", "b.safetensors", "local.safetensors"])
+        rows = {r["name"]: r for r in v["rows"]}
+        self.assertEqual(rows["a.safetensors"]["backends"], ["k"])
+        self.assertEqual(rows["b.safetensors"]["backends"], [])          # share only
+        self.assertEqual(rows["local.safetensors"]["status"], "not_on_share")
+        await self.drain()
+        v = main.lora_meta_view()
+        self.assertFalse(v["busy"])
+        self.assertEqual(v["counts"], {"files": 2, "hashed": 2, "found": 0,
+                                       "not_found": 2, "civitai_pending": 0})
+
+    async def test_loop_survives_a_failing_pass(self):
+        calls = []
+
+        async def bad():
+            calls.append(1)
+            raise ValueError("boom")
+        saved = main.lora_meta_pass
+        main.lora_meta_pass = bad
+        self.addCleanup(setattr, main, "lora_meta_pass", saved)
+        task = asyncio.ensure_future(main.lora_meta_loop())
+        await asyncio.sleep(0.05)
+        main._lm_wake_up()
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(len(calls), 2)
+        self.assertIn("pass failed", main._lm_state["last_error"])
+
 
 if __name__ == "__main__":
     unittest.main()

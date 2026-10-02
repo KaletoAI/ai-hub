@@ -979,6 +979,7 @@ async def lifespan(app: FastAPI):
         migrate_provider_tokens()      # per-host API tokens → one per provider (idempotent)
     except Exception as e:
         logger.warning(f"managed hosts: token migration failed: {type(e).__name__}")
+    lora_meta_boot()                   # LoRA trigger words: stored records → memory
     backend_models.update(store.load_backend_models())   # seed last-known models (offline → 503, not 403)
     backend_context.update(store.load_backend_context())  # learned context windows survive a restart
     apply_server_settings()            # overlay UI-managed server settings onto config
@@ -1025,6 +1026,7 @@ async def lifespan(app: FastAPI):
     health_task = asyncio.create_task(health_loop())
     probe_task = asyncio.create_task(fast_probe_loop())
     watch_task = asyncio.create_task(watch_config_loop())
+    lora_task = asyncio.create_task(lora_meta_loop())
 
     # Stats: record calls + prune, but NO separate server — the dashboard lives in
     # /ui → Statistic now (so no extra port/bind).
@@ -1054,6 +1056,7 @@ async def lifespan(app: FastAPI):
     health_task.cancel()
     probe_task.cancel()
     watch_task.cancel()
+    lora_task.cancel()
     faults_prune_task.cancel()
     if jobs_prune_task is not None:
         jobs_prune_task.cancel()
@@ -6418,12 +6421,262 @@ async def _civitai_lookup(sha: str) -> tuple:
                 buf += chunk
                 if len(buf) > _CIVITAI_MAX_BYTES:
                     return ("error", "answer larger than 1 MB")
-    except httpx.HTTPError as e:
-        return ("error", type(e).__name__)
+    except Exception as e:                  # noqa: BLE001 — "never raises": a pass must progress
+        return ("error", type(e).__name__)  # (httpx.HTTPError included; Cancelled passes)
     try:
         return ("found", loratags.parse_civitai(json.loads(bytes(buf)), time.time()))
-    except (ValueError, TypeError):
+    except Exception:                       # noqa: BLE001 — incl. RecursionError on nested JSON
         return ("error", "unparsable answer")
+
+
+def _lm_snapshot() -> dict:
+    """What the API and the console read — memory only (N1)."""
+    st = _lm_state
+    return {"configured": st["configured"], "problem": st["problem"], "share": st["share"],
+            "shas": st["shas"], "meta": lora_meta, "errors": _lm_errors}
+
+
+def _lm_wake_event() -> asyncio.Event:
+    global _lm_wake
+    if _lm_wake is None:
+        _lm_wake = asyncio.Event()
+    return _lm_wake
+
+
+def _lm_wake_up() -> None:
+    _lm_wake_event().set()
+
+
+def lora_meta_boot() -> None:
+    """Lifespan: the stored records into memory, and the snapshot's starting state — a
+    configured share reads "not listed yet" (every LoRA pending) until the first pass,
+    never an empty listing that would call every LoRA not_on_share."""
+    try:
+        lora_meta.clear()
+        lora_meta.update(store.lora_meta_all())
+    except Exception as e:                               # noqa: BLE001 — never block the boot
+        logger.warning(f"lora meta: store read failed: {type(e).__name__}: {e}")
+    configured = bool(_modelsrc_host())
+    _lm_state.update(configured=configured, problem="not listed yet" if configured else "")
+
+
+async def _lm_persist(sha: str, rec: dict) -> None:
+    try:
+        await asyncio.to_thread(store.lora_meta_put, sha, rec)
+    except Exception as e:                               # noqa: BLE001 — the memory value stands
+        logger.warning(f"lora meta: store write failed for {sha[:12]}: {type(e).__name__}")
+        _lm_state["last_error"] = f"store write failed: {type(e).__name__}"
+
+
+def _lm_backoff(key: str, error: str, now: float, fixed: Optional[float] = None) -> None:
+    lo, hi = _CIVITAI_BACKOFF
+    prev = (_lm_errors.get(key) or {}).get("backoff_s") or 0.0
+    b = fixed if fixed is not None else min(hi, max(lo, prev * 2))
+    _lm_errors[key] = {"error": error, "next_try": now + b, "backoff_s": b}
+    _lm_state["last_error"] = error
+
+
+def _lm_wants_civitai(sha: str, now: float) -> bool:
+    if (_lm_errors.get(sha) or {}).get("next_try", 0) > now:
+        return False
+    return sha in _lm_refetch or "civitai" not in (lora_meta.get(sha) or {})
+
+
+async def _lm_apply(sha: str, kind: str, data, now: float) -> bool:
+    """One Civitai answer → memory (+ the store for 200/404; a transient failure stays
+    in memory, N2). False = stop asking this pass (429)."""
+    if kind in ("found", "not_found"):
+        rec = dict(lora_meta.get(sha) or {})               # a copy: `curated` is kept as is
+        rec["civitai"] = data if kind == "found" else loratags.not_found_record(now)
+        lora_meta[sha] = rec
+        _lm_errors.pop(sha, None)
+        _lm_refetch.discard(sha)
+        _lm_state["pause_s"] = 0.0
+        await _lm_persist(sha, rec)
+        return True
+    if kind == "busy":
+        if data is not None:
+            pause = float(data)
+        else:
+            lo, hi = _CIVITAI_PAUSE
+            pause = min(hi, max(lo, _lm_state["pause_s"] * 2))
+            _lm_state["pause_s"] = pause
+        _lm_state["pause_until"] = now + pause
+        _lm_state["last_error"] = f"Civitai rate limit (429) — paused for {int(pause)} s"
+        return False
+    _lm_backoff(sha, f"Civitai: {data}", now)
+    return True
+
+
+async def lora_meta_pass() -> Optional[float]:
+    """One worker pass: list the share (TTL'd), ask Civitai for every hash that needs it
+    (before the next hash starts — results show while the rest still hashes), then hash
+    at most ONE share LoRA at priority 3. → the pause before the next pass (after a
+    hash: as long as it took, at least 10 s — the share reads for this at most half the
+    time, N3), None = the regular tick."""
+    if not _modelsrc_host():
+        _lm_state.update(configured=False, problem="", share={}, shas={})
+        return None
+    lan = modelsrc()
+    await lan.refresh()
+    problem = lan.problem()
+    _lm_state.update(configured=True, problem=problem)
+    if problem:
+        return None
+    share = loratags.share_loras(lan.cached())
+    files = await asyncio.to_thread(lan.sha_files)
+    offered = set()
+    for names in list(backend_loras.values()):
+        for n in names:
+            p, _ = loratags.share_path(n, share)
+            if p is not None:
+                offered.add(share[p][0])
+    reals: dict = {}                                     # real path → size, in work order
+    for p in sorted(share, key=lambda p: (share[p][0] not in offered, p)):
+        reals.setdefault(*share[p])
+    shas = {r: files[r][1] for r, n in reals.items() if r in files and files[r][0] == n}
+    _lm_state.update(share=share, shas=shas)
+    for sha in dict.fromkeys(shas.values()):
+        now = time.time()
+        if now < _lm_state["pause_until"]:
+            break
+        if not _lm_wants_civitai(sha, now):
+            continue
+        gap = _CIVITAI_MIN_GAP_S - (time.monotonic() - _lm_state["last_civitai"])
+        if gap > 0:
+            await asyncio.sleep(gap)
+        _lm_state["last_civitai"] = time.monotonic()
+        kind, data = await _civitai_lookup(sha)
+        if not await _lm_apply(sha, kind, data, time.time()):
+            break
+    for real, size in reals.items():
+        if real in shas or (_lm_errors.get(real) or {}).get("next_try", 0) > time.time():
+            continue
+        t0 = time.monotonic()
+        _lm_state["hashing"] = real
+        try:
+            sha = await lan.sha256(real, size, background=3)
+            _lm_errors.pop(real, None)
+            new = dict(_lm_state["shas"])
+            new[real] = sha
+            _lm_state["shas"] = new
+        except RuntimeError as e:
+            _lm_backoff(real, f"hash: {e}", time.time(), fixed=_LM_HASH_RETRY_S)
+        finally:
+            _lm_state["hashing"] = None
+        return max(_LM_HASH_PAUSE_MIN_S, time.monotonic() - t0)
+    return None
+
+
+async def lora_meta_loop() -> None:
+    """The lifespan task: a pass, then the pause it asked for (or the 60-s tick); a
+    console refresh wakes it early. A failing pass is logged, never the loop's end."""
+    while True:
+        try:
+            pause = await lora_meta_pass()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:                           # noqa: BLE001 — never die
+            logger.warning(f"lora meta: pass failed: {type(e).__name__}: {e}")
+            _lm_state["last_error"] = f"pass failed: {type(e).__name__}"
+            pause = None
+        _lm_state["last_run"] = time.time()
+        ev = _lm_wake_event()
+        try:
+            await asyncio.wait_for(ev.wait(), pause or _LM_TICK_S)
+        except asyncio.TimeoutError:
+            pass
+        ev.clear()
+
+
+async def lora_refresh_all() -> str:
+    """Console: ask Civitai again for every current share LoRA's hash — earlier 404s
+    included; nothing is re-hashed (54 GB) and no curated list is touched."""
+    shas = set(_lm_state["shas"].values())
+    _lm_refetch.update(shas)
+    for s in shas:
+        _lm_errors.pop(s, None)
+    _lm_wake_up()
+    return f"asking Civitai again for {len(shas)} LoRA hash(es)"
+
+
+async def lora_refresh(name: str) -> str:
+    """Console: one LoRA — forget its cached sha (re-hash: catches a change in place at
+    the same size) and ask Civitai again. The curated list stays."""
+    st = _lm_state
+    if not st["configured"] or st["problem"]:
+        return f"not refreshed: the LAN share is not usable ({st['problem'] or 'not set up'})"
+    path, why = loratags.share_path(name, st["share"])
+    if path is None:
+        return f"not refreshed: {name} is not a LoRA on the share ({why})"
+    real, size = st["share"][path]
+    sha = st["shas"].get(real)
+    await asyncio.to_thread(modelsrc().forget_sha, real, size)
+    st["shas"] = {r: h for r, h in st["shas"].items() if r != real}
+    _lm_errors.pop(real, None)
+    if sha:
+        _lm_refetch.add(sha)
+        _lm_errors.pop(sha, None)
+    _lm_wake_up()
+    return f"refreshing {name}: re-hash and ask Civitai again"
+
+
+async def lora_curate(sha: str, words: Optional[list]) -> str:
+    """Console: the curated trigger words of the LoRA file `sha` (None = back to
+    Civitai's list; [] = deliberately none). → refusal text, "" = saved. Refused for a
+    sha no current share LoRA has — the form showed a file that changed since (F1)."""
+    if not loratags.valid_sha(sha) or sha not in set(_lm_state["shas"].values()):
+        return "the file changed since this page was loaded — reload and edit again"
+    rec = dict(lora_meta.get(sha) or {})
+    if words is None:
+        rec["curated"], rec["curated_at"] = None, None
+    else:
+        rec["curated"], rec["curated_at"] = loratags.clean_words(list(words)), time.time()
+    lora_meta[sha] = rec
+    await _lm_persist(sha, rec)
+    return ""
+
+
+def lora_meta_view() -> dict:
+    """The LoRAs tab: one row per LoRA a ComfyUI backend offers plus every share LoRA
+    no backend offers (by its name under models/loras/), each a `loratags.lookup` item
+    with `backends`; the worker's counts and state. Memory only."""
+    snap = _lm_snapshot()
+    hosts: dict = {}
+    for b in backends:
+        if b.get("type") == "comfyui":
+            for n in backend_loras.get(backend_id(b), set()):
+                hosts.setdefault(n, []).append(b["name"])
+    names = set(hosts)
+    usable = snap["configured"] and not snap["problem"]
+    if usable:
+        claimed = {loratags.share_path(n, snap["share"])[0] for n in names}
+        names |= {p[len(loratags.LORA_ROOT):] for p in snap["share"] if p not in claimed}
+    rows = []
+    for n in sorted(names):
+        it = loratags.lookup(n, snap)
+        it["backends"] = sorted(hosts.get(n, []))
+        rows.append(it)
+    now = time.time()
+    reals = {v[0] for v in snap["share"].values()} if usable else set()
+    shas = {snap["shas"][r] for r in reals if r in snap["shas"]}
+
+    def civ(s):
+        return ((lora_meta.get(s) or {}).get("civitai") or {}).get("status")
+    counts = {"files": len(reals), "hashed": sum(1 for r in reals if r in snap["shas"]),
+              "found": sum(1 for s in shas if civ(s) == "found"),
+              "not_found": sum(1 for s in shas if civ(s) == "not_found")}
+    counts["civitai_pending"] = len(shas) - counts["found"] - counts["not_found"]
+    unhashed = [r for r in reals if r not in snap["shas"]
+                and (_lm_errors.get(r) or {}).get("next_try", 0) <= now]
+    busy = bool(usable and (_lm_state["hashing"] or unhashed
+                            or any(_lm_wants_civitai(s, now) for s in shas)))
+    pause = _lm_state["pause_until"]
+    return {"configured": snap["configured"], "problem": snap["problem"], "rows": rows,
+            "counts": counts, "hashing": _lm_state["hashing"],
+            "pause_until": pause if pause > now else None,
+            "last_error": _lm_state["last_error"], "last_run": _lm_state["last_run"],
+            "busy": busy}
 
 
 # ── model sources, Stage 3: Check & save (spec "enter a URL once, verified") ─────

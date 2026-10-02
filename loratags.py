@@ -92,7 +92,7 @@ def civitai_url(civ) -> Optional[str]:
 def retry_after_s(value) -> Optional[float]:
     """A 429's `Retry-After` in seconds (digits only, capped at one hour); None for an
     HTTP date or anything else — the caller then doubles its own pause."""
-    if isinstance(value, str) and value.strip().isdigit():
+    if isinstance(value, str) and value.strip().isascii() and value.strip().isdigit():
         return float(min(int(value.strip()), 3600))
     return None
 

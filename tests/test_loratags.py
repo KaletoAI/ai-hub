@@ -79,6 +79,7 @@ class ParseCivitai(unittest.TestCase):
         self.assertEqual(loratags.retry_after_s(" 99999 "), 3600.0)
         self.assertIsNone(loratags.retry_after_s("Wed, 21 Oct 2026 07:28:00 GMT"))
         self.assertIsNone(loratags.retry_after_s(None))
+        self.assertIsNone(loratags.retry_after_s("\u00b2"))
 
     def test_valid_sha(self):
         self.assertTrue(loratags.valid_sha(SHA_A))
