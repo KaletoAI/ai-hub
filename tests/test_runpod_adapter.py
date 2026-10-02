@@ -61,9 +61,16 @@ class _RunPod:
                 return httpx.Response(self.run_status, json={"error": "nope"})
             return httpx.Response(200, json={"id": "rp1", "status": "IN_QUEUE"})
         if "/status/" in p:
-            st = self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
+            if self.cancels and getattr(self, "after_cancel", None) is not None:
+                st = self.after_cancel
+            else:
+                st = self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
             if isinstance(st, int):
                 return httpx.Response(st, json={})
+            if isinstance(st, bytes):                    # a body that is no JSON
+                return httpx.Response(200, content=st)
+            if isinstance(st, list):                     # JSON, but not an object
+                return httpx.Response(200, json=st)
             return httpx.Response(200, json={"id": "rp1", **st})
         if "/cancel/" in p:
             self.cancels.append(p.rsplit("/", 1)[1])
@@ -884,6 +891,74 @@ class RunJobBilling(unittest.TestCase):
             cloud = [{"backend": "mz", "meshy": {"endpoint": "image-to-3d"}}]
             self.assertFalse(admin._same_kind(cloud, "rp"))
             self.assertNotIn("<option>rp</option>", admin._backends_section("a", cloud))
+
+
+
+class PollClocksAndEnds(unittest.TestCase):
+    """Items 5–7 (final review): how a poll ENDS. `max_wait` counted from submit let a
+    cold start's queue + boot eat the execution budget RunPod still granted; a job that
+    COMPLETED while being given up was cancelled and its paid result thrown away; a 200
+    whose body was not a JSON object ended the job as unsettled; three 4xx gave up
+    without the /cancel every other give-up sends."""
+
+    def test_max_wait_counts_execution_not_the_queue(self):
+        rp = _RunPod([{"status": "IN_QUEUE"}] * 12 + [{"status": "IN_PROGRESS"}, DONE])
+        req = _req()
+        out = _run(rp, lambda: _adapter(queue_max_s=60, max_wait=0.08).generate(req))
+        self.assertEqual([b.name for b in out.blobs], ["o_00001_.png"])
+        self.assertEqual(rp.cancels, [])
+
+    def test_execution_beyond_max_wait_still_times_out_and_the_queue_stays_capped(self):
+        rp = _RunPod([{"status": "IN_QUEUE"}] * 3 + [{"status": "IN_PROGRESS"}])
+        with self.assertRaises(TimeoutError) as cm:
+            _run(rp, lambda: _adapter(queue_max_s=60, max_wait=0.05).generate(_req()))
+        self.assertIn("of execution", str(cm.exception))
+        self.assertEqual(rp.cancels, ["rp1"])
+        rp = _RunPod([{"status": "IN_QUEUE"}])
+        with self.assertRaises(adapters.CloudBusy):
+            _run(rp, lambda: _adapter(queue_max_s=0.05, max_wait=60).generate(_req()))
+
+    def test_completed_found_by_the_grace_cancel_is_delivered(self):
+        rp = _RunPod([{"status": "IN_PROGRESS"}, 503], cancel_reply={"status": "COMPLETED"})
+        rp.after_cancel = DONE
+        req = _req()
+        out = _run(rp, lambda: _adapter(queue_max_s=60).generate(req))
+        self.assertEqual([(b.name, b.data) for b in out.blobs], [("o_00001_.png", b"img")])
+        self.assertTrue(req.cloud_trace["runpod_settled"])
+        self.assertEqual(rp.cancels, ["rp1"])
+
+    def test_completed_found_by_the_max_wait_cancel_is_delivered(self):
+        rp = _RunPod([{"status": "IN_PROGRESS"}], cancel_reply={"status": "IN_PROGRESS"})
+        rp.after_cancel = DONE                  # it finished between the last poll and /cancel
+        out = _run(rp, lambda: _adapter(queue_max_s=60, max_wait=0.05).generate(_req()))
+        self.assertEqual([b.name for b in out.blobs], ["o_00001_.png"])
+
+    def test_unreadable_200_is_transient(self):
+        for odd in (b"<html>bad gateway</html>", ["not", "an", "object"]):
+            rp = _RunPod([{"status": "IN_PROGRESS"}, odd, DONE])
+            req = _req()
+            out = _run(rp, lambda: _adapter(queue_max_s=60).generate(req))
+            self.assertEqual([b.name for b in out.blobs], ["o_00001_.png"], odd)
+        rp = _RunPod([{"status": "IN_PROGRESS"}, b"<html>"])     # for good → grace → cancel
+        req = _req()
+        with self.assertRaises(ConnectionError):
+            _run(rp, lambda: _adapter(queue_max_s=60).generate(req))
+        self.assertEqual(rp.cancels, ["rp1"])
+        self.assertTrue(req.cloud_trace["runpod_settled"])
+
+    def test_three_4xx_go_through_cancel(self):
+        rp = _RunPod([{"status": "IN_PROGRESS"}, 400])
+        req = _req()
+        with self.assertRaises(RuntimeError) as cm:
+            _run(rp, lambda: _adapter(queue_max_s=60).generate(req))
+        self.assertIn("three times", str(cm.exception))
+        self.assertEqual(rp.cancels, ["rp1"])
+        self.assertTrue(req.cloud_trace["runpod_settled"])
+        rp = _RunPod([{"status": "IN_PROGRESS"}, 403], cancel_reply={"status": "IN_PROGRESS"})
+        req = _req()
+        with self.assertRaises(RuntimeError):
+            _run(rp, lambda: _adapter(queue_max_s=60).generate(req))
+        self.assertFalse(req.cloud_trace.get("runpod_settled"))
 
 
 if __name__ == "__main__":

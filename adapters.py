@@ -4689,6 +4689,16 @@ _RP_TERMINAL = ("COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT")
 _RP_VENDOR = "RunPod"
 
 
+def _rp_json(r) -> Optional[dict]:
+    """A RunPod answer's JSON object, or None when the body is no JSON or not an object
+    (a proxy's HTML page under 200) — the caller treats that like a transient fault."""
+    try:
+        d = r.json()
+    except Exception:
+        return None
+    return d if isinstance(d, dict) else None
+
+
 def runpod_endpoint_id(url: str) -> Optional[str]:
     m = _RP_URL_RE.match((url or "").strip())
     return m.group(1) if m else None
@@ -4909,15 +4919,29 @@ class RunpodAdapter(ComfyUIAdapter):
     async def _cancel_rp(self, client, url: str, rp_id: str) -> bool:
         """POST /cancel; True only once RunPod confirms the job is no longer running
         (CANCELLED, or a /status that is terminal) — the condition for a re-run."""
+        return (await self._cancel_settle(client, url, rp_id))[0]
+
+    async def _cancel_settle(self, client, url: str, rp_id: str) -> tuple:
+        """(settled, completed status | None). /cancel, then — unless the cancel answer
+        itself confirms a non-COMPLETED end — /status: a job that COMPLETED meanwhile is
+        returned whole, because its work is done and paid; giving up on it would throw
+        a finished result away (and the caller would raise an error about a success)."""
         try:
             r = await client.post(f"{url}/cancel/{rp_id}", headers=self._headers(), timeout=10.0)
-            if r.status_code == 200 and (r.json() or {}).get("status") in _RP_TERMINAL:
-                return True
+            cs = _rp_json(r) if r.status_code == 200 else None
+            if cs is not None and cs.get("status") in _RP_TERMINAL and cs.get("status") != "COMPLETED":
+                return True, None
             s = await client.get(f"{url}/status/{rp_id}", headers=self._headers(), timeout=10.0)
-            return s.status_code == 404 or (
-                s.status_code == 200 and (s.json() or {}).get("status") in _RP_TERMINAL)
+            if s.status_code == 404:
+                return True, None
+            st = _rp_json(s) if s.status_code == 200 else None
+            if st is None:
+                return (cs is not None and cs.get("status") == "COMPLETED"), None
+            if st.get("status") == "COMPLETED":
+                return True, st
+            return st.get("status") in _RP_TERMINAL, None
         except Exception:
-            return False
+            return False, None
 
     async def _submit(self, client, url: str, raw: bytes, req: NormalizedRequest) -> str:
         tr = req.cloud_trace
@@ -4975,43 +4999,67 @@ class RunpodAdapter(ComfyUIAdapter):
 
     async def _poll_rp(self, client, url: str, rp_id: str, req: NormalizedRequest,
                        poll_interval: float, max_wait: float) -> dict:
+        """Poll /status to a terminal state. Two clocks, like RunPod's own policy: the
+        queue phase is bounded by `queue_max_s`, and `max_wait` counts EXECUTION only —
+        from the first IN_PROGRESS, as `executionTimeout` does. Started at submit, a cold
+        start's queue + boot ate the execution budget and the gateway gave up on a job
+        RunPod would still have let finish. Both together never exceed the job's ttl."""
         b, tr = self.backend, req.cloud_trace
         grace = float(b.get("disconnect_grace", 30))
         queue_max = float(b.get("queue_max_s", 300))
         start = last_ok = time.monotonic()
-        deadline = start + max_wait
+        hard_end = start + queue_max + max_wait     # = the ttl the job was submitted with
+        exec_start: Optional[float] = None
         bad4 = 0
 
-        async def give_up(exc: BaseException):
-            if await self._cancel_rp(client, url, rp_id):
+        async def give_up(exc: BaseException) -> dict:
+            settled, done = await self._cancel_settle(client, url, rp_id)
+            if settled:
                 tr["runpod_settled"] = True
+            if done is not None:
+                logger.info(f"RunPod job {rp_id} COMPLETED while being given up "
+                            f"({type(exc).__name__}) — delivering it")
+                return done
             raise exc
 
-        while time.monotonic() < deadline:
+        def transient(what: str):
+            if time.monotonic() - last_ok > grace:
+                return give_up(ConnectionError(f"{what} for >{grace:.0f}s while job {rp_id} ran"))
+            return None
+
+        while True:
+            now = time.monotonic()
+            if (exec_start is not None and now - exec_start > max_wait) or now > hard_end:
+                break
             await asyncio.sleep(poll_interval)
             try:
                 r = await client.get(f"{url}/status/{rp_id}", headers=self._headers())
             except httpx.HTTPError as e:
-                if time.monotonic() - last_ok > grace:
-                    await give_up(ConnectionError(
-                        f"RunPod unreachable for >{grace:.0f}s while job {rp_id} ran: "
-                        f"{type(e).__name__}"))
+                g = transient(f"RunPod unreachable ({type(e).__name__})")
+                if g is not None:
+                    return await g
                 continue
             if r.status_code == 404:
                 tr["runpod_settled"] = True
                 raise RuntimeError(f"RunPod job {rp_id} expired at RunPod (ttl) — no result")
             if r.status_code == 429 or r.status_code >= 500:
-                if time.monotonic() - last_ok > grace:
-                    await give_up(ConnectionError(
-                        f"RunPod /status answered {r.status_code} for >{grace:.0f}s (job {rp_id})"))
+                g = transient(f"RunPod /status answered {r.status_code}")
+                if g is not None:
+                    return await g
                 continue
             if r.status_code >= 400:
                 bad4 += 1
                 if bad4 >= 3:
-                    raise RuntimeError(f"RunPod /status {r.status_code} three times for job {rp_id}")
+                    return await give_up(RuntimeError(
+                        f"RunPod /status {r.status_code} three times for job {rp_id}"))
+                continue
+            st = _rp_json(r)
+            if st is None:                         # a 200 we cannot read: the service, not the job
+                g = transient("RunPod /status answered an unreadable 200")
+                if g is not None:
+                    return await g
                 continue
             bad4, last_ok = 0, time.monotonic()
-            st = r.json() or {}
             s = st.get("status")
             if s == "COMPLETED":
                 tr["runpod_settled"] = True
@@ -5028,16 +5076,20 @@ class RunpodAdapter(ComfyUIAdapter):
                     raise CloudBusy(f"RunPod job {rp_id} timed out before a worker took it",
                                     vendor=_RP_VENDOR)
                 raise RuntimeError(f"RunPod job {rp_id} hit the endpoint's execution timeout")
+            if s == "IN_PROGRESS" and exec_start is None:
+                exec_start = time.monotonic()
             self._progress(req, st)
-            if s == "IN_QUEUE" and time.monotonic() - start > queue_max:
-                await give_up(CloudBusy(
+            if s == "IN_QUEUE" and exec_start is None and time.monotonic() - start > queue_max:
+                return await give_up(CloudBusy(
                     f"RunPod job {rp_id} waited >{queue_max:.0f}s for a worker — cancelled",
                     vendor=_RP_VENDOR))
-        ok = await self._cancel_rp(client, url, rp_id)
-        if ok:
+        settled, done = await self._cancel_settle(client, url, rp_id)
+        if settled:
             tr["runpod_settled"] = True
-        raise TimeoutError(f"RunPod job {rp_id} not finished after {max_wait:.0f}s"
-                           + ("" if ok else " — cancel unconfirmed, it may still be running"))
+        if done is not None:
+            return done
+        raise TimeoutError(f"RunPod job {rp_id} not finished after {max_wait:.0f}s of execution"
+                           + ("" if settled else " — cancel unconfirmed, it may still be running"))
 
     def _sibling_exts(self, req: NormalizedRequest) -> list:
         exts = set()
