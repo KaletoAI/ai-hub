@@ -195,6 +195,7 @@ class GenNameClashWarning(unittest.TestCase):
         self.assertEqual(main.gen_name_clashes(pair), [("gpu", ("comfyui", "runpod"))])
         self.assertEqual(main.gen_name_clashes(pair[1:]), [])
         saved = list(main.config_backends), set(main._gen_clash_warned), main.store._active
+        state = {k: getattr(main, k) for k in ("backends", "backend_hosts", "host_backends")}
         try:
             main.config_backends[:] = pair
             main.store._active = False
@@ -209,7 +210,9 @@ class GenNameClashWarning(unittest.TestCase):
             main.config_backends[:] = saved[0]
             main._gen_clash_warned.clear(); main._gen_clash_warned.update(saved[1])
             main.store._active = saved[2]
-            main.rebuild_backends()
+            for k, v in state.items():
+                setattr(main, k, v)
+            main.rebuild_route_index()
 
 
 class Users(_Fixture):
