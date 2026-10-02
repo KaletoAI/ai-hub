@@ -2824,6 +2824,81 @@ def _parse_object_info(raw: bytes) -> tuple:
     return _comfy_node_types(oi), _comfy_models(oi), _comfy_loras(oi)
 
 
+@dataclass
+class BuiltPrompt:
+    """What `_build_prompt` produced: the final workflow, the mapping it was built with,
+    the job summary, the input names this job wrote (post-success cleanup) and the
+    GenIO that holds them — RunPod's io carries the collected inputs to `_execute`."""
+    wf: dict
+    mapping: dict
+    summary: dict
+    uploaded: list
+    io: "GenIO"
+
+
+class GenIO:
+    """Every backend I/O `_build_prompt` does, behind one per-REQUEST object (never
+    stored on the adapter: concurrent jobs on one adapter must not share inputs).
+    ComfyIO talks to a ComfyUI over HTTP; RunpodIO collects the inputs into the /run
+    payload. Keeping the build behind this seam is what makes a local and a RunPod
+    candidate of one alias run the SAME workflow (tests/test_gen_build.py)."""
+
+    async def put_image(self, name: str, data: bytes) -> str:
+        raise NotImplementedError
+
+    async def put_file(self, name: str, data: bytes) -> str:
+        raise NotImplementedError
+
+    async def placeholder(self) -> str:
+        raise NotImplementedError
+
+    def files_unsupported(self) -> Optional[str]:
+        """Why client files cannot be placed on this backend, None when they can."""
+        return None
+
+    def input_ref(self, stored: str) -> str:
+        raise NotImplementedError
+
+    async def node_types(self, wf: dict, ids: list) -> dict:
+        raise NotImplementedError
+
+    async def cleanup(self, names: list) -> None:
+        return None
+
+
+class ComfyIO(GenIO):
+    """GenIO of a ComfyUI backend — today's upload/object_info code, unchanged."""
+
+    def __init__(self, adapter: "ComfyUIAdapter"):
+        self.a = adapter
+
+    async def put_image(self, name: str, data: bytes) -> str:
+        async with _pooled_client(self.a.ctx) as c:
+            return await self.a._upload_image(c, data, name)       # raises → job fails
+
+    async def put_file(self, name: str, data: bytes) -> str:
+        return await self.a.upload_input(data, name)               # raises with the reply
+
+    async def placeholder(self) -> str:
+        async with _pooled_client(self.a.ctx) as c:
+            return await self.a._upload_placeholder(c)
+
+    def files_unsupported(self) -> Optional[str]:
+        if comfy_input_dir(self.a.backend):
+            return None
+        return (f"backend '{self.a.name}' has no comfy_input_dir/comfy_output_dir "
+                "— cannot resolve uploaded file to an absolute path")
+
+    def input_ref(self, stored: str) -> str:
+        return input_path_ref(self.a.backend, stored)
+
+    async def node_types(self, wf: dict, ids: list) -> dict:
+        return await self.a._node_types_for(wf, ids)
+
+    async def cleanup(self, names: list) -> None:
+        await self.a._cleanup_uploads(names)
+
+
 class ComfyUIAdapter(BackendAdapter):
     """ComfyUI image/video/audio backend. discover() via /object_info; generate()
     submits a parametrized workflow and polls /history, then fetches /view."""
@@ -3184,21 +3259,20 @@ class ComfyUIAdapter(BackendAdapter):
             return f"{outdir}/{mesh_name}"
         return input_path_ref(backend2, await self.upload_input(mesh_bytes, mesh_name))
 
-    async def _resolve_image_sentinels(self, fixed: list) -> list:
+    async def _resolve_image_sentinels(self, fixed: list, io: Optional["GenIO"] = None) -> list:
         """Replace the placeholder sentinel in fixed bindings with the uploaded 8×8
         placeholder's name (a leftover legacy upload pin counts as one — see
         LEGACY_UPLOAD_SENTINEL)."""
         sentinels = (PLACEHOLDER_SENTINEL, LEGACY_UPLOAD_SENTINEL)
         if not any(b.get("value") in sentinels for b in fixed):
             return fixed
-        async with _pooled_client(self.ctx) as c:
-            ph = await self._upload_placeholder(c)
+        ph = await (io or ComfyIO(self)).placeholder()
         return [({**b, "value": ph} if b.get("value") in sentinels and ph else b) for b in fixed]
 
     async def _apply_image_params(self, wf: dict, mapping: dict, params: list,
                                   uploads: dict, prefix: str, used: list,
                                   node_types: dict, pruned: dict,
-                                  extra_bypass: list) -> list:
+                                  extra_bypass: list, io: "GenIO") -> list:
         """Per request-field image params: upload that field's image (or the 8×8
         placeholder when none was provided) and set the loader node's field to the
         stored name. Each param gets its own JOB-UNIQUE input file (`<prefix>_<param>`),
@@ -3207,44 +3281,44 @@ class ComfyUIAdapter(BackendAdapter):
         post-success cleanup; `pruned` collects `{param: [node ids]}` for the ones an
         `on_empty: disable` slot took out (job summary + the output-node check) and
         `extra_bypass` the same slot's `on_empty_bypass` ids, handed to the one
-        `_apply_bypass` pass at the end of `generate` (see slot_empty_bypass)."""
+        `_apply_bypass` pass at the end of `_build_prompt` (see slot_empty_bypass)."""
         if not params:
             return []
         applied = []
-        async with _pooled_client(self.ctx) as c:
-            for p in params:
-                m = mapping.get(p) or {}
-                nid, fld = m.get("node"), m.get("field")
-                if not (nid and fld):
+        for p in params:
+            m = mapping.get(p) or {}
+            nid, fld = m.get("node"), m.get("field")
+            if not (nid and fld):
+                continue
+            data = uploads.get(p)
+            if data:
+                slot = upload_slot_name(prefix, p)
+                name = await io.put_image(slot, bytes(data))   # raises → job fails
+                used.append(slot)
+            else:
+                mode = slot_empty_mode(m)
+                if mode == "required":
+                    continue              # no 8×8 fallback (e.g. inpaint image/mask) →
+                                          # keep the workflow's own value / error if empty
+                if mode == "disable":     # drop the loader AND whatever cannot run
+                    # without it (dead branch) — except the slot's opt-in extras,
+                    # which are bypassed (not pruned), so a node in the main path is
+                    # skipped without cutting the path behind it
+                    extras = slot_empty_bypass(m)
+                    gone = _prune_branch(wf, nid, node_types, keep=extras)
+                    if gone:
+                        pruned[p] = gone
+                    extra_bypass.extend(extras)
+                    applied.append(p)
                     continue
-                data = uploads.get(p)
-                if data:
-                    slot = upload_slot_name(prefix, p)
-                    name = await self._upload_image(c, bytes(data), slot)   # raises → job fails
-                    used.append(slot)
-                else:
-                    mode = slot_empty_mode(m)
-                    if mode == "required":
-                        continue              # no 8×8 fallback (e.g. inpaint image/mask) →
-                                              # keep the workflow's own value / error if empty
-                    if mode == "disable":     # drop the loader AND whatever cannot run
-                        # without it (dead branch) — except the slot's opt-in extras,
-                        # which are bypassed (not pruned), so a node in the main path is
-                        # skipped without cutting the path behind it
-                        extras = slot_empty_bypass(m)
-                        gone = _prune_branch(wf, nid, node_types, keep=extras)
-                        if gone:
-                            pruned[p] = gone
-                        extra_bypass.extend(extras)
-                        applied.append(p)
-                        continue
-                    name = await self._upload_placeholder(c)
-                wf.setdefault(nid, {}).setdefault("inputs", {})[fld] = name
-                applied.append(p)
+                name = await io.placeholder()
+            wf.setdefault(nid, {}).setdefault("inputs", {})[fld] = name
+            applied.append(p)
         return applied
 
     async def _apply_file_params(self, wf: dict, mapping: dict, files: dict,
-                                 protected: set, prefix: str, used: list) -> list:
+                                 protected: set, prefix: str, used: list,
+                                 io: "GenIO") -> list:
         """Client-supplied non-image files (`files:{param: …}`, e.g. the mesh a shrink
         alias works on): upload each into THIS backend's input dir under a JOB-UNIQUE
         name (`<prefix>_<param>.<ext>`; the client's filename only contributes the
@@ -3257,10 +3331,9 @@ class ComfyUIAdapter(BackendAdapter):
         input dir is unknown fails the job instead of running it against a phantom path."""
         if not files:
             return []
-        indir = comfy_input_dir(self.backend)
-        if not indir:
-            raise RuntimeError(f"backend '{self.name}' has no comfy_input_dir/comfy_output_dir "
-                               "— cannot resolve uploaded file to an absolute path")
+        why = io.files_unsupported()
+        if why:
+            raise RuntimeError(why)
         applied = []
         for p, (name, data) in files.items():
             m = mapping.get(p) or {}                    # keyed by param — the endpoint already
@@ -3273,13 +3346,13 @@ class ComfyUIAdapter(BackendAdapter):
                                f"node {nid}.{fld} is pinned by the alias")
                 continue
             slot = upload_slot_name(prefix, p, os.path.splitext(name or "")[1] or "bin")
-            stored = await self.upload_input(bytes(data), slot)   # raises → job fails with the reply
+            stored = await io.put_file(slot, bytes(data))   # raises → job fails with the reply
             used.append(slot)
-            wf.setdefault(nid, {}).setdefault("inputs", {})[fld] = input_path_ref(self.backend, stored)
+            wf.setdefault(nid, {}).setdefault("inputs", {})[fld] = io.input_ref(stored)
             applied.append(p)
         return applied
 
-    async def _autofill_empty_images(self, wf: dict, mapping: dict) -> list:
+    async def _autofill_empty_images(self, wf: dict, mapping: dict, io: "GenIO") -> list:
         """Any image-loader node still left with an empty `image` (not a mapped
         request field) → fill it with the 8×8 placeholder, so ComfyUI never tries to
         open the input/ directory. Mapped image fields are handled per-field above.
@@ -3294,8 +3367,7 @@ class ComfyUIAdapter(BackendAdapter):
                  and nid not in skip]
         if not empty:
             return []
-        async with _pooled_client(self.ctx) as c:
-            name = await self._upload_placeholder(c)
+        name = await io.placeholder()
         for nid in empty:
             wf[nid].setdefault("inputs", {})["image"] = name
         return empty
@@ -3326,17 +3398,21 @@ class ComfyUIAdapter(BackendAdapter):
             logger.debug(f"model_set_key on [{self.name}] failed: {e}")
             return None
 
-    async def generate(self, req: NormalizedRequest) -> GenOutput:
-        b = self.backend
-        url = b["url"].rstrip("/")
-        bname = self.name
+    def _new_io(self, req: NormalizedRequest) -> "GenIO":
+        return ComfyIO(self)
+
+    async def _build_prompt(self, req: NormalizedRequest, io: "GenIO") -> BuiltPrompt:
+        """Everything before the submit: the workflow with pins, mapped values, LoRAs,
+        image/file inputs, the dead-branch prune and the bypass applied. Its ONLY backend
+        I/O goes through `io` — so a RunPod candidate builds exactly what a local
+        ComfyUI candidate builds (tests/test_gen_build.py)."""
         wf = self._workflow_for(req)
         # Every input file this job uploads lives under ONE job-unique prefix, and the
         # names it actually wrote are collected in `uploaded` for the post-success
         # cleanup. No two jobs ever address the same input file (see upload_slot_name).
         prefix = upload_prefix_for(req.upload_prefix)
         uploaded: list = []
-        fixed = await self._resolve_image_sentinels(list(req.fixed or []))
+        fixed = await self._resolve_image_sentinels(list(req.fixed or []), io)
         fixed_applied = _apply_fixed(wf, fixed)                # pin models / switches / ref-images
         protected = {(b.get("node"), b.get("field")) for b in fixed   # pins the API cannot override
                      if b.get("node") and b.get("field")}
@@ -3386,10 +3462,10 @@ class ComfyUIAdapter(BackendAdapter):
         prune_types = ({} if not any(not uploads.get(p)
                                      and slot_empty_mode(mapping.get(p)) == "disable"
                                      for p in img_params)
-                       else await self._node_types_for(wf, list(wf)))
+                       else await io.node_types(wf, list(wf)))
         img_applied = await self._apply_image_params(wf, mapping, img_params, uploads,
                                                      prefix, uploaded, prune_types, pruned,
-                                                     extra_bypass)
+                                                     extra_bypass, io)
         # A disabled slot that takes the alias's output node with it would submit a
         # workflow that cannot deliver anything — name the slot instead of letting the
         # job fail later as "produced no output".
@@ -3402,8 +3478,8 @@ class ComfyUIAdapter(BackendAdapter):
                 f"requires it, including the alias's output node {req.output_node} — "
                 f"this slot is not optional in this workflow")
         files_applied = await self._apply_file_params(wf, mapping, req.upload_files or {},
-                                                      protected, prefix, uploaded)
-        autofilled = await self._autofill_empty_images(wf, mapping)
+                                                      protected, prefix, uploaded, io)
+        autofilled = await self._autofill_empty_images(wf, mapping, io)
         # Bypass LAST — after every injection, so it rewires the FINAL link graph
         # (remove each bypassed node, reconnect consumers to its same-typed input).
         # The backend's own `bypass` and the empty image slots' `on_empty_bypass` run in
@@ -3414,7 +3490,7 @@ class ComfyUIAdapter(BackendAdapter):
         # summary reads like the node was skipped twice.
         byp_ids = list(dict.fromkeys(str(x) for x in (list(req.bypass or []) + extra_bypass)))
         bypassed = _apply_bypass(wf, byp_ids,
-                                 await self._node_types_for(wf, byp_ids))
+                                 await io.node_types(wf, byp_ids))
         summary = {"applied": sorted(applied.keys()),
                    "seed": values.get(seed_param) if seed_param else None,
                    "fixed": sorted(fixed_applied.keys()),
@@ -3423,6 +3499,15 @@ class ComfyUIAdapter(BackendAdapter):
                    **({"disabled_nodes": pruned} if pruned else {}),
                    **({"files": sorted(files_applied)} if files_applied else {}),
                    **({"bypassed": bypassed} if bypassed else {})}
+        return BuiltPrompt(wf, mapping, summary, uploaded, io)
+
+    async def generate(self, req: NormalizedRequest) -> GenOutput:
+        b = self.backend
+        url = b["url"].rstrip("/")
+        bname = self.name
+        io = self._new_io(req)
+        built = await self._build_prompt(req, io)
+        wf, mapping, summary, uploaded = built.wf, built.mapping, built.summary, built.uploaded
 
         poll_interval = float(b.get("poll_interval", 1.0))
         max_wait = float(b.get("max_wait", 600))
@@ -3523,7 +3608,7 @@ class ComfyUIAdapter(BackendAdapter):
         # nothing will read these inputs again — shrink them to the 72-byte placeholder.
         # After a timeout/interrupt the ComfyUI prompt may STILL run and open the file,
         # so the failure paths deliberately leave the inputs alone.
-        await self._cleanup_uploads(uploaded)
+        await io.cleanup(uploaded)
         elapsed_ms = int((time.monotonic() - started) * 1000)
         if log_on:
             logger.info(f"← [{bname}] {len(blobs)} artifact(s) in {elapsed_ms} ms")
