@@ -5745,6 +5745,38 @@ class ShareShaCache(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(asyncio.gather(run, conf, chk), 5)
         self.assertEqual(order, ["vae/c.st", "vae/a.st", "vae/b.st"])
 
+    async def test_lora_metadata_priority_runs_last(self):
+        """LoRA trigger words (2026-10-02): the metadata worker hashes at priority 3,
+        BEHIND a directory confirmation (2) — clamped to 2, 54 GB of LoRA hashes would
+        queue level with the confirmations in arrival order."""
+        sh = self.share()
+        sh.files["vae/c.st"] = b"ccccc"
+        sh.files["vae/d.st"] = b"dddddd"
+        gate, order = asyncio.Event(), []
+        real = sh.ssh
+
+        async def ssh(argv, stdin=None, timeout=60):
+            words = shlex.split(argv[-1]) if argv[0] != "ssh-keyscan" else [""]
+            if words[0] == "sha256":
+                order.append(words[1])
+                await gate.wait()
+            return await real(argv, stdin, timeout)
+        sh.ssh = ssh
+        lan = self.lan(sh)
+        lan._ssh = ssh
+        lan.sha_files()
+        run = asyncio.ensure_future(lan.sha256("models/vae/c.st", 5, background=2))
+        await asyncio.sleep(0.01)
+        lora = asyncio.ensure_future(lan.sha256("models/vae/d.st", 6, background=3))
+        await asyncio.sleep(0.01)
+        conf = asyncio.ensure_future(lan.sha256("models/vae/b.st", 4, background=2))
+        await asyncio.sleep(0.01)
+        self.assertEqual(lan.hash_queue(),
+                         ["models/vae/c.st", "models/vae/b.st", "models/vae/d.st"])
+        gate.set()
+        await asyncio.wait_for(asyncio.gather(run, lora, conf), 5)
+        self.assertEqual(order, ["vae/c.st", "vae/b.st", "vae/d.st"])
+
     async def test_a_hash_answered_after_a_host_change_is_not_kept(self):
         sh = self.share()
         hosts = [_SRCHOST]

@@ -1492,7 +1492,7 @@ class LanSource:
             return
         fut = asyncio.get_running_loop().create_future()
         self._hash_seq += 1
-        ticket = (min(max(int(background), 0), 2), self._hash_seq, path, fut)
+        ticket = (min(max(int(background), 0), 3), self._hash_seq, path, fut)
         self._hash_wait.append(ticket)
         try:
             await fut
@@ -1519,8 +1519,10 @@ class LanSource:
         a time: a second request for the same file waits and takes the first's answer.
         `background` is the priority (lower runs first, arrival order within one):
         False/0 a transfer's, True/1 a Check & save the operator waits for, 2 a
-        directory check's background confirmation — so neither a transfer nor the next
-        Check & save waits behind hours of confirmations (review-3 M-3).
+        directory check's background confirmation, 3 the LoRA trigger-word worker's
+        (main.lora_meta_pass) — so neither a transfer nor the next Check & save waits
+        behind hours of confirmations (review-3 M-3), and 54 GB of LoRA hashes wait
+        behind everything.
         Every failure is a RuntimeError — an unset or non-plain share host and a path
         with no share mapping included (they are ValueErrors underneath)."""
         raw = self._look()
