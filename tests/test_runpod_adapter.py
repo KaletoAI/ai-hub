@@ -1022,5 +1022,35 @@ class EndpointKeyed(unittest.TestCase):
                                 ("d", "")])
 
 
+
+class HealthAndLoras(unittest.TestCase):
+    """Item 9 (final review): an execution fault quarantines a RunPod endpoint like any
+    ComfyUI box — routing changes — yet /health and the Backends tab said nothing; and
+    the LoRAs tab never listed what the probe discovered."""
+
+    def test_health_carries_quarantine_and_fail_rate_but_no_watchdog(self):
+        import time as _t
+        m = _main()
+        import admin
+        b = {"name": "rp", "type": "runpod", "url": URL, "enabled": True, "paid": True}
+        bid = m.backend_id(b)
+        with unittest.mock.patch.object(m, "backends", [b]), \
+                unittest.mock.patch.dict(m.gen_exec_faults,
+                                         {f"img|{bid}": {"until": _t.time() + 600, "fails": 2,
+                                                         "error": "node 4: OOM"}}), \
+                unittest.mock.patch.dict(m.backend_loras, {bid: {"style.safetensors"}}):
+            m._record_gen_attempt(bid, conn_fail=False, exec_fail=True)
+            try:
+                e = asyncio.run(m.health())["backends"][bid]
+                loras = admin._backend_loras()
+            finally:
+                m.backend_gen_window.pop(bid, None)
+        self.assertEqual([q["alias"] for q in e["quarantined"]], ["img"])
+        self.assertIn("exec_fail_rate", e)
+        self.assertNotIn("exec_stuck", e)
+        self.assertNotIn("last_restart", e)
+        self.assertEqual(loras.get("rp"), ["style.safetensors"])
+
+
 if __name__ == "__main__":
     unittest.main()

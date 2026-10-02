@@ -5721,13 +5721,17 @@ def _comfy_watch_info(b: dict) -> dict:
     into /health + UI snapshot). Both fail rates stay display-only (runbook C): the
     operator decides — they never reorder routing (A1). The `quarantined` list beside
     them is the one thing here that does, and is reported for exactly that reason."""
-    if b.get("type") != "comfyui":
+    if b.get("type") not in ("comfyui", "runpod"):
         return {}
     info: dict = {}
     fs = _gen_fail_stats(backend_id(b))
     if fs:
         info.update(fs)
+    # A RunPod endpoint runs the same workflows, so an execution fault quarantines it
+    # like a ComfyUI box — and a quarantine that changes routing must be visible.
     info.update(_quarantine_info(backend_id(b)))
+    if b.get("type") != "comfyui":
+        return info                 # no executor watchdog, nothing to restart on RunPod
     ad = backend_adapters.get(backend_id(b))
     if ad is not None:
         info.update({"exec_stuck": bool(getattr(ad, "exec_stuck", False)),
@@ -8754,7 +8758,7 @@ admin.bind(runpod_probe=runpod_probe, runpod_object_info=runpod_object_info,
            check_source=check_source, check_dir_source=check_dir_source,
            remove_source=remove_source,
            backend_loras=lambda: {b["name"]: sorted(backend_loras.get(backend_id(b), set()))
-                                  for b in backends if b.get("type") == "comfyui"},
+                                  for b in backends if b.get("type") in ("comfyui", "runpod")},
            lora_meta_view=lora_meta_view, lora_curate=lora_curate,
            lora_refresh=lora_refresh, lora_refresh_all=lora_refresh_all)
 
