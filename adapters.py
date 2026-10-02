@@ -4843,6 +4843,20 @@ class RunpodAdapter(ComfyUIAdapter):
     async def restart(self) -> str:
         raise RuntimeError("a RunPod endpoint has no service to restart")
 
+    # ── chains: refused in milestone 1. The inherited ComfyUI roles would run a billed
+    # stage 1 and then GET /view on api.runpod.ai (no such route, no auth), or upload a
+    # stage-2 mesh to api.runpod.ai/upload/image — both fail only AFTER the money is spent.
+    _NO_CHAIN = "a runpod backend cannot be a chain stage (milestone 1)"
+
+    def chain_export(self, cand: dict, succ: dict, params: dict, prefix: str) -> ChainExport:
+        return ChainExport("", error=self._NO_CHAIN)
+
+    async def chain_take_mesh(self, out: GenOutput, export: ChainExport, want_bytes: bool) -> Optional[bytes]:
+        raise RuntimeError(self._NO_CHAIN)
+
+    async def chain_feed_mesh(self, req2, backend2, mesh_param, mesh_name, mesh_bytes, outdir) -> str:
+        raise RuntimeError(self._NO_CHAIN)
+
     async def cancel(self, job_id: str = "") -> None:
         ent = self._rp_jobs.get(job_id) if job_id else None
         if ent:

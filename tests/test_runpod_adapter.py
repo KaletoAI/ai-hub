@@ -604,5 +604,64 @@ class Console(unittest.TestCase):
         self.assertEqual(oi["UnetLoaderGGUF"]["unet_name"], ["q.gguf"])
 
 
+
+class NoChainRoles(unittest.TestCase):
+    """Item 1 (final review): a RunpodAdapter inherited ComfyUI's chain roles — a stage 1
+    ran (billed) and only then GET /view on api.runpod.ai failed; a stage 2 uploaded to
+    api.runpod.ai/upload/image. Milestone 1 has no chains: refused by name, up front."""
+
+    def test_hooks_refuse_like_the_base_class(self):
+        ad = _adapter()
+        ex = ad.chain_export({"workflow_json": WF}, {"export_node": "9"}, {}, "gwchain_j")
+        self.assertIn("cannot be a chain stage", ex.error)
+        self.assertEqual(ex.mesh_name, "")
+        with self.assertRaises(RuntimeError):
+            asyncio.run(ad.chain_take_mesh(adapters.GenOutput(blobs=[]), ex, True))
+        with self.assertRaises(RuntimeError):
+            asyncio.run(ad.chain_feed_mesh(adapters.NormalizedRequest(alias="r"), {}, "m",
+                                           "x.glb", b"glTF", ""))
+
+    def test_a_runpod_stage1_candidate_is_refused_before_any_run(self):
+        import meshy
+        import tests.test_run_job_failover as rjf
+        m = rjf.main
+        h = rjf.RunJobExecFailover("test_execution_error_fails_over_to_the_next_backend")
+        h.setUp()
+        fj = rjf._ChainJobs()
+        m.jobs = fj
+        saved = (m._gen_backends[:], dict(m.image_models), dict(m.backend_healthy),
+                 m.store._active, m._gen_waiting[:])
+        try:
+            m.store._active = False
+            rpb = {"name": "rp", "type": "runpod", "url": URL, "api_key": "k", "enabled": True,
+                   "paid": True}
+            rb = {"name": "r", "type": "meshy", "enabled": True}
+            m._gen_backends[:] = [rpb, rb]
+            succ = {"alias": "rig", "mesh_param": "input_mesh_path", "export_node": "9"}
+            rig = meshy.default_candidate("r")
+            rig["meshy"]["endpoint"] = "rigging"
+            m.image_models.clear()
+            m.image_models.update({"s1": [{"backend": "rp", "workflow_json": WF,
+                                           "successor": succ}], "rig": [rig]})
+            m.backend_healthy.clear()
+            m.backend_healthy.update({"runpod:rp": True, "meshy:r": True})
+            m._gen_waiting.clear()
+            rp = _RunPod([DONE])
+            ad = adapters.RunpodAdapter(rpb, _ctx())
+            m.backend_adapters.update({"runpod:rp": ad, "meshy:r": rjf._Adapter()})
+            _run(rp, lambda: m._run_chain("job1", "s1", succ, {}, None, {}, {}, {}, {}))
+            self.assertIn("cannot be a chain stage", fj.failed["msg"])
+            self.assertFalse(any(p.endswith("/run") for _m, _h, p in rp.paths))
+            self.assertEqual(m.backend_inflight.get("runpod:rp", 0), 0)
+        finally:
+            gb, im, bh, sa, gw = saved
+            m._gen_backends[:] = gb
+            m.image_models.clear(); m.image_models.update(im)
+            m.backend_healthy.clear(); m.backend_healthy.update(bh)
+            m.store._active = sa
+            m._gen_waiting[:] = gw
+            h.tearDown()
+
+
 if __name__ == "__main__":
     unittest.main()
