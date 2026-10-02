@@ -14,7 +14,6 @@ import copy
 import json
 import os
 import sys
-import tempfile
 import unittest
 import unittest.mock
 
@@ -170,6 +169,39 @@ class IoEquivalence(unittest.TestCase):
         self.assertEqual(built.wf, EXPECTED)
         self.assertEqual(sorted(built.io.puts), ["gw_job1_image.png", "gw_job1_mesh.glb"])
         self.assertEqual(built.uploaded, ["gw_job1_image.png", "gw_job1_mesh.glb"])
+
+
+class FetchSeam(unittest.TestCase):
+    """Delivery reads files through ONE callable — a 404 probes on, anything else
+    raises, exactly as with /view."""
+
+    def _fetch(self, files, calls):
+        async def fetch(params):
+            calls.append(dict(params))
+            key = params.get("filename")
+            if key in files:
+                return files[key]
+            return 404, b""
+        return fetch
+
+    def test_sibling_preferred_and_404_probes_on(self):
+        outputs = {"9": {"result": [{"filename": "m.fbx", "type": "output"}]}}
+        calls = []
+        fetch = self._fetch({"m.glb": (200, b"glb")}, calls)
+        blobs = asyncio.run(_adapter()._fetch_outputs(fetch, {}, outputs, "9", "glb", None))
+        self.assertEqual([(b.name, b.data) for b in blobs], [("m.glb", b"glb")])
+
+    def test_a_non_404_raises(self):
+        outputs = {"9": {"images": [{"filename": "a.png", "type": "output"}]}}
+        fetch = self._fetch({"a.png": (500, b"")}, [])
+        with self.assertRaises(RuntimeError):
+            asyncio.run(_adapter()._fetch_outputs(fetch, {}, outputs, "9", None, None))
+
+    def test_globs_through_fetch(self):
+        outputs = {"9": {"images": [{"filename": "x_mia.fbx", "type": "output"}]}}
+        fetch = self._fetch({"x_mia.glb": (200, b"g")}, [])
+        blobs = asyncio.run(_adapter()._fetch_by_globs(fetch, outputs, ["*_mia.glb"]))
+        self.assertEqual([b.name for b in blobs], ["x_mia.glb"])
 
 
 if __name__ == "__main__":

@@ -3503,14 +3503,11 @@ class ComfyUIAdapter(BackendAdapter):
 
     async def generate(self, req: NormalizedRequest) -> GenOutput:
         b = self.backend
-        url = b["url"].rstrip("/")
         bname = self.name
         io = self._new_io(req)
         built = await self._build_prompt(req, io)
-        wf, mapping, summary, uploaded = built.wf, built.mapping, built.summary, built.uploaded
+        wf, summary, uploaded = built.wf, built.summary, built.uploaded
 
-        poll_interval = float(b.get("poll_interval", 1.0))
-        max_wait = float(b.get("max_wait", 600))
         if not req.slot_held:            # a chain claims the slot itself and holds it across stages
             self.ctx.inflight_inc(self.bid)
         started = time.monotonic()
@@ -3524,82 +3521,8 @@ class ComfyUIAdapter(BackendAdapter):
             # multi-second generation job costs nothing.
             timeout = httpx.Timeout(30.0, read=float(b.get("read_timeout", 60)))
             async with httpx.AsyncClient(timeout=timeout) as client:
-                # A client_id ties this prompt to our websocket listener below. ComfyUI
-                # 0.30 broadcasts progress to everyone, 0.34 measurably does not — sending
-                # the id is what makes the feed work on both, and it is inert otherwise.
-                client_id = f"gw-{req.job_id or uuid.uuid4().hex[:12]}"
-                pr = await client.post(f"{url}/prompt",
-                                       json={"prompt": wf, "client_id": client_id})
-                if pr.status_code != 200:
-                    raise RuntimeError(_comfy_prompt_error(pr.status_code, pr.text, wf, mapping))
-                submitted = pr.json() or {}
-                # A PARTLY invalid workflow still returns 200 AND a prompt_id: ComfyUI
-                # queues the branches it can run and reports the rest in `node_errors`
-                # (measured — one wrong link type). Letting that run would deliver
-                # silently less than the alias configures, so a non-empty node_errors
-                # fails the job here, before anything occupies the GPU.
-                if submitted.get("node_errors"):
-                    raise RuntimeError(_comfy_prompt_error(pr.status_code, pr.text, wf, mapping))
-                prompt_id = submitted.get("prompt_id")
-                if not prompt_id:
-                    raise RuntimeError("ComfyUI returned no prompt_id")
-                if log_on:
-                    logger.info(f"→ [{bname}] queued {prompt_id} (workflow {os.path.basename(req.workflow or '?')})")
-                # Live progress runs BESIDE the /history poll, never instead of it: the
-                # poll owns the job's outcome (and its timeout, disconnect grace and
-                # failover), the socket only says how far along it is. If the socket
-                # never connects the job is completely unaffected.
-                ws_state = {"prompt_id": prompt_id, "began": time.monotonic()}
-                ws_task = asyncio.create_task(
-                    self._ws_progress(url, client_id, req.job_id, ws_state))
-                if req.job_id:
-                    self._prompts[req.job_id] = prompt_id      # what a cancel may stop
-                try:
-                    outputs = await self._poll(client, url, prompt_id, poll_interval, max_wait)
-                except asyncio.CancelledError:
-                    # The job was cancelled (main.cancel_generation cancels this task): stop
-                    # OUR prompt on the way out — targeted, see _stop_prompt — or it keeps
-                    # the GPU busy for a result nobody will fetch.
-                    with contextlib.suppress(Exception):
-                        await asyncio.wait_for(self._stop_prompt(client, url, prompt_id), 10.0)
-                    raise
-                finally:
-                    ws_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError, Exception):
-                        await ws_task
-                    if req.job_id:
-                        self.ctx.note_progress(req.job_id, None)   # the row owns it now
-                        if self._prompts.get(req.job_id) == prompt_id:
-                            self._prompts.pop(req.job_id, None)
-                rig, warnings = None, []
-                if req.output_cases:                 # conditional case delivery (+ rig + validation)
-                    blobs, rig = await self._fetch_by_cases(client, url, outputs, req.output_cases)
-                    if not blobs:
-                        raise RuntimeError(f"no output case matched (rigs: "
-                                           f"{[c.get('rig') for c in req.output_cases]}; nodes with "
-                                           f"outputs: {', '.join(sorted(outputs)) or 'none'})")
-                    if req.output_globs:             # plain glob lines mixed with cases: unconditional extras
-                        have = {b.name for b in blobs}
-                        blobs += [b for b in await self._fetch_by_globs(client, url, outputs, req.output_globs)
-                                  if b.name not in have]
-                    # PIL work on multi-MB textures: off the event loop, which every other
-                    # request and every other job's poll shares (P9)
-                    await asyncio.to_thread(normalize_delivery, blobs, rig,
-                                            req.texture_format)   # V-flip (+ optional jpeg) textures
-                    warnings = await asyncio.to_thread(validate_delivery, blobs, rig)
-                else:
-                    blobs = await self._fetch_outputs(client, url, wf, outputs, req.output_node,
-                                                      req.output_ext, req.output_globs)
-                    if req.output_globs and not req.output_node and not blobs:
-                        raise RuntimeError(f"no output file matched {req.output_globs} "
-                                           f"(nodes with outputs: {', '.join(sorted(outputs)) or 'none'})")
-                    if req.output_node and not blobs:
-                        extra = (f" as a '.{req.output_ext}' sibling" if req.output_ext else "")
-                        raise RuntimeError(f"configured output node {req.output_node} produced "
-                                           f"no fetchable artifact{extra} (no matching file in its outputs)")
-                    if req.dummy_check:          # 2x2-dummy safety net (case mode does it in validate);
-                        await asyncio.to_thread(_check_glb_not_dummy, blobs)   # opt-out: legit 1x1/2x2 exports
-                    warnings = await asyncio.to_thread(validate_delivery, blobs, None)   # rig-less: >30 MB guideline
+                outputs, fetch, extra = await self._execute(req, built, client)
+                blobs, rig, warnings = await self._deliver(req, wf, outputs, fetch)
         finally:
             if not req.slot_held:
                 self.ctx.inflight_dec(self.bid)
@@ -3614,10 +3537,107 @@ class ComfyUIAdapter(BackendAdapter):
             logger.info(f"← [{bname}] {len(blobs)} artifact(s) in {elapsed_ms} ms")
         return GenOutput(blobs=blobs, meta={
             "backend": bname, "workflow": req.workflow,
-            "elapsed_ms": elapsed_ms, **summary,
+            "elapsed_ms": elapsed_ms, **summary, **extra,
             **({"rig": rig} if rig else {}),
             **({"warnings": warnings} if warnings else {}),
         })
+
+    async def _execute(self, req: NormalizedRequest, built: BuiltPrompt, client):
+        """Submit the built prompt and wait for it: ComfyUI's /prompt + ws progress +
+        /history poll. Returns (outputs, fetch, extra_meta) — `fetch(params)` reads one
+        file the way delivery expects ((status, bytes), 404 = absent)."""
+        b, wf, mapping = self.backend, built.wf, built.mapping
+        url = b["url"].rstrip("/")
+        bname = self.name
+        log_on = self.ctx.log_enabled()
+        poll_interval = float(b.get("poll_interval", 1.0))
+        max_wait = float(b.get("max_wait", 600))
+        # A client_id ties this prompt to our websocket listener below. ComfyUI
+        # 0.30 broadcasts progress to everyone, 0.34 measurably does not — sending
+        # the id is what makes the feed work on both, and it is inert otherwise.
+        client_id = f"gw-{req.job_id or uuid.uuid4().hex[:12]}"
+        pr = await client.post(f"{url}/prompt",
+                               json={"prompt": wf, "client_id": client_id})
+        if pr.status_code != 200:
+            raise RuntimeError(_comfy_prompt_error(pr.status_code, pr.text, wf, mapping))
+        submitted = pr.json() or {}
+        # A PARTLY invalid workflow still returns 200 AND a prompt_id: ComfyUI
+        # queues the branches it can run and reports the rest in `node_errors`
+        # (measured — one wrong link type). Letting that run would deliver
+        # silently less than the alias configures, so a non-empty node_errors
+        # fails the job here, before anything occupies the GPU.
+        if submitted.get("node_errors"):
+            raise RuntimeError(_comfy_prompt_error(pr.status_code, pr.text, wf, mapping))
+        prompt_id = submitted.get("prompt_id")
+        if not prompt_id:
+            raise RuntimeError("ComfyUI returned no prompt_id")
+        if log_on:
+            logger.info(f"→ [{bname}] queued {prompt_id} (workflow {os.path.basename(req.workflow or '?')})")
+        # Live progress runs BESIDE the /history poll, never instead of it: the
+        # poll owns the job's outcome (and its timeout, disconnect grace and
+        # failover), the socket only says how far along it is. If the socket
+        # never connects the job is completely unaffected.
+        ws_state = {"prompt_id": prompt_id, "began": time.monotonic()}
+        ws_task = asyncio.create_task(
+            self._ws_progress(url, client_id, req.job_id, ws_state))
+        if req.job_id:
+            self._prompts[req.job_id] = prompt_id      # what a cancel may stop
+        try:
+            outputs = await self._poll(client, url, prompt_id, poll_interval, max_wait)
+        except asyncio.CancelledError:
+            # The job was cancelled (main.cancel_generation cancels this task): stop
+            # OUR prompt on the way out — targeted, see _stop_prompt — or it keeps
+            # the GPU busy for a result nobody will fetch.
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self._stop_prompt(client, url, prompt_id), 10.0)
+            raise
+        finally:
+            ws_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await ws_task
+            if req.job_id:
+                self.ctx.note_progress(req.job_id, None)   # the row owns it now
+                if self._prompts.get(req.job_id) == prompt_id:
+                    self._prompts.pop(req.job_id, None)
+
+        async def fetch(params: dict):
+            r = await client.get(f"{url}/view", params=params)
+            return r.status_code, r.content
+        return outputs, fetch, {}
+
+    async def _deliver(self, req: NormalizedRequest, wf: dict, outputs: dict, fetch):
+        """Turn the outputs into the delivery (cases / node / globs, normalisation,
+        validation) — reading every file through `fetch`."""
+        rig, warnings = None, []
+        if req.output_cases:                 # conditional case delivery (+ rig + validation)
+            blobs, rig = await self._fetch_by_cases(fetch, outputs, req.output_cases)
+            if not blobs:
+                raise RuntimeError(f"no output case matched (rigs: "
+                                   f"{[c.get('rig') for c in req.output_cases]}; nodes with "
+                                   f"outputs: {', '.join(sorted(outputs)) or 'none'})")
+            if req.output_globs:             # plain glob lines mixed with cases: unconditional extras
+                have = {b.name for b in blobs}
+                blobs += [b for b in await self._fetch_by_globs(fetch, outputs, req.output_globs)
+                          if b.name not in have]
+            # PIL work on multi-MB textures: off the event loop, which every other
+            # request and every other job's poll shares (P9)
+            await asyncio.to_thread(normalize_delivery, blobs, rig,
+                                    req.texture_format)   # V-flip (+ optional jpeg) textures
+            warnings = await asyncio.to_thread(validate_delivery, blobs, rig)
+        else:
+            blobs = await self._fetch_outputs(fetch, wf, outputs, req.output_node,
+                                              req.output_ext, req.output_globs)
+            if req.output_globs and not req.output_node and not blobs:
+                raise RuntimeError(f"no output file matched {req.output_globs} "
+                                   f"(nodes with outputs: {', '.join(sorted(outputs)) or 'none'})")
+            if req.output_node and not blobs:
+                extra = (f" as a '.{req.output_ext}' sibling" if req.output_ext else "")
+                raise RuntimeError(f"configured output node {req.output_node} produced "
+                                   f"no fetchable artifact{extra} (no matching file in its outputs)")
+            if req.dummy_check:          # 2x2-dummy safety net (case mode does it in validate);
+                await asyncio.to_thread(_check_glb_not_dummy, blobs)   # opt-out: legit 1x1/2x2 exports
+            warnings = await asyncio.to_thread(validate_delivery, blobs, None)   # rig-less: >30 MB guideline
+        return blobs, rig, warnings
 
     async def _ws_progress(self, url: str, client_id: str, job_id: str, state: dict) -> None:
         """Follow ComfyUI's /ws feed and report this job's real step progress.
@@ -3795,7 +3815,7 @@ class ComfyUIAdapter(BackendAdapter):
         raise TimeoutError(f"ComfyUI timeout after {max_wait:.0f}s (prompt {prompt_id}); "
                            f"last poll error: {last_exc}")
 
-    async def _fetch_outputs(self, client, url, wf, outputs,
+    async def _fetch_outputs(self, fetch, wf, outputs,
                              output_node: Optional[str] = None,
                              output_ext: Optional[str] = None,
                              output_globs: Optional[list] = None) -> list[GenBlob]:
@@ -3811,7 +3831,7 @@ class ComfyUIAdapter(BackendAdapter):
         # authoritative and the globs ship as unconditional extras (appended
         # below) — same semantics as globs mixed with output_cases.
         if output_globs and not output_node:
-            return await self._fetch_by_globs(client, url, outputs, output_globs)
+            return await self._fetch_by_globs(fetch, outputs, output_globs)
         # Single-node mode: the alias's explicit output node (mapping editor
         # "Output" section) is authoritative — a workflow may export intermediate
         # files from several nodes, and only the configured one is the result. It
@@ -3864,12 +3884,13 @@ class ComfyUIAdapter(BackendAdapter):
                             r = None
                             break
                         seen.add(key)
-                        r = await client.get(f"{url}/view", params=view)
-                        if r.status_code == 200:
+                        status, content = await fetch(view)
+                        if status == 200:
+                            r = content
                             break
-                        if r.status_code != 404:   # only "no such file" may probe on — a backend
+                        if status != 404:          # only "no such file" may probe on — a backend
                             raise RuntimeError(    # error must not silently shrink the delivery
-                                f"/view '{fn}' → HTTP {r.status_code}")
+                                f"/view '{fn}' → HTTP {status}")
                         r = None
                     if r is None:
                         continue
@@ -3881,7 +3902,7 @@ class ComfyUIAdapter(BackendAdapter):
                             if top in ("video", "audio"):
                                 kind = top
                                 mime = {"video": "video/mp4", "audio": "audio/mpeg"}[top]
-                    blobs.append(GenBlob(data=r.content, mime=mime, kind=kind, name=fn))
+                    blobs.append(GenBlob(data=r, mime=mime, kind=kind, name=fn))
         # output_node + output_globs: glob extras on top of the node's result (e.g.
         # the metallic PNG a SaveImage bakes next to a Preview3D-delivered GLB).
         # Only on a delivered node result — an empty one stays empty so the caller's
@@ -3889,11 +3910,11 @@ class ComfyUIAdapter(BackendAdapter):
         # partial extras-only delivery.
         if output_globs and blobs:
             have = {b.name for b in blobs}
-            blobs += [b for b in await self._fetch_by_globs(client, url, outputs, output_globs)
+            blobs += [b for b in await self._fetch_by_globs(fetch, outputs, output_globs)
                       if b.name not in have]
         return blobs
 
-    async def _fetch_by_cases(self, client, url, outputs, cases) -> tuple:
+    async def _fetch_by_cases(self, fetch, outputs, cases) -> tuple:
         """Conditional delivery: pick the FIRST case whose detect file (its first
         glob) actually exists in this run, then deliver all of that case's globs.
         Two riggers may share a workflow (humanoid MIA vs non-humanoid UniRig) or
@@ -3910,13 +3931,13 @@ class ComfyUIAdapter(BackendAdapter):
             globs = case.get("globs") or []
             if not globs:
                 continue
-            blobs = await self._fetch_by_globs(client, url, outputs, globs)
+            blobs = await self._fetch_by_globs(fetch, outputs, globs)
             if not any(fnmatch.fnmatch((b.name or "").lower(), globs[0].lower()) for b in blobs):
                 continue                              # detect file absent → this case didn't run
             return blobs, case.get("rig")
         return [], None
 
-    async def _fetch_by_globs(self, client, url, outputs, globs) -> list[GenBlob]:
+    async def _fetch_by_globs(self, fetch, outputs, globs) -> list[GenBlob]:
         """Deliver every registered file (or a same-stem sibling) matching a glob.
         Order follows the globs, so results come out predictable for the client."""
         glob_exts = {g.rsplit(".", 1)[-1].lower() for g in globs if "." in g}
@@ -3950,15 +3971,15 @@ class ComfyUIAdapter(BackendAdapter):
                     continue
                 if not fnmatch.fnmatch(cfn.lower(), g.lower()):
                     continue
-                r = await client.get(f"{url}/view", params=view)
-                if r.status_code == 404:                 # sibling for this glob doesn't exist
+                status, content = await fetch(view)
+                if status == 404:                        # sibling for this glob doesn't exist
                     continue
-                if r.status_code != 200:                 # a backend error is not "file absent" —
+                if status != 200:                        # a backend error is not "file absent" —
                     raise RuntimeError(                  # it must not shrink or mis-detect a delivery
-                        f"/view '{cfn}' → HTTP {r.status_code}")
+                        f"/view '{cfn}' → HTTP {status}")
                 fetched.add((cfn, view.get("subfolder", "")))
                 mime, kind = _mime_and_kind(cfn)
-                blobs.append(GenBlob(data=r.content, mime=mime, kind=kind, name=cfn))
+                blobs.append(GenBlob(data=content, mime=mime, kind=kind, name=cfn))
         return blobs
 
 
