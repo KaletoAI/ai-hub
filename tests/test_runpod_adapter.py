@@ -769,5 +769,122 @@ class ProbeAcrossRebuild(unittest.TestCase):
         self.assertEqual(far._models, set())
 
 
+
+class _RpFake:
+    """A RunPod stand-in for `_run_job`: writes the trace exactly where RunpodAdapter's
+    _submit/_poll_rp do, then raises `boom` (or returns one artifact)."""
+
+    def __init__(self, boom=None, settled=False):
+        self.boom, self.settled, self.calls = boom, settled, 0
+
+    async def generate(self, req):
+        self.calls += 1
+        req.cloud_trace.update({"backend": "rp", "runpod": True,
+                                "runpod_job_id": f"rpj{self.calls}",
+                                "runpod_settled": self.settled})
+        if self.boom is not None:
+            raise self.boom
+        import types
+        return types.SimpleNamespace(blobs=[b"art"], meta={})
+
+
+class RunJobBilling(unittest.TestCase):
+    """Item 4 (final review): the billing invariant end to end through `_run_job`, not
+    only at predicate level. An unsettled RunPod job may still run — and bill — at RunPod:
+    a self-retry or the next candidate would pay for the same work twice, and the row
+    would read like an ordinary failover."""
+
+    def setUp(self):
+        import tests.test_run_job_failover as rjf
+        self.rjf, self.m = rjf, rjf.main
+        self.h = rjf.RunJobExecFailover("test_execution_error_fails_over_to_the_next_backend")
+        self.h.setUp()
+        self.jobs = self.h.jobs
+
+    def tearDown(self):
+        self.h.tearDown()
+
+    @staticmethod
+    def _rp(name="rp", retries=0):
+        return ({"name": name, "type": "runpod", "url": URL, "paid": True,
+                 "self_retries": retries}, {"backend": name, "workflow_json": {}})
+
+    def _run(self, cands, ads):
+        import types
+        self.m.backend_adapters.update(ads)
+        asyncio.run(self.m._run_job("job1", "alias1", cands,
+                                    lambda b, c: types.SimpleNamespace(slot_held=False,
+                                                                       cloud_trace={})))
+
+    def test_unsettled_execution_error_is_final(self):
+        a, good = _RpFake(RuntimeError("worker crashed")), self.rjf._Adapter()
+        self._run([self._rp(), self.h._comfy("good")], {"runpod:rp": a, "comfyui:good": good})
+        self.assertEqual((a.calls, good.calls), (1, 0))
+        self.assertIsNone(self.jobs.completed)
+        msg = self.jobs.failed["msg"]
+        self.assertIn("RunPod job rpj1", msg)
+        self.assertIn("may still be running", msg)
+        self.assertEqual(self.jobs.failed["meta"]["runpod_job_id"], "rpj1")
+
+    def test_unsettled_failover_class_error_is_never_self_retried(self):
+        for boom in (adapters.CloudBusy("RunPod /status 429", vendor="RunPod"),
+                     ConnectionError("RunPod unreachable for >30s")):
+            self.h.tearDown(); self.h.setUp(); self.jobs = self.h.jobs
+            a, good = _RpFake(boom), self.rjf._Adapter()
+            self._run([self._rp(retries=1), self.h._comfy("good")],
+                      {"runpod:rp": a, "comfyui:good": good})
+            self.assertEqual((a.calls, good.calls), (1, 0), boom)
+            self.assertIn("RunPod job rpj1", self.jobs.failed["msg"])
+            self.assertIn("may still be running", self.jobs.failed["msg"])
+
+    def test_a_settled_failed_job_fails_over(self):
+        a, good = _RpFake(RuntimeError("RunPod: node 4 OOM"), settled=True), self.rjf._Adapter()
+        self._run([self._rp(), self.h._comfy("good")], {"runpod:rp": a, "comfyui:good": good})
+        self.assertEqual((a.calls, good.calls), (1, 1))
+        self.assertIsNotNone(self.jobs.completed)
+        self.assertIsNone(self.jobs.failed)
+
+    def test_runpod_never_reaches_comfy_free(self):
+        """Spec §5.12: a RunPod endpoint has no /free — the claim and after-job paths are
+        ComfyUI-only, or a POST /free goes to api.runpod.ai with the API key."""
+        m = self.m
+        rpb = self._rp()[0]
+        m._free_comfy_vram = self.h._orig_free           # the REAL after-job policy
+        m.backend_hosts[m.backend_id(rpb)] = "rp-host"
+        # both policies switched ON for its host: only the type gate may keep it out
+        m.hosts_meta["rp-host"] = {"comfy_free_after_job": True, "comfy_free_before_job": True}
+        try:
+            async def go():
+                await m._claim_gen_backend(rpb, "alias1", "other-models")
+                await m._free_comfy_vram(rpb, "job done")
+                m.backend_adapters["runpod:rp"] = _RpFake()
+                import types
+                await m._run_job("job1", "alias1", [self._rp()],
+                                 lambda b, c: types.SimpleNamespace(slot_held=False,
+                                                                    cloud_trace={}))
+                await asyncio.sleep(0.05)                # let the after-job _bg task run
+            asyncio.run(go())
+        finally:
+            m.backend_hosts.pop(m.backend_id(rpb), None)
+            m.hosts_meta.pop("rp-host", None)
+        self.assertIsNotNone(self.jobs.completed)
+        self.assertEqual(self.h.frees, [])
+
+    def test_the_alias_editor_offers_a_runpod_backend_to_a_workflow_alias(self):
+        import admin
+        m = self.m
+        b = [{"name": "gpu", "type": "comfyui", "url": "http://10.0.0.3:8188", "enabled": True},
+             {"name": "rp", "type": "runpod", "url": URL, "enabled": True},
+             {"name": "mz", "type": "meshy", "url": "https://api.meshy.ai", "enabled": True}]
+        with unittest.mock.patch.object(m, "backends", b):
+            self.assertIn("rp", [x["name"] for x in admin._gen_backends()])
+            wf_cands = [{"backend": "gpu", "workflow_json": {}}]
+            self.assertTrue(admin._same_kind(wf_cands, "rp"))
+            self.assertIn("<option>rp</option>", admin._backends_section("a", wf_cands))
+            cloud = [{"backend": "mz", "meshy": {"endpoint": "image-to-3d"}}]
+            self.assertFalse(admin._same_kind(cloud, "rp"))
+            self.assertNotIn("<option>rp</option>", admin._backends_section("a", cloud))
+
+
 if __name__ == "__main__":
     unittest.main()
