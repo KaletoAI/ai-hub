@@ -158,8 +158,9 @@ def rebuild_backends() -> None:
         # Cost tier for the scheduler (spec 2026-09-01): a paid backend is a candidate
         # only when no unpaid one is free. Normalized here — config and store entries
         # may omit the key entirely. A cloud backend (Meshy, Tripo) bills per task, so it
-        # is ALWAYS paid.
-        b["paid"] = True if b.get("type") in adapters.CLOUD_TYPES else bool(b.get("paid"))
+        # is ALWAYS paid, and a RunPod endpoint bills per second of every run.
+        b["paid"] = True if (b.get("type") in adapters.CLOUD_TYPES
+                             or b.get("type") in adapters.BILLING_TYPES) else bool(b.get("paid"))
     # Every rebuild hands out NEW backend dicts; a managed-host controller reads its
     # entry and services from what it was handed, so it must be given the current ones.
     # BEFORE the grouping and the route index: an attached backend's forward ends and
@@ -997,6 +998,7 @@ async def lifespan(app: FastAPI):
                   jobs_cfg.get("blob_dir", "jobs"),
                   jobs_cfg.get("default_ttl_s", 86400))
         jobs_prune_task = asyncio.create_task(jobs.prune_loop(jobs_cfg.get("prune_interval_s", 3600)))
+        _bg(_cancel_orphaned_runpod(jobs.last_orphans()))
         # Seed the media gen-speed EMA from the job store so a restart does not have
         # to re-probe every backend once per alias. Best-effort: a missing/odd jobs DB
         # must never hold up the boot.
@@ -2192,6 +2194,15 @@ def _cost_usd(bid: str, model_id: Optional[str], in_tok: int, out_tok: int,
 # Services handed to every backend adapter so it stays import-cycle-free and
 # hot-reload-safe (the log flag is read per-call via a callable, never cached).
 
+def _runpod_probe_save(name: str, rec: dict) -> None:
+    """Store a RunPod probe record under its backend name (worker thread)."""
+    if not store.is_active():
+        return
+    allp = dict(store.get_setting("runpod_probe") or {})
+    allp[name] = rec
+    store.set_settings({"runpod_probe": allp})
+
+
 adapter_ctx = AdapterContext(
     auth_headers=backend_auth_headers,
     inflight_inc=_inflight_inc,
@@ -2207,6 +2218,10 @@ adapter_ctx = AdapterContext(
     apply_reasoning=_reasoning_apply,
     http_client=lambda: http_client,   # shared pool; callable so adapters never cache it
     loras_of=lambda bid: backend_loras.get(bid, set()),
+    note_job_meta=lambda job_id, meta: jobs.merge_meta(job_id, meta) if jobs._active else None,
+    runpod_probe_load=lambda name: (store.get_setting("runpod_probe") or {}).get(name)
+        if store.is_active() else None,
+    runpod_probe_save=_runpod_probe_save,
 )
 
 
@@ -3426,6 +3441,16 @@ def _billed_cloud_task(cand: dict, trace: dict, e: BaseException,
     unbilled must not make a later, never-created attempt look billed.
     `CloudTaskRetryable` stays retryable — `_poll` raises it only for a vendor-side fault
     that consumed no credits, which is the one case a re-run is meant for."""
+    if trace.get("runpod"):
+        # A RunPod run of a WORKFLOW candidate (cloud_kind is None for it). The adapter
+        # sets `runpod_settled` only once RunPod confirms the job is no longer running —
+        # anything else may still be billing, and a re-run would pay for it twice.
+        rp = trace.get("runpod_job_id")
+        if rp and rp != prior_task and not trace.get("runpod_settled"):
+            return f"RunPod job {rp}"
+        if not rp and trace.get("create_unconfirmed"):
+            return "a RunPod job (the /run request was sent but its answer was lost)"
+        return None
     if not adapters.cloud_kind(cand) or isinstance(e, adapters.CloudTaskRetryable):
         return None
     vendor = adapters.cloud_module(adapters.cloud_kind(cand)).VENDOR
@@ -3896,8 +3921,9 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req,
                     _record_gen_attempt(bid, conn_fail=False, exec_fail=True)
                     _note_fault(backend, "job", "execution", f"{alias}: {_err_text(e)}")
                     cloud_trace = _cloud_trace_of(req) or cloud_trace
-                    if adapters.cloud_kind(cand):
-                        # A cloud task is BILLED. Whatever failed here may have happened
+                    if adapters.cloud_kind(cand) or _billed_cloud_task(cand, _cloud_trace_of(req), e):
+                        # A cloud task is BILLED (and a RunPod job that is not settled may
+                        # still be running). Whatever failed here may have happened
                         # after the paid task was created, and re-running the job on the
                         # next candidate would buy the same mesh twice — the invariant
                         # tripo.py/adapters.py go out of their way to preserve. Final.
@@ -5741,6 +5767,62 @@ def _cloud_info(b: dict) -> dict:
     return info
 
 
+def _runpod_info(b: dict) -> dict:
+    """What the last discovery and probe of a RunPod backend saw (merged into /health +
+    the Backends tab); {} for every other type."""
+    if b.get("type") != "runpod":
+        return {}
+    ad = backend_adapters.get(backend_id(b))
+    if ad is None:
+        return {}
+    h = getattr(ad, "health", {}) or {}
+    return {"runpod": {"workers_idle": (h.get("workers") or {}).get("idle"),
+                       "workers_running": (h.get("workers") or {}).get("running"),
+                       "in_queue": (h.get("jobs") or {}).get("inQueue"),
+                       "workers_max": (getattr(ad, "endpoint_info", {}) or {}).get("workersMax"),
+                       "probe": dict(getattr(ad, "probe_state", {}) or {})}}
+
+
+def runpod_probe(bid: str) -> bool:
+    """Start one probe of a RunPod backend in the background (console action)."""
+    ad = backend_adapters.get(bid)
+    if not isinstance(ad, adapters.RunpodAdapter) or ad.probe_state.get("state") == "running":
+        return False
+    _bg(ad.probe())
+    return True
+
+
+def runpod_object_info(name: str) -> Optional[dict]:
+    """The probed /object_info of the RunPod backend `name` (the mapping editor's widget
+    source — the endpoint has no /object_info of its own to ask)."""
+    for b in backends:
+        if b.get("name") == name and b.get("type") == "runpod":
+            ad = backend_adapters.get(backend_id(b))
+            return getattr(ad, "object_info_full", None)
+    return None
+
+
+async def _cancel_orphaned_runpod(orphans: list) -> int:
+    """Startup: a job the restart orphaned may still run — and bill — at RunPod. Cancel
+    each one whose row names a RunPod job (best effort; the job's own ttl ends it
+    otherwise). Returns how many cancels were sent."""
+    n = 0
+    for job_id, bname, meta in orphans:
+        rp = (meta or {}).get("runpod_job_id")
+        if not rp:
+            continue
+        b = next((x for x in backends if x.get("name") == bname and x.get("type") == "runpod"), None)
+        ad = backend_adapters.get(backend_id(b)) if b else None
+        if ad is None:
+            continue
+        n += 1
+        ok = await ad.cancel_runpod_id(rp)
+        await asyncio.to_thread(jobs.merge_meta, job_id, {"runpod_cancelled_at_restart": ok})
+        logger.warning(f"startup: RunPod job {rp} of orphaned job {job_id} "
+                       f"{'cancelled' if ok else 'cancel UNCONFIRMED — check the RunPod console'}")
+    return n
+
+
 async def _scan_fetch(url: str):
     """netscan's fetch: (status, json|None) with a short timeout — an open port that
     does not answer HTTP in 2 s is not a backend worth waiting for."""
@@ -5826,7 +5908,7 @@ def gateway_info() -> dict:
             "host": backend_hosts.get(backend_id(b), ""),
             "host_explicit": bool((b.get("host") or "").strip()),
             "source": "config" if backend_id(b) in config_ids else "ui",
-            **_comfy_watch_info(b), **_cloud_info(b), **_model_filter_info(b), **_loaded_info(b),
+            **_comfy_watch_info(b), **_cloud_info(b), **_runpod_info(b), **_model_filter_info(b), **_loaded_info(b),
         } for b in backends],
         "virtual_models": list(virtual_models.keys()),
         "endpoints": ["/v1/chat/completions", "/v1/completions", "/v1/embeddings",
@@ -8545,7 +8627,8 @@ def llm_backends_info() -> list[dict]:
 
 # Wire the UI to the generation core, the ComfyUI backends, the status snapshot,
 # and the backend-change hook.
-admin.bind(comfy_backends=lambda: [b for b in backends if b.get("type") == "comfyui"],
+admin.bind(runpod_probe=runpod_probe, runpod_object_info=runpod_object_info,
+           comfy_backends=lambda: [b for b in backends if b.get("type") == "comfyui"],
            gen_backends=lambda: [b for b in backends if _is_gen(b)],
            gateway_info=gateway_info,
            gen_speed_info=gen_speed_info,
@@ -8662,7 +8745,7 @@ async def health(verbose: bool = True) -> dict:
                 # `error` above is gone the moment the next poll succeeds.
                 "faults_24h": {k: (fmap.get(backend_id(b)) or {}).get(k, 0)
                                for k in ("faults", "outages", "downtime_s")},
-                **_comfy_watch_info(b), **_cloud_info(b), **_model_filter_info(b), **_loaded_info(b),
+                **_comfy_watch_info(b), **_cloud_info(b), **_runpod_info(b), **_model_filter_info(b), **_loaded_info(b),
             }
             for b in backends
         },

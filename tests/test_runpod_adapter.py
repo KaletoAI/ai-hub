@@ -405,5 +405,87 @@ class DiscoveryAndProbe(unittest.TestCase):
         self.assertIn("did not start", st["error"])
 
 
+import tempfile  # noqa: E402
+
+
+def _main():
+    """Import main inside a temp cwd with an empty config (the pattern of test_gen_cancel)."""
+    prev = os.getcwd()
+    t = tempfile.TemporaryDirectory()
+    with open(os.path.join(t.name, "config.yaml"), "w") as f:
+        f.write('api_key: ""\nbackends: []\n')
+    os.chdir(t.name)
+    try:
+        import main
+    finally:
+        os.chdir(prev)
+        t.cleanup()
+    return main
+
+
+class BilledPredicate(unittest.TestCase):
+    def setUp(self):
+        self.main = _main()
+
+    def test_unsettled_runpod_job_blocks_exec_failover(self):
+        m = self.main
+        cand = {"backend": "rp", "workflow_json": {}}
+        tr = {"runpod": True, "runpod_job_id": "rp1", "runpod_settled": False}
+        self.assertIn("RunPod job rp1", m._billed_cloud_task(cand, tr, RuntimeError("x")))
+        tr["runpod_settled"] = True
+        self.assertIsNone(m._billed_cloud_task(cand, tr, RuntimeError("x")))
+
+    def test_lost_create_answer_is_billed(self):
+        tr = {"runpod": True, "create_unconfirmed": True}
+        self.assertIn("answer was lost",
+                      self.main._billed_cloud_task({"backend": "rp"}, tr, ConnectionError("x")))
+
+    def test_a_refused_create_is_not_billed(self):
+        self.assertIsNone(self.main._billed_cloud_task({"backend": "rp"}, {"runpod": True},
+                                                       ConnectionError("x")))
+
+    def test_runpod_is_paid(self):
+        m = self.main
+        saved = (list(m.backends), dict(m.backend_adapters))
+        try:
+            with unittest.mock.patch.object(m, "config_backends",
+                                            [{"name": "rp", "type": "runpod", "url": URL}]):
+                with unittest.mock.patch.object(m.store, "is_active", lambda: False):
+                    m.rebuild_backends()
+            self.assertTrue(next(b for b in m.backends if b["name"] == "rp")["paid"])
+        finally:
+            m.backends[:] = saved[0]
+
+
+class StartupCancel(unittest.TestCase):
+    def test_startup_cancels_orphaned_runpod_job(self):
+        m = _main()
+        cancelled = []
+
+        class _Ad:
+            async def cancel_runpod_id(self, rp_id):
+                cancelled.append(rp_id)
+                return True
+        b = {"name": "rp", "type": "runpod", "url": URL}
+        with unittest.mock.patch.object(m, "backends", [b]), \
+                unittest.mock.patch.dict(m.backend_adapters, {m.backend_id(b): _Ad()}), \
+                unittest.mock.patch.object(m.jobs, "merge_meta", lambda *a: None):
+            n = asyncio.run(m._cancel_orphaned_runpod(
+                [("j1", "rp", {"runpod_job_id": "rp1"}), ("j2", "gpu", {})]))
+        self.assertEqual((n, cancelled), (1, ["rp1"]))
+
+
+class Jobs(unittest.TestCase):
+    def test_reconcile_remembers_the_orphans_with_their_meta(self):
+        import jobs
+        with tempfile.TemporaryDirectory() as t:
+            jobs.init(os.path.join(t, "j.db"), os.path.join(t, "b"))
+            jid = jobs.create("image", "a", "rp")
+            jobs.set_status(jid, "running")
+            jobs.merge_meta(jid, {"runpod_job_id": "rp9"})
+            jobs.reconcile_orphans()
+            self.assertEqual(jobs.last_orphans(), [(jid, "rp", {"runpod_job_id": "rp9"})])
+
+
 if __name__ == "__main__":
     unittest.main()

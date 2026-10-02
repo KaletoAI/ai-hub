@@ -577,15 +577,35 @@ def _delete(job_id: str) -> None:
         c.execute("DELETE FROM jobs WHERE id=?", (job_id,))
 
 
+_LAST_ORPHANS: list = []
+
+
 def reconcile_orphans() -> int:
     """Mark jobs still in `running`/`queued` as failed. Called at startup: the async
     tasks that owned them died with the previous process, so they can never finish —
-    otherwise they linger as forever-'running' rows (ticking duration) until TTL."""
+    otherwise they linger as forever-'running' rows (ticking duration) until TTL.
+    The rows it fails are remembered (`last_orphans`): a RunPod job behind one is still
+    BILLING, and main cancels it once the adapters exist."""
+    global _LAST_ORPHANS
     with _conn() as c:
+        rows = c.execute(f"SELECT id, backend, meta_json FROM jobs WHERE {_LIVE}").fetchall()
         cur = c.execute(
             "UPDATE jobs SET status='failed', error='interrupted by process restart', updated=? "
             "WHERE status IN ('running','queued')", (int(time.time()),))
-        return cur.rowcount
+    out = []
+    for r in rows:
+        try:
+            meta = json.loads(r[2] or "{}") or {}
+        except ValueError:
+            meta = {}
+        out.append((r[0], r[1] or "", meta))
+    _LAST_ORPHANS = out
+    return cur.rowcount
+
+
+def last_orphans() -> list:
+    """(job_id, backend, meta) of the rows the last reconcile_orphans() failed."""
+    return list(_LAST_ORPHANS)
 
 
 def prune_once() -> int:
