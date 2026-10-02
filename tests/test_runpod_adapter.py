@@ -961,5 +961,66 @@ class PollClocksAndEnds(unittest.TestCase):
         self.assertFalse(req.cloud_trace.get("runpod_settled"))
 
 
+
+class EndpointKeyed(unittest.TestCase):
+    """Item 8 (final review): probe records and job meta were keyed by backend NAME
+    only. A url changed to another endpoint (or a reused name) served the old endpoint's
+    probe — models and node types of a different image — and a restart sent the orphan's
+    cancel to the CURRENT endpoint, which ends nothing while the old one bills on."""
+
+    B = {"name": "rp", "type": "runpod", "url": URL, "api_key": "k", "poll_interval": 0.01}
+
+    def _disc(self, ad):
+        async def go():
+            async with httpx.AsyncClient() as c:
+                return await ad.discover(c)
+        return _run(_RunPod([DONE]), go)
+
+    def test_probe_record_carries_the_endpoint_and_a_foreign_one_is_ignored(self):
+        saved = {}
+        rp = _RunPod([INFO])
+        ad = adapters.RunpodAdapter(dict(self.B), _ctx(runpod_probe_save=lambda n, r: saved.update({n: r})))
+        real = httpx.AsyncClient
+        ad.ctx.http_client = lambda: real(transport=httpx.MockTransport(rp.handler))
+        asyncio.run(ad.probe())
+        self.assertEqual(saved["rp"]["endpoint"], "ep123")
+        mine = adapters.RunpodAdapter(dict(self.B), _ctx(runpod_probe_load=lambda n: saved.get(n)))
+        self.assertIn("q.gguf", self._disc(mine).models)
+        for rec in ({**saved["rp"], "endpoint": "other"}, {k: v for k, v in saved["rp"].items()
+                                                            if k != "endpoint"}):
+            ad2 = adapters.RunpodAdapter(dict(self.B), _ctx(runpod_probe_load=lambda n, r=rec: r))
+            self.assertEqual(self._disc(ad2).models, set())
+            self.assertEqual(ad2.probe_state["state"], "none")
+            self.assertTrue(ad2._snap_loaded)
+
+    def test_job_meta_names_the_endpoint(self):
+        metas = []
+        ad = _adapter()
+        ad.ctx.note_job_meta = lambda jid, meta: metas.append(meta)
+        _run(_RunPod([DONE]), lambda: ad.generate(_req()))
+        self.assertEqual(metas[0]["runpod_endpoint"], "ep123")
+        self.assertEqual(metas[0]["runpod_job_id"], "rp1")
+
+    def test_orphan_cancel_goes_to_the_endpoint_the_job_ran_on(self):
+        m = _main()
+        sent = []
+
+        class _Ad:
+            async def cancel_runpod_id(self, rp_id, url=""):
+                sent.append((rp_id, url))
+                return True
+        b = {"name": "rp", "type": "runpod", "url": "https://api.runpod.ai/v2/newep"}
+        with unittest.mock.patch.object(m, "backends", [b]), \
+                unittest.mock.patch.dict(m.backend_adapters, {m.backend_id(b): _Ad()}), \
+                unittest.mock.patch.object(m.jobs, "merge_meta", lambda *a: None):
+            asyncio.run(m._cancel_orphaned_runpod([
+                ("j1", "rp", {"runpod_job_id": "a", "runpod_endpoint": "oldep"}),
+                ("j2", "rp", {"runpod_job_id": "b", "runpod_endpoint": "newep"}),
+                ("j3", "rp", {"runpod_job_id": "c"}),
+                ("j4", "rp", {"runpod_job_id": "d", "runpod_endpoint": "x/../../evil"})]))
+        self.assertEqual(sent, [("a", "https://api.runpod.ai/v2/oldep"), ("b", ""), ("c", ""),
+                                ("d", "")])
+
+
 if __name__ == "__main__":
     unittest.main()

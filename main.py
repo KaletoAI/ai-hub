@@ -5870,7 +5870,15 @@ async def _cancel_orphaned_runpod(orphans: list) -> int:
                                f"'{bname}' is no runpod backend now — check the RunPod console")
                 continue
             n += 1
-            ok = await ad.cancel_runpod_id(rp)
+            # The job ran on the endpoint its row names — the backend's url may have been
+            # changed since, and a cancel sent to the new endpoint ends nothing.
+            ep = (meta or {}).get("runpod_endpoint")
+            ep_url = f"https://api.runpod.ai/v2/{ep}" if isinstance(ep, str) else ""
+            if ep_url and adapters.runpod_endpoint_id(ep_url) == ep \
+                    and ep != adapters.runpod_endpoint_id(b.get("url") or ""):
+                ok = await ad.cancel_runpod_id(rp, url=ep_url)
+            else:
+                ok = await ad.cancel_runpod_id(rp)
             logger.warning(f"startup: RunPod job {rp} of orphaned job {job_id} "
                            f"{'cancelled' if ok else 'cancel UNCONFIRMED — check the RunPod console'}")
             await asyncio.to_thread(jobs.merge_meta, job_id, {"runpod_cancelled_at_restart": ok})

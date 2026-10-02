@@ -4847,6 +4847,10 @@ class RunpodAdapter(ComfyUIAdapter):
             # `_snap_loaded` only once the load attempt is OVER: set before the await, a
             # rebuild during it handed the replacement "loaded" with an empty snapshot.
             rec = await asyncio.to_thread(self.ctx.runpod_probe_load, self.name)
+            # Records are stored per backend NAME: one probed on another endpoint (the url
+            # was changed, or a deleted backend's name reused) describes another image.
+            if rec and rec.get("endpoint") != ep:
+                rec = None
             if rec and not self._snap_loaded:      # a probe may have finished meanwhile
                 try:
                     await asyncio.to_thread(self._apply_snapshot, rec)
@@ -4878,6 +4882,7 @@ class RunpodAdapter(ComfyUIAdapter):
             if out.get("error") or not out.get("object_info_gz"):
                 raise RuntimeError(str(out.get("error") or "worker returned no object_info"))
             rec = {"at": int(time.time()), "worker_version": out.get("worker_version"),
+                   "endpoint": runpod_endpoint_id(url),
                    "object_info_gz": out["object_info_gz"], "models": out.get("models") or {}}
             await asyncio.to_thread(self._apply_snapshot, rec)
             self._snap_loaded = True
@@ -5124,7 +5129,8 @@ class RunpodAdapter(ComfyUIAdapter):
             if req.job_id:
                 self._rp_jobs[req.job_id] = (url, rp_id)
                 await asyncio.to_thread(self.ctx.note_job_meta, req.job_id,
-                                        {"runpod_job_id": rp_id, "backend": self.name})
+                                        {"runpod_job_id": rp_id, "backend": self.name,
+                                         "runpod_endpoint": runpod_endpoint_id(url)})
             st = await self._poll_rp(client, url, rp_id, req, poll_interval, max_wait)
         except asyncio.CancelledError:
             with contextlib.suppress(Exception):
