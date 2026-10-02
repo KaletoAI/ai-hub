@@ -22,6 +22,7 @@ import contextlib
 import contextvars
 import copy
 import fnmatch
+import gzip
 import hashlib
 import json
 import logging
@@ -587,6 +588,9 @@ class AdapterContext:
     # gateway restart mid-run can still cancel what is billing). (job_id, meta) → merged
     # via jobs.merge_meta. No-op default keeps non-main constructions valid.
     note_job_meta: Callable[[str, dict], None] = lambda job_id, meta: None
+    # RunPod probe snapshot persistence (store setting `runpod_probe`, per backend name).
+    runpod_probe_load: Callable[[str], Optional[dict]] = lambda name: None
+    runpod_probe_save: Callable[[str, dict], None] = lambda name, rec: None
 
 
 @asynccontextmanager
@@ -4735,6 +4739,14 @@ class RunpodAdapter(ComfyUIAdapter):
     def __init__(self, backend: dict, ctx: AdapterContext):
         super().__init__(backend, ctx)
         self._rp_jobs: dict = {}          # gateway job id → (endpoint url, RunPod job id): cancel target
+        self.health: dict = {}
+        self.endpoint_info: dict = {}
+        self.probe_state: dict = {"state": "none"}
+        self.object_info_full: Optional[dict] = None   # admin's editor reads class specs here
+        self.models_index: dict = {}
+        self._models: set = set()
+        self._loras: set = set()
+        self._snap_loaded = False
 
     def _headers(self) -> dict:
         key = (self.backend.get("api_key") or "").strip()
@@ -4747,6 +4759,86 @@ class RunpodAdapter(ComfyUIAdapter):
         super().adopt_state(old)
         if isinstance(old, RunpodAdapter):
             self._rp_jobs = old._rp_jobs          # running jobs keep their cancel target
+            if old.backend.get("url") == self.backend.get("url"):
+                for k in ("probe_state", "object_info_full", "models_index", "_models",
+                          "_loras", "_snap_loaded", "_node_types"):
+                    setattr(self, k, getattr(old, k))
+
+    def _apply_snapshot(self, rec: dict) -> None:
+        """Parse a probe record (CPU work — call via asyncio.to_thread)."""
+        raw = gzip.decompress(base64.b64decode(rec["object_info_gz"]))
+        node_types, models, loras = _parse_object_info(raw)
+        self.object_info_full = json.loads(raw)
+        self._node_types, self._models, self._loras = node_types, models, loras
+        self.models_index = rec.get("models") or {}
+        self.probe_state = {"state": "ok", "at": rec.get("at"),
+                            "worker_version": rec.get("worker_version")}
+
+    async def discover(self, client: httpx.AsyncClient) -> Capabilities:
+        """Never submits a job (that costs money): /health + the REST endpoint record,
+        models/LoRAs/node types from the probe snapshot. workersMax 0 — RunPod's silent
+        scale-down after 7 idle days — is DOWN with its cause."""
+        url = self.backend["url"].rstrip("/")
+        ep = runpod_endpoint_id(url)
+        if not ep:
+            raise RuntimeError("url must be https://api.runpod.ai/v2/<endpoint id>")
+        h = self._headers()
+        r = await client.get(f"{url}/health", headers=h, timeout=_COMFY_DISCOVERY_TIMEOUT)
+        if r.status_code in (401, 403):
+            raise RuntimeError("RunPod API key refused (/health)")
+        r.raise_for_status()
+        self.health = r.json() or {}
+        e = await client.get(f"{RUNPOD_REST}/endpoints/{ep}", headers=h,
+                             timeout=_COMFY_DISCOVERY_TIMEOUT)
+        if e.status_code in (401, 403):
+            raise RuntimeError("RunPod API key refused (REST /endpoints)")
+        e.raise_for_status()
+        info = e.json() or {}
+        self.endpoint_info = {k: info.get(k) for k in ("workersMax", "workersMin", "gpuTypeIds",
+                                                       "allowedCudaVersions", "idleTimeout")}
+        if info.get("workersMax") == 0:
+            raise RuntimeError("scaled to 0 by RunPod after 7 idle days — raise max workers "
+                               "in the RunPod console")
+        if not self._snap_loaded:
+            self._snap_loaded = True
+            rec = await asyncio.to_thread(self.ctx.runpod_probe_load, self.name)
+            if rec:
+                try:
+                    await asyncio.to_thread(self._apply_snapshot, rec)
+                except Exception as ex:
+                    self.probe_state = {"state": "failed", "error": f"stored probe unreadable: {ex}"}
+        return Capabilities(models=set(self._models), loras=set(self._loras), pricing={})
+
+    async def probe(self) -> dict:
+        """One `op: info` job: /object_info, the model index and the worker version —
+        and the real-GPU smoke test of a new image. Costs one cold start."""
+        b = self.backend
+        url = b["url"].rstrip("/")
+        prev = dict(self.probe_state)
+        self.probe_state = {**prev, "state": "running", "started": int(time.time())}
+        req = NormalizedRequest(alias="(probe)")
+        try:
+            max_wait = float(b.get("max_wait", 600))
+            raw = json.dumps({"input": {"op": "info"},
+                              "policy": {"executionTimeout": int(max_wait * 1000),
+                                         "ttl": int((max_wait + float(b.get("queue_max_s", 300))) * 1000)}}
+                             ).encode()
+            async with _pooled_client(self.ctx) as c:
+                rp_id = await self._submit(c, url, raw, req)
+                st = await self._poll_rp(c, url, rp_id, req, float(b.get("poll_interval", 2.0)),
+                                         max_wait)
+            out = st.get("output") or {}
+            if out.get("error") or not out.get("object_info_gz"):
+                raise RuntimeError(str(out.get("error") or "worker returned no object_info"))
+            rec = {"at": int(time.time()), "worker_version": out.get("worker_version"),
+                   "object_info_gz": out["object_info_gz"], "models": out.get("models") or {}}
+            await asyncio.to_thread(self._apply_snapshot, rec)
+            self._snap_loaded = True
+            await asyncio.to_thread(self.ctx.runpod_probe_save, self.name, rec)
+        except Exception as e:
+            self.probe_state = {**prev, "state": "failed", "at": int(time.time()),
+                                "error": (str(e) or type(e).__name__)[:500]}
+        return self.probe_state
 
     async def restart(self) -> str:
         raise RuntimeError("a RunPod endpoint has no service to restart")

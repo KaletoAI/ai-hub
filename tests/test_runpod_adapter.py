@@ -330,5 +330,80 @@ class Generate(unittest.TestCase):
         self.assertIsNone(adapters.runpod_endpoint_id("https://api.runpod.ai/v2/"))
 
 
+import gzip  # noqa: E402
+
+OI = {"KSampler": {"input": {"required": {"seed": ["INT", {}]}}, "output": ["LATENT"]},
+      "UnetLoaderGGUF": {"input": {"required": {"unet_name": [["q.gguf"], {}]}}, "output": ["MODEL"]},
+      "LoraLoader": {"input": {"required": {"lora_name": [["style.safetensors"], {}]}},
+                     "output": ["MODEL"]}}
+INFO = {"status": "COMPLETED", "executionTime": 900, "output": {
+    "object_info_gz": _b64(gzip.compress(json.dumps(OI).encode())),
+    "models": {"image": {}, "volume": {"models/unet/q.gguf": 4}}, "worker_version": "v7"}}
+
+
+class DiscoveryAndProbe(unittest.TestCase):
+    def _disc(self, rp, ad):
+        async def go():
+            async with httpx.AsyncClient() as c:
+                return await ad.discover(c)
+        return _run(rp, go)
+
+    def test_unprobed_backend_has_empty_caps_and_says_so(self):
+        rp = _RunPod([DONE])
+        ad = _adapter()
+        caps = self._disc(rp, ad)
+        self.assertEqual((caps.models, caps.loras), (set(), set()))
+        self.assertEqual(ad.probe_state["state"], "none")
+        self.assertFalse(any(p.endswith("/run") for _m, _h, p in rp.paths))
+
+    def test_workers_max_zero_is_down_with_the_cause(self):
+        rp = _RunPod([DONE])
+        rp.endpoint["workersMax"] = 0
+        with self.assertRaises(RuntimeError) as cm:
+            self._disc(rp, _adapter())
+        self.assertIn("raise max workers", str(cm.exception))
+
+    def test_refused_key_is_down_named(self):
+        rp = _RunPod([DONE])
+        orig = rp.handler
+        rp.handler = lambda r: (httpx.Response(401, json={}) if r.url.path.endswith("/health")
+                                else orig(r))
+        with self.assertRaises(RuntimeError) as cm:
+            self._disc(rp, _adapter())
+        self.assertIn("API key", str(cm.exception))
+
+    def test_probe_stores_the_snapshot_and_discovery_serves_it(self):
+        saved = {}
+        rp = _RunPod([INFO])
+        b = {"name": "rp", "type": "runpod", "url": URL, "api_key": "k", "poll_interval": 0.01}
+        ad = adapters.RunpodAdapter(b, _ctx(runpod_probe_save=lambda n, rec: saved.update({n: rec})))
+        real = httpx.AsyncClient
+        ad.ctx.http_client = lambda: real(transport=httpx.MockTransport(rp.handler))
+        st = asyncio.run(ad.probe())
+        self.assertEqual(st["state"], "ok")
+        self.assertEqual(st["worker_version"], "v7")
+        self.assertEqual(rp.runs[0]["input"], {"op": "info"})
+        self.assertIn("rp", saved)
+        caps = self._disc(_RunPod([DONE]), ad)
+        self.assertIn("q.gguf", caps.models)
+        self.assertIn("style.safetensors", caps.loras)
+        self.assertIn("KSampler", ad._node_types)
+        # a fresh adapter (gateway restart) loads it from the store on its first discovery
+        ad2 = adapters.RunpodAdapter(b, _ctx(runpod_probe_load=lambda n: saved.get(n)))
+        caps2 = self._disc(_RunPod([DONE]), ad2)
+        self.assertIn("q.gguf", caps2.models)
+        self.assertEqual(ad2.probe_state["state"], "ok")
+
+    def test_failed_probe_says_why_and_keeps_the_old_snapshot(self):
+        rp = _RunPod([{"status": "FAILED", "error": "ComfyUI did not start in the worker"}])
+        b = {"name": "rp", "type": "runpod", "url": URL, "api_key": "k", "poll_interval": 0.01}
+        ad = adapters.RunpodAdapter(b, _ctx())
+        real = httpx.AsyncClient
+        ad.ctx.http_client = lambda: real(transport=httpx.MockTransport(rp.handler))
+        st = asyncio.run(ad.probe())
+        self.assertEqual(st["state"], "failed")
+        self.assertIn("did not start", st["error"])
+
+
 if __name__ == "__main__":
     unittest.main()
