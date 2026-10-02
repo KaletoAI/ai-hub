@@ -34,7 +34,7 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
   restart for backend/alias changes. Read **only at startup**:
   `stats.enabled` and the stats/jobs DB paths.
 - **No linter or build step, and no blanket test suite** — only targeted stdlib
-  `unittest` files for the mechanisms that fail SILENTLY (see the seventy-three listed under
+  `unittest` files for the mechanisms that fail SILENTLY (see the seventy-five listed under
   `anthropic_bridge.py`): `venv/bin/python -m unittest discover -s tests -t .`.
   Everything else is verified by running the server and hitting endpoints with
   `curl` (README "Try it"), `curl -H "Authorization: Bearer <admin key>"
@@ -53,12 +53,12 @@ venv/bin/uvicorn main:app --host 0.0.0.0 --port 4000   # add --reload for dev
 
 ## Architecture
 
-Twenty-three self-contained Python files hold everything (`ls *.py` is the count of
+Twenty-four self-contained Python files hold everything (`ls *.py` is the count of
 record; the tests live in `tests/`, the scripts that run on OTHER boxes in `ops/`).
 `main.py` owns app state; the others (`adapters`, `meshy`, `tripo`, `cloudtask`, `jobs`,
 `store`, `stats`, `admin`, `reasoning`, `scheduler`, `responses_bridge`,
 `anthropic_bridge`, `openai_image_bridge`, `previewanim`, `netscan`, `faults`, `thunder`,
-`hostapi`, `hostctl`, `services`, `modelsync`, `sshrun`) never import `main` — they receive what they need
+`hostapi`, `hostctl`, `services`, `modelsync`, `loratags`, `sshrun`) never import `main` — they receive what they need
 via injected callables, staying hot-reload-safe.
 
 - **`main.py`** — config loading, health/discovery loop, routing, all HTTP
@@ -788,7 +788,7 @@ via injected callables, staying hot-reload-safe.
   running the tool. Covered by
   `test_anthropic_bridge.py` (stdlib `unittest` — a streaming tool-call bridge fails
   silently rather than crashing). `ls tests/test_*.py` is the count of record —
-  **seventy-three** files today — and each exists for that same reason: the mechanism it
+  **seventy-five** files today — and each exists for that same reason: the mechanism it
   guards fails SILENTLY, so it is named next to that mechanism above.
   `test_anthropic_bridge.py`, `test_prune_branch.py` (a
   dead-branch prune that cascades one node too far or too few surfaces as an aborted
@@ -1898,6 +1898,26 @@ via injected callables, staying hot-reload-safe.
   (`resolve_link`): a link is kept only when its target stays in its root and is a file
   the same alias syncs — one that would dangle is dropped, never "present".
   `status_text` is the 503 wording. `test_modelsync.py`.
+- **`loratags.py`** — the PURE half of **LoRA trigger words** (spec
+  `2026-10-02-lora-trigger-words-design.md`, local only). **AI-Hub stores and delivers
+  trigger words; it never changes a prompt.** Metadata hangs on the sha256 of the file on
+  the LAN share (the share renames files): `share_loras` (listing → `{listed path: (real
+  path, size)}`, a link counts as its target), `share_path` (name → `models/loras/<name>`,
+  else the UNIQUE suffix match, never a guess), `clean_words` (form only — a tag chain
+  stays ONE entry), `parse_civitai` (by-hash answer → record; no version → ValueError =
+  transient), `civitai_url` (from integer ids only), `status_of` (the ONE status rule:
+  unavailable / pending / not_on_share / curated / civitai / not_on_civitai — a share not
+  listed yet is pending, never a verdict), `effective_words` (curated, also [], wins),
+  `lookup`/`items` (the client item; `pair` + merged words only when the alias's workflow
+  has BOTH high and low stacks). main's half: store table `lora_meta` (sha → `{civitai,
+  curated, curated_at}`), `lora_meta_loop` (lifespan; idle without `modelsrc_host`) whose
+  `lora_meta_pass` asks Civitai for every hash that needs it (≤ 1/2 s; 404 persisted; 429
+  global pause; 5xx/odd answer per-sha backoff in memory only) and then hashes ONE share
+  LoRA at LanSource priority **3** (behind transfer 0, Check & save 1, dir confirmation
+  2), pausing max(10 s, its duration); the API (`/v1/generations/{alias}/loras` `items`,
+  `/loras/{name:path}`) and the LoRAs tab read `_lm_snapshot()` only. Refresh all
+  re-asks Civitai (no re-hash), refresh one forgets the sha; neither touches `curated`.
+  `test_loratags.py`, `test_lora_meta.py`.
 - **Model sources** (spec `2026-10-01-model-sources-design.md`, local only): a share
   file is synced from a PUBLIC URL when the catalog names one — Stage 1 derives the
   share's Hugging Face cache (`modelsync.derived_urls`, above); Stage 3 is **Check &

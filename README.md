@@ -1096,7 +1096,19 @@ LoRAs are first-class:
   installed on no backend is ignored (the normal ordering decides). An explicit `backend`
   pin is never overridden.
 - **`GET /v1/generations/{alias}/loras`** returns the LoRA filenames valid for an
-  alias (the union installed across its backends) — for building a correct picker.
+  alias (`loras`, the union installed across its backends — for building a correct
+  picker) and `items`: per LoRA its **trigger words** and where they come from —
+  `{name, status, trigger_words, curated, civitai: {trained_words, model_id, version_id,
+  model_name, version_name, base_model, url, fetched_at}, sha256, pair}`. `status` is
+  `curated` (an operator list, Input & Routing → LoRAs, wins — also when empty),
+  `civitai`, `not_on_civitai`, `pending` (not determined yet; `error` says why),
+  `not_on_share` (the LoRA exists only on a backend) or `unavailable` (no LAN model
+  share configured). The words are looked up on Civitai by the sha256 of the file on the
+  LAN model share, in the background — only the hash leaves the gateway, and **the
+  gateway never inserts them into a prompt**: the client builds the prompt. When the
+  alias's workflow has high and low LoRA stacks, a pair half's `trigger_words` include
+  its counterpart's (`pair` names it). `GET /v1/generations/{alias}/loras/{name}` returns
+  one item.
 
 ### Jobs & TTL
 
@@ -2004,7 +2016,8 @@ The gateway therefore keeps a **voice reference library** (Playground → Voice)
 |---|---|---|
 | `POST` | `/v1/generations` | run a generation alias (sync or `mode:"async"`); per-field reference images via `images: {param: base64\|URL}`, other file inputs (meshes) via `files: {param: base64\|URL}` |
 | `GET` | `/v1/generations/{alias}/schema` | alias self-description: `params`, `images`, `files` (mesh uploads), LoRA/fps info |
-| `GET` | `/v1/generations/{alias}/loras` | LoRAs valid for an alias |
+| `GET` | `/v1/generations/{alias}/loras` | LoRAs valid for an alias (+ trigger words) |
+| `GET` | `/v1/generations/{alias}/loras/{name}` | One LoRA's trigger words + status |
 | `GET` | `/v1/jobs/{id}` | job status + results |
 | `GET` | `/v1/jobs/{id}/result/{n}` | a result artifact (owner-gated) |
 | `GET` | `/v1/jobs/{id}/input/{n}` | a stored reference image (owner-gated) |
