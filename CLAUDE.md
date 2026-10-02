@@ -1734,7 +1734,8 @@ via injected callables, staying hot-reload-safe.
   listing no longer has at that size. Hashes run ONE at a time (`_hash_turn`; a second
   request for one file takes the first's answer) by priority — `sha256(…, background=)`
   0/False a transfer's, 1/True a Check & save's, 2 a directory check's background
-  confirmation (M-5 / review-3 M-3: a LAN transfer holds the one stream slot until its
+  confirmation, 3 the LoRA trigger-word worker (`main.lora_meta_pass`, lowest of all)
+  (M-5 / review-3 M-3: a LAN transfer holds the one stream slot until its
   hash answers, and the next Check & save must not wait behind hours of confirmations;
   a hash already running is not interrupted), `hash_queue()` lists the waiting paths in the order they will run (the
   running one first), `sha_files()`/`known_sha()` read without hashing,

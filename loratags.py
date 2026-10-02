@@ -49,8 +49,11 @@ def _int(v) -> Optional[int]:
     return v if isinstance(v, int) and not isinstance(v, bool) else None
 
 
+_MAX_STR, _MAX_WORDS = 300, 200
+
+
 def _str(v) -> Optional[str]:
-    return v.strip() if isinstance(v, str) and v.strip() else None
+    return v.strip()[:_MAX_STR] if isinstance(v, str) and v.strip() else None
 
 
 def parse_civitai(body, now: float) -> dict:
@@ -67,7 +70,8 @@ def parse_civitai(body, now: float) -> dict:
     return {"status": "found", "model_id": model_id, "version_id": version_id,
             "model_name": _str(model.get("name")), "version_name": _str(body.get("name")),
             "base_model": _str(body.get("baseModel")),
-            "trained_words": clean_words(body.get("trainedWords")),
+            "trained_words": [w[:_MAX_STR] for w in
+                              clean_words(body.get("trainedWords"))[:_MAX_WORDS]],
             "fetched_at": float(now)}
 
 

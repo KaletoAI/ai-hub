@@ -4895,6 +4895,9 @@ def _lora_status_line(v: dict) -> str:
         if v.get("pause_until"):
             parts.append("Civitai paused until " + _esc(
                 time.strftime("%H:%M:%S", time.localtime(v["pause_until"]))))
+    if v.get("store_ok") is False:
+        parts.append("<span class='bad'>store unreadable at boot — trigger words are not "
+                     "saved; restart the gateway</span>")
     if v.get("last_error"):
         parts.append(f"<span class='bad'>last error: {_esc(v['last_error'])}</span>")
     if v.get("last_run"):

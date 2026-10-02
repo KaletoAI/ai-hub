@@ -54,6 +54,17 @@ class ParseCivitai(unittest.TestCase):
             "model_name": "Mapcraft", "version_name": "Anima v1", "base_model": "Anima",
             "trained_words": ["mapcraft"], "fetched_at": 5.0})
 
+    def test_caps(self):
+        body = {"id": 1, "name": "v" * 900, "baseModel": "b" * 900,
+                "model": {"name": "m" * 900},
+                "trainedWords": ["w%d" % i for i in range(500)]}
+        r = loratags.parse_civitai(body, 1.0)
+        self.assertEqual((len(r["model_name"]), len(r["version_name"]),
+                          len(r["base_model"])), (300, 300, 300))
+        self.assertEqual(len(r["trained_words"]), 200)
+        r = loratags.parse_civitai({"id": 1, "trainedWords": ["x" * 900]}, 1.0)
+        self.assertEqual(len(r["trained_words"][0]), 300)
+
     def test_missing_and_odd_fields(self):
         r = loratags.parse_civitai({"id": 7, "modelId": "8", "model": "x",
                                     "baseModel": 3, "trainedWords": None}, 1.0)

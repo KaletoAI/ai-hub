@@ -121,7 +121,7 @@ class _Fixture(unittest.IsolatedAsyncioTestCase):
     NAMES = ("lora_meta", "_lm_errors", "_lm_refetch", "_lm_state", "_lm_wake",
              "_civitai_client", "_CIVITAI_MIN_GAP_S", "modelsrc", "_modelsrc_host",
              "backend_loras", "backends", "image_models", "get_gen_routes",
-             "api_key", "users", "_users_by_key")
+             "api_key", "users", "_users_by_key", "_lm_persist_lock")
 
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -145,6 +145,7 @@ class _Fixture(unittest.IsolatedAsyncioTestCase):
         main._lm_refetch = set()
         main._lm_state = main._lm_initial_state()
         main._lm_wake = None
+        main._lm_persist_lock = None
         main._civitai_client = self.http
         main._CIVITAI_MIN_GAP_S = 0.0
         main.modelsrc = lambda: self.lan
@@ -415,6 +416,82 @@ class Worker(_Fixture):
         self.assertEqual(v["counts"], {"files": 2, "hashed": 2, "found": 0,
                                        "not_found": 2, "civitai_pending": 0})
 
+    async def test_persist_race_keeps_curated(self):
+        self.lan.files = {PA: A}
+        s = sha_of(A)
+        orig, calls = store.lora_meta_put, []
+
+        def slow(sha, rec):
+            calls.append(1)
+            if len(calls) == 1:
+                time.sleep(0.2)                                  # the worker's write is slow
+            return orig(sha, rec)
+        store.lora_meta_put = slow
+        self.addCleanup(setattr, store, "lora_meta_put", orig)
+        main._lm_state["shas"] = {PA: s}
+        apply_t = asyncio.create_task(main._lm_apply(s, "found", loratags.parse_civitai(version(["w"]), 1.0), time.time()))
+        await asyncio.sleep(0.05)
+        self.assertEqual(await main.lora_curate(s, ["mine"]), "")
+        await apply_t
+        self.assertEqual(store.lora_meta_all()[s], main.lora_meta[s])
+        self.assertEqual(main.lora_meta[s]["curated"], ["mine"])
+        self.assertEqual(main.lora_meta[s]["civitai"]["status"], "found")
+
+    async def test_boot_read_failure_never_overwrites(self):
+        s = sha_of(A)
+        store.lora_meta_put(s, {"curated": ["keep"], "curated_at": 1.0})
+        orig = store.lora_meta_all
+
+        def boom():
+            raise OSError("db locked")
+        store.lora_meta_all = boom
+        try:
+            main.lora_meta_boot()
+        finally:
+            store.lora_meta_all = orig
+        self.lan.files = {PA: A}
+        self.civ.answers[s] = (200, version(["w"]), {})
+        await self.drain()
+        self.assertEqual(store.lora_meta_all()[s]["curated"], ["keep"])
+        self.assertFalse(main.lora_meta_view()["store_ok"])
+        self.assertIn("not saved", await main.lora_curate(s, ["x"]))
+        main.lora_meta_boot()                                    # a good read resets it
+        self.assertTrue(main.lora_meta_view()["store_ok"])
+
+    async def test_hash_oserror_backs_off_and_next_file_hashes(self):
+        self.lan.files = {PA: A, PB: B}
+        orig = self.lan.sha256
+
+        async def sha256(path, size, background=False):
+            if path == PA:
+                raise OSError("no ssh")
+            return await orig(path, size, background)
+        self.lan.sha256 = sha256
+        await main.lora_meta_pass()
+        self.assertIn("OSError", main._lm_errors[PA]["error"])
+        await main.lora_meta_pass()
+        self.assertIn(PB, [p for p, _ in self.lan.hashed])
+
+    async def test_curate_store_failure_is_a_refusal(self):
+        s = sha_of(A)
+        main._lm_state["shas"] = {PA: s}
+        orig = store.lora_meta_put
+
+        def boom(sha, rec):
+            raise OSError("disk full")
+        store.lora_meta_put = boom
+        self.addCleanup(setattr, store, "lora_meta_put", orig)
+        self.assertIn("not saved", await main.lora_curate(s, ["x"]))
+        self.assertEqual(main.lora_meta[s]["curated"], ["x"])
+
+    async def test_busy_false_while_civitai_paused(self):
+        self.lan.files = {PA: A}
+        self.civ.answers[sha_of(A)] = (429, {}, {"Retry-After": "120"})
+        await self.drain()
+        v = main.lora_meta_view()
+        self.assertTrue(v["pause_until"])
+        self.assertFalse(v["busy"])
+
     async def test_loop_survives_a_failing_pass(self):
         calls = []
 
@@ -599,6 +676,12 @@ class Console(_Fixture):
         self.lan.files[PB] = B                                    # a new LoRA appears
         main._lm_state["share"] = loratags.share_loras(self.lan.cached())
         self.assertIn('<main data-live="5"', self.page())
+
+    def test_status_line_says_store_unreadable(self):
+        main._lm_state["store_ok"] = False
+        h = self.page()
+        self.assertIn("store unreadable at boot", h)
+        self.assertIn("restart the gateway", h)
 
     def test_no_share_says_where_to_set_it_up(self):
         main._lm_state = main._lm_initial_state()

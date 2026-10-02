@@ -6434,9 +6434,10 @@ _lm_refetch: set = set()      # shas a manual refresh wants asked again
 def _lm_initial_state() -> dict:
     return {"configured": False, "problem": "", "share": {}, "shas": {}, "hashing": None,
             "pause_until": 0.0, "pause_s": 0.0, "last_civitai": 0.0, "last_run": None,
-            "last_error": ""}
+            "last_error": "", "store_ok": True}
 
 
+_lm_persist_lock: Optional[asyncio.Lock] = None   # serialises the table writes (lazy, per loop)
 _lm_state: dict = _lm_initial_state()
 _lm_wake: Optional[asyncio.Event] = None
 
@@ -6472,6 +6473,10 @@ async def _civitai_lookup(sha: str) -> tuple:
         return ("error", "unparsable answer")
 
 
+_LM_STORE_BAD = ("store unreadable at boot — trigger words are not saved; "
+                 "restart the gateway")
+
+
 def _lm_snapshot() -> dict:
     """What the API and the console read — memory only (N1)."""
     st = _lm_state
@@ -6494,21 +6499,42 @@ def lora_meta_boot() -> None:
     """Lifespan: the stored records into memory, and the snapshot's starting state — a
     configured share reads "not listed yet" (every LoRA pending) until the first pass,
     never an empty listing that would call every LoRA not_on_share."""
+    global _lm_persist_lock
+    _lm_persist_lock = None
     try:
         lora_meta.clear()
         lora_meta.update(store.lora_meta_all())
+        _lm_state["store_ok"] = True
     except Exception as e:                               # noqa: BLE001 — never block the boot
+        # Memory is EMPTY now: writing from it would replace every stored record —
+        # curated lists included. Nothing is written until a restart reads the store.
+        _lm_state["store_ok"] = False
         logger.warning(f"lora meta: store read failed: {type(e).__name__}: {e}")
     configured = bool(_modelsrc_host())
     _lm_state.update(configured=configured, problem="not listed yet" if configured else "")
 
 
-async def _lm_persist(sha: str, rec: dict) -> None:
-    try:
-        await asyncio.to_thread(store.lora_meta_put, sha, rec)
-    except Exception as e:                               # noqa: BLE001 — the memory value stands
-        logger.warning(f"lora meta: store write failed for {sha[:12]}: {type(e).__name__}")
-        _lm_state["last_error"] = f"store write failed: {type(e).__name__}"
+async def _lm_persist(sha: str, rec: dict) -> bool:
+    """Write the record of `sha` to the store → True when written. Writes are serialised
+    and each carries what memory holds when its turn comes (not the caller's copy), so a
+    worker write and an operator's Save for one sha cannot land out of order and drop
+    `curated`."""
+    global _lm_persist_lock
+    if not _lm_state["store_ok"]:
+        if not _lm_state.get("store_warned"):
+            _lm_state["store_warned"] = True
+            logger.warning("lora meta: store unreadable at boot — not writing trigger words")
+        return False
+    if _lm_persist_lock is None:
+        _lm_persist_lock = asyncio.Lock()
+    async with _lm_persist_lock:
+        try:
+            await asyncio.to_thread(store.lora_meta_put, sha, lora_meta.get(sha, rec))
+            return True
+        except Exception as e:                           # noqa: BLE001 — the memory value stands
+            logger.warning(f"lora meta: store write failed for {sha[:12]}: {type(e).__name__}")
+            _lm_state["last_error"] = f"store write failed: {type(e).__name__}"
+            return False
 
 
 def _lm_backoff(key: str, error: str, now: float, fixed: Optional[float] = None) -> None:
@@ -6603,8 +6629,10 @@ async def lora_meta_pass() -> Optional[float]:
             new = dict(_lm_state["shas"])
             new[real] = sha
             _lm_state["shas"] = new
-        except RuntimeError as e:
-            _lm_backoff(real, f"hash: {e}", time.time(), fixed=_LM_HASH_RETRY_S)
+        except Exception as e:                           # noqa: BLE001 — else the next pass
+            _lm_backoff(real, f"hash: {e}" if isinstance(e, RuntimeError)   # picks this file again
+                        else f"hash: {type(e).__name__}: {e}",
+                        time.time(), fixed=_LM_HASH_RETRY_S)
         finally:
             _lm_state["hashing"] = None
         return max(_LM_HASH_PAUSE_MIN_S, time.monotonic() - t0)
@@ -6670,13 +6698,16 @@ async def lora_curate(sha: str, words: Optional[list]) -> str:
     sha no current share LoRA has — the form showed a file that changed since (F1)."""
     if not loratags.valid_sha(sha) or sha not in set(_lm_state["shas"].values()):
         return "the file changed since this page was loaded — reload and edit again"
+    if not _lm_state["store_ok"]:
+        return _LM_STORE_BAD
     rec = dict(lora_meta.get(sha) or {})
     if words is None:
         rec["curated"], rec["curated_at"] = None, None
     else:
         rec["curated"], rec["curated_at"] = loratags.clean_words(list(words)), time.time()
     lora_meta[sha] = rec
-    await _lm_persist(sha, rec)
+    if not await _lm_persist(sha, rec):
+        return "not saved to the store (kept in memory until a restart) — see the last error"
     return ""
 
 
@@ -6712,12 +6743,14 @@ def lora_meta_view() -> dict:
     counts["civitai_pending"] = len(shas) - counts["found"] - counts["not_found"]
     unhashed = [r for r in reals if r not in snap["shas"]
                 and (_lm_errors.get(r) or {}).get("next_try", 0) <= now]
+    paused = now < _lm_state["pause_until"]            # Civitai waits; hashing still counts
     busy = bool(usable and (_lm_state["hashing"] or unhashed
-                            or any(_lm_wants_civitai(s, now) for s in shas)))
+                            or (not paused and any(_lm_wants_civitai(s, now) for s in shas))))
     pause = _lm_state["pause_until"]
     return {"configured": snap["configured"], "problem": snap["problem"], "rows": rows,
             "counts": counts, "hashing": _lm_state["hashing"],
             "pause_until": pause if pause > now else None,
+            "store_ok": _lm_state["store_ok"],
             "last_error": _lm_state["last_error"], "last_run": _lm_state["last_run"],
             "busy": busy}
 
