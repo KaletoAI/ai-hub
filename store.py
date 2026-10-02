@@ -179,6 +179,15 @@ def init(db_path: str = "store.db") -> None:
                 updated      INTEGER NOT NULL
             )
         """)
+        # LoRA trigger words (spec 2026-10-02): metadata keyed by the share file's
+        # sha256 — a renamed file finds its record again, a changed one gets a new one.
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS lora_meta (
+                sha256     TEXT PRIMARY KEY,
+                value_json TEXT NOT NULL,
+                updated    INTEGER NOT NULL
+            )
+        """)
     _active = True
     logger.info(f"store: generation aliases at {_DB_PATH}")
 
@@ -248,6 +257,21 @@ def _encode_secret_json(entity: dict) -> str:
     if d.get("api_key"):
         d["api_key"] = encrypt_secret(d["api_key"])
     return json.dumps(d)
+
+
+# ── LoRA trigger words ────────────────────────────────────────────────────────────
+
+def lora_meta_all() -> dict:
+    """Every stored LoRA record, {sha256: record} (main loads it once at startup)."""
+    return {r["sha256"]: json.loads(r["value_json"])
+            for r in _rows_all("lora_meta", ("sha256", "value_json"), "sha256")}
+
+
+def lora_meta_put(sha: str, rec: dict) -> None:
+    """One LoRA record, replaced whole (the worker writes `civitai`, the console
+    `curated` — each on a copy of the record it read)."""
+    _row_upsert("lora_meta", ("sha256",), (sha,), "value_json",
+                json.dumps(rec, separators=(",", ":"), ensure_ascii=False))
 
 
 def bootstrap(image_models_cfg: dict) -> None:

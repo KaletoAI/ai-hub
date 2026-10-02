@@ -40,6 +40,7 @@ import socket
 import stats
 import store
 import modelsync
+import loratags
 import hostapi
 import hostctl
 import services
@@ -6360,6 +6361,69 @@ def _share_sha_files() -> dict:
     [size, sha256]}` of the CONFIGURED share host ({} for a record of another host).
     Never starts a hash."""
     return modelsrc().sha_files()
+
+
+# ── LoRA trigger words (spec 2026-10-02-lora-trigger-words-design) ─────────────────
+# AI-Hub STORES and DELIVERS a LoRA's trigger words — it never edits a prompt. The
+# metadata hangs on the share file's sha256 (the share renames files): the worker below
+# hashes every share LoRA through the LanSource queue at the LOWEST priority (3) and
+# asks Civitai by hash; the API and the console read only the in-memory snapshot
+# (`_lm_snapshot`), never a hash, a listing or Civitai (N1).
+_CIVITAI_BY_HASH = "https://civitai.com/api/v1/model-versions/by-hash/"
+_CIVITAI_TIMEOUT = httpx.Timeout(20.0)
+_CIVITAI_MAX_BYTES = 1 << 20
+_CIVITAI_MIN_GAP_S = 2.0                  # at most one Civitai request per 2 s
+_CIVITAI_BACKOFF = (300.0, 21600.0)       # per sha, transient failure: 5 min doubling → 6 h
+_CIVITAI_PAUSE = (60.0, 3600.0)           # 429 without Retry-After: 1 min doubling → 1 h
+_LM_TICK_S = 60.0
+_LM_HASH_PAUSE_MIN_S = 10.0
+_LM_HASH_RETRY_S = 600.0
+_civitai_client: Optional[httpx.AsyncClient] = None     # None = http_client (tests: a mock)
+
+lora_meta: dict = {}          # sha256 → record (store table lora_meta; see loratags)
+_lm_errors: dict = {}         # sha or real share path → {"error", "next_try", "backoff_s"}
+_lm_refetch: set = set()      # shas a manual refresh wants asked again
+
+
+def _lm_initial_state() -> dict:
+    return {"configured": False, "problem": "", "share": {}, "shas": {}, "hashing": None,
+            "pause_until": 0.0, "pause_s": 0.0, "last_civitai": 0.0, "last_run": None,
+            "last_error": ""}
+
+
+_lm_state: dict = _lm_initial_state()
+_lm_wake: Optional[asyncio.Event] = None
+
+
+async def _civitai_lookup(sha: str) -> tuple:
+    """Ask Civitai about ONE sha256 — the only thing that leaves the gateway (N5).
+    → ("found", record) | ("not_found", None) | ("busy", Retry-After s | None) |
+    ("error", text). Never raises."""
+    if not loratags.valid_sha(sha):
+        return ("error", "invalid sha256")
+    client = _civitai_client or http_client
+    try:
+        async with client.stream("GET", _CIVITAI_BY_HASH + sha, timeout=_CIVITAI_TIMEOUT,
+                                 headers={"User-Agent": "ai-hub",
+                                          "Accept": "application/json"},
+                                 follow_redirects=False) as r:
+            if r.status_code == 404:
+                return ("not_found", None)
+            if r.status_code == 429:
+                return ("busy", loratags.retry_after_s(r.headers.get("retry-after")))
+            if r.status_code != 200:
+                return ("error", f"HTTP {r.status_code}")
+            buf = bytearray()
+            async for chunk in r.aiter_bytes():
+                buf += chunk
+                if len(buf) > _CIVITAI_MAX_BYTES:
+                    return ("error", "answer larger than 1 MB")
+    except httpx.HTTPError as e:
+        return ("error", type(e).__name__)
+    try:
+        return ("found", loratags.parse_civitai(json.loads(bytes(buf)), time.time()))
+    except (ValueError, TypeError):
+        return ("error", "unparsable answer")
 
 
 # ── model sources, Stage 3: Check & save (spec "enter a URL once, verified") ─────
