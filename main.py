@@ -5092,18 +5092,55 @@ async def generations(request: Request, authorization: Optional[str] = Header(No
     return JSONResponse(view, status_code=code)
 
 
-@app.get("/v1/generations/{alias}/loras")
-async def gen_alias_loras(alias: str, request: Request, authorization: Optional[str] = Header(None)):
-    """LoRA filenames valid for a generation alias — the union of what's installed on
-    the alias's backends. Lets a client present a valid LoRA picker per alias."""
+def _alias_paired(cands) -> bool:
+    """Whether the alias's workflow has BOTH high and low LoRA stacks — exactly when
+    `_apply_lora_list` loads a pair's counterpart itself (F7: a client then gets both
+    halves' trigger words without knowing about pairs). May read a workflow FILE: call
+    it in a worker thread."""
+    for c in cands or []:
+        wf = adapters.cand_workflow(c) or {}
+        if {"high", "low"} <= {k for _, k in lora_groups(wf, (c or {}).get("mapping") or {})}:
+            return True
+    return False
+
+
+async def _alias_lora_items(alias: str, request: Request, authorization: Optional[str]) -> tuple:
+    """(sorted LoRA names valid for the alias, their trigger-word items). The names are
+    the union installed across the alias's backends, as always; the items come from the
+    in-memory snapshot only — never a hash, a listing or Civitai (N1)."""
     await gate_request(authorization, request, alias)                # auth + allow-list
-    known = (await asyncio.to_thread(store.get, alias)) if store.is_active() else None
-    if not (known or image_models.get(alias)):
+    cands = ((await asyncio.to_thread(store.get, alias)) if store.is_active() else None) \
+        or image_models.get(alias)
+    if not cands:
         raise HTTPException(404, f"generation alias '{alias}' not found")
     loras: set = set()
     for b, _ in await asyncio.to_thread(get_gen_routes, alias):
         loras |= backend_loras.get(backend_id(b), set())
-    return {"object": "list", "alias": alias, "loras": sorted(loras)}
+    names = sorted(loras)
+    paired = await asyncio.to_thread(_alias_paired, cands)
+    return names, loratags.items(names, _lm_snapshot(),
+                                 adapters.lora_counterpart if paired else None)
+
+
+@app.get("/v1/generations/{alias}/loras")
+async def gen_alias_loras(alias: str, request: Request, authorization: Optional[str] = Header(None)):
+    """LoRA filenames valid for a generation alias — the union of what's installed on
+    the alias's backends (`loras`, unchanged), plus `items`: per name its trigger words
+    (curated before Civitai), status, Civitai record and pair. Information only — the
+    gateway never edits a prompt."""
+    names, its = await _alias_lora_items(alias, request, authorization)
+    return {"object": "list", "alias": alias, "loras": names, "items": its}
+
+
+@app.get("/v1/generations/{alias}/loras/{name:path}")
+async def gen_alias_lora(alias: str, name: str, request: Request,
+                         authorization: Optional[str] = Header(None)):
+    """One LoRA's trigger-word item for an alias; 404 when the name is not valid there."""
+    _names, its = await _alias_lora_items(alias, request, authorization)
+    for it in its:
+        if it["name"] == name:
+            return it
+    raise HTTPException(404, f"LoRA '{name}' is not valid for generation alias '{alias}'")
 
 
 @app.get("/v1/generations/{alias}/schema")
@@ -5132,6 +5169,12 @@ async def gen_alias_schema(alias: str, request: Request, authorization: Optional
                  "modes": ["sync", "async"],
                  "loras_url": f"/v1/generations/{alias}/loras",
                  "loras": {"list_url": f"/v1/generations/{alias}/loras",
+                           "item_url": f"/v1/generations/{alias}/loras/{{name}}",
+                           "trigger_words": ("items[] in list_url carry each LoRA's "
+                                             "trigger_words (curated before Civitai), "
+                                             "status, base model and Civitai link — "
+                                             "information only: the gateway never edits "
+                                             "the prompt"),
                            "request": "loras: [{name, strength}]",
                            **({"paired_stacks": kinds,
                                "note": "send ONE pair half; the counterpart is resolved server-side"}

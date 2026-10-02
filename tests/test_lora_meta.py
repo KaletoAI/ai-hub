@@ -435,5 +435,95 @@ class Worker(_Fixture):
         self.assertIn("pass failed", main._lm_state["last_error"])
 
 
+WF_PAIRED = {"1": {"class_type": "LoraStack", "_meta": {"title": "input_lora_high"},
+                   "inputs": {"lora_01": "None", "strength_01": 1.0}},
+             "2": {"class_type": "LoraStack", "_meta": {"title": "input_lora_low"},
+                   "inputs": {"lora_01": "None", "strength_01": 1.0}}}
+WF_PLAIN = {"1": {"class_type": "LoraStack", "_meta": {"title": "loras"},
+                  "inputs": {"lora_01": "None", "strength_01": 1.0}}}
+BK = {"name": "k", "type": "comfyui", "url": "http://k:8188"}
+
+
+class Api(_Fixture):
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        main.backends = [dict(BK)]
+        self.cand = {"backend": "k", "workflow_json": WF_PAIRED, "mapping": {}}
+        main.image_models = {"wan": [self.cand]}
+        main.get_gen_routes = lambda alias: [(BK, self.cand)] if alias == "wan" else []
+        self.names = {"w-HIGH.safetensors", "w-LOW.safetensors",
+                      "dir/my lora #1+%.safetensors", "local.safetensors"}
+        main.backend_loras = {main.backend_id(BK): set(self.names)}
+        self.lan.files = {"models/loras/w-HIGH.safetensors": b"hi",
+                          "models/loras/w-LOW.safetensors": b"lo",
+                          "models/loras/dir/my lora #1+%.safetensors": b"odd"}
+        self.civ.answers[sha_of(b"hi")] = (200, version(["hiword"]), {})
+        self.civ.answers[sha_of(b"lo")] = (200, version(["loword"]), {})
+        await self.drain()
+        self.c = TestClient(main.app)
+
+    def test_list_keeps_loras_and_adds_items(self):
+        r = self.c.get("/v1/generations/wan/loras")
+        self.assertEqual(r.status_code, 200, r.text)
+        j = r.json()
+        self.assertEqual(set(j), {"object", "alias", "loras", "items"})
+        self.assertEqual(j["loras"], sorted(self.names))        # unchanged for old clients
+        self.assertEqual([i["name"] for i in j["items"]], j["loras"])
+        by = {i["name"]: i for i in j["items"]}
+        self.assertEqual(by["local.safetensors"]["status"], "not_on_share")
+        self.assertEqual(by["w-HIGH.safetensors"]["status"], "civitai")
+        self.assertEqual(by["w-HIGH.safetensors"]["pair"],
+                         {"name": "w-LOW.safetensors", "status": "civitai"})
+        self.assertEqual(by["w-HIGH.safetensors"]["trigger_words"], ["hiword", "loword"])
+        self.assertEqual(by["w-HIGH.safetensors"]["civitai"]["url"],
+                         "https://civitai.com/models/11?modelVersionId=22")
+
+    def test_no_pair_without_high_and_low_stacks(self):
+        self.cand["workflow_json"] = WF_PLAIN
+        by = {i["name"]: i for i in self.c.get("/v1/generations/wan/loras").json()["items"]}
+        self.assertIsNone(by["w-HIGH.safetensors"]["pair"])
+        self.assertEqual(by["w-HIGH.safetensors"]["trigger_words"], ["hiword"])
+
+    def test_single_route(self):
+        r = self.c.get("/v1/generations/wan/loras/w-LOW.safetensors")
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["trigger_words"], ["loword", "hiword"])
+        self.assertEqual(self.c.get("/v1/generations/wan/loras/other.safetensors").status_code,
+                         404)
+        self.assertEqual(self.c.get("/v1/generations/nope/loras/x.safetensors").status_code,
+                         404)
+
+    def test_single_route_special_characters(self):
+        # Review Focus 1: space, #, %, + and a subfolder in a LoRA name
+        from urllib.parse import quote
+        r = self.c.get("/v1/generations/wan/loras/" + quote("dir/my lora #1+%.safetensors"))
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["name"], "dir/my lora #1+%.safetensors")
+        self.assertEqual(r.json()["sha256"], sha_of(b"odd"))      # resolved on the share
+
+    def test_routes_never_touch_the_share_or_civitai(self):
+        def boom():
+            raise AssertionError("request path touched the LanSource")
+        main.modelsrc = boom
+        main._civitai_client = object()                       # any use would raise
+        self.assertEqual(self.c.get("/v1/generations/wan/loras").status_code, 200)
+        self.assertEqual(self.c.get("/v1/generations/wan/loras/w-HIGH.safetensors")
+                         .status_code, 200)
+
+    def test_gate_applies(self):
+        main.api_key = "master"
+        self.assertEqual(self.c.get("/v1/generations/wan/loras").status_code, 401)
+        self.assertEqual(self.c.get("/v1/generations/wan/loras/w-HIGH.safetensors")
+                         .status_code, 401)
+        ok = self.c.get("/v1/generations/wan/loras",
+                        headers={"authorization": "Bearer master"})
+        self.assertEqual(ok.status_code, 200)
+
+    def test_schema_points_to_the_items(self):
+        j = self.c.get("/v1/generations/wan/schema").json()
+        self.assertEqual(j["loras"]["item_url"], "/v1/generations/wan/loras/{name}")
+        self.assertIn("never edits the prompt", j["loras"]["trigger_words"])
+
+
 if __name__ == "__main__":
     unittest.main()
