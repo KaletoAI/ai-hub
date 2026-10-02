@@ -134,6 +134,83 @@ class Backends(_Fixture):
                                             "smp_more": "{broken"})
         self.refused(r, "invalid JSON", 'value="0.7"', "{broken")
 
+    # ── RunPod: one KIND with comfyui, so a shared name is ambiguous (final review #2) ──
+    RP = {"name": "gpu", "type": "runpod", "url": "https://api.runpod.ai/v2/ep123"}
+
+    def test_runpod_onto_a_comfyui_name_is_refused(self):
+        """Names are unique per (name, type) and a workflow candidate names its backend
+        by NAME: a runpod backend named like a comfyui one makes every name-only lookup
+        pick either — local work could silently run, billed, on RunPod."""
+        store.upsert_backend({"name": "gpu", "type": "comfyui", "url": "http://10.0.0.3:8188"})
+        r = self.post("/ui/backends/save", {**self.RP, "queue_max_s": "120"})
+        self.refused(r, "a comfyui backend named 'gpu' already exists", 'value="120"')
+        self.assertIsNone(store.get_backend("gpu", "runpod"))
+
+    def test_comfyui_onto_a_config_runpod_name_is_refused(self):
+        self.config_backends.append({**self.RP, "source": "config", "enabled": True,
+                                     "healthy": True, "models": 0})
+        r = self.post("/ui/backends/save", {"name": "gpu", "type": "comfyui",
+                                            "url": "http://10.0.0.3:8188"})
+        self.refused(r, "a runpod backend named 'gpu' already exists")
+        self.assertIsNone(store.get_backend("gpu", "comfyui"))
+
+    def test_other_kinds_may_still_share_a_name(self):
+        store.upsert_backend({"name": "gpu", "type": "meshy", "url": "https://api.meshy.ai"})
+        store.upsert_backend({"name": "gpu", "type": "openai", "url": "http://10.0.0.4:1"})
+        self.assertEqual(self.post("/ui/backends/save", self.RP).status_code, 303)
+        self.assertIsNotNone(store.get_backend("gpu", "runpod"))
+
+    def test_changing_the_type_of_the_same_backend_is_no_clash(self):
+        store.upsert_backend({"name": "gpu", "type": "comfyui", "url": "http://10.0.0.3:8188"})
+        r = self.post("/ui/backends/save", {**self.RP, "orig": "comfyui:gpu"})
+        self.assertEqual(r.status_code, 303)
+        self.assertIsNone(store.get_backend("gpu", "comfyui"))
+        self.assertIsNotNone(store.get_backend("gpu", "runpod"))
+
+    def test_runpod_save_is_paid_checks_the_url_and_drops_comfy_keys(self):
+        r = self.post("/ui/backends/save", {**self.RP, "comfy_output_dir": "/o",
+                                            "comfy_input_dir": "/i", "auto_restart": "on",
+                                            "restart_cooldown_s": "60", "stuck_after_s": "30",
+                                            "rp_max_wait": "900", "queue_max_s": "120",
+                                            "cost_per_hour": "1.75"})
+        self.assertEqual(r.status_code, 303, r.text[-400:])
+        b = store.get_backend("gpu", "runpod")
+        self.assertIs(b["paid"], True)                 # the form never sends the box
+        for k in ("comfy_output_dir", "comfy_input_dir", "auto_restart", "restart_cooldown_s",
+                  "stuck_after_s"):
+            self.assertNotIn(k, b)
+        self.assertEqual((b["max_wait"], b["queue_max_s"], b["cost_per_hour"]), (900, 120, 1.75))
+        for bad in ("http://api.runpod.ai/v2/ep1", "https://api.runpod.ai/v2/",
+                    "https://evil.example/v2/ep1", "https://api.runpod.ai/v2/ep1/run"):
+            r = self.post("/ui/backends/save", {**self.RP, "name": "rp2", "url": bad})
+            self.refused(r, "url must be https://api.runpod.ai/v2/")
+            self.assertIsNone(store.get_backend("rp2", "runpod"), bad)
+
+
+class GenNameClashWarning(unittest.TestCase):
+    def test_a_config_pair_is_warned_once(self):
+        pair = [{"name": "gpu", "type": "comfyui", "url": "http://10.0.0.3:8188"},
+                {"name": "gpu", "type": "runpod", "url": "https://api.runpod.ai/v2/ep1"},
+                {"name": "gpu", "type": "openai", "url": "http://10.0.0.4:1"}]
+        self.assertEqual(main.gen_name_clashes(pair), [("gpu", ("comfyui", "runpod"))])
+        self.assertEqual(main.gen_name_clashes(pair[1:]), [])
+        saved = list(main.config_backends), set(main._gen_clash_warned), main.store._active
+        try:
+            main.config_backends[:] = pair
+            main.store._active = False
+            main._gen_clash_warned.clear()
+            with self.assertLogs(main.logger, "WARNING") as cm:
+                main.rebuild_backends()
+                main.rebuild_backends()
+                main.logger.warning("sentinel")
+            hits = [m for m in cm.output if "both named 'gpu'" in m]
+            self.assertEqual(len(hits), 1)
+        finally:
+            main.config_backends[:] = saved[0]
+            main._gen_clash_warned.clear(); main._gen_clash_warned.update(saved[1])
+            main.store._active = saved[2]
+            main.rebuild_backends()
+
 
 class Users(_Fixture):
     def test_new_user_onto_an_existing_name_is_refused(self):

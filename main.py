@@ -154,6 +154,7 @@ def rebuild_backends() -> None:
         for b in store.list_backends():
             merged[backend_id(b)] = b      # store overrides config per (name, type)
     backends = sorted(merged.values(), key=lambda b: b.get("priority", 100))   # list order only
+    _warn_gen_name_clashes(backends)
     for b in backends:
         # Cost tier for the scheduler (spec 2026-09-01): a paid backend is a candidate
         # only when no unpaid one is free. Normalized here — config and store entries
@@ -172,6 +173,33 @@ def rebuild_backends() -> None:
         host_backends.setdefault(h, []).append(bid)
     apply_hosts()
     rebuild_route_index()                  # backend set/enabled flags changed
+
+
+_gen_clash_warned: set = set()
+
+
+def gen_name_clashes(blist: list) -> list:
+    """[(name, (type, type, …))] — generation backends of the SAME kind sharing a name
+    (a `comfyui` and a `runpod` backend, the first two types of one kind). Names are
+    unique only per (name, type), and a workflow candidate names its backend by NAME:
+    `_gen_backend_for` and every other name-only lookup would then pick whichever comes
+    first, so local work could silently run (and bill) on RunPod. The console refuses
+    such a name (admin.backend_save); config.yaml can still hold one."""
+    seen: dict = {}
+    for b in blist:
+        if b.get("type") in adapters.GEN_TYPES:
+            seen.setdefault((b.get("name"), adapters.backend_kind(b)), set()).add(b.get("type"))
+    return [(n, tuple(sorted(ts))) for (n, _k), ts in seen.items() if len(ts) > 1]
+
+
+def _warn_gen_name_clashes(blist: list) -> None:
+    for name, types in gen_name_clashes(blist):
+        if (name, types) in _gen_clash_warned:
+            continue
+        _gen_clash_warned.add((name, types))
+        logger.warning(f"backends: {' and '.join(types)} backends are both named '{name}' — "
+                       "an alias candidate names its backend by name, so its jobs may run on "
+                       "either one (a paid RunPod run included); rename one of them")
 
 
 def apply_hosts() -> None:

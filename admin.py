@@ -2937,6 +2937,20 @@ async def backend_save(request: Request):
         # created an override of it.
         problems.append(f"a {new_type} backend named '{name}' already exists — pick another "
                         "name, or edit that one")
+    if name and new_type in adapters.GEN_TYPES:
+        # Generation candidates name their backend by NAME, resolved per kind — and
+        # `comfyui` and `runpod` are ONE kind. Two such backends named alike make every
+        # name-only lookup ambiguous, so local work could silently run (paid) on RunPod.
+        kind = adapters.backend_kind({"type": new_type})
+        for x in [*store.list_backends(), *_gateway_info().get("backends", [])]:
+            xt = x.get("type", "openai")
+            if (x.get("name") == name and xt != new_type and xt in adapters.GEN_TYPES
+                    and adapters.backend_kind({"type": xt}) == kind
+                    and not (orig and (name, xt) == (oname, otype))):
+                problems.append(f"a {xt} backend named '{name}' already exists — a {new_type} "
+                                "backend may not share its name (alias candidates name their "
+                                "backend by name); pick another name")
+                break
     b.update({"name": name, "type": new_type, "url": url,
               "paid": bool(f.get("paid"))})       # unchecked box = absent from the form = False
     mc, mc_err = _int_field(f.get("max_concurrent"), "max_concurrent", "unlimited")
