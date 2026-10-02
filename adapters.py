@@ -4734,7 +4734,7 @@ class RunpodAdapter(ComfyUIAdapter):
 
     def __init__(self, backend: dict, ctx: AdapterContext):
         super().__init__(backend, ctx)
-        self._rp_jobs: dict = {}          # gateway job id → RunPod job id (cancel target)
+        self._rp_jobs: dict = {}          # gateway job id → (endpoint url, RunPod job id): cancel target
 
     def _headers(self) -> dict:
         key = (self.backend.get("api_key") or "").strip()
@@ -4752,14 +4752,14 @@ class RunpodAdapter(ComfyUIAdapter):
         raise RuntimeError("a RunPod endpoint has no service to restart")
 
     async def cancel(self, job_id: str = "") -> None:
-        rp_id = self._rp_jobs.get(job_id) if job_id else None
-        if rp_id:
-            await self.cancel_runpod_id(rp_id)
+        ent = self._rp_jobs.get(job_id) if job_id else None
+        if ent:
+            await self.cancel_runpod_id(ent[1], ent[0])
 
-    async def cancel_runpod_id(self, rp_id: str) -> bool:
+    async def cancel_runpod_id(self, rp_id: str, url: str = "") -> bool:
         try:
             async with _pooled_client(self.ctx) as c:
-                return await self._cancel_rp(c, self.backend["url"].rstrip("/"), rp_id)
+                return await self._cancel_rp(c, (url or self.backend["url"]).rstrip("/"), rp_id)
         except Exception:
             return False
 
@@ -4786,8 +4786,9 @@ class RunpodAdapter(ComfyUIAdapter):
                 f"{url}/run", content=raw,
                 headers={**self._headers(), "Content-Type": "application/json"},
                 timeout=httpx.Timeout(connect=10.0, read=60.0, write=max(60.0, mb * 4), pool=30.0))
-        except (httpx.ReadTimeout, httpx.ReadError, httpx.RemoteProtocolError):
-            tr["create_unconfirmed"] = True       # sent whole, answer lost — may exist
+        except (httpx.ReadTimeout, httpx.ReadError, httpx.RemoteProtocolError,
+                asyncio.CancelledError):
+            tr["create_unconfirmed"] = True       # sent whole, answer lost/abandoned — may exist
             raise
         if r.status_code == 429:
             raise CloudBusy("RunPod rate limit on /run (429)", vendor=_RP_VENDOR)
@@ -4797,15 +4798,15 @@ class RunpodAdapter(ComfyUIAdapter):
             raise RuntimeError("RunPod refused the API key (/run)")
         if r.status_code >= 400:
             raise RuntimeError(f"RunPod rejected /run ({r.status_code}): {r.text[:300]}")
-        rp_id = str((r.json() or {}).get("id") or "")
+        try:
+            rp_id = str((r.json() or {}).get("id") or "")
+        except Exception:
+            rp_id = ""
         if not rp_id:
-            raise RuntimeError("RunPod returned no job id")
+            tr["create_unconfirmed"] = True       # a 2xx we cannot read — the job may exist
+            raise RuntimeError("RunPod answered /run without a readable job id")
         tr["runpod_job_id"] = rp_id
         tr["runpod_settled"] = False
-        if req.job_id:
-            self._rp_jobs[req.job_id] = rp_id
-            await asyncio.to_thread(self.ctx.note_job_meta, req.job_id,
-                                    {"runpod_job_id": rp_id, "backend": self.name})
         if self.ctx.log_enabled():
             logger.info(f"→ [{self.name}] RunPod job {rp_id}")
         return rp_id
@@ -4921,6 +4922,10 @@ class RunpodAdapter(ComfyUIAdapter):
                                "> 9 MB) — milestone 1 has no bucket upload")
         rp_id = await self._submit(client, url, raw, req)
         try:
+            if req.job_id:
+                self._rp_jobs[req.job_id] = (url, rp_id)
+                await asyncio.to_thread(self.ctx.note_job_meta, req.job_id,
+                                        {"runpod_job_id": rp_id, "backend": self.name})
             st = await self._poll_rp(client, url, rp_id, req, poll_interval, max_wait)
         except asyncio.CancelledError:
             with contextlib.suppress(Exception):
@@ -4930,7 +4935,7 @@ class RunpodAdapter(ComfyUIAdapter):
         finally:
             if req.job_id:
                 self.ctx.note_progress(req.job_id, None)
-                if self._rp_jobs.get(req.job_id) == rp_id:
+                if self._rp_jobs.get(req.job_id) == (url, rp_id):
                     self._rp_jobs.pop(req.job_id, None)
         out = st.get("output") or {}
         if not isinstance(out, dict) or not isinstance(out.get("outputs"), dict):

@@ -243,6 +243,72 @@ class Generate(unittest.TestCase):
         self.assertEqual(rp.cancels, ["rp1"])
         self.assertNotIn("job1", ad._rp_jobs)
 
+    def test_cancel_while_run_answer_pending_is_unconfirmed(self):
+        rp = _RunPod([DONE])
+        req = _req()
+
+        orig = rp.handler
+
+        class Slow(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request):
+                if request.url.path.endswith("/run"):
+                    await asyncio.sleep(30)
+                return orig(request)
+        real = httpx.AsyncClient
+        mk = lambda *a, **kw: real(transport=Slow(), **{k: v for k, v in kw.items() if k != "transport"})
+
+        async def go():
+            t = asyncio.create_task(_adapter().generate(req))
+            await asyncio.sleep(0.1)
+            t.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await t
+        with unittest.mock.patch.object(adapters.httpx, "AsyncClient", mk):
+            asyncio.run(go())
+        self.assertTrue(req.cloud_trace["create_unconfirmed"])
+
+    def test_cancel_right_after_the_id_exists_sends_cancel_and_leaks_nothing(self):
+        rp = _RunPod([{"status": "IN_PROGRESS"}])
+        ad = _adapter(queue_max_s=60, max_wait=30)
+        started = []
+
+        def block(job_id, meta):
+            started.append(job_id)
+            import time
+            time.sleep(0.3)
+        ad.ctx.note_job_meta = block
+
+        async def go():
+            t = asyncio.create_task(ad.generate(_req()))
+            for _ in range(300):
+                await asyncio.sleep(0.01)
+                if started:
+                    break
+            t.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await t
+        _run(rp, go)
+        self.assertEqual(rp.cancels, ["rp1"])
+        self.assertEqual(ad._rp_jobs, {})
+
+    def test_run_200_without_id_is_unconfirmed(self):
+        rp = _RunPod([DONE])
+        orig = rp.handler
+        rp.handler = lambda r: (httpx.Response(200, json={}) if r.url.path.endswith("/run") else orig(r))
+        req = _req()
+        with self.assertRaises(RuntimeError):
+            _run(rp, lambda: _adapter().generate(req))
+        self.assertTrue(req.cloud_trace["create_unconfirmed"])
+
+    def test_cancel_after_url_change_hits_the_old_endpoint(self):
+        rp = _RunPod([DONE])
+        old = _adapter()
+        old._rp_jobs["job1"] = (URL, "rp1")
+        new = adapters.RunpodAdapter({**old.backend, "url": "https://api.runpod.ai/v2/other"}, _ctx())
+        new.adopt_state(old)
+        _run(rp, lambda: new.cancel("job1"))
+        self.assertEqual([p for m, h, p in rp.paths if "/cancel/" in p], ["/v2/ep123/cancel/rp1"])
+
     def test_concurrent_jobs_do_not_share_inputs(self):
         rp = _RunPod([DONE])
         ad = _adapter()
