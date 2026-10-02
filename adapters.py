@@ -17,10 +17,12 @@ Design notes:
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import contextvars
 import copy
 import fnmatch
+import hashlib
 import json
 import logging
 import math
@@ -581,6 +583,10 @@ class AdapterContext:
     # Installed LoRAs of a backend (discovery) — the `loras:[…]` pair resolution
     # validates against this. Default empty = no validation (non-main constructions).
     loras_of: Callable[[str], set] = lambda bid: set()
+    # Facts a running job must carry on its ROW before it ends (RunPod: the job id, so a
+    # gateway restart mid-run can still cancel what is billing). (job_id, meta) → merged
+    # via jobs.merge_meta. No-op default keeps non-main constructions valid.
+    note_job_meta: Callable[[str, dict], None] = lambda job_id, meta: None
 
 
 @asynccontextmanager
@@ -601,6 +607,7 @@ class BackendAdapter(ABC):
     dispatch; the router (main.py) stays protocol-agnostic."""
 
     type: str = "base"
+    bills = False          # True: every run costs money → main forces `paid` (BILLING_TYPES)
     serves_generation: bool = False   # True → the backend is a POST /v1/generations candidate
 
     def __init__(self, backend: dict, ctx: AdapterContext):
@@ -4669,6 +4676,289 @@ class TripoAdapter(CloudTaskAdapter):
         return RunResult(task_id, endpoint, body, state, extra)
 
 
+# ── RunPod Serverless: ComfyUI on a RunPod endpoint (spec 2026-10-02) ────────────
+
+RUNPOD_REST = "https://rest.runpod.io/v1"
+_RP_URL_RE = re.compile(r"^https://api\.runpod\.ai/v2/([A-Za-z0-9]+)/?$")
+_RP_INPUT_MAX = 9 * 1024 * 1024          # /run takes 10 MB; leave room for the envelope
+_RP_TERMINAL = ("COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT")
+_RP_VENDOR = "RunPod"
+
+
+def runpod_endpoint_id(url: str) -> Optional[str]:
+    m = _RP_URL_RE.match((url or "").strip())
+    return m.group(1) if m else None
+
+
+class RunpodIO(GenIO):
+    """Inputs go INTO the /run payload (base64) instead of onto a box; the placeholder
+    is baked into the worker image; node types come from the probe snapshot."""
+
+    def __init__(self, adapter: "RunpodAdapter"):
+        self.a = adapter
+        self.inputs: list = []
+
+    async def put_image(self, name: str, data: bytes) -> str:
+        self.inputs.append({"name": name, "b64": base64.b64encode(data).decode()})
+        return name
+
+    async def put_file(self, name: str, data: bytes) -> str:
+        return await self.put_image(name, data)
+
+    async def placeholder(self) -> str:
+        return _PLACEHOLDER_NAME
+
+    def input_ref(self, stored: str) -> str:
+        return f"/comfyui/input/{stored}"
+
+    async def node_types(self, wf: dict, ids: list) -> dict:
+        return self.a._node_types
+
+
+class RunpodAdapter(ComfyUIAdapter):
+    """A ComfyUI workflow run on a RunPod Serverless endpoint. The build is ComfyUI's
+    (`_build_prompt`, same GenIO seam), so a local and a RunPod candidate of one alias run
+    the same workflow; what differs is HOW it runs: /run → /status → /cancel, and the
+    delivery reads the worker's manifest instead of /view.
+
+    Billing rules (main._billed_cloud_task reads the trace this class writes):
+      - /run refused (connect error, 5xx, 429): nothing exists → normal failover.
+      - /run answer lost: `create_unconfirmed` → FINAL; the orphan ends by its own ttl.
+      - job known, then poll grace / max_wait / queue cap: /cancel first; only a confirmed
+        cancel or a terminal status sets `runpod_settled`, and only a settled job may be
+        re-run elsewhere. Otherwise the row says the job may still be running.
+    """
+
+    type = "runpod"
+    bills = True
+
+    def __init__(self, backend: dict, ctx: AdapterContext):
+        super().__init__(backend, ctx)
+        self._rp_jobs: dict = {}          # gateway job id → RunPod job id (cancel target)
+
+    def _headers(self) -> dict:
+        key = (self.backend.get("api_key") or "").strip()
+        return {"Authorization": f"Bearer {key}"} if key else {}
+
+    def _new_io(self, req: NormalizedRequest) -> GenIO:
+        return RunpodIO(self)
+
+    def adopt_state(self, old: BackendAdapter) -> None:
+        super().adopt_state(old)
+        if isinstance(old, RunpodAdapter):
+            self._rp_jobs = old._rp_jobs          # running jobs keep their cancel target
+
+    async def restart(self) -> str:
+        raise RuntimeError("a RunPod endpoint has no service to restart")
+
+    async def cancel(self, job_id: str = "") -> None:
+        rp_id = self._rp_jobs.get(job_id) if job_id else None
+        if rp_id:
+            await self.cancel_runpod_id(rp_id)
+
+    async def cancel_runpod_id(self, rp_id: str) -> bool:
+        try:
+            async with _pooled_client(self.ctx) as c:
+                return await self._cancel_rp(c, self.backend["url"].rstrip("/"), rp_id)
+        except Exception:
+            return False
+
+    async def _cancel_rp(self, client, url: str, rp_id: str) -> bool:
+        """POST /cancel; True only once RunPod confirms the job is no longer running
+        (CANCELLED, or a /status that is terminal) — the condition for a re-run."""
+        try:
+            r = await client.post(f"{url}/cancel/{rp_id}", headers=self._headers(), timeout=10.0)
+            if r.status_code == 200 and (r.json() or {}).get("status") in _RP_TERMINAL:
+                return True
+            s = await client.get(f"{url}/status/{rp_id}", headers=self._headers(), timeout=10.0)
+            return s.status_code == 404 or (
+                s.status_code == 200 and (s.json() or {}).get("status") in _RP_TERMINAL)
+        except Exception:
+            return False
+
+    async def _submit(self, client, url: str, raw: bytes, req: NormalizedRequest) -> str:
+        tr = req.cloud_trace
+        tr.setdefault("backend", self.name)
+        tr["runpod"] = True
+        mb = len(raw) / (1024 * 1024)
+        try:
+            r = await client.post(
+                f"{url}/run", content=raw,
+                headers={**self._headers(), "Content-Type": "application/json"},
+                timeout=httpx.Timeout(connect=10.0, read=60.0, write=max(60.0, mb * 4), pool=30.0))
+        except (httpx.ReadTimeout, httpx.ReadError, httpx.RemoteProtocolError):
+            tr["create_unconfirmed"] = True       # sent whole, answer lost — may exist
+            raise
+        if r.status_code == 429:
+            raise CloudBusy("RunPod rate limit on /run (429)", vendor=_RP_VENDOR)
+        if r.status_code >= 500:
+            raise ConnectionError(f"RunPod /run {r.status_code}: {r.text[:200]}")
+        if r.status_code in (401, 403):
+            raise RuntimeError("RunPod refused the API key (/run)")
+        if r.status_code >= 400:
+            raise RuntimeError(f"RunPod rejected /run ({r.status_code}): {r.text[:300]}")
+        rp_id = str((r.json() or {}).get("id") or "")
+        if not rp_id:
+            raise RuntimeError("RunPod returned no job id")
+        tr["runpod_job_id"] = rp_id
+        tr["runpod_settled"] = False
+        if req.job_id:
+            self._rp_jobs[req.job_id] = rp_id
+            await asyncio.to_thread(self.ctx.note_job_meta, req.job_id,
+                                    {"runpod_job_id": rp_id, "backend": self.name})
+        if self.ctx.log_enabled():
+            logger.info(f"→ [{self.name}] RunPod job {rp_id}")
+        return rp_id
+
+    def _progress(self, req: NormalizedRequest, st: dict) -> None:
+        if not req.job_id:
+            return
+        if st.get("status") == "IN_QUEUE":
+            self.ctx.note_progress(req.job_id, {"basis": "live", "backend": self.name,
+                                                "phase": "queued at RunPod", "updated_ago_s": 0})
+            return
+        p = st.get("output")
+        if isinstance(p, dict) and isinstance(p.get("step"), (int, float)) \
+                and isinstance(p.get("steps"), (int, float)) and p["steps"] > 0:
+            self.ctx.note_progress(req.job_id, {
+                "basis": "live", "backend": self.name, "node": p.get("node") or None,
+                "step": int(p["step"]), "steps": int(p["steps"]),
+                "fraction": round(min(p["step"] / p["steps"], 1.0), 3), "updated_ago_s": 0})
+
+    async def _poll_rp(self, client, url: str, rp_id: str, req: NormalizedRequest,
+                       poll_interval: float, max_wait: float) -> dict:
+        b, tr = self.backend, req.cloud_trace
+        grace = float(b.get("disconnect_grace", 30))
+        queue_max = float(b.get("queue_max_s", 300))
+        start = last_ok = time.monotonic()
+        deadline = start + max_wait
+        bad4 = 0
+
+        async def give_up(exc: BaseException):
+            if await self._cancel_rp(client, url, rp_id):
+                tr["runpod_settled"] = True
+            raise exc
+
+        while time.monotonic() < deadline:
+            await asyncio.sleep(poll_interval)
+            try:
+                r = await client.get(f"{url}/status/{rp_id}", headers=self._headers())
+            except httpx.HTTPError as e:
+                if time.monotonic() - last_ok > grace:
+                    await give_up(ConnectionError(
+                        f"RunPod unreachable for >{grace:.0f}s while job {rp_id} ran: "
+                        f"{type(e).__name__}"))
+                continue
+            if r.status_code == 404:
+                tr["runpod_settled"] = True
+                raise RuntimeError(f"RunPod job {rp_id} expired at RunPod (ttl) — no result")
+            if r.status_code == 429 or r.status_code >= 500:
+                if time.monotonic() - last_ok > grace:
+                    await give_up(ConnectionError(
+                        f"RunPod /status answered {r.status_code} for >{grace:.0f}s (job {rp_id})"))
+                continue
+            if r.status_code >= 400:
+                bad4 += 1
+                if bad4 >= 3:
+                    raise RuntimeError(f"RunPod /status {r.status_code} three times for job {rp_id}")
+                continue
+            bad4, last_ok = 0, time.monotonic()
+            st = r.json() or {}
+            s = st.get("status")
+            if s == "COMPLETED":
+                tr["runpod_settled"] = True
+                return st
+            if s == "FAILED":
+                tr["runpod_settled"] = True
+                raise RuntimeError(f"RunPod: {str(st.get('error') or 'job failed')[:4000]}")
+            if s == "CANCELLED":
+                tr["runpod_settled"] = True
+                raise ComfyPromptInterrupted(f"RunPod job {rp_id} was cancelled at RunPod")
+            if s == "TIMED_OUT":
+                tr["runpod_settled"] = True
+                if not st.get("executionTime"):
+                    raise CloudBusy(f"RunPod job {rp_id} timed out before a worker took it",
+                                    vendor=_RP_VENDOR)
+                raise RuntimeError(f"RunPod job {rp_id} hit the endpoint's execution timeout")
+            self._progress(req, st)
+            if s == "IN_QUEUE" and time.monotonic() - start > queue_max:
+                await give_up(CloudBusy(
+                    f"RunPod job {rp_id} waited >{queue_max:.0f}s for a worker — cancelled",
+                    vendor=_RP_VENDOR))
+        ok = await self._cancel_rp(client, url, rp_id)
+        if ok:
+            tr["runpod_settled"] = True
+        raise TimeoutError(f"RunPod job {rp_id} not finished after {max_wait:.0f}s"
+                           + ("" if ok else " — cancel unconfirmed, it may still be running"))
+
+    def _sibling_exts(self, req: NormalizedRequest) -> list:
+        exts = set()
+        if req.output_ext:
+            exts.add(str(req.output_ext).lower())
+        globs = list(req.output_globs or [])
+        for c in req.output_cases or []:
+            globs += list((c or {}).get("globs") or [])
+        for g in globs:
+            if "." in g:
+                exts.add(g.rsplit(".", 1)[-1].lower())
+        return sorted(exts)
+
+    async def _execute(self, req: NormalizedRequest, built: BuiltPrompt, client):
+        b = self.backend
+        url = b["url"].rstrip("/")
+        poll_interval = float(b.get("poll_interval", 2.0))
+        max_wait = float(b.get("max_wait", 600))
+        queue_max = float(b.get("queue_max_s", 300))
+        payload = {"input": {"op": "prompt", "workflow": built.wf,
+                             "inputs": list(getattr(built.io, "inputs", [])),
+                             "deliver": {"sibling_exts": self._sibling_exts(req)},
+                             "gw_job": req.job_id or ""},
+                   "policy": {"executionTimeout": int(max_wait * 1000),
+                              "ttl": int((max_wait + queue_max) * 1000)}}
+        raw = await asyncio.to_thread(lambda: json.dumps(payload).encode())
+        if len(raw) > _RP_INPUT_MAX:
+            raise RuntimeError(f"inputs too large for RunPod /run ({len(raw) / 1048576:.1f} MB "
+                               "> 9 MB) — milestone 1 has no bucket upload")
+        rp_id = await self._submit(client, url, raw, req)
+        try:
+            st = await self._poll_rp(client, url, rp_id, req, poll_interval, max_wait)
+        except asyncio.CancelledError:
+            with contextlib.suppress(Exception):
+                if await asyncio.wait_for(self._cancel_rp(client, url, rp_id), 10.0):
+                    req.cloud_trace["runpod_settled"] = True
+            raise
+        finally:
+            if req.job_id:
+                self.ctx.note_progress(req.job_id, None)
+                if self._rp_jobs.get(req.job_id) == rp_id:
+                    self._rp_jobs.pop(req.job_id, None)
+        out = st.get("output") or {}
+        if not isinstance(out, dict) or not isinstance(out.get("outputs"), dict):
+            raise RuntimeError(f"RunPod job {rp_id}: the worker returned no outputs")
+        manifest = out.get("manifest") or {}
+
+        async def fetch(params: dict):
+            key = "/".join(p for p in (params.get("type") or "output",
+                                       params.get("subfolder") or "",
+                                       params.get("filename") or "") if p)
+            ent = manifest.get(key)
+            if not ent:
+                return 404, b""
+            data = base64.b64decode(ent.get("b64") or "")
+            if len(data) != ent.get("size") or hashlib.sha256(data).hexdigest() != ent.get("sha256"):
+                raise RuntimeError(f"RunPod job {rp_id}: '{key}' arrived damaged (size/sha256)")
+            return 200, data
+
+        exec_ms, cph = st.get("executionTime"), float(b.get("cost_per_hour") or 0)
+        extra = {"runpod_job_id": rp_id, "delay_ms": st.get("delayTime"),
+                 "execution_ms": exec_ms, "worker_version": out.get("worker_version")}
+        if cph > 0 and isinstance(exec_ms, (int, float)):
+            extra["cost_est_usd"] = round(exec_ms / 3_600_000 * cph, 4)
+            extra["cost_basis"] = ("execution only — lower bound (boot, model load and "
+                                   "idle timeout are billed too)")
+        return out["outputs"], fetch, extra
+
+
 # ── Registry ──────────────────────────────────────────────────────────────────
 
 ADAPTERS: dict[str, type[BackendAdapter]] = {
@@ -4677,6 +4967,7 @@ ADAPTERS: dict[str, type[BackendAdapter]] = {
     "comfyui": ComfyUIAdapter,
     "meshy": MeshyAdapter,
     "tripo": TripoAdapter,
+    "runpod": RunpodAdapter,
 }
 
 # Backend types that take POST /v1/generations work (main routes generation to these
@@ -4686,6 +4977,10 @@ GEN_TYPES: frozenset = frozenset(t for t, cls in ADAPTERS.items() if cls.serves_
 # The cloud task backends among them (Meshy, Tripo) — a candidate's kind must match its
 # backend's (see backend_kind). Derived from the classes for the same reason as above.
 CLOUD_TYPES: frozenset = frozenset(t for t, cls in ADAPTERS.items() if getattr(cls, "cloud", False))
+
+# Types whose every run costs money but which are not cloud TASK kinds (RunPod runs a
+# ComfyUI workflow): main forces them `paid` like the cloud types.
+BILLING_TYPES: frozenset = frozenset(t for t, cls in ADAPTERS.items() if getattr(cls, "bills", False))
 
 
 def make_adapter(backend: dict, ctx: AdapterContext) -> BackendAdapter:
