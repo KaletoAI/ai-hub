@@ -128,11 +128,18 @@ def build_manifest(outputs: dict, sibling_exts: list, dirs: dict, max_b64: int) 
     matched against the directory). Raises HandlerError past `max_b64`."""
     man, total = {}, 0
 
-    def add(key, path):
+    def inside(path, root):
+        """realpath containment: a `..` subfolder, a relative bare path, a sibling ext
+        holding `/`, or a symlink out of the type dir names a file this job did not write
+        (the volume's models, the worker's own files) — never read, never shipped."""
+        real, rroot = os.path.realpath(path), os.path.realpath(root)
+        return real != rroot and os.path.commonpath([real, rroot]) == rroot
+
+    def add(key, path, root):
         nonlocal total
         if key in man:
             return
-        if not os.path.isfile(path):
+        if not inside(path, root) or not os.path.isfile(path):
             man[key] = None
             return
         n = os.path.getsize(path)
@@ -153,17 +160,17 @@ def build_manifest(outputs: dict, sibling_exts: list, dirs: dict, max_b64: int) 
                 if vp is None:
                     continue
                 fn, view = vp
-                base = os.path.join(dirs.get(view["type"], dirs["output"]),
-                                    view.get("subfolder", ""))
-                add(view_key(view), os.path.join(base, fn))
+                root = dirs.get(view["type"], dirs["output"])
+                base = os.path.join(root, view.get("subfolder", ""))
+                add(view_key(view), os.path.join(base, fn), root)
                 stem = fn.rsplit(".", 1)[0] if "." in fn else fn
                 for ext in sibling_exts or []:
                     pat = os.path.join(glob.escape(base), glob.escape(stem) + "." + ext)
                     hits = sorted(glob.glob(pat)) if any(c in ext for c in "*?[") else [
                         os.path.join(base, f"{stem}.{ext}")]
                     for h in hits:
-                        if os.path.isfile(h):
-                            add(view_key({**view, "filename": os.path.basename(h)}), h)
+                        if os.path.isfile(h) or not inside(h, root):
+                            add(view_key({**view, "filename": os.path.basename(h)}), h, root)
     return man
 
 

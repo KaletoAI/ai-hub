@@ -70,9 +70,6 @@ class BuildContext(unittest.TestCase):
                                  p.read_text(errors="ignore").lower(), p.name)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 import base64  # noqa: E402
 import hashlib  # noqa: E402
@@ -259,3 +256,40 @@ class Handler(unittest.TestCase):
 
     def test_artifact_extensions_equal_the_gateways(self):
         self.assertEqual(set(handler.ARTIFACT_EXTS), set(adapters._MIME_BY_EXT))
+
+    def test_manifest_never_reads_outside_its_type_dir(self):
+        """Item 11a (final review): the manifest named files by joining what /history
+        said onto the type dir — a `..` subfolder, a relative bare path or a sibling ext
+        holding `/` walked out of it, and the file shipped to the gateway as a result."""
+        import builtins
+        root = pathlib.Path(self.t.name)
+        (root / "secret.png").write_bytes(b"model weights")
+        (self.dirs["output"] / "ok.png").write_bytes(b"png")
+        (self.dirs["output"] / "link.png").symlink_to(root / "secret.png")
+        outputs = {"9": {"images": [
+            {"filename": "secret.png", "subfolder": "..", "type": "output"},
+            {"filename": "secret.png", "subfolder": "../output/..", "type": "temp"},
+            "../secret.png",
+            {"filename": "link.png", "type": "output"},
+            {"filename": "ok.png", "type": "output"}]}}
+        real, opened = builtins.open, []
+
+        def spy(f, *a, **k):
+            opened.append(str(f))
+            return real(f, *a, **k)
+        builtins.open = spy
+        try:
+            man = handler.build_manifest(outputs, ["/../../secret.png", "png"],
+                                         {k: str(v) for k, v in self.dirs.items()}, 10 ** 6)
+        finally:
+            builtins.open = real
+        self.assertFalse([o for o in opened if "secret" in o or o.endswith("link.png")], opened)
+        self.assertEqual(base64.b64decode(man["output/ok.png"]["b64"]), b"png")
+        self.assertIsNone(man["output/link.png"])
+        others = {k: v for k, v in man.items() if k not in ("output/ok.png", "output/link.png")}
+        self.assertTrue(others)
+        self.assertTrue(all(v is None for v in others.values()), others)
+
+
+if __name__ == "__main__":
+    unittest.main()
