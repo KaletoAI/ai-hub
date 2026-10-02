@@ -543,5 +543,66 @@ class Jobs(unittest.TestCase):
             self.assertEqual(jobs.last_orphans(), [(jid, "rp", {"runpod_job_id": "rp9"})])
 
 
+class Console(unittest.TestCase):
+    def setUp(self):
+        _main()
+        import admin
+        self.admin = admin
+
+    def test_type_select_offers_runpod_forces_paid_and_names_the_tab(self):
+        html = self.admin._type_select("runpod")
+        self.assertIn('<option value="runpod" selected>runpod</option>', html)
+        self.assertIn("RunPod", html)
+        self.assertIn("runpod", html.split("bill=", 1)[1][:80])
+        self.assertEqual(self.admin._type_tab_label("runpod"), "RunPod")
+
+    def test_form_renders_the_runpod_block(self):
+        html = self.admin._backend_form({"name": "rp", "type": "runpod", "url": URL,
+                                         "queue_max_s": 120, "cost_per_hour": 1.75}, [])
+        self.assertIn('data-btype="runpod"', html)
+        for f in ("rp_max_wait", "rp_poll_interval", "queue_max_s", "cost_per_hour"):
+            self.assertIn(f'name="{f}"', html)
+        self.assertIn("paid — always", html)
+
+    def test_list_row_badge_probe_button_and_escaped_state(self):
+        a = self.admin
+        self.assertIn("runpod", a._type_badge("runpod"))
+        info = {"backends": [{
+            "name": "rp", "type": "runpod", "url": URL, "enabled": True, "healthy": True,
+            "models": 0, "source": "ui", "paid": True,
+            "runpod": {"workers_idle": 1, "workers_running": 2, "in_queue": 3, "workers_max": 5,
+                       "probe": {"state": "failed", "error": "<script>x</script>"}}}],
+            "hosts": {}}
+        with unittest.mock.patch.object(a, "_gateway_info", lambda: info), \
+                unittest.mock.patch.object(a.store, "is_active", lambda: False):
+            r = asyncio.run(a._backends_view({}))
+        html = r.body.decode()
+        self.assertIn("/ui/backends/runpod-probe?id=", html)
+        self.assertIn("⚡", html)
+        self.assertIn("probe failed", html)
+        self.assertNotIn("<script>x</script>", html)
+        self.assertIn("probe failed: &lt;script&gt;x&lt;/script&gt;", html)
+        self.assertIn("workers 2 running / 1 idle, max 5 · queue 3", html)
+
+    def test_probe_is_a_post_action(self):
+        self.assertTrue(self.admin._is_post_action("/ui/backends/runpod-probe?id=runpod:rp"))
+
+    def test_job_view_table(self):
+        t = self.admin._runpod_table({"runpod_job_id": "rp1", "delay_ms": 1200,
+                                      "execution_ms": 36000, "cost_est_usd": 0.018,
+                                      "cost_basis": "execution only — lower bound",
+                                      "worker_version": "abc"})
+        for s in ("rp1", "1.2 s", "36.0 s", "0.018", "lower bound", "abc"):
+            self.assertIn(s, t)
+        self.assertEqual(self.admin._runpod_table({}), "")
+
+    def test_editor_widgets_come_from_the_probe_snapshot(self):
+        a = self.admin
+        with unittest.mock.patch.object(a, "_runpod_object_info", lambda n: OI if n == "rp" else None):
+            oi = asyncio.run(a._object_info("rp", {"1": {"class_type": "UnetLoaderGGUF",
+                                                           "inputs": {}}}))
+        self.assertEqual(oi["UnetLoaderGGUF"]["unet_name"], ["q.gguf"])
+
+
 if __name__ == "__main__":
     unittest.main()

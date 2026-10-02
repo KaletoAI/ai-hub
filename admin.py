@@ -977,7 +977,7 @@ def _field(label: str, control: str, short: bool = False, wide: bool = False,
 # or a pasted URL followed deleted things. `{…}` marks a path parameter.
 _POST_ACTIONS = frozenset((
     "/ui/backends/delete", "/ui/backends/drain", "/ui/backends/undrain",
-    "/ui/backends/restart", "/ui/backends/enable",
+    "/ui/backends/restart", "/ui/backends/enable", "/ui/backends/runpod-probe",
     # managed hosts (Ruling M1: one prefix, the host as field `host`, a service as `bid`)
     "/ui/hosts/managed/save", "/ui/hosts/managed/delete",
     "/ui/hosts/managed/start", "/ui/hosts/managed/stop", "/ui/hosts/managed/forget",
@@ -1299,6 +1299,8 @@ def _type_badge(t: str) -> str:
     t = (t or "openai").lower()
     if t == "comfyui":
         return _badge("🖼 comfyui", "img", "image-generation backend (ComfyUI)")
+    if t == "runpod":
+        return _badge("🖼 runpod", "img", "ComfyUI on a RunPod Serverless endpoint (paid, per second)")
     if t in adapters.CLOUD_TYPES:
         mod = adapters.cloud_module(t)
         return _badge(f"☁ {t}", "img", f"{mod.VENDOR} cloud mesh generation (paid, per task)")
@@ -1608,28 +1610,33 @@ _OI_TTL_ERR = 60.0                # a FAILED fetch (backend down / class not ins
                                   # stay invisible for the full TTL. Cost: one probe per minute.
 
 
+def _oi_fields(spec: dict) -> dict:
+    """One class's /object_info `input` spec → the editor's field widgets (combos,
+    numeric constraints)."""
+    fields = {}
+    for section in ("required", "optional"):
+        for fn, fspec in (spec.get(section) or {}).items():
+            if not (isinstance(fspec, list) and fspec):
+                continue
+            if isinstance(fspec[0], list):                      # combo (old form) → options list
+                fields[fn] = fspec[0]
+            elif fspec[0] == "COMBO" and len(fspec) > 1 and isinstance(fspec[1], dict) \
+                    and isinstance(fspec[1].get("options"), list):
+                fields[fn] = list(fspec[1]["options"])          # combo (new form: ["COMBO", {options}])
+            elif fspec[0] in ("FLOAT", "INT") and len(fspec) > 1 and isinstance(fspec[1], dict):
+                c = fspec[1]                                    # numeric → discovery constraints
+                fields[fn] = {"_num": fspec[0], "default": c.get("default"),
+                              "min": c.get("min"), "max": c.get("max"), "step": c.get("step")}
+    return fields
+
+
 async def _fetch_oi_class(client, url: str, cls: str):
     """Fetch + parse one class's input spec from /object_info/{cls}."""
     try:
         r = await client.get(f"{url}/object_info/{cls}")
         if r.status_code != 200:
             return cls, None
-        spec = r.json()[cls]["input"]
-        fields = {}
-        for section in ("required", "optional"):
-            for fn, fspec in (spec.get(section) or {}).items():
-                if not (isinstance(fspec, list) and fspec):
-                    continue
-                if isinstance(fspec[0], list):                      # combo (old form) → options list
-                    fields[fn] = fspec[0]
-                elif fspec[0] == "COMBO" and len(fspec) > 1 and isinstance(fspec[1], dict) \
-                        and isinstance(fspec[1].get("options"), list):
-                    fields[fn] = list(fspec[1]["options"])          # combo (new form: ["COMBO", {options}])
-                elif fspec[0] in ("FLOAT", "INT") and len(fspec) > 1 and isinstance(fspec[1], dict):
-                    c = fspec[1]                                    # numeric → discovery constraints
-                    fields[fn] = {"_num": fspec[0], "default": c.get("default"),
-                                  "min": c.get("min"), "max": c.get("max"), "step": c.get("step")}
-        return cls, fields
+        return cls, _oi_fields(r.json()[cls]["input"])
     except Exception:
         return cls, None
 
@@ -1639,6 +1646,16 @@ async def _object_info(backend_name: str, wf: dict, mapping: Optional[dict] = No
     (a request field may be a combo/number on any node — e.g. UniRigAutoRig's
     skeleton_template — and those need widget metadata too). Fetches uncached classes
     in parallel and caches them with a short TTL, so re-opening an alias is instant."""
+    snap = _runpod_object_info(backend_name)
+    if snap:
+        # A RunPod endpoint has no /object_info to ask — its probe snapshot answers.
+        classes = {n.get("class_type", "") for n in wf.values()}
+        for m in (mapping or {}).values():
+            cls = (wf.get((m or {}).get("node")) or {}).get("class_type", "")
+            if cls:
+                classes.add(cls)
+        return {cls: _oi_fields((snap.get(cls) or {}).get("input") or {})
+                for cls in classes if cls in snap}
     url = _backend_url(backend_name)
     if not url:
         return {}
@@ -1749,6 +1766,8 @@ def _type_tab_label(t: str) -> str:
     live in the shared tabs (there is no openai-only pane, so the tab is hidden)."""
     if t == "comfyui":
         return "ComfyUI"
+    if t == "runpod":
+        return "RunPod"
     if t in adapters.CLOUD_TYPES:
         return "Cloud task API"
     if t == "anthropic":
@@ -1937,8 +1956,8 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
             # there: shown checked + disabled (a disabled box is NOT submitted —
             # backend_save forces it too).
             + _field("cost tier", ('<label class="ckbox"><input type="checkbox" name="paid" value="1" '
-                                   'checked disabled> paid — always, a cloud backend bills per task</label>')
-                     if cur_type in adapters.CLOUD_TYPES else
+                                   'checked disabled> paid — always, a cloud backend bills per task or second</label>')
+                     if (cur_type in adapters.CLOUD_TYPES or cur_type in adapters.BILLING_TYPES) else
                      _checkbox("paid", gb("paid"), "paid — used only when no unpaid backend is free"))
             + "<p class='hint' style='margin:-4px 0 10px'><b>paid</b>: this backend bills per request "
               "(a cloud API). The scheduler sends a request to the fastest free <b>unpaid</b> backend "
@@ -2121,6 +2140,28 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
                       f'{"" if k == cur_type else ";display:none"}">{m.BACKEND_HINT}</p>'
                       for k, m in adapters.CLOUD_MODULES.items())
             + "</div>"
+            # RunPod-only options. Named rp_* where #comfyopts already spends the plain
+            # name (max_wait / poll_interval) — one form may carry each name only once.
+            + _btype_block("runpod", cur_type,
+                           '<div class="grouphdr">RunPod Serverless</div>'
+                           + _field("max wait s", _inp("rp_max_wait", g("max_wait") if cur_type == "runpod" else "",
+                                    placeholder="600", typ="number"))
+                           + _field("poll interval s", _inp("rp_poll_interval",
+                                    g("poll_interval") if cur_type == "runpod" else "",
+                                    placeholder="2", typ="number", step="0.5"))
+                           + _field("queue max s", _inp("queue_max_s", g("queue_max_s"),
+                                    placeholder="300", typ="number"))
+                           + _field("cost per hour $", _inp("cost_per_hour", g("cost_per_hour"),
+                                    placeholder="e.g. 1.75", typ="number", step="0.01"))
+                           + "<p class='hint' style='margin:-4px 0 10px'><b>url</b> (General tab) is "
+                             "<code>https://api.runpod.ai/v2/&lt;endpoint id&gt;</code>, <b>api key</b> "
+                             "your RunPod API key. <b>max wait s</b> is the job's execution timeout at "
+                             "RunPod too; a job still <b>queued</b> after <b>queue max s</b> (no worker — "
+                             "e.g. no CUDA-13 host free) is cancelled, which is free, and fails over. "
+                             "<b>cost per hour</b> (from RunPod's pricing page for the endpoint's GPU) "
+                             "makes the job view show an estimate — a LOWER bound: boot, model load "
+                             "and idle time are billed too. Use <b>Probe</b> in the backend list after "
+                             "every new worker release: it reads the worker's nodes and models.</p>")
             # Anthropic-only options — the licence warning sits AT the credential field,
             # not in a footnote, because that is where the decision is made.
             + f'<div id="anthopts" style="{"" if cur_type == "anthropic" else "display:none"}">'
@@ -2153,7 +2194,7 @@ def _sampling_text(d) -> str:
 def _type_select(current: str) -> str:
     """Backend type select that shows/hides the type-specific option blocks on change
     (LLM / ComfyUI / cloud / Anthropic — the form renders all, only one is ever visible).
-    A cloud type also reveals its own backend hint and forces `paid` (it bills per task);
+    A cloud type or a billing type (RunPod) forces `paid` (it bills per task/second);
     the disabled box is not submitted, so `backend_save` sets it server-side too.
 
     The URL field is filled with the chosen kind's fixed endpoint when it is blank OR
@@ -2174,11 +2215,12 @@ def _type_select(current: str) -> str:
     touching this handler. ES5 only (var/function, no arrows): an inline attribute is
     never transpiled, and test_admin_live pins the console's JS to ES5."""
     opts = "".join(f'<option value="{t}"{" selected" if t == current else ""}>{t}</option>'
-                   for t in ("comfyui", "meshy", "tripo", "openai", "anthropic"))
+                   for t in ("comfyui", "runpod", "meshy", "tripo", "openai", "anthropic"))
     # This JS sits inside a double-quoted HTML attribute: attribute-escape the JSON, the
     # browser decodes `&quot;` back before the handler is parsed.
     urls = _esc(_js_json(_cloud_urls()))
-    return ('<select name="type" onchange="var t=this.value,cloudUrls=' + urls + ","
+    bill = _esc(_js_json(sorted(adapters.BILLING_TYPES)))
+    return ('<select name="type" onchange="var t=this.value,cloudUrls=' + urls + ",bill=" + bill + ","
             "l=document.getElementById('llmopts'),c=document.getElementById('comfyopts'),"
             "m=document.getElementById('cloudopts'),a=document.getElementById('anthopts'),"
             "u=document.querySelector('input[name=url]'),p=document.querySelector('input[name=paid]');"
@@ -2193,13 +2235,14 @@ def _type_select(current: str) -> str:
             "h.style.display=(v.indexOf(' '+t+' ')>=0||(cloudUrls[t]&&v.indexOf(' cloud ')>=0))"
             "?'':'none'});"
             "var bt=document.getElementById('btab-type');"
-            "if(bt){var lb=t==='comfyui'?'ComfyUI':"
-            "(cloudUrls[t]?'Cloud task API':(t==='anthropic'?'Anthropic':''));"
+            "if(bt){var lb=t==='comfyui'?'ComfyUI':(t==='runpod'?'RunPod':"
+            "(cloudUrls[t]?'Cloud task API':(t==='anthropic'?'Anthropic':'')));"
             "bt.textContent=lb;bt.style.display=lb?'':'none';"
             "if(window.gwBackendTab)window.gwBackendTab();}"
-            "if(cloudUrls[t]){if(u){var ow=!u.value;"
+            "if(cloudUrls[t]&&u){var ow=!u.value;"
             "for(var k in cloudUrls){if(k!==t&&u.value===cloudUrls[k])ow=true}"
             "if(ow)u.value=cloudUrls[t]}"
+            "if(cloudUrls[t]||bill.indexOf(t)>=0){"
             "if(p){if(p.dataset.was===undefined)p.dataset.was=p.checked?'1':'';"
             "p.checked=true;p.disabled=true}}"
             "else if(p){p.disabled=false;if(p.dataset.was!==undefined){"
@@ -2378,6 +2421,11 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
             acts_list.append(("⟳", f"/ui/backends/restart?id={quote(bid)}", "secondary",
                               "Restart the ComfyUI service (ComfyUI-Manager reboot)",
                               f"Restart ComfyUI on {b['name']}? Pending prompts there are lost."))
+        if b.get("type") == "runpod" and b["enabled"]:
+            acts_list.append(("⚡", f"/ui/backends/runpod-probe?id={quote(bid)}", "secondary",
+                              "Probe: run one info job on the endpoint (nodes, models, worker "
+                              "version — the real-GPU smoke test of a new image)",
+                              f"Probe {b['name']}? This starts a RunPod worker — a few cents."))
         if b.get("source", "config") == "ui":
             acts_list.append(("✕", f"/ui/backends/delete?id={quote(bid)}", "danger",
                               "Delete", f"Remove backend {b['name']} ({b['type']})?"))
@@ -2412,7 +2460,26 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
         # llama-swap: what is loaded right now — the model a `<backend>/current` call gets
         ld = (f" · loaded {_loaded_text(b['loaded'], html=False)}"
               if isinstance(b.get("loaded"), list) else "")
-        sub = f"{b['url']}{host} · {b['models']} models{ld}{flags}{smp}{fr}{qn}{cr}{rst}{src}"
+        # `sub` is TEXT: _item escapes it, so nothing here is escaped or marked up.
+        rpi = ""
+        rpd = b.get("runpod") or {}
+        if rpd:
+            pr = rpd.get("probe") or {}
+            st = pr.get("state")
+            rpi = (f" · workers {rpd.get('workers_running') or 0} running / "
+                   f"{rpd.get('workers_idle') or 0} idle, max {rpd.get('workers_max')}"
+                   f" · queue {rpd.get('in_queue') or 0}")
+            if st == "ok":
+                rpi += f" · probed {pr.get('worker_version') or '?'}"
+                if pr.get("at"):
+                    rpi += f" ({_age(pr['at'])} ago)"
+            elif st == "running":
+                rpi += " · probing…"
+            elif st == "failed":
+                rpi += f" · probe failed: {str(pr.get('error') or '')[:160]}"
+            else:
+                rpi += " · not probed — node types and models unknown until ⚡ Probe"
+        sub = f"{b['url']}{host} · {b['models']} models{ld}{flags}{smp}{fr}{qn}{cr}{rpi}{rst}{src}"
         return _item(f"{_esc(b['name'])}{_type_badge(b['type'])}{badge}", sub, acts, sel=(bid == edit_id))
 
     # group by kind: LLM (openai-compatible) vs Media (every generation type — ComfyUI,
@@ -2478,7 +2545,10 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
     # a managed host that is not off (or an op in flight — a start is still `off` until
     # its create) changes phase on its own: the card must follow it
     host_busy = any(v.get("phase") != "off" or v.get("op") for _n, v in tviews)
-    live = 4 if draining_now else (2 if scan_st.get("running") else (3 if host_busy else None))
+    probing = any(((b.get("runpod") or {}).get("probe") or {}).get("state") == "running"
+                  for b in binfo)
+    live = 4 if draining_now else (2 if scan_st.get("running") else
+                                   (3 if (host_busy or probing) else None))
     return HTMLResponse(_page("Backends", body, "backends", refresh=None if static else live),
                         status_code=status)
 
@@ -2998,6 +3068,31 @@ async def backend_save(request: Request):
         for k in ("comfy_output_dir", "comfy_input_dir", "auto_restart", "restart_cooldown_s",
                   "stuck_after_s", "self_retries"):
             b.pop(k, None)
+    # RunPod Serverless: paid by nature, its own timing fields (rp_* because #comfyopts
+    # spends max_wait/poll_interval), and a URL that must name an endpoint — discovery
+    # would otherwise go DOWN with a less helpful text.
+    if new_type == "runpod":
+        b["paid"] = True
+        if url and not adapters.runpod_endpoint_id(url):
+            problems.append("url must be https://api.runpod.ai/v2/<endpoint id>")
+        for src, dst, cast, blank in (("rp_max_wait", "max_wait", int, "600 s"),
+                                      ("rp_poll_interval", "poll_interval", float, "2 s"),
+                                      ("queue_max_s", "queue_max_s", int, "300 s"),
+                                      ("cost_per_hour", "cost_per_hour", float, "no estimate")):
+            fv, fv_err = _float_field(f.get(src), src.replace("rp_", "").replace("_", " "), blank)
+            if fv_err:
+                problems.append(fv_err)
+            val = cast(fv or 0)
+            if val > 0:
+                b[dst] = val
+            else:
+                b.pop(dst, None)
+        for k in ("comfy_output_dir", "comfy_input_dir", "auto_restart", "restart_cooldown_s",
+                  "stuck_after_s"):
+            b.pop(k, None)
+    else:
+        b.pop("queue_max_s", None)
+        b.pop("cost_per_hour", None)
     # Anthropic: how the credential is sent, plus the fallback model list used when
     # a subscription token isn't allowed on GET /v1/models.
     if new_type == "anthropic":
@@ -3088,11 +3183,14 @@ async def _refuse_backend(msg: str, b: dict, f: dict, orig: str) -> HTMLResponse
     status 400. It used to be a bare error page whose "← Back" opened an empty form."""
     shown = dict(b)
     cloud = b.get("type") in adapters.CLOUD_TYPES
+    rp = b.get("type") == "runpod"
     for key, src in (("max_concurrent", "max_concurrent"), ("restart_cooldown_s", "restart_cooldown_s"),
                      ("stuck_after_s", "stuck_after_s"), ("self_retries", "self_retries"),
                      ("remote_port", "remote_port"),
-                     ("max_wait", "cloud_max_wait" if cloud else "max_wait"),
-                     ("poll_interval", "cloud_poll_interval" if cloud else "poll_interval")):
+                     ("max_wait", "cloud_max_wait" if cloud else ("rp_max_wait" if rp else "max_wait")),
+                     ("poll_interval", "cloud_poll_interval" if cloud else
+                      ("rp_poll_interval" if rp else "poll_interval")),
+                     ("queue_max_s", "queue_max_s"), ("cost_per_hour", "cost_per_hour")):
         typed = (f.get(src, "") or "").strip()
         if typed:
             shown[key] = typed                  # the bad value too — the reason names it
@@ -3190,6 +3288,14 @@ async def backend_del(request: Request):
             + _refs_table(found, _REF_KEPT, "Left alone — still naming a backend that is gone")
             + f'<div class="actions">{_btn("← Backends", "/ui/backends", "secondary")}</div>')
     return HTMLResponse(_page(f"Deleted {name}", body, "backends"))
+
+
+async def backend_runpod_probe(request: Request):
+    """Start a RunPod probe in the background; the list shows its progress (live)."""
+    bid = (request.query_params.get("id", "") or "").strip()
+    if _runpod_probe and bid:
+        _runpod_probe(bid)
+    return RedirectResponse("/ui/backends", status_code=303)
 
 
 async def backend_restart(request: Request):
@@ -8162,6 +8268,26 @@ def _job_thumbs(jid: str, kind: str, entries: list) -> str:
     return f"<div style='display:flex;gap:10px;flex-wrap:wrap;margin:8px 0'>{cells}</div>"
 
 
+def _runpod_table(m: dict) -> str:
+    """A RunPod run's facts on the job page — '' for every other run."""
+    if not m.get("runpod_job_id"):
+        return ""
+    rows = [("RunPod job", _esc(str(m["runpod_job_id"])))]
+    if isinstance(m.get("delay_ms"), (int, float)):
+        rows.append(("queue + cold start", f"{m['delay_ms'] / 1000:.1f} s"))
+    if isinstance(m.get("execution_ms"), (int, float)):
+        rows.append(("execution", f"{m['execution_ms'] / 1000:.1f} s"))
+    if m.get("cost_est_usd") is not None:
+        rows.append(("cost estimate", f"${_esc(str(m['cost_est_usd']))} — {_esc(str(m.get('cost_basis') or ''))}"))
+    if m.get("worker_version"):
+        rows.append(("worker", _esc(str(m["worker_version"]))))
+    if "runpod_cancelled_at_restart" in m:
+        rows.append(("cancelled at restart", "yes" if m["runpod_cancelled_at_restart"] else
+                     "<b>unconfirmed — check the RunPod console</b>"))
+    body = "".join(f"<tr><td class='muted'>{k}</td><td>{v}</td></tr>" for k, v in rows)
+    return f"<h3>RunPod</h3><table>{body}</table>"
+
+
 def _cloud_table(title: str, m: dict) -> str:
     """One cloud run (Meshy, Tripo) in the job view: the body actually sent (image data
     replaced by its size) plus the task id — the id is what the vendor's own dashboard is
@@ -8378,6 +8504,7 @@ async def job_detail_page(job_id: str, request: Request):
     # so a cloud→cloud chain reads in the order it ran. Each table names its OWN vendor.
     inbox += _cloud_table("Cloud · stage 1", meta.get("chain_stage1") or {})
     inbox += _cloud_table("Cloud", meta)
+    inbox += _runpod_table(meta)
     if st in ("queued", "running"):
         # A long render used to be a spinner and nothing else — the one question it
         # could not answer was whether anything was still happening. The backend's step
@@ -10773,6 +10900,7 @@ def register(app) -> None:
     app.add_api_route("/ui/backends/drain", backend_drain, methods=["POST"])
     app.add_api_route("/ui/backends/undrain", backend_undrain, methods=["POST"])
     app.add_api_route("/ui/backends/restart", backend_restart, methods=["POST"])
+    app.add_api_route("/ui/backends/runpod-probe", backend_runpod_probe, methods=["POST"])
     app.add_api_route("/ui/backends/enable", backend_enable, methods=["POST"])
     app.add_api_route("/ui/hosts/managed/save", managed_host_save, methods=["POST"])
     app.add_api_route("/ui/hosts/managed/delete", managed_host_delete, methods=["POST"])
