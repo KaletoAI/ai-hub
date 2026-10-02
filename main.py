@@ -5829,8 +5829,18 @@ def runpod_probe(bid: str) -> bool:
     ad = backend_adapters.get(bid)
     if not isinstance(ad, adapters.RunpodAdapter) or ad.probe_state.get("state") == "running":
         return False
-    _bg(ad.probe())
+    _bg(_runpod_probe_run(bid, ad))
     return True
+
+
+async def _runpod_probe_run(bid: str, ad) -> None:
+    """The probe runs to its end on THIS instance — a backend save meanwhile may have
+    replaced it (build_backend_adapters), and the replacement would otherwise never learn
+    the result (its probe_state stayed "running" for good). Same endpoint → hand it over."""
+    await ad.probe()
+    cur = backend_adapters.get(bid)
+    if cur is not ad and isinstance(cur, adapters.RunpodAdapter):
+        cur.adopt_probe(ad)
 
 
 def runpod_object_info(name: str) -> Optional[dict]:

@@ -663,5 +663,111 @@ class NoChainRoles(unittest.TestCase):
             h.tearDown()
 
 
+
+class ProbeAcrossRebuild(unittest.TestCase):
+    """Item 3 (final review): a backend save replaces the adapter. A copied "running"
+    probe_state never ended on the replacement (every new probe refused, the Backends tab
+    live for good); a snapshot load still awaited on the old instance left the new one
+    "loaded" and empty; a probe finishing on the old instance was lost."""
+
+    B = {"name": "rp", "type": "runpod", "url": URL, "api_key": "k", "poll_interval": 0.01}
+
+    def test_a_running_probe_state_is_never_copied(self):
+        old = adapters.RunpodAdapter(dict(self.B), _ctx())
+        old.probe_state = {"state": "ok", "at": 5, "worker_version": "v1"}
+        old._probe_prev = dict(old.probe_state)
+        old.probe_state = {**old.probe_state, "state": "running", "started": 9}
+        new = adapters.RunpodAdapter({**self.B, "max_wait": 900}, _ctx())
+        new.adopt_state(old)
+        self.assertEqual(new.probe_state, {"state": "ok", "at": 5, "worker_version": "v1"})
+
+    def test_probe_saves_the_previous_settled_state(self):
+        rp = _RunPod([{"status": "IN_PROGRESS"}, INFO])
+        ad = adapters.RunpodAdapter(dict(self.B), _ctx())
+        ad.probe_state = {"state": "failed", "error": "x"}
+        real = httpx.AsyncClient
+        ad.ctx.http_client = lambda: real(transport=httpx.MockTransport(rp.handler))
+        seen = []
+
+        async def go():
+            t = asyncio.create_task(ad.probe())
+            await asyncio.sleep(0)
+            seen.append((ad.probe_state["state"], ad._settled_probe()["state"]))
+            await t
+        asyncio.run(go())
+        self.assertEqual(seen, [("running", "failed")])
+        self.assertEqual(ad.probe_state["state"], "ok")
+
+    def test_snapshot_loaded_after_the_rebuild_reaches_the_replacement(self):
+        import threading
+        gate = threading.Event()
+        rec = {"at": 1, "worker_version": "v7", "endpoint": "ep123",
+               "object_info_gz": INFO["output"]["object_info_gz"], "models": {}}
+
+        def slow_load(name):
+            gate.wait(5)
+            return rec
+        old = adapters.RunpodAdapter(dict(self.B), _ctx(runpod_probe_load=slow_load))
+        rp = _RunPod([DONE])
+
+        async def go():
+            async with httpx.AsyncClient() as c:
+                t = asyncio.create_task(old.discover(c))
+                await asyncio.sleep(0.05)
+                self.assertFalse(old._snap_loaded)          # not before the load is over
+                new = adapters.RunpodAdapter({**self.B, "max_wait": 900},
+                                             _ctx(runpod_probe_load=lambda n: None))
+                new.adopt_state(old)
+                self.assertFalse(new._snap_loaded)          # → it would load on its own
+                gate.set()
+                await t
+                new.adopt_discovery(old)                    # main.refresh_backend's hand-over
+                return new
+        new = _run(rp, go)
+        self.assertTrue(new._snap_loaded)
+        self.assertIn("q.gguf", new._models)
+        self.assertIn("KSampler", new._node_types)
+        self.assertEqual(new.probe_state["state"], "ok")
+
+    def test_adopt_discovery_respects_the_url_and_a_newer_snapshot(self):
+        old = adapters.RunpodAdapter(dict(self.B), _ctx())
+        old._models, old._snap_loaded = {"old.gguf"}, True
+        other = adapters.RunpodAdapter({**self.B, "url": "https://api.runpod.ai/v2/other"}, _ctx())
+        other.adopt_discovery(old)
+        self.assertEqual(other._models, set())
+        mine = adapters.RunpodAdapter(dict(self.B), _ctx())
+        mine._models, mine._snap_loaded = {"new.gguf"}, True
+        mine.adopt_discovery(old)
+        self.assertEqual(mine._models, {"new.gguf"})
+
+    def test_a_probe_finishing_on_the_replaced_instance_reaches_the_current_one(self):
+        m = _main()
+        rp = _RunPod([INFO])
+        old = adapters.RunpodAdapter(dict(self.B), _ctx(runpod_probe_save=lambda n, r: None))
+        new = adapters.RunpodAdapter({**self.B, "max_wait": 900}, _ctx())
+        far = adapters.RunpodAdapter({**self.B, "url": "https://api.runpod.ai/v2/other"}, _ctx())
+        real = httpx.AsyncClient
+        old.ctx.http_client = lambda: real(transport=httpx.MockTransport(rp.handler))
+        for cur, want in ((new, "ok"), (far, "none")):
+            old.probe_state = {"state": "none"}
+            rp.statuses = [INFO]
+
+            async def go():
+                t = asyncio.create_task(m._runpod_probe_run("runpod:rp", old))
+                await asyncio.sleep(0)
+                self.assertEqual(old.probe_state["state"], "running")
+                cur.adopt_state(old)                 # the save lands mid-probe
+                self.assertNotEqual(cur.probe_state["state"], "running")
+                m.backend_adapters["runpod:rp"] = cur
+                await t
+            try:
+                asyncio.run(go())
+            finally:
+                m.backend_adapters.pop("runpod:rp", None)
+            self.assertEqual(cur.probe_state["state"], want)
+        self.assertIn("q.gguf", new._models)
+        self.assertEqual(far._models, set())
+
+
 if __name__ == "__main__":
     unittest.main()

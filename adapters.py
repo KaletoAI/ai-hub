@@ -4747,6 +4747,7 @@ class RunpodAdapter(ComfyUIAdapter):
         self._models: set = set()
         self._loras: set = set()
         self._snap_loaded = False
+        self._probe_prev: dict = {"state": "none"}    # probe_state before the probe in flight
 
     def _headers(self) -> dict:
         key = (self.backend.get("api_key") or "").strip()
@@ -4755,14 +4756,47 @@ class RunpodAdapter(ComfyUIAdapter):
     def _new_io(self, req: NormalizedRequest) -> GenIO:
         return RunpodIO(self)
 
+    _SNAP_FIELDS = ("object_info_full", "models_index", "_models", "_loras", "_node_types")
+
+    def _settled_probe(self) -> dict:
+        """probe_state without a probe in flight: a "running" state belongs to the instance
+        whose probe() runs — copied, it would never end (main.runpod_probe refuses every
+        new probe while it says running, and the Backends tab stays live for good)."""
+        ps = self.probe_state
+        return dict(self._probe_prev if ps.get("state") == "running" else ps)
+
+    def _same_endpoint(self, old: BackendAdapter) -> bool:
+        return isinstance(old, RunpodAdapter) and old.backend.get("url") == self.backend.get("url")
+
     def adopt_state(self, old: BackendAdapter) -> None:
-        super().adopt_state(old)
+        super().adopt_state(old)                  # → adopt_discovery: the snapshot, same URL
         if isinstance(old, RunpodAdapter):
             self._rp_jobs = old._rp_jobs          # running jobs keep their cancel target
-            if old.backend.get("url") == self.backend.get("url"):
-                for k in ("probe_state", "object_info_full", "models_index", "_models",
-                          "_loras", "_snap_loaded", "_node_types"):
-                    setattr(self, k, getattr(old, k))
+
+    def adopt_discovery(self, old: BackendAdapter) -> None:
+        """What a discovery of `old` saw — /health, the endpoint record and the probe
+        snapshot it loaded from the store — while the URL is unchanged. The snapshot only
+        while this instance has none of its own yet (a probe finished here is newer).
+        Deliberately NOT ComfyUI's: its watchdog fields do not apply, and its unconditional
+        `_node_types` copy would overwrite a snapshot probed on this instance."""
+        if not self._same_endpoint(old):
+            return
+        self.health, self.endpoint_info = old.health, old.endpoint_info
+        if not self._snap_loaded and self.probe_state.get("state") != "running":
+            for k in self._SNAP_FIELDS:
+                setattr(self, k, getattr(old, k))
+            self._snap_loaded = old._snap_loaded
+            self.probe_state = old._settled_probe()
+
+    def adopt_probe(self, old: "RunpodAdapter") -> None:
+        """A probe that ran to its end on `old` after this instance replaced it (main's
+        runpod_probe hands it over): its result is the newest — unless a probe runs here."""
+        if not self._same_endpoint(old) or self.probe_state.get("state") == "running":
+            return
+        for k in self._SNAP_FIELDS:
+            setattr(self, k, getattr(old, k))
+        self._snap_loaded = old._snap_loaded
+        self.probe_state = old._settled_probe()
 
     def _apply_snapshot(self, rec: dict) -> None:
         """Parse a probe record (CPU work — call via asyncio.to_thread)."""
@@ -4800,13 +4834,15 @@ class RunpodAdapter(ComfyUIAdapter):
             raise RuntimeError("scaled to 0 by RunPod after 7 idle days — raise max workers "
                                "in the RunPod console")
         if not self._snap_loaded:
-            self._snap_loaded = True
+            # `_snap_loaded` only once the load attempt is OVER: set before the await, a
+            # rebuild during it handed the replacement "loaded" with an empty snapshot.
             rec = await asyncio.to_thread(self.ctx.runpod_probe_load, self.name)
-            if rec:
+            if rec and not self._snap_loaded:      # a probe may have finished meanwhile
                 try:
                     await asyncio.to_thread(self._apply_snapshot, rec)
                 except Exception as ex:
                     self.probe_state = {"state": "failed", "error": f"stored probe unreadable: {ex}"}
+            self._snap_loaded = True
         return Capabilities(models=set(self._models), loras=set(self._loras), pricing={})
 
     async def probe(self) -> dict:
@@ -4814,7 +4850,8 @@ class RunpodAdapter(ComfyUIAdapter):
         and the real-GPU smoke test of a new image. Costs one cold start."""
         b = self.backend
         url = b["url"].rstrip("/")
-        prev = dict(self.probe_state)
+        prev = self._settled_probe()
+        self._probe_prev = prev
         self.probe_state = {**prev, "state": "running", "started": int(time.time())}
         req = NormalizedRequest(alias="(probe)")
         try:
