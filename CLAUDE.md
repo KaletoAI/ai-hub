@@ -68,7 +68,7 @@ must be in both AND in `.gitignore`, or `rsync --delete` wipes it on prod: `conf
 ## Architecture map
 
 Twenty-four Python files at the top level (`ls *.py` is the count of record), tests in
-`tests/`, scripts that run on OTHER boxes in `ops/`. `main.py` owns all app state as
+`tests/`, scripts that run on OTHER boxes in `ops/` (`ops/runpod/` is the RunPod worker's Docker build context). `main.py` owns all app state as
 module globals; **no other module imports `main`** — they get what they need through
 injected callables (`AdapterContext`, `admin.bind(...)`, hostctl `Deps`) and stay
 hot-reload-safe. Modules marked *pure* do no I/O and import neither `main` nor
@@ -77,7 +77,7 @@ hot-reload-safe. Modules marked *pure* do no I/O and import neither `main` nor
 | Module | Role |
 |---|---|
 | `main.py` | Config load/hot reload, discovery loop, routing, every HTTP endpoint, auth/quotas, parking, generation orchestration, Responses bridge endpoints. `load_config` → `rebuild_backends` / `rebuild_virtual_models` → `rebuild_route_index`; `refresh_backend` = discovery; `build_backend_adapters` keeps unchanged adapter instances (`adopt_state`). |
-| `adapters.py` | Per-backend protocol seam: `OpenAIAdapter` (chat/completions/embeddings/TTS, stream normalizer), `AnthropicAdapter` (verbatim `/v1/messages` passthrough), `ComfyUIAdapter` (workflow mapping, bypass/prune, watchdog, ws progress, targeted stop), `CloudTaskAdapter` + `MeshyAdapter`/`TripoAdapter`. |
+| `adapters.py` | Per-backend protocol seam: `OpenAIAdapter` (chat/completions/embeddings/TTS, stream normalizer), `AnthropicAdapter` (verbatim `/v1/messages` passthrough), `ComfyUIAdapter` (workflow mapping, bypass/prune, watchdog, ws progress, targeted stop), `CloudTaskAdapter` + `MeshyAdapter`/`TripoAdapter`, `RunpodAdapter` (ComfyUI workflows on RunPod Serverless, via the `GenIO` build seam). |
 | `meshy.py`, `tripo.py` | *Pure* halves of the cloud 3D vendors; same duck-typed module interface (`KIND`, `ENDPOINTS`, `OPTION_FIELDS`, `build_request`, `parse_task`, …). |
 | `cloudtask.py` | *Pure* leaf for both: `TaskState`, the `opt__<key>` option-form reader/writer. |
 | `scheduler.py` | *Pure* ordering: fastest free unpaid backend, freed-backend type affinity, overdue guard, exec-fault quarantine, VRAM-free decisions, host flag table. |
@@ -116,6 +116,8 @@ Each of these once failed without an error; the full story is in `docs/architect
   own 503 — no failover, no fault row.
 - A billed cloud task never fails over or self-retries (only `CloudTaskRetryable`);
   after the primary task is billed, follow-up failures are final `RuntimeError`s.
+- A RunPod job that may still run is never re-run: only a `/cancel`-confirmed or terminal
+  job (`runpod_settled`) may fail over (`docs/architecture.md`, RunPod Serverless).
 - Sampling precedence is client > alias > backend; backend defaults and reasoning are
   derived per backend inside the adapter so a failover re-derives them.
 - `<backend>/current` never loads a model.

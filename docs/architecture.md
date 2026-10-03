@@ -8,7 +8,7 @@ look (grep the symbol) before changing a mechanism. Moved out of `CLAUDE.md` on
 
 ## Contents
 
-- [Modules](#modules): [main.py](#mainpy), [adapters.py](#adapterspy), [meshy.py](#meshypy), [cloudtask.py](#cloudtaskpy), [tripo.py](#tripopy), [faults.py](#faultspy), [jobs.py](#jobspy), [store.py](#storepy), [admin.py](#adminpy), [Media statistics](#media-statistics--the-job-store-not-the-call-log), [stats.py](#statspy), [responses_bridge.py](#responses_bridgepy), [anthropic_bridge.py](#anthropic_bridgepy), [openai_image_bridge.py](#openai_image_bridgepy), [reasoning.py](#reasoningpy), [previewanim.py](#previewanimpy), [netscan.py](#netscanpy), [Managed hosts](#managed-hosts), [thunder.py](#thunderpy), [hostapi.py](#hostapipy), [services.py](#servicespy), [sshrun.py](#sshrunpy), [hostctl.py](#hostctlpy), [modelsync.py](#modelsyncpy), [loratags.py](#loratagspy), [Model sources](#model-sources), [ops/](#ops)
+- [Modules](#modules): [main.py](#mainpy), [adapters.py](#adapterspy), [RunPod Serverless](#runpod-serverless-runpodadapter), [meshy.py](#meshypy), [cloudtask.py](#cloudtaskpy), [tripo.py](#tripopy), [faults.py](#faultspy), [jobs.py](#jobspy), [store.py](#storepy), [admin.py](#adminpy), [Media statistics](#media-statistics--the-job-store-not-the-call-log), [stats.py](#statspy), [responses_bridge.py](#responses_bridgepy), [anthropic_bridge.py](#anthropic_bridgepy), [openai_image_bridge.py](#openai_image_bridgepy), [reasoning.py](#reasoningpy), [previewanim.py](#previewanimpy), [netscan.py](#netscanpy), [Managed hosts](#managed-hosts), [thunder.py](#thunderpy), [hostapi.py](#hostapipy), [services.py](#servicespy), [sshrun.py](#sshrunpy), [hostctl.py](#hostctlpy), [modelsync.py](#modelsyncpy), [loratags.py](#loratagspy), [Model sources](#model-sources), [ops/](#ops)
 - [Request flow](#request-flow)
 - [Routing rules](#routing-rules-resolve_routesget_gen_routes--alias_entry)
 - [Auth / multi-user](#auth--multi-user)
@@ -265,6 +265,129 @@ write through into the stored candidate) and the derived `CLOUD_TYPES`/
 `CloudNoCredits`/`CloudBusy` (the pre-Tripo `Meshy*` names and the `.meshy` request
 field are gone — nothing stored carries them; the candidate's `meshy` KEY is the kind
 and stays) have a `vendor` attribute that `main._fault_label`/`_gen_exhausted_msg` name.
+
+**The build/execute/deliver seam** (`ComfyUIAdapter.generate`). What used to be one
+method is three steps so a second backend can reuse the first: `_build_prompt(req, io)`
+→ `BuiltPrompt` (the final workflow after `_apply_mapping`/`_apply_lora_cascade`/
+`_apply_fixed`/`_apply_bypass`, the mapping, the job summary, the input names written),
+`_execute(req, built, client)` → `(outputs, fetch, extra_meta)` (submit and wait) and
+`_deliver(req, wf, outputs, fetch)` (cases / node / globs, normalisation, validation —
+every file read through `fetch(params)` → `(status, bytes)`, 404 = absent, exactly the
+`/view` contract). Every backend I/O of the build sits behind a per-REQUEST `GenIO`
+(`put_image`/`put_file`/`placeholder`/`name_refusal`/`input_ref`/`node_types`/
+`cleanup`; never stored on the adapter — concurrent jobs must not share inputs):
+`ComfyIO` is the old upload/`/object_info` code unchanged, `RunpodIO` collects inputs
+into the `/run` payload. WHY a seam and not a copy: a local and a RunPod candidate of
+one alias must run the SAME workflow, or one alias renders two different pictures
+depending on where it ran — and nothing shows it, since every workflow is valid.
+`tests/test_gen_build.py` pins the built workflow byte for byte against the pre-split
+output.
+
+### RunPod Serverless (`RunpodAdapter`)
+
+`type: runpod` (subclass of `ComfyUIAdapter`, `bills = True`, `serves_generation`) runs
+the alias's ComfyUI workflow on a RunPod Serverless endpoint. The build is ComfyUI's
+(`_build_prompt` through `RunpodIO`), so mapping, pins, LoRA cascade, bypass and prune
+behave identically; what differs is HOW it runs. `url` must be
+`https://api.runpod.ai/v2/<endpoint id>` (`runpod_endpoint_id`; `_rp_check_url` refuses
+anything else before a byte is sent, and the console refuses it on Save) because the API
+key travels as a bearer header and may only ever reach api.runpod.ai. `BILLING_TYPES`
+(derived from `bills`) makes `main.rebuild_backends` force `paid` like the cloud kinds —
+the scheduler then reaches for RunPod only when no unpaid backend is free — and
+`_execution_fault`-style bookkeeping treats it like a ComfyUI box: fail rate and the
+exec-fault quarantine show for `comfyui` and `runpod` alike (`quarantined` changes
+routing, so it must be visible), while the executor-watchdog and restart fields do not
+exist for it (`restart()` raises).
+
+**The job.** `_execute` serialises ONE payload in a worker thread —
+`{"input": {"op": "prompt", workflow, inputs: [{name, b64}], deliver: {sibling_exts},
+gw_job}, "policy": {executionTimeout: max_wait·1000, ttl: (max_wait+queue_max_s)·1000}}`
+— and refuses above `_RP_INPUT_MAX` (9 MB of the 10 MB `/run` allows; base64 only, no
+bucket upload in M1) BEFORE anything is billed. Inputs whose file names the worker's
+`NAME_RE` would refuse (`upload_slot_name` keeps any `isalnum` character, unicode
+letters included) fail in `RunpodIO.name_refusal` at build time, naming the param — the
+alternative was a refusal inside the worker after `/run` was paid. Placeholder:
+`gw_placeholder.png` is baked into the image (`placeholder()` returns the name, nothing
+uploaded); node types come from the probe snapshot. `_submit` POSTs `/run`, `_poll_rp`
+polls `/status/<id>`, `_cancel_settle` ends it. Status table: `COMPLETED` → the result;
+`FAILED` → `RuntimeError` with the worker's text; `CANCELLED` → `ComfyPromptInterrupted`
+(ends the job, no failover, no fault); `TIMED_OUT` with no `executionTime` → `CloudBusy`
+(no worker ever took it, free, fails over) else the endpoint's execution timeout; a
+`/status` 404 → the job expired at RunPod (ttl). Transport errors, 429, 5xx and an
+unreadable 200 are about the SERVICE and get `disconnect_grace` of continuous failure; a
+4xx three times in a row is a verdict about the job and ends in a cancel attempt (not a
+bare raise — the job may still run). Progress: `IN_QUEUE` → "queued at RunPod"; a
+worker's `output.step/steps` → the live bar.
+
+**Two clocks** (`_poll_rp`): the queue phase is bounded by `queue_max_s` (default 300; a
+still-queued job — no CUDA-13 host free — is cancelled, which is free, and fails over as
+`CloudBusy`), and `max_wait` counts EXECUTION only, from the first `IN_PROGRESS`, like
+RunPod's own `executionTimeout`; the hard end is `queue_max_s + max_wait` = the job's
+ttl. Counted from submit, a cold start's queue plus image boot ate the execution budget
+and the gateway gave up on a job RunPod would have let finish.
+
+**Billing rules** — the point of the class; `main._billed_cloud_task` reads the trace
+`_submit` writes into `req.cloud_trace` (`runpod`, `runpod_job_id`, `runpod_settled`,
+`create_unconfirmed`) and its RunPod branch makes `_run_job` end the job instead of
+failing over. A `/run` that was refused (connect error, 5xx, 429) created nothing →
+normal failover. A `/run` whose answer was lost, or a 2xx without a readable id, sets
+`create_unconfirmed` → FINAL, and that key wins in the predicate over any settled earlier
+job (the orphan ends by its own ttl). Once the id is known, every give-up path (poll
+grace, `max_wait`, the queue cap, three 4xx, a cancelled task) sends `/cancel` first;
+only a confirmed end — `CANCELLED`, a terminal `/status`, a 404 — sets
+`runpod_settled`, and only a settled job may be re-run elsewhere; otherwise the row says
+the job may still be running. A job that `COMPLETED` while being given up is DELIVERED
+(`_cancel_settle` returns the status whole): its work is done and paid, and an error
+about a success throws it away. The trace is reset per `/run` (`_submit` pops the three
+keys) because a request is reused across self-retries — a settled attempt 1 must not
+hide a lost answer of attempt 2. A cancelled gateway job cancels its RunPod job in the
+`CancelledError` arm of `_execute`; `adapter.cancel(job_id)` uses `_rp_jobs`
+(gateway job → `(url, RunPod id)` — the URL because a save may repoint the backend while
+the job runs). At startup `jobs.reconcile_orphans` remembers the rows it failed
+(`jobs.last_orphans()`) and `main._cancel_orphaned_runpod` cancels each one whose meta
+names a `runpod_job_id` — on the endpoint the row names (`runpod_endpoint`, written with
+the id by `ctx.note_job_meta`, best effort), not the backend's current url — and records
+`runpod_cancelled_at_restart`; the console shows an unconfirmed one in bold.
+
+**Delivery.** The worker (`ops/runpod/handler.py`) runs the prompt on the in-container
+ComfyUI and returns `outputs` plus a `manifest` `{<type>/<subfolder>/<file>: {b64, size,
+sha256} | null}` of every file the outputs name and each requested sibling extension
+(`deliver.sibling_exts`, derived by `_sibling_exts` from `output_ext`/globs/cases). The
+adapter's `fetch` reads the manifest instead of `/view` (absent → 404, so
+`_fetch_outputs`/`_fetch_by_cases` behave unchanged), verifies size and sha256 (damage is
+a raise, never a smaller delivery), and the worker refuses past `OUT_MAX_B64` (7 MB —
+`/run` results cap at 10 MB). M1 therefore delivers images and small files; 3D and video
+need the bucket upload of a later milestone. The job meta carries `runpod_job_id`,
+`delay_ms` (queue + cold start), `execution_ms`, `worker_version` and, with
+`cost_per_hour`, `cost_est_usd` — execution only, a LOWER bound (boot, model load and the
+endpoint's idle timeout bill too; `cost_basis` says so). `admin._runpod_table` renders it.
+
+**Discovery never runs a job** (that costs money). `discover()` reads `/health` (workers,
+queue) and the REST endpoint record (`workersMax`, GPUs, `allowedCudaVersions`);
+`workersMax 0` — RunPod's silent scale-down after 7 idle days — is DOWN with that cause,
+401/403 name the key. Models, LoRAs and node types come from the **probe snapshot**: the
+console's Probe button (`POST /ui/backends/runpod-probe` → `main.runpod_probe`) submits
+one `op: info` job (a cold start — also the real-GPU smoke test of a new image) and
+stores `{at, worker_version, endpoint, object_info_gz, models}` in the bulk setting
+`runpod_probe` (per backend NAME; `store._BULK_SETTINGS`, never in `get_settings()`). A
+record whose `endpoint` is not this backend's endpoint id is IGNORED (a changed url or a
+reused name describes another image). `RunpodAdapter` keeps `object_info_full`, which
+`admin._object_info` answers the mapping editor's widgets from — the endpoint has no
+`/object_info` of its own — and `adopt_state`/`adopt_discovery`/`adopt_probe` keep the
+snapshot, the running jobs and a probe finished on a replaced instance across a save
+(a copied `running` probe state would stay `running` for good and the tab live forever;
+`_settled_probe`). `/health` and the Backends tab carry `runpod` (idle/running workers,
+queue, max workers, probe state).
+
+**Fences.** A RunPod backend refuses every chain role (`chain_export` returns an error,
+`chain_take_mesh`/`chain_feed_mesh` raise): the inherited ComfyUI hooks would run a
+billed stage 1 and then `GET /view` on api.runpod.ai, or upload to it — failing only
+after the money is spent. A name shared by a `comfyui` and a `runpod` backend is refused
+on Save (`admin.backend_save`) and warned for config (`main.gen_name_clashes` /
+`_warn_gen_name_clashes`): backends are keyed `(name, type)` but a workflow candidate
+names its backend by NAME, so `_gen_backend_for` would pick whichever comes first and
+local work could run — and bill — on RunPod. Tests: `test_gen_build.py`,
+`test_runpod_adapter.py`, `test_runpod_worker.py`.
 
 ### `meshy.py`
 
@@ -1701,6 +1824,23 @@ exclude lists (`RSYNC_EXCLUDES`/`TAR_EXCLUDES`) — without the latter `rsync --
 wipes the instance key and the LAN pin on every deploy, and would pull a live socket
 (pinned by `test_hostctl.MainWiring.test_deploy_and_gitignore_exclude_keys`).
 
+`ops/runpod/` is the Docker build context of the RunPod Serverless worker (image
+profile: Qwen-Image 2.1), not a script run over ssh: `Dockerfile` (CUDA 13 base; Python,
+torch, torchvision/audio, CUDA tag and the ComfyUI commit are `ARG`s equal to the Thunder
+bootstrap's pins — `test_runpod_worker.py` compares them), `install-nodes.sh` (the third
+copy of `parse_node_line`, pinned equal to the two bootstrap copies), `nodes.image.txt`
+(lines copied VERBATIM from `thunder-nodes.default.txt`, a subset — a pack at another
+revision renders a different picture), `extra_model_paths.yaml` (models from the network
+volume at `/runpod-volume/models/<folder>/`, the same tree as ComfyUI's), `gw_placeholder.png`
+and `handler.py` (the worker: one prompt per job against the in-container ComfyUI, plain
+functions over a base URL so they test without the `runpod` SDK or a GPU; our own code —
+nothing copied from the AGPL worker-comfyui). The image is built by RunPod from a PRIVATE
+worker repo, never from ai-hub: `sync.sh <checkout>` copies the context there and writes
+`worker.json` (the version — ai-hub commit, `-dirty` when `ops/runpod` has uncommitted
+changes — that every job reports back as `worker_version`); commit, push and
+`gh release create v<N>` (which starts the billed build) stay the operator's. After each
+release the operator presses Probe.
+
 ## Request flow
 
 - **Chat/LLM** (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`,
@@ -2229,7 +2369,7 @@ the /ui origin, so `admin._audio_headers` plays only `audio/*` and turns anythin
 
 Every test file also says this in its own docstring; this is the overview.
 
-`ls tests/test_*.py` is the count of record (seventy-five files on 2026-10-03). There
+`ls tests/test_*.py` is the count of record (seventy-eight files on 2026-10-03). There
 is no blanket suite on purpose: each file exists because the mechanism it guards fails
 SILENTLY — the result looks plausible, nothing raises.
 `test_anthropic_bridge.py`, `test_prune_branch.py` (a
@@ -2735,4 +2875,22 @@ information, escaped URLs that are never links, the actions per source as POSTs
 landing on `?sub=models`, the GET filter, live only while a check or hash runs, and
 the catalog editor's stale-form guard end to end — text kept, current hash handed
 back, a validation refusal keeping the old one).
+`test_gen_build.py` (what `_build_prompt` hands a backend: the built workflow is shown
+nowhere, so a refactor that drops the label→param aliasing, prunes a node too many or
+forgets a pin still submits a VALID prompt and delivers a plausible picture of the wrong
+thing — pinned byte for byte, so the GenIO split cannot change it).
+`test_runpod_worker.py` (the worker image and handler, built on RunPod far from every
+test: drift shows only as a job on a different stack than Thunder — another torch,
+ComfyUI commit or node revision — or a manifest the gateway reads as "file absent"; pins
+the Dockerfile to the Thunder pins, the node list to the default list, the three
+`parse_node_line` copies equal, the artifact extensions equal to the gateway's and the
+handler's output shape).
+`test_runpod_adapter.py` (the RunPod backend against a scripted RunPod: a job id lost on
+a dropped `/run` answer becomes a second billed run, a give-up without `/cancel` leaves a
+GPU billing, a queued job without a CUDA-13 worker holds the slot for the whole
+`max_wait`, a manifest read unlike `/view` delivers less than asked, and the workflow
+must equal a local ComfyUI's; pins the status table, the two clocks, the settled/unconfirmed
+trace and `main._billed_cloud_task`, a COMPLETED result found while giving up, the
+startup orphan cancel, the probe record's endpoint check, the chain refusal, the name
+clash and the url rule).
 Run them all with `python -m unittest discover -s tests -t .` (no runner dependency).

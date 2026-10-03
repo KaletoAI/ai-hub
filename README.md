@@ -25,7 +25,7 @@ code, image clients like anima-verse, …) and a fleet of backends.
 - [Call parking](#call-parking) — queue instead of `503` when busy
 - [Reasoning control](#reasoning-control) — thinking on/off per request, per alias, per model×backend
 - [Claude Code / Anthropic Messages](#claude-code--anthropic-messages) — `/v1/messages`, mixed Anthropic + open-weight
-- [Media generation](#media-generation) — ComfyUI image/video/audio + Meshy.ai and Tripo3D cloud meshes & rigging, aliases, mapping, chains, LoRA, jobs
+- [Media generation](#media-generation) — ComfyUI image/video/audio, RunPod Serverless ComfyUI + Meshy.ai and Tripo3D cloud meshes & rigging, aliases, mapping, chains, LoRA, jobs
 - [Managed hosts](#managed-hosts-thunder-compute-runpod-later) — on-demand GPU machines (Thunder Compute) the gateway starts and stops; ComfyUI and OpenAI-compatible backends attach to them, with model sync
 - [The `/ui` console](#the-ui-console)
 - [Stats & routing dashboard](#stats--routing-dashboard)
@@ -717,10 +717,12 @@ respect.
 
 ## Media generation
 
-Generation runs on three backend types: **`type: comfyui`** — a ComfyUI server on
+Generation runs on four backend types: **`type: comfyui`** — a ComfyUI server on
 your own GPU, or on a GPU rented on demand as a
-[managed host](#managed-hosts-thunder-compute-runpod-later) — and the two cloud mesh APIs
-**`type: meshy`** (Meshy.ai) and **`type: tripo`** (Tripo3D), both further down. A ComfyUI
+[managed host](#managed-hosts-thunder-compute-runpod-later) —, **`type: runpod`** (the
+same workflows on a [RunPod Serverless](#runpod-serverless-comfyui-workflows-pay-per-second)
+endpoint) and the two cloud mesh APIs **`type: meshy`** (Meshy.ai) and **`type: tripo`**
+(Tripo3D), both further down. A ComfyUI
 backend speaks a different protocol, so it declares `type: comfyui`.
 Discovery is via `/object_info` (checkpoints/UNETs/VAEs **and** installed LoRAs);
 dispatch submits a parametrised workflow, polls `/history`, and fetches whatever
@@ -967,6 +969,74 @@ The Tripo alias set this is built for (register them in **Aliases › Media**):
 | `Tripo-Multiview` | `img2mesh` | multiview-to-model (front + ≥1 more view) | – |
 | `Tripo-Humanoid` | `img2mesh` | image-to-model, `face_limit: 150000` | `Tripo-Rig` · `input_mesh_path` · `rig: tripo` |
 | `Tripo-Rig` | `mesh2rig` | rig (`spec: mixamo`) | – |
+
+### RunPod Serverless (ComfyUI workflows, pay per second)
+
+A RunPod backend (`type: runpod`, <https://docs.runpod.io/serverless/overview>) runs the
+**same ComfyUI workflows** as a `comfyui` backend on a Serverless endpoint: it costs
+nothing while idle and bills per second of GPU time while a job runs (plus the cold
+start). An alias may hold a local ComfyUI candidate and a RunPod candidate — both are
+built from the same workflow, mapping, pins and LoRA settings; RunPod is always
+**paid**, so the scheduler reaches for it only when no unpaid backend is free.
+
+```yaml
+backends:
+  - name: runpod-image
+    type: runpod
+    url: https://api.runpod.ai/v2/<endpoint id>   # the id from the RunPod console
+    api_key: rpa_…                    # RunPod console → Settings → API Keys (sent to api.runpod.ai only)
+    # max_wait: 600                   # seconds of EXECUTION (counted from the first
+                                      # IN_PROGRESS; also the endpoint's execution timeout)
+    # queue_max_s: 300                # a job still queued after this long (no worker free,
+                                      # e.g. no CUDA 13 host) is cancelled — free — and fails over
+    # poll_interval: 2                # seconds between /status polls
+    # cost_per_hour: 1.75             # $/h of the endpoint's GPU (RunPod's pricing page);
+                                      # the job view then shows a cost estimate
+    # disconnect_grace: 30            # unreachability tolerated while polling
+```
+
+Setup, once (the form's fields are the same: **Backends → + Add → type RunPod**):
+
+1. **Network volume** in a datacenter that has the GPU you want and CUDA 13 hosts
+   (`EU-CZ-1` or `EU-RO-1` at the time of writing), holding the model set under
+   `models/<folder>/` (`checkpoints`, `diffusion_models`, `text_encoders`, `vae`, `loras`,
+   …, the same tree as `ComfyUI/models`). The worker reads it at `/runpod-volume/models`.
+2. **Private worker repo.** The worker image is built by RunPod from a private GitHub
+   repo, never from this one. Fill it with `ops/runpod/sync.sh <checkout of that repo>`
+   (copies the build context, writes `worker.json` with the version every job reports),
+   commit and push it, then `gh release create v<N>` — the release starts the (billed)
+   build through RunPod's GitHub integration.
+3. **Serverless endpoint** from that release: GPU of your choice, **allowed CUDA
+   versions ≥ 13.0** (the image's torch needs it), the network volume attached, max
+   workers ≥ 1. RunPod scales an endpoint with no traffic to 0 workers after 7 idle
+   days; the backend then shows DOWN with that reason — raise max workers again.
+4. **Backend + Probe + alias.** Add the backend with the endpoint url and your API key,
+   then press **⚡ Probe** in the backend list: one cold-start job reads the worker's
+   nodes, models and LoRAs (and smoke-tests the image on a real GPU). The result is
+   stored; models, LoRAs and the mapping editor's widgets come from it, so probe again
+   after every new worker release. Finally add the backend as a candidate to a media
+   alias (**Aliases › Media**) — an existing ComfyUI alias works unchanged.
+
+Behaviour worth knowing:
+
+- **Nothing is billed twice.** A job that may still be running at RunPod is never re-run
+  elsewhere: on a timeout, a lost connection or a cancel the gateway sends `/cancel` and
+  only a confirmed end allows a failover; a lost answer to the submit ends the job (the
+  orphan stops by its own ttl) and the job row says so. A job that finished while the
+  gateway was giving up is delivered. After a gateway restart, running RunPod jobs of
+  interrupted rows are cancelled.
+- The job view shows the RunPod job id, queue + cold-start time, execution time, the
+  worker version and — with `cost_per_hour` — a **cost estimate that is a lower bound**:
+  boot, model load and the endpoint's idle timeout are billed too.
+- Fail rate, the execution-fault quarantine and `/health` (`runpod`: idle/running
+  workers, queue, probe state) work as for ComfyUI backends.
+- A backend named like a `comfyui` backend is refused (alias candidates name their
+  backend by name).
+
+Milestone 1 limits: files travel **base64 inside the request/response** — all inputs
+together ≤ 9 MB, outputs ≤ 7 MB (images and small files; larger ones fail with a message
+naming the limit); **no 3D, no video**; a RunPod backend cannot be a **chain** stage; one
+workflow image profile (Qwen-Image 2.1 nodes); the cost figure is an estimate only.
 
 ### Generation aliases + mapping
 
