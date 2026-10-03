@@ -370,6 +370,16 @@ class DiscoveryAndProbe(unittest.TestCase):
             self._disc(rp, _adapter())
         self.assertIn("raise max workers", str(cm.exception))
 
+    def test_unknown_endpoint_404_is_named_not_found(self):
+        rp = _RunPod([DONE])
+        orig = rp.handler
+        rp.handler = lambda r: (httpx.Response(404, json={}) if r.url.path.endswith("/health")
+                                else orig(r))
+        with self.assertRaises(RuntimeError) as cm:
+            self._disc(rp, _adapter())
+        self.assertIn("not found", str(cm.exception))
+        self.assertIn(adapters.runpod_endpoint_id(URL), str(cm.exception))
+
     def test_refused_key_is_down_named(self):
         rp = _RunPod([DONE])
         orig = rp.handler
@@ -590,6 +600,22 @@ class Console(unittest.TestCase):
         self.assertNotIn("<script>x</script>", html)
         self.assertIn("probe failed: &lt;script&gt;x&lt;/script&gt;", html)
         self.assertIn("workers 2 running / 1 idle, max 5 · queue 3", html)
+
+    def test_unknown_workers_max_is_omitted(self):
+        a = self.admin
+        def render(wm):
+            info = {"backends": [{
+                "name": "rp", "type": "runpod", "url": URL, "enabled": True, "healthy": True,
+                "models": 0, "source": "ui", "paid": True,
+                "runpod": {"workers_idle": 1, "workers_running": 2, "in_queue": 3,
+                           "workers_max": wm}}], "hosts": {}}
+            with unittest.mock.patch.object(a, "_gateway_info", lambda: info), \
+                    unittest.mock.patch.object(a.store, "is_active", lambda: False):
+                return asyncio.run(a._backends_view({})).body.decode()
+        h = render(None)
+        self.assertNotIn("max None", h)
+        self.assertIn("workers 2 running / 1 idle · queue 3", h)
+        self.assertIn("max 1 · queue", render(1))
 
     def test_probe_is_a_post_action(self):
         self.assertTrue(self.admin._is_post_action("/ui/backends/runpod-probe?id=runpod:rp"))

@@ -2467,8 +2467,9 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
             pr = rpd.get("probe") or {}
             st = pr.get("state")
             rpi = (f" · workers {rpd.get('workers_running') or 0} running / "
-                   f"{rpd.get('workers_idle') or 0} idle, max {rpd.get('workers_max')}"
-                   f" · queue {rpd.get('in_queue') or 0}")
+                   f"{rpd.get('workers_idle') or 0} idle"
+                   + (f", max {rpd['workers_max']}" if rpd.get("workers_max") is not None else "")
+                   + f" · queue {rpd.get('in_queue') or 0}")
             if st == "ok":
                 rpi += f" · probed {pr.get('worker_version') or '?'}"
                 if pr.get("at"):

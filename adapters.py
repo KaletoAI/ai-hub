@@ -4861,12 +4861,16 @@ class RunpodAdapter(ComfyUIAdapter):
         r = await client.get(f"{url}/health", headers=h, timeout=_COMFY_DISCOVERY_TIMEOUT)
         if r.status_code in (401, 403):
             raise RuntimeError("RunPod API key refused (/health)")
+        if r.status_code == 404:
+            raise RuntimeError(f"RunPod endpoint {ep} not found — check the endpoint id in the url")
         r.raise_for_status()
         self.health = r.json() or {}
         e = await client.get(f"{RUNPOD_REST}/endpoints/{ep}", headers=h,
                              timeout=_COMFY_DISCOVERY_TIMEOUT)
         if e.status_code in (401, 403):
             raise RuntimeError("RunPod API key refused (REST /endpoints)")
+        if e.status_code == 404:
+            raise RuntimeError(f"RunPod endpoint {ep} not found — check the endpoint id in the url")
         e.raise_for_status()
         info = e.json() or {}
         self.endpoint_info = {k: info.get(k) for k in ("workersMax", "workersMin", "gpuTypeIds",
