@@ -1266,5 +1266,40 @@ class CatalogShapes(unittest.TestCase):
         self.assertTrue(any("../x" in e for e in errs), errs)
 
 
+class SharedSyncHelpers(unittest.TestCase):
+    """The RunPod volume controller (rpvolume.py) must not import hostctl, so the pure
+    halves it shares with Thunder live in modelsync. A copy that drifted would plan the
+    same alias differently on the two paths — silently (no error, other files)."""
+
+    def test_manifest_round_trip_is_hostctls(self):
+        import hostctl
+        self.assertIs(hostctl.parse_manifest, ms.parse_manifest)
+        self.assertIs(hostctl.normalize_manifest, ms.normalize_manifest)
+        m = ms.parse_manifest('{"models/a.safetensors": {"size": 3, "aliases": "x"}}')
+        self.assertEqual(m["models/a.safetensors"]["aliases"], [])
+        m = ms.parse_manifest('{"models/a.safetensors": {"size": 3, "aliases": ["x"]}}')
+        self.assertEqual(m["models/a.safetensors"]["aliases"], ["x"])
+        self.assertEqual(ms.parse_manifest("not json"), {})
+
+    def test_without_fallbacks_drops_stale_records(self):
+        urls = {"models/a": {"url": "https://h/a"}, "models/b": {"url": "https://h/b2"}}
+        fb = {"models/a": "https://h/a", "models/b": "https://h/b", "models/c": "https://h/c"}
+        kept, stale = ms.without_fallbacks(urls, fb)
+        self.assertEqual(kept, {"models/b": {"url": "https://h/b2"}})
+        self.assertEqual(sorted(stale), ["models/b", "models/c"])
+
+    def test_plan_view_labels_current_source_without_exposing_url(self):
+        path = "models/vae/v.safetensors"
+        p = mk([need("x", [R_VAE])])
+        view = ms.plan_view(p, set(), {}, {}, {})
+        self.assertEqual(view["aliases"]["x"]["files"][0]["source"], "lan")
+        urls = {path: {"url": "https://h/v?token=secret"}}
+        view = ms.plan_view(p, set(), {}, {}, urls)
+        f = view["aliases"]["x"]["files"][0]
+        self.assertEqual(f["source"], "url")
+        self.assertEqual(f["origin"], "catalog")
+        self.assertNotIn("url", f)
+
+
 if __name__ == "__main__":
     unittest.main()

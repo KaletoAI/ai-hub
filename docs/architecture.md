@@ -1785,10 +1785,14 @@ a `?msg=` redirect (browser history, access log): `main.check_source` refuses a 
 with the FIXED `SRC_URL_REFUSED` (never the URL — its query may hold a token), and
 `hosts_source_check` logs the path only, never the answer. The Models
 sub-tab is live (3 s) only while `pending`, never on a refusal (its URL is the POST).
+`modelsync` also owns `parse_manifest`/`normalize_manifest` (re-exported by
+`hostctl`) and the pure `without_fallbacks` filter; the controller still drops stale
+fallback state and persists it. Thunder and RunPod can share these decisions without
+importing a lifecycle controller.
 The host card's per-file sync rows carry `_card_src_badge` — the plan view's
-`source`/`origin` (hostctl `_plan_view` adds them from the url catalog the plan was
-handed), `outdated` from `_model_source_kinds` (fetched once per Backends render in a
-worker thread, only when a view has a plan), `URL failed — LAN` from the view's
+`source`/`origin` (`modelsync.plan_view`, delegated by hostctl `_plan_view`, adds
+them from the url catalog the plan was handed), `outdated` from `_model_source_kinds`
+(fetched once per Backends render in a worker thread, only when a view has a plan), `URL failed — LAN` from the view's
 `url_fallback`. The badge is the CURRENT source (where this plan would fetch the file),
 never its provenance: a present file LAN-synced before its URL entry existed reads
 `URL ✓`/`HF auto` — the manifest's `source` is shown nowhere. `_hosts_panel`

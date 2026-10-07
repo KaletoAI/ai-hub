@@ -66,6 +66,7 @@ no I/O, no module-level config. Covered by tests/test_modelsync.py.
 from __future__ import annotations
 
 import copy
+import json
 import re
 from urllib.parse import quote
 from dataclasses import dataclass, field
@@ -1247,3 +1248,90 @@ def status_text(plan_: dict, alias: str, backend_name: str) -> str:
     extra = f" + {unsized} file{'s' if unsized != 1 else ''} of unknown size" if unsized else ""
     return (f"models for {alias} are syncing on {backend_name} "
             f"({_gb(a['have_bytes'])} of {_gb(a['need_bytes'])} GB{extra})")
+
+
+def parse_manifest(text: str) -> dict:
+    """The manifest file → `{path: entry}`, `aliases` always a list. Unreadable → `{}`:
+    its files then count as "unknown" (listed, never deleted) — the safe direction."""
+    try:
+        d = json.loads(text or "{}")
+    except ValueError:
+        return {}
+    return normalize_manifest(d)
+
+
+def normalize_manifest(d) -> dict:
+    """`{path: entry}` with dict entries only and `aliases` always a list (a string
+    there would otherwise be iterated letter by letter)."""
+    if not isinstance(d, dict):
+        return {}
+    out: dict = {}
+    for k, v in d.items():
+        if not isinstance(k, str) or not isinstance(v, dict):
+            continue
+        e = dict(v)
+        al = e.get("aliases")
+        e["aliases"] = [str(x) for x in al] if isinstance(al, (list, tuple)) else []
+        out[k] = e
+    return out
+
+
+def without_fallbacks(urls: dict, fallback: dict) -> tuple:
+    """The URL sources minus those given up for the share's copy, and the fallback
+    records that went stale (the entry names another url now, or none)."""
+    urls = urls or {}
+    stale = [p for p, u in (fallback or {}).items()
+             if not isinstance(urls.get(p), dict) or urls[p].get("url") != u]
+    valid = set(fallback or {}) - set(stale)
+    return {p: e for p, e in urls.items() if p not in valid}, stale
+
+
+def plan_view(plan: dict, ready_aliases: set, dest: dict, manifest: dict, urls: dict) -> dict:
+    """The panel's plan summary (Task 13): per alias sizes, counts and texts, the
+    fetch/prune/held/unknown lists. No URL (a catalog URL may carry a query token)."""
+    p = plan
+    held: dict = {}
+    for h in p["held"]:
+        held[h[2]] = held.get(h[2], 0) + 1
+    # what the stop will delete, with sizes for the preview ("N files, X GB"): the
+    # destination's size, else the manifest's; None when neither knows
+    man = manifest
+
+    def prune_size(path):
+        n = dest.get(path)
+        if n is None and isinstance(man.get(path), dict):
+            n = man[path].get("size")
+        return n if isinstance(n, int) and not isinstance(n, bool) else None
+    # each file's source as THIS plan decided it (the card's badge): the url
+    # catalog the plan was handed — fallbacks already filtered out — names it `url`
+    # (`origin` hf-auto | catalog), a link is a `link`, everything else `lan`
+
+    def with_source(f):
+        # the CURRENT source — where this plan would fetch the file — never its
+        # provenance: a present file LAN-synced before a URL entry existed reads
+        # `url`/`hf-auto` (the manifest's `source` is not shown anywhere)
+        f = dict(f)
+        if f.get("link") is not None:
+            f["source"] = "link"
+        elif f.get("path") in urls:
+            f["source"] = "url"
+            u = urls[f["path"]]
+            f["origin"] = ("hf-auto" if isinstance(u, dict) and u.get("origin") == "hf-auto"
+                           else "catalog")
+        else:
+            f["source"] = "lan"
+        return f
+    return {
+        "aliases": {a: {"ready": a in ready_aliases, "need_bytes": r["need_bytes"],
+                        "have_bytes": r["have_bytes"], "missing": len(r["missing"]),
+                        "blocked": list(r["blocked"]), "hints": list(r["hints"]),
+                        "held": held.get(a, 0), "selectable": list(r["selectable"]),
+                        "files": [with_source(f) for f in r["files"]]}
+                    for a, r in p["per_alias"].items()},
+        "fetch": [{k: e[k] for k in ("path", "size", "source", "aliases")}
+                  for e in p["fetch"]],
+        "prune": list(p["prune"]),
+        "prune_sizes": [[x, prune_size(x)] for x in p["prune"]],
+        "held": [list(h) for h in p["held"]],
+        "unknown": [list(u) for u in p["unknown"]],
+        "need_total": p["need_total"], "have_total": p["have_total"]}

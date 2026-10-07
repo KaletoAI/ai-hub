@@ -131,6 +131,7 @@ import httpx
 
 import hostapi
 import modelsync
+from modelsync import parse_manifest, normalize_manifest  # noqa: F401
 import services
 import sshrun
 
@@ -937,32 +938,6 @@ def parse_index(text: str) -> dict:
         key = plan_path(path)
         if key is not None:
             out[key] = int(size)
-    return out
-
-
-def parse_manifest(text: str) -> dict:
-    """The manifest file → `{path: entry}`, `aliases` always a list. Unreadable → `{}`:
-    its files then count as "unknown" (listed, never deleted) — the safe direction."""
-    try:
-        d = json.loads(text or "{}")
-    except ValueError:
-        return {}
-    return normalize_manifest(d)
-
-
-def normalize_manifest(d) -> dict:
-    """`{path: entry}` with dict entries only and `aliases` always a list (a string
-    there would otherwise be iterated letter by letter)."""
-    if not isinstance(d, dict):
-        return {}
-    out: dict = {}
-    for k, v in d.items():
-        if not isinstance(k, str) or not isinstance(v, dict):
-            continue
-        e = dict(v)
-        al = e.get("aliases")
-        e["aliases"] = [str(x) for x in al] if isinstance(al, (list, tuple)) else []
-        out[k] = e
     return out
 
 
@@ -4578,13 +4553,12 @@ class Controller:
         derived alike) — the plan then says `lan` for those paths, with no change to
         modelsync. Keyed on the URL: a path whose entry names ANOTHER url now (the
         operator fixed it), or none, drops its record and is planned as it says."""
-        stale = [p for p, u in self._url_fallback.items()
-                 if not isinstance(urls.get(p), dict) or urls[p].get("url") != u]
+        kept, stale = modelsync.without_fallbacks(urls, self._url_fallback)
         for p in stale:
             self._drop_fallback(p)
         if stale:
             self._persist()
-        return {p: e for p, e in urls.items() if p not in self._url_fallback}
+        return kept
 
     def _prune_template_report(self, dest: dict) -> None:
         """The card's "Models the template brought along" names files the instance no
@@ -4899,58 +4873,13 @@ class Controller:
         return p
 
     def _plan_view(self) -> Optional[dict]:
-        """The panel's plan summary (Task 13): per alias sizes, counts and texts, the
-        fetch/prune/held/unknown lists. No URL (a catalog URL may carry a query token)."""
-        p = self.plan
-        if p is None:
+        """The panel's plan summary without catalog URLs that may carry query tokens."""
+        if self.plan is None:
             return None
-        held: dict = {}
-        for h in p["held"]:
-            held[h[2]] = held.get(h[2], 0) + 1
-        # what the stop will delete, with sizes for the preview ("N files, X GB"): the
-        # destination's size, else the manifest's; None when neither knows
-        dest = (self._plan_inputs or (None, None, {}))[2] or {}
-        man = self._manifest if isinstance(self._manifest, dict) else {}
-
-        def prune_size(path):
-            n = dest.get(path)
-            if n is None and isinstance(man.get(path), dict):
-                n = man[path].get("size")
-            return n if isinstance(n, int) and not isinstance(n, bool) else None
-        # each file's source as THIS plan decided it (the card's badge): the url
-        # catalog the plan was handed — fallbacks already filtered out — names it `url`
-        # (`origin` hf-auto | catalog), a link is a `link`, everything else `lan`
-        urls = (self._plan_inputs or (None,) * 5)[4] or {}
-
-        def with_source(f):
-            # the CURRENT source — where this plan would fetch the file — never its
-            # provenance: a present file LAN-synced before a URL entry existed reads
-            # `url`/`hf-auto` (the manifest's `source` is not shown anywhere)
-            f = dict(f)
-            if f.get("link") is not None:
-                f["source"] = "link"
-            elif f.get("path") in urls:
-                f["source"] = "url"
-                u = urls[f["path"]]
-                f["origin"] = ("hf-auto" if isinstance(u, dict) and u.get("origin") == "hf-auto"
-                               else "catalog")
-            else:
-                f["source"] = "lan"
-            return f
-        return {
-            "aliases": {a: {"ready": a in self.ready_aliases, "need_bytes": r["need_bytes"],
-                            "have_bytes": r["have_bytes"], "missing": len(r["missing"]),
-                            "blocked": list(r["blocked"]), "hints": list(r["hints"]),
-                            "held": held.get(a, 0), "selectable": list(r["selectable"]),
-                            "files": [with_source(f) for f in r["files"]]}
-                        for a, r in p["per_alias"].items()},
-            "fetch": [{k: e[k] for k in ("path", "size", "source", "aliases")}
-                      for e in p["fetch"]],
-            "prune": list(p["prune"]),
-            "prune_sizes": [[x, prune_size(x)] for x in p["prune"]],
-            "held": [list(h) for h in p["held"]],
-            "unknown": [list(u) for u in p["unknown"]],
-            "need_total": p["need_total"], "have_total": p["have_total"]}
+        inp = self._plan_inputs or (None,) * 5
+        return modelsync.plan_view(self.plan, self.ready_aliases, inp[2] or {},
+                                   self._manifest if isinstance(self._manifest, dict) else {},
+                                   inp[4] or {})
 
     async def _make_links(self, plan: dict) -> dict:
         """Create the plan's missing symlinks (the HF cache's snapshots/, modelsync
