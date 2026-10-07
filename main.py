@@ -43,6 +43,7 @@ import modelsync
 import loratags
 import hostapi
 import hostctl
+import rpvolume
 import services
 import sshrun
 import thunder
@@ -167,6 +168,7 @@ def rebuild_backends() -> None:
     # BEFORE the grouping and the route index: an attached backend's forward ends and
     # URL are derived there (and written onto these dicts).
     sync_host_controllers()
+    sync_volume_controllers()
     backend_hosts = {backend_id(b): backend_host(b) for b in backends}
     host_backends = {}
     for bid, h in backend_hosts.items():
@@ -2260,6 +2262,7 @@ adapter_ctx = AdapterContext(
     runpod_probe_load=lambda name: (store.get_setting("runpod_probe") or {}).get(name)
         if store.is_active() else None,
     runpod_probe_save=_runpod_probe_save,
+    runpod_account_key=lambda: provider_token("runpod"),
 )
 
 
@@ -6412,10 +6415,10 @@ def _mapping_fields(cand: dict) -> list:
 
 
 def _comfy_name_of(bid: str) -> Optional[str]:
-    """The backend NAME of a ComfyUI backend id (`comfyui:<name>`), None for any other
-    type — the model sync is about ComfyUI candidates only."""
+    """A RunPod backend runs ComfyUI workflows; the candidate kind is comfyui.
+    Both backend id kinds therefore participate in the same model planning."""
     kind, sep, name = str(bid or "").partition(":")
-    return name if sep and kind == "comfyui" else None
+    return name if sep and kind in ("comfyui", "runpod") else None
 
 
 def service_alias_needs(bid: str, catalog=None) -> list:
@@ -7981,6 +7984,8 @@ def _hosts_boot() -> None:
     _hosts_booted = True
     for name, c in list(host_controllers.items()):
         _host_run(name, c)
+    for name, c in list(volume_controllers.items()):
+        _vol_run(name, c)
     _modelsrc_prepare()
 
 
@@ -7989,7 +7994,8 @@ async def _hosts_shutdown() -> None:
     client. The INSTANCES are not touched — they keep running and resume() finds them."""
     global _hosts_booted
     _hosts_booted = False
-    tasks = [t for ts in _host_tasks.values() for t in ts if not t.done()]
+    tasks = [t for ts in list(_host_tasks.values()) + list(_vol_tasks.values())
+             for t in ts if not t.done()]
     if _modelsrc_key_task is not None and not _modelsrc_key_task.done():
         tasks.append(_modelsrc_key_task)
     for t in tasks:
@@ -8001,6 +8007,12 @@ async def _hosts_shutdown() -> None:
             await c.aclose()
         except Exception as e:
             logger.warning(f"[host {name}] shutdown: {type(e).__name__}: {e}")
+
+    for name, c in list(volume_controllers.items()):
+        try:
+            await c.aclose()
+        except Exception as e:
+            logger.warning(f"[volume {name}] shutdown: {type(e).__name__}")
 
 
 # ── host views and actions (the console's card, /health) ─────────────────────────
@@ -8211,11 +8223,19 @@ def _gated_only_aliases(aliases) -> set:
 
 def modelsync_gate(backend: dict, alias: str) -> Optional[str]:
     """None = `alias` may route to `backend`; else why not (the text a client's 503
-    carries). Only a ComfyUI backend that is a managed host's service is ever gated —
+    carries). RunPod volume snapshots and managed ComfyUI services gate routing —
     backends are keyed (name, type), so a same-named LLM backend is not the box. Backend
     → `host` → controller → the service's plan (R-W7). Runs per request and per waiter ×
     backend inside a worker thread: it reads the controller's in-memory plan only
     (`is_alias_ready`/`alias_status` do no I/O), never anything slower."""
+    if backend.get("type") == "runpod":
+        v = backend.get("volume")
+        if not v:
+            return None
+        c = volume_controllers.get(v)
+        if c is None:
+            return f"RunPod volume {v} is not set up yet"
+        return None if c.is_alias_ready(alias) else c.alias_status(alias)
     if backend.get("type") != "comfyui":
         return None
     c = _host_ctl(backend)
@@ -8365,6 +8385,243 @@ def save_managed_host(name: str, entry: dict, new: bool) -> str:
     return ""
 
 
+# ── RunPod volumes (store entries and restart-safe controller state) ─────────────
+
+runpod_volumes: dict = {}
+volume_controllers: dict = {}
+_vol_tasks: dict = {}
+_vol_warned: set = set()
+runpod_secret_kinds = ("runpod", "runpod_s3")
+_SECRET_KINDS = set(runpod_secret_kinds)
+
+
+def _load_runpod_volumes() -> dict:
+    """A failed read must not look like every volume was removed."""
+    if not store.is_active():
+        return {}
+    try:
+        entries = store.get_setting("runpod_volumes")
+        if entries is None:
+            return {}
+        if not isinstance(entries, dict):
+            raise ValueError("runpod_volumes is not a dict")
+        return entries
+    except Exception as e:
+        logger.warning(f"runpod_volumes unreadable — keeping the last read: {type(e).__name__}")
+        return dict(runpod_volumes)
+
+
+def _volume_load_state(name: str) -> Optional[dict]:
+    d = store.get_setting("runpod_volume_state")
+    if d is None:
+        return None
+    if not isinstance(d, dict):
+        raise ValueError("runpod_volume_state is not a dict")
+    return d.get(name)
+
+
+def _volume_save_state(name: str, d: dict) -> None:
+    """Read-modify-write without an await, on the event loop only. Moving this to
+    worker threads loses updates when two volumes read the same shared setting."""
+    cur = store.get_setting("runpod_volume_state")
+    if cur is None:
+        cur = {}
+    if not isinstance(cur, dict):
+        raise ValueError("runpod_volume_state is unreadable — not saved")
+    cur[name] = d
+    store.set_settings({"runpod_volume_state": cur})
+
+
+def _volume_deps(name: str) -> "rpvolume.VolumeDeps":
+    lan = modelsrc()
+
+    def live(bid):
+        b = next((b for b in backends if backend_id(b) == bid and b.get("type") == "runpod"), None)
+        ad = backend_adapters.get(bid)
+        if b is None or not isinstance(ad, adapters.RunpodAdapter):
+            raise RuntimeError(f"RunPod backend {bid} is not available")
+        return b, ad
+
+    async def run_fetch(bid, payload, on_id):
+        b, ad = live(bid)
+        return await ad.run_op(payload, float(b.get("max_wait", 600)), on_id)
+
+    async def fetch_status(bid, rp_id):
+        return await live(bid)[1].job_status(rp_id)
+
+    async def fetch_cancel(bid, rp_id):
+        return await live(bid)[1].cancel_runpod_id(rp_id)
+
+    def creds():
+        access, _, secret = provider_token("runpod_s3").partition(":")
+        return provider_token("runpod"), access, secret
+
+    return rpvolume.VolumeDeps(
+        client_factory=lambda: httpx.AsyncClient(),
+        load_state=_volume_load_state, save_state=_volume_save_state, creds=creds,
+        backends=lambda name: sorted([b for b in backends if b.get("type") == "runpod"
+            and b.get("enabled", True) and b.get("volume") == name], key=lambda b: b["name"]),
+        alias_needs=service_alias_needs, alias_signature=service_alias_signature,
+        source_index=lan.cached, lan=lan,
+        url_catalog=lambda src: modelsync.url_catalog(_modelsync_catalog(), src, _share_sha_files()),
+        run_fetch=run_fetch, fetch_status=fetch_status, fetch_cancel=fetch_cancel,
+        note_fault=lambda kind, detail: _note_fault(
+            {"name": f"volume:{name}", "type": "runpod"}, "volume", kind, detail),
+        log=logger.info, now=time.time, hf_token=_thunder_hf_token)
+
+
+def _vol_spawn(name: str, what: str, coro) -> asyncio.Task:
+    t = _bg(coro)
+    def done(t):
+        if not t.cancelled() and t.exception() is not None:
+            # Provider exceptions can contain keys or signed URLs.
+            logger.warning(f"[volume {name}] {what}: {type(t.exception()).__name__}")
+    t.add_done_callback(done)
+    _vol_tasks[name] = [x for x in _vol_tasks.get(name, []) if not x.done()] + [t]
+    return t
+
+
+def _vol_run(name: str, c) -> None:
+    async def run():
+        try:
+            await c.resume()
+        except Exception as e:
+            # The loop retries resume with its own backoff; boot must not strand it.
+            logger.warning(f"[volume {name}] resume: {type(e).__name__}")
+        await c.run_forever()
+    _vol_spawn(name, "background loop", run())
+
+
+def sync_volume_controllers() -> None:
+    global runpod_volumes
+    runpod_volumes = _load_runpod_volumes()
+    for name, entry in runpod_volumes.items():
+        try:
+            c = volume_controllers.get(name)
+            if c is None:
+                c = rpvolume.VolumeController(name, entry, _volume_deps(name))
+                volume_controllers[name] = c
+                if _hosts_booted:
+                    _vol_run(name, c)
+            else:
+                c.cfg = entry
+            _vol_warned.discard(name)
+        except Exception as e:
+            logger.warning(f"[volume {name}] not driven: {type(e).__name__}")
+    for name in list(volume_controllers):
+        if name in runpod_volumes:
+            continue
+        c = volume_controllers[name]
+        if c.state.get("fetch_job") or c.state.get("mpu"):
+            if name not in _vol_warned:
+                logger.warning(f"[volume {name}] entry removed with writers pending — controller kept")
+                _vol_warned.add(name)
+            continue
+        volume_controllers.pop(name)
+        for t in _vol_tasks.pop(name, []):
+            t.cancel()
+        if _hosts_booted:
+            _vol_spawn(name, "retire", c.aclose())
+
+
+def volume_names() -> list:
+    return sorted(set(runpod_volumes) | set(volume_controllers))
+
+
+def volume_view(name: str) -> Optional[dict]:
+    c = volume_controllers.get(name)
+    if c is not None:
+        return c.view()
+    entry = runpod_volumes.get(name)
+    return {"name": name, **entry, "phase": "off"} if entry is not None else None
+
+
+def volume_field_refusal(value) -> str:
+    """Refuse a dangling backend reference before the console stores it."""
+    if value == "" or (isinstance(value, str) and value in runpod_volumes):
+        return ""
+    return "unknown RunPod volume"
+
+
+def save_volume(name: str, entry: dict, new: bool) -> str:
+    if not isinstance(name, str) or not rpvolume.NAME_RE.fullmatch(name):
+        return "volume name must match [a-z0-9-]{1,40}"
+    entries = _load_runpod_volumes()
+    if new and (name in entries or name in volume_controllers):
+        return "volume name is already taken"
+    if not new and name not in entries:
+        return "unknown RunPod volume"
+    dc = entry.get("datacenter")
+    if dc not in rpvolume.DCS:
+        return "unknown datacenter"
+    c = volume_controllers.get(name)
+    state = c.state if c else (_volume_load_state(name) or {})
+    if state.get("id") and dc != state.get("dc"):
+        return "a created volume cannot change datacenter"
+    size, maximum = entry.get("size_gb"), entry.get("max_size_gb")
+    if (type(size) is not int or type(maximum) is not int
+            or not 10 <= size <= maximum <= 4000):
+        return "sizes must satisfy 10 <= size_gb <= max_size_gb <= 4000"
+    if state.get("size_gb") and size < state["size_gb"]:
+        return "a volume only grows"
+    if not store.is_active():
+        return "the store is not active — not saved"
+    entries[name] = {"datacenter": dc, "size_gb": size, "max_size_gb": maximum}
+    store.set_settings({"runpod_volumes": entries})
+    sync_volume_controllers()
+    return ""
+
+
+async def volume_sync_now(name: str, recreate: bool = False) -> str:
+    c = volume_controllers.get(name)
+    if c is None:
+        return "unknown RunPod volume"
+    c.sync_now(recreate=recreate)
+    return ""
+
+
+async def volume_delete_unknown(name: str, paths) -> str:
+    c = volume_controllers.get(name)
+    if c is None:
+        return "unknown RunPod volume"
+    try:
+        await c.delete_unknown(paths)
+        return ""
+    except Exception as e:
+        return f"volume delete failed ({type(e).__name__})"
+
+
+async def delete_volume(name: str) -> str:
+    c = volume_controllers.get(name)
+    if c is None:
+        return "unknown RunPod volume"
+    # Disabled references also keep the volume: enabling them later must be safe.
+    if any(b.get("type") == "runpod" and b.get("volume") == name for b in backends):
+        return "Volume is referenced by a RunPod backend"
+    if c.state.get("fetch_job") or c.state.get("mpu"):
+        return "Volume has transfers pending"
+    if not c.state.get("id"):
+        # never created at RunPod (no id saved, so nothing is billed): only the config
+        # entry goes — a fresh-list lookup would never find it and refuse for good. A
+        # create whose answer was lost is still adopted by name if the entry comes back.
+        entries = _load_runpod_volumes()
+        entries.pop(name, None)
+        store.set_settings({"runpod_volumes": entries})
+        sync_volume_controllers()
+        return ""
+    try:
+        why = await c.delete_volume()
+    except Exception as e:
+        return f"volume delete failed ({type(e).__name__})"
+    if why:
+        return why
+    entries = _load_runpod_volumes()
+    entries.pop(name, None)
+    store.set_settings({"runpod_volumes": entries})
+    sync_volume_controllers()
+    return ""
+
+
 # ── provider API tokens (one per provider kind, `store.set_provider_token`) ─────────
 
 _PROVIDER_KIND_RE = re.compile(r"[a-z0-9_-]{1,40}")
@@ -8384,9 +8641,8 @@ def provider_token(kind: str) -> str:
 
 
 def provider_tokens_info() -> dict:
-    """{kind: token set?} for every provider in `hostapi.PROVIDERS` — the console's
-    token rows. Never the value."""
-    return {k: bool(provider_token(k)) for k in hostapi.PROVIDERS}
+    """Provider and volume credential presence for the console; never their values."""
+    return {k: bool(provider_token(k)) for k in tuple(hostapi.PROVIDERS) + runpod_secret_kinds}
 
 
 def save_provider_token(kind: str, token: str) -> str:
@@ -8394,9 +8650,12 @@ def save_provider_token(kind: str, token: str) -> str:
     (encrypted at rest). Every controller of that provider gets it at once (a sync, no
     restart). → the refusal, "" = saved; a refusal never repeats the value."""
     kind, token = str(kind or ""), str(token or "")
-    if hostapi.provider(kind) is None:
+    if hostapi.provider(kind) is None and kind not in _SECRET_KINDS:
         return (f"unknown provider {kind!r} (known: "
                 + ", ".join(sorted(hostapi.PROVIDERS)) + ")")
+    if kind == "runpod_s3" and token and (token.count(":") != 1
+            or not all(token.split(":")) or any(ch.isspace() for ch in token)):
+        return "expected <access key id>:<secret>"
     # it goes into an Authorization header: a space, a line break or a control
     # character would make every provider call fail — refused here, out loud
     if token and (len(token) > _PROVIDER_TOKEN_MAX
@@ -8828,4 +9087,7 @@ async def health(verbose: bool = True) -> dict:
         "alias_model_conflicts": [c for c in alias_model_conflicts() if c["shadowed"]],
         # Managed hosts (hostctl.py): lifecycle and each attached service's status.
         "hosts_managed": hosts_managed_info(),
+        **({"runpod_volumes": {name: {k: c.view().get(k) for k in
+            ("id", "size_gb", "phase")} | {"ready_aliases": sorted(c.ready_aliases)}
+            for name, c in volume_controllers.items()}} if verbose else {}),
     }

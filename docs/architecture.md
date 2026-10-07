@@ -2979,3 +2979,22 @@ answer was lost (no id saved) holds its paths `GHOST_HOLD_S` — the job may run
 and two writers on one `.gw-part` corrupt it. `run_forever` catches every exception
 (a FAILED job's `RuntimeError` included) into the backoff: a loop that died there left
 the volume unsynced for good. The change signature (store reads) runs in a thread.
+
+### RunPod volume gateway wiring
+
+`main.sync_volume_controllers` follows the bulk store setting `runpod_volumes`,
+keeping the last good configuration on read errors and retaining removed controllers
+while fetch or multipart records remain. State saves read-modify-write
+`runpod_volume_state` on the event loop without an await; neither bulk setting enters
+`get_settings()`. A volume edit replaces the controller config so growth ceilings
+change immediately. Boot resumes before starting each loop; transient resume errors
+reach the loop's recovery/backoff, and shutdown closes controllers beside managed hosts.
+
+`modelsync_gate` refuses a RunPod candidate with a volume until its cached alias plan
+is ready; blank volume retains M1 behavior. RunPod ids participate in the ComfyUI alias
+needs/signature helpers. Fetch/status/cancel resolve the live backend adapter each time,
+using its current max wait. Account credentials are an injected adapter fallback; S3
+credentials remain encrypted provider tokens with exactly one colon and no whitespace.
+Volume faults use the pseudo RunPod backend `volume:<name>` and source `volume`.
+`volume_field_refusal` is the admin save seam; deletion also refuses disabled backend
+references and pending writers. Tests: `tests/test_rpvolume_main.py`.

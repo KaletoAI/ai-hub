@@ -750,16 +750,18 @@ class ProviderTokens(_StoreCase):
         store.set_managed_host("vm1", _host())
         store.set_managed_host("vm2", _host())
         main.sync_host_controllers()
-        self.assertIn("unknown provider", main.save_provider_token("runpod", "x"))
+        self.assertIn("unknown provider", main.save_provider_token("unknown", "x"))
         self.assertIn("not saved", main.save_provider_token("thunder", "has space"))
         self.assertEqual(store.get_provider_token("thunder"), TOKEN)   # nothing written
         self.assertEqual(main.save_provider_token("thunder", "tok-2"), "")
         for n in ("vm1", "vm2"):
             self.assertEqual(main.host_controllers[n].host["api_key"], "tok-2")
-        self.assertEqual(main.provider_tokens_info(), {"thunder": True})
+        self.assertEqual(main.provider_tokens_info(),
+                         {"thunder": True, "runpod": False, "runpod_s3": False})
         self.assertEqual(main.save_provider_token("thunder", ""), "")
         self.assertEqual(main.host_controllers["vm1"].host["api_key"], "")
-        self.assertEqual(main.provider_tokens_info(), {"thunder": False})
+        self.assertEqual(main.provider_tokens_info(),
+                         {"thunder": False, "runpod": False, "runpod_s3": False})
         self.assertFalse(main.host_view("vm1")["api_key_set"])
 
     def test_view_and_health_never_carry_the_token(self):
