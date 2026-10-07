@@ -1471,6 +1471,17 @@ Namespace-tolerant XML readers retain ListV2 continuation tokens and multipart
 upload ids. `tests/test_s3vol.py` pins AWS signatures (including form POST and a
 Unicode model key) and the readers: signing slips otherwise look like rejected
 credentials, and a lost continuation token makes files past 1000 disappear.
+The HTTP half borrows an injected async client and signs the payload hash for every
+request. `S3Volume` follows all ListV2 pages, treats missing reads as `None` and
+missing deletes/aborts as done, and exposes multipart upload ids and ETags for
+controller recovery. Completion gets a 900-second timeout (other requests 60 seconds)
+and error XML is checked even under HTTP 200: otherwise an uncommitted upload looks
+successful. Authentication failures have a distinct `S3AuthError` so the controller
+can pause until credentials change. Single puts and multipart parts reject buffers
+of 500,000,000 bytes or more before sending, since RunPod requires less than 500 MB.
+The HTTP tests pin three-page listings, object and multipart round trips, XML-escaped
+ETags, authentication/error responses, cleanup, timeouts, size boundaries and secrets
+staying out of request URLs.
 
 ### `modelsync.py`
 
