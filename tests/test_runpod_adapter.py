@@ -1145,5 +1145,84 @@ class KeyStaysAtRunPod(unittest.TestCase):
             self.assertEqual(rp.paths, [], bad)
 
 
+class VolumeOps(unittest.TestCase):
+    """Volume writers must be recoverable before polling, and account credentials
+    must stay on RunPod even when a backend has no key of its own."""
+
+    def test_run_op_reports_id_before_polling(self):
+        events = []
+        output = {"results": [{"path": "models/a", "ok": True}]}
+        rp = _RunPod([{"status": "IN_PROGRESS"},
+                      {"status": "COMPLETED", "output": output, "executionTime": 12}])
+        handle = rp.handler
+
+        def handler(request):
+            if request.url.path.endswith("/run"):
+                rp.runs.append(json.loads(request.read()))
+                return httpx.Response(200, json={"id": "j1"})
+            if "/status/" in request.url.path:
+                events.append("poll")
+            return handle(request)
+        rp.handler = handler
+        payload = {"op": "fetch", "items": []}
+        result = _run(rp, lambda: _adapter().run_op(payload, 3, lambda jid: events.append(jid)))
+        self.assertEqual(events, ["j1", "poll", "poll"])
+        self.assertEqual(result["output"], output)
+        self.assertEqual(result["executionTime"], 12)
+        self.assertEqual(rp.runs, [{"input": payload,
+                                   "policy": {"executionTimeout": 3000, "ttl": 3050}}])
+
+    def test_account_key_fallback(self):
+        for key, want in (("", "acct"), ("backend", "backend")):
+            rp = _RunPod([DONE])
+            headers = []
+            handle = rp.handler
+
+            def handler(request):
+                headers.append(request.headers.get("Authorization"))
+                return handle(request)
+            rp.handler = handler
+            ad = _adapter(api_key=key)
+            ad.ctx = _ctx(runpod_account_key=lambda: "acct")
+            _run(rp, lambda: ad.run_op({"op": "link", "links": []}, 2, lambda jid: None))
+            self.assertEqual(headers, [f"Bearer {want}"] * 2)
+
+    def test_job_status_404_is_none(self):
+        self.assertIsNone(_run(_RunPod([404]), lambda: _adapter().job_status("rp1")))
+
+    def test_job_status_returns_status_and_raises_errors(self):
+        self.assertEqual(_run(_RunPod([DONE]), lambda: _adapter().job_status("rp1")),
+                         {"id": "rp1", **DONE})
+        with self.assertRaises(httpx.HTTPStatusError):
+            _run(_RunPod([503]), lambda: _adapter().job_status("rp1"))
+        rp = _RunPod([DONE])
+        rp.handler = lambda request: (_ for _ in ()).throw(httpx.ConnectError("offline"))
+        with self.assertRaises(httpx.ConnectError):
+            _run(rp, lambda: _adapter().job_status("rp1"))
+
+    def test_on_id_failure_cancels_before_reraising(self):
+        rp = _RunPod([DONE])
+        boom = RuntimeError("state save failed")
+
+        def on_id(jid):
+            raise boom
+        with self.assertRaises(RuntimeError) as cm:
+            _run(rp, lambda: _adapter().run_op({"op": "fetch", "items": []}, 2, on_id))
+        self.assertIs(cm.exception, boom)
+        self.assertEqual(rp.cancels, ["rp1"])
+        self.assertFalse(any("/status/" in p for _, _, p in rp.paths))
+
+    def test_account_key_never_reaches_a_foreign_url(self):
+        for url in KeyStaysAtRunPod.BAD:
+            rp = _RunPod([DONE])
+            ad = _adapter(url=url, api_key="")
+            ad.ctx = _ctx(runpod_account_key=lambda: "acct")
+            with self.assertRaises(RuntimeError):
+                _run(rp, lambda: ad.run_op({"op": "info"}, 2, lambda jid: None))
+            with self.assertRaises(RuntimeError):
+                _run(rp, lambda: ad.job_status("rp1"))
+            self.assertEqual(rp.paths, [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -591,6 +591,8 @@ class AdapterContext:
     # RunPod probe snapshot persistence (store setting `runpod_probe`, per backend name).
     runpod_probe_load: Callable[[str], Optional[dict]] = lambda name: None
     runpod_probe_save: Callable[[str, dict], None] = lambda name, rec: None
+    # Live account key fallback so backends without their own key survive hot reload.
+    runpod_account_key: Callable[[], str] = lambda: ""
 
 
 @asynccontextmanager
@@ -4792,7 +4794,43 @@ class RunpodAdapter(ComfyUIAdapter):
 
     def _headers(self) -> dict:
         key = (self.backend.get("api_key") or "").strip()
+        if not key:
+            try:
+                key = str(self.ctx.runpod_account_key() or "").strip()
+            except Exception:
+                key = ""
         return {"Authorization": f"Bearer {key}"} if key else {}
+
+    async def run_op(self, payload: dict, max_wait: float, on_id: Callable[[str], None]) -> dict:
+        """One non-generation job (`op: fetch|link|info`) — the volume sync's. The id goes
+        to `on_id` before the first poll: a restart must find a job that may still write."""
+        b = self.backend
+        url = b["url"].rstrip("/")
+        _rp_check_url(url)
+        req = NormalizedRequest(alias="(volume sync)")
+        raw = json.dumps({"input": payload,
+                          "policy": {"executionTimeout": int(max_wait * 1000),
+                                     "ttl": int((max_wait + float(b.get("queue_max_s", 300))) * 1000)}}
+                         ).encode()
+        async with _pooled_client(self.ctx) as c:
+            rp_id = await self._submit(c, url, raw, req)
+            try:
+                on_id(rp_id)
+            except BaseException:
+                await self._cancel_rp(c, url, rp_id)
+                raise
+            return await self._poll_rp(c, url, rp_id, req, float(b.get("poll_interval", 2.0)), max_wait)
+
+    async def job_status(self, rp_id: str) -> Optional[dict]:
+        """One status read for restart recovery; a missing job no longer holds a writer."""
+        url = self.backend["url"].rstrip("/")
+        _rp_check_url(url)
+        async with _pooled_client(self.ctx) as c:
+            r = await c.get(f"{url}/status/{rp_id}", headers=self._headers(), timeout=10.0)
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return _rp_json(r)
 
     def _new_io(self, req: NormalizedRequest) -> GenIO:
         return RunpodIO(self)

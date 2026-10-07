@@ -285,6 +285,8 @@ output.
 
 ### RunPod Serverless (`RunpodAdapter`)
 
+`run_op` persists the volume writer job id through `on_id` before polling (cancels if saving fails); `job_status` supports restart recovery, and an injected live account key backs a missing backend key, with the RunPod URL guard before requests (`tests/test_runpod_adapter.py`, `VolumeOps`).
+
 `type: runpod` (subclass of `ComfyUIAdapter`, `bills = True`, `serves_generation`) runs
 the alias's ComfyUI workflow on a RunPod Serverless endpoint. The build is ComfyUI's
 (`_build_prompt` through `RunpodIO`), so mapping, pins, LoRA cascade, bypass and prune
