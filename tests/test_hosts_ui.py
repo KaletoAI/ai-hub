@@ -2424,7 +2424,7 @@ class ProviderTokenUI(Actions):
                                      r'autocomplete="new-password"')
 
     def test_refusals_are_400_and_never_echo_the_value(self):
-        r = self.post(400, provider="runpod", api_key="rp-SECRET")
+        r = self.post(400, provider="unknown", api_key="rp-SECRET")
         self.assertIn("unknown provider", r.text)
         self.assertNotIn("rp-SECRET", r.text)
         r = self.post(400, provider="thunder", api_key="th BAD SECRET")

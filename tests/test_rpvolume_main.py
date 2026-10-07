@@ -42,7 +42,7 @@ class VolumeMain(unittest.TestCase):
         self.assertIsNone(self.m.modelsync_gate(dict(type='runpod'), 'a'))
 
     def test_save_volume_refusals(self):
-        """Invalid edits cannot change DC or shrink a billed volume."""
+        """Invalid edits cannot change DC or lower the ceiling below the billed size."""
         m = self.m
         self.assertTrue(m.save_volume('BAD', self.cfg, True))
         self.assertEqual(m.save_volume('models', self.cfg, True), '')
@@ -50,11 +50,15 @@ class VolumeMain(unittest.TestCase):
         c = m.volume_controllers['models']
         c.state.update(id='v1', size_gb=70)
         self.assertTrue(m.save_volume('models', dict(self.cfg, datacenter='US-CA-2'), False))
-        self.assertEqual(m.save_volume('models', self.cfg, False), 'a volume only grows')
+        # created and grown to 70: the start size (50) is no shrink — an edit of the
+        # ceiling must still save (the browser check found every edit refused)
+        self.assertEqual(m.save_volume('models', self.cfg, False), '')
+        self.assertIn('only grows', m.save_volume('models', dict(self.cfg, max_size_gb=60), False))
         self.assertTrue(m.save_volume('models', dict(self.cfg, max_size_gb=20), False))
         entry = dict(self.cfg, size_gb=70, max_size_gb=300)
         self.assertEqual(m.save_volume('models', entry, False), '')
-        self.assertEqual(c.cfg, entry)
+        # the start size of a created volume is kept; the new ceiling applies at once
+        self.assertEqual(c.cfg, dict(self.cfg, max_size_gb=300))
 
     def test_runpod_s3_secret_format(self):
         """Malformed S3 credentials are refused without leaking their value."""

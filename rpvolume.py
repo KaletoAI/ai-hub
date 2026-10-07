@@ -461,8 +461,9 @@ class VolumeController:
             job["items"] = [{k: item[k] for k in ("path", "size") if k in item}
                             for item in self.state["fetch_job"].get("items", [])]
         return {"name": self.name, "dc": self.cfg["datacenter"], "id": self.state["id"],
-                "size_gb": size, "max_size_gb": self.cfg["max_size_gb"],
-                "used_bytes": self._used_bytes(),
+                "size_gb": size, "start_size_gb": self.cfg["size_gb"],
+                "max_size_gb": self.cfg["max_size_gb"],
+                "used_bytes": self._used_bytes(), "missing": self.state["missing"],
                 "phase": ("off" if not self.state["id"] else
                           "syncing" if self.plan is None or self.plan["fetch"] or self.transfers
                           else "ready"),

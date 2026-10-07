@@ -36,6 +36,7 @@ import hostapi
 import jobs
 import scheduler
 import reasoning
+import rpvolume
 import services
 import stats
 import store
@@ -211,6 +212,14 @@ _lora_refresh_all: Callable = None
 _host_names: Callable[[], list] = lambda: []
 _host_view: Callable[[str], Optional[dict]] = lambda name: None
 _host_action: Callable = None
+# Volume views are cached; rendering must never make a provider request.
+_volume_names: Callable[[], list] = lambda: []
+_volume_view: Callable = lambda name: None
+_save_volume: Callable = None
+_delete_volume: Callable = None
+_volume_sync_now: Callable = None
+_volume_delete_unknown: Callable = None
+_volume_field_refusal: Callable = lambda value: ""
 _save_managed_host: Callable = None                 # (name, entry, new) → refusal
 # (name, type, prev (name, type) of a rename | None) → the tunnel's local port of a
 # backend on a managed host (main.assign_local_port; stable over saves and renames).
@@ -978,6 +987,7 @@ def _field(label: str, control: str, short: bool = False, wide: bool = False,
 _POST_ACTIONS = frozenset((
     "/ui/backends/delete", "/ui/backends/drain", "/ui/backends/undrain",
     "/ui/backends/restart", "/ui/backends/enable", "/ui/backends/runpod-probe",
+    "/ui/volumes/save", "/ui/volumes/sync", "/ui/volumes/delete-unknown", "/ui/volumes/delete",
     # managed hosts (Ruling M1: one prefix, the host as field `host`, a service as `bid`)
     "/ui/hosts/managed/save", "/ui/hosts/managed/delete",
     "/ui/hosts/managed/start", "/ui/hosts/managed/stop", "/ui/hosts/managed/forget",
@@ -1891,6 +1901,9 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
     src = b or ({"local": prefill.get("type", "openai") == "openai", **prefill} if prefill else {})
     g = lambda k, d="": str(src.get(k) if src.get(k) is not None else d)
     gb = lambda k: bool(src.get(k))
+    vnames = set(_volume_names())
+    if g("volume"):
+        vnames.add(g("volume"))         # a refused unknown selection stays visible
     # orig_id/err/raw: a refused Save shown again — `b` then holds what was typed,
     # `orig_id` the identity it was editing ("" = a new backend), `raw` the posted form.
     oid = (_bid(b) if b else "") if orig_id is None else orig_id
@@ -2144,6 +2157,9 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
             # name (max_wait / poll_interval) — one form may carry each name only once.
             + _btype_block("runpod", cur_type,
                            '<div class="grouphdr">RunPod Serverless</div>'
+                           + _field("volume", _select("volume", [("", "(none)")] +
+                                    [(n, n) for n in sorted(vnames)], g("volume")),
+                                    hint="Models sync to this volume before aliases can run. Blank = ungated.")
                            + _field("max wait s", _inp("rp_max_wait", g("max_wait") if cur_type == "runpod" else "",
                                     placeholder="600", typ="number"))
                            + _field("poll interval s", _inp("rp_poll_interval",
@@ -2495,7 +2511,8 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
     items = items or "<p class='muted'>No backends.</p>"
     scan_st = _scan_status()
     tviews = _host_views()
-    if any(isinstance(v.get("plan"), dict) for _n, v in tviews):
+    vviews = [(n, dict(v)) for n in _volume_names() if (v := _volume_view(n)) is not None]
+    if any(isinstance(v.get("plan"), dict) for _n, v in tviews + vviews):
         # the card's source badges: main's source kinds (memoised there; the first
         # build is a pass over the share listing — a worker thread, never the loop)
         try:
@@ -2503,7 +2520,7 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
         except Exception as e:                          # noqa: BLE001 — badges, not the tab
             logger.warning(f"ui: model source kinds unavailable: {type(e).__name__}: {e}")
             kinds = {}
-        for _n, v in tviews:
+        for _n, v in tviews + vviews:
             v["_src_kinds"] = kinds if isinstance(kinds, dict) else {}
     # what a console action answered (the host buttons redirect here with it) — a
     # refusal raised before the op's first await only ever shows up here
@@ -2519,6 +2536,7 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
                  + f"<p class='hint'>Edit a backend to manage it here (editing a config one creates an "
                  f"editable copy that overrides it).</p>{items}"
                  + _managed_hosts_section(tviews)
+                 + _runpod_volumes_section(vviews)
                  + _hosts_panel(binfo, "" if qp.get("new") else qp.get("host", ""), tviews)
                  + _scan_panel(scan_st))
     hosts = sorted({b["host"] for b in binfo if b.get("host")})
@@ -2531,6 +2549,15 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
         if not editing and prefill is None:
             prefill = _host_prefill(qp, binfo)
         detail = _backend_form(editing, hosts, prefill=prefill)
+    elif qp.get("vol_new"):
+        detail = _volume_form({"new": True})
+    elif qp.get("vol_edit"):
+        vn = qp.get("vol_edit", "")
+        vv = _volume_view(vn)
+        # the form edits the START size (the view's size_gb is RunPod's, 0 before the create)
+        detail = (_volume_form(dict(vv, name=vn, new=False, current_gb=vv.get("size_gb"),
+                                    size_gb=vv.get("start_size_gb", vv.get("size_gb"))))
+                  if vv is not None else _form_err("unknown RunPod volume"))
     elif qp.get("mhost_new"):
         detail = _managed_host_form(new=True, provider=qp.get("provider", ""))
     elif qp.get("mhost"):
@@ -2548,8 +2575,12 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
     host_busy = any(v.get("phase") != "off" or v.get("op") for _n, v in tviews)
     probing = any(((b.get("runpod") or {}).get("probe") or {}).get("state") == "running"
                   for b in binfo)
+    # live while a volume is being created or synced (incl. `off`: the first create runs
+    # in that phase); a ready volume's card has nothing that moves on its own
+    vol_busy = any(v.get("phase") != "ready" or v.get("transfers") or v.get("fetch_job")
+                   for _n, v in vviews)
     live = 4 if draining_now else (2 if scan_st.get("running") else
-                                   (3 if (host_busy or probing) else None))
+                                   (3 if (host_busy or probing or vol_busy) else None))
     return HTMLResponse(_page("Backends", body, "backends", refresh=None if static else live),
                         status_code=status)
 
@@ -3088,6 +3119,13 @@ async def backend_save(request: Request):
     # would otherwise go DOWN with a less helpful text.
     if new_type == "runpod":
         b["paid"] = True
+        volume = (f.get("volume") or "").strip()
+        b["volume"] = volume
+        refusal = _volume_field_refusal(volume)
+        if refusal:
+            problems.append(refusal)
+        if not volume:
+            b.pop("volume", None)
         if url and not adapters.runpod_endpoint_id(url):
             problems.append("url must be https://api.runpod.ai/v2/<endpoint id>")
         for src, dst, cast, blank in (("rp_max_wait", "max_wait", int, "600 s"),
@@ -3106,6 +3144,7 @@ async def backend_save(request: Request):
                   "stuck_after_s"):
             b.pop(k, None)
     else:
+        b.pop("volume", None)
         b.pop("queue_max_s", None)
         b.pop("cost_per_hour", None)
     # Anthropic: how the credential is sent, plus the fallback model list used when
@@ -3495,7 +3534,7 @@ def _sync_files_row(alias: str, files, kinds=None, fallback=None) -> str:
             "</details></td></tr>")
 
 
-def _host_sync(k: str, name: str, v: dict) -> str:
+def _host_sync(k: str, name: str, v: dict, base="/ui/hosts/managed", qkey="host") -> str:
     """Model sync of one managed host's ComfyUI: per alias need/have/missing and status, the
     transfers, what the stop will delete, the held and the unknown files."""
     p = v.get("plan") if isinstance(v.get("plan"), dict) else None
@@ -3507,7 +3546,9 @@ def _host_sync(k: str, name: str, v: dict) -> str:
     if p is None:
         if running:
             out.append(f'<p class="hint" data-k="{_esc(k)}-noplan">Planning the model sync …</p>')
-        return "".join(out)
+        if qkey == "host":
+            return "".join(out)
+        p = {}
     aliases = p.get("aliases") if isinstance(p.get("aliases"), dict) else {}
     ready = sum(1 for r in aliases.values() if isinstance(r, dict) and r.get("ready"))
     out.append(f'<div class="tfacts" data-k="{_esc(k)}-synctot">models {_gb1(p.get("have_total"))}'
@@ -3542,7 +3583,7 @@ def _host_sync(k: str, name: str, v: dict) -> str:
                 rate = "—"
             eta = _hms(t["eta"]) if t.get("eta") is not None else "—"
             trs += (f'<tr data-k="tx-{_esc(t["file"])}"><td><code>{_esc(t["file"])}</code></td>'
-                    f"<td>{_esc(t.get('source') or '')}</td><td>{prog}</td><td>{rate}</td>"
+                    f"<td>{_esc(t.get('source') or t.get('via') or '')}</td><td>{prog}</td><td>{rate}</td>"
                     f"<td>{eta}</td></tr>")
         out.append(f'<table data-k="{_esc(k)}-tx"><tr><th>transfer</th><th>source</th>'
                    f"<th>progress</th><th>rate</th><th>ETA</th></tr>{trs}</table>")
@@ -3564,7 +3605,7 @@ def _host_sync(k: str, name: str, v: dict) -> str:
         pr = "".join(f'<tr data-k="p-{_esc(x[0])}"><td><code>{_esc(x[0])}</code></td>'
                      f'<td>{f"{_gb1(x[1])} GB" if len(x) > 1 and x[1] is not None else "?"}</td></tr>'
                      for x in prune)
-        out.append(f'<details data-k="{_esc(k)}-prune"><summary>deleted at stop: {len(prune)} '
+        out.append(f'<details data-k="{_esc(k)}-prune"><summary>{"deleted at stop" if qkey == "host" else "deleted when space is needed"}: {len(prune)} '
                    f"file{'s' if len(prune) != 1 else ''}, {_gb1(pb)} GB"
                    + (f" (+ {unsized} of unknown size)" if unsized else "")
                    + " — synced by us, no alias needs them any more</summary><table><tr><th>file"
@@ -3583,10 +3624,10 @@ def _host_sync(k: str, name: str, v: dict) -> str:
         # from `data-confirm-sum` for the boxes actually ticked at click time
         confirm = f"Delete {n} unknown file{'s' if n != 1 else ''} ({_gb1(ub)} GB) {what}"
         out.append(
-            f'<details data-k="{_esc(k)}-unknown-sync"><summary>unknown files on the instance: {n}, '
+            f'<details data-k="{_esc(k)}-unknown-sync"><summary>unknown files on the {"instance" if qkey == "host" else "volume"}: {n}, '
             f"{_gb1(ub)} GB (never deleted automatically)</summary>"
-            '<form method="post" action="/ui/hosts/managed/delete-unknown">'
-            f'<input type="hidden" name="host" value="{_esc(name)}">'
+            f'<form method="post" action="{_esc(base)}/delete-unknown">'
+            f'<input type="hidden" name="{_esc(qkey)}" value="{_esc(name)}">'
             f"<table><tr><th>file</th><th>size</th></tr>{ur}</table>"
             f'<button type="submit" class="btn danger sm" '
             f'data-confirm="{_esc(confirm)}" '
@@ -4267,6 +4308,148 @@ _MHOST_GUIDE = ("<a href='/ui/server?sub=keys'>1. Enter the provider's API token
 # the section only points there. A constant, rendered raw (its only markup is the link).
 _MHOST_MODELS = ('<p class="muted" data-k="hosts-models">LAN model source and model '
                  'catalog: <a href="/ui/server?sub=models">Server → Models</a></p>')
+
+
+def _runpod_volumes_section(views: list) -> str:
+    """Keep idle volumes visible because their provisioned space still bills."""
+    return ('<div class="grouphdr">RunPod volumes</div>'
+            '<p class="hint">AI-Hub creates and grows network volumes, then syncs the models their backends need.</p>'
+            + _btn("+ Volume", "/ui/backends?vol_new=1")
+            + "".join(_volume_card(n, v) for n, v in views))
+
+
+def _volume_card(name: str, v: dict) -> str:
+    """Show billing and the missing prerequisites before offering volume actions."""
+    k = "volume-" + name
+    size = v.get("size_gb", 0) or 0
+    # before the create RunPod bills nothing: say so instead of "0 GB · $0.00/month"
+    sizes = (f'{_esc(size)} GB / {_esc(v.get("max_size_gb", "?"))} GB limit · '
+             f'{_gb1(v.get("used_bytes"))} GB used · '
+             f'{_money(v.get("cost_month_usd", size * .07))}/month · ' if v.get("id") else
+             f'not created yet (start size {_esc(v.get("start_size_gb", v.get("size_gb", "?")))} GB, '
+             f'limit {_esc(v.get("max_size_gb", "?"))} GB) · ')
+    out = (f'<div class="tblock" data-k="{_esc(k)}"><h3>{_esc(name)} '
+           f'{_badge(v.get("phase") or "off", "muted")}</h3>'
+           f'<p class="tfacts">RunPod id: {_esc(v.get("id") or "—")} · '
+           f'DC: {_esc(v.get("dc") or v.get("datacenter") or "—")} · {sizes}'
+           f'sync cost {_money(v.get("sync_cost_usd", 0))}</p>')
+    if v.get("backends"):
+        out += (f'<p class="tfacts" data-k="{_esc(k)}-backends">backends: '
+                + ", ".join(f'<a href="/ui/backends?edit={_q("runpod:" + b)}">{_esc(b)}</a>'
+                            for b in v["backends"]) + "</p>")
+    for i, why in enumerate(v.get("problems") or []):
+        out += f'<p class="warn" data-k="{_esc(k)}-problem-{i}">{_esc(why)}</p>'
+    for path, why in (v.get("blocked") or {}).items():
+        out += f'<p class="bad" data-k="{_esc(k)}-blocked-{_esc(path)}">{_esc(path)}: {_esc(why)}</p>'
+    if isinstance(v.get("plan"), dict) and v["plan"] or v.get("transfers") or v.get("sync_error"):
+        out += _host_sync(k, name, v, base="/ui/volumes", qkey="vol")
+    job = v.get("fetch_job")
+    if job:
+        out += f'<p data-k="{_esc(k)}-job">Fetch job: {_esc(job.get("id", ""))}</p>'
+    gone = v.get("missing", 0) >= 2
+    if gone:
+        out += '<p class="bad">deleted outside AI-Hub?</p>'
+    confirm = f"Re-create {name}? A NEW, EMPTY volume of {size} GB will be billed." if gone else ""
+    out += ('<div class="tacts">'
+            + _btn("Edit", "/ui/backends?vol_edit=" + _q(name), "secondary", sm=True)
+            + _btn("Re-create volume" if gone else "Sync now",
+                   "/ui/volumes/sync?vol=" + _q(name) + ("&recreate=1" if gone else ""),
+                   confirm=confirm, sm=True))
+    if not v.get("backends"):
+        out += (f'<form method="post" action="/ui/volumes/delete?vol={_q(name)}" data-guard>'
+                + _field("type volume name to delete", _inp("confirm_name", id=k + "-confirm"),
+                         hint="Irreversible: every file on the volume is deleted.")
+                + _btn("Delete volume", kind="danger", submit=True, sm=True) + '</form>')
+    return out + '</div></div>'
+
+
+def _volume_form(entry: dict, err: str = "") -> str:
+    """Keep invalid text on refusals; a disabled DC also submits its hidden value."""
+    new = bool(entry.get("new", True))
+    name = entry.get("name", "")
+    dc = entry.get("datacenter", entry.get("dc", "EU-RO-1"))
+    locked = not new and bool(entry.get("id"))
+    name_input = _inp("name", name)
+    if not new:
+        name_input = name_input.replace('<input ', '<input readonly ', 1)
+    choices = [(d, d) for d in rpvolume.DCS]
+    if dc not in rpvolume.DCS:
+        choices.append((dc, dc))
+    dc_input = _select("datacenter", choices, dc)
+    size_input = _inp("size_gb", entry.get("size_gb", 50))
+    if locked:
+        dc_input = (dc_input.replace('<select ', '<select disabled ', 1)
+                    + f'<input type="hidden" name="datacenter" value="{_esc(dc)}">')
+        # created: the sync grows it; the start size is kept (main ignores a change)
+        size_input = size_input.replace('<input ', '<input readonly ', 1)
+    return ('<form method="post" action="/ui/volumes/save" data-guard>'
+            + ('<input type="hidden" name="new" value="1">' if new else '')
+            + f'<div class="formbar"><h2>{"New RunPod volume" if new else "RunPod volume"}</h2>'
+            + _btn("Save", submit=True) + _btn("Cancel", "/ui/backends", "secondary") + '</div>'
+            + _form_err(err) + _field("name", name_input)
+            + _field("datacenter", dc_input)
+            + _field("size GB", size_input,
+                     hint=("start size of the create — the sync grows the volume (now "
+                           f"{_esc(entry.get('current_gb', '?'))} GB)" if locked
+                           else "10…4000; volumes only grow."))
+            + _field("max size GB", _inp("max_size_gb", entry.get("max_size_gb", 200)), hint="Required ceiling for automatic growth, up to 4000 GB.")
+            + '</form>')
+
+
+async def volume_save(request: Request):
+    """Validate before storing so a refused save returns the operator's full input."""
+    f = await _form(request)
+    name = (f.get("name") or "").strip()
+    new = bool(f.get("new"))
+    entry = {k: f.get(k, "") for k in ("datacenter", "size_gb", "max_size_gb")}
+    normalized = dict(entry)
+    for k in ("size_gb", "max_size_gb"):
+        try:
+            normalized[k] = int(entry[k])
+        except (TypeError, ValueError):
+            pass                        # main refuses it; typed text stays in the form
+    try:
+        why = str(_save_volume(name, normalized, new) or "") if _save_volume else "volumes cannot be saved here"
+    except Exception as e:                          # noqa: BLE001 — refusal keeps the form
+        why = f"not saved: {type(e).__name__}"
+    if why:
+        shown = dict(_volume_view(name) or {}) if not new else {}
+        shown.update(entry, name=f.get("name", ""), new=new)
+        return await _backends_view(request.query_params, detail=_volume_form(shown, why), status=400)
+    return _hosts_msg(f"RunPod volume {name} saved")
+
+
+async def volume_sync(request: Request):
+    f = await _form(request)
+    name = (f.get("vol") or request.query_params.get("vol") or "").strip()
+    recreate = (f.get("recreate") or request.query_params.get("recreate")) == "1"
+    why = await _volume_sync_now(name, recreate=recreate) if _volume_sync_now else "volume sync unavailable"
+    return _hosts_msg(why or f"RunPod volume {name}: sync requested")
+
+
+async def volume_delete_unknown(request: Request):
+    """The controller checks ticked paths against a fresh plan before deleting."""
+    f = await _form_multi(request)
+    name = ((f.get("vol") or [""])[-1] or request.query_params.get("vol") or "").strip()
+    paths = [p for p in f.get("path") or [] if p]
+    why = (await _volume_delete_unknown(name, paths) if paths and _volume_delete_unknown
+           else "no file ticked or volume sync unavailable")
+    return _hosts_msg(why or f"RunPod volume {name}: unknown files deleted")
+
+
+async def volume_delete(request: Request):
+    """A typed name is required even for a forged POST that bypasses the card."""
+    f = await _form(request)
+    name = (f.get("vol") or request.query_params.get("vol") or "").strip()
+    if not name or f.get("confirm_name") != name:
+        why = "type the volume name to confirm deletion"
+    elif (_volume_view(name) or {}).get("backends"):
+        why = "backends still reference this volume"
+    else:
+        why = await _delete_volume(name) if _delete_volume else "volumes cannot be deleted here"
+    if why:
+        return await _backends_view({}, notice=why, status=400)
+    return _hosts_msg(f"RunPod volume {name} deleted")
 
 
 def _managed_hosts_section(views: list) -> str:
@@ -10215,7 +10398,7 @@ def _srv_key_row(dk: str, action: str, label: str, is_set: bool, name: str, unse
 def _srv_keys_body(st: dict, key_errs: Optional[dict] = None,
                    notice: Optional[str] = None) -> str:
     """Every secret the SERVER holds, one row each: the master API key, one API token per
-    provider in `hostapi.PROVIDERS`, the Hugging Face token. `key_errs` = {row: why a
+    provider in `hostapi.PROVIDERS`, the RunPod keys and the Hugging Face token. `key_errs` = {row: why a
     Save was refused} (never the value); `notice` = a refusal no row owns."""
     key_errs = key_errs or {}
     rows = _srv_key_row(
@@ -10238,6 +10421,21 @@ def _srv_keys_body(st: dict, key_errs: Optional[dict] = None,
             f"{_esc(name)} managed host uses it.",
             hidden=f'<input type="hidden" name="provider" value="{_esc(kind)}">',
             clear="api_key_clear", err=key_errs.get(f"provider-{kind}", ""))
+    rows += _srv_key_row(
+        "srvkey-provider-runpod", "/ui/server/provider-token", "RunPod API key",
+        bool(ptok.get("runpod")), "api_key", "RunPod account API key",
+        "Used for network volumes and RunPod backends with a blank API key.",
+        hidden='<input type="hidden" name="provider" value="runpod">',
+        clear="api_key_clear", err=key_errs.get("provider-runpod", ""))
+    rows += ('<form method="post" action="/ui/server/provider-token" '
+             'data-k="srvkey-provider-runpod_s3" data-guard>'
+             '<input type="hidden" name="provider" value="runpod_s3">'
+             + _form_err(key_errs.get("provider-runpod_s3", ""))
+             + _field("RunPod S3 key", _badge("set", "ok") if ptok.get("runpod_s3") else _badge("not set", "warn"))
+             + _field("access key id", _inp("s3_id", "", typ="password", placeholder="user_…"))
+             + _field("secret", _inp("s3_secret", "", typ="password", placeholder="rps_…"))
+             + _checkbox("api_key_clear", False, "clear", "remove the stored value on Save")
+             + f'<div class="tacts">{_btn("Save", submit=True, sm=True)}</div></form>')
     try:
         hf_set = bool(_hf_token_set())
     except Exception as e:                              # noqa: BLE001 — a row, not the tab
@@ -10762,12 +10960,17 @@ async def server_provider_token(request: Request):
     f = await _form(request)
     kind = (f.get("provider") or "").strip()
     tok = (f.get("api_key") or "").strip()
+    if kind == "runpod_s3":
+        sid, secret = (f.get("s3_id") or "").strip(), (f.get("s3_secret") or "").strip()
+        tok = f"{sid}:{secret}" if sid or secret else ""
+    if kind in ("runpod", "runpod_s3") and f.get("api_key_clear"):
+        tok = ""
     if _save_provider_token is None:
         return _keys_msg("provider tokens cannot be saved here")
-    if kind not in hostapi.PROVIDERS:
+    if kind not in hostapi.PROVIDERS and kind not in ("runpod", "runpod_s3"):
         return _server_view(request, "keys", status=400,
                             notice=f"unknown provider {kind[:40]!r} — token not saved")
-    name = _provider_name(kind)
+    name = {"runpod": "RunPod", "runpod_s3": "RunPod S3"}.get(kind) or _provider_name(kind)
     if not tok and not f.get("api_key_clear"):
         return _keys_msg(f"{name} API token unchanged (blank keeps it)")
     try:
@@ -10917,6 +11120,10 @@ def register(app) -> None:
     app.add_api_route("/ui/backends/restart", backend_restart, methods=["POST"])
     app.add_api_route("/ui/backends/runpod-probe", backend_runpod_probe, methods=["POST"])
     app.add_api_route("/ui/backends/enable", backend_enable, methods=["POST"])
+    app.add_api_route("/ui/volumes/save", volume_save, methods=["POST"])
+    app.add_api_route("/ui/volumes/sync", volume_sync, methods=["POST"])
+    app.add_api_route("/ui/volumes/delete-unknown", volume_delete_unknown, methods=["POST"])
+    app.add_api_route("/ui/volumes/delete", volume_delete, methods=["POST"])
     app.add_api_route("/ui/hosts/managed/save", managed_host_save, methods=["POST"])
     app.add_api_route("/ui/hosts/managed/delete", managed_host_delete, methods=["POST"])
     app.add_api_route("/ui/hosts/managed/start", managed_host_start, methods=["POST"])

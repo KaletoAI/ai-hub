@@ -8531,7 +8531,12 @@ def volume_names() -> list:
 def volume_view(name: str) -> Optional[dict]:
     c = volume_controllers.get(name)
     if c is not None:
-        return c.view()
+        v = c.view()
+        # every referencing backend, disabled ones too (delete_volume refuses on them):
+        # the controller's own list exists only after a plan round with working keys
+        v["backends"] = sorted(b["name"] for b in backends
+                               if b.get("type") == "runpod" and b.get("volume") == name)
+        return v
     entry = runpod_volumes.get(name)
     return {"name": name, **entry, "phase": "off"} if entry is not None else None
 
@@ -8559,11 +8564,17 @@ def save_volume(name: str, entry: dict, new: bool) -> str:
     if state.get("id") and dc != state.get("dc"):
         return "a created volume cannot change datacenter"
     size, maximum = entry.get("size_gb"), entry.get("max_size_gb")
+    if state.get("id") and name in entries:
+        # the start size only applies to the create; afterwards the sync grows the
+        # volume and the console's form shows the size read-only — compared with the
+        # grown size, every later edit (a new ceiling) would be refused as a shrink
+        size = entries[name].get("size_gb", size)
     if (type(size) is not int or type(maximum) is not int
             or not 10 <= size <= maximum <= 4000):
         return "sizes must satisfy 10 <= size_gb <= max_size_gb <= 4000"
-    if state.get("size_gb") and size < state["size_gb"]:
-        return "a volume only grows"
+    if state.get("size_gb") and maximum < state["size_gb"]:
+        return (f"max size is below the volume's current {state['size_gb']} GB "
+                "(a volume only grows)")
     if not store.is_active():
         return "the store is not active — not saved"
     entries[name] = {"datacenter": dc, "size_gb": size, "max_size_gb": maximum}
@@ -8994,6 +9005,9 @@ admin.bind(runpod_probe=runpod_probe, runpod_object_info=runpod_object_info,
            parse_voice_target=parse_voice_target, voice_dir_ok=_voice_dir_ok,
            apply_hosts=apply_hosts,
            # managed hosts: the Backends tab's host cards, form and actions
+           volume_names=volume_names, volume_view=volume_view, save_volume=save_volume,
+           delete_volume=delete_volume, volume_sync_now=volume_sync_now,
+           volume_delete_unknown=volume_delete_unknown, volume_field_refusal=volume_field_refusal,
            host_names=host_names, host_view=host_view, host_action=host_action,
            host_longrun=host_longrun, save_managed_host=save_managed_host,
            assign_local_port=assign_local_port,

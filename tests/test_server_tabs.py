@@ -289,7 +289,7 @@ class ApiKeysTab(_Fixture):
         for secret in ("MASTER-SECRET", "hf_SECRETVAL", "th-SECRET"):
             self.assertNotIn(secret, page)
         pw = re.findall(r'<input type="password"[^>]*>', self.main_of(page))
-        self.assertEqual(len(pw), 2 + len(hostapi.PROVIDERS))
+        self.assertEqual(len(pw), 5 + len(hostapi.PROVIDERS))
         for tag in pw:
             self.assertIn('value=""', tag)
             self.assertIn('autocomplete="new-password"', tag)
@@ -399,7 +399,7 @@ class ApiKeysTab(_Fixture):
                                                     "api_key": "th BAD SECRET"}, status=400)
         self.assertIn("not saved", r.text)
         self.assertNotIn("th BAD SECRET", r.text)
-        r = self.post("/ui/server/provider-token", {"provider": "runpod",
+        r = self.post("/ui/server/provider-token", {"provider": "unknown",
                                                     "api_key": "rp-SECRET"}, status=400)
         self.assertIn("unknown provider", r.text)
         self.assertNotIn("rp-SECRET", r.text)

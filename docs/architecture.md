@@ -627,7 +627,15 @@ carries `api_key_set`; `test_backend_key_field.py`).
 
 The `/ui` console (mounted via `admin.register(app)` +
 `add_api_route`, *not* `include_router` — broken in this starlette build;
-callbacks injected via `admin.bind(...)`). Session-gated by `_ui_guard` once
+callbacks injected via `admin.bind(...)`).
+The Backends tab renders cached RunPod volume views after managed hosts. Volume
+cards share `_host_sync` with a volume action prefix and field name; cleanup stays
+explicit, and prune text reflects space pressure. Volume saves preserve refused
+input, backend saves validate their volume reference before writing, and deletion
+requires the typed name plus no references. RunPod API/S3 secret forms expose only
+presence, with S3 id/secret joined on POST; blank keeps and clear removes.
+`tests/test_rpvolume_ui.py` pins these console contracts, recreation billing confirms,
+and fields rendered in every backend pane state. Session-gated by `_ui_guard` once
 locked. Tabs in `TABS`; a top tab can group child views via `SUBTABS` +
 `_subnav()` (rendered outside `<main>` via `_page(subnav=…)`; `?sub=` on the
 parent route, first child = default —
