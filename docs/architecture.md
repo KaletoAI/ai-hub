@@ -1851,6 +1851,20 @@ exclude lists (`RSYNC_EXCLUDES`/`TAR_EXCLUDES`) — without the latter `rsync --
 wipes the instance key and the LAN pin on every deploy, and would pull a live socket
 (pinned by `test_hostctl.MainWiring.test_deploy_and_gitignore_exclude_keys`).
 
+`rpvolume.py` owns the RunPod network-volume REST lifecycle through injected
+`VolumeDeps`, without importing app state or another controller. `ensure_volume`
+lists before creating and adopts `aihub-<name>` after a lost POST answer; a saved
+id is considered gone only after two successful lists without it, and creation
+then requires an explicit `create=True`. Growth and deletion require a fresh
+record with matching id, name and DC; growth never shrinks or exceeds the config
+ceiling, and deletion refuses referencing backends (checked again after the
+list awaits). Identity/size changes are saved synchronously before client cleanup
+can yield. Growth records old/new GB and monthly cost through the injected
+`note_fault(kind, detail)` seam. `tests/test_rpvolume.py` pins these money and
+ownership guards, persisted defaults, REST list shapes, bounded errors and the
+credential checklist. Transfer planning and routing integration are added by
+later volume-sync tasks.
+
 `ops/runpod/` is the Docker build context of the RunPod Serverless worker (image
 profile: Qwen-Image 2.1), not a script run over ssh: `Dockerfile` (CUDA 13 base; Python,
 torch, torchvision/audio, CUDA tag and the ComfyUI commit are `ARG`s equal to the Thunder
