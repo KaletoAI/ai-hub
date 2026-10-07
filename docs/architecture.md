@@ -475,8 +475,10 @@ file goes alone and its `.gw-part` can resume across jobs. Catalog-only files wi
 unknown size try a capacity-checked Content-Length from a URL HEAD. HEAD failures
 (including 4xx/405) and absent lengths mean unknown size, cached for ten minutes;
 successful sizes are cached by URL until Sync now. An unknown-size item goes alone
-with `size: null`; only its optional hash is checked by the worker, and the S3 HEAD
-size becomes the manifest size. The gateway HF token goes only on this size HEAD to
+with `size: null`; the worker starts from zero and checks the response length and
+optional hash. With neither an announced length nor a hash it refuses publication;
+the verified S3 HEAD size becomes the manifest size. The gateway HF token goes
+only on this size HEAD to
 `huggingface.co`, its subdomains or `hf.co`; httpx strips it on a cross-origin CDN
 redirect. Worker downloads instead use endpoint-env `HF_TOKEN`, never job input.
 
@@ -489,8 +491,14 @@ HEAD before acquiring manifest ownership. Only an explicit per-item `ok: false`
 consumes an attempt. Three item failures or a worker `final:` error record a LAN
 fallback; without a share copy the path is blocked and a fault recorded. Job-level
 failure, missing results or failed S3 verification clears the settled job and backs
-off with a visible problem; it does not sacrifice every URL in a batch. Execution
-cost is `execution_ms / 3.6e6 * cost_per_hour`, accumulated in `sync_cost_usd`.
+off with a visible problem; it does not sacrifice every URL in a batch. A job with
+no item results first salvages each final path through S3 HEAD (expected size, or
+any present size for a size-less item), recording source `url` and an empty hash.
+Consecutive job-level failures persist in `job_failures`; three pause URL jobs
+until Sync now, while LAN streams continue. Per-item results reset the counter.
+The last reason is scrubbed of URLs and credentials and clipped to 200 characters;
+both top-level RunPod errors and poll exceptions retain the worker mount diagnosis.
+Execution cost is `execution_ms / 3.6e6 * cost_per_hour`, accumulated in `sync_cost_usd`.
 
 One LAN stream runs per volume, using the shared LanSource hash slot (transfer hash
 has priority). Files below `PART_SIZE = 128 * 1024 * 1024` use a single put; others
@@ -513,11 +521,18 @@ whenever its final path is held by a fetch, ghost, LAN stream or multipart uploa
 Link jobs wait for their blobs and use the same saved job lifecycle. Worker
 fetch/link ops run before ComfyUI readiness and refuse an unmounted `/runpod-volume`
 with a job-level error before any per-item work. Fetch accepts HTTPS only, resumes
-`.gw-part`, checks size/hash before `os.replace`, and rejects absolute, `..`, NUL,
-over-512-char or out-of-root paths per item. Resolved paths stay within `models/` or
+sized `.gw-part` downloads, checks size/hash before `os.replace`, and rejects
+absolute, `..`, NUL, over-512-char or out-of-root paths per item. Resolved paths stay within `models/` or
 `hf-cache/`; link targets must resolve within `/runpod-volume/hf-cache/`. Worker HF
 credentials are sent only to HF hosts and kept off redirects. `info` reports mounted
-volume bytes.
+volume bytes. Existing final files at the expected size (any size for size-less
+items) return `skipped: true` without downloading or hashing: publication already
+verified them. Every announced Content-Length (200) or Content-Range span (206)
+must match received bytes; short reads retain sized parts but remove size-less
+parts. A wrong range offset or a resumed 416 gets one fresh request from zero;
+a 416 without a prefix is final. Partial bytes count as used space and subtract
+from the same file's remaining growth need in both planning and URL HEAD checks.
+Malformed `runpod_volume_state` refuses console deletion before any mutation.
 
 **Resume and gate.** Boot settles a saved fetch/link job by polling or confirmed
 cancel before another writer, allowing the saved budget (four hours for old records)

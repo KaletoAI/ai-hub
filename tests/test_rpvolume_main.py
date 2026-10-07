@@ -179,6 +179,16 @@ class VolumeMain(unittest.TestCase):
         with patch.object(self.m, 'backends', [dict(type='runpod', volume='models', enabled=False)]):
             self.assertTrue(asyncio.run(self.m.delete_volume('models')))
 
+    def test_delete_refuses_corrupt_state_without_mutation(self):
+        """A malformed setting must produce a console refusal instead of a 500."""
+        self.m.save_volume('models', self.cfg, True)
+        for value in ([], 'broken', 42):
+            store.set_settings({'runpod_volume_state': value})
+            with patch.object(self.m, 'backends', []):
+                self.assertIn('runpod_volume_state', asyncio.run(self.m.delete_volume('models')))
+            self.assertIn('models', self.m.volume_names())
+            self.assertEqual(store.get_setting('runpod_volume_state'), value)
+
     def test_delete_never_created_volume(self):
         """A volume never created at RunPod (no id saved) could not be deleted: the
         fresh-list lookup never finds it, so its entry stayed in the console for good."""

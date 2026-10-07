@@ -153,7 +153,8 @@ class VolumeController:
         return {"id": None, "dc": self.cfg["datacenter"], "size_gb": None,
                 "missing": 0, "fetch_job": None, "mpu": [],
                 "url_fallback": {}, "url_fallback_why": {},
-                "sync_cost_usd": 0.0, "sync_seconds": 0.0, "blocked": {}, "ghost": {}}
+                "sync_cost_usd": 0.0, "sync_seconds": 0.0, "blocked": {}, "ghost": {},
+                "job_failures": 0, "job_failure_reason": ""}
 
     def _save(self):
         self.deps.save_state(self.name, self.state)
@@ -172,7 +173,10 @@ class VolumeController:
             lines.append("S3 key rejected")
         if self._transfer_problem:
             lines.append(self._transfer_problem)
-        if self._fetch_problem:
+        if self.state['job_failures'] >= 3:
+            lines.append('fetch jobs paused after 3 failed jobs (last: ' +
+                         self.state['job_failure_reason'] + ') — Sync now retries')
+        elif self._fetch_problem:
             lines.append(self._fetch_problem)
         if self._problem:
             lines.append(self._problem)
@@ -438,10 +442,14 @@ class VolumeController:
                      f['path'] in self.state['blocked'] for f in row['files'])}
         self.plan, self.ready_aliases = plan, ready
 
+    def _entry_need(self, entry):
+        """A partial already occupies used bytes, so only its remaining bytes need room."""
+        return max(0, (entry['size'] or 0) - self.leftovers.get(entry['path'] + '.gw-part', 0))
+
     def _remaining_need(self, plan):
         """Growth counts only missing transferable bytes in the current destination."""
         entries = {e['path']: e for e in plan['fetch']}
-        return sum(e['size'] or 0 for e in entries.values()
+        return sum(self._entry_need(e) for e in entries.values()
                    if e['source'] != 'link' and e['path'] not in self.state['blocked']
                    and (e['size'] is None or self.dest.get(e['path']) != e['size']))
 
@@ -459,7 +467,7 @@ class VolumeController:
                 if self._backends and modelsync.link_target(e['path'], e['target']) in self.dest:
                     return True
             elif e['path'] in self.urls:
-                if self._backends:
+                if self._backends and self.state['job_failures'] < 3:
                     return True
             elif self.deps.lan and self.deps.lan.usable():
                 return True
@@ -500,7 +508,7 @@ class VolumeController:
                                  key=lambda item: (item[1]["need_bytes"] - item[1]["have_bytes"], item[0])):
             missing = [f for f in row["files"] if not f["present"] and f["path"] not in allocated
                        and f["path"] not in blocked and "link" not in f]
-            amount = sum(f["size"] or 0 for f in missing)
+            amount = sum(self._entry_need(f) for f in missing)
             if amount > available:
                 reason = f"needs {amount / 1e9:.1f} GB, limit {self.cfg['max_size_gb']} GB"
                 for f in missing:
@@ -582,10 +590,7 @@ class VolumeController:
         url = entry.get('url') or self.urls.get(path, {}).get('url')
         self.state['url_fallback'][path] = url
         # Worker error bodies can echo a signed URL or credentials.
-        reason = error
-        for value in (url, *self.deps.creds()):
-            if value:
-                reason = reason.replace(value, '[redacted]')
+        reason = self._scrub_error(error)
         self.state['url_fallback_why'][path] = reason
         if not isinstance(self.deps.source_index().get(path), int):
             self.state['blocked'][path] = reason
@@ -593,15 +598,33 @@ class VolumeController:
         self._save()
         self._sync_requested = True
 
+    def _scrub_error(self, detail):
+        """Provider errors may echo credentials and signed URLs into the console."""
+        detail = str(detail)
+        for value in (*self.deps.creds(), self.deps.hf_token()):
+            if value:
+                detail = detail.replace(value, '[redacted]')
+        return re.sub(r'https?://[^\s]+', '[redacted]', detail)[:200]
+
     def _job_failed(self, status):
-        # Arbitrary provider error bodies can echo signed URLs or secrets. The mount
-        # error is worker-owned text and helps diagnose an unattached endpoint.
         output = status.get('output') or {}
-        mount_error = 'network volume not mounted at /runpod-volume'
-        detail = (mount_error if output.get('error') == mount_error else
-                  str(status.get('status') or 'result not verified'))
-        self._fetch_problem = 'fetch job failed: ' + detail
+        detail = self._scrub_error(status.get('error') or output.get('error') or
+                                  status.get('status') or 'result not verified')
+        self._fetch_problem = ('fetch jobs paused after 3 failed jobs (last: ' + detail +
+                               ') — Sync now retries' if self.state['job_failures'] >= 3 else
+                               'fetch job failed: ' + detail)
         raise RuntimeError(self._fetch_problem)
+
+    def _job_outcome(self, status, results):
+        """Only consecutive job-wide failures should pause paid endpoint work."""
+        output = status.get('output') or {}
+        if results:
+            self.state['job_failures'] = 0
+            self.state['job_failure_reason'] = ''
+        else:
+            self.state['job_failures'] += 1
+            self.state['job_failure_reason'] = self._scrub_error(status.get('error') or
+                output.get('error') or status.get('status') or 'result not verified')
 
     async def _finish_fetch(self, s3, job, status, entries=None):
         output = status.get('output') or {}
@@ -612,6 +635,8 @@ class VolumeController:
             entry = {**item, **by_path.get(item['path'], {})}
             result = results.get(item['path'])
             if result is None:
+                if not results:
+                    await self._record_present(s3, entry, '', 'url')
                 failed = True
             elif result.get('ok') is False:
                 self._attempt_failed(entry, result.get('error') or 'fetch item failed')
@@ -619,6 +644,7 @@ class VolumeController:
                 self.attempts.pop(item['path'], None)
             else:
                 failed = True
+        self._job_outcome(status, results)
         backend = next((b for b in self.deps.backends(self.name)
                         if 'runpod:' + b['name'] == job['bid']), {})
         ms = status.get('executionTime') or 0
@@ -667,7 +693,10 @@ class VolumeController:
                 if not self.state['fetch_job']:
                     self._hold_uncertain(exc, paths, bid, budget_s)
                 elif not isinstance(exc, asyncio.CancelledError):
-                    self._fetch_problem = 'fetch job failed: ' + type(exc).__name__
+                    try:
+                        self._job_failed({'error': str(exc)})
+                    except RuntimeError:
+                        pass
                 raise
             if status.get('status') not in ('COMPLETED', 'FAILED', 'CANCELLED', 'TIMED_OUT'):
                 self._resumed = False
@@ -787,7 +816,10 @@ class VolumeController:
                 if not self.state['fetch_job']:
                     self._hold_uncertain(exc, paths, bid, 600)
                 else:
-                    self._fetch_problem = 'fetch job failed: ' + type(exc).__name__
+                    try:
+                        self._job_failed({'error': str(exc)})
+                    except RuntimeError:
+                        pass
                 raise
             async with self.deps.client_factory() as client:
                 await self._finish_links(self._client_s3(client), self.state['fetch_job'], status, entries)
@@ -809,6 +841,7 @@ class VolumeController:
                                       aliases=e.get('aliases', []), ts=self.deps.now())
         await s3.put(MANIFEST_KEY, json.dumps(man, sort_keys=True).encode())
         self.manifest = man
+        self._job_outcome(status, results)
         backend = next((b for b in self.deps.backends(self.name)
                         if 'runpod:' + b['name'] == job['bid']), {})
         self.state['sync_cost_usd'] += (status.get('executionTime') or 0) / 3.6e6 * float(backend.get('cost_per_hour') or 0)
@@ -890,6 +923,8 @@ class VolumeController:
                         or entry['source'] == 'link'):
                     continue
                 if path in self.urls:
+                    if self.state['job_failures'] >= 3:
+                        continue
                     if not backend:
                         self._transfer_problem = 'needs a RunPod endpoint on this volume'
                         continue
@@ -1025,6 +1060,9 @@ class VolumeController:
         for path, reason in list(self.state['blocked'].items()):
             if path not in held and not self._capacity_reason(reason):
                 self.state['blocked'].pop(path)
+        self.state['job_failures'] = 0
+        self.state['job_failure_reason'] = ''
+        self._fetch_problem = ''
         self._head_sizes.clear()
         self._head_retry_at.clear()
         self._save()

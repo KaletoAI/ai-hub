@@ -321,7 +321,7 @@ class FetchOps(unittest.TestCase):
         def op(req, timeout=None):
             self.seen.append(req)
             r = io.BytesIO(data)
-            r.status, r.headers = status, {}
+            r.status, r.headers = status, ({"Content-Range": "bytes 3-5/6"} if status == 206 else {})
             return r
         return op
 
@@ -387,6 +387,7 @@ class FetchOps(unittest.TestCase):
         """Hash the prefix on 206; a server ignoring Range must not duplicate it."""
         data = b"abcdef"
         for status, body in ((206, b"def"), (200, data)):
+            pathlib.Path(self.root, "models/a").unlink(missing_ok=True)
             with self.subTest(status=status):
                 p = pathlib.Path(self.root, "models/a")
                 p.parent.mkdir(exist_ok=True)
@@ -549,6 +550,115 @@ class FetchOps(unittest.TestCase):
         self.assertFalse(out["results"][0]["ok"])
         self.assertFalse((cache / "sub/a").is_symlink())
 
+
+    def test_published_file_skips_download_and_hash(self):
+        """A timed-out batch must not bill another download of already verified files."""
+        p = pathlib.Path(self.root, 'models/a')
+        p.parent.mkdir()
+        p.write_bytes(b'abc')
+        for size in (3, None):
+            out = handler.run_fetch({'items': [dict(path='models/a', url='https://e/a',
+                size=size, sha256='0' * 64)]}, self.root, opener=self.opener(b'bad'), env={})
+            self.assertTrue(out['results'][0].get('skipped'))
+        self.assertEqual(self.seen, [])
+
+    def test_response_lengths_and_sizeless_restart(self):
+        """Dropped bodies and stale prefixes must never become ready models (repro5)."""
+        import io
+        for size in (None, 1000):
+            with self.subTest(size=size):
+                def short(req, timeout):
+                    r = io.BytesIO(b'x' * 300)
+                    r.status, r.headers = 200, {'Content-Length': '1000'}
+                    return r
+                out = handler.run_fetch({'items': [dict(path='models/a', url='https://e/a', size=size)]},
+                                        self.root, opener=short, env={})
+                self.assertEqual(out['results'][0]['error'], 'short read (300 of 1000 bytes)')
+                self.assertFalse(pathlib.Path(self.root, 'models/a').exists())
+                self.assertEqual(pathlib.Path(self.root, 'models/a.gw-part').exists(), size is not None)
+        def complete(req, timeout):
+            self.assertIsNone(req.get_header('Range'))
+            r = io.BytesIO(b'new')
+            r.status, r.headers = 200, {'Content-Length': '3'}
+            return r
+        out = handler.run_fetch({'items': [dict(path='models/a', url='https://e/a', size=None)]},
+                                self.root, opener=complete, env={})
+        self.assertTrue(out['results'][0]['ok'])
+        self.assertEqual(pathlib.Path(self.root, 'models/a').read_bytes(), b'new')
+
+    def test_sizeless_without_length_or_hash_refuses_publication(self):
+        """An unbounded response cannot establish integrity from EOF alone."""
+        out = handler.run_fetch({'items': [dict(path='models/a', url='https://e/a', size=None)]},
+                                self.root, opener=self.opener(b'abc'), env={})
+        self.assertEqual(out['results'][0]['error'], 'size unknown and no sha256 — not published')
+        self.assertFalse(pathlib.Path(self.root, 'models/a').exists())
+
+    def test_resumed_416_retries_once_without_range(self):
+        """A stale prefix must not permanently give up a working URL."""
+        import urllib.error
+        p = pathlib.Path(self.root, 'models/a.gw-part')
+        p.parent.mkdir()
+        p.write_bytes(b'old')
+        def op(req, timeout):
+            self.seen.append(req)
+            if len(self.seen) == 1:
+                raise urllib.error.HTTPError(req.full_url, 416, 'range', {}, None)
+            self.assertIsNone(req.get_header('Range'))
+            return self.opener(b'abcdef')(req, timeout)
+        out = handler.run_fetch({'items': [dict(path='models/a', url='https://e/a', size=6)]},
+                                self.root, opener=op, env={})
+        self.assertTrue(out['results'][0]['ok'], out)
+
+    def test_sizeless_cleanup_preserves_refused_symlink_target(self):
+        """Error cleanup must obey the same path fence as publication."""
+        outside = pathlib.Path(self.root, 'outside')
+        outside.mkdir()
+        part = outside / 'a.gw-part'
+        part.write_bytes(b'keep')
+        pathlib.Path(self.root, 'models').symlink_to(outside)
+        out = handler.run_fetch({'items': [dict(path='models/a', url='https://e/a', size=None)]},
+                                self.root, opener=self.opener(b'abc'), env={})
+        self.assertFalse(out['results'][0]['ok'])
+        self.assertEqual(part.read_bytes(), b'keep')
+
+    def test_range_span_short_read_and_wrong_offset(self):
+        """A truncated range stays resumable; a mismatched offset must start over."""
+        import io
+        p = pathlib.Path(self.root, 'models/a.gw-part')
+        p.parent.mkdir()
+        p.write_bytes(b'abc')
+        def short(req, timeout):
+            r = io.BytesIO(b'd')
+            r.status, r.headers = 206, {'Content-Range': 'bytes 3-5/6'}
+            return r
+        payload = {'items': [dict(path='models/a', url='https://e/a', size=6)]}
+        out = handler.run_fetch(payload, self.root, opener=short, env={})
+        self.assertEqual(out['results'][0]['error'], 'short read (1 of 3 bytes)')
+        self.assertEqual(p.read_bytes(), b'abcd')
+        calls = []
+        def wrong(req, timeout):
+            calls.append(req)
+            r = io.BytesIO(b'abcdef')
+            r.status = 206 if len(calls) == 1 else 200
+            r.headers = {'Content-Range': 'bytes 0-5/6', 'Content-Length': '6'}
+            return r
+        out = handler.run_fetch(payload, self.root, opener=wrong, env={})
+        self.assertTrue(out['results'][0]['ok'], out)
+        self.assertEqual(len(calls), 2)
+        self.assertIsNone(calls[-1].get_header('Range'))
+        self.assertEqual(pathlib.Path(self.root, 'models/a').read_bytes(), b'abcdef')
+
+    def test_fresh_416_is_final(self):
+        """A second 416 cannot create an unbounded retry loop within a billed job."""
+        import urllib.error
+        calls = []
+        def fail(req, timeout):
+            calls.append(req)
+            raise urllib.error.HTTPError(req.full_url, 416, 'range', {}, None)
+        out = handler.run_fetch({'items': [dict(path='models/a', url='https://e/a', size=6)]},
+                                self.root, opener=fail, env={})
+        self.assertEqual(out['results'][0]['error'], 'final: HTTP 416')
+        self.assertEqual(len(calls), 1)
 
     def test_sizeless_fetch_checks_hash_and_reports_actual_size(self):
         """HEAD-refusing URLs must still download safely with only the optional hash check."""

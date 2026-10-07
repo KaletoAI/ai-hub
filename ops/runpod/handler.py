@@ -304,6 +304,7 @@ def run_fetch(job_input: dict, root: str, opener=urllib.request.urlopen, env=os.
         result = {"path": item.get("path") if isinstance(item, dict) else None,
                   "ok": False, "size": 0, "sha256": "", "error": ""}
         results.append(result)
+        part, size = None, None
         try:
             path = safe_rel(result["path"])
             if path is None:
@@ -315,35 +316,78 @@ def run_fetch(job_input: dict, root: str, opener=urllib.request.urlopen, env=os.
             if size is not None and (not isinstance(size, int) or isinstance(size, bool) or size < 0):
                 raise HandlerError("size must be a nonnegative integer")
             final = os.path.join(root, path)
-            part = final + ".gw-part"
+            candidate = final + ".gw-part"
             fence = os.path.join(root, path.split("/", 1)[0])
-            if not _under(fence, root) or not _under(final, fence) or not _under(part, fence):
+            if not _under(fence, root) or not _under(final, fence) or not _under(candidate, fence):
                 raise HandlerError("path escapes volume root")
+            part = candidate
             os.makedirs(os.path.dirname(final), exist_ok=True)
-            req = urllib.request.Request(url, headers={"User-Agent": "ai-hub-worker"})
-            if _hf_host(url) and env.get("HF_TOKEN"):
-                # HF redirects to CDNs: ordinary headers would forward the secret.
-                req.add_unredirected_header("Authorization", "Bearer " + env["HF_TOKEN"])
+            if os.path.isfile(final) and (size is None or os.path.getsize(final) == size):
+                result.update(ok=True, size=os.path.getsize(final), skipped=True)
+                continue
+            if size is None and os.path.exists(part):
+                os.unlink(part)
             n, digest = 0, hashlib.sha256()
-            if os.path.isfile(part) and (size is None or os.path.getsize(part) < size):
+            if size is not None and os.path.isfile(part) and os.path.getsize(part) < size:
                 with open(part, "rb") as f:
                     while chunk := f.read(_CHUNK):
                         digest.update(chunk)
                         n += len(chunk)
+            # A stale range gets one fresh request in this job, never an endless loop.
+            for attempt in range(2):
+                req = urllib.request.Request(url, headers={"User-Agent": "ai-hub-worker"})
+                if _hf_host(url) and env.get("HF_TOKEN"):
+                    req.add_unredirected_header("Authorization", "Bearer " + env["HF_TOKEN"])
                 if n:
                     req.add_header("Range", f"bytes={n}-")
-            with opener(req, timeout=60) as response:
-                if response.status >= 400:
-                    raise urllib.error.HTTPError(url, response.status, "fetch refused",
-                                                 response.headers, None)
-                if n and response.status != 206:
-                    n, digest = 0, hashlib.sha256()
-                resumed = n > 0
-                with open(part, "ab" if n else "wb") as f:
-                    while chunk := response.read(_CHUNK):
-                        f.write(chunk)
-                        digest.update(chunk)
-                        n += len(chunk)
+                try:
+                    response = opener(req, timeout=60)
+                    if response.status >= 400:
+                        response.close()
+                        raise urllib.error.HTTPError(url, response.status, "fetch refused",
+                                                     response.headers, None)
+                except urllib.error.HTTPError as exc:
+                    if exc.code == 416 and n and attempt == 0:
+                        os.unlink(part)
+                        n, digest = 0, hashlib.sha256()
+                        continue
+                    raise
+                with response:
+                    announced = response.headers.get('Content-Length')
+                    announced = int(announced) if announced is not None else None
+                    if response.status == 206:
+                        span = re.fullmatch(r'bytes (\d+)-(\d+)/(?:\d+|\*)',
+                                            response.headers.get('Content-Range', ''))
+                        if not span or int(span[1]) != n or int(span[2]) < int(span[1]):
+                            if attempt == 0:
+                                if os.path.exists(part):
+                                    os.unlink(part)
+                                n, digest = 0, hashlib.sha256()
+                                continue
+                            raise HandlerError('invalid Content-Range')
+                        announced = int(span[2]) - int(span[1]) + 1
+                    elif n:
+                        n, digest = 0, hashlib.sha256()
+                    resumed = n > 0
+                    received = 0
+                    with open(part, "ab" if n else "wb") as f:
+                        while chunk := response.read(_CHUNK):
+                            f.write(chunk)
+                            digest.update(chunk)
+                            n += len(chunk)
+                            received += len(chunk)
+                    if announced is not None and received != announced:
+                        result['error'] = f'short read ({received} of {announced} bytes)'
+                        if size is None:
+                            os.unlink(part)
+                        break
+                    if size is None and announced is None and not item.get('sha256'):
+                        os.unlink(part)
+                        result['error'] = 'size unknown and no sha256 — not published'
+                        break
+                break
+            if result['error']:
+                continue
             result.update(size=n, sha256=digest.hexdigest())
             if (size is not None and n != size) or (item.get("sha256") and item["sha256"] != digest.hexdigest()):
                 os.unlink(part)
@@ -355,8 +399,11 @@ def run_fetch(job_input: dict, root: str, opener=urllib.request.urlopen, env=os.
             os.replace(part, final)
             result["ok"] = True
         except Exception as e:
+            if size is None and part is not None and os.path.isfile(part):
+                os.unlink(part)
             prefix = "final: " if isinstance(e, urllib.error.HTTPError) and 400 <= e.code < 500 else ""
-            result["error"] = (prefix + f"{type(e).__name__}: {e}")[:300]
+            detail = f"HTTP {e.code}" if isinstance(e, urllib.error.HTTPError) else f"{type(e).__name__}: {e}"
+            result["error"] = (prefix + detail)[:300]
     return {"results": results}
 
 

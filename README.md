@@ -1089,7 +1089,8 @@ Volumes only grow. Capacity pressure first prunes unneeded manifest-owned files,
 then grows within the ceiling; unknown files are never automatically removed. A need
 above the ceiling blocks the affected aliases with a readable reason. Completed or
 blocked transfers do not add to growth needs. Partial `.gw-part` downloads count
-toward used space and appear under unknown cleanup; active writers protect their parts.
+toward used space and subtract from that file’s remaining growth need; they appear
+under unknown cleanup, and active writers protect their parts.
 Billing is by **provisioned size**, estimated at **$0.07/GB/month**: deleting files does not lower
 that charge. The card shows monthly volume cost and cumulative fetch execution cost
 (`execution_ms / 3.6e6 * cost_per_hour`), an estimate that excludes cold-start/idle
@@ -1097,12 +1098,20 @@ charges. Fetch jobs normally batch up to 20 GB and 50 files; a larger file goes 
 Downloads get a separate execution budget based on bytes, from ten minutes up to
 four hours. If HEAD cannot determine the size, the file goes alone with a four-hour
 budget and its completed size is verified through S3. The worker requires the
-network volume to be mounted before fetch/link work.
+network volume to be mounted before fetch/link work. It skips already published
+files at the expected size. Size-less downloads start from zero and require a
+response length or sha256; announced response lengths are checked before publishing.
+Interrupted sized downloads retain their partial bytes for resume; a stale range
+gets one fresh download attempt within the job.
 
 For gated Hugging Face downloads, set **`HF_TOKEN` in the endpoint environment**;
 it never travels in a job input. Until M2b this is manual. Three per-item failures
 or a final item error trigger fallback to a LAN copy; job/queue failures back off
-without consuming item retries. A failed HEAD still allows a worker download.
+without consuming item retries. After a job-level failure, S3 checks salvage any
+files already published. Three consecutive job-level failures pause URL fetching
+until **Sync now**; LAN streams continue. Item results reset this persisted counter,
+and endpoint failures do not trigger LAN fallback. The card shows the last scrubbed
+error, including an unattached mount. A failed HEAD still allows a worker download.
 Without a LAN copy the file blocks and the checklist explains the problem. The
 AI-Hub HF token is used only for the preliminary size HEAD to HF hosts, while the
 worker uses its endpoint token for downloads. Saved jobs/uploads are recovered before

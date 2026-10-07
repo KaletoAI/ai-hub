@@ -8607,6 +8607,14 @@ async def delete_volume(name: str) -> str:
     c = volume_controllers.get(name)
     if c is None:
         return "unknown RunPod volume"
+    try:
+        states = store.get_setting("runpod_volume_state")
+        if states is None:
+            states = {}
+        if not isinstance(states, dict):
+            return "runpod_volume_state is unreadable — not deleted"
+    except Exception:
+        return "runpod_volume_state is unreadable — not deleted"
     # Disabled references also keep the volume: enabling them later must be safe.
     if any(b.get("type") == "runpod" and b.get("volume") == name for b in backends):
         return "Volume is referenced by a RunPod backend"
@@ -8617,7 +8625,6 @@ async def delete_volume(name: str) -> str:
         # Remove its local identity too, otherwise reusing the name keeps the gone id.
         entries = _load_runpod_volumes()
         entries.pop(name, None)
-        states = store.get_setting("runpod_volume_state", {})
         states.pop(name, None)
         store.set_settings({"runpod_volumes": entries, "runpod_volume_state": states})
         sync_volume_controllers()

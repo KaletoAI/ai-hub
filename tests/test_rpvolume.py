@@ -1095,7 +1095,7 @@ class FixRound(unittest.TestCase):
         self.assertEqual(self.ctl.attempts, {})
         self.assertEqual(self.ctl.state['url_fallback'], {})
         self.assertIsNone(self.ctl.state['fetch_job'])
-        self.assertIn('fetch job failed: TIMED_OUT', self.ctl.problems())
+        self.assertIn('fetch jobs paused after 3 failed jobs (last: TIMED_OUT) — Sync now retries', self.ctl.problems())
 
     def test_head_405_unknown_size_cached_and_fetched_alone(self):
         """GET-only URLs must reach the worker and failed HEADs must not repeat every tick."""
@@ -1333,6 +1333,134 @@ class FixRound(unittest.TestCase):
         self.run_round()
         self.assertNotIn(p, self.ctl.plan['prune'])
         self.assertTrue(self.ctl.plan['held'])
+
+    def test_failed_job_salvages_published_catalog_file(self):
+        """A timed-out job must not repeatedly download its published files (repro4)."""
+        p = 'models/a.safetensors'
+        self.src = {}
+        self.urls = {p: {'url': 'https://example/a'}}
+        def transport(req):
+            if req.url.host == 'example': return httpx.Response(405)
+            return self.rest(req) if req.url.host == 'rest.runpod.io' else self.fake.handler(req)
+        self.ctl.deps.client_factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(transport))
+        async def failed(bid, payload, on_id, *, max_wait=None):
+            self.payloads.append(payload)
+            on_id('j')
+            self.fake.objs[p] = b'12345'
+            return dict(status='TIMED_OUT', output=None, executionTime=3600000)
+        self.ctl.deps.run_fetch = failed
+        with self.assertRaises(RuntimeError): asyncio.run(self.transfer())
+        self.assertEqual(self.ctl.manifest[p]['sha256'], '')
+        self.assertEqual(self.ctl.manifest[p]['source'], 'url')
+        self.assertTrue(self.ctl.is_alias_ready('A'))
+        self.assertEqual(self.ctl.state['job_failures'], 1)
+        self.assertEqual(self.ctl.state['sync_cost_usd'], 2)
+
+    def test_job_failures_pause_urls_but_allow_lan_and_sync_now(self):
+        """Persistent endpoint failures must stop billing after three jobs, across restart."""
+        p = 'models/a.safetensors'
+        self.urls = {p: {'url': 'https://example/a', 'size': 5}}
+        async def failed(bid, payload, on_id, *, max_wait=None):
+            self.payloads.append(payload)
+            on_id('j')
+            return dict(status='TIMED_OUT', output=None)
+        self.ctl.deps.run_fetch = failed
+        asyncio.run(self.ctl.resume())
+        asyncio.run(self.ctl.plan_round())
+        for _ in range(8):
+            try: asyncio.run(self.ctl._transfer_round())
+            except RuntimeError: pass
+        self.assertEqual(len(self.payloads), 3)
+        self.assertEqual(self.saved[-1]['job_failures'], 3)
+        self.assertIn('fetch jobs paused after 3 failed jobs (last: TIMED_OUT) — Sync now retries', self.ctl.problems())
+        self.src['models/b'] = 5
+        self.needs = [need('A', [], catalog=list(self.src))]
+        asyncio.run(self.ctl.plan_round())
+        asyncio.run(self.ctl._transfer_round())
+        self.assertEqual(self.fake.objs['models/b'], b'12345')
+        self.ctl.sync_now()
+        self.assertEqual(self.ctl.state['job_failures'], 0)
+
+    def test_partial_bytes_do_not_order_permanent_growth(self):
+        """An 8 GB file with a 4 GB prefix fits a 10 GB volume (repro4)."""
+        p = 'models/x.safetensors'
+        self.src = {p: 8 * 10**9}
+        self.needs = [need('A', [], catalog=[p])]
+        self.urls = {p: {'url': 'https://example/x'}}
+        self.fake.objs[p + '.gw-part'] = SizedBody(4 * 10**9)
+        self.run_round()
+        self.assertEqual(self.ctl.state['size_gb'], 10)
+        self.assertNotIn('PATCH', self.rest.events)
+        self.assertNotIn(p, self.ctl.state['blocked'])
+
+    def test_paused_jobs_survive_restart_and_item_results_reset(self):
+        """A gateway restart must not release a persisted billing pause."""
+        self.ctl.state.update(job_failures=3, job_failure_reason='TIMED_OUT')
+        self.ctl._save()
+        self.ctl.deps.load_state = lambda name: self.saved[-1]
+        restarted = rpvolume.VolumeController(self.ctl.name, self.ctl.cfg, self.ctl.deps)
+        self.assertEqual(restarted.state['job_failures'], 3)
+        self.assertIn('Sync now retries', ' '.join(restarted.problems()))
+        job = dict(bid='runpod:worker', items=[dict(path='models/a', size=5)])
+        async def finish():
+            async with self.ctl.deps.client_factory() as client:
+                await self.ctl._finish_fetch(self.ctl._client_s3(client), job,
+                    dict(output={'results': [dict(path='models/a', ok=False, error='temporary')]}))
+        asyncio.run(finish())
+        self.assertEqual(self.ctl.state['job_failures'], 0)
+        self.assertEqual(self.saved[-1]['job_failures'], 0)
+
+    def test_link_item_results_reset_job_failure_counter(self):
+        """A successful link job breaks the sequence of endpoint-wide failures too."""
+        self.ctl.state.update(job_failures=3, job_failure_reason='TIMED_OUT')
+        async def finish():
+            async with self.ctl.deps.client_factory() as client:
+                await self.ctl._finish_links(self.ctl._client_s3(client),
+                    dict(bid='runpod:worker', items=[]),
+                    dict(status='COMPLETED', output={'results': [dict(path='hf-cache/a', ok=True)]}))
+        asyncio.run(finish())
+        self.assertEqual(self.ctl.state['job_failures'], 0)
+        self.assertEqual(self.saved[-1]['job_failures'], 0)
+
+    def test_head_learned_size_discounts_partial_growth(self):
+        """Learning a catalog-only size must use the same partial-aware capacity check."""
+        p = 'models/x.safetensors'
+        self.src = {}
+        self.needs = [need('A', [], catalog=[p])]
+        self.urls = {p: {'url': 'https://example/x'}}
+        self.fake.objs[p + '.gw-part'] = SizedBody(4 * 10**9)
+        def transport(req):
+            if req.url.host == 'example': return httpx.Response(200, headers={'content-length': str(8 * 10**9)})
+            return self.rest(req) if req.url.host == 'rest.runpod.io' else self.fake.handler(req)
+        self.ctl.deps.client_factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(transport))
+        self.run_round()
+        asyncio.run(self.ctl._fetch_entry(self.ctl.plan['fetch'][0]))
+        self.assertEqual(self.ctl.state['size_gb'], 10)
+        self.assertNotIn('PATCH', self.rest.events)
+        self.assertNotIn(p, self.ctl.state['blocked'])
+
+    def test_poll_exception_preserves_real_mount_problem(self):
+        """An adapter exception after submit must show the worker's actual mount problem."""
+        mount = 'network volume not mounted at /runpod-volume'
+        self.urls = {'models/a.safetensors': {'url': 'https://e/a', 'size': 5}}
+        async def failed(bid, payload, on_id, *, max_wait=None):
+            on_id('j')
+            raise RuntimeError('RunPod: ' + mount)
+        self.ctl.deps.run_fetch = failed
+        with self.assertRaises(RuntimeError): asyncio.run(self.transfer())
+        self.assertIn(mount, ' '.join(self.ctl.problems()))
+        self.assertEqual(self.ctl.state['fetch_job']['id'], 'j')
+
+    def test_real_mount_error_and_exception_are_scrubbed(self):
+        """RunPod top-level errors and poll exceptions must explain failed jobs safely."""
+        mount = 'network volume not mounted at /runpod-volume'
+        for status in ({'status': 'FAILED', 'error': mount},
+                       {'error': RuntimeError('RunPod: ' + mount)}):
+            with self.assertRaisesRegex(RuntimeError, mount): self.ctl._job_failed(status)
+        with self.assertRaises(RuntimeError):
+            self.ctl._job_failed({'error': 'x' * 220 + ' https://e/a?secret=z'})
+        self.assertLessEqual(len(self.ctl._fetch_problem.removeprefix('fetch job failed: ')), 200)
+        self.assertNotIn('https://', self.ctl._fetch_problem)
 
     def test_job_level_error_does_not_expose_signed_url(self):
         """Job-wide error text must not expose RunPod's stored signed download URL in the card or log."""
