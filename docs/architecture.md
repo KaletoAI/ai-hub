@@ -1859,7 +1859,10 @@ revision renders a different picture), `extra_model_paths.yaml` (models from the
 volume at `/runpod-volume/models/<folder>/`, the same tree as ComfyUI's), `gw_placeholder.png`
 and `handler.py` (the worker: one prompt per job against the in-container ComfyUI, plain
 functions over a base URL so they test without the `runpod` SDK or a GPU; our own code —
-nothing copied from the AGPL worker-comfyui). The image is built by RunPod from a PRIVATE
+nothing copied from the AGPL worker-comfyui). Volume `fetch`/`link` ops run before
+ComfyUI readiness: HTTPS downloads resume `.gw-part` files, verify size/hash before
+rename, keep HF credentials in env and off redirects, and fence resolved paths to
+`models/` or `hf-cache/`; `info` reports volume bytes (`test_runpod_worker.FetchOps`). The image is built by RunPod from a PRIVATE
 worker repo, never from ai-hub: `sync.sh <checkout>` copies the context there and writes
 `worker.json` (the version — ai-hub commit, `-dirty` when `ops/runpod` has uncommitted
 changes — that every job reports back as `worker_version`); commit, push and

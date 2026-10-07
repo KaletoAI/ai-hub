@@ -6,8 +6,12 @@ Apache-2.0). The contract (adapters.RunpodAdapter reads it):
   {"op": "prompt", "workflow", "inputs": [{name, b64}], "deliver": {"sibling_exts"}}
     → {"outputs", "manifest": {"<type>/<subfolder>/<file>": {b64, size, sha256} | null},
        "worker_version"}  |  {"error": "<text>"}  (RunPod then reports FAILED)
-  {"op": "info"} → {"object_info_gz", "models": {"image": {…}, "volume": {…}}, "worker_version"}
-Everything but `main()` is plain functions over a base URL, testable without the runpod
+  {"op": "info"} → {"object_info_gz", "models": {"image": {…}, "volume": {…}},
+    "worker_version", "volume": {total, used, free} | null}
+  {"op": "fetch", "items": [{path, url, size, sha256?}]}
+    → {"results": [{path, ok, size, sha256, error}]}
+  {"op": "link", "links": [{path, target}]} → {"results": [{path, ok, error}]}
+Everything but `main()` is plain functions over a base URL or volume root, testable without the runpod
 SDK and without a GPU (tests/test_runpod_worker.py)."""
 import base64
 import binascii
@@ -22,8 +26,15 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
+from typing import Optional
+
+VOLUME = "/runpod-volume"
+_ROOTS = ("models/", "hf-cache/")
+_HF_HOSTS = ("huggingface.co", "hf.co")
+_CHUNK = 8 * 1024 * 1024
 
 COMFY = "http://127.0.0.1:8188"
 COMFY_DIR = "/comfyui"
@@ -261,12 +272,146 @@ def run_prompt(job_input: dict, base: str, dirs: dict, report, poll_s: float = 1
         return {"error": f"{type(e).__name__}: {e}"[:4000]}
 
 
+def safe_rel(path) -> Optional[str]:
+    if not isinstance(path, str) or not path or len(path) > 512 or "\x00" in path:
+        return None
+    if path.startswith("/") or "\\" in path:
+        return None
+    norm = os.path.normpath(path)
+    if norm != path.rstrip("/") or norm.startswith("..") or "/../" in f"/{norm}/":
+        return None
+    return norm if norm.startswith(_ROOTS) else None
+
+
+def _hf_host(url: str) -> bool:
+    h = (urllib.parse.urlsplit(url).hostname or "").lower()
+    return any(h == x or h.endswith("." + x) for x in _HF_HOSTS)
+
+
+def _under(path: str, root: str) -> bool:
+    """Existing symlinks must obey the same fence as job-supplied path segments."""
+    real, base = os.path.realpath(path), os.path.abspath(root)
+    return real != base and os.path.commonpath([real, base]) == base
+
+
+def run_fetch(job_input: dict, root: str, opener=urllib.request.urlopen, env=os.environ) -> dict:
+    """Publish only verified bytes; retain interrupted downloads for the next job."""
+    results = []
+    for item in job_input.get("items") or []:
+        result = {"path": item.get("path") if isinstance(item, dict) else None,
+                  "ok": False, "size": 0, "sha256": "", "error": ""}
+        results.append(result)
+        try:
+            path = safe_rel(result["path"])
+            if path is None:
+                raise HandlerError("path refused")
+            url = item.get("url")
+            if not isinstance(url, str) or urllib.parse.urlsplit(url).scheme != "https":
+                raise HandlerError("URL must use https")
+            size = item.get("size")
+            if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+                raise HandlerError("size must be a nonnegative integer")
+            final = os.path.join(root, path)
+            part = final + ".gw-part"
+            fence = os.path.join(root, path.split("/", 1)[0])
+            if not _under(fence, root) or not _under(final, fence) or not _under(part, fence):
+                raise HandlerError("path escapes volume root")
+            os.makedirs(os.path.dirname(final), exist_ok=True)
+            req = urllib.request.Request(url, headers={"User-Agent": "ai-hub-worker"})
+            if _hf_host(url) and env.get("HF_TOKEN"):
+                # HF redirects to CDNs: ordinary headers would forward the secret.
+                req.add_unredirected_header("Authorization", "Bearer " + env["HF_TOKEN"])
+            n, digest = 0, hashlib.sha256()
+            if os.path.isfile(part) and os.path.getsize(part) < size:
+                with open(part, "rb") as f:
+                    while chunk := f.read(_CHUNK):
+                        digest.update(chunk)
+                        n += len(chunk)
+                if n:
+                    req.add_header("Range", f"bytes={n}-")
+            with opener(req, timeout=60) as response:
+                if response.status >= 400:
+                    raise urllib.error.HTTPError(url, response.status, "fetch refused",
+                                                 response.headers, None)
+                if n and response.status != 206:
+                    n, digest = 0, hashlib.sha256()
+                resumed = n > 0
+                with open(part, "ab" if n else "wb") as f:
+                    while chunk := response.read(_CHUNK):
+                        f.write(chunk)
+                        digest.update(chunk)
+                        n += len(chunk)
+            result.update(size=n, sha256=digest.hexdigest())
+            if n != size or (item.get("sha256") and item["sha256"] != digest.hexdigest()):
+                os.unlink(part)
+                why = "size mismatch" if n != size else "sha256 mismatch"
+                # a resumed part may be a stale file's head: the part is gone now, so the
+                # next attempt starts from byte 0 — only a fresh download's mismatch is final
+                result["error"] = ("" if resumed else "final: ") + why
+                continue
+            os.replace(part, final)
+            result["ok"] = True
+        except Exception as e:
+            prefix = "final: " if isinstance(e, urllib.error.HTTPError) and 400 <= e.code < 500 else ""
+            result["error"] = (prefix + f"{type(e).__name__}: {e}")[:300]
+    return {"results": results}
+
+
+def run_link(job_input: dict, root: str) -> dict:
+    """Replace stale entries atomically so a sync never exposes a half-made link."""
+    results = []
+    for item in job_input.get("links") or []:
+        result = {"path": item.get("path") if isinstance(item, dict) else None,
+                  "ok": False, "error": ""}
+        results.append(result)
+        tmp = None
+        try:
+            path = safe_rel(result["path"])
+            target = item.get("target")
+            if path is None or not path.startswith("hf-cache/"):
+                raise HandlerError("link path refused")
+            if (not isinstance(target, str) or not target or os.path.isabs(target)
+                    or "\x00" in target or "\\" in target):
+                raise HandlerError("link target must be relative")
+            final = os.path.join(root, path)
+            cache = os.path.join(root, "hf-cache")
+            real = os.path.realpath(os.path.join(os.path.dirname(final), target))
+            if (not _under(cache, root) or not _under(os.path.dirname(final), root)
+                    or not _under(real, cache)
+                    or (not _under(os.path.dirname(final), cache)
+                        and os.path.dirname(final) != cache)):
+                raise HandlerError("link escapes hf-cache")
+            os.makedirs(os.path.dirname(final), exist_ok=True)
+            if not os.path.islink(final) or os.readlink(final) != target:
+                tmp = final + ".gw-part-" + uuid.uuid4().hex
+                os.symlink(target, tmp)
+                os.replace(tmp, final)
+            result["ok"] = True
+        except Exception as e:
+            result["error"] = f"{type(e).__name__}: {e}"[:300]
+        finally:
+            if tmp is not None and os.path.lexists(tmp):
+                os.unlink(tmp)
+    return {"results": results}
+
+
+def volume_space(root: str) -> Optional[dict]:
+    try:
+        st = os.statvfs(root)
+        return {"total": st.f_blocks * st.f_frsize,
+                "used": (st.f_blocks - st.f_bfree) * st.f_frsize,
+                "free": st.f_bavail * st.f_frsize}
+    except OSError:
+        return None
+
+
 def run_info(base: str, roots: dict) -> dict:
     st, body = _http("GET", f"{base}/object_info", timeout=120.0)
     if st != 200:
         return {"error": f"/object_info → HTTP {st}"}
     return {"object_info_gz": base64.b64encode(gzip.compress(body)).decode(),
-            "models": model_index(roots), "worker_version": _worker_version()}
+            "models": model_index(roots), "worker_version": _worker_version(),
+            "volume": volume_space(VOLUME)}
 
 
 def wait_ready(base: str, deadline_s: float = 180.0) -> bool:
@@ -288,9 +433,13 @@ def main() -> None:
     ready = wait_ready(COMFY)
 
     def handle(job):
+        inp = job.get("input") or {}
+        if inp.get("op") == "fetch":
+            return run_fetch(inp, VOLUME)
+        if inp.get("op") == "link":
+            return run_link(inp, VOLUME)
         if not ready or proc.poll() is not None:
             return {"error": "ComfyUI did not start in the worker"}
-        inp = job.get("input") or {}
         if inp.get("op") == "info":
             return run_info(COMFY, MODEL_ROOTS)
         if inp.get("op") == "prompt":

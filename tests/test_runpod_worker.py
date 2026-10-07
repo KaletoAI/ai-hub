@@ -295,5 +295,253 @@ class Handler(unittest.TestCase):
         self.assertEqual(adapters._RP_INPUT_NAME_RE.pattern, handler.NAME_RE.pattern)
 
 
+class FetchOps(unittest.TestCase):
+    """The fetch job writes straight onto the network volume every RunPod worker mounts.
+    A path escape writes outside models/, a rename before the hash check publishes a
+    truncated model that ComfyUI loads as garbage, and a token read from the job input
+    lands in RunPod's stored job history — all silent."""
+
+    def setUp(self):
+        import tempfile
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = self.temp.name
+        self.seen = []
+
+    def opener(self, data, status=200):
+        import io
+
+        def op(req, timeout=None):
+            self.seen.append(req)
+            r = io.BytesIO(data)
+            r.status, r.headers = status, {}
+            return r
+        return op
+
+    def test_fetch_writes_after_check(self):
+        data = b"model-bytes"
+        sha = hashlib.sha256(data).hexdigest()
+        out = handler.run_fetch({"items": [{"path": "models/loras/a.safetensors",
+                                            "url": "https://example.com/a", "size": len(data),
+                                            "sha256": sha}]}, self.root, opener=self.opener(data), env={})
+        self.assertEqual(out["results"][0]["ok"], True)
+        p = pathlib.Path(self.root, "models/loras/a.safetensors")
+        self.assertEqual(p.read_bytes(), data)
+        self.assertFalse(pathlib.Path(str(p) + ".gw-part").exists())
+
+    def test_fetch_sha_mismatch_publishes_nothing(self):
+        out = handler.run_fetch({"items": [{"path": "models/x", "url": "https://e/x", "size": 3,
+                                            "sha256": "0" * 64}]}, self.root,
+                                opener=self.opener(b"abc"), env={})
+        self.assertFalse(out["results"][0]["ok"])
+        self.assertTrue(out["results"][0]["error"].startswith("final: "))
+        self.assertEqual([p for p in pathlib.Path(self.root).rglob("*") if p.is_file()], [])
+
+    def test_fetch_refuses_bad_paths(self):
+        items = [{"path": p, "url": "https://e/x", "size": 1} for p in
+                 ("models/../../etc/x", "/abs", "other/x", "models/a\x00b", "hf-cache/../x")]
+        items.append({"path": "models/ok", "url": "https://e/x", "size": 1})
+        out = handler.run_fetch({"items": items}, self.root, opener=self.opener(b"z"), env={})
+        self.assertEqual([r["ok"] for r in out["results"]], [False] * 5 + [True])
+
+    def test_fetch_refuses_http_url(self):
+        out = handler.run_fetch({"items": [{"path": "models/a", "url": "http://e/a", "size": 1}]},
+                                self.root, opener=self.opener(b"z"), env={})
+        self.assertFalse(out["results"][0]["ok"])
+
+    def test_hf_token_only_from_env_and_only_to_hf(self):
+        env = {"HF_TOKEN": "hf_secret"}
+        handler.run_fetch({"items": [{"path": "models/a", "url": "https://huggingface.co/r/a",
+                                      "size": 1}], "hf_token": "from_input"},
+                          self.root, opener=self.opener(b"z"), env=env)
+        handler.run_fetch({"items": [{"path": "models/b", "url": "https://huggingface.co.evil.example/b",
+                                      "size": 1}]}, self.root, opener=self.opener(b"z"), env=env)
+        auth = [r.get_header("Authorization") for r in self.seen]
+        self.assertEqual(auth, ["Bearer hf_secret", None])
+
+    def test_link_stays_inside_hf_cache(self):
+        pathlib.Path(self.root, "hf-cache/hub/m/blobs").mkdir(parents=True)
+        pathlib.Path(self.root, "hf-cache/hub/m/blobs/abc").write_bytes(b"x")
+        out = handler.run_link({"links": [
+            {"path": "hf-cache/hub/m/snapshots/r/f.bin", "target": "../../blobs/abc"},
+            {"path": "hf-cache/hub/m/snapshots/r/g.bin", "target": "../../../../../../etc/passwd"}]},
+            self.root)
+        self.assertEqual([r["ok"] for r in out["results"]], [True, False])
+        self.assertTrue(pathlib.Path(self.root, "hf-cache/hub/m/snapshots/r/f.bin").is_symlink())
+    def test_fetch_size_mismatch_is_final(self):
+        """A short body must never publish a model or consume three URL attempts."""
+        out = handler.run_fetch({"items": [{"path": "models/a", "url": "https://e/a",
+                                            "size": 4}]}, self.root,
+                                opener=self.opener(b"abc"), env={})
+        self.assertTrue(out["results"][0]["error"].startswith("final: "))
+        self.assertFalse(pathlib.Path(self.root, "models/a.gw-part").exists())
+
+    def test_fetch_resume_and_range_ignored(self):
+        """Hash the prefix on 206; a server ignoring Range must not duplicate it."""
+        data = b"abcdef"
+        for status, body in ((206, b"def"), (200, data)):
+            with self.subTest(status=status):
+                p = pathlib.Path(self.root, "models/a")
+                p.parent.mkdir(exist_ok=True)
+                pathlib.Path(str(p) + ".gw-part").write_bytes(b"abc")
+                out = handler.run_fetch({"items": [{"path": "models/a", "url": "https://e/a",
+                                                    "size": 6,
+                                                    "sha256": hashlib.sha256(data).hexdigest()}]},
+                                        self.root, opener=self.opener(body, status), env={})
+                self.assertTrue(out["results"][0]["ok"], out)
+                self.assertEqual(p.read_bytes(), data)
+                self.assertEqual(self.seen[-1].get_header("Range"), "bytes=3-")
+
+    def test_fetch_resumed_mismatch_is_retryable(self):
+        """A stale .gw-part (an older file's head) + a correct tail fails the hash; that
+        is no reason to give the URL up for good — the part is gone, the next try
+        starts at byte 0. Marked final, the sync would fall back to the LAN at once."""
+        data = b"abcdef"
+        pathlib.Path(self.root, "models").mkdir(exist_ok=True)
+        pathlib.Path(self.root, "models/a.gw-part").write_bytes(b"XYZ")
+        out = handler.run_fetch({"items": [{"path": "models/a", "url": "https://e/a", "size": 6,
+                                            "sha256": hashlib.sha256(data).hexdigest()}]},
+                                self.root, opener=self.opener(b"def", 206), env={})
+        r = out["results"][0]
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["error"], "sha256 mismatch")
+        self.assertFalse(pathlib.Path(self.root, "models/a.gw-part").exists())
+
+    def test_fetch_http_errors_and_transport_are_per_item(self):
+        """Only 4xx are final; an unavailable URL must not stop the batch."""
+        import urllib.error
+        for code in (403, 404, 429, 500, None):
+            def fail(req, timeout=None):
+                if code is None:
+                    raise urllib.error.URLError("offline")
+                raise urllib.error.HTTPError(req.full_url, code, "refused", {}, None)
+            out = handler.run_fetch({"items": [{"path": "models/a", "url": "https://e/a",
+                                                "size": 1}]}, self.root, opener=fail, env={})
+            r = out["results"][0]
+            self.assertFalse(r["ok"])
+            self.assertEqual(r["error"].startswith("final: "), code is not None and code < 500)
+            self.assertLessEqual(len(r["error"]), 300)
+
+    def test_safe_rel_boundaries(self):
+        """Odd path spellings and oversized keys must not bypass the two roots."""
+        for p in (None, "", "models", "models/./a", "models//a", "models/a/..",
+                  "models/a\\b", "models/" + "a" * 506):
+            self.assertIsNone(handler.safe_rel(p), p)
+        self.assertEqual(handler.safe_rel("models/a/"), "models/a")
+
+    def test_symlink_escapes_refused(self):
+        """Lexical containment alone lets existing symlinks write outside the volume."""
+        outside = pathlib.Path(self.root, "outside")
+        outside.mkdir()
+        pathlib.Path(self.root, "models").symlink_to(outside)
+        out = handler.run_fetch({"items": [{"path": "models/a", "url": "https://e/a",
+                                            "size": 1}]}, self.root,
+                                opener=self.opener(b"z"), env={})
+        self.assertFalse(out["results"][0]["ok"])
+        cache = pathlib.Path(self.root, "hf-cache")
+        cache.mkdir()
+        (cache / "escape").symlink_to(outside)
+        out = handler.run_link({"links": [{"path": "hf-cache/a", "target": "escape/x"},
+                                          {"path": "hf-cache/escape/a", "target": "../x"}]},
+                               self.root)
+        self.assertEqual([r["ok"] for r in out["results"]], [False, False])
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_link_replaces_and_is_idempotent(self):
+        """Repeated syncs preserve the correct link and replace stale files atomically."""
+        p = pathlib.Path(self.root, "hf-cache/a")
+        p.parent.mkdir()
+        p.write_bytes(b"stale")
+        payload = {"links": [{"path": "hf-cache/a", "target": "blobs/x"},
+                             {"path": "models/a", "target": "blobs/x"},
+                             {"path": "hf-cache/b", "target": "/etc/passwd"}]}
+        for _ in range(2):
+            out = handler.run_link(payload, self.root)
+            self.assertEqual([r["ok"] for r in out["results"]], [True, False, False])
+            self.assertEqual(p.readlink(), pathlib.Path("blobs/x"))
+
+    def test_volume_space_and_info(self):
+        """A missing mount reports None; info exposes filesystem capacity in bytes."""
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        with patch.object(handler.os, "statvfs", return_value=SimpleNamespace(
+                f_blocks=100, f_frsize=4096, f_bfree=40, f_bavail=30)):
+            self.assertEqual(handler.volume_space(self.root),
+                             {"total": 409600, "used": 245760, "free": 122880})
+            with patch.object(handler, "_http", return_value=(200, b"{}")):
+                self.assertEqual(handler.run_info("http://e", {})["volume"]["free"], 122880)
+        self.assertIsNone(handler.volume_space(self.root + "/absent"))
+
+    def test_fetch_link_before_comfy_readiness(self):
+        """Volume ops must work even when ComfyUI failed to start."""
+        from unittest.mock import patch, Mock
+        from types import SimpleNamespace
+        sdk = SimpleNamespace(serverless=SimpleNamespace(start=Mock()))
+        with patch.dict(sys.modules, {"runpod": sdk}), \
+                patch.object(handler.subprocess, "Popen"), \
+                patch.object(handler, "wait_ready", return_value=False), \
+                patch.object(handler, "VOLUME", self.root):
+            handler.main()
+        handle = sdk.serverless.start.call_args[0][0]["handler"]
+        self.assertEqual(handle({"input": {"op": "fetch", "items": []}}), {"results": []})
+        self.assertEqual(handle({"input": {"op": "link", "links": []}}), {"results": []})
+        self.assertIn("error", handle({"input": {"op": "prompt"}}))
+
+    def test_token_not_forwarded_on_redirect(self):
+        """urllib normally copies headers to a CDN redirect, leaking the HF secret."""
+        import urllib.request
+        handler.run_fetch({"items": [{"path": "models/a", "url": "https://huggingface.co/a",
+                                      "size": 1}]}, self.root,
+                          opener=self.opener(b"z"), env={"HF_TOKEN": "hf_secret"})
+        redirected = urllib.request.HTTPRedirectHandler().redirect_request(
+            self.seen[0], None, 302, "Found", {}, "https://cdn.example/a")
+        self.assertIsNone(redirected.get_header("Authorization"))
+
+    def test_hf_hosts_and_bad_items_continue(self):
+        """Subdomains and hf.co get env auth; malformed items do not lose later results."""
+        items = [None, {"path": "models/a", "url": "https://e/a", "size": -1}]
+        items += [{"path": "models/" + str(i), "url": url, "size": 1}
+                  for i, url in enumerate(("https://hf.co/a", "https://sub.huggingface.co/a",
+                                           "https://hf.co.evil.example/a"))]
+        out = handler.run_fetch({"items": items}, self.root,
+                                opener=self.opener(b"z"), env={"HF_TOKEN": "secret"})
+        self.assertEqual([r["ok"] for r in out["results"]], [False, False, True, True, True])
+        self.assertEqual([r.get_header("Authorization") for r in self.seen],
+                         ["Bearer secret", "Bearer secret", None])
+
+    def test_mismatch_preserves_previous_final(self):
+        """A failed refresh must leave the last verified model available."""
+        p = pathlib.Path(self.root, "models/a")
+        p.parent.mkdir()
+        p.write_bytes(b"good")
+        out = handler.run_fetch({"items": [{"path": "models/a", "url": "https://e/a", "size": 3,
+                                            "sha256": "0" * 64}]}, self.root,
+                                opener=self.opener(b"bad"), env={})
+        self.assertFalse(out["results"][0]["ok"])
+        self.assertEqual(p.read_bytes(), b"good")
+
+    def test_complete_partial_restarts(self):
+        """An already full partial must not append another copy on retry."""
+        p = pathlib.Path(self.root, "models/a.gw-part")
+        p.parent.mkdir()
+        p.write_bytes(b"old")
+        out = handler.run_fetch({"items": [{"path": "models/a", "url": "https://e/a", "size": 3}]},
+                                self.root, opener=self.opener(b"new"), env={})
+        self.assertTrue(out["results"][0]["ok"])
+        self.assertEqual(pathlib.Path(self.root, "models/a").read_bytes(), b"new")
+        self.assertIsNone(self.seen[-1].get_header("Range"))
+
+    def test_link_target_resolves_symlinks_before_parent_segments(self):
+        """Collapsing '..' before symlinks hides a target escaping the cache."""
+        cache = pathlib.Path(self.root, "hf-cache")
+        (cache / "parent").mkdir(parents=True)
+        (cache / "sub").mkdir()
+        (cache / "parent/deep").symlink_to(cache / "sub")
+        out = handler.run_link({"links": [{"path": "hf-cache/parent/deep/a",
+                                          "target": "../../secret"}]}, self.root)
+        self.assertFalse(out["results"][0]["ok"])
+        self.assertFalse((cache / "sub/a").is_symlink())
+
+
 if __name__ == "__main__":
     unittest.main()
