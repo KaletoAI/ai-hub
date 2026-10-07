@@ -504,3 +504,510 @@ class PlanRound(unittest.TestCase):
                 self.run_round()
                 self.assertIn('models/old', self.fake.objs)
                 self.ctl.state[field] = None if field == 'fetch_job' else []
+
+
+import hashlib
+import sys
+from unittest.mock import patch
+
+
+class TransferRound(unittest.TestCase):
+    """Transfer tests exercise the controller against local bytes and fake providers."""
+    def setUp(self):
+        PlanRound.setUp(self)
+        self.payloads, self.faults = [], []
+        self.result_ok = True
+        self.error = 'temporary failure'
+        self.publish = True
+        self.body = b'12345'
+        outer = self
+        class Lan:
+            generation = 0
+            def usable(self): return True
+            def problem(self): return 'offline'
+            def cat_argv(self, path, off):
+                assert off == 0
+                return [sys.executable, '-c', 'import sys; sys.stdout.buffer.write(' + repr(outer.body) + ')']
+            async def sha256(self, path, size):
+                return hashlib.sha256(outer.body).hexdigest()
+        self.ctl.deps.lan = Lan()
+        self.ctl.deps.note_fault = lambda kind, detail: self.faults.append((kind, detail))
+        async def run_fetch(bid, payload, on_id):
+            self.payloads.append(payload)
+            on_id('j1')
+            self.assertEqual(self.saved[-1]['fetch_job']['id'], 'j1')
+            results = []
+            for item in payload.get('items', []):
+                if self.publish and self.result_ok:
+                    self.fake.objs[item['path']] = self.body
+                results.append(dict(path=item['path'], ok=self.result_ok, size=5,
+                                    sha256=hashlib.sha256(self.body).hexdigest(), error=self.error))
+            return dict(status='COMPLETED', output={'results': results}, executionTime=3600000)
+        self.ctl.deps.run_fetch = run_fetch
+        self.ctl.deps.fetch_status = lambda bid, jid: run_fetch(bid, {'items': self.ctl.state['fetch_job']['items']}, lambda jid: None)
+        async def cancel(bid, jid): return True
+        self.ctl.deps.fetch_cancel = cancel
+        self.refs[0]['cost_per_hour'] = 2
+
+    run_round = PlanRound.run_round
+    manifest = PlanRound.manifest
+
+    async def transfer(self):
+        await self.ctl.resume()
+        await self.ctl.plan_round()
+        await self.ctl._transfer_round()
+
+    def test_job_and_lan_split(self):
+        """Catalog URLs must bypass the uplink while LAN-only files use S3."""
+        self.src['models/b'] = 5
+        self.needs = [need('A', [], catalog=list(self.src))]
+        self.urls = {'models/a.safetensors': {'url': 'https://example/a', 'size': 5}}
+        asyncio.run(self.transfer())
+        self.assertEqual([i['path'] for i in self.payloads[0]['items']], ['models/a.safetensors'])
+        self.assertEqual(self.fake.objs['models/b'], b'12345')
+        self.assertEqual(self.ctl.manifest['models/b']['source'], 'lan')
+        self.assertAlmostEqual(self.ctl.state['sync_cost_usd'], 2)
+
+    def test_fetch_payload_has_no_secret(self):
+        """Fetch input cannot carry gateway or S3 credentials to the worker."""
+        self.keys = ('hf-private-token', 'access', 's3-private-secret')
+        self.urls = {'models/a.safetensors': {'url': 'https://example/a', 'size': 5}}
+        asyncio.run(self.transfer())
+        self.assertNotIn('private', json.dumps(self.payloads))
+
+    def test_job_id_saved_before_poll(self):
+        """An id must survive a restart before run_fetch begins polling."""
+        self.urls = {'models/a.safetensors': {'url': 'https://example/a', 'size': 5}}
+        asyncio.run(self.transfer())
+        saved = next(s['fetch_job'] for s in self.saved if s['fetch_job'])
+        self.assertEqual(saved['bid'], 'runpod:worker')
+        self.assertEqual(saved['items'], [{'path': 'models/a.safetensors', 'size': 5, 'url': 'https://example/a'}])
+
+    def test_manifest_only_after_head(self):
+        """A worker's ok flag alone cannot publish absent model ownership."""
+        self.publish = False
+        self.urls = {'models/a.safetensors': {'url': 'https://example/a', 'size': 5}}
+        asyncio.run(self.transfer())
+        self.assertNotIn('models/a.safetensors', self.ctl.manifest)
+        self.assertEqual(self.ctl.attempts['models/a.safetensors'], 1)
+
+    def test_url_failure_falls_back_to_lan_then_blocks_without_share(self):
+        """Final URL failures must select a share copy or block with a fault."""
+        self.result_ok = False
+        self.error = 'final: size mismatch'
+        self.urls = {'models/a.safetensors': {'url': 'https://example/a', 'size': 5}}
+        asyncio.run(self.transfer())
+        self.assertEqual(self.ctl.state['url_fallback']['models/a.safetensors'], 'https://example/a')
+        asyncio.run(self.ctl._transfer_round())
+        self.assertEqual(self.ctl.manifest['models/a.safetensors']['source'], 'lan')
+        self.setUp()
+        self.src = {}
+        self.manifest({'models/a.safetensors': {'size': 5}})
+        self.result_ok = False
+        self.error = 'final: HTTP 404'
+        self.urls = {'models/a.safetensors': {'url': 'https://example/a', 'size': 5}}
+        asyncio.run(self.transfer())
+        self.assertIn('models/a.safetensors', self.ctl.state['blocked'])
+        self.assertTrue(self.faults)
+
+    def test_multipart_abort_on_sha_mismatch(self):
+        """Changed share bytes must abort parts and block after two failed streams."""
+        async def bad_hash(path, size): return 'wrong'
+        self.ctl.deps.lan.sha256 = bad_hash
+        with patch.object(rpvolume, 'PART_SIZE', 3, create=True):
+            asyncio.run(self.transfer())
+            asyncio.run(self.ctl._transfer_round())
+        self.assertEqual(self.fake.mpu, {})
+        self.assertNotIn('models/a.safetensors', self.ctl.manifest)
+        self.assertEqual(self.ctl.state['blocked']['models/a.safetensors'], 'share file changing?')
+
+    def test_complete_timeout_with_right_head_is_success(self):
+        """A lost completion answer must accept verified bytes instead of duplicating them."""
+        handler = self.fake.handler
+        def timeout(req):
+            response = handler(req)
+            if req.method == 'POST' and 'uploadId' in req.url.params:
+                raise httpx.ReadTimeout('lost answer')
+            return response
+        self.fake.handler = timeout
+        with patch.object(rpvolume, 'PART_SIZE', 3, create=True):
+            asyncio.run(self.transfer())
+        self.assertEqual(self.ctl.manifest['models/a.safetensors']['size'], 5)
+        self.assertEqual(self.ctl.state['mpu'], [])
+
+    def test_never_two_writers(self):
+        """A concurrent round cannot stream the path held by a fetch job."""
+        async def check():
+            started, release = asyncio.Event(), asyncio.Event()
+            orig = self.ctl.deps.run_fetch
+            async def pending(bid, payload, on_id):
+                on_id('pending'); started.set()
+                await release.wait()
+                return await orig(bid, payload, on_id)
+            self.ctl.deps.run_fetch = pending
+            self.urls = {'models/a.safetensors': {'url': 'https://example/a', 'size': 5}}
+            await self.ctl.resume(); await self.ctl.plan_round()
+            task = asyncio.create_task(self.ctl._transfer_round())
+            await started.wait()
+            self.ctl.urls = {}
+            await self.ctl._transfer_round()
+            self.assertNotIn('models/a.safetensors', self.fake.objs)
+            release.set(); await task
+        asyncio.run(check())
+
+    def test_resume_finishes_saved_job_before_new_writer(self):
+        """Restart must settle the saved writer before launching another one."""
+        self.ctl.state['fetch_job'] = {'id': 'old', 'bid': 'runpod:worker', 'ts': 0,
+            'items': [{'path': 'models/a.safetensors', 'size': 5, 'url': 'https://example/a'}]}
+        events = []
+        async def status(bid, jid):
+            events.append((bid, jid))
+            self.fake.objs['models/a.safetensors'] = b'12345'
+            return {'status': 'COMPLETED', 'output': {'results': [{'path': 'models/a.safetensors', 'ok': True, 'sha256': 'abc'}]}}
+        self.ctl.deps.fetch_status = status
+        asyncio.run(self.transfer())
+        self.assertEqual(events, [('runpod:worker', 'old')])
+        self.assertEqual(self.payloads, [])
+        self.assertEqual(self.ctl.state['fetch_job'], None)
+
+    def test_resume_aborts_saved_and_listed_uploads(self):
+        """Restart cannot leave persisted or unrecorded multipart storage orphaned."""
+        self.fake.mpu = {'saved': ('models/a', {}), 'lost': ('hf-cache/b', {})}
+        self.ctl.state['mpu'] = [{'key': 'models/a', 'upload_id': 'saved'}]
+        asyncio.run(self.ctl.resume())
+        self.assertEqual(self.fake.mpu, {})
+        self.assertEqual(self.ctl.state['mpu'], [])
+
+    def test_delete_unknown_only_unknown_and_not_inflight(self):
+        """Operator cleanup cannot erase owned, arbitrary or actively written objects."""
+        self.fake.objs.update({'models/unknown': b'1', 'models/held': b'2', 'models/owned': b'3'})
+        self.manifest({'models/owned': {'size': 1}})
+        self.run_round()
+        self.ctl._inflight.add('models/held')
+        count = asyncio.run(self.ctl.delete_unknown(['models/unknown', 'models/held', 'models/owned', '.gw-modelsync.json']))
+        self.assertEqual(count, 1)
+        self.assertIn('models/owned', self.fake.objs)
+        self.assertIn('models/held', self.fake.objs)
+
+    def test_backoff_doubles_and_resets(self):
+        """Transient failures must delay retries and a good round resets the delay."""
+        async def check():
+            clock = [0]
+            self.ctl.deps.now = lambda: clock[0]
+            calls = []
+            original = self.fake.handler
+            def failing(req): return httpx.Response(503)
+            self.fake.handler = failing
+            async def tick(seconds):
+                calls.append(clock[0]); clock[0] += seconds
+                if clock[0] == 85: self.fake.handler = original
+                if clock[0] >= 105: await self.ctl.aclose()
+            with patch('rpvolume.asyncio.sleep', tick):
+                await self.ctl.run_forever()
+            self.assertEqual(self.ctl._backoff, 0)
+            self.assertIn(30, calls)
+            self.assertIn(90, calls)
+        asyncio.run(check())
+
+    def test_auth_error_pauses_until_creds_change(self):
+        """Rejected credentials must pause S3 requests until the tuple changes."""
+        async def check():
+            clock = [0]; rejected_calls = []
+            self.ctl.deps.now = lambda: clock[0]
+            original = self.fake.handler
+            def rejected(req):
+                rejected_calls.append(clock[0]); return httpx.Response(403)
+            self.fake.handler = rejected
+            async def tick(seconds):
+                clock[0] += seconds
+                if clock[0] == 10:
+                    self.assertIn('S3 key rejected', self.ctl.problems())
+                if clock[0] == 15:
+                    self.keys = ('api-key', 'new-access', 'new-secret'); self.fake.handler = original
+                if clock[0] >= 25: await self.ctl.aclose()
+            with patch('rpvolume.asyncio.sleep', tick): await self.ctl.run_forever()
+            self.assertEqual(rejected_calls, [0])
+            self.assertNotIn('S3 key rejected', self.ctl.problems())
+        asyncio.run(check())
+
+    def test_fetch_batches_obey_both_limits(self):
+        """Batching must preserve plan order without exceeding either worker limit."""
+        self.src = {'models/a': 5, 'models/b': 5, 'models/c': 5}
+        self.needs = [need('A', [], catalog=list(self.src))]
+        self.urls = {p: {'url': 'https://example/' + p} for p in self.src}
+        with patch.object(rpvolume, 'JOB_BYTES', 10), patch.object(rpvolume, 'JOB_FILES', 1):
+            asyncio.run(self.transfer())
+        self.assertEqual([[i['path'] for i in p['items']] for p in self.payloads],
+                         [['models/a'], ['models/b'], ['models/c']])
+
+    def test_links_only_after_target_and_resume_link_job(self):
+        """A link needs a present blob, and its job must remain recoverable across restart."""
+        self.src = {'hf-cache/blobs/b': 5, 'hf-cache/snapshots/v/a': {'link': '../../blobs/b'}}
+        self.needs = [need('A', [], catalog=['hf-cache/snapshots/v/a'])]
+        orig = self.ctl.deps.run_fetch
+        async def run(bid, payload, on_id):
+            if payload['op'] != 'link': return await orig(bid, payload, on_id)
+            self.assertIn('hf-cache/blobs/b', self.fake.objs)
+            on_id('link-job')
+            return {'status': 'COMPLETED', 'output': {'results': [{'path': payload['links'][0]['path'], 'ok': True}]}}
+        self.ctl.deps.run_fetch = run
+        asyncio.run(self.transfer())
+        self.assertEqual(self.ctl.manifest['hf-cache/snapshots/v/a']['target'], '../../blobs/b')
+        self.assertTrue(self.ctl.is_alias_ready('A'))
+
+    def test_resume_unconfirmed_cancel_keeps_gate_closed(self):
+        """A deadline cannot authorize a second writer when cancel was not confirmed."""
+        self.ctl.state['fetch_job'] = {'id': 'old', 'bid': 'runpod:worker', 'ts': 0,
+            'items': [{'path': 'models/a.safetensors', 'size': 5, 'url': 'https://example/a'}]}
+        async def check():
+            clock = [0]
+            self.ctl.deps.now = lambda: clock[0]
+            async def status(bid, jid): return {'status': 'IN_PROGRESS'}
+            async def cancel(bid, jid): return False
+            async def tick(seconds): clock[0] += 1800
+            self.ctl.deps.fetch_status, self.ctl.deps.fetch_cancel = status, cancel
+            with patch('rpvolume.asyncio.sleep', tick): await self.ctl.resume()
+            await self.ctl.plan_round(); await self.ctl._transfer_round()
+            self.assertFalse(self.ctl._resumed)
+            self.assertIsNotNone(self.ctl.state['fetch_job'])
+            self.assertNotIn('models/a.safetensors', self.fake.objs)
+        asyncio.run(check())
+
+    def test_sha_short_read_and_nonzero_exit_abort(self):
+        """Short or failed cat output must never complete or publish multipart data."""
+        self.body = b'12'
+        with patch.object(rpvolume, 'PART_SIZE', 3): asyncio.run(self.transfer())
+        self.assertEqual(self.fake.mpu, {})
+        self.assertNotIn('models/a.safetensors', self.fake.objs)
+
+    def test_sync_now_recreates_only_explicitly(self):
+        """A vanished billed volume must stay gone through automatic and plain sync rounds."""
+        async def check():
+            self.rest.vols = []
+            self.ctl.state['missing'] = 2
+            clock = [0]
+            self.ctl.deps.now = lambda: clock[0]
+            async def tick(seconds):
+                clock[0] += seconds
+                if clock[0] == 5: self.ctl.sync_now()
+                if clock[0] == 10:
+                    self.assertNotIn('POST', self.rest.events)
+                    self.ctl.sync_now(recreate=True)
+                if clock[0] >= 15: await self.ctl.aclose()
+            with patch('rpvolume.asyncio.sleep', tick): await self.ctl.run_forever()
+            self.assertIn('POST', self.rest.events)
+        asyncio.run(check())
+
+    def test_retry_success_after_transfer_error(self):
+        """A transfer transport error must not poison the next good round's error state."""
+        async def check():
+            clock = [0]; original = self.fake.handler
+            self.ctl.deps.now = lambda: clock[0]
+            def lost_put(req):
+                if req.method == 'PUT': raise httpx.ConnectError('offline')
+                return original(req)
+            self.fake.handler = lost_put
+            async def tick(seconds):
+                clock[0] += seconds
+                if clock[0] == 25: self.fake.handler = original
+                if clock[0] >= 40: await self.ctl.aclose()
+            with patch('rpvolume.asyncio.sleep', tick): await self.ctl.run_forever()
+            self.assertEqual(self.ctl._backoff, 0)
+            self.assertEqual(self.ctl.sync_error, '')
+            self.assertTrue(self.ctl.is_alias_ready('A'))
+        asyncio.run(check())
+
+    def test_aclose_interrupts_active_loop(self):
+        """Shutdown must cancel an active stream so it cannot outlive its controller."""
+        async def check():
+            entered = asyncio.Event()
+            async def status(bid, jid):
+                entered.set(); await asyncio.Event().wait()
+            self.ctl.state['fetch_job'] = {'id': 'old', 'bid': 'runpod:worker', 'ts': 0,
+                'items': [{'path': 'models/a.safetensors', 'size': 5, 'url': 'https://example/a'}]}
+            self.ctl.deps.fetch_status = status
+            task = asyncio.create_task(self.ctl.run_forever())
+            await entered.wait(); await self.ctl.aclose()
+            await asyncio.sleep(0)
+            done = task.done()
+            if not done: task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            self.assertTrue(done)
+            self.assertIsNotNone(self.ctl.state['fetch_job'])
+        asyncio.run(check())
+
+    def test_idle_tick_does_not_replan_ready_volume(self):
+        """A ready volume must not pay for a fresh S3 listing every five seconds."""
+        async def check():
+            self.fake.objs['models/a.safetensors'] = b'12345'
+            clock = [0]; self.ctl.deps.now = lambda: clock[0]
+            async def tick(seconds):
+                clock[0] += seconds
+                if clock[0] >= 20: await self.ctl.aclose()
+            with patch('rpvolume.asyncio.sleep', tick): await self.ctl.run_forever()
+            listings = [p for method, p, auth in self.fake.calls if 'list-type' in p]
+            self.assertEqual(len(listings), 2)
+        asyncio.run(check())
+
+    def test_delete_unknown_cannot_delete_needed_unowned_file(self):
+        """A model required by an alias is not unknown merely because it lacks a manifest."""
+        self.fake.objs['models/a.safetensors'] = b'12345'
+        self.run_round()
+        self.assertEqual(asyncio.run(self.ctl.delete_unknown(['models/a.safetensors'])), 0)
+        self.assertTrue(self.ctl.is_alias_ready('A'))
+
+    def test_url_without_share_gets_size_before_fetch(self):
+        """A catalog-only model needs a bounded size even when the share cannot list it."""
+        self.src = {}
+        self.urls = {'models/a.safetensors': {'url': 'https://example/a'}}
+        original = self.fake.handler
+        def transport(request):
+            if request.url.host == 'example':
+                self.assertEqual(request.method, 'HEAD')
+                self.assertNotIn('authorization', request.headers)
+                return httpx.Response(200, headers={'content-length': '5'})
+            if request.url.host == 'rest.runpod.io': return self.rest(request)
+            return original(request)
+        self.ctl.deps.client_factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(transport))
+        asyncio.run(self.transfer())
+        self.assertEqual(self.payloads[0]['items'][0]['size'], 5)
+        self.assertTrue(self.ctl.is_alias_ready('A'))
+
+    def test_transient_url_failure_falls_back_on_third_attempt(self):
+        """Transient fetch failures must consume exactly three attempts before LAN fallback."""
+        self.result_ok = False
+        self.urls = {'models/a.safetensors': {'url': 'https://example/a'}}
+        asyncio.run(self.transfer())
+        self.assertEqual(self.ctl.state['url_fallback'], {})
+        asyncio.run(self.ctl._transfer_round())
+        self.assertEqual(self.ctl.state['url_fallback'], {})
+        asyncio.run(self.ctl._transfer_round())
+        self.assertEqual(len(self.payloads), 3)
+        self.assertEqual(self.ctl.state['url_fallback']['models/a.safetensors'], 'https://example/a')
+
+    def test_resume_polls_then_clears_missing_job(self):
+        """A saved queued job must be polled, and a 404 must release its reserved paths."""
+        self.ctl.state['fetch_job'] = {'id': 'old', 'bid': 'runpod:worker', 'ts': 0,
+            'items': [{'path': 'models/a.safetensors', 'size': 5, 'url': 'https://example/a'}]}
+        async def check():
+            calls = []
+            async def status(bid, jid):
+                calls.append(jid)
+                return {'status': 'IN_QUEUE'} if len(calls) == 1 else None
+            async def tick(seconds): self.assertEqual(seconds, 5)
+            self.ctl.deps.fetch_status = status
+            with patch('rpvolume.asyncio.sleep', tick): await self.ctl.resume()
+            self.assertEqual(calls, ['old', 'old'])
+            self.assertTrue(self.ctl._resumed)
+            self.assertEqual(self.ctl._inflight, set())
+            self.assertIsNone(self.saved[-1]['fetch_job'])
+        asyncio.run(check())
+
+    def test_no_backend_or_lan_reports_wait(self):
+        """Missing endpoint or offline share must explain why sync cannot advance."""
+        self.urls = {'models/a.safetensors': {'url': 'https://example/a'}}
+        self.refs = []
+        # Retain a plan from the referencing backend while it becomes unavailable.
+        self.refs = [{'name': 'worker'}]
+        async def check():
+            await self.ctl.resume(); await self.ctl.plan_round()
+            self.ctl._backends = []
+            await self.ctl._transfer_round()
+            self.assertIn('needs a RunPod endpoint on this volume', self.ctl.problems())
+            self.ctl._backends = [{'name': 'worker'}]
+            self.ctl.urls = {}
+            self.ctl.deps.lan.usable = lambda: False
+            await self.ctl._transfer_round()
+            self.assertIn('waiting for LAN source (offline)', self.ctl.problems())
+        asyncio.run(check())
+
+
+class TransferReview(TransferRound):
+    """Controller review of Task 8: each case once failed silently."""
+
+    def test_loop_survives_a_failed_job(self):
+        """run_fetch raises RuntimeError for a FAILED job (adapter _poll_rp). Uncaught, it
+        ended run_forever for good — the volume never synced again, no error anywhere."""
+        async def check():
+            clock = [0]
+            self.ctl.deps.now = lambda: clock[0]
+            self.urls = {'models/a.safetensors': {'url': 'https://example/a', 'size': 5}}
+            calls = []
+
+            async def failing(bid, payload, on_id):
+                calls.append(clock[0])
+                on_id('j1')                         # a FAILED job has an id
+                raise RuntimeError('RunPod: job failed')
+            self.ctl.deps.run_fetch = failing
+
+            async def tick(seconds):
+                clock[0] += seconds
+                if clock[0] >= 200:
+                    await self.ctl.aclose()
+            with patch('rpvolume.asyncio.sleep', tick):
+                await self.ctl.run_forever()
+            self.assertTrue(calls)
+            self.assertTrue(any('job failed' in line for line in self.logs))
+            # later rounds ran: the saved job was settled through resume (fetch_status)
+            self.assertIsNone(self.ctl.state['fetch_job'])
+        asyncio.run(check())
+
+    def test_lost_run_answer_holds_paths(self):
+        """A /run whose answer was lost may have started a job with no id saved: its
+        paths are held GHOST_HOLD_S before another job may write the same .gw-part."""
+        async def check():
+            clock = [0]
+            self.ctl.deps.now = lambda: clock[0]
+            self.urls = {'models/a.safetensors': {'url': 'https://example/a', 'size': 5}}
+            ok = self.ctl.deps.run_fetch
+            sent = []
+
+            async def lost(bid, payload, on_id):
+                sent.append(clock[0])
+                if len(sent) == 1:
+                    raise httpx.ReadTimeout('answer lost')
+                return await ok(bid, payload, on_id)
+            self.ctl.deps.run_fetch = lost
+            await self.ctl.resume()
+            await self.ctl.plan_round()
+            with self.assertRaises(httpx.ReadTimeout):
+                await self.ctl._transfer_round()
+            clock[0] = 60
+            await self.ctl._transfer_round()
+            self.assertEqual(len(sent), 1)
+            clock[0] = rpvolume.GHOST_HOLD_S + 1
+            await self.ctl._transfer_round()
+            self.assertEqual(len(sent), 2)
+        asyncio.run(check())
+
+    def test_size_head_sends_hf_token_only_to_hf(self):
+        """Without the token a gated HF file's size HEAD answers 401 and the file was
+        given up for the LAN at once although the endpoint holds HF_TOKEN."""
+        self.src = {}
+        self.ctl.deps.hf_token = lambda: 'hf_tok'
+        self.urls = {'models/a.safetensors': {'url': 'https://huggingface.co/r/resolve/main/a'},
+                     'models/b.safetensors': {'url': 'https://example/b'}}
+        self.needs = [need('A', [], catalog=list(self.urls))]
+        seen = {}
+        original = self.fake.handler
+
+        def transport(request):
+            if request.method == 'HEAD' and request.url.host in ('huggingface.co', 'example'):
+                seen[request.url.host] = request.headers.get('authorization')
+                return httpx.Response(200, headers={'content-length': '5'})
+            if request.url.host == 'rest.runpod.io':
+                return self.rest(request)
+            return original(request)
+        self.ctl.deps.client_factory = lambda: httpx.AsyncClient(transport=httpx.MockTransport(transport))
+        asyncio.run(self.transfer())
+        self.assertEqual(seen, {'huggingface.co': 'Bearer hf_tok', 'example': None})
+
+    def test_file_above_job_bytes_goes_alone(self):
+        """JOB_BYTES bounds a batch, not a file: a 30 GB model waited forever."""
+        big = rpvolume.JOB_BYTES + 1
+        self.urls = {'models/a.safetensors': {'url': 'https://example/a', 'size': big}}
+        self.src['models/a.safetensors'] = big
+        self.ctl.cfg['max_size_gb'] = 100
+        self.result_ok = False
+        asyncio.run(self.transfer())
+        self.assertEqual([i['size'] for i in self.payloads[0]['items']], [big])

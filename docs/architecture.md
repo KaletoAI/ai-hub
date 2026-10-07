@@ -2949,3 +2949,33 @@ transient S3/REST error keeps the last good snapshot (the files do not vanish wi
 503), only a gone or foreign volume clears it. Console snapshots omit catalog URLs,
 including job item URLs. `tests/test_rpvolume.py` pins S3 readiness, capped growth, pressure-only
 pruning, corrupt manifests, idle volumes and cached views without network I/O.
+
+Volume transfers reserve paths across fetch jobs and LAN streams. Fetch ids (backend
+id plus path/size/URL items) and multipart ids are saved before polling or streaming;
+fetch successes and completed LAN streams acquire manifest ownership only after an
+independent S3 HEAD. URL failures fall back after three attempts or a worker `final:`
+error; missing share copies block with a fault. LAN subprocesses use 128 MiB parts,
+verify byte count, exit status and the share hash, abort failed uploads, and accept a
+lost completion answer only with matching HEAD. Fetch batches retain plan order and
+cap both bytes and file count. Link jobs wait for their blobs and use the same saved
+job lifecycle so restarting cannot launch another link writer.
+
+Restart recovery settles the saved job (an unconfirmed cancel keeps the gate closed),
+then aborts saved and listed multipart uploads before enabling transfers. Unknown
+cleanup uses a fresh ownership list and fresh plan, and excludes every reserved path.
+The five-second loop replans on alias/backend/config, LAN-generation or catalog changes,
+an explicit sync, or ten minutes; transient errors back off 30–600 seconds and auth
+errors pause until credentials change. Only explicit recreation permits replacing a
+saved missing volume. Shutdown cancels the loop while preserving unsettled records.
+`tests/test_rpvolume.py` pins transfer splitting, secret-free payloads, save-before-poll,
+HEAD ownership, fallbacks, multipart failure/timeout, concurrent writers, recovery,
+batch limits, link ordering, cleanup guards, retry/auth pauses and shutdown.
+Catalog-only paths with no planner size get a URL HEAD before job submission (the HF
+token only for a Hugging Face host — httpx drops it on the CDN redirect; without it a
+gated file's 401 would give the URL up at once); the Content-Length is capacity-checked.
+`JOB_BYTES` bounds a batch, not a file: a bigger file goes alone and its `.gw-part`
+resumes across jobs. A missing length waits with a readable problem. A `/run` whose
+answer was lost (no id saved) holds its paths `GHOST_HOLD_S` — the job may run anyway,
+and two writers on one `.gw-part` corrupt it. `run_forever` catches every exception
+(a FAILED job's `RuntimeError` included) into the backoff: a loop that died there left
+the volume unsynced for good. The change signature (store reads) runs in a thread.
