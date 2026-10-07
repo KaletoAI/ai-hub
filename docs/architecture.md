@@ -2938,3 +2938,14 @@ trace and `main._billed_cloud_task`, a COMPLETED result found while giving up, t
 startup orphan cancel, the probe record's endpoint check, the chain refusal, the name
 clash and the url rule).
 Run them all with `python -m unittest discover -s tests -t .` (no runner dependency).
+
+The volume plan round reads both S3 model roots and the manifest, excludes worker
+`.gw-part` leftovers, and merges alias needs across referencing RunPod backends in a
+worker thread. Only capacity pressure permits pruning manifest-owned leftovers;
+unknown files remain untouched and count toward growth. Growth uses the lifecycle's
+fresh ownership check and configured ceiling. Capacity blocks and readiness are
+cached for request-time checks and swapped only at the end of a good round: a
+transient S3/REST error keeps the last good snapshot (the files do not vanish with a
+503), only a gone or foreign volume clears it. Console snapshots omit catalog URLs,
+including job item URLs. `tests/test_rpvolume.py` pins S3 readiness, capped growth, pressure-only
+pruning, corrupt manifests, idle volumes and cached views without network I/O.

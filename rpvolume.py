@@ -5,12 +5,17 @@ verify ownership afresh: a stale saved id is never permission to spend or delete
 """
 import asyncio
 import copy
+import json
+import math
 import re
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
 import httpx
+
+import modelsync
+import s3vol
 
 REST = "https://rest.runpod.io/v1"
 NAME_RE = re.compile(r"^[a-z0-9-]{1,40}$")
@@ -19,6 +24,7 @@ DCS = ("EU-RO-1", "EU-CZ-1", "EUR-IS-1", "EUR-NO-1", "US-CA-2",
        "US-NC-1", "US-NC-2", "US-NE-1", "US-WA-1")
 GONE_AFTER = 2
 FETCH_ATTEMPTS = 3
+MANIFEST_KEY = ".gw-modelsync.json"
 
 
 def rp_name(name: str) -> str:
@@ -105,6 +111,16 @@ class VolumeController:
         self._problem = ""
         self._api_rejected = None
         self._lock = asyncio.Lock()
+        self._plan_lock = asyncio.Lock()
+        self.plan = None
+        self.ready_aliases = set()
+        self.dest, self.manifest, self.urls = {}, {}, {}
+        self.transfers = []
+        self.sync_error = ""
+        self._backends = []
+        self._s3 = None
+        self._round_plan = None
+        self.last_error: Optional[BaseException] = None   # the last round's S3/REST error (backoff, auth pause)
 
     def _empty_state(self) -> dict:
         return {"id": None, "dc": self.cfg["datacenter"], "size_gb": None,
@@ -261,3 +277,172 @@ class VolumeController:
                 self.state = self._empty_state()
                 self._save()
                 return ""
+
+
+    def _used_bytes(self) -> int:
+        return sum(v for v in self.dest.values() if isinstance(v, int))
+
+    async def plan_round(self) -> None:
+        """Refresh the routing snapshot before any transfer can spend disk or money."""
+        async with self._plan_lock:
+            # The routing snapshot (plan, ready_aliases) is swapped only at the END of a
+            # good round: cleared up front, every round would 503 the RunPod aliases for
+            # its whole duration, and a transient S3 error would block models that are
+            # still on the volume. Only a volume that is gone or not ours clears it.
+            self.last_error = None
+            key, access, secret = self.deps.creds()
+            if not key or not access or not secret:
+                return
+            if not self.state["id"]:
+                self._problem = "volume id missing"
+                self.plan, self.ready_aliases = None, set()
+                return
+            if self._problem == "volume id missing":
+                self._problem = ""
+            if self._problem or self.state["missing"] >= GONE_AFTER:
+                self.plan, self.ready_aliases = None, set()
+                return
+
+            def inputs():
+                backends = self.deps.backends(self.name)
+                needs = modelsync._merge_needs([
+                    n for b in backends
+                    for n in self.deps.alias_needs(f"runpod:{b['name']}")])
+                src = self.deps.source_index()
+                return backends, needs, src, self.deps.url_catalog(src)
+
+            self._backends, needs, src, urls = await asyncio.to_thread(inputs)
+            async with self.deps.client_factory() as client:
+                self._s3 = (self.deps.s3_factory(client) if self.deps.s3_factory else
+                            s3vol.S3Volume(client, s3vol.endpoint_for(self.cfg["datacenter"]),
+                                           self.state["id"], access, secret,
+                                           self.cfg["datacenter"].lower()))
+                try:
+                    dest = await self._s3.list_objects("models/")
+                    dest.update(await self._s3.list_objects("hf-cache/"))
+                    self.dest = {p: v for p, v in dest.items() if not p.endswith(".gw-part")}
+                    raw = await self._s3.get(MANIFEST_KEY)
+                    try:
+                        text = (raw or b"{}").decode("utf-8")
+                        if not isinstance(json.loads(text), dict):
+                            raise ValueError("manifest is not an object")
+                    except (ValueError, UnicodeError):
+                        self.deps.log(f"RunPod volume {self.name}: unreadable manifest; files are unknown")
+                        text = "{}"
+                    self.manifest = modelsync.parse_manifest(text)
+                    for p, entry in self.manifest.items():
+                        target = entry.get("link")
+                        if entry.get("source") == "link":
+                            target = entry.get("target")
+                        if isinstance(target, str) and not p.endswith(".gw-part"):
+                            self.dest[p] = {"link": target}
+                    self.urls, stale = modelsync.without_fallbacks(urls, self.state["url_fallback"])
+                    if stale:
+                        for p in stale:
+                            self.state["url_fallback"].pop(p, None)
+                            self.state["url_fallback_why"].pop(p, None)
+                        self._save()
+                    plan = self._round_plan = modelsync.plan(needs, src, self.dest,
+                                                             self.manifest, self.urls)
+                    if self._backends:
+                        await self._space_for(sum(e["size"] or 0 for e in plan["fetch"]))
+                        plan = modelsync.plan(needs, src, self.dest, self.manifest, self.urls)
+                    else:
+                        # An idle volume keeps all owned leftovers, even if it is full.
+                        plan["prune"] = []
+                    ready = {a for a, row in plan["per_alias"].items()
+                             if not self._problem and modelsync.ready(plan, a) and not any(
+                                 f["path"] in self.state["blocked"] for f in row["files"])}
+                    self.plan, self.ready_aliases = plan, ready
+                    self.sync_error = ""
+                except (s3vol.S3Error, httpx.TransportError, RestError) as exc:
+                    # Provider error bodies may contain credentials or signed URLs. The
+                    # last good snapshot stays: the files it saw do not vanish with a 503.
+                    self.sync_error = f"volume sync failed ({type(exc).__name__})"
+                    self.last_error = exc
+                finally:
+                    self._round_plan = None
+                    self._s3 = None
+
+    async def _write_manifest(self, man: dict) -> None:
+        """Whole-object replacement keeps deleted paths out of persisted ownership."""
+        await self._s3.put(MANIFEST_KEY, json.dumps(man, sort_keys=True).encode("utf-8"))
+
+    async def _space_for(self, need_bytes: int) -> int:
+        """Only owned leftovers may make room; unknown objects still consume capacity."""
+        size = self.state["size_gb"] or self.cfg["size_gb"]
+        if self._used_bytes() + need_bytes > size * 10**9 * .95:
+            job = self.state["fetch_job"] or {}
+            inflight = {item["path"] for item in job.get("items", [])}
+            inflight.update(item["key"] for item in self.state["mpu"])
+            for p in self._round_plan["prune"]:
+                if p in inflight:
+                    continue
+                if await self.ensure_volume(False) is None:
+                    return max(0, self._used_bytes() + need_bytes - int(size * 10**9 * .95))
+                await self._s3.delete(p)
+                self.dest.pop(p, None)
+                self.manifest.pop(p, None)
+                await self._write_manifest(self.manifest)
+            have = self._used_bytes()
+            if have + need_bytes > size * 10**9 * .95:
+                target = math.ceil((have + need_bytes) * 1.10 / 1e9)
+                await self.grow_to(min(target, self.cfg["max_size_gb"]))
+        size = self.state["size_gb"] or self.cfg["size_gb"]
+        available = max(0, int(size * 10**9 * .95) - self._used_bytes())
+        blocked = self.state["blocked"]
+        # Re-evaluate capacity blocks, but preserve transfer-failure reasons.
+        for p in list(blocked):
+            if blocked[p].startswith("needs ") and ", limit " in blocked[p]:
+                del blocked[p]
+        allocated = set()
+        for alias, row in sorted(self._round_plan["per_alias"].items(),
+                                 key=lambda item: (item[1]["need_bytes"] - item[1]["have_bytes"], item[0])):
+            missing = [f for f in row["files"] if not f["present"] and f["path"] not in allocated]
+            amount = sum(f["size"] or 0 for f in missing)
+            if amount > available:
+                reason = f"needs {amount / 1e9:.1f} GB, limit {self.cfg['max_size_gb']} GB"
+                for f in missing:
+                    blocked.setdefault(f["path"], reason)
+            elif not row["blocked"]:
+                available -= amount
+                allocated.update(f["path"] for f in missing)
+        self._save()
+        return max(0, self._used_bytes() + need_bytes - int(size * 10**9 * .95))
+
+    def is_alias_ready(self, alias: str) -> bool:
+        return alias in self.ready_aliases
+
+    def alias_status(self, alias: str) -> str:
+        prefix = f"RunPod volume {self.name}: "
+        if self.plan is None:
+            return prefix + "no plan yet"
+        row = self.plan["per_alias"].get(alias, {})
+        reasons = sorted({self.state["blocked"][f["path"]] for f in row.get("files", [])
+                          if f["path"] in self.state["blocked"]})
+        return prefix + ("; ".join(reasons) if reasons else
+                         modelsync.status_text(self.plan, alias, self.name))
+
+    def view(self) -> dict:
+        """Expose the cached round without URLs or request-time network traffic."""
+        size = self.state["size_gb"] or 0
+        job = self.state["fetch_job"]
+        if job:
+            job = {k: copy.deepcopy(job[k]) for k in ("id", "bid", "ts") if k in job}
+            job["items"] = [{k: item[k] for k in ("path", "size") if k in item}
+                            for item in self.state["fetch_job"].get("items", [])]
+        return {"name": self.name, "dc": self.cfg["datacenter"], "id": self.state["id"],
+                "size_gb": size, "max_size_gb": self.cfg["max_size_gb"],
+                "used_bytes": self._used_bytes(),
+                "phase": ("off" if not self.state["id"] else
+                          "syncing" if self.plan is None or self.plan["fetch"] or self.transfers
+                          else "ready"),
+                "plan": modelsync.plan_view(self.plan, self.ready_aliases, self.dest,
+                                            self.manifest, self.urls) if self.plan is not None else {},
+                "transfers": copy.deepcopy(self.transfers),
+                "fetch_job": job,
+                "url_fallback": dict(self.state["url_fallback_why"]),
+                "blocked": dict(self.state["blocked"]), "sync_error": self.sync_error,
+                "problems": self.problems(), "cost_month_usd": size * .07,
+                "sync_cost_usd": self.state["sync_cost_usd"],
+                "backends": [b["name"] for b in self._backends]}
