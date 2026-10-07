@@ -3,6 +3,7 @@
 The volume API has no bulk delete or presigned URLs; requests use the same
 encoded path and query as the signer so model names survive unchanged.
 """
+import asyncio
 import hashlib
 import hmac
 import time
@@ -142,7 +143,9 @@ class S3Volume:
                    ok=(200,), missing_ok=False):
         path = f"/{self.bucket}/{key}" if key else f"/{self.bucket}"
         h = dict(headers or {})
-        h["x-amz-content-sha256"] = hashlib.sha256(body).hexdigest()
+        digest = (await asyncio.to_thread(hashlib.sha256, body)
+                  if len(body) >= 1024 * 1024 else hashlib.sha256(body))
+        h["x-amz-content-sha256"] = digest.hexdigest()
         h.update(sign(method, self.host, path, query or {}, h, h["x-amz-content-sha256"],
                       self._ak, self._sk, self.region, self._now()))
         q = encode_query(query or {})

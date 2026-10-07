@@ -2577,7 +2577,7 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
                   for b in binfo)
     # live while a volume is being created or synced (incl. `off`: the first create runs
     # in that phase); a ready volume's card has nothing that moves on its own
-    vol_busy = any(v.get("phase") != "ready" or v.get("transfers") or v.get("fetch_job")
+    vol_busy = any(v.get("phase") in ("syncing", "off") or v.get("transfers") or v.get("fetch_job")
                    for _n, v in vviews)
     live = 4 if draining_now else (2 if scan_st.get("running") else
                                    (3 if (host_busy or probing or vol_busy) else None))
@@ -3539,7 +3539,7 @@ def _host_sync(k: str, name: str, v: dict, base="/ui/hosts/managed", qkey="host"
     transfers, what the stop will delete, the held and the unknown files."""
     p = v.get("plan") if isinstance(v.get("plan"), dict) else None
     phase = str(v.get("phase") or "off")
-    running = phase in _SYNC_PHASES
+    running = phase in _SYNC_PHASES or (qkey == "vol" and phase == "waiting")
     out = []
     if v.get("sync_error"):
         out.append(f'<p class="bad" data-k="{_esc(k)}-syncerr">sync: {_esc(v["sync_error"])}</p>')
@@ -4342,7 +4342,9 @@ def _volume_card(name: str, v: dict) -> str:
     for path, why in (v.get("blocked") or {}).items():
         out += f'<p class="bad" data-k="{_esc(k)}-blocked-{_esc(path)}">{_esc(path)}: {_esc(why)}</p>'
     if isinstance(v.get("plan"), dict) and v["plan"] or v.get("transfers") or v.get("sync_error"):
-        out += _host_sync(k, name, v, base="/ui/volumes", qkey="vol")
+        sync_view = dict(v, plan=dict(v.get("plan") or {}))
+        sync_view["plan"]["unknown"] = list(sync_view["plan"].get("unknown") or []) + list(v.get("leftovers") or [])
+        out += _host_sync(k, name, sync_view, base="/ui/volumes", qkey="vol")
     job = v.get("fetch_job")
     if job:
         out += f'<p data-k="{_esc(k)}-job">Fetch job: {_esc(job.get("id", ""))}</p>'

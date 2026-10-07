@@ -187,3 +187,25 @@ class VolumeMain(unittest.TestCase):
         with patch.object(self.m, 'backends', []):
             self.assertEqual(asyncio.run(self.m.delete_volume('models')), '')
         self.assertNotIn('models', self.m.volume_names())
+
+    def test_delete_confirmed_gone_removes_config_and_state(self):
+        """Confirmed external deletion must be removable without creating or deleting a billed volume."""
+        self.m.save_volume('models', self.cfg, True)
+        c = self.m.volume_controllers['models']
+        c.state.update(id='gone', missing=2)
+        self.m._volume_save_state('models', c.state)
+        with patch.object(self.m, 'backends', []), patch.object(c, 'delete_volume', AsyncMock()) as delete:
+            self.assertEqual(asyncio.run(self.m.delete_volume('models')), '')
+            delete.assert_not_awaited()
+        self.assertNotIn('models', self.m.volume_names())
+        self.assertIsNone(self.m._volume_load_state('models'))
+
+    def test_fetch_execution_budget_override(self):
+        """Model transfers must pass their own byte-derived budget instead of a generation timeout."""
+        ad = Mock(spec=self.m.adapters.RunpodAdapter, run_op=AsyncMock(return_value={}))
+        b = dict(name='rp1', type='runpod', volume='models', max_wait=123)
+        with patch.object(self.m, 'backends', [b]), patch.object(self.m, 'backend_adapters', {'runpod:rp1': ad}):
+            d = self.m._volume_deps('models')
+            on_id = Mock()
+            asyncio.run(d.run_fetch('runpod:rp1', {'op': 'fetch'}, on_id, max_wait=1300))
+            ad.run_op.assert_awaited_once_with({'op': 'fetch'}, 1300, on_id)

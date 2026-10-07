@@ -294,8 +294,11 @@ def _under(path: str, root: str) -> bool:
     return real != base and os.path.commonpath([real, base]) == base
 
 
-def run_fetch(job_input: dict, root: str, opener=urllib.request.urlopen, env=os.environ) -> dict:
+def run_fetch(job_input: dict, root: str, opener=urllib.request.urlopen, env=os.environ,
+              ismount=os.path.ismount) -> dict:
     """Publish only verified bytes; retain interrupted downloads for the next job."""
+    if not ismount(root):
+        return {"error": "network volume not mounted at /runpod-volume"}
     results = []
     for item in job_input.get("items") or []:
         result = {"path": item.get("path") if isinstance(item, dict) else None,
@@ -309,7 +312,7 @@ def run_fetch(job_input: dict, root: str, opener=urllib.request.urlopen, env=os.
             if not isinstance(url, str) or urllib.parse.urlsplit(url).scheme != "https":
                 raise HandlerError("URL must use https")
             size = item.get("size")
-            if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            if size is not None and (not isinstance(size, int) or isinstance(size, bool) or size < 0):
                 raise HandlerError("size must be a nonnegative integer")
             final = os.path.join(root, path)
             part = final + ".gw-part"
@@ -322,7 +325,7 @@ def run_fetch(job_input: dict, root: str, opener=urllib.request.urlopen, env=os.
                 # HF redirects to CDNs: ordinary headers would forward the secret.
                 req.add_unredirected_header("Authorization", "Bearer " + env["HF_TOKEN"])
             n, digest = 0, hashlib.sha256()
-            if os.path.isfile(part) and os.path.getsize(part) < size:
+            if os.path.isfile(part) and (size is None or os.path.getsize(part) < size):
                 with open(part, "rb") as f:
                     while chunk := f.read(_CHUNK):
                         digest.update(chunk)
@@ -342,9 +345,9 @@ def run_fetch(job_input: dict, root: str, opener=urllib.request.urlopen, env=os.
                         digest.update(chunk)
                         n += len(chunk)
             result.update(size=n, sha256=digest.hexdigest())
-            if n != size or (item.get("sha256") and item["sha256"] != digest.hexdigest()):
+            if (size is not None and n != size) or (item.get("sha256") and item["sha256"] != digest.hexdigest()):
                 os.unlink(part)
-                why = "size mismatch" if n != size else "sha256 mismatch"
+                why = "size mismatch" if size is not None and n != size else "sha256 mismatch"
                 # a resumed part may be a stale file's head: the part is gone now, so the
                 # next attempt starts from byte 0 — only a fresh download's mismatch is final
                 result["error"] = ("" if resumed else "final: ") + why
@@ -357,8 +360,10 @@ def run_fetch(job_input: dict, root: str, opener=urllib.request.urlopen, env=os.
     return {"results": results}
 
 
-def run_link(job_input: dict, root: str) -> dict:
+def run_link(job_input: dict, root: str, ismount=os.path.ismount) -> dict:
     """Replace stale entries atomically so a sync never exposes a half-made link."""
+    if not ismount(root):
+        return {"error": "network volume not mounted at /runpod-volume"}
     results = []
     for item in job_input.get("links") or []:
         result = {"path": item.get("path") if isinstance(item, dict) else None,

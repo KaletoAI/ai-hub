@@ -165,3 +165,24 @@ class VolumeUI(unittest.TestCase):
              patch.object(admin.store, 'is_active', return_value=False):
             response = asyncio.run(admin._backends_view({}))
         self.assertNotIn('data-live=', response.body.decode())
+
+    def test_waiting_volume_page_is_static(self):
+        """A blocked or offline volume must not keep morphing the Backends tab forever."""
+        v = self.view()
+        v.update(phase='waiting', transfers=[], fetch_job=None)
+        with patch.object(admin, '_volume_names', return_value=['models']), \
+             patch.object(admin, '_volume_view', return_value=v), \
+             patch.object(admin, '_gateway_info', return_value={'backends': []}), \
+             patch.object(admin, '_host_names', return_value=[]), \
+             patch.object(admin.store, 'is_active', return_value=False):
+            response = asyncio.run(admin._backends_view({}))
+        self.assertNotIn('data-live=', response.body.decode())
+
+    def test_part_leftover_has_cleanup_checkbox(self):
+        """Worker partials must be visible and selectable alongside unknown volume objects."""
+        v = self.view(leftovers=[['models/download.gw-part', 123]])
+        v['phase'] = 'waiting'
+        html = admin._volume_card('models', v)
+        self.assertIn('name="path" value="models/download.gw-part"', html)
+        self.assertIn('/ui/volumes/delete-unknown', html)
+        self.assertEqual(v['plan']['unknown'], [['models/old', 100]])

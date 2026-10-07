@@ -307,6 +307,13 @@ class FetchOps(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = self.temp.name
         self.seen = []
+        # Temp directories stand in for the real mount for existing path/download tests.
+        from functools import partial
+        from unittest.mock import patch
+        fetch = patch.object(handler, 'run_fetch', partial(handler.run_fetch, ismount=lambda root: True))
+        link = patch.object(handler, 'run_link', partial(handler.run_link, ismount=lambda root: True))
+        fetch.start(); link.start()
+        self.addCleanup(fetch.stop); self.addCleanup(link.stop)
 
     def opener(self, data, status=200):
         import io
@@ -541,6 +548,29 @@ class FetchOps(unittest.TestCase):
                                           "target": "../../secret"}]}, self.root)
         self.assertFalse(out["results"][0]["ok"])
         self.assertFalse((cache / "sub/a").is_symlink())
+
+
+    def test_sizeless_fetch_checks_hash_and_reports_actual_size(self):
+        """HEAD-refusing URLs must still download safely with only the optional hash check."""
+        data = b'abc'
+        out = handler.run_fetch({'items': [dict(path='models/a', url='https://e/a', size=None,
+                    sha256=hashlib.sha256(data).hexdigest())]}, self.root,
+                    opener=self.opener(data), env={}, ismount=lambda root: True)
+        self.assertTrue(out['results'][0]['ok'])
+        self.assertEqual(out['results'][0]['size'], 3)
+        out = handler.run_fetch({'items': [dict(path='models/b', url='https://e/b', size=None,
+                    sha256='0' * 64)]}, self.root,
+                    opener=self.opener(data), env={}, ismount=lambda root: True)
+        self.assertFalse(out['results'][0]['ok'])
+        self.assertFalse(pathlib.Path(self.root, 'models/b').exists())
+
+    def test_unmounted_fetch_and_link_refused_before_writing(self):
+        """A worker without its network mount must not publish files into the container."""
+        out = handler.run_fetch({'items': [dict(path='models/a', url='https://e/a', size=3)]},
+                                self.root, opener=self.opener(b'abc'), ismount=lambda root: False)
+        self.assertEqual(out, {'error': 'network volume not mounted at /runpod-volume'})
+        self.assertEqual(handler.run_link({'links': []}, self.root, ismount=lambda root: False), out)
+        self.assertEqual(self.seen, [])
 
 
 if __name__ == "__main__":

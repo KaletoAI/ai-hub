@@ -1075,29 +1075,43 @@ Supported DCs: `EU-RO-1`, `EU-CZ-1`, `EUR-IS-1`, `EUR-NO-1`, `US-CA-2`, `US-GA-2
 `runpod_volume_state` is controller-owned persisted state, including the actual size,
 volume/job/upload ids and accumulated sync costs.
 
-All actions are POSTs. **Sync now** requests another round; if a saved volume has
+All actions are POSTs. **Sync now** requests another round, clears transfer failures
+and URL fallbacks for paths without an active writer, and retries size/hash lookups; if a saved volume has
 vanished from two lists, recreation requires confirming that a new empty volume will
 be billed. **Delete unknown** deletes only checked files after confirmation.
 **Delete volume** requires its name typed and no referencing backend, including
 disabled ones; pending writers must be settled. A never-created volume's delete
-removes only the config entry. Existing-volume growth/deletion verifies ownership
+removes its config and saved state. A volume confirmed deleted outside AI-Hub can
+also be removed without a RunPod DELETE. Existing-volume growth/deletion verifies ownership
 against a fresh RunPod list; a lost create answer is adopted on the next round.
 
 Volumes only grow. Capacity pressure first prunes unneeded manifest-owned files,
 then grows within the ceiling; unknown files are never automatically removed. A need
-above the ceiling blocks the affected aliases with a readable reason. Billing is
-by **provisioned size**, estimated at **$0.07/GB/month**: deleting files does not lower
+above the ceiling blocks the affected aliases with a readable reason. Completed or
+blocked transfers do not add to growth needs. Partial `.gw-part` downloads count
+toward used space and appear under unknown cleanup; active writers protect their parts.
+Billing is by **provisioned size**, estimated at **$0.07/GB/month**: deleting files does not lower
 that charge. The card shows monthly volume cost and cumulative fetch execution cost
 (`execution_ms / 3.6e6 * cost_per_hour`), an estimate that excludes cold-start/idle
 charges. Fetch jobs normally batch up to 20 GB and 50 files; a larger file goes alone.
+Downloads get a separate execution budget based on bytes, from ten minutes up to
+four hours. If HEAD cannot determine the size, the file goes alone with a four-hour
+budget and its completed size is verified through S3. The worker requires the
+network volume to be mounted before fetch/link work.
 
 For gated Hugging Face downloads, set **`HF_TOKEN` in the endpoint environment**;
-it never travels in a job input. Until M2b this is manual. A failed URL falls back to
-a LAN copy; without one it blocks and the checklist explains the problem. The
+it never travels in a job input. Until M2b this is manual. Three per-item failures
+or a final item error trigger fallback to a LAN copy; job/queue failures back off
+without consuming item retries. A failed HEAD still allows a worker download.
+Without a LAN copy the file blocks and the checklist explains the problem. The
 AI-Hub HF token is used only for the preliminary size HEAD to HF hosts, while the
 worker uses its endpoint token for downloads. Saved jobs/uploads are recovered before
 new transfers after restart, and transient sync errors back off while retaining the
-last good routing snapshot.
+last good routing snapshot. Each completed file/batch refreshes alias readiness
+immediately; remaining uploads proceed one unit per tick. Offline or blocked volumes
+show **waiting** and stop live polling. Lost submit answers reserve their paths
+across restart for the download budget plus queue time and a safety margin; expired
+job results are logged and shown on the card.
 
 ### Generation aliases + mapping
 

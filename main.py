@@ -8442,9 +8442,10 @@ def _volume_deps(name: str) -> "rpvolume.VolumeDeps":
             raise RuntimeError(f"RunPod backend {bid} is not available")
         return b, ad
 
-    async def run_fetch(bid, payload, on_id):
+    async def run_fetch(bid, payload, on_id, *, max_wait=None):
         b, ad = live(bid)
-        return await ad.run_op(payload, float(b.get("max_wait", 600)), on_id)
+        budget = float(b.get("max_wait", 600)) if max_wait is None else max_wait
+        return await ad.run_op(payload, budget, on_id)
 
     async def fetch_status(bid, rp_id):
         return await live(bid)[1].job_status(rp_id)
@@ -8611,13 +8612,14 @@ async def delete_volume(name: str) -> str:
         return "Volume is referenced by a RunPod backend"
     if c.state.get("fetch_job") or c.state.get("mpu"):
         return "Volume has transfers pending"
-    if not c.state.get("id"):
-        # never created at RunPod (no id saved, so nothing is billed): only the config
-        # entry goes — a fresh-list lookup would never find it and refuse for good. A
-        # create whose answer was lost is still adopted by name if the entry comes back.
+    if not c.state.get("id") or c.state.get("missing", 0) >= rpvolume.GONE_AFTER:
+        # A never-created or confirmed-gone volume has no remaining bill to cancel.
+        # Remove its local identity too, otherwise reusing the name keeps the gone id.
         entries = _load_runpod_volumes()
         entries.pop(name, None)
-        store.set_settings({"runpod_volumes": entries})
+        states = store.get_setting("runpod_volume_state", {})
+        states.pop(name, None)
+        store.set_settings({"runpod_volumes": entries, "runpod_volume_state": states})
         sync_volume_controllers()
         return ""
     try:

@@ -417,34 +417,40 @@ on the event loop without an await; new volume, job and upload ids are saved bef
 the next await, so a restart cannot buy a second volume or start a second writer.
 Neither bulk setting enters `get_settings()`.
 
-The account key (`runpod`) and S3 credentials (`runpod_s3`, encrypted as
-`<access id>:<secret>`, exactly one colon and no whitespace) are provider-token kinds,
-not hosting providers. They never enter rendered views, logs, argv or job inputs.
-The account key also backs an empty backend `api_key` through the adapter's injected
-callable. Fetch/status/cancel resolve the live adapter and its current max wait;
-volume faults use backend `volume:<name>` and source `volume`.
+The account key (`runpod`) and S3 credentials (`runpod_s3`, encrypted as `<access
+id>:<secret>`, exactly one colon and no whitespace) are provider-token kinds, not
+hosting providers. They never enter rendered views, logs, argv or job inputs. The
+account key also backs an empty backend `api_key` through the adapter's injected
+callable. Fetch/status/cancel resolve the live adapter; fetch accepts a transfer
+budget override and otherwise uses the backend max wait; volume faults use backend
+`volume:<name>` and source `volume`.
 
-**S3.** `s3vol.py` uses stdlib SigV4 and an injected httpx client, with no new dependency.
-The endpoint is `https://s3api-<dc lower>.runpod.io`, bucket is the volume id,
-path-style `/<volume id>/<key>`, and signing region is the lower-case DC id.
-Raw path segments and query fields share encoders with the request URL; paths are
-encoded once without normalizing model names. Every request signs its payload hash.
-Namespace-tolerant XML readers preserve continuation tokens, upload ids and errors;
-ListV2 follows every page so keys past 1000 are not silently lost. Missing reads
-return `None`, missing deletes/aborts count as done. Completion has a 900-second
-timeout (other requests 60 seconds), and error XML is checked even under HTTP 200.
-Authentication has a distinct `S3AuthError`; puts and multipart parts refuse buffers
-of 500,000,000 bytes or more.
+**S3.** `s3vol.py` uses stdlib SigV4 and an injected httpx client, with no new
+dependency. The endpoint is `https://s3api-<dc lower>.runpod.io`, bucket is the
+volume id, path-style `/<volume id>/<key>`, and signing region is the lower-case DC
+id. Raw path segments and query fields share encoders with the request URL; paths
+are encoded once without normalizing model names. Every request signs its payload
+hash; payloads of at least 1 MiB are hashed in a worker thread so multipart signing
+cannot stall requests. Namespace-tolerant XML readers preserve continuation tokens,
+upload ids and errors; ListV2 follows every page so keys past 1000 are not silently
+lost. Missing reads return `None`, missing deletes/aborts count as done. Completion
+has a 900-second timeout (other requests 60 seconds), and error XML is checked even
+under HTTP 200. Authentication has a distinct `S3AuthError`; puts and multipart
+parts refuse buffers of 500,000,000 bytes or more.
 
-**Plan round and money.** The controller merges alias needs across enabled referencing
-backends through the shared, pure `modelsync.plan()`. It reads `models/`, `hf-cache/`
-and `.gw-modelsync.json` over S3; `.gw-part` leftovers are excluded and reported.
-Manifest links override listing sizes. An unreadable manifest warns and becomes
-empty: its files are unknown, never automatically deleted. No referencing backend
-means idle, with nothing pruned. Needs and the change signature's store reads run in
-a worker thread.
+**Plan round and money.** The controller merges alias needs across enabled
+referencing backends through the shared, pure `modelsync.plan()`. It reads
+`models/`, `hf-cache/` and `.gw-modelsync.json` over S3; `.gw-part` leftovers stay
+outside the planning index but count toward used bytes and appear as selectable
+cleanup rows on the card. Manifest links override listing sizes. An unreadable
+manifest warns and becomes empty: its files are unknown, never automatically
+deleted. No referencing backend means idle, with nothing pruned. Needs and the
+change signature's store reads run in a worker thread.
 
-When used bytes plus missing bytes exceed 95% of provisioned capacity, only
+Missing bytes count only non-link fetch entries that are neither blocked nor already
+present at the planned size in the current destination. Unknown sizes count zero
+until a URL HEAD supplies a size or a completed job is verified by S3 HEAD. When
+used bytes plus missing bytes exceed 95% of provisioned capacity, only
 manifest-owned prune candidates may be removed, with manifest updates after each
 delete. Unknown files still consume space. If that is insufficient, growth targets
 `ceil((used + missing) * 1.10 / 10**9)` GB, capped by `max_size_gb`; aliases whose
@@ -453,86 +459,120 @@ does not lower the bill: provisioned GB cost $0.07/GB/month. Growth logs old/new
 and monthly cost through `note_fault(kind, detail)`.
 
 Creation first lists volumes and adopts a matching `aihub-<name>` in the right DC,
-including after a lost create answer; an absent volume has no id to validate yet.
-A saved id is gone only after two successful lists without it. Recreation requires
+including after a lost create answer; an absent volume has no id to validate yet. A
+saved id is gone only after two successful lists without it. Recreation requires
 explicit Sync now and confirmation that a new empty volume will be billed. Growth,
 volume deletion and S3 cleanup require an id in a fresh list with matching name/DC.
 Growth never shrinks or exceeds the ceiling. Volume deletion refuses every backend
 reference (including disabled backends, checked again after the list awaits) and
-pending writers. Deleting a never-created volume removes only its config entry.
+pending writers. Deleting a never-created volume or one confirmed gone from two
+lists removes its config and saved state without a REST DELETE.
 
 **Volume transfers.** URL catalog / HF-auto files use a fetch job; other files use a
 LAN stream. Fetch batches preserve plan order, normally at most `20 * 10**9` bytes
 and 50 files, one job per volume. `JOB_BYTES` bounds a batch, not a file: a larger
 file goes alone and its `.gw-part` can resume across jobs. Catalog-only files with
-unknown size get a capacity-checked Content-Length from a URL HEAD; absent length
-waits with a readable problem. The gateway HF token goes only on this size HEAD to
+unknown size try a capacity-checked Content-Length from a URL HEAD. HEAD failures
+(including 4xx/405) and absent lengths mean unknown size, cached for ten minutes;
+successful sizes are cached by URL until Sync now. An unknown-size item goes alone
+with `size: null`; only its optional hash is checked by the worker, and the S3 HEAD
+size becomes the manifest size. The gateway HF token goes only on this size HEAD to
 `huggingface.co`, its subdomains or `hf.co`; httpx strips it on a cross-origin CDN
 redirect. Worker downloads instead use endpoint-env `HF_TOKEN`, never job input.
 
 Jobs use the first enabled referencing backend sorted by name; without one, URL
-files wait for an endpoint. Fetch job ids, endpoint/backend and items are saved
-before polling. Every successful item needs an independent S3 HEAD before acquiring
-manifest ownership. Three URL failures or a worker `final:` error record a LAN
-fallback; without a share copy the path is blocked and a fault recorded. Execution
+files wait for an endpoint. Fetch job ids, endpoint/backend, items including alias
+ownership, and `budget_s` are saved before polling. Downloads use `max(600,
+min(4*3600, total_bytes / 20e6 + 300))` seconds, or four hours for an unknown-size
+item, passed through main to `run_op`. Every successful item needs an independent S3
+HEAD before acquiring manifest ownership. Only an explicit per-item `ok: false`
+consumes an attempt. Three item failures or a worker `final:` error record a LAN
+fallback; without a share copy the path is blocked and a fault recorded. Job-level
+failure, missing results or failed S3 verification clears the settled job and backs
+off with a visible problem; it does not sacrifice every URL in a batch. Execution
 cost is `execution_ms / 3.6e6 * cost_per_hour`, accumulated in `sync_cost_usd`.
 
 One LAN stream runs per volume, using the shared LanSource hash slot (transfer hash
 has priority). Files below `PART_SIZE = 128 * 1024 * 1024` use a single put; others
-save the multipart id before streaming `cat_argv(path, 0)` into 128 MiB parts.
-Byte count, subprocess exit and sha256 must match the share hash before completion;
-an independent HEAD must match before manifest ownership. Failure aborts the upload;
-a second failure blocks with “share file changing?”. A lost completion answer counts
-as success only if HEAD has the right size, otherwise abort and retry next round.
+save the multipart id before streaming `cat_argv(path, 0)` into 128 MiB parts. Byte
+count, subprocess exit and sha256 must match the share hash before completion; an
+independent HEAD must match before manifest ownership. Failure aborts the upload; a
+second failure blocks with “share file changing?”. A hash mismatch evicts the share
+hash cache, and LAN chunks of at least 1 MiB are hashed off the event loop. A lost
+completion answer counts as success only if HEAD has the right size, otherwise abort
+and retry next round.
 
 Fetch and LAN paths are reserved so there is never a second writer; pruning and
 Delete unknown skip all reserved paths. A lost `/run` answer without a saved id
-holds its paths for `GHOST_HOLD_S = 1800` seconds: the unseen job may still write.
-Link jobs wait for their blobs and use the same saved job lifecycle. Worker fetch/link
-ops run before ComfyUI readiness. Fetch accepts HTTPS only, resumes `.gw-part`,
-checks size/hash before `os.replace`, and rejects absolute, `..`, NUL, over-512-char
-or out-of-root paths per item. Resolved paths stay within `models/` or `hf-cache/`;
-link targets must resolve within `/runpod-volume/hf-cache/`. Worker HF credentials
-are sent only to HF hosts and kept off redirects. `info` reports mounted volume bytes.
+holds its paths for the job budget plus the backend queue allowance (default 300 s)
+plus 60 s: the unseen job may still write. Only ReadTimeout, ReadError,
+RemoteProtocolError, cancellation, or the unreadable-job-id RuntimeError creates
+this hold; definite pre-submit failures do not. Holds persist in `state["ghost"]`
+and survive restart; expired holds are dropped. Cleanup protects a `.gw-part`
+whenever its final path is held by a fetch, ghost, LAN stream or multipart upload.
+Link jobs wait for their blobs and use the same saved job lifecycle. Worker
+fetch/link ops run before ComfyUI readiness and refuse an unmounted `/runpod-volume`
+with a job-level error before any per-item work. Fetch accepts HTTPS only, resumes
+`.gw-part`, checks size/hash before `os.replace`, and rejects absolute, `..`, NUL,
+over-512-char or out-of-root paths per item. Resolved paths stay within `models/` or
+`hf-cache/`; link targets must resolve within `/runpod-volume/hf-cache/`. Worker HF
+credentials are sent only to HF hosts and kept off redirects. `info` reports mounted
+volume bytes.
 
-**Resume and gate.** Boot settles a saved fetch/link job by polling or confirmed cancel
-before another writer, then aborts saved and listed multipart leftovers under both
-model roots. An unconfirmed cancel keeps the gate closed. Shutdown preserves unsettled
-records. The five-second loop replans on alias/backend/config, LAN-generation or
-catalog changes, explicit Sync now, or every ten minutes. It survives any round
-exception, including a FAILED job's `RuntimeError`, with 30–600-second backoff;
-auth failures pause until credentials change.
+**Resume and gate.** Boot settles a saved fetch/link job by polling or confirmed
+cancel before another writer, allowing the saved budget (four hours for old records)
+plus 300 s queue time and 60 s margin before cancellation, then aborts saved and
+listed multipart leftovers under both model roots. An unconfirmed cancel keeps the
+gate closed. Shutdown preserves unsettled records. Expired RunPod results release
+the saved writer with a logged and visible “result lost … files are re-checked”
+warning; execution cost cannot be recovered from an expired response. The
+five-second loop replans on alias/backend/config, LAN-generation or catalog changes,
+explicit Sync now, or every ten minutes. It survives any round exception, including
+a FAILED job's `RuntimeError`, with 30–600-second backoff; auth failures pause until
+credentials change.
 
-Readiness excludes aliases touching blocked paths. The routing snapshot is swapped
-at the end of a good round; transient S3/REST errors keep the last good snapshot,
-while a gone or foreign volume clears it. `modelsync_gate` checks cached readiness
-and status without I/O: configured volume without controller/plan is not ready and
-returns an explanatory 503; blank `volume` retains ungated M1 behavior. RunPod ids
-participate in the shared ComfyUI alias needs/signature helpers. Console snapshots
-omit catalog and job-item URLs.
+Each tick transfers one LAN file, one fetch batch or one link job. A completed unit
+recomputes the plan and readiness purely over the cached needs/source/URLs and the
+updated destination/manifest, without S3 listing or manifest GET. Waiting ticks do
+no replanning or store writes; space checks save only changed blocks. The next tick
+checks the change signature before starting another unit.
+
+Sync now releases transfer blocks, URL attempts/fallbacks and LAN failure counts,
+and evicts failed LAN hashes and URL HEAD sizes, while preserving held paths and
+capacity decisions. A plan-present file or manifest link clears its persisted block.
+Readiness excludes aliases touching remaining blocks. The routing snapshot is
+swapped at the end of a good plan or completed transfer unit; transient S3/REST
+errors keep the last good snapshot, while a gone or foreign volume clears it.
+`modelsync_gate` checks cached readiness and status without I/O: configured volume
+without controller/plan is not ready and returns an explanatory 503; blank `volume`
+retains ungated M1 behavior. RunPod ids participate in the shared ComfyUI alias
+needs/signature helpers. Console snapshots omit catalog and job-item URLs.
 
 **Console.** Backends → RunPod volumes follows Managed hosts, with cached cards,
 checklist, referencing-backend links, sync table/source badges, transfer progress,
 fetch id, provisioned/used size, monthly cost and cumulative sync cost. The editor
 shows the configured start size, read-only once created; the ceiling may never fall
 below the grown size. A not-yet-created volume says so, no plan means no empty sync
-table, and the Backends tab polls while a volume is not ready. Sync now, Delete unknown
-(checked paths plus confirmation) and Delete volume (typed name, no references) are
-POST actions. Cards share `_host_sync` with a volume action prefix and field name.
-Unknown cleanup refreshes ownership and plan before deletion. Refused saves preserve
-typed input with 400; `volume_field_refusal` validates the backend volume reference
-before writing, and the select renders in every pane state. Cards/rows carry `data-k`, with no new
-script. Separate API/S3 secret forms show presence only: blank keeps, clear removes;
-S3 id and secret are joined on POST. Endpoint/template provisioning and setting the
-worker's HF_TOKEN remain operator work until M2b.
+table, and the Backends tab polls only for off/syncing volumes or active
+transfers/jobs. Remaining files waiting on an offline LAN, missing endpoint or
+blocks show phase `waiting`; their cached tables and unknown/partial cleanup remain
+visible. Sync now, Delete unknown (checked paths plus confirmation) and Delete
+volume (typed name, no references) are POST actions. Cards share `_host_sync` with a
+volume action prefix and field name. Unknown cleanup refreshes ownership and plan
+before deletion. Refused saves preserve typed input with 400; `volume_field_refusal`
+validates the backend volume reference before writing, and the select renders in
+every pane state. Cards/rows carry `data-k`, with no new script. Separate API/S3
+secret forms show presence only: blank keeps, clear removes; S3 id and secret are
+joined on POST. Endpoint/template provisioning and setting the worker's HF_TOKEN
+remain operator work until M2b.
 
 Tests (each guards a silent failure):
 
-- `tests/test_s3vol.py`: AWS signatures/raw Unicode encoding, XML readers, three-page ListV2, multipart/ETags, HTTP-200 errors, auth, timeouts, size boundaries and secret-free URLs.
-- `tests/test_rpvolume.py`: adoption/gone/ownership money guards, pressure-only prune and capped growth, atomic cached readiness, HEAD ownership, batch splitting, fallbacks, multipart failures, writer reservations, ghost holds, resume, links, cleanup, backoff/auth pauses and shutdown.
-- `tests/test_rpvolume_main.py`: controller reconciliation, state persistence, live adapter/secrets wiring, routing gate, reference validation and deletion guards.
-- `tests/test_rpvolume_ui.py`: volume forms/cards, start versus grown size, reference links, recreation billing confirms, actions, secret presence and backend fields in every pane.
-- `tests/test_runpod_worker.py` (`FetchOps`): path/link escape refusal, resumable downloads, hash-before-rename, HF token from env only and mounted-volume info.
+- `tests/test_s3vol.py`: AWS signatures/raw Unicode encoding, XML readers, three-page ListV2, multipart/ETags, HTTP-200 errors, auth, timeouts, size boundaries, secret-free URLs and payload hashing off the event loop.
+- `tests/test_rpvolume.py`: adoption/gone/ownership money guards, pressure-only prune and capped growth, atomic cached readiness, HEAD ownership, batch splitting, fallbacks, multipart failures, writer reservations, persisted ghost holds, resume budgets/alias ownership, partial cleanup, retry resets, job-level versus item failures, HEAD caching/unknown sizes, one-unit readiness, current-byte growth accounting, backoff/auth pauses and shutdown.
+- `tests/test_rpvolume_main.py`: controller reconciliation, state persistence, live adapter/secrets wiring, routing gate, reference validation, transfer budget overrides and confirmed-gone deletion guards.
+- `tests/test_rpvolume_ui.py`: volume forms/cards, start versus grown size, reference links, recreation billing confirms, actions, secret presence, waiting-page polling, partial cleanup rows and backend fields in every pane.
+- `tests/test_runpod_worker.py` (`FetchOps`): path/link escape refusal, resumable downloads, hash-before-rename, HF token from env only, unknown-size verification, unmounted-operation refusal and mounted-volume info.
 - `tests/test_runpod_adapter.py` (`VolumeOps`): save-before-poll/cancel-on-save-failure, job-status recovery, account-key fallback and RunPod URL guard.
 
 ### `meshy.py`

@@ -346,3 +346,19 @@ class HTTPClient(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HashOffLoop(unittest.TestCase):
+    def test_large_payload_hash_runs_in_thread(self):
+        """S3 signing a large part must not stall the event loop for a second full hash."""
+        from unittest.mock import patch
+        async def check():
+            orig = asyncio.to_thread
+            calls = []
+            async def spy(fn, *args, **kwargs):
+                calls.append(fn); return await orig(fn, *args, **kwargs)
+            async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200))) as client:
+                s3 = s3vol.S3Volume(client, 'https://s3api-eu-ro-1.runpod.io', 'v', 'a', 's', 'eu-ro-1')
+                with patch('asyncio.to_thread', spy): await s3.put('models/a', b'x' * 1048576)
+            self.assertTrue(calls)
+        asyncio.run(check())

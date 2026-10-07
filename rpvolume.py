@@ -29,10 +29,6 @@ PART_SIZE = 128 * 1024 * 1024
 JOB_BYTES = 20 * 10**9
 JOB_FILES = 50
 MANIFEST_KEY = ".gw-modelsync.json"
-# A /run whose answer was lost may still have started a job we have no id for: its
-# paths stay reserved this long (≥ a fetch job's executionTimeout + queue) before
-# another writer may touch them — two writers on one `.gw-part` corrupt it.
-GHOST_HOLD_S = 1800
 _HF_HOSTS = ("huggingface.co", "hf.co")
 
 
@@ -125,6 +121,9 @@ class VolumeController:
         self.plan = None
         self.ready_aliases = set()
         self.dest, self.manifest, self.urls = {}, {}, {}
+        self.leftovers = {}
+        self._plan_inputs = None
+        self._head_sizes, self._head_retry_at = {}, {}
         self.transfers = []
         self.sync_error = ""
         self._backends = []
@@ -143,14 +142,18 @@ class VolumeController:
         self._paused_creds = None
         self._s3_rejected = None
         self._transfer_problem = ""
-        self._ghost: dict = {}                 # path → monotonic-ish deadline (deps.now) of a lost /run
+        self._fetch_problem = ""
+        self._ghost = {p: t for p, t in self.state['ghost'].items() if t > deps.now()}
+        if self._ghost != self.state['ghost']:
+            self.state['ghost'] = dict(self._ghost)
+            self._save()
         self.last_error: Optional[BaseException] = None   # the last round's S3/REST error (backoff, auth pause)
 
     def _empty_state(self) -> dict:
         return {"id": None, "dc": self.cfg["datacenter"], "size_gb": None,
                 "missing": 0, "fetch_job": None, "mpu": [],
                 "url_fallback": {}, "url_fallback_why": {},
-                "sync_cost_usd": 0.0, "sync_seconds": 0.0, "blocked": {}}
+                "sync_cost_usd": 0.0, "sync_seconds": 0.0, "blocked": {}, "ghost": {}}
 
     def _save(self):
         self.deps.save_state(self.name, self.state)
@@ -169,6 +172,8 @@ class VolumeController:
             lines.append("S3 key rejected")
         if self._transfer_problem:
             lines.append(self._transfer_problem)
+        if self._fetch_problem:
+            lines.append(self._fetch_problem)
         if self._problem:
             lines.append(self._problem)
         if self.state["missing"] >= GONE_AFTER:
@@ -308,7 +313,8 @@ class VolumeController:
 
 
     def _used_bytes(self) -> int:
-        return sum(v for v in self.dest.values() if isinstance(v, int))
+        return (sum(v for v in self.dest.values() if isinstance(v, int))
+                + sum(self.leftovers.values()))
 
     async def plan_round(self) -> None:
         """Refresh the routing snapshot before any transfer can spend disk or money."""
@@ -349,6 +355,7 @@ class VolumeController:
                     dest = await self._s3.list_objects("models/")
                     dest.update(await self._s3.list_objects("hf-cache/"))
                     self.dest = {p: v for p, v in dest.items() if not p.endswith(".gw-part")}
+                    self.leftovers = {p: v for p, v in dest.items() if p.endswith(".gw-part")}
                     raw = await self._s3.get(MANIFEST_KEY)
                     try:
                         text = (raw or b"{}").decode("utf-8")
@@ -370,18 +377,21 @@ class VolumeController:
                             self.state["url_fallback"].pop(p, None)
                             self.state["url_fallback_why"].pop(p, None)
                         self._save()
+                    self._plan_inputs = (needs, src, self.urls)
                     plan = self._round_plan = modelsync.plan(needs, src, self.dest,
                                                              self.manifest, self.urls)
+                    self._drop_present_blocks(plan)
+                    # A raised ceiling releases the old capacity decision for this round.
+                    before = dict(self.state['blocked'])
+                    for p, reason in list(before.items()):
+                        if (self._capacity_reason(reason) and
+                                not reason.endswith(f"limit {self.cfg['max_size_gb']} GB")):
+                            self.state['blocked'].pop(p)
+                    if before != self.state['blocked']:
+                        self._save()
                     if self._backends:
-                        await self._space_for(sum(e["size"] or 0 for e in plan["fetch"]))
-                        plan = modelsync.plan(needs, src, self.dest, self.manifest, self.urls)
-                    else:
-                        # An idle volume keeps all owned leftovers, even if it is full.
-                        plan["prune"] = []
-                    ready = {a for a, row in plan["per_alias"].items()
-                             if not self._problem and modelsync.ready(plan, a) and not any(
-                                 f["path"] in self.state["blocked"] for f in row["files"])}
-                    self.plan, self.ready_aliases = plan, ready
+                        await self._space_for(self._remaining_need(plan))
+                    self._refresh_plan()
                     self.sync_error = ""
                 except (s3vol.S3Error, httpx.TransportError, RestError) as exc:
                     # Provider error bodies may contain credentials or signed URLs. The
@@ -392,18 +402,79 @@ class VolumeController:
                     self._round_plan = None
                     self._s3 = None
 
+    @staticmethod
+    def _capacity_reason(reason):
+        return reason.startswith('needs ') and ', limit ' in reason
+
+    def _held_paths(self):
+        held = set(self._inflight)
+        held.update(i['path'] for i in (self.state['fetch_job'] or {}).get('items', []))
+        held.update(m['key'] for m in self.state['mpu'])
+        held.update(p for p, t in self._ghost.items() if t > self.deps.now())
+        return held
+
+    def _drop_present_blocks(self, plan):
+        before = dict(self.state['blocked'])
+        for row in plan['per_alias'].values():
+            for f in row['files']:
+                if f['present']:
+                    self.state['blocked'].pop(f['path'], None)
+        if before != self.state['blocked']:
+            self._save()
+
+    def _refresh_plan(self):
+        """Publish each completed unit immediately without paying for another S3 listing."""
+        if self._plan_inputs is None:
+            return
+        needs, src, urls = self._plan_inputs
+        urls, _ = modelsync.without_fallbacks(urls, self.state['url_fallback'])
+        self.urls = urls
+        plan = modelsync.plan(needs, src, self.dest, self.manifest, urls)
+        self._drop_present_blocks(plan)
+        if not self._backends:
+            plan['prune'] = []
+        ready = {a for a, row in plan['per_alias'].items()
+                 if not self._problem and modelsync.ready(plan, a) and not any(
+                     f['path'] in self.state['blocked'] for f in row['files'])}
+        self.plan, self.ready_aliases = plan, ready
+
+    def _remaining_need(self, plan):
+        """Growth counts only missing transferable bytes in the current destination."""
+        entries = {e['path']: e for e in plan['fetch']}
+        return sum(e['size'] or 0 for e in entries.values()
+                   if e['source'] != 'link' and e['path'] not in self.state['blocked']
+                   and (e['size'] is None or self.dest.get(e['path']) != e['size']))
+
+    def _can_progress(self):
+        if self._inflight or self.transfers or self.state['fetch_job']:
+            return True
+        if (self.plan is None or not all(self.deps.creds()) or self._paused_creds == self.deps.creds()
+                or self.state['missing'] >= GONE_AFTER or self._problem):
+            return False
+        held = self._held_paths()
+        for e in self.plan['fetch']:
+            if e['path'] in held or e['path'] in self.state['blocked']:
+                continue
+            if e['source'] == 'link':
+                if self._backends and modelsync.link_target(e['path'], e['target']) in self.dest:
+                    return True
+            elif e['path'] in self.urls:
+                if self._backends:
+                    return True
+            elif self.deps.lan and self.deps.lan.usable():
+                return True
+        return False
+
     async def _write_manifest(self, man: dict) -> None:
         """Whole-object replacement keeps deleted paths out of persisted ownership."""
         await self._s3.put(MANIFEST_KEY, json.dumps(man, sort_keys=True).encode("utf-8"))
 
     async def _space_for(self, need_bytes: int) -> int:
         """Only owned leftovers may make room; unknown objects still consume capacity."""
+        before = dict(self.state["blocked"])
         size = self.state["size_gb"] or self.cfg["size_gb"]
         if self._used_bytes() + need_bytes > size * 10**9 * .95:
-            job = self.state["fetch_job"] or {}
-            inflight = {item["path"] for item in job.get("items", [])}
-            inflight.update(item["key"] for item in self.state["mpu"])
-            inflight.update(self._inflight)
+            inflight = self._held_paths()
             for p in self._round_plan["prune"]:
                 if p in inflight:
                     continue
@@ -422,12 +493,13 @@ class VolumeController:
         blocked = self.state["blocked"]
         # Re-evaluate capacity blocks, but preserve transfer-failure reasons.
         for p in list(blocked):
-            if blocked[p].startswith("needs ") and ", limit " in blocked[p]:
+            if self._capacity_reason(blocked[p]):
                 del blocked[p]
         allocated = set()
         for alias, row in sorted(self._round_plan["per_alias"].items(),
                                  key=lambda item: (item[1]["need_bytes"] - item[1]["have_bytes"], item[0])):
-            missing = [f for f in row["files"] if not f["present"] and f["path"] not in allocated]
+            missing = [f for f in row["files"] if not f["present"] and f["path"] not in allocated
+                       and f["path"] not in blocked and "link" not in f]
             amount = sum(f["size"] or 0 for f in missing)
             if amount > available:
                 reason = f"needs {amount / 1e9:.1f} GB, limit {self.cfg['max_size_gb']} GB"
@@ -436,7 +508,8 @@ class VolumeController:
             elif not row["blocked"]:
                 available -= amount
                 allocated.update(f["path"] for f in missing)
-        self._save()
+        if before != blocked:
+            self._save()
         return max(0, self._used_bytes() + need_bytes - int(size * 10**9 * .95))
 
     def is_alias_ready(self, alias: str) -> bool:
@@ -464,8 +537,10 @@ class VolumeController:
                 "size_gb": size, "start_size_gb": self.cfg["size_gb"],
                 "max_size_gb": self.cfg["max_size_gb"],
                 "used_bytes": self._used_bytes(), "missing": self.state["missing"],
+                "leftovers": [[p, n] for p, n in sorted(self.leftovers.items())],
                 "phase": ("off" if not self.state["id"] else
-                          "syncing" if self.plan is None or self.plan["fetch"] or self.transfers
+                          "syncing" if self._can_progress() else
+                          "waiting" if self.plan is None or self.plan["fetch"] or self.problems()
                           else "ready"),
                 "plan": modelsync.plan_view(self.plan, self.ready_aliases, self.dest,
                                             self.manifest, self.urls) if self.plan is not None else {},
@@ -487,14 +562,16 @@ class VolumeController:
     async def _record_present(self, s3, entry, sha256, source):
         """Only independent S3 verification establishes manifest ownership."""
         path = entry['path']
-        if await s3.head(path) != entry['size']:
+        size = await s3.head(path)
+        if size is None or (entry['size'] is not None and size != entry['size']):
             return False
         man = dict(self.manifest)
-        man[path] = dict(size=entry['size'], sha256=sha256, source=source,
+        man[path] = dict(size=size, sha256=sha256, source=source,
                          aliases=entry.get('aliases', []), ts=self.deps.now())
         await s3.put(MANIFEST_KEY, json.dumps(man, sort_keys=True).encode())
         self.manifest = man
-        self.dest[path] = entry['size']
+        self.dest[path] = size
+        self.leftovers.pop(path + '.gw-part', None)
         return True
 
     def _attempt_failed(self, entry, error):
@@ -516,44 +593,81 @@ class VolumeController:
         self._save()
         self._sync_requested = True
 
+    def _job_failed(self, status):
+        # Arbitrary provider error bodies can echo signed URLs or secrets. The mount
+        # error is worker-owned text and helps diagnose an unattached endpoint.
+        output = status.get('output') or {}
+        mount_error = 'network volume not mounted at /runpod-volume'
+        detail = (mount_error if output.get('error') == mount_error else
+                  str(status.get('status') or 'result not verified'))
+        self._fetch_problem = 'fetch job failed: ' + detail
+        raise RuntimeError(self._fetch_problem)
+
     async def _finish_fetch(self, s3, job, status, entries=None):
-        results = {r.get('path'): r for r in (status.get('output') or {}).get('results', [])}
+        output = status.get('output') or {}
+        results = {r.get('path'): r for r in output.get('results', [])}
         by_path = {e['path']: e for e in entries or []}
+        failed = not results
         for item in job['items']:
             entry = {**item, **by_path.get(item['path'], {})}
-            result = results.get(item['path'], {})
-            if (result.get('ok') and await self._record_present(
-                    s3, entry, result.get('sha256'), 'url')):
+            result = results.get(item['path'])
+            if result is None:
+                failed = True
+            elif result.get('ok') is False:
+                self._attempt_failed(entry, result.get('error') or 'fetch item failed')
+            elif result.get('ok') and await self._record_present(s3, entry, result.get('sha256'), 'url'):
                 self.attempts.pop(item['path'], None)
             else:
-                self._attempt_failed(entry, result.get('error') or 'fetch result not verified')
+                failed = True
         backend = next((b for b in self.deps.backends(self.name)
                         if 'runpod:' + b['name'] == job['bid']), {})
         ms = status.get('executionTime') or 0
         self.state['sync_cost_usd'] += ms / 3.6e6 * float(backend.get('cost_per_hour') or 0)
         self.state['fetch_job'] = None
         self._save()
+        self._refresh_plan()
+        if failed:
+            self._job_failed(status)
+        self._fetch_problem = ''
+
+    def _hold_uncertain(self, exc, paths, bid, budget_s):
+        """Only an ambiguous /run reserves paths without an id, including across restart."""
+        if not (isinstance(exc, (httpx.ReadTimeout, httpx.ReadError, httpx.RemoteProtocolError,
+                                 asyncio.CancelledError)) or
+                isinstance(exc, RuntimeError) and
+                str(exc) == 'RunPod answered /run without a readable job id'):
+            return
+        backend = next((b for b in self._backends or self.deps.backends(self.name)
+                        if 'runpod:' + b['name'] == bid), {})
+        until = self.deps.now() + budget_s + float(backend.get('queue_max_s', 300)) + 60
+        self._ghost.update({p: until for p in paths})
+        self.state['ghost'] = dict(self._ghost)
+        self._save()
 
     async def _fetch_batch(self, bid: str, entries: list) -> None:
         """Persist the billed job before polling and keep its paths reserved until settled."""
         if self.state['fetch_job'] or any(e['path'] in self._inflight for e in entries):
             return
+        budget_s = (4 * 3600 if any(e['size'] is None for e in entries) else
+                    max(600, min(4 * 3600, sum(e['size'] for e in entries) / 20e6 + 300)))
         items = [{k: e[k] for k in ('path', 'url', 'size', 'sha256') if k in e}
                  for e in entries]
         paths = {e['path'] for e in entries}
         self._inflight.update(paths)
         def on_id(jid):
-            self.state['fetch_job'] = dict(id=jid, bid=bid, items=[
-                {k: i[k] for k in ('path', 'size', 'url')} for i in items], ts=self.deps.now())
+            self.state['fetch_job'] = dict(id=jid, bid=bid, budget_s=budget_s, items=[
+                {k: e[k] for k in ('path', 'size', 'url', 'aliases') if k in e}
+                for e in entries], ts=self.deps.now())
             self._save()
         try:
             try:
-                status = await self.deps.run_fetch(bid, {'op': 'fetch', 'items': items}, on_id)
-            except BaseException:
+                status = await self.deps.run_fetch(bid, {'op': 'fetch', 'items': items}, on_id,
+                                                   max_wait=budget_s)
+            except BaseException as exc:
                 if not self.state['fetch_job']:
-                    # no id saved: the job may exist anyway (lost /run answer) — hold
-                    until = self.deps.now() + GHOST_HOLD_S
-                    self._ghost.update({p: until for p in paths})
+                    self._hold_uncertain(exc, paths, bid, budget_s)
+                elif not isinstance(exc, asyncio.CancelledError):
+                    self._fetch_problem = 'fetch job failed: ' + type(exc).__name__
                 raise
             if status.get('status') not in ('COMPLETED', 'FAILED', 'CANCELLED', 'TIMED_OUT'):
                 self._resumed = False
@@ -581,7 +695,10 @@ class VolumeController:
                 chunk = exc.partial
             if not chunk:
                 break
-            digest.update(chunk)
+            if len(chunk) >= 1024 * 1024:
+                await asyncio.to_thread(digest.update, chunk)
+            else:
+                digest.update(chunk)
             progress['bytes'] += len(chunk)
             if uid:
                 etags.append(await s3.mpu_part(entry['path'], uid, len(etags) + 1, chunk))
@@ -591,6 +708,8 @@ class VolumeController:
                 break
         rc = await proc.wait()
         expected = await self.deps.lan.sha256(entry['path'], entry['size'])
+        if digest.hexdigest() != expected and hasattr(self.deps.lan, 'forget_sha'):
+            self.deps.lan.forget_sha(entry['path'], entry['size'])
         if rc or progress['bytes'] != entry['size'] or digest.hexdigest() != expected:
             return None
         if uid:
@@ -628,6 +747,7 @@ class VolumeController:
                         self._stream_failed(path)
                     else:
                         self._stream_failures.pop(path, None)
+                        self._refresh_plan()
                 finally:
                     if uid:
                         if not verified:
@@ -643,7 +763,7 @@ class VolumeController:
 
     async def _make_links(self, plan) -> None:
         entries = [e for e in plan['fetch'] if e['source'] == 'link' and
-                   e['path'] not in self._inflight and e['path'] not in self.state['blocked']
+                   e['path'] not in self._held_paths() and e['path'] not in self.state['blocked']
                    and modelsync.link_target(e['path'], e['target']) in self.dest]
         if not entries:
             return
@@ -655,12 +775,20 @@ class VolumeController:
         self._inflight.update(paths)
         bid = 'runpod:' + sorted(self._backends, key=lambda b: b['name'])[0]['name']
         def on_id(jid):
-            self.state['fetch_job'] = dict(id=jid, bid=bid, ts=self.deps.now(),
-                items=[dict(path=e['path'], size=0, url='', target=e['target']) for e in entries])
+            self.state['fetch_job'] = dict(id=jid, bid=bid, ts=self.deps.now(), budget_s=600,
+                items=[dict(path=e['path'], size=0, url='', target=e['target'],
+                            aliases=e.get('aliases', [])) for e in entries])
             self._save()
         try:
-            status = await self.deps.run_fetch(bid, {'op': 'link', 'links': [
-                dict(path=e['path'], target=e['target']) for e in entries]}, on_id)
+            try:
+                status = await self.deps.run_fetch(bid, {'op': 'link', 'links': [
+                    dict(path=e['path'], target=e['target']) for e in entries]}, on_id, max_wait=600)
+            except BaseException as exc:
+                if not self.state['fetch_job']:
+                    self._hold_uncertain(exc, paths, bid, 600)
+                else:
+                    self._fetch_problem = 'fetch job failed: ' + type(exc).__name__
+                raise
             async with self.deps.client_factory() as client:
                 await self._finish_links(self._client_s3(client), self.state['fetch_job'], status, entries)
         finally:
@@ -676,6 +804,7 @@ class VolumeController:
         man = dict(self.manifest)
         for e in entries or job['items']:
             if results.get(e['path'], {}).get('ok'):
+                self.dest[e['path']] = {'link': e['target']}
                 man[e['path']] = dict(source='link', target=e['target'], link=e['target'],
                                       aliases=e.get('aliases', []), ts=self.deps.now())
         await s3.put(MANIFEST_KEY, json.dumps(man, sort_keys=True).encode())
@@ -685,63 +814,79 @@ class VolumeController:
         self.state['sync_cost_usd'] += (status.get('executionTime') or 0) / 3.6e6 * float(backend.get('cost_per_hour') or 0)
         self.state['fetch_job'] = None
         self._save()
+        self._refresh_plan()
+        if not results:
+            self._job_failed(status)
+        self._fetch_problem = ''
 
     async def _fetch_entry(self, entry):
-        """Catalog-only paths need a known size before bounded jobs can accept them."""
+        """A failed HEAD does not prove GET will fail, especially with endpoint HF_TOKEN."""
         if entry['size'] is not None:
             return entry
         entry = dict(entry)
-        headers = {}
-        host = (httpx.URL(entry['url']).host or '').lower()
-        if any(host == h or host.endswith('.' + h) for h in _HF_HOSTS):
-            tok = str(self.deps.hf_token() or '')
-            if tok:
-                # httpx drops Authorization on a redirect to another origin (the CDN)
-                headers['Authorization'] = 'Bearer ' + tok
-        async with self.deps.client_factory() as client:
-            response = await client.head(entry['url'], headers=headers, timeout=30,
-                                         follow_redirects=True)
-            if response.status_code == 429 or response.status_code >= 500:
-                raise httpx.TransportError('URL size lookup unavailable')
-            if 400 <= response.status_code < 500:
-                self._attempt_failed(entry, f'final: HTTP {response.status_code}')
-                return None
+        url, now = entry['url'], self.deps.now()
+        if url not in self._head_sizes or (self._head_sizes[url] is None and
+                                          now >= self._head_retry_at[url]):
+            headers = {}
+            host = (httpx.URL(url).host or '').lower()
+            if any(host == h or host.endswith('.' + h) for h in _HF_HOSTS):
+                tok = str(self.deps.hf_token() or '')
+                if tok:
+                    headers['Authorization'] = 'Bearer ' + tok
+            size = None
             try:
-                size = int(response.headers['content-length'])
-            except (KeyError, ValueError):
-                self._transfer_problem = 'fetch size unknown'
-                return None
-            if size < 0:
-                self._transfer_problem = 'fetch size unknown'
-                return None
-            entry['size'] = size
+                async with self.deps.client_factory() as client:
+                    response = await client.head(url, headers=headers, timeout=30, follow_redirects=True)
+                    if 200 <= response.status_code < 300:
+                        n = int(response.headers.get('content-length', '-1'))
+                        if n >= 0:
+                            size = n
+            except (httpx.TransportError, ValueError):
+                pass
+            self._head_sizes[url] = size
+            self._head_retry_at[url] = now + 600
+        entry['size'] = self._head_sizes[url]
+        if entry['size'] is not None:
             async with self._plan_lock:
-                self._s3, self._round_plan = self._client_s3(client), self.plan
-                try:
-                    need = size + sum(e['size'] or 0 for e in self.plan['fetch'])
-                    if await self._space_for(need):
-                        self.state['blocked'][entry['path']] = (
-                            f"needs {need / 1e9:.1f} GB, limit {self.cfg['max_size_gb']} GB")
-                        self._save()
-                        return None
-                finally:
-                    self._s3 = self._round_plan = None
+                async with self.deps.client_factory() as client:
+                    self._s3 = self._client_s3(client)
+                    self._round_plan = copy.deepcopy(self.plan)
+                    self._round_plan['fetch'] = [entry if e['path'] == entry['path'] else e
+                                                 for e in self._round_plan['fetch']]
+                    for row in self._round_plan['per_alias'].values():
+                        for f in row['files']:
+                            if f['path'] == entry['path']:
+                                f['size'] = entry['size']
+                                f['present'] = self.dest.get(f['path']) == f['size']
+                        row['need_bytes'] = sum(f['size'] or 0 for f in row['files'])
+                        row['have_bytes'] = sum(f['size'] or 0 for f in row['files'] if f['present'])
+                    try:
+                        await self._space_for(self._remaining_need(self._round_plan))
+                        # Later HEADs in this batch must include sizes already learned.
+                        self.plan = self._round_plan
+                        if entry['path'] in self.state['blocked']:
+                            return None
+                    finally:
+                        self._s3 = self._round_plan = None
         return entry
 
     async def _transfer_round(self) -> None:
-        """Concurrent triggers cannot create a second writer or a second billed job."""
+        """One unit per tick exposes readiness and lets signature changes interrupt long queues."""
         if (not self._resumed or self._transfer_lock.locked() or self.plan is None
                 or not self.plan['fetch']):
             return
         async with self._transfer_lock:
             self._transfer_problem = ''
-            now = self.deps.now()
-            self._ghost = {p: t for p, t in self._ghost.items() if t > now}
+            ghost = {p: t for p, t in self._ghost.items() if t > self.deps.now()}
+            if ghost != self._ghost:
+                self._ghost = ghost
+                self.state['ghost'] = dict(ghost)
+                self._save()
             batch, amount = [], 0
             backend = next(iter(sorted(self._backends, key=lambda b: b['name'])), None)
             for entry in self.plan['fetch']:
                 path = entry['path']
-                if (path in self._inflight or path in self._ghost or path in self.state['blocked']
+                if (path in self._held_paths() or path in self.state['blocked']
                         or entry['source'] == 'link'):
                     continue
                 if path in self.urls:
@@ -752,43 +897,51 @@ class VolumeController:
                     if entry is None:
                         continue
                     size = entry['size']
-                    if size is None:
-                        self._transfer_problem = 'fetch size unknown'
-                        continue
-                    # JOB_BYTES bounds a batch, not a file: a bigger file goes alone (its
-                    # .gw-part resumes across jobs if one job's time runs out)
-                    if batch and (len(batch) == JOB_FILES or amount + size > JOB_BYTES):
-                        await self._fetch_batch('runpod:' + backend['name'], batch)
-                        if not self._resumed: return
-                        batch, amount = [], 0
-                    batch.append(entry); amount += size
+                    if batch and (size is None or batch[0]['size'] is None or
+                                  len(batch) == JOB_FILES or amount + size > JOB_BYTES):
+                        break
+                    batch.append(entry)
+                    amount += size or 0
+                    if size is None or amount >= JOB_BYTES or len(batch) == JOB_FILES:
+                        break
                 elif self.deps.lan and self.deps.lan.usable():
+                    if batch:
+                        break
                     await self._lan_stream(entry)
+                    return
                 else:
                     problem = self.deps.lan.problem() if self.deps.lan else 'not configured'
                     self._transfer_problem = f'waiting for LAN source ({problem})'
+            batch = [e for e in batch if e['path'] not in self.state['blocked']]
             if batch:
                 await self._fetch_batch('runpod:' + backend['name'], batch)
+                return
             if self._resumed:
                 await self._make_links(self.plan)
-                await self.plan_round()
 
     async def _resume_job(self, s3, job):
         """An unconfirmed cancel keeps the restart gate closed, even after the deadline."""
         paths = {i['path'] for i in job['items']}
         self._inflight.update(paths)
-        deadline = self.deps.now() + 1800
+        deadline = self.deps.now() + job.get('budget_s', 4 * 3600) + 300 + 60
         while True:
             status = await self.deps.fetch_status(job['bid'], job['id'])
             if status is None:
+                self._fetch_problem = (f"fetch job {job['id']} result lost (expired at RunPod)"
+                                          ' — files are re-checked')
+                self.deps.log(f'RunPod volume {self.name}: {self._fetch_problem}')
                 self.state['fetch_job'] = None
                 self._save()
                 break
             if status.get('status') in ('COMPLETED', 'FAILED', 'CANCELLED', 'TIMED_OUT'):
-                if any('target' in i for i in job['items']):
-                    await self._finish_links(s3, job, status)
-                else:
-                    await self._finish_fetch(s3, job, status)
+                try:
+                    if any('target' in i for i in job['items']):
+                        await self._finish_links(s3, job, status)
+                    else:
+                        await self._finish_fetch(s3, job, status)
+                finally:
+                    if self.state['fetch_job'] is None:
+                        self._inflight.difference_update(paths)
                 break
             if self.deps.now() >= deadline:
                 if not await self.deps.fetch_cancel(job['bid'], job['id']):
@@ -839,20 +992,42 @@ class VolumeController:
                 needs, src, cat = await asyncio.to_thread(inputs)
                 urls, _ = modelsync.without_fallbacks(cat, self.state['url_fallback'])
                 unknown = {p for p, size in modelsync.plan(needs, src, dest, man, urls)['unknown']}
-                held = set(self._inflight)
-                held.update(i['path'] for i in (self.state['fetch_job'] or {}).get('items', []))
-                held.update(m['key'] for m in self.state['mpu'])
+                held = self._held_paths()
+                unknown.update(p for p in dest if p.endswith('.gw-part'))
                 for path in dict.fromkeys(paths):
-                    if path in unknown and path not in man and path not in held:
+                    final = path[:-8] if path.endswith('.gw-part') else path
+                    if path in unknown and path not in man and final not in held:
                         await s3.delete(path)
                         self.dest.pop(path, None)
+                        self.leftovers.pop(path, None)
                         count += 1
         self._sync_requested = True
         return count
 
     def sync_now(self, recreate: bool = False) -> None:
+        """An operator repair releases stale failures without disturbing active writers."""
         self._sync_requested = True
         self._recreate = self._recreate or recreate
+        held = self._held_paths()
+        forgotten = (set(self._stream_failures) |
+                     {p for p, reason in self.state['blocked'].items()
+                      if reason == 'share file changing?'}) - held
+        for path in forgotten:
+            if hasattr(self.deps.lan, 'forget_sha'):
+                size = next((e['size'] for e in (self.plan or {}).get('fetch', [])
+                             if e['path'] == path), 0) or 0
+                # LanSource requires size but invalidates by path even before a plan.
+                self.deps.lan.forget_sha(path, size)
+        for mapping in (self.attempts, self._stream_failures, self.state['url_fallback'],
+                        self.state['url_fallback_why']):
+            for path in set(mapping) - held:
+                mapping.pop(path)
+        for path, reason in list(self.state['blocked'].items()):
+            if path not in held and not self._capacity_reason(reason):
+                self.state['blocked'].pop(path)
+        self._head_sizes.clear()
+        self._head_retry_at.clear()
+        self._save()
 
     def _signature(self):
         """Blocking store reads — called through asyncio.to_thread only."""
