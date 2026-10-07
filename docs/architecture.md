@@ -1462,6 +1462,16 @@ socket). `/health` (full view only) carries `hosts_managed: {name: {provider, ph
 uptime_s, cost_per_h, services: {bid: status}[, error]}}`. `test_hostctl.py`,
 `test_managed_hosts.py`.
 
+### `s3vol.py` — RunPod volume S3
+
+RunPod volumes use path-style S3 with the datacenter id as the signing region.
+The stdlib SigV4 signer encodes raw paths once without normalizing model names;
+its path/query encoders also build the request URL so the signed bytes agree.
+Namespace-tolerant XML readers retain ListV2 continuation tokens and multipart
+upload ids. `tests/test_s3vol.py` pins AWS signatures (including form POST and a
+Unicode model key) and the readers: signing slips otherwise look like rejected
+credentials, and a lost continuation token makes files past 1000 disappear.
+
 ### `modelsync.py`
 
 The PURE half of the model sync: which files an alias candidate
