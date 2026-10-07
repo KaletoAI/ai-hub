@@ -997,7 +997,8 @@ backends:
 
 Setup, once (the form's fields are the same: **Backends → + Add → type RunPod**):
 
-1. **Network volume** in a datacenter that has the GPU you want and CUDA 13 hosts
+1. **Network volume** (AI-Hub can create and fill it; see [RunPod volumes](#runpod-volumes))
+   in a datacenter that has the GPU you want and CUDA 13 hosts
    (`EU-CZ-1` or `EU-RO-1` at the time of writing), holding the model set under
    `models/<folder>/` (`checkpoints`, `diffusion_models`, `text_encoders`, `vae`, `loras`,
    …, the same tree as `ComfyUI/models`). The worker reads it at `/runpod-volume/models`.
@@ -1037,6 +1038,66 @@ Milestone 1 limits: files travel **base64 inside the request/response** — all 
 together ≤ 9 MB, outputs ≤ 7 MB (images and small files; larger ones fail with a message
 naming the limit); **no 3D, no video**; a RunPod backend cannot be a **chain** stage; one
 workflow image profile (Qwen-Image 2.1 nodes); the cost figure is an estimate only.
+
+### RunPod volumes
+
+AI-Hub can create, grow and fill a RunPod network volume with the models needed by
+its referencing backends' media aliases. Several backends can share one volume;
+a backend with a `volume` selected routes an alias only after its models are ready.
+Blank `volume` keeps the ungated Serverless behavior.
+
+1. **Server → API Keys:** save the **RunPod** account API key and **RunPod S3** access
+   id (`user_…`) plus secret (`rps_…`). They are encrypted and never displayed again;
+   blank keeps a saved key, clear removes it. The account key also backs a RunPod
+   backend with an empty `api_key`.
+2. **Backends → RunPod volumes → + Volume:** choose a name, S3-capable datacenter,
+   start size and growth ceiling. AI-Hub creates `aihub-<name>` and shows its id.
+3. Attach that volume to your Serverless endpoint in RunPod, then select it in the
+   backend editor's **RunPod → volume** field. Endpoint/image/template provisioning
+   remains manual until M2b; several AI-Hub backends may reference the same volume.
+4. Add the backend to the media aliases that need the models and press **Sync now**.
+   Configure the URL catalog / LAN share under **Server → Models**. URL files download
+   on the endpoint; LAN-only files stream from the share via S3. The card's checklist,
+   sync table, source badges and progress explain what is missing or blocked.
+
+Volumes live in the store setting `runpod_volumes`:
+
+| Field | Meaning |
+|---|---|
+| name | Identity matching `[a-z0-9-]{1,40}`; no rename. |
+| `datacenter` | S3-capable DC selected in the form; fixed after creation. |
+| `size_gb` | Start size, 10…4000 GB; read-only after creation. The card separately shows the current, possibly grown size. |
+| `max_size_gb` | Required automatic-growth ceiling, start size…4000 GB; after growth it cannot fall below the current size. |
+
+Supported DCs: `EU-RO-1`, `EU-CZ-1`, `EUR-IS-1`, `EUR-NO-1`, `US-CA-2`, `US-GA-2`,
+`US-IL-1`, `US-KS-2`, `US-MD-1`, `US-MO-1`, `US-MO-2`, `US-NC-1`, `US-NC-2`,
+`US-NE-1`, `US-WA-1`. The backend field `volume` must name a configured volume.
+`runpod_volume_state` is controller-owned persisted state, including the actual size,
+volume/job/upload ids and accumulated sync costs.
+
+All actions are POSTs. **Sync now** requests another round; if a saved volume has
+vanished from two lists, recreation requires confirming that a new empty volume will
+be billed. **Delete unknown** deletes only checked files after confirmation.
+**Delete volume** requires its name typed and no referencing backend, including
+disabled ones; pending writers must be settled. A never-created volume's delete
+removes only the config entry. Existing-volume growth/deletion verifies ownership
+against a fresh RunPod list; a lost create answer is adopted on the next round.
+
+Volumes only grow. Capacity pressure first prunes unneeded manifest-owned files,
+then grows within the ceiling; unknown files are never automatically removed. A need
+above the ceiling blocks the affected aliases with a readable reason. Billing is
+by **provisioned size**, estimated at **$0.07/GB/month**: deleting files does not lower
+that charge. The card shows monthly volume cost and cumulative fetch execution cost
+(`execution_ms / 3.6e6 * cost_per_hour`), an estimate that excludes cold-start/idle
+charges. Fetch jobs normally batch up to 20 GB and 50 files; a larger file goes alone.
+
+For gated Hugging Face downloads, set **`HF_TOKEN` in the endpoint environment**;
+it never travels in a job input. Until M2b this is manual. A failed URL falls back to
+a LAN copy; without one it blocks and the checklist explains the problem. The
+AI-Hub HF token is used only for the preliminary size HEAD to HF hosts, while the
+worker uses its endpoint token for downloads. Saved jobs/uploads are recovered before
+new transfers after restart, and transient sync errors back off while retaining the
+last good routing snapshot.
 
 ### Generation aliases + mapping
 

@@ -67,7 +67,7 @@ must be in both AND in `.gitignore`, or `rsync --delete` wipes it on prod: `conf
 
 ## Architecture map
 
-Twenty-four Python files at the top level (`ls *.py` is the count of record), tests in
+Twenty-six Python files at the top level (`ls *.py` is the count of record), tests in
 `tests/`, scripts that run on OTHER boxes in `ops/` (`ops/runpod/` is the RunPod worker's Docker build context). `main.py` owns all app state as
 module globals; **no other module imports `main`** — they get what they need through
 injected callables (`AdapterContext`, `admin.bind(...)`, hostctl `Deps`) and stay
@@ -80,6 +80,8 @@ hot-reload-safe. Modules marked *pure* do no I/O and import neither `main` nor
 | `adapters.py` | Per-backend protocol seam: `OpenAIAdapter` (chat/completions/embeddings/TTS, stream normalizer), `AnthropicAdapter` (verbatim `/v1/messages` passthrough), `ComfyUIAdapter` (workflow mapping, bypass/prune, watchdog, ws progress, targeted stop), `CloudTaskAdapter` + `MeshyAdapter`/`TripoAdapter`, `RunpodAdapter` (ComfyUI workflows on RunPod Serverless, via the `GenIO` build seam). |
 | `meshy.py`, `tripo.py` | *Pure* halves of the cloud 3D vendors; same duck-typed module interface (`KIND`, `ENDPOINTS`, `OPTION_FIELDS`, `build_request`, `parse_task`, …). |
 | `cloudtask.py` | *Pure* leaf for both: `TaskState`, the `opt__<key>` option-form reader/writer. |
+| `s3vol.py` | S3 SigV4 client for RunPod volumes. |
+| `rpvolume.py` | RunPod network volume: REST + `VolumeController` model sync. |
 | `scheduler.py` | *Pure* ordering: fastest free unpaid backend, freed-backend type affinity, overdue guard, exec-fault quarantine, VRAM-free decisions, host flag table. |
 | `reasoning.py` | *Pure* `reasoning: off\|on\|auto` → per-(model, backend) mechanism. |
 | `responses_bridge.py`, `anthropic_bridge.py`, `openai_image_bridge.py` | *Pure* protocol translation (Responses↔Chat, Messages↔Chat, OpenAI image shims). |
@@ -161,6 +163,10 @@ Each of these once failed without an error; the full story is in `docs/architect
   command line; every ssh argv ends `-- <host>`.
 - A backend's `enabled` belongs to the host it is on NOW (R-K2): a detach never disables.
 - Tunnel forwards change via ControlMaster `-O forward|cancel`, never a respawn.
+- A RunPod volume is created only after a fresh list (adopt a matching name/DC);
+  growth or deletion requires its id in a fresh matching list. A fetch job or open
+  multipart upload saved in `runpod_volume_state` is settled before any new writer
+  (`docs/architecture.md`, RunPod volume sync).
 
 **Every new silently-failing mechanism gets a test** in `tests/` whose docstring says
 what it guards, and a line in `docs/architecture.md`.
