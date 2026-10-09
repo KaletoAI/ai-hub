@@ -62,13 +62,16 @@ def init(db_path: str = "jobs.db", blob_dir: str = "jobs", default_ttl_s: int = 
                 result_count INTEGER NOT NULL DEFAULT 0,
                 results_json TEXT,
                 meta_json    TEXT,
-                stage        TEXT
+                stage        TEXT,
+                started      INTEGER
             )
         """)
         c.execute("CREATE INDEX IF NOT EXISTS jobs_created ON jobs(created)")
         cols = {r[1] for r in c.execute("PRAGMA table_info(jobs)").fetchall()}
         if "stage" not in cols:                # migrate existing DBs (multi-stage progress, e.g. "1/2")
             c.execute("ALTER TABLE jobs ADD COLUMN stage TEXT")
+        if "started" not in cols:              # migrate: run start, so durations exclude the queue wait
+            c.execute("ALTER TABLE jobs ADD COLUMN started INTEGER")
     logger.info(f"jobs: store at {_DB_PATH}, blobs in {_BLOB_DIR}/ (default ttl {_DEFAULT_TTL}s)")
     n = reconcile_orphans()
     if n:
@@ -92,6 +95,11 @@ def new_id() -> str:
 
 def is_active() -> bool:
     return _active
+
+
+# A job's run time in SQL: from the claim (`started`), not from creation — the queue
+# wait is not the backend's runtime. Rows from before the column fall back to `created`.
+RUN_S = "updated - COALESCE(started, created)"
 
 
 # Task types that live in the job store but are NOT media generations: parked-chat
@@ -148,7 +156,8 @@ def recent(limit: int = 20, media_only: bool = False, owner: Optional[str] = Non
     flt = f" WHERE {' AND '.join(conds)}" if conds else ""
     with _conn() as c:
         rows = c.execute(
-            f"SELECT id, created, updated, status, task, alias, backend, owner, result_count, error, stage "
+            f"SELECT id, created, updated, status, task, alias, backend, owner, result_count, error, stage, "
+            f"started "
             f"FROM jobs{flt} ORDER BY created DESC, rowid DESC LIMIT ?", (*args, limit)).fetchall()
     return [dict(r) for r in rows]
 
@@ -222,7 +231,7 @@ def median_duration(alias: str, backend: Optional[str] = None, limit: int = 10) 
     narrowed to one backend) — the basis for the job view's progress/ETA estimate."""
     if not _active:
         return None
-    q = "SELECT updated - created FROM jobs WHERE status = 'done' AND alias = ?"
+    q = f"SELECT {RUN_S} FROM jobs WHERE status = 'done' AND alias = ?"
     args: list = [alias]
     if backend:
         q += " AND backend = ?"
@@ -254,7 +263,7 @@ def gen_stats_rows() -> list:
             "SELECT alias, backend, "
             "  SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END), "
             "  SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), "
-            "  AVG(CASE WHEN status = 'done' THEN (updated - created) * 1000.0 END), "
+            f"  AVG(CASE WHEN status = 'done' THEN ({RUN_S}) * 1000.0 END), "
             "  MAX(created) "
             "FROM jobs "
             f"WHERE task NOT IN ({','.join('?' * len(_NON_MEDIA_TASKS))}) "
@@ -271,14 +280,14 @@ def gen_speed_rows() -> list:
     runtimes are kept (stats.calls never sees a ComfyUI generation).
 
     Accepted skew, no action: a chain job counts both stages under its stage-1 alias,
-    and a job's parked wait time sits inside created→updated. Both make the seed
-    pessimistic, and the EMA (alpha 0.3) corrects it within a few real jobs.
+    which makes the seed pessimistic, and the EMA (alpha 0.3) corrects it within a few
+    real jobs. The queue wait is NOT in it (`RUN_S` starts at the claim).
     Empty if the job store is off."""
     if not _active:
         return []
     with _conn() as c:
         rows = c.execute(
-            "SELECT alias, backend, AVG((updated - created) * 1000.0) FROM jobs "
+            f"SELECT alias, backend, AVG(({RUN_S}) * 1000.0) FROM jobs "
             f"WHERE status = 'done' AND task NOT IN ({','.join('?' * len(_NON_MEDIA_TASKS))}) "
             "AND alias IS NOT NULL AND alias != '' "
             "AND backend IS NOT NULL AND backend != '' "
@@ -333,10 +342,16 @@ _LIVE = "status IN ('queued','running')"
 
 def set_status(job_id: str, status: str) -> bool:
     """Move a LIVE job to `status` (in practice queued → running). False when the row is
-    already terminal (cancelled meanwhile) or gone — the caller must not start work."""
+    already terminal (cancelled meanwhile) or gone — the caller must not start work.
+
+    The FIRST move to `running` stamps `started` (a failover or chain re-claim keeps
+    it): the run time is updated − started, not updated − created, which also counted
+    the time the job sat parked waiting for a free backend."""
+    now = int(time.time())
     with _conn() as c:
-        cur = c.execute(f"UPDATE jobs SET status=?, updated=? WHERE id=? AND {_LIVE}",
-                        (status, int(time.time()), job_id))
+        cur = c.execute(f"UPDATE jobs SET status=?, updated=?, "
+                        f"started = CASE WHEN ? = 'running' THEN COALESCE(started, ?) ELSE started END "
+                        f"WHERE id=? AND {_LIVE}", (status, now, status, now, job_id))
         return cur.rowcount > 0
 
 

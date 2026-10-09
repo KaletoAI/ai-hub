@@ -804,6 +804,12 @@ reaches a terminal row (facts, never status). `prune_once` removes FINISHED jobs
 a short client `ttl_s` used to delete a running job under its worker.
 `test_jobs_lifecycle.py`. Carries `owner`. Reused for
 **background Responses** jobs (task type `response`, result via `complete_json`).
+A job's DURATION is its run time, `jobs.RUN_S` = updated − COALESCE(`started`,
+created): the first `set_status(…, "running")` (the claim) stamps `started` once, a
+failover/chain re-claim keeps it. updated − created counted the time a job sat parked
+behind a busy backend, so the `dur` column, the ETA median, the Media generation avg
+and the scheduler's boot seed all called a backend with a long queue slow. Rows from
+before the column fall back to `created`. `test_job_run_time.py`.
 
 ### `store.py`
 

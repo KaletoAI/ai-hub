@@ -3341,6 +3341,9 @@ async def _job_view(job_id: str, request: Request) -> dict:
     if job["status"] in ("queued", "running"):
         elapsed = max(0, int(time.time()) - int(job.get("created") or 0))
         view["elapsed_s"] = elapsed
+        # The median is a RUN time (jobs.RUN_S, from the claim) — compare it with this
+        # job's run time, not with elapsed, which also holds the queue wait.
+        elapsed = max(0, int(time.time()) - int(job.get("started") or job.get("created") or 0))
         if job["status"] == "running":
             # The backend's own step counter wins when we have it: the median can only
             # say what jobs of this shape USUALLY take, while this one knows that this

@@ -6228,7 +6228,20 @@ _PIN_CSS_JS = ("<style>.ptabs{display:flex;gap:4px;margin:10px 0 0;flex-wrap:wra
                "<script>function pinTab(b,p){var f=b.closest('form');"
                "f.querySelectorAll('.ptab').forEach(function(x){x.classList.toggle('on',x===b);});"
                "f.querySelectorAll('.ppanel').forEach(function(x){x.style.display="
-               "x.getAttribute('data-pt')===p?'':'none';});}</script>")
+               "x.getAttribute('data-pt')===p?'':'none';});}"
+               # "default" on an extra tab: copy the primary's live value (unsaved edits
+               # included). A select lacking it (model not listed on THIS backend) gets
+               # the option added — setting .value to a missing option would blank it.
+               "function pinDef(b){var f=b.closest('form'),"
+               "s=f.elements.namedItem(b.getAttribute('data-src')),"
+               "d=f.elements.namedItem(b.getAttribute('data-dst'));if(!s||!d)return;var v=s.value;"
+               "if(d.tagName==='SELECT'){var ok=false;for(var i=0;i<d.options.length;i++)"
+               "{if(d.options[i].value===v){ok=true;break;}}"
+               "if(!ok){var o=document.createElement('option');o.value=v;o.textContent=v;d.appendChild(o);}}"
+               "d.value=v;d.dispatchEvent(new Event('change',{bubbles:true}));"
+               "var r=b.closest('.ovrow');r.classList.add('inherited');"
+               "var t=r.querySelector('.ovtag');if(t){t.className='ovtag inh';t.textContent='inherited';}}"
+               "</script>")
 
 
 def _map_del_btn(alias: str, qs: str) -> str:
@@ -6314,7 +6327,9 @@ def _pin_tab_rows(alias: str, c: dict, is_primary: bool, fixed: list, wf: dict, 
     """One pinned-values tab — SAME layout in every tab (.ovrow). The PRIMARY (first
     backend) tab is the editor: value + ✕ delete per slot. Extra backends override
     only the VALUE (no delete; the slot set is shared). A value equal to the
-    primary's is flagged "inherited" and dimmed; a differing one "override"."""
+    primary's is flagged "inherited" and dimmed; a differing one "override". Where
+    the primary has ✕, an extra tab has "default": it copies the primary's CURRENT
+    form value into this slot (pinDef), which the save stores as inherited."""
     rows = ""
     for b in fixed:
         nid, fld = str(b["node"]), str(b["field"])
@@ -6327,8 +6342,12 @@ def _pin_tab_rows(alias: str, c: dict, is_primary: bool, fixed: list, wf: dict, 
             cv = next((x.get("value") for x in (c.get("fixed") or [])
                        if str(x.get("node")) == nid and str(x.get("field")) == fld), None)
             inherited = cv is None or cv == b.get("value")
-            cur, name, acts = (cv if cv is not None else b.get("value")), \
-                "ovr__" + str(c.get("backend")) + "__" + nid + "__" + fld, ""
+            cur, name = (cv if cv is not None else b.get("value")), \
+                "ovr__" + str(c.get("backend")) + "__" + nid + "__" + fld
+            # names travel as data-*, never spliced into the handler
+            acts = (f"<span class='ovact'><button type='button' class='btn secondary sm' "
+                    f"data-src=\"{_esc(f'fixed__{nid}__{fld}')}\" data-dst=\"{_esc(name)}\" "
+                    f"title=\"Use the primary backend's value\" onclick='pinDef(this)'>default</button></span>")
         ctl = _value_control(name, nid, fld, cur, wf, oi_bn)
         tag = "" if is_primary else (" <span class='ovtag inh'>inherited</span>" if inherited
                                      else " <span class='ovtag set'>override</span>")
@@ -8193,9 +8212,14 @@ def _job_dur_cell(j: dict, now: int) -> str:
     slow?" without opening the job. Shared by Media Jobs and the dashboard.
 
     The estimate is a SIBLING of `.jdur`, never inside it: _JOB_TICK overwrites that
-    element's textContent once a second and would eat it."""
+    element's textContent once a second and would eat it.
+
+    Measured from the claim (`started`), not from creation: a job parked behind a busy
+    backend used to show its queue wait as runtime. Rows from before the column, and a
+    job cancelled while still queued, fall back to `created` (jobs.RUN_S)."""
     st = j["status"]
-    cr, upd = int(j.get("created") or 0), int(j.get("updated") or 0)
+    cr = int(j.get("started") or j.get("created") or 0)
+    upd = int(j.get("updated") or 0)
     if st in ("done", "failed") and upd >= cr:
         return f"<td class='muted' data-sv=\"{(upd - cr) * 1000}\">{_dur((upd - cr) * 1000)}</td>"
     est = _expected_dur_s(j.get("alias") or "", j.get("backend") or "") \
