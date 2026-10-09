@@ -146,7 +146,11 @@ judged over the alias's AND its successor's mapping, since params are threaded b
 label — `test_mapping_values.py`); a mapping `label` is the param's public
 API name — incoming values are accepted under label OR param, and the
 auto-random seed keys on that effective name (`''` counts as unset);
-`_apply_lora_cascade` drops client LoRAs into free stack slots; `_apply_fixed`
+`_apply_lora_cascade` drops client LoRAs into free stack slots (so with a pinned
+`lora_01` the client's `lora_01` runs in `lora_02`; the job view tags each client
+`lora_N`/`strength_N` row with its landing slot from `meta.loras` via
+`admin._lora_landing` — the raw key beside the pin read as "slot 1 used twice",
+`test_job_lora_slots.py`); `_apply_fixed`
 applies admin pins (the API can't override a pinned `(node,field)`);
 `_apply_bypass` runs LAST (per-backend `bypass` node ids): ComfyUI mode-4 —
 remove each node and reconnect its consumers to the same-typed input (k-th

@@ -8551,6 +8551,35 @@ def _cloud_table(title: str, m: dict) -> str:
             f"<table>{rows}</table>{sub}")
 
 
+def _lora_landing(params: dict, placed: list) -> dict:
+    """{client param: 'node.field'} — the stack slot each client `lora_N` (and its
+    `strength_N`) actually landed on. The cascade moves a client's `lora_01` past a
+    pinned slot (an alias pinning `lora_01` runs it in `lora_02`), so the raw param key
+    alone misreads as "slot 1 used twice". `placed` is the job's `meta.loras`
+    (`node.field=value`): the `loras:[…]` list placements first, then the cascade's in
+    client-index order — so client params are matched by value from the END, highest
+    index first. A LoRA that found no free slot gets no entry."""
+    pool = []
+    for e in placed or []:
+        slot, _, val = str(e).partition("=")
+        pool.append([slot, val, False])
+    client = sorted(((int(m.group(1)), k) for k in params
+                     if (m := adapters._LORA_SLOT_RE.match(k))
+                     and str(params[k]) not in ("", "None")), reverse=True)
+    out = {}
+    for idx, k in client:
+        hit = next((p for p in reversed(pool) if not p[2] and p[1] == str(params[k])), None)
+        if hit is None:
+            continue
+        hit[2] = True
+        out[k] = hit[0]
+        node, _, fld = hit[0].partition(".")
+        for sk in (f"strength_{idx:02d}", f"strength_{idx}"):
+            if sk in params:
+                out[sk] = f"{node}.{fld.replace('lora_', 'strength_', 1)}"
+    return out
+
+
 def _stage2_section(s2: dict) -> str:
     """The chain hand-off, for the job view: what stage 2 was actually HANDED and which
     of it the successor mapped. Stage-1 params are threaded to the successor by mapping
@@ -8672,9 +8701,14 @@ async def job_detail_page(job_id: str, request: Request):
                 return str((m or {}).get("node"))
         return None
 
+    landing = _lora_landing(params, meta.get("loras"))   # client lora_N → the slot it ran in
     prow = []
     for k, v in params.items():
         s, tag = _byp(_param_node(k))
+        if k in landing:
+            node, _, fld = landing[k].partition(".")
+            tag += (f" <span class='muted' title='client LoRAs fill the next free stack "
+                    f"slot; pinned slots are skipped'>→ {_esc(fld)} · node {_esc(node)}</span>")
         prow.append(f"<tr><td{s}><code>{_esc(k)}</code></td><td{s}>{_esc(str(v))}{tag}</td></tr>")
     prows = "".join(prow)
     frow = []
