@@ -38,7 +38,7 @@ from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urljoin, urlsplit
 
 import httpx
 
@@ -47,8 +47,10 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 import anthropic_bridge
+import arliai
 import cloudtask
 import meshy
+import nanogpt
 import tripo
 
 logger = logging.getLogger(__name__)
@@ -485,7 +487,8 @@ class NormalizedRequest:
 
 
 # ── cloud task kinds (Meshy, Tripo): the one seam main/admin ask "which kind?" ──
-CLOUD_MODULES: dict = {meshy.KIND: meshy, tripo.KIND: tripo}     # kind → pure module
+CLOUD_MODULES: dict = {meshy.KIND: meshy, tripo.KIND: tripo, arliai.KIND: arliai,
+                       nanogpt.KIND: nanogpt}  # kind → pure module
 
 
 def cloud_kind(cand: dict) -> Optional[str]:
@@ -1448,6 +1451,121 @@ class OpenAIAdapter(BackendAdapter):
                        headers={**call.rheaders, **_ratelimit_headers(resp.headers)})
         out.parsed_json = resp_json    # internal callers (Responses bridge) reuse this — no re-parse
         return out
+
+
+# ── NanoGPT OpenAI-compatible text / speech / embeddings ──────────────────────
+
+class NanoGPTTextAdapter(OpenAIAdapter):
+    """NanoGPT's three callable catalogs, with dispatch inherited unchanged.
+
+    Discovery is atomic: any failed catalog marks the backend DOWN, never fresh
+    with stale speech/embedding routes. No catalog state survives a refresh.
+    """
+
+    type = "nanogpt"
+    bills = True
+    serves_generation = False
+    _CATALOGS = (
+        ("text", "/v1/models?detailed=true"),
+        ("tts", "/v1/audio-models?type=tts&detailed=true"),
+        ("embedding", "/v1/embedding-models"),
+    )
+
+    def __init__(self, backend: dict, ctx: AdapterContext):
+        super().__init__(backend, ctx)
+        self.model_catalogs: dict[str, dict[str, dict]] = {}
+
+    async def discover(self, client: httpx.AsyncClient) -> Capabilities:
+        b = self.backend
+        self.model_catalogs = {}
+        headers = self.ctx.auth_headers(b)
+        responses = await asyncio.gather(*(
+            client.get(f"{b['url'].rstrip('/')}{path}", headers=headers,
+                       timeout=_DISCOVERY_TIMEOUT)
+            for _, path in self._CATALOGS
+        ), return_exceptions=True)
+        # Settle all three GETs before propagating an error; no orphan poll remains.
+        for response in responses:
+            if isinstance(response, BaseException):
+                raise response
+            response.raise_for_status()
+        caps, catalogs = await asyncio.to_thread(self._parse_snapshot, responses, b)
+        self.model_catalogs = catalogs
+        return caps
+
+    @staticmethod
+    def _pricing(price, kind: str) -> Optional[dict[str, float]]:
+        """Only reported USD token rates; chars/seconds/generations are not tokens."""
+        if not isinstance(price, dict) or price.get("currency", "USD") != "USD":
+            return None
+
+        def number(value):
+            if value is None or isinstance(value, bool):
+                return None
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                return None
+            return value if math.isfinite(value) and value >= 0 else None
+
+        if kind == "embedding":
+            rate = number(price.get("per_million_tokens"))
+            return {"input": rate, "output": 0.0} if rate is not None else None
+        if kind != "text" or price.get("unit") != "per_million_tokens":
+            return None
+        inp, out = number(price.get("prompt")), number(price.get("completion"))
+        if inp is None or out is None:
+            return None
+        result = {"input": inp, "output": out}
+        # These explicit NanoGPT field names document PER THOUSAND token units,
+        # independently of prompt/completion's per-million unit.
+        for key, source in (("cache_read", "cacheReadInputPer1kTokens"),
+                            ("cache_write", "cacheWriteInputPer1kTokens")):
+            rate = number(price.get(source))
+            if rate is not None:
+                result[key] = rate * 1000
+        return result
+
+    @classmethod
+    def _parse_snapshot(cls, responses: list, backend: dict) -> tuple[Capabilities, dict]:
+        """Keep original metadata alongside token-only pricing and filtered IDs."""
+        models, pricing, context, catalogs = set(), {}, {}, {}
+        for (kind, _), response in zip(cls._CATALOGS, responses):
+            payload = response.json()
+            data = payload.get("data") if isinstance(payload, dict) else payload
+            if not isinstance(data, list):
+                raise ValueError(f"NanoGPT {kind} catalog has no model list")
+            rows, metadata = [], {}
+            for model in data:
+                if (not isinstance(model, dict) or not isinstance(model.get("id"), str)
+                        or not model["id"].strip()):
+                    raise ValueError(f"NanoGPT {kind} catalog has an invalid model id")
+                if kind == "tts" and not (model.get("capabilities") or {}).get("text_to_speech"):
+                    # The public type=tts catalog also returns music/effects.
+                    continue
+                if kind == "text" and not _is_chat_model(model):
+                    # A provider cross-listing media cannot make it chat-routable.
+                    continue
+                metadata[model["id"]] = model
+                model = dict(model)
+                price = cls._pricing(model.get("pricing"), kind)
+                model["pricing"] = price
+                if price is not None:
+                    # Keep explicit zero rates; missing rates stay absent/unknown.
+                    pricing[model["id"]] = price
+                if kind == "embedding":
+                    model["context_length"] = model.get("max_tokens")
+                rows.append(model)
+            # Legacy Together filters apply to TEXT only. Dedicated catalogs list
+            # callable speech/embedding APIs, even when TTS is character-priced.
+            filters = backend if kind == "text" else {}
+            kept = filter_models(extract_models(rows, filters), backend)
+            catalogs[kind] = {mid: metadata[mid] for mid in kept}
+            models.update(kept)
+            context.update({mid: value for mid, value in extract_context(rows).items()
+                            if mid in kept})
+        pricing = {mid: value for mid, value in pricing.items() if mid in models}
+        return Capabilities(models=models, pricing=pricing, context=context), catalogs
 
 
 # ── Anthropic adapter ─────────────────────────────────────────────────────────
@@ -4037,6 +4155,143 @@ class RunResult:
 _CLOUD_JOB: contextvars.ContextVar = contextvars.ContextVar("cloud_job", default="")
 
 
+class ArliAIImageAdapter(BackendAdapter):
+    """Synchronous SDNext image generation; a lost POST answer is final, not rerun."""
+
+    type = arliai.KIND
+    mod = arliai
+    cloud = True
+    serves_generation = True
+    bills = False                       # subscription, not per-generation credits
+    vendor = arliai.VENDOR
+
+    def __init__(self, backend: dict, ctx: AdapterContext):
+        super().__init__(backend, ctx)
+        self.checkpoint_metadata: dict = {}
+
+    def _url(self, path: str) -> str:
+        return (self.backend.get("url") or arliai.URL).rstrip("/") + path
+
+    def _error_text(self, response) -> str:
+        text = response.text
+        key = self.backend.get("api_key") or ""
+        if key:
+            text = text.replace(key, "[redacted]")
+        # An injected account credential can differ from the backend's own key.
+        for value in self.ctx.auth_headers(self.backend).values():
+            secret = str(value).split(" ", 1)[-1]
+            if secret:
+                text = text.replace(secret, "[redacted]")
+        return text[:200]
+
+    async def discover(self, client: httpx.AsyncClient) -> Capabilities:
+        response = await client.get(self._url("/sdapi/v1/sd-models"),
+                                    headers=self.ctx.auth_headers(self.backend),
+                                    timeout=_DISCOVERY_TIMEOUT)
+        if response.status_code >= 400:
+            raise RuntimeError(f"ArliAI discovery HTTP {response.status_code}: "
+                               f"{self._error_text(response)}")
+        payload = await asyncio.to_thread(response.json)
+        if not isinstance(payload, list):
+            raise RuntimeError("ArliAI checkpoint listing must be a list")
+        rows, metadata = [], {}
+        for entry in payload:
+            if not isinstance(entry, dict):
+                raise RuntimeError("ArliAI checkpoint listing contains a malformed entry")
+            name = entry.get("title") or entry.get("model_name") or entry.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise RuntimeError("ArliAI checkpoint listing contains no checkpoint name")
+            rows.append({**entry, "id": name})
+            metadata[name] = dict(entry)
+        models = filter_models(extract_models(rows, self.backend), self.backend)
+        self.checkpoint_metadata = {name: metadata[name] for name in models}
+        return Capabilities(models=models, pricing={}, context={})
+
+    def adopt_state(self, old: BackendAdapter) -> None:
+        if (isinstance(old, ArliAIImageAdapter)
+                and old.backend.get("url") == self.backend.get("url")
+                and old.backend.get("api_key") == self.backend.get("api_key")):
+            self.checkpoint_metadata = dict(old.checkpoint_metadata)
+
+    def adopt_discovery(self, old: BackendAdapter) -> None:
+        self.adopt_state(old)
+
+    @staticmethod
+    def _decode_result(response) -> tuple[list, dict]:
+        # JSON, base64 and PIL all run on the worker: the response can be many MiB.
+        from io import BytesIO
+        from PIL import Image
+        try:
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError("response must be an object")
+            images = payload.get("images")
+            if not isinstance(images, list) or len(images) != 1:
+                raise ValueError("response must contain exactly one image")
+            encoded = images[0]
+            if not isinstance(encoded, str) or not encoded:
+                raise ValueError("image must be a nonempty base64 string")
+            data = base64.b64decode(encoded, validate=True)
+            with Image.open(BytesIO(data)) as image:
+                image.load()
+                fmt = image.format
+                mime = Image.MIME.get(fmt)
+            extensions = {"PNG": "png", "JPEG": "jpg", "WEBP": "webp", "GIF": "gif",
+                          "BMP": "bmp", "TIFF": "tiff", "AVIF": "avif"}
+            if not mime or not mime.startswith("image/") or fmt not in extensions:
+                raise ValueError("unsupported image format")
+            info = payload.get("info", {})
+            if isinstance(info, str):
+                info = json.loads(info)
+            if not isinstance(info, dict):
+                raise ValueError("info must be an object or JSON object string")
+            return [GenBlob(data=data, mime=mime, kind="image",
+                            name=f"image.{extensions[fmt]}")], info
+        except Exception as e:
+            # Neither malformed vendor content nor invalid images permit another POST.
+            raise RuntimeError("ArliAI returned a malformed image generation result") from e
+
+    async def generate(self, req: NormalizedRequest) -> GenOutput:
+        cand = {"model": req.real_model, arliai.KIND: req.cloud or {}}
+        values = {**req.params, **req.inputs}
+        body = arliai.build_request(
+            cand, values, req.upload_images, req.upload_files,
+            max_image_pixels=self.backend.get("max_image_pixels",
+                                               arliai.MAX_IMAGE_PIXELS_DEFAULT))
+        raw = await asyncio.to_thread(lambda: json.dumps(body).encode())
+        max_wait = float(self.backend.get("max_wait", arliai.MAX_WAIT_DEFAULT))
+        if not req.slot_held:
+            self.ctx.inflight_inc(self.bid)
+        started = time.monotonic()
+        try:
+            async with _pooled_client(self.ctx) as client:
+                try:
+                    response = await client.post(
+                        self._url("/v1/txt2img"), content=raw,
+                        headers={**self.ctx.auth_headers(self.backend),
+                                 "Content-Type": "application/json"},
+                        timeout=httpx.Timeout(max_wait, connect=10.0, pool=30.0))
+                except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
+                    raise                       # no request submitted; normal routing semantics
+                except (httpx.TransportError, ConnectionError, TimeoutError) as e:
+                    req.cloud_trace.update(backend=self.name, cloud=arliai.KIND,
+                                           endpoint="txt2img", create_unconfirmed=True,
+                                           request=arliai.request_summary(body))
+                    raise RuntimeError("ArliAI submit outcome is uncertain; generation "
+                                       "will not be retried") from e
+                if response.status_code >= 400:
+                    raise RuntimeError(f"ArliAI generation HTTP {response.status_code}: "
+                                       f"{self._error_text(response)}")
+                blobs, info = await asyncio.to_thread(self._decode_result, response)
+        finally:
+            if not req.slot_held:
+                self.ctx.inflight_dec(self.bid)
+        return GenOutput(blobs=blobs, meta={
+            "backend": self.name, "cloud": arliai.KIND, "endpoint": "txt2img",
+            "ai_model": req.real_model, "request": arliai.request_summary(body),
+            "info": info, "elapsed_ms": int((time.monotonic() - started) * 1000)})
+
+
 class CloudTaskAdapter(BackendAdapter):
     """Everything a cloud task API shares: the in-flight slot, the create/poll/download
     loop with its grace rules, the job meta and the chain roles. A vendor subclass
@@ -4047,6 +4302,7 @@ class CloudTaskAdapter(BackendAdapter):
     discovery."""
 
     cloud = True
+    bills = True
     serves_generation = True
     mod = meshy                      # the pure module; every subclass overrides it
     type = mod.KIND
@@ -4374,6 +4630,305 @@ class CloudTaskAdapter(BackendAdapter):
             raise RuntimeError(f"chain: a {self.vendor} stage 2 needs the mesh bytes (upload relay)")
         req2.upload_files[mesh_param] = (mesh_name, mesh_bytes)
         return f"<upload:{mesh_name} ({len(mesh_bytes) / (1024 * 1024):.1f} MB)>"
+
+class NanoGPTMediaAdapter(CloudTaskAdapter):
+    """NanoGPT paid media: synchronous images or real asynchronous vendor tasks."""
+
+    mod = nanogpt
+    type = mod.KIND
+
+    def __init__(self, backend: dict, ctx: AdapterContext):
+        super().__init__(backend, ctx)
+        # Endpoint -> callable model id -> original catalog metadata. Never partial.
+        self.model_catalogs: dict[str, dict[str, dict]] = {}
+
+    def _api(self, path: str) -> str:
+        return (self.backend.get("url") or self.mod.URL).rstrip("/") + path
+
+    def _headers(self) -> dict:
+        key = (self.backend.get("api_key") or "").strip()
+        return {"x-api-key": key} if key else {}
+
+    def _redact(self, text: str) -> str:
+        key = (self.backend.get("api_key") or "").strip()
+        return text.replace(key, "[redacted]") if key else text
+
+    def _msg(self, response) -> str:
+        return self._redact(response.text)[:200]
+
+    def adopt_state(self, old: BackendAdapter) -> None:
+        super().adopt_state(old)
+        if (isinstance(old, NanoGPTMediaAdapter)
+                and old.backend.get("url") == self.backend.get("url")
+                and old.backend.get("api_key") == self.backend.get("api_key")):
+            self.model_catalogs = copy.deepcopy(old.model_catalogs)
+
+    async def discover(self, client: httpx.AsyncClient) -> Capabilities:
+        self.model_catalogs = {}
+        responses = await asyncio.gather(*(
+            client.get(self._api(path), headers=self._headers(),
+                       timeout=_CLOUD_DISCOVERY_TIMEOUT)
+            for path in self.mod.CATALOG_PATHS.values()), return_exceptions=True)
+        for response in responses:
+            if isinstance(response, BaseException):
+                raise response
+            response.raise_for_status()
+        catalogs = await asyncio.to_thread(self._parse_catalogs, responses)
+        self.model_catalogs = catalogs
+        return Capabilities(models=set().union(*(set(c) for c in catalogs.values())),
+                            pricing={}, context={})
+
+    def _parse_catalogs(self, responses) -> dict:
+        catalogs = {}
+        for endpoint, response in zip(self.mod.CATALOG_PATHS, responses):
+            payload = response.json()
+            rows = payload.get("data") if isinstance(payload, dict) else payload
+            if not isinstance(rows, list):
+                raise RuntimeError(f"NanoGPT {endpoint} catalog has no model list")
+            metadata = {}
+            for row in rows:
+                if (not isinstance(row, dict) or not isinstance(row.get("id"), str)
+                        or not row["id"].strip()):
+                    raise RuntimeError(f"NanoGPT {endpoint} catalog has an invalid model id")
+                if endpoint == "3d" and (row.get("capabilities") or {}).get("model_3d_generation") is False:
+                    continue
+                metadata[row["id"]] = row
+            kept = filter_models(set(metadata), self.backend)
+            catalogs[endpoint] = {mid: metadata[mid] for mid in kept}
+        return catalogs
+
+    async def _download(self, client, url: str) -> bytes:
+        # Sora's content proxy is authenticated; CDN assets are not. Never let
+        # httpx carry the custom x-api-key header through a cross-origin redirect.
+        content = urlsplit(self._api("/generate-video/content"))
+        asset = urlsplit(url)
+        if (asset.scheme, asset.netloc, asset.path) != (content.scheme, content.netloc, content.path):
+            return await super()._download(client, url)
+        response = await client.get(url, headers=self._headers(), timeout=_CLOUD_DOWNLOAD_TIMEOUT,
+                                    follow_redirects=False)
+        if response.is_redirect and response.headers.get("location"):
+            return await super()._download(client, urljoin(url, response.headers["location"]))
+        if response.status_code != 200:
+            raise RuntimeError(f"NanoGPT video content download failed ({response.status_code})")
+        return response.content
+
+
+    async def _task_request(self, client, endpoint: str, task_id: str):
+        method, path, values = self.mod.status_request(endpoint, task_id)
+        if method.upper() == "GET":
+            response = await client.get(self._api(path), params=values, headers=self._headers())
+        else:
+            raw = await asyncio.to_thread(lambda: json.dumps(values).encode())
+            response = await client.post(self._api(path), content=raw,
+                headers={**self._headers(), "Content-Type": "application/json"})
+        if response.status_code == 200:
+            response.nanogpt_payload = await asyncio.to_thread(response.json)
+        return response
+
+    def _task_body(self, response) -> dict:
+        return response.nanogpt_payload
+
+    @staticmethod
+    def _image_blob(data: bytes, index: int) -> GenBlob:
+        from io import BytesIO
+        from PIL import Image
+        with Image.open(BytesIO(data)) as image:
+            image.load()
+            fmt = image.format
+            mime = Image.MIME.get(fmt)
+        extensions = {"PNG": "png", "JPEG": "jpg", "WEBP": "webp", "GIF": "gif",
+                      "BMP": "bmp", "TIFF": "tiff", "AVIF": "avif"}
+        if not mime or fmt not in extensions:
+            raise RuntimeError("NanoGPT returned an unsupported image format")
+        return GenBlob(data=data, mime=mime, kind="image", name=f"image-{index}.{extensions[fmt]}")
+
+    async def generate(self, req: NormalizedRequest) -> GenOutput:
+        cand = {"model": req.real_model, self.mod.KIND: req.cloud or {}}
+        endpoint = self.mod.endpoint_of(cand)
+        if self.model_catalogs and req.real_model not in self.model_catalogs.get(endpoint, {}):
+            raise self.mod.INPUT_ERROR(f"NanoGPT model is unavailable for {endpoint}")
+        cand["model_metadata"] = self.model_catalogs.get(endpoint, {}).get(req.real_model)
+        opts = await asyncio.to_thread(self.mod.options_of, cand)
+        values = {**(req.inputs or {}), **(req.params or {})}
+        await asyncio.to_thread(self.mod.validate_request, cand, values,
+            (req.upload_images or {}).keys(), (req.upload_files or {}).keys(),
+            model_meta=cand["model_metadata"])
+        body = await asyncio.to_thread(self.mod.build_request, cand, values,
+                                       req.upload_images or {}, req.upload_files or {})
+        raw = await asyncio.to_thread(lambda: json.dumps(body).encode())
+        max_wait = float(self.backend.get("max_wait", self.mod.MAX_WAIT_DEFAULT))
+        interval = float(self.backend.get("poll_interval", self.mod.POLL_INTERVAL_DEFAULT))
+        headers = {**self._headers(), "Content-Type": "application/json"}
+        if endpoint == "images":
+            key = (self.backend.get("api_key") or "").strip()
+            if key:
+                headers["Authorization"] = "Bearer " + key
+        started = time.monotonic()
+        task_id, state = "", None
+        token = _CLOUD_JOB.set(req.job_id or "")
+        if not req.slot_held:
+            self.ctx.inflight_inc(self.bid)
+        try:
+            async with httpx.AsyncClient(timeout=_CLOUD_HTTP_TIMEOUT) as client:
+                try:
+                    response = await client.post(self._api(self.mod.SUBMIT_PATHS[endpoint]),
+                        content=raw, headers=headers,
+                        timeout=httpx.Timeout(connect=30.0, pool=30.0, read=max_wait,
+                                              write=max(60.0, len(raw) / (1024 * 1024) * 4)))
+                except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
+                    raise
+                except (httpx.TransportError, ConnectionError, TimeoutError) as e:
+                    req.cloud_trace.update(backend=self.name, cloud=self.mod.KIND,
+                        endpoint=endpoint, create_unconfirmed=True,
+                        request=self.mod.request_summary(body))
+                    raise RuntimeError("NanoGPT submit outcome is uncertain; generation "
+                                       "will not be retried") from e
+                # Any answer after a paid submit can hide an accepted upstream request.
+                # Neither a 5xx nor malformed success permits another generation POST.
+                req.cloud_trace.update(backend=self.name, cloud=self.mod.KIND,
+                    endpoint=endpoint, create_unconfirmed=True,
+                    request=self.mod.request_summary(body))
+                if not 200 <= response.status_code < 300:
+                    raise RuntimeError(f"NanoGPT generation HTTP {response.status_code}: {self._msg(response)}")
+                try:
+                    payload = await asyncio.to_thread(response.json)
+                    task_id = self.mod.task_id_of(payload, endpoint)
+                    blobs = []
+                    if task_id:
+                        self._note_task(req, task_id, endpoint, body)
+                        req.cloud_trace.pop("create_unconfirmed", None)
+                        if req.job_id:
+                            self.ctx.note_job_meta(req.job_id, dict(req.cloud_trace))
+                        remaining = max_wait - (time.monotonic() - started)
+                        state = await self._poll(client, endpoint, task_id, [], opts, interval, remaining)
+                        for index, (name, url) in enumerate(state.downloads, 1):
+                            data = await self._download(client, url)
+                            mime, kind = _mime_and_kind(name)
+                            if endpoint == "images":
+                                blob = await asyncio.to_thread(self._image_blob, data, index)
+                            else:
+                                blob = GenBlob(data=data, mime=mime, kind=kind, name=name)
+                            if not data:
+                                raise RuntimeError("NanoGPT returned an empty artifact")
+                            blobs.append(blob)
+                        if endpoint == "3d" and state.thumbnail:
+                            try:
+                                thumb = await self._download(client, state.thumbnail)
+                                preview = await asyncio.to_thread(self._image_blob, thumb, 0)
+                                preview.name = "preview" + os.path.splitext(preview.name)[1]
+                                blobs.append(preview)
+                            except Exception:
+                                logger.warning(f"[{self.name}] NanoGPT thumbnail download failed")
+                    elif endpoint == "images":
+                        outputs = await asyncio.to_thread(self.mod.image_outputs, payload)
+                        for index, (_, source, is_base64) in enumerate(outputs, 1):
+                            if is_base64:
+                                data = await asyncio.to_thread(base64.b64decode, source, validate=True)
+                            else:
+                                data = await self._download(client, source)
+                            blobs.append(await asyncio.to_thread(self._image_blob, data, index))
+                    else:
+                        raise RuntimeError("NanoGPT returned no task id")
+                    expected_kind = {"images": "image", "video": "video", "3d": "file"}[endpoint]
+                    if not any(blob.kind == expected_kind for blob in blobs):
+                        raise RuntimeError(f"NanoGPT returned no {endpoint} artifact")
+                    if endpoint == "images" and len(blobs) != int(body.get("n", 1)):
+                        raise RuntimeError("NanoGPT returned a different image count than requested")
+                except Exception as e:
+                    raise RuntimeError(f"NanoGPT {endpoint} result failed"
+                        f"{' after task ' + task_id if task_id else ' after paid submit'}: "
+                        f"{self._redact(str(e))}") from e
+        finally:
+            if not req.slot_held:
+                self.ctx.inflight_dec(self.bid)
+            _CLOUD_JOB.reset(token)
+            if req.job_id:
+                self.ctx.note_progress(req.job_id, None)
+        meta = {"backend": self.name, "cloud": self.mod.KIND, "endpoint": endpoint,
+                "ai_model": req.real_model, "request": self.mod.request_summary(body),
+                "elapsed_ms": int((time.monotonic() - started) * 1000)}
+        if task_id:
+            meta["cloud_task_id"] = task_id
+            if state.credits is not None:
+                meta["consumed_credits"] = state.credits
+        return GenOutput(blobs=blobs, meta=meta)
+
+
+
+class NanoGPTAdapter(BackendAdapter):
+    """One account, identity and concurrency pool for all six NanoGPT catalogs.
+
+    The protocol components share the configured backend and injected context;
+    neither is registered as an independently schedulable backend.
+    """
+
+    type = "nanogpt"
+    serves_generation = True
+    cloud = True
+    bills = True
+
+    def __init__(self, backend: dict, ctx: AdapterContext):
+        super().__init__(backend, ctx)
+        self._text = NanoGPTTextAdapter(backend, ctx)
+        self._media = NanoGPTMediaAdapter(backend, ctx)
+        self.model_catalogs: dict[str, dict[str, dict]] = {}
+
+    def _publish_catalogs(self, catalogs: dict) -> None:
+        self.model_catalogs = catalogs
+        self._text.model_catalogs = {kind: catalogs[kind]
+                                    for kind, _ in self._text._CATALOGS if kind in catalogs}
+        self._media.model_catalogs = {kind: catalogs[kind]
+                                     for kind in nanogpt.ENDPOINTS if kind in catalogs}
+
+    async def discover(self, client: httpx.AsyncClient) -> Capabilities:
+        # No partial or stale metadata may validate a paid request during refresh.
+        self._publish_catalogs({})
+        try:
+            results = await asyncio.gather(self._text.discover(client),
+                                          self._media.discover(client),
+                                          return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+            text, media = results
+            catalogs = {**self._text.model_catalogs, **self._media.model_catalogs}
+        except BaseException:
+            self._publish_catalogs({})
+            raise
+        self._publish_catalogs(catalogs)
+        return Capabilities(models=text.models | media.models, pricing=text.pricing,
+                            context=text.context)
+
+    def adopt_state(self, old: BackendAdapter) -> None:
+        if (not isinstance(old, NanoGPTAdapter)
+                or old.backend.get("url") != self.backend.get("url")
+                or old.backend.get("api_key") != self.backend.get("api_key")):
+            return
+        self._media.adopt_state(old._media)
+        catalogs = copy.deepcopy(old.model_catalogs)
+        for kind, metadata in catalogs.items():
+            kept = set(metadata)
+            if kind == "text":
+                # Legacy text filters need normalized token prices, not flat fees.
+                rows = [dict(row, pricing=self._text._pricing(row.get("pricing"), kind))
+                        for row in metadata.values()]
+                kept = extract_models(rows, self.backend)
+            kept = filter_models(kept, self.backend)
+            catalogs[kind] = {mid: metadata[mid] for mid in kept}
+        self._publish_catalogs(catalogs)
+
+    def adopt_discovery(self, old: BackendAdapter) -> None:
+        self.adopt_state(old)
+
+    async def dispatch(self, req: NormalizedRequest):
+        return await self._text.dispatch(req)
+
+    async def generate(self, req: NormalizedRequest) -> GenOutput:
+        cand = {"model": req.real_model, nanogpt.KIND: req.cloud or {}}
+        endpoint = nanogpt.endpoint_of(cand)
+        if req.real_model not in self.model_catalogs.get(endpoint, {}):
+            raise nanogpt.INPUT_ERROR(f"NanoGPT model is unavailable for {endpoint}")
+        return await self._media.generate(req)
 
 
 # ── Meshy.ai (cloud image → 3D) ───────────────────────────────────────────────
@@ -5254,15 +5809,17 @@ class RunpodAdapter(ComfyUIAdapter):
 
 ADAPTERS: dict[str, type[BackendAdapter]] = {
     "openai": OpenAIAdapter,
+    "nanogpt": NanoGPTAdapter,
     "anthropic": AnthropicAdapter,
     "comfyui": ComfyUIAdapter,
     "meshy": MeshyAdapter,
     "tripo": TripoAdapter,
+    "arliai": ArliAIImageAdapter,
     "runpod": RunpodAdapter,
 }
 
-# Backend types that take POST /v1/generations work (main routes generation to these
-# and keeps them OUT of the chat catalogs). Derived from the classes, not listed twice.
+# Backend types that take POST /v1/generations work. Multi-protocol adapters may
+# also dispatch text; their model_catalogs separates route purposes.
 GEN_TYPES: frozenset = frozenset(t for t, cls in ADAPTERS.items() if cls.serves_generation)
 
 # The cloud task backends among them (Meshy, Tripo) — a candidate's kind must match its

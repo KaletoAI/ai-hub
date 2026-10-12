@@ -271,6 +271,21 @@ class CloudBilledTaskIsFinal(unittest.TestCase):
         self.assertEqual((a.calls, b.calls), (1, 0))
         self.assertIn("answer was lost", self.jobs.failed["msg"])
 
+    def test_flat_subscription_uncertain_submit_has_no_billed_task(self):
+        """A lost SDNext answer stays final without inventing a per-task bill."""
+        trace = {"backend": "a", "cloud": "arliai", "endpoint": "txt2img",
+                 "create_unconfirmed": True}
+        cand = {"backend": "a", "model": "Checkpoint", "arliai": {"endpoint": "txt2img"}}
+        error = RuntimeError("ArliAI submit outcome is uncertain")
+        self.assertIsNone(main._billed_cloud_task(cand, trace, error))
+        a, b = _BillingAdapter(error, trace=trace), _BillingAdapter()
+        first = ({"name": "a", "type": "arliai", "self_retries": 1}, cand)
+        second = ({"name": "b", "type": "arliai"}, dict(cand, backend="b"))
+        self._run([first, second], {"arliai:a": a, "arliai:b": b})
+        self.assertEqual((a.calls, b.calls), (1, 0))
+        self.assertIsNotNone(self.jobs.failed)
+        self.assertIsNone(self.jobs.completed)
+
     def test_a_failure_before_any_task_still_fails_over(self):
         """No task, no bill: a full queue or a refused connect must keep the failover."""
         import adapters
@@ -390,6 +405,28 @@ class ChainStage1BilledIsFinal(unittest.TestCase):
         main.store._active = sa
         main._gen_waiting[:] = gw
         RunJobExecFailover.tearDown(self)
+
+    def test_native_image_slot_refuses_chain_before_buying_stage1(self):
+        """A NanoGPT image slot must not admit GLB handoff after billing stage 1."""
+        import adapters
+        import nanogpt
+        self.r.update(type="nanogpt", url="https://provider.test/api")
+        self.succ["mesh_param"] = "input_image"
+        meta = {"capabilities": {"image_to_image": True},
+                "supported_parameters": {"max_input_images": 1}}
+        main.image_models["rig"] = [nanogpt.candidate_for("r", "native-image", "images", meta)]
+        native = adapters.make_adapter(self.r, main.adapter_ctx)
+        native._publish_catalogs({"images": {"native-image": meta}})
+        first, second = self._stage1(), self._stage1()
+        main.backend_adapters.update({"meshy:a": first, "meshy:b": second, "nanogpt:r": native})
+        main.backend_healthy["nanogpt:r"] = True
+        asyncio.run(main._run_chain("job1", "s1", self.succ, {}, None, {}, {}, {}, {}))
+        self.assertEqual((first.calls, second.calls), (0, 0))
+        self.assertIsNotNone(self.jobs.failed)
+        self.assertIsNone(self.jobs.completed)
+        self.assertEqual(main.backend_inflight.get("meshy:a", 0), 0)
+        self.assertEqual(main.backend_inflight.get("nanogpt:r", 0), 0)
+
 
     def test_a_stage1_task_lost_to_the_vendor_is_not_bought_again(self):
         import adapters as ad_mod

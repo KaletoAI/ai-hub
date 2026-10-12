@@ -30,7 +30,9 @@ from watchfiles import awatch
 import adapters
 import admin
 import anthropic_bridge
+import arliai
 import faults
+import nanogpt
 import jobs
 import reasoning
 import scheduler
@@ -62,6 +64,38 @@ logger = logging.getLogger(__name__)
 
 CONFIG_PATH = Path("config.yaml")
 
+def _normalize_nanogpt_config(cfg: dict) -> None:
+    """Normalize legacy config at the boundary; only one public NanoGPT type."""
+    rows = cfg.get("backends") or []
+    legacy_refs = {cand["backend"] for candidates in (cfg.get("image_models") or {}).values()
+                   for cand in candidates if "nanogpt_media" in cand and cand.get("backend")}
+    if store.is_active():
+        names = store.migrate_nanogpt(rows, legacy_refs)
+    else:
+        occupied = {b["name"] for b in rows}
+        public = {b["name"] for b in rows if b.get("type") == "nanogpt"}
+        names = {}
+        for name in sorted({b["name"] for b in rows if b.get("type") == "nanogpt_media"} | legacy_refs):
+            target, n = name, 2
+            if target in public:
+                target = name + "-media"
+                while target in occupied:
+                    target = f"{name}-media-{n}"
+                    n += 1
+            names[name] = target
+            occupied.add(target)
+    for b in rows:
+        if b.get("type") == "nanogpt_media":
+            b.update(name=names[b["name"]], type="nanogpt")
+    for candidates in (cfg.get("image_models") or {}).values():
+        for cand in candidates:
+            if "nanogpt_media" in cand:
+                block = cand.pop("nanogpt_media")
+                if "nanogpt" in cand and cand["nanogpt"] != block:
+                    raise ValueError("Conflicting legacy and current NanoGPT alias blocks")
+                cand["nanogpt"] = block
+                cand["backend"] = names.get(cand.get("backend"), cand.get("backend"))
+
 def load_config() -> None:
     """Read config.yaml and (re)bind module-level config values."""
     global config, config_backends, config_virtual_models, virtual_models
@@ -69,7 +103,9 @@ def load_config() -> None:
     global stats_cfg, log_per_call, model_prefix, max_concurrent_default
     global image_models, jobs_cfg
     with open(CONFIG_PATH) as f:
-        config = yaml.safe_load(f)
+        loaded = yaml.safe_load(f)
+    _normalize_nanogpt_config(loaded)
+    config = loaded
     config_backends = sorted(config["backends"], key=lambda b: b.get("priority", 100))
     # Chat aliases: config is the base, UI-managed store entries merge over it (see
     # rebuild_virtual_models). `virtual_models` is the effective dict the router reads.
@@ -126,6 +162,7 @@ max_concurrent_default: Optional[int]
 image_models: dict
 jobs_cfg: dict
 load_config()
+_jobs_startup_cfg = dict(jobs_cfg)
 backends = list(config_backends)                              # store merges in once it's active (lifespan)
 
 
@@ -161,8 +198,7 @@ def rebuild_backends() -> None:
         # only when no unpaid one is free. Normalized here — config and store entries
         # may omit the key entirely. A cloud backend (Meshy, Tripo) bills per task, so it
         # is ALWAYS paid, and a RunPod endpoint bills per second of every run.
-        b["paid"] = True if (b.get("type") in adapters.CLOUD_TYPES
-                             or b.get("type") in adapters.BILLING_TYPES) else bool(b.get("paid"))
+        b["paid"] = True if b.get("type") in adapters.BILLING_TYPES else bool(b.get("paid"))
     # Every rebuild hands out NEW backend dicts; a managed-host controller reads its
     # entry and services from what it was handed, so it must be given the current ones.
     # BEFORE the grouping and the route index: an attached backend's forward ends and
@@ -371,9 +407,21 @@ def backend_id(backend: dict) -> str:
 
 
 def _is_gen(b: dict) -> bool:
-    """A generation backend (ComfyUI, Meshy, Tripo): routed by POST /v1/generations, never
-    listed in the chat catalogs. Type-agnostic replacement for `type == "comfyui"`."""
+    """Supports generation; NanoGPT also supports the LLM protocol family."""
     return b.get("type") in adapters.GEN_TYPES
+
+
+def _is_llm(b: dict) -> bool:
+    return b.get("type") == "nanogpt" or not _is_gen(b)
+
+
+def _llm_models(b: dict) -> set:
+    models = backend_models.get(backend_id(b), set())
+    if b.get("type") != "nanogpt":
+        return models
+    catalogs = getattr(backend_adapters.get(backend_id(b)), "model_catalogs", {})
+    text = set().union(*(set(catalogs.get(k, {})) for k in ("text", "tts", "embedding")))
+    return models & adapters.add_model_extras(text, b)
 
 
 def enabled_backends() -> list[dict]:
@@ -399,9 +447,25 @@ def backend_max_concurrent(backend: dict) -> Optional[int]:
 
 
 def backend_busy(backend: dict) -> bool:
-    """True when the backend is at/above its in-flight cap → temporarily skipped."""
+    """At the backend's own cap or its shared account group's lowest finite cap."""
     cap = backend_max_concurrent(backend)
-    return cap is not None and backend_inflight.get(backend_id(backend), 0) >= cap
+    if cap is not None and backend_inflight.get(backend_id(backend), 0) >= cap:
+        return True
+    group = backend.get("concurrency_group")
+    if not isinstance(group, str) or not group:
+        return False
+    group_cap = None
+    group_inflight = 0
+    # Use every current member, not enabled_backends(): disabling/draining a backend
+    # does not finish its active requests, and a save must not free their account slot.
+    for member in backends:
+        if member.get("concurrency_group") != group:
+            continue
+        member_cap = backend_max_concurrent(member)
+        if member_cap is not None and (group_cap is None or member_cap < group_cap):
+            group_cap = member_cap
+        group_inflight += backend_inflight.get(backend_id(member), 0)
+    return group_cap is not None and group_inflight >= group_cap
 
 
 # ── Graceful drain (take a backend offline once idle) ─────────────────────────
@@ -734,7 +798,7 @@ def _alias_context(alias: str, candidates: list) -> Optional[int]:
     pairs = []
     for b in candidates:
         real, _prio = alias_entry(alias, b["name"])
-        if real is not None and real in backend_models.get(backend_id(b), set()):
+        if real is not None and real in _llm_models(b):
             pairs.append((b, real))
     return _context_min(pairs)
 
@@ -818,9 +882,9 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
             backend_running.pop(bid, None)
         else:
             backend_running[bid] = running
-        if changed or had_running != (running is not None):
-            # model set changed, or `/running` appeared/vanished (which decides whether
-            # an alias's `current` entry is a candidate at all) → refresh the candidates
+        if changed or backend.get("type") == "nanogpt" or had_running != (running is not None):
+            # NanoGPT's typed catalogs can repopulate with unchanged cached IDs after
+            # restart, or after an index rebuild during discovery. Restore those routes too.
             rebuild_route_index()
         was_healthy = backend_healthy.get(bid, False)
         if not was_healthy:
@@ -929,6 +993,7 @@ def reload_config() -> None:
         backend_inflight.pop(stale, None)
         logger.info(f"  removed backend [{stale}] — state cleared")
     build_backend_adapters()       # rebind adapters to the new backend dicts
+    _activate_generation_jobs()
     logger.info("Config reloaded.")
     log_config_summary()
 
@@ -992,6 +1057,7 @@ async def watch_config_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _jobs_startup_cfg
     logger.info("Starting AI-Hub")
 
     # Writable store backs all UI-managed state (backends, chat aliases, generation
@@ -999,6 +1065,8 @@ async def lifespan(app: FastAPI):
     # Brought up BEFORE discovery so UI-added (store) backends are merged in and
     # discovered too.
     store.init(jobs_cfg.get("store_path", "store.db"))
+    load_config()                     # migrate old NanoGPT identities before seeding aliases
+    _jobs_startup_cfg = dict(jobs_cfg)
     store.bootstrap(image_models)
     for _alias, _cands in store.list_aliases().items():
         if adapters.migrate_upload_pins(_cands):
@@ -1023,7 +1091,7 @@ async def lifespan(app: FastAPI):
     # Generation job store: on whenever image_models are configured (or forced via
     # `jobs.enabled`).
     jobs_prune_task: Optional[asyncio.Task] = None
-    if image_models or jobs_cfg.get("enabled"):
+    if image_models or jobs_cfg.get("enabled") or any(_is_gen(b) for b in backends):
         jobs.init(jobs_cfg.get("db_path", "jobs.db"),
                   jobs_cfg.get("blob_dir", "jobs"),
                   jobs_cfg.get("default_ttl_s", 86400))
@@ -1376,18 +1444,22 @@ def _expand_grants(allow) -> set:
     if GRANT_ALL_CHAT in out:
         out |= set(virtual_models)
     if GRANT_ALL_BACKENDS in out:
-        out |= {b["name"] for b in backends if b.get("name") and not _is_gen(b)}
+        out |= {b["name"] for b in backends if b.get("name") and _is_llm(b)}
     return out
 
 
-def _model_allowed(user: dict, model: Optional[str]) -> bool:
+def _model_allowed(user: dict, model: Optional[str], *, media: Optional[bool] = None) -> bool:
     raw = user.get("models") or []
     if not raw or not model:
         return True                              # empty allow-list = all models
-    allow = _expand_grants(raw)
+    # A group grants its request family, not a same-named alias in another family.
+    # Inventory callers use None to consider both namespaces.
+    allow = _expand_grants(grant for grant in raw
+                           if (media is not True or grant != GRANT_ALL_CHAT)
+                           and (media is not False or grant != GRANT_ALL_IMAGE))
     if model in allow:                           # exact id / chat alias / image alias
         return True
-    if GRANT_ALL_IMAGE in allow and _gen_alias_exists(model):
+    if media is not False and GRANT_ALL_IMAGE in allow and (_gen_alias_exists(model) or _nano_direct_candidates(model)):
         return True
     bname, bare = split_backend_prefix(model)    # backend/model
     if bname and bname in allow:                 # whole-backend grant (prefixed request)
@@ -1405,7 +1477,7 @@ def _model_allowed(user: dict, model: Optional[str]) -> bool:
     # is offline) instead of a misleading 403. Disabled backends keep their last model set.
     is_alias = model in virtual_models
     for b in backends:
-        if _is_gen(b) or b.get("name") not in allow:
+        if not _is_llm(b) or b.get("name") not in allow:
             continue
         served = backend_models.get(backend_id(b), set())
         if bare in served:                                       # real model on a granted backend
@@ -1417,7 +1489,8 @@ def _model_allowed(user: dict, model: Optional[str]) -> bool:
     return False
 
 
-async def gate_request(authorization: Optional[str], request: Request, model: Optional[str]) -> Optional[dict]:
+async def gate_request(authorization: Optional[str], request: Request, model: Optional[str],
+                       *, media: bool = False) -> Optional[dict]:
     """Authenticate + enforce model allow-list and per-day quota; attribute the call
     to the user (stats source / job owner read it off request.state). Returns the user
     (None = anonymous bootstrap mode). Async only for the monthly-cost DB scan (run
@@ -1433,7 +1506,7 @@ async def gate_request(authorization: Optional[str], request: Request, model: Op
     request.state.gw_user = user["name"]
     # admin-only request powers downstream (a backend path in generation params)
     request.state.gw_admin = bool(user.get("_master") or user.get("role") == "admin")
-    if not _model_allowed(user, model):
+    if not _model_allowed(user, model, media=media):
         raise HTTPException(403, f"user '{user['name']}' is not allowed model '{model}'")
     cap = user.get("quota_cost_month")                 # monthly cost/credit quota (E1)
     if cap and stats.is_active():
@@ -1606,19 +1679,19 @@ def rebuild_route_index() -> None:
     first), so candidates keep their insertion order as the stable tiebreak."""
     global _backend_names, _llm_backends, _gen_backends, _route_index
     _backend_names = {b["name"] for b in backends}
-    _llm_backends = [b for b in enabled_backends() if not _is_gen(b)]
+    _llm_backends = [b for b in enabled_backends() if _is_llm(b)]
     _gen_backends = [b for b in enabled_backends() if _is_gen(b)]
     index: dict[str, list] = {}
     for alias in virtual_models:                       # aliases (they shadow same-named real ids)
         for b in _llm_backends:
             real, _prio = alias_entry(alias, b["name"])
-            if real is not None and (real in backend_models.get(backend_id(b), set())
+            if real is not None and (real in _llm_models(b)
                                      or _is_current(b, real)):
                 # a `current` entry stays the placeholder here — what it resolves to
                 # changes with every swap, so resolve_routes picks it per request
                 index.setdefault(alias, []).append((b, real))
     for b in _llm_backends:                            # bare model ids → pass-through routing
-        for mid in backend_models.get(backend_id(b), set()):
+        for mid in _llm_models(b):
             if mid not in virtual_models:
                 index.setdefault(mid, []).append((b, mid))
     _route_index = index
@@ -1667,7 +1740,7 @@ def anthropic_only_candidates(alias: str) -> bool:
             return False
         real = resolve_for_backend(bare, bname)
         # A model that backend never listed is not an endpoint mistake — leave it 503.
-        if real is None or real not in backend_models.get(backend_id(b), set()):
+        if real is None or real not in _llm_models(b):
             return False
         return b.get("type") == "anthropic"
     cands = _route_index.get(alias) or []
@@ -1698,7 +1771,7 @@ def resolve_routes(alias: str, path: str = "/v1/chat/completions") -> tuple[list
         real = resolve_for_backend(bare, bname)
         if _is_current(b, real):
             real = _current_model(b, path)
-        if real is None or real not in backend_models.get(backend_id(b), set()):
+        if real is None or real not in _llm_models(b):
             return [], []
         return ([], [(b, real)]) if backend_busy(b) else ([(b, real)], [])
 
@@ -1818,8 +1891,7 @@ def alias_model_conflicts() -> list[dict]:
     out = []
     for name in virtual_models:
         hosting = [b["name"] for b in enabled_backends()
-                   if not _is_gen(b)
-                   and name in backend_models.get(backend_id(b), set())]
+                   if _is_llm(b) and name in _llm_models(b)]
         if not hosting:
             continue
         covered = [bn for bn in hosting if alias_entry(name, bn)[0] is not None]
@@ -1846,14 +1918,14 @@ def routing_snapshot() -> dict:
     for name in virtual_models:
         rows = []
         for b in backends:                     # all (incl. disabled) LLM backends, so a
-            if _is_gen(b):                     # mapping doesn't vanish when off
+            if not _is_llm(b):                 # mapping doesn't vanish when off
                 continue                       # chat aliases route only to LLM backends
             real, _prio = alias_entry(name, b["name"])
             if real is None:
                 continue                       # alias not mapped to this backend
             bid, enbl = backend_id(b), is_enabled(b)
             healthy = enbl and backend_healthy.get(bid, False)
-            present = real in backend_models.get(bid, set()) or _is_current(b, real)
+            present = real in _llm_models(b) or _is_current(b, real)
             busy = enbl and healthy and backend_busy(b)
             rows.append({
                 "backend": b["name"],
@@ -1871,7 +1943,7 @@ def routing_snapshot() -> dict:
     model_hosts: dict[str, list] = {}
     for b in enabled:
         healthy = backend_healthy.get(backend_id(b), False)
-        for mid in backend_models.get(backend_id(b), set()):
+        for mid in _llm_models(b) if _is_llm(b) else ():
             model_hosts.setdefault(mid, []).append({
                 "backend": b["name"],
                 "type": b.get("type", "openai"),
@@ -1941,7 +2013,7 @@ async def probe_reasoning(backend_name: str, model: str, adapter: str, param: di
     the /ui Reasoning-tab live test drives this. Returns a plain dict for the UI."""
     requested = requested if requested in ("off", "on") else "off"
     b = next((x for x in backends if x.get("name") == backend_name
-              and not _is_gen(x)), None)
+              and _is_llm(x)), None)
     if b is None:
         return {"error": f"backend '{backend_name}' not found or not an LLM backend"}
     if b.get("type") == "anthropic":
@@ -2038,9 +2110,9 @@ def _local_whisper():
 def _whisper_route() -> Optional[tuple[dict, str]]:
     """First healthy LLM backend serving a whisper* model (fallback transcription)."""
     for b in enabled_backends():
-        if _is_gen(b):
+        if not _is_llm(b):
             continue
-        for m in sorted(backend_models.get(backend_id(b), set())):
+        for m in sorted(_llm_models(b)):
             if "whisper" in m.lower() and backend_healthy.get(backend_id(b)):
                 return b, m
     return None
@@ -2654,7 +2726,7 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
     # Per-user allow-list FILTERS the catalog (empty = all). Entries may be a model id,
     # a chat/image alias, or a backend name (grants all of that backend's models).
     allow = _expand_grants((user.get("models") if user else None) or [])
-    typ = (request.query_params.get("type") or "").lower()    # ""=both, "chat", "image"
+    typ = (request.query_params.get("type") or "").lower()
     now = int(time.time())
     seen: set[str] = set()
     data = []
@@ -2664,13 +2736,22 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
 
     # CHAT/LLM catalog = LLM backends only (ComfyUI "models" are checkpoints, not
     # chat-callable). Names are unique within the LLM type, so the prefix is unambiguous.
-    if typ != "image":
+    if typ in ("", "chat", "tts", "embedding"):
         offered = [b for b in enabled_backends()
-                   if not (_is_gen(b) or is_draining(b) or not backend_healthy.get(backend_id(b)))]
+                   if _is_llm(b) and not is_draining(b) and backend_healthy.get(backend_id(b))]
         for backend in offered:                   # comfy / draining / down → not offered
             bname = backend["name"]
             expose_bare = backend.get("local", False)
-            for mid in sorted(backend_models.get(backend_id(backend), set())):
+            catalogs = getattr(backend_adapters.get(backend_id(backend)), "model_catalogs", {})
+            for mid in sorted(_llm_models(backend)):
+                if typ:
+                    if backend.get("type") == "nanogpt":
+                        key = {"chat": "text", "tts": "tts", "embedding": "embedding"}[typ]
+                        known = any(mid in catalog for catalog in catalogs.values())
+                        if mid not in catalogs.get(key, {}) and not (typ == "chat" and not known):
+                            continue
+                    elif typ != "chat":
+                        continue
                 # model_prefix on → '<backend>/<model>' (provider visible, distinct across
                 # backends). off → legacy bare ids deduplicated across backends.
                 disp = f"{bname}/{mid}" if model_prefix else mid
@@ -2687,30 +2768,43 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
                     data.append(_with_context(
                         {"id": mid, "object": "model", "created": now, "owned_by": bname},
                         _context_min((b2, mid) for b2 in offered
-                                     if mid in backend_models.get(backend_id(b2), set()))))
+                                     if mid in _llm_models(b2))))
             # `<backend>/current` (llama-swap only) — always prefixed, a bare `current`
             # would be ambiguous. No context_length: it changes with every swap.
             cur = f"{bname}/{adapters.CURRENT_MODEL}"
-            if _is_current(backend, adapters.CURRENT_MODEL) and cur not in seen and visible({cur, bname}):
+            if typ in ("", "chat") and _is_current(backend, adapters.CURRENT_MODEL) and cur not in seen and visible({cur, bname}):
                 seen.add(cur)
                 data.append({"id": cur, "object": "model", "created": now, "owned_by": bname})
         # Virtual chat aliases are cross-backend → always listed bare (no prefix).
-        for alias in virtual_models:
+        for alias in virtual_models if typ in ("", "chat") else ():
             if alias not in seen and visible({alias}):
                 seen.add(alias)
                 data.append(_with_context(
                     {"id": alias, "object": "model", "created": now, "owned_by": "ai-hub (virtual)"},
                     _alias_context(alias, offered)))
 
-    # IMAGE generation aliases (separate namespace) — listed so image clients (anima-verse)
-    # can discover them; granted by alias name. `?type=image` returns only these.
-    if typ != "chat":
-        img_aliases = (list((await asyncio.to_thread(store.list_aliases)).keys())
-                       if store.is_active() else list(image_models.keys()))
-        for alias in img_aliases:
+    # Optional aliases retain precedence over directly discovered media IDs.
+    if typ in ("", "image", "video", "3d", "tts"):
+        img_aliases = (await asyncio.to_thread(store.list_aliases)
+                       if store.is_active() else image_models)
+        for alias, cands in img_aliases.items():
+            kind = _generation_type(cands[0]) if cands else "image"
+            if typ and kind != typ:
+                continue
             if alias not in seen and visible({alias, GRANT_ALL_IMAGE}):
                 seen.add(alias)
-                data.append({"id": alias, "object": "model", "created": now, "owned_by": "ai-hub (image)"})
+                data.append({"id": alias, "object": "model", "created": now,
+                             "owned_by": f"ai-hub ({kind})"})
+        for row in generation_models_info():
+            kind = "image" if row["endpoint"] == "images" else row["endpoint"]
+            mid = row["candidate"]["model"]
+            disp = row["id"] if model_prefix else mid
+            if row["id"] in img_aliases or disp in img_aliases or (typ and typ != kind):
+                continue
+            if disp not in seen and visible({disp, mid, row["backend"], GRANT_ALL_IMAGE}):
+                seen.add(disp)
+                data.append({"id": disp, "object": "model", "created": now,
+                             "owned_by": row["backend"]})
 
     return {"object": "list", "data": data}
 
@@ -2723,7 +2817,7 @@ async def get_model(model_id: str, authorization: Optional[str] = Header(None)):
     if user is not None and not _model_allowed(user, model_id):
         raise HTTPException(404, f"Model '{model_id}' not found")
     now = int(time.time())
-    llm = [b for b in enabled_backends() if not _is_gen(b)]
+    llm = [b for b in enabled_backends() if _is_llm(b)]
     if model_id in virtual_models:
         return _with_context(
             {"id": model_id, "object": "model", "created": now, "owned_by": "ai-hub (virtual)"},
@@ -2731,17 +2825,20 @@ async def get_model(model_id: str, authorization: Optional[str] = Header(None)):
     bname, bare = split_backend_prefix(model_id)
     if bname is not None:
         b = next((b for b in llm if b["name"] == bname), None)
-        if b is not None and bare in backend_models.get(backend_id(b), set()):
+        if b is not None and bare in _llm_models(b):
             return _with_context({"id": model_id, "object": "model", "created": now, "owned_by": bname},
                                  model_context(b, bare))
         if b is not None and _is_current(b, bare):
             return {"id": model_id, "object": "model", "created": now, "owned_by": bname}
     else:
-        hosts = [b for b in llm if model_id in backend_models.get(backend_id(b), set())]
+        hosts = [b for b in llm if model_id in _llm_models(b)]
         if hosts:      # a bare id routes across every host → the smallest window, as in the listing
             return _with_context(
                 {"id": model_id, "object": "model", "created": now, "owned_by": hosts[0]["name"]},
                 _context_min((b, model_id) for b in hosts))
+    routes = await asyncio.to_thread(get_gen_routes, model_id)
+    if routes:
+        return {"id": model_id, "object": "model", "created": now, "owned_by": routes[0][0]["name"]}
     raise HTTPException(404, f"Model '{model_id}' not found")
 
 
@@ -3072,6 +3169,52 @@ def _gen_backend_for(name: str, cand: Optional[dict],
     return None
 
 
+def _generation_type(cand: dict) -> str:
+    if adapters.cand_kind(cand) == nanogpt.KIND:
+        endpoint = nanogpt.endpoint_of(cand)
+        return "image" if endpoint == "images" else endpoint
+    task = str(cand.get("task") or "")
+    if "vid" in task:
+        return "video"
+    if "3d" in task or adapters.cand_kind(cand) in ("meshy", "tripo"):
+        return "3d"
+    return "tts" if "tts" in task or "audio" in task else "image"
+
+
+def _nano_direct_candidates(model: str, pool=None) -> list[dict]:
+    """Resolve catalog IDs without writing aliases; explicit aliases win upstream."""
+    bname, bare = split_backend_prefix(model)
+    out = []
+    for b in _gen_backends if pool is None else pool:
+        if b.get("type") != "nanogpt" or (bname is not None and b["name"] != bname):
+            continue
+        catalogs = getattr(backend_adapters.get(backend_id(b)), "model_catalogs", {})
+        for endpoint in ("images", "video", "3d"):
+            if bare in catalogs.get(endpoint, {}):
+                out.append(nanogpt.candidate_for(b["name"], bare, endpoint, catalogs[endpoint][bare]))
+    return out
+
+
+def generation_models_info() -> list[dict]:
+    """Current directly callable media inventory for the console, without secrets."""
+    out = []
+    for b in _gen_backends:
+        if b.get("type") != "nanogpt" or is_draining(b) or not backend_healthy.get(backend_id(b)):
+            continue
+        catalogs = getattr(backend_adapters.get(backend_id(b)), "model_catalogs", {})
+        for endpoint in ("images", "video", "3d"):
+            for model, meta in sorted(catalogs.get(endpoint, {}).items()):
+                out.append({"id": f"{b['name']}/{model}", "name": meta.get("name") or model,
+                            "backend": b["name"], "endpoint": endpoint,
+                            "candidate": nanogpt.candidate_for(b["name"], model, endpoint, meta)})
+    return out
+
+
+def generation_candidate(model: str) -> Optional[dict]:
+    routes = get_gen_routes(model)
+    return routes[0][1] if routes else None
+
+
 def _gen_routes(alias: str, gated: Optional[list] = None) -> tuple[list, list]:
     """(ready, all) (backend, candidate) pairs for a generation alias, each ordered
     **unpaid before paid, then fastest first** (`gen_speed` EMA per alias+backend; an
@@ -3095,7 +3238,9 @@ def _gen_routes(alias: str, gated: Optional[list] = None) -> tuple[list, list]:
     (store read) — call via asyncio.to_thread from async code."""
     candidates = store.get(alias) if store.is_active() else None
     if candidates is None:
-        candidates = image_models.get(alias, [])
+        candidates = image_models.get(alias)
+    if candidates is None:
+        candidates = _nano_direct_candidates(alias)
     # generation routes only to generation backends (ComfyUI, Meshy, Tripo), so a name
     # shared with an LLM backend resolves to the right one — and, since backends are keyed
     # (name, type), the candidate's own KIND picks between a same-named ComfyUI and
@@ -3106,6 +3251,12 @@ def _gen_routes(alias: str, gated: Optional[list] = None) -> tuple[list, list]:
         b = _gen_backend_for(cand.get("backend"), cand, gen)
         if b is None or not backend_healthy.get(backend_id(b)):
             continue
+        if b.get("type") == "nanogpt":
+            endpoint = nanogpt.endpoint_of(cand)
+            meta = getattr(backend_adapters.get(backend_id(b)), "model_catalogs", {}).get(
+                endpoint, {}).get(cand.get("model"))
+            if meta is not None:
+                cand = {**cand, "model_metadata": meta}
         why = modelsync_gate(b, alias)
         if why:
             if gated is not None:
@@ -3495,9 +3646,10 @@ def _billed_cloud_task(cand: dict, trace: dict, e: BaseException,
         if rp and not trace.get("runpod_settled"):
             return f"RunPod job {rp}"
         return None
-    if not adapters.cloud_kind(cand) or isinstance(e, adapters.CloudTaskRetryable):
+    kind = adapters.cloud_kind(cand)
+    if kind not in adapters.BILLING_TYPES or isinstance(e, adapters.CloudTaskRetryable):
         return None
-    vendor = adapters.cloud_module(adapters.cloud_kind(cand)).VENDOR
+    vendor = adapters.cloud_module(kind).VENDOR
     tid = trace.get("cloud_task_id")
     if tid and tid != prior_task:
         return f"{vendor} task {tid}"
@@ -4027,6 +4179,8 @@ def _chain_mesh_param_error(s2: dict, mesh_param: str, succ_alias: str) -> Optio
     label table, and the mesh is a FILE field (public_fields()[2]). Pure over `s2` —
     unit-tested."""
     k = adapters.cloud_kind(s2)
+    if k in (arliai.KIND, nanogpt.KIND):
+        return f"chain: a {k} backend cannot be a chain stage 2"
     if k:
         vendor = adapters.cloud_module(k).VENDOR
         s2_files = [f["name"] for f in adapters.public_fields(s2)[2]]
@@ -4669,6 +4823,12 @@ async def cancel_generation(job_id: str) -> bool:
              if store.is_active() else None) or image_models.get(job_alias) or []
     cand = next((c for c in cands if c.get("backend") == job.get("backend")), None)
     pool = [x for x in backends if _is_gen(x)]       # incl. disabled: cancel must still reach it
+    if cand is None:
+        cand = next((c for c in _nano_direct_candidates(job_alias, pool)
+                     if c.get("backend") == job.get("backend")), None)
+    if cand is None and (job.get("meta") or {}).get("cloud") == nanogpt.KIND:
+        # A running paid task keeps its kind even when discovery goes down.
+        cand = {nanogpt.KIND: {}}
     b = (_gen_backend_for(job.get("backend"), cand, pool) if cand is not None
          else next((x for x in pool if x.get("name") == job.get("backend")), None))
     adapter = backend_adapters.get(backend_id(b)) if b else None
@@ -4938,8 +5098,35 @@ async def run_generation(body: dict, request: Request,
 
     routes, parked, eligible = await _gen_pick(alias, force, body)
     inputs, params = _gen_inputs_params(body)
-    _apply_seconds(params, routes[0][1])         # seconds → frames (alias fps; 400 if unsupported)
     c0 = routes[0][1]
+    nano_media = adapters.cloud_kind(c0) == nanogpt.KIND
+    if not nano_media:
+        _apply_seconds(params, c0)              # workflow seconds → frames
+    if nano_media:
+        if "n" in output:
+            params["n"] = output["n"]
+        try:
+            backend = routes[0][0]
+            adapter = backend_adapters.get(backend_id(backend))
+            catalog = getattr(adapter, "model_catalogs", {})
+            endpoint = nanogpt.endpoint_of(c0)
+            if catalog and c0.get("model") not in catalog.get(endpoint, {}):
+                raise nanogpt.NanoGPTInput(f"NanoGPT model is unavailable for {endpoint}")
+            await asyncio.to_thread(nanogpt.validate_request, c0, {**inputs, **params},
+                (upload_images or {}).keys(), (upload_files or {}).keys(),
+                model_meta=catalog.get(endpoint, {}).get(c0.get("model")))
+        except nanogpt.NanoGPTInput as e:
+            raise HTTPException(400, str(e)) from e
+    if adapters.cloud_kind(c0) == "arliai":
+        if output.get("n", 1) != 1:
+            raise HTTPException(400, "ArliAI supports one image per generation request (`n=1`)")
+        try:
+            arliai.build_request(
+                c0, {**params, **inputs}, upload_images or {}, upload_files or {},
+                max_image_pixels=routes[0][0].get("max_image_pixels",
+                                                arliai.MAX_IMAGE_PIXELS_DEFAULT))
+        except arliai.ArliAIInput as e:
+            raise HTTPException(400, str(e)) from e
     wf_maps = [(adapters.cand_workflow(c0) or {}, c0.get("mapping") or {})]
     succ_alias = ((c0.get("successor") or {}).get("alias") or "").strip()
     if succ_alias:
@@ -5079,19 +5266,24 @@ async def _decode_upload_files(alias: str, files: dict) -> dict:
     Deliberately STRICT where `params` are lenient (unknown names are ignored there):
     a dropped file would not degrade the job, it would run the workflow against its
     baked-in default and hand back a confidently wrong result."""
-    wf, mapping = await asyncio.to_thread(_gen_alias_mapping, alias)
-    # Same lookup as every other alias read (_gen_routes, gen_alias_schema): store first,
-    # config `image_models` for aliases the store doesn't hold — a config-defined cloud
-    # alias must hit the branch below too, not fall through and drop the files silently.
-    cands = ((await asyncio.to_thread(store.get, alias)) if store.is_active() else None) \
-        or image_models.get(alias)
-    k = adapters.cloud_kind(cands[0]) if cands else None
+    cand = await asyncio.to_thread(generation_candidate, alias)
+    if cand is None:
+        # Offline aliases still describe their file fields; direct models require discovery.
+        cands = ((await asyncio.to_thread(store.get, alias)) if store.is_active() else None)
+        if cands is None:
+            cands = image_models.get(alias)
+        cand = cands[0] if cands else None
+    if cand is None:
+        raise HTTPException(503, f"No available generation model '{alias}' to resolve file inputs")
+    wf = adapters.cand_workflow(cand) or {}
+    mapping = cand.get("mapping") or {}
+    k = adapters.cloud_kind(cand)
     if k:
         # A cloud alias (Meshy, Tripo) has no mapping — its file inputs are the endpoint's
         # fixed table (the rig endpoint: input_mesh_path; the image ones: none), so the
         # keys are checked against public_fields instead, and are their OWN param names.
         vendor = adapters.cloud_module(k).VENDOR
-        allowed = {f["name"] for f in adapters.public_fields(cands[0])[2]}
+        allowed = {f["name"] for f in adapters.public_fields(cand)[2]}
         if not allowed:
             raise HTTPException(400, f"generation alias '{alias}' runs on {vendor} and accepts"
                                      f" no `files` — send images under `images`")
@@ -5133,7 +5325,7 @@ async def _decode_ref_images(imgs: dict) -> dict:
 @app.post("/v1/generations")
 async def generations(request: Request, authorization: Optional[str] = Header(None)):
     body = await request.json()
-    await gate_request(authorization, request, body.get("model"))    # auth + allow-list + quota
+    await gate_request(authorization, request, body.get("model"), media=True)    # auth + allow-list + quota
     # Optional per-field reference images: {"images": {<image-param>: <base64|data-URI|URL>}}
     # — the native counterpart of the playground's per-field uploads and the OpenAI
     # shims' positional ref_images.
@@ -5181,7 +5373,7 @@ async def _alias_lora_items(alias: str, request: Request, authorization: Optiona
     """(sorted LoRA names valid for the alias, their trigger-word items). The names are
     the union installed across the alias's backends, as always; the items come from the
     in-memory snapshot only — never a hash, a listing or Civitai (N1)."""
-    await gate_request(authorization, request, alias)                # auth + allow-list
+    await gate_request(authorization, request, alias, media=True)                # auth + allow-list
     cands = ((await asyncio.to_thread(store.get, alias)) if store.is_active() else None) \
         or image_models.get(alias)
     if not cands:
@@ -5224,7 +5416,7 @@ async def gen_alias_schema(alias: str, request: Request, authorization: Optional
     from the workflow, image slots with their empty behaviour, `files` (uploads that
     are not images — a mesh a rig/shrink alias works on), fps/frames raster, and
     where to list valid LoRAs."""
-    await gate_request(authorization, request, alias)                # auth + allow-list
+    await gate_request(authorization, request, alias, media=True)                # auth + allow-list
     cands = ((await asyncio.to_thread(store.get, alias)) if store.is_active() else None) \
         or image_models.get(alias)
     if not cands:
@@ -5499,20 +5691,49 @@ async def _decode_ref_image(ref) -> Optional[bytes]:
     return got[0] if got else None
 
 
+def _image_shim_settings(alias: str, size, params: dict, n):
+    """Preserve NanoGPT model-native controls; workflow backends retain size defaults."""
+    routes = get_gen_routes(alias)
+    nano = bool(routes and adapters.cloud_kind(routes[0][1]) == nanogpt.KIND)
+    params = dict(params)
+    if nano:
+        if nanogpt.endpoint_of(routes[0][1]) != "images":
+            raise HTTPException(400, "OpenAI Images requires a NanoGPT images alias")
+        if size not in (None, ""):
+            params["size"] = size
+        if n is None:
+            n = params.get("n")
+        if n in (None, "") and isinstance(params.get("extra"), dict):
+            n = params["extra"].get("n")
+        if n in (None, ""):
+            n = nanogpt.options_of(routes[0][1]).get("n")
+        return params, n if n is not None else 1, True
+    w, h = parse_size(size)
+    return {"width": w, "height": h, **params}, int(n or 1), False
+
+
 @app.post("/v1/images/generations")
 async def images_generations(request: Request, authorization: Optional[str] = Header(None)):
     """OpenAI Images API (text->image). Bonus: LocalAI-style `ref_images`
     (base64/URL list) are accepted and mapped onto the alias's image slots."""
     body = await request.json()
     alias = body.get("model", "")
-    await gate_request(authorization, request, alias)
+    await gate_request(authorization, request, alias, media=True)
     if not body.get("prompt"):
         raise HTTPException(400, "`prompt` is required")
-    w, h = parse_size(body.get("size"))
     refs = body.get("ref_images") or []
     if not isinstance(refs, list):
         raise HTTPException(400, "`ref_images` must be a list")
     slots = await asyncio.to_thread(_gen_image_slots, alias)   # ONE lookup — uploads + log
+    if refs and not slots:
+        raise HTTPException(400, f"'{alias}' has no reference-image inputs")
+    params, count, nano = await asyncio.to_thread(_image_shim_settings, alias, body.get("size"),
+        {**(body.get("params") or {}), **{k: v for k, v in body.items() if k not in OAI_IMG_KEYS}},
+        body.get("n"))
+    if nano:
+        if len(refs) > len(slots):
+            raise HTTPException(400, f"NanoGPT accepts at most {len(slots)} reference images")
+        params.update({k: body[k] for k in ("quality", "style", "background", "output_format") if k in body})
     # images_uploads keeps one image per slot; fetching the rest would only download
     # (and, for URLs, reach out for) bytes that are thrown away.
     decoded = [await _decode_ref_image(r) for r in refs[:len(slots)]]
@@ -5524,8 +5745,8 @@ async def images_generations(request: Request, authorization: Optional[str] = He
     native = {
         "model": alias, "mode": "sync",
         "prompt": body.get("prompt", ""), "negative_prompt": body.get("negative_prompt", ""),
-        "params": {"width": w, "height": h, **(body.get("params") or {}), **extra},
-        "output": {"n": int(body.get("n") or 1), "mode": "sync"},
+        "params": params,
+        "output": {"n": count, "mode": "sync"},
     }
     view = gen_done_or_502(await run_generation(native, request, upload_images=uploads))
     return JSONResponse(await asyncio.to_thread(          # b64 branch reads result files
@@ -5540,26 +5761,35 @@ async def images_edits(request: Request, authorization: Optional[str] = Header(N
     f = await multipart_list(request)
     one = lambda k, d="": (f.get(k) or [d])[0]
     alias = (one("model") or "").strip()
-    await gate_request(authorization, request, alias)
+    await gate_request(authorization, request, alias, media=True)
     images = [v for v in (f.get("image") or []) if isinstance(v, (bytes, bytearray))]
     if not images:
         raise HTTPException(400, "at least one `image` file is required")
     masks = [v for v in (f.get("mask") or []) if isinstance(v, (bytes, bytearray))]
     slots = await asyncio.to_thread(_gen_image_slots, alias)   # ONE lookup — uploads + log
+    if not slots:
+        raise HTTPException(400, f"'{alias}' does not support image edits")
+    routes = await asyncio.to_thread(get_gen_routes, alias)
+    nano = bool(routes and adapters.cloud_kind(routes[0][1]) == nanogpt.KIND)
+    if nano and masks:
+        raise HTTPException(400, "NanoGPT mask edits require params.maskDataUrl on /v1/generations")
+    if nano and len(images) > len(slots):
+        raise HTTPException(400, f"NanoGPT accepts at most {len(slots)} reference images")
     logger.info(f"images/edits '{alias}': image_files={len(images)} mask_files={len(masks)} "  # where they land
                 f"slots={slots} "
                 f"scalar_keys={sorted(k for k, vs in f.items() if not isinstance((vs or [None])[0], (bytes, bytearray)))}")
     # OpenAI `mask` field → the next positional slot (the mask slot is normally last in
     # the mapping order, after the reference image[s]).
     images = (images + masks)[:16]                      # OpenAI gpt-image-1 max; workflow may use fewer
-    w, h = parse_size(one("size") or None)
     extra = {k: coerce_scalar(one(k)) for k, vs in f.items()  # dynamic scalar params (loras, seed, …)
              if k not in EDIT_KNOWN and not isinstance((vs or [None])[0], (bytes, bytearray))}
+    params, count, _ = await asyncio.to_thread(_image_shim_settings, alias, one("size") or None,
+                                             extra, one("n") or None)
     native = {
         "model": alias, "mode": "sync", "task": "img2img",
         "prompt": one("prompt"), "negative_prompt": one("negative_prompt"),
-        "params": {"width": w, "height": h, **extra},
-        "output": {"n": int((one("n") or "1") or 1), "mode": "sync"},
+        "params": params,
+        "output": {"n": count, "mode": "sync"},
     }
     view = gen_done_or_502(await run_generation(native, request, upload_images=images_uploads(images, slots)))
     return JSONResponse(await asyncio.to_thread(          # b64 branch reads result files
@@ -5577,7 +5807,8 @@ def dashboard_snapshot() -> dict:
         bid, en = backend_id(b), is_enabled(b)
         # requests handled in the last hour: LLM calls from stats, image jobs from the
         # job store (an LLM and a ComfyUI backend may share a name → pick by type).
-        src_1h = jobs_1h if _is_gen(b) else calls_1h
+        reqs_1h = ((calls_1h.get(b["name"], 0) if _is_llm(b) else 0) +
+                   (jobs_1h.get(b["name"], 0) if _is_gen(b) else 0))
         bes.append({
             "name": b["name"], "type": b.get("type", "openai"),
             "enabled": en, "healthy": en and backend_healthy.get(bid, False),
@@ -5586,7 +5817,7 @@ def dashboard_snapshot() -> dict:
             "draining": is_draining(b),
             "max_concurrent": backend_max_concurrent(b),
             "models": len(backend_models.get(bid, set())),
-            "reqs_1h": src_1h.get(b["name"], 0),
+            "reqs_1h": reqs_1h,
             "sampling_defaults": b.get("sampling_defaults") or None,
             **_loaded_info(b),
         })
@@ -5967,6 +6198,9 @@ def gateway_info() -> dict:
             "inflight": backend_inflight.get(backend_id(b), 0), "draining": is_draining(b),
             "models": len(backend_models.get(backend_id(b), set())), "url": b["url"],
             "max_concurrent": b.get("max_concurrent"),
+            "concurrency_group": b.get("concurrency_group"),
+            "max_image_pixels": b.get("max_image_pixels"),
+            "model_context": b.get("model_context"),
             "chat_only": bool(b.get("chat_only")), "serverless_only": bool(b.get("serverless_only")),
             "local": bool(b.get("local")), "paid": bool(b.get("paid")),
             "api_key_set": bool(b.get("api_key")),      # the key itself never leaves main
@@ -5991,6 +6225,20 @@ def gateway_info() -> dict:
     }
 
 
+def _activate_generation_jobs() -> None:
+    """Start the job store on a runtime generation cutover, using startup-only paths."""
+    if jobs.is_active() or not any(_is_gen(b) for b in backends):
+        return
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    jobs.init(_jobs_startup_cfg.get("db_path", "jobs.db"),
+              _jobs_startup_cfg.get("blob_dir", "jobs"),
+              _jobs_startup_cfg.get("default_ttl_s", 86400))
+    _bg(jobs.prune_loop(_jobs_startup_cfg.get("prune_interval_s", 3600)))
+
+
 def apply_backend_change() -> None:
     """Re-merge config + store backends, rebind adapters, and kick an immediate
     discovery — called by the UI after a backend is added/edited/deleted/enabled.
@@ -5999,6 +6247,7 @@ def apply_backend_change() -> None:
     grabbed once discovery marks it healthy — see refresh_backend)."""
     rebuild_backends()
     build_backend_adapters()
+    _activate_generation_jobs()
     _notify_slot_free()
 
     async def _discover():
@@ -8970,10 +9219,10 @@ def llm_backends_info() -> list[dict]:
     editor's per-backend model pickers."""
     return [{"name": b["name"], "type": b.get("type", "openai"),
              "enabled": is_enabled(b),
-             "models": sorted(backend_models.get(backend_id(b), set())),
+             "models": sorted(_llm_models(b)),
              # `/running` answers → the alias editor also offers `current` here
              "current": _is_current(b, adapters.CURRENT_MODEL)}
-            for b in backends if not _is_gen(b)]
+            for b in backends if _is_llm(b)]
 
 
 # Wire the UI to the generation core, the ComfyUI backends, the status snapshot,
@@ -8981,6 +9230,8 @@ def llm_backends_info() -> list[dict]:
 admin.bind(runpod_probe=runpod_probe, runpod_object_info=runpod_object_info,
            comfy_backends=lambda: [b for b in backends if b.get("type") == "comfyui"],
            gen_backends=lambda: [b for b in backends if _is_gen(b)],
+           generation_models=generation_models_info,
+           generation_candidate=generation_candidate,
            gateway_info=gateway_info,
            gen_speed_info=gen_speed_info,
            faults_info=faults_info,
@@ -9008,7 +9259,7 @@ admin.bind(runpod_probe=runpod_probe, runpod_object_info=runpod_object_info,
            set_backend_enabled=set_backend_enabled,
            restart_comfy=restart_comfy_backend,
            llm_backend_names=lambda: sorted({b["name"] for b in backends
-                                             if not _is_gen(b)}),
+                                             if _is_llm(b)}),
            resolve_for_backend=resolve_for_backend,
            apply_reasoning=apply_reasoning_rules,
            probe_reasoning=probe_reasoning,

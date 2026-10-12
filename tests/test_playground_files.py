@@ -88,6 +88,8 @@ class RecentArtifacts(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        saved = {k: getattr(jobs, k) for k in ("_DB_PATH", "_BLOB_DIR", "_DEFAULT_TTL", "_active")}
+        self.addCleanup(lambda: [setattr(jobs, k, v) for k, v in saved.items()])
         jobs.init(os.path.join(self.tmp.name, "jobs.db"),
                   os.path.join(self.tmp.name, "blobs"), 3600)
 
@@ -172,6 +174,10 @@ class GenerateBody(unittest.TestCase):
         import store
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        saved_jobs = {k: getattr(jobs, k) for k in ("_DB_PATH", "_BLOB_DIR", "_DEFAULT_TTL", "_active")}
+        saved_store = {k: getattr(store, k) for k in ("_DB_PATH", "_active")}
+        self.addCleanup(lambda: [setattr(jobs, k, v) for k, v in saved_jobs.items()])
+        self.addCleanup(lambda: [setattr(store, k, v) for k, v in saved_store.items()])
         store.init(os.path.join(self.tmp.name, "store.db"))
         jobs.init(os.path.join(self.tmp.name, "jobs.db"),
                   os.path.join(self.tmp.name, "blobs"), 3600)

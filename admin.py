@@ -31,6 +31,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 
 import adapters
+import arliai
 import cloudtask
 import hostapi
 import jobs
@@ -44,26 +45,21 @@ import store
 logger = logging.getLogger(__name__)
 
 
-# Each cloud kind (Meshy, Tripo) is one FIXED endpoint — the form pre-fills it and
-# backend_save accepts a blank url for those types. Derived from the modules, never
-# a literal here: a new kind must not need a second edit in the console.
-def _cloud_urls() -> dict:
+# Recommended provider bases for the unified backend editor.
+def _provider_urls() -> dict:
     return {k: m.URL for k, m in adapters.CLOUD_MODULES.items()}
 
 
-def _cloud_url_for(new_type: str, url: str) -> str:
-    """The url a backend of type `new_type` is SAVED with. One fixed cloud endpoint per
-    kind — nothing to type. Fill it when the field is blank, and REPLACE another cloud
-    kind's fixed URL: switching an existing meshy backend to tripo would otherwise store
-    api.meshy.ai on a Tripo backend, which surfaces only as an auth error at discovery,
-    pointing at the wrong thing. A URL the operator typed himself (a self-hosted proxy)
-    is left alone, and a non-cloud type is never touched. The form's JS does the same
-    live; this is the authority, since the field is editable."""
-    if new_type not in adapters.CLOUD_TYPES:
-        return url
-    curls = _cloud_urls()
-    if not url or any(k != new_type and url == u for k, u in curls.items()):
-        return curls.get(new_type, "")
+def _provider_url_for(new_type: str, url: str) -> str:
+    """Fill a blank provider base or replace another provider's recommended base.
+
+    Operator-supplied proxies and arbitrary OpenAI-compatible URLs remain untouched.
+    The type-select handler mirrors this rule; Save remains the authority.
+    """
+    urls = _provider_urls()
+    if new_type in urls and (not url or any(k != new_type and url == u
+                                          for k, u in urls.items())):
+        return urls[new_type]
     return url
 
 _MODEL_EXTS = (".safetensors", ".gguf", ".ckpt", ".pt", ".pth", ".bin", ".sft", ".onnx")
@@ -139,6 +135,8 @@ def _num(s: str):
 # `_foo`). No triple bookkeeping (signature + global stmt + assignments) to keep in sync.
 _comfy_backends: Callable[[], list] = lambda: []
 _gen_backends: Callable[[], list] = lambda: []      # every generation backend (ComfyUI, Meshy, Tripo)
+_generation_models: Callable[[], list] = lambda: []   # healthy direct media catalog rows
+_generation_candidate: Callable[[str], Optional[dict]] = lambda model: None
 _gateway_info: Callable[[], dict] = lambda: {}
 # LAN scan (Backends tab → Scan network): start one, read the snapshot. Bound by main.
 _scan_start: Callable[[], bool] = lambda: False
@@ -1085,8 +1083,8 @@ def _select(name: str, options: list, selected=None) -> str:
     return f'<select name="{_esc(name)}">{opts}</select>'
 
 
-_TASK_OPTIONS = ("text2img", "img2img", "text2vid", "img2vid", "img2mesh", "mesh2mesh",
-                 "mesh2rig", "text2audio")
+_TASK_OPTIONS = ("text2img", "img2img", "text2vid", "img2vid", "text2mesh", "img2mesh",
+                 "mesh2mesh", "mesh2rig", "text2audio")
 # JS that shows the Video section (fps/frames) only for a video task, driven by the
 # task dropdown; matched loosely so img2vid / img2video / text2video all count.
 _TASK_VIDEO_JS = ("var v=document.getElementById('gw-video');"
@@ -1311,6 +1309,10 @@ def _type_badge(t: str) -> str:
         return _badge("🖼 comfyui", "img", "image-generation backend (ComfyUI)")
     if t == "runpod":
         return _badge("🖼 runpod", "img", "ComfyUI on a RunPod Serverless endpoint (paid, per second)")
+    if t == "arliai":
+        return _badge(t, "img", "ArliAI SDNext image generation (subscription)")
+    if t == "nanogpt":
+        return _badge("NanoGPT", "llm", "NanoGPT text, speech, embeddings, images, video and 3D (paid)")
     if t in adapters.CLOUD_TYPES:
         mod = adapters.cloud_module(t)
         return _badge(f"☁ {t}", "img", f"{mod.VENDOR} cloud mesh generation (paid, per task)")
@@ -1778,6 +1780,10 @@ def _type_tab_label(t: str) -> str:
         return "ComfyUI"
     if t == "runpod":
         return "RunPod"
+    if t == "arliai":
+        return "ArliAI Images"
+    if t == "nanogpt":
+        return "NanoGPT"
     if t in adapters.CLOUD_TYPES:
         return "Cloud task API"
     if t == "anthropic":
@@ -1946,8 +1952,11 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
               "media generation. <b>meshy</b> = Meshy.ai cloud mesh generation (image / multi-image → 3D), "
               "billed per task in credits — always <b>paid</b>. <b>tripo</b> = Tripo3D cloud mesh "
               "generation + Mixamo-spec rigging (image / multi-image → 3D), billed per task — always "
-              "<b>paid</b>. <b>anthropic</b> = api.anthropic.com for "
-              "Claude Code, reachable through <code>/v1/messages</code> only.</p>"
+              "<b>paid</b>. <b>arliai</b> = ArliAI SDNext image generation; its LLM API uses "
+              "<b>openai</b>. <b>nanogpt</b> = NanoGPT text, TTS, embeddings, images, video "
+              "and 3D with one API key (always <b>paid</b>). "
+              "<b>anthropic</b> = api.anthropic.com for Claude Code, reachable through "
+              "<code>/v1/messages</code> only.</p>"
             # A managed host's backend has a DERIVED url (its tunnel port) — readonly,
             # never disabled: a disabled input is not submitted, and absent reads as cleared.
             + _field("url", _inp("url", g("url"), placeholder="http://host:8080",
@@ -1969,13 +1978,18 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
             # there: shown checked + disabled (a disabled box is NOT submitted —
             # backend_save forces it too).
             + _field("cost tier", ('<label class="ckbox"><input type="checkbox" name="paid" value="1" '
-                                   'checked disabled> paid — always, a cloud backend bills per task or second</label>')
-                     if (cur_type in adapters.CLOUD_TYPES or cur_type in adapters.BILLING_TYPES) else
+                                   'checked disabled> paid — always, this backend bills per request, task or second</label>')
+                     if cur_type in adapters.BILLING_TYPES else
                      _checkbox("paid", gb("paid"), "paid — used only when no unpaid backend is free"))
             + "<p class='hint' style='margin:-4px 0 10px'><b>paid</b>: this backend bills per request "
               "(a cloud API). The scheduler sends a request to the fastest free <b>unpaid</b> backend "
               "and reaches for a paid one only when no unpaid backend is free.</p>"
             + _field("max_concurrent", _inp("max_concurrent", g("max_concurrent"), placeholder="optional, e.g. 1", typ="number"))
+            + _field("concurrency group", _inp("concurrency_group", g("concurrency_group"),
+                                               placeholder="e.g. arliai-core"),
+                     hint="Backends with the same group share one in-flight budget, including "
+                          "chat streams and media jobs. Set <code>max_concurrent=1</code> on both "
+                          "ArliAI Core backends. Blank = independent backend limits.")
             # Never rendered back (it is a cloud secret): blank keeps the stored key —
             # or a config backend's, see backend_save — and "clear" removes it.
             + _field("api key", _inp("api_key", "", typ="password",
@@ -2009,7 +2023,7 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
               "and the whitelist cannot bring it back, because it only ever subtracts. Added after "
               "the filter, and only once discovery has succeeded. A typo here is silent: the id "
               "routes, and the backend rejects it.</p>"
-            + f'<div id="llmopts" style="{"" if cur_type == "openai" else "display:none"}">'
+            + f'<div id="llmopts" style="{"" if cur_type in ("openai", "nanogpt") else "display:none"}">'
             + '<div class="grouphdr">LLM</div>'
             + _field("discovery filters",
                      _checkbox("chat_only", gb("chat_only"), "chat_only",
@@ -2052,7 +2066,7 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
 
             # ── Behavior ──────────────────────────────────────────────────────────
             + pane("behavior")
-            + _btype_block("openai", cur_type,
+            + _btype_block("openai nanogpt", cur_type,
                            _field("prompt cache passthrough",
                                   _checkbox("prompt_cache", gb("prompt_cache"), "prompt_cache"))
                            + "<p class='hint'><b>prompt_cache</b>: keep Claude Code's cache breakpoints "
@@ -2084,10 +2098,9 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
                              "content errors are never retried, and an <b>execution</b> fault never "
                              "repeats on the same backend either (it reproduces).</p>")
             + _btype_block("cloud", cur_type,
-                           "<p class='hint'>A cloud task API runs the job on the vendor's side: there is "
-                           "no sampling to default and no local fault to retry (a task that failed after "
-                           "creation is already billed). Its timeouts live in the "
-                           "<b>Cloud task API</b> tab.</p>")
+                           "<p class='hint'>Cloud generation runs on the vendor's side. "
+                           "There is no local fault to self-retry. A request with an uncertain "
+                           "outcome is not submitted again. Timeouts live in the type tab.</p>")
             + _btype_block("anthropic", cur_type,
                            "<p class='hint'>An Anthropic backend is a <b>verbatim</b> passthrough: "
                            "sampling defaults, the reasoning toggle and cache rewriting are deliberately "
@@ -2146,9 +2159,15 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
             + '<div class="grouphdr">Cloud task API</div>'
             + _field("max wait s", _inp("cloud_max_wait", g("max_wait"), typ="number",
                      placeholder=num(cmod.MAX_WAIT_DEFAULT) if cmod else "900"))
-            + _field("poll interval s", _inp("cloud_poll_interval", g("poll_interval"),
-                     typ="number", step="0.5",
-                     placeholder=num(cmod.POLL_INTERVAL_DEFAULT) if cmod else "5"))
+            + _btype_block("meshy tripo nanogpt", cur_type,
+                           _field("poll interval s", _inp("cloud_poll_interval", g("poll_interval"),
+                                  typ="number", step="0.5",
+                                  placeholder=num(cmod.POLL_INTERVAL_DEFAULT) if cmod else "5")))
+            + _btype_block("arliai", cur_type,
+                           _field("max image pixels", _inp("max_image_pixels", g("max_image_pixels"),
+                                  typ="number", placeholder="3000000"),
+                                  hint="Core: 3,000,000 pixels per image generation. "
+                                       "Blank uses that limit; larger requests are refused, not resized."))
             + "".join(f"<p class='hint' data-cloud-hint=\"{k}\" style=\"margin:-4px 0 10px"
                       f'{"" if k == cur_type else ";display:none"}">{m.BACKEND_HINT}</p>'
                       for k, m in adapters.CLOUD_MODULES.items())
@@ -2210,14 +2229,9 @@ def _sampling_text(d) -> str:
 def _type_select(current: str) -> str:
     """Backend type select that shows/hides the type-specific option blocks on change
     (LLM / ComfyUI / cloud / Anthropic — the form renders all, only one is ever visible).
-    A cloud type or a billing type (RunPod) forces `paid` (it bills per task/second);
-    the disabled box is not submitted, so `backend_save` sets it server-side too.
-
-    The URL field is filled with the chosen kind's fixed endpoint when it is blank OR
-    still holds ANOTHER cloud kind's fixed URL — switching meshy → tripo would otherwise
-    store a Tripo backend pointing at api.meshy.ai, which only surfaces as an auth error
-    at discovery, pointing at the wrong thing. Anything else the operator typed (a
-    self-hosted proxy) is never overwritten. `backend_save` applies the same rule.
+    A billing type forces `paid`; the disabled checkbox is not submitted, so Save
+    applies the same rule. Provider URLs autofill only when blank or still equal to
+    another provider's recommended base; operator-supplied proxies stay untouched.
 
     Two mechanisms, because a type-specific block may sit in a shared tab: the four
     historic blocks keep their ids (#llmopts / #comfyopts / #cloudopts / #anthopts), and
@@ -2230,35 +2244,38 @@ def _type_select(current: str) -> str:
     Every cloud kind comes from adapters.CLOUD_MODULES, so a new one appears here without
     touching this handler. ES5 only (var/function, no arrows): an inline attribute is
     never transpiled, and test_admin_live pins the console's JS to ES5."""
+    types = ("comfyui", "runpod", *adapters.CLOUD_MODULES, "openai", "anthropic")
     opts = "".join(f'<option value="{t}"{" selected" if t == current else ""}>{t}</option>'
-                   for t in ("comfyui", "runpod", "meshy", "tripo", "openai", "anthropic"))
+                   for t in types)
     # This JS sits inside a double-quoted HTML attribute: attribute-escape the JSON, the
     # browser decodes `&quot;` back before the handler is parsed.
-    urls = _esc(_js_json(_cloud_urls()))
+    urls = _esc(_js_json(_provider_urls()))
+    cloud = _esc(_js_json(sorted(adapters.CLOUD_TYPES)))
     bill = _esc(_js_json(sorted(adapters.BILLING_TYPES)))
-    return ('<select name="type" onchange="var t=this.value,cloudUrls=' + urls + ",bill=" + bill + ","
+    return ('<select name="type" onchange="var t=this.value,providerUrls=' + urls
+            + ",cloud=" + cloud + ",bill=" + bill + ","
             "l=document.getElementById('llmopts'),c=document.getElementById('comfyopts'),"
             "m=document.getElementById('cloudopts'),a=document.getElementById('anthopts'),"
             "u=document.querySelector('input[name=url]'),p=document.querySelector('input[name=paid]');"
-            "if(l)l.style.display=t==='openai'?'':'none';"
+            "if(l)l.style.display=(t==='openai'||t==='nanogpt')?'':'none';"
             "if(c)c.style.display=t==='comfyui'?'':'none';"
-            "if(m)m.style.display=cloudUrls[t]?'':'none';"
+            "if(m)m.style.display=cloud.indexOf(t)>=0?'':'none';"
             "if(a)a.style.display=t==='anthropic'?'':'none';"
             "Array.prototype.forEach.call(document.querySelectorAll('[data-cloud-hint]'),"
             "function(h){h.style.display=h.getAttribute('data-cloud-hint')===t?'':'none'});"
             "Array.prototype.forEach.call(document.querySelectorAll('[data-btype]'),"
             "function(h){var v=' '+(h.getAttribute('data-btype')||'')+' ';"
-            "h.style.display=(v.indexOf(' '+t+' ')>=0||(cloudUrls[t]&&v.indexOf(' cloud ')>=0))"
+            "h.style.display=(v.indexOf(' '+t+' ')>=0||(cloud.indexOf(t)>=0&&v.indexOf(' cloud ')>=0))"
             "?'':'none'});"
-            "var bt=document.getElementById('btab-type');"
-            "if(bt){var lb=t==='comfyui'?'ComfyUI':(t==='runpod'?'RunPod':"
-            "(cloudUrls[t]?'Cloud task API':(t==='anthropic'?'Anthropic':'')));"
+            "var bt=document.getElementById('btab-type'),labels="
+            + _esc(_js_json({t: _type_tab_label(t) for t in types}))
+            + ";if(bt){var lb=labels[t]||'';"
             "bt.textContent=lb;bt.style.display=lb?'':'none';"
             "if(window.gwBackendTab)window.gwBackendTab();}"
-            "if(cloudUrls[t]&&u){var ow=!u.value;"
-            "for(var k in cloudUrls){if(k!==t&&u.value===cloudUrls[k])ow=true}"
-            "if(ow)u.value=cloudUrls[t]}"
-            "if(cloudUrls[t]||bill.indexOf(t)>=0){"
+            "if(providerUrls[t]&&u){var ow=!u.value;"
+            "for(var k in providerUrls){if(k!==t&&u.value===providerUrls[k])ow=true}"
+            "if(ow)u.value=providerUrls[t]}"
+            "if(bill.indexOf(t)>=0){"
             "if(p){if(p.dataset.was===undefined)p.dataset.was=p.checked?'1':'';"
             "p.checked=true;p.disabled=true}}"
             "else if(p){p.disabled=false;if(p.dataset.was!==undefined){"
@@ -2925,7 +2942,7 @@ async def backend_save(request: Request):
     name = (f.get("name", "") or "").strip()
     url = (f.get("url", "") or "").strip().rstrip("/")
     new_type = (f.get("type", "openai") or "openai").strip()
-    url = _cloud_url_for(new_type, url)      # pure rule, tested in test_cloud_editor.py
+    url = _provider_url_for(new_type, url)
     orig = (f.get("orig", "") or "").strip()
     oname, otype = _parse_bid(orig) if orig else (name, new_type)
     # start from the existing store backend (by old identity) so fields we don't render
@@ -2984,7 +3001,7 @@ async def backend_save(request: Request):
                                 "backend by name); pick another name")
                 break
     b.update({"name": name, "type": new_type, "url": url,
-              "paid": bool(f.get("paid"))})       # unchecked box = absent from the form = False
+              "paid": new_type in adapters.BILLING_TYPES or bool(f.get("paid"))})
     mc, mc_err = _int_field(f.get("max_concurrent"), "max_concurrent", "unlimited")
     if mc_err:
         problems.append(mc_err)
@@ -2992,6 +3009,11 @@ async def backend_save(request: Request):
         b["max_concurrent"] = mc
     else:
         b.pop("max_concurrent", None)
+    group = (f.get("concurrency_group", "") or "").strip()
+    if group:
+        b["concurrency_group"] = group
+    else:
+        b.pop("concurrency_group", None)
     host = mhost or host_txt
     if host:
         b["host"] = host
@@ -3099,11 +3121,13 @@ async def backend_save(request: Request):
     # forced here). Its max_wait/poll_interval arrive under cloud_* names because
     # #comfyopts already renders those two names, and none of the ComfyUI-only keys apply.
     if new_type in adapters.CLOUD_TYPES:
-        b["paid"] = True                       # bills per task — never an unpaid candidate
+        if new_type in adapters.BILLING_TYPES:
+            b["paid"] = True                   # billed tasks; flat subscriptions are operator-chosen
         for src, dst, cast in (("cloud_max_wait", "max_wait", int),
                                ("cloud_poll_interval", "poll_interval", float)):
-            fv, fv_err = _float_field(f.get(src), src[len("cloud_"):].replace("_", " "),
-                                      "the vendor default")
+            parse = _int_field if cast is int else _float_field
+            fv, fv_err = parse(f.get(src), src[len("cloud_"):].replace("_", " "),
+                               "the vendor default")
             if fv_err:
                 problems.append(fv_err)
             val = cast(fv or 0)
@@ -3114,6 +3138,18 @@ async def backend_save(request: Request):
         for k in ("comfy_output_dir", "comfy_input_dir", "auto_restart", "restart_cooldown_s",
                   "stuck_after_s", "self_retries"):
             b.pop(k, None)
+    if new_type == "arliai":
+        pixels, pixel_err = _int_field(f.get("max_image_pixels"), "max image pixels",
+                                      "3,000,000", minimum=1)
+        if pixel_err:
+            problems.append(pixel_err)
+        if pixels is not None:
+            b["max_image_pixels"] = pixels
+        else:
+            b.pop("max_image_pixels", None)
+        b.pop("poll_interval", None)           # synchronous SDNext call, no task polling
+    else:
+        b.pop("max_image_pixels", None)
     # RunPod Serverless: paid by nature, its own timing fields (rp_* because #comfyopts
     # spends max_wait/poll_interval), and a URL that must name an endpoint — discovery
     # would otherwise go DOWN with a less helpful text.
@@ -3244,6 +3280,7 @@ async def _refuse_backend(msg: str, b: dict, f: dict, orig: str) -> HTMLResponse
                      ("max_wait", "cloud_max_wait" if cloud else ("rp_max_wait" if rp else "max_wait")),
                      ("poll_interval", "cloud_poll_interval" if cloud else
                       ("rp_poll_interval" if rp else "poll_interval")),
+                     ("max_image_pixels", "max_image_pixels"),
                      ("queue_max_s", "queue_max_s"), ("cost_per_hour", "cost_per_hour")):
         typed = (f.get(src, "") or "").strip()
         if typed:
@@ -5865,7 +5902,7 @@ def _register_form(vals: Optional[dict] = None, err: str = "") -> str:
                 "file field.</p>") if err else "")
             + "<p class='hint'>The gateway <b>owns</b> the API JSON once registered — independent of "
             "later ComfyUI-GUI edits. You'll map fields after registering. For a <b>cloud</b> backend "
-            "(meshy, tripo) no JSON is needed — the alias is created with that vendor's defaults and "
+            "(meshy, tripo, arliai, nanogpt) no JSON is needed — the alias is created with that vendor's defaults and "
             "edited next.</p>"
             + _field("alias", _inp("alias", v.get("alias", ""), placeholder="flux"))
             + _field("backend", _select("backend", backend_opts, v.get("backend")))
@@ -6048,12 +6085,15 @@ async def register_post(request: Request):
     bt = next((b.get("type") for b in _gen_backends()
                if b["name"] == backend and b.get("type") in adapters.CLOUD_TYPES), None)
     if bt:
-        cand = adapters.cloud_module(bt).default_candidate(backend)
-        # The task dropdown defaults to `text2img`, which no cloud backend can do at all
-        # (they only turn images into 3D). So the form's untouched default — like a
-        # missing field — keeps default_candidate's `img2mesh`; only a task the user
-        # actually PICKED overrides it. Without this the alias landed in the text2img group.
-        if picked_task and picked_task != "text2img":
+        mod = adapters.cloud_module(bt)
+        cand = mod.default_candidate(backend)
+        if getattr(mod, "task_for", None):
+            endpoint = ("video" if "vid" in task else "3d" if "mesh" in task else "images")
+            cand[mod.KIND]["endpoint"] = endpoint
+            cand["task"] = mod.task_for(endpoint, task)
+        # Mesh vendors keep img2mesh when the form's text2img default was untouched.
+        # ArliAI retains its fixed text2img task and checkpoint contract.
+        elif bt != "arliai" and picked_task and picked_task != "text2img":
             cand["task"] = picked_task
         store.upsert(alias, [cand])
         logger.info(f"ui: registered '{alias}' -> {backend} ({bt}, no workflow)")
@@ -6610,7 +6650,7 @@ def _bypass_block(alias: str, cands: list, wf: dict) -> str:
             f"{body}{add_sel}")
 
 
-def _option_rows(mod, opts: dict, ep: str) -> str:
+def _option_rows(mod, opts: dict, ep: str, schema: Optional[dict] = None) -> str:
     """The vendor option block of a cloud alias editor, rendered from `mod.OPTION_FIELDS`.
 
     Consecutive bool fields whose label is "" share the previous field's row (Meshy's
@@ -6643,17 +6683,35 @@ def _option_rows(mod, opts: dict, ep: str) -> str:
             continue
         flush()
         pending_label, pending_ctrls, pending_hint = None, [], ""
-        if t == "select":
+        spec = (schema or {}).get(k, {})
+        value = cloudtask.field_value_str(fld, opts.get(k))
+        if spec.get("choices"):
+            choices = [("", "model default")] + [
+                (str(c).lower(), str(c).lower()) if spec.get("type") == "bool" else (c, c or "none")
+                for c in spec["choices"]]
+            if spec.get("type") == "bool":
+                value = value.lower()
+            if value and value not in [str(c) for c, _ in choices]:
+                choices.insert(0, (value, value))
+            ctrl = _select(f"opt__{k}", choices, value)
+        elif spec.get("type") in ("int", "float"):
+            bounds = {key: spec[key] for key in ("min", "max", "step") if key in spec}
+            bounds.setdefault("step", 1 if spec["type"] == "int" else "any")
+            ctrl = _num_input(f"opt__{k}", value, bounds)
+        elif t == "select":
             # _select treats a bare list as a scalar option — its choices must be TUPLES
             choices = [tuple(c) if isinstance(c, (tuple, list)) else (c, c) for c in fld["choices"]]
             ctrl = _select(f"opt__{k}", choices, cloudtask.field_value_str(fld, opts.get(k)))
         elif t == "tristate":
             ctrl = _select(f"opt__{k}", [("", "model default"), ("true", "always"), ("false", "never")],
                            cloudtask.field_value_str(fld, opts.get(k)))
+        elif fld.get("textarea"):
+            ctrl = _textarea(f"opt__{k}", cloudtask.field_value_str(fld, opts.get(k)), rows=6,
+                             placeholder=fld.get("placeholder", ""))
         else:                                   # int | text | list
             ctrl = _inp(f"opt__{k}", cloudtask.field_value_str(fld, opts.get(k)),
                         placeholder=fld.get("placeholder", ""), typ="number" if t == "int" else "text")
-        rows.append(_field(label + rig_mark, ctrl, short=(t == "int")))
+        rows.append(_field(label + rig_mark, ctrl, short=(t == "int"), wide=bool(fld.get("textarea"))))
         if fld.get("hint"):
             rows.append(f"<p class='hint' style='margin:-4px 0 10px'>{fld['hint']}</p>")
     flush()
@@ -6661,7 +6719,7 @@ def _option_rows(mod, opts: dict, ep: str) -> str:
 
 
 def _cloud_editor(kind: str, alias: str, cands: list, saved: bool = False, taken: str = "",
-                  err: str = "") -> str:
+                  err: str = "", raw: Optional[dict] = None) -> str:
     """Editor for a cloud alias (Meshy, Tripo): endpoint, ai model and the admin option
     defaults — no workflow, no mapping, no pins (the public fields are a fixed table, see
     the vendor module). Everything vendor-specific is READ from that module (OPTION_FIELDS,
@@ -6682,15 +6740,53 @@ def _cloud_editor(kind: str, alias: str, cands: list, saved: bool = False, taken
         rig_opts.append((rig_cur, f"{rig_cur} — (unknown)"))   # …a Save would clear it otherwise
     ep = mod.endpoint_of(cand)
     opts = mod.options_of(cand)
-    model = cand.get("model") if cand.get("model") in mod.AI_MODELS else mod.AI_MODELS[0]
+    if raw is not None:
+        ep = raw.get("cloud_endpoint") or ep
+        opts.update({fld["key"]: raw.get(f'opt__{fld["key"]}', "") for fld in mod.OPTION_FIELDS})
+    image_api = kind == "arliai"
+    dynamic_models = getattr(mod, "DYNAMIC_MODELS", False) or not mod.AI_MODELS
+    model = ((cand.get("model") or "") if dynamic_models else
+             (cand.get("model") if cand.get("model") in mod.AI_MODELS else mod.AI_MODELS[0]))
+    if raw is not None:
+        model = raw.get("cloud_model", "")
+    model_control = _inp("cloud_model", model, placeholder="exact provider model id")
+    schema_cand = cand
+    if kind == "nanogpt":
+        backend_names = {c.get("backend") for c in cands}
+        catalog = [row for row in _generation_models() if row.get("backend") in backend_names]
+        dlid = "nano-alias-models"
+        suggestions = ""
+        for row in catalog:
+            discovered = row.get("candidate") or {}
+            if not discovered.get("model"):
+                continue
+            label = (str(row.get("backend", "")) + " · " + str(row.get("endpoint", ""))
+                     + " · " + str(row.get("name") or discovered["model"]))
+            suggestions += f'<option value="{_esc(discovered["model"])}" label="{_esc(label)}">'
+        model_control = (_dl_input("cloud_model", model, dlid, "exact discovered model id")
+                         + f'<datalist id="{dlid}">{suggestions}</datalist>')
+        schema_endpoint = ep if ep in mod.ENDPOINTS else mod.endpoint_of(cand)
+        metadata = next(((row.get("candidate") or {}).get("model_metadata") for row in catalog
+                         if row.get("backend") == cand.get("backend") and row.get("endpoint") == schema_endpoint
+                         and (row.get("candidate") or {}).get("model") == model), None)
+        schema_cand = {**cand, "model": model,
+                       kind: {**(cand.get(kind) or {}), "endpoint": schema_endpoint}}
+        if model != cand.get("model") or schema_endpoint != mod.endpoint_of(cand):
+            schema_cand.pop("model_metadata", None)
+        if metadata is not None:
+            schema_cand["model_metadata"] = metadata
     retries = next((c.get("retries") for c in cands if c.get("retries") not in (None, "")), "")
+    if raw is not None:
+        retries = raw.get("retries", "")
     cur_task = next((c.get("task") for c in cands if c.get("task")), "") or "img2mesh"
-    # the rig endpoint answers with a narrower format set (options_of filters either way,
-    # so a stored alias that is switched TO it cannot keep an impossible format)
+    if raw is not None:
+        cur_task = raw.get("task") or cur_task
+    # Rigging narrows the formats; providers with native output controls have no
+    # gateway format checklist and must not acquire a fabricated target_formats pin.
     fmts = "".join(f'<label style="margin-right:10px"><input type="checkbox" name="fmt__{_esc(f)}"'
-                   f'{" checked" if f in opts["target_formats"] else ""}> {_esc(f)}</label>'
+                   f'{" checked" if f in opts.get("target_formats", []) else ""}> {_esc(f)}</label>'
                    for f in (mod.RIG_FORMATS if ep == mod.RIG_ENDPOINT else mod.FORMATS))
-    params, images, files = adapters.public_fields(cand)
+    params, images, files = adapters.public_fields(schema_cand)
     fields = "".join(f"<tr><td><code>{_esc(i['name'])}</code></td><td>image · {_esc(i['on_empty'])}</td></tr>"
                      for i in images)
     fields += "".join(f"<tr><td><code>{_esc(x['name'])}</code></td><td>file · "
@@ -6708,17 +6804,25 @@ def _cloud_editor(kind: str, alias: str, cands: list, saved: bool = False, taken
             f'<div class="formbar"><h2 style="margin:0">{_esc(alias)}</h2>'
             f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/aliases?sub=media", "secondary")}'
             + _saved_chip(saved, taken, err) + "</div>"
-            + _field("alias name", _inp("new_alias", alias), short=True)
-            + _field("task", _task_select(cur_task), short=True)
+            + _field("alias name", _inp("new_alias", (raw or {}).get("new_alias", alias)), short=True)
+            + (_field("task", "text2img") + '<input type="hidden" name="task" value="text2img">'
+               if image_api else _field("task", _task_select(cur_task), short=True))
             + f'<h2 style="margin-top:18px">{_esc(vendor)}</h2>'
             + _field("endpoint", _select("cloud_endpoint", list(mod.ENDPOINTS), ep))
             + f"<p class='hint' style='margin:-4px 0 10px'>{mod.ENDPOINT_HINT}</p>"
-            + _field("ai model", _select("cloud_model", list(mod.AI_MODELS), model))
-            + _option_rows(mod, opts, ep)
-            + _field("deliver formats", fmts)
+            + (_field("checkpoint", _inp("cloud_model", model, placeholder="exact ArliAI checkpoint title"),
+                      hint="Use an exact checkpoint from Routing → Image models. "
+                           "The alias pins it; a client cannot select another checkpoint.")
+               if image_api else
+               _field("model id", model_control,
+                      hint="Choose an exact discovered ID from this backend's catalog, or keep a stored ID. "
+                           "The alias pins this model; client parameters cannot override it.")
+               if dynamic_models else _field("ai model", _select("cloud_model", list(mod.AI_MODELS), model)))
+            + _option_rows(mod, opts, ep, {p["name"]: p for p in params} if kind == "nanogpt" else None)
+            + (_field("deliver formats", fmts) if fmts else "")
             + _field("retries", _inp("retries", str(retries), placeholder="blank = try all backends",
                                      typ="number"), short=True)
-            + '<h2 style="margin-top:18px">Chain (successor)</h2>'
+            + ('<h2 style="margin-top:18px">Chain (successor)</h2>'
             + "<p class='hint'>Optional: run a second alias (a rigger) on this alias's mesh and deliver "
               "ONLY its result. Leave blank for a normal single-stage alias.</p>"
             + _field("successor alias", _inp("successor", s.get("alias", ""),
@@ -6737,16 +6841,16 @@ def _cloud_editor(kind: str, alias: str, cands: list, saved: bool = False, taken
               "<code>generic</code>/<code>mixamo</code> are additionally normalized and validated at chain "
               "level, <code>meshy</code>/<code>tripo</code> are only tagged (a cloud vendor rigs to its own "
               "conventions). Requires <code>glb</code> in <b>deliver formats</b> — the job is refused up "
-              f"front otherwise, before credits are spent. {mod.CHAIN_HINT}</p>"
+              f"front otherwise, before credits are spent. {mod.CHAIN_HINT}</p>" if kind in ("meshy", "tripo") else "")
             + '<h2 style="margin-top:18px">Request fields</h2>'
-            + f"<p class='hint'>Fixed for {_esc(vendor)} aliases — what "
+            + f"<p class='hint'>Request fields for {_esc(vendor)} — what "
               f"<code>GET /v1/generations/{{alias}}/schema</code> advertises.{ign_hint}</p>"
             + f"<table class='pins'><tr><th>name</th><th>type</th></tr>{fields}</table>"
             + "</form>"
             + '<h2 style="margin-top:18px">Backends</h2>'
-            + "<p class='hint'>Allowed backends for this alias — a job takes the fastest free one; on a "
-              f"connection error the next one is used. Only {_esc(vendor)} backends can be added to a "
-              f"{_esc(vendor)} alias.</p>"
+            + "<p class='hint'>Allowed backends for this alias — a job takes the fastest free one. "
+              f"Only {_esc(vendor)} backends can be added. A submitted request with an uncertain "
+              "outcome is final; it is not generated again on another backend.</p>"
             + _backends_section(alias, cands))
 
 
@@ -7290,13 +7394,22 @@ def _cloud_update_apply(kind: str, cands: list, f: dict) -> None:
     ep = (f.get("cloud_endpoint", "") or "").strip()
     ep = ep if ep in mod.ENDPOINTS else mod.ENDPOINTS[0]
     model = (f.get("cloud_model", "") or "").strip()
-    model = model if model in mod.AI_MODELS else mod.AI_MODELS[0]
-    opts = cloudtask.parse_options(mod.OPTION_FIELDS, f, mod.OPTION_DEFAULTS)
-    # ASSIGN, never mutate: parse_options shallow-copies the defaults, so appending here
-    # would rewrite OPTION_DEFAULTS["target_formats"] for every future alias.
-    opts["target_formats"] = [x for x in mod.FORMATS if f.get(f"fmt__{x}")] or ["glb"]
+    dynamic_models = getattr(mod, "DYNAMIC_MODELS", False) or not mod.AI_MODELS
+    if dynamic_models:
+        if not model:
+            error = getattr(mod, "INPUT_ERROR", arliai.ArliAIInput)
+            raise error(f"an exact {mod.VENDOR} {'checkpoint' if kind == 'arliai' else 'model id'} is required")
+    else:
+        model = model if model in mod.AI_MODELS else mod.AI_MODELS[0]
+    opts = (mod.read_options(f) if getattr(mod, "read_options", None) else
+            cloudtask.parse_options(mod.OPTION_FIELDS, f, mod.OPTION_DEFAULTS))
+    # Assign a fresh list; never mutate vendor defaults or invent unsupported formats.
+    if mod.FORMATS:
+        opts["target_formats"] = [x for x in mod.FORMATS if f.get(f"fmt__{x}")] or ["glb"]
     opts = mod.options_of({mod.KIND: {"endpoint": ep, "options": opts}, "model": model})
-    task = (f.get("task", "") or "").strip()
+    task = "text2img" if kind == "arliai" else (f.get("task", "") or "").strip()
+    if getattr(mod, "task_for", None):
+        task = mod.task_for(ep, task or cands[0].get("task", ""))
     retries = (f.get("retries", "") or "").strip()
     # chain successor (blank alias → not a chain). No export_node and no relay: a cloud
     # stage's mesh is a result blob and always travels to stage 2 as bytes (_run_chain
@@ -7309,6 +7422,13 @@ def _cloud_update_apply(kind: str, cands: list, f: dict) -> None:
              **({"keep_from_mesh": keep} if keep else {}),
              **({"rig": rig} if rig else {})}
             if succ_alias else None)
+    if getattr(mod, "INPUT_ERROR", None):
+        _, retry_err = _int_field(retries, "retries", "try all backends")
+        if retry_err:
+            raise mod.INPUT_ERROR(retry_err)
+    if kind not in ("meshy", "tripo") and succ:
+        input_error = getattr(mod, "INPUT_ERROR", arliai.ArliAIInput)
+        raise input_error(f"{mod.VENDOR} does not support workflow chains")
     for c in cands:
         # a fresh options dict per candidate — one shared object would let a later
         # in-place edit of one candidate rewrite the others
@@ -7332,7 +7452,13 @@ async def cloud_update(request: Request):
     kind = adapters.cloud_kind(cands[0]) if cands else None
     if not kind:
         raise HTTPException(404, "cloud alias not found")
-    _cloud_update_apply(kind, cands, f)
+    mod = adapters.cloud_module(kind)
+    input_error = getattr(mod, "INPUT_ERROR", arliai.ArliAIInput)
+    try:
+        _cloud_update_apply(kind, cands, f)
+    except input_error as e:
+        return await _mapping_view({"sub": "media", "edit": alias}, status=400,
+                                   detail=_cloud_editor(kind, alias, cands, err=str(e), raw=f))
     alias, taken = _rename_gen_alias(alias, f)
     store.upsert(alias, cands)
     logger.info(f"ui: updated {kind} alias '{alias}' "
@@ -7378,13 +7504,16 @@ _pg_images: dict = {}
 # file's extension from the data-URI MIME, and octet-stream would lose it).
 _PG_FILE_ACCEPT = ".glb,.gltf,.obj,.fbx,.stl,.ply"
 _PG_FILE_MIME = {"glb": "model/gltf-binary", "gltf": "model/gltf+json", "obj": "model/obj",
-                 "stl": "model/stl", "ply": "model/ply", "fbx": "model/fbx"}
+                 "stl": "model/stl", "ply": "model/ply", "fbx": "model/fbx",
+                 "mp4": "video/mp4", "webm": "video/webm", "mov": "video/quicktime",
+                 "mp3": "audio/mpeg", "wav": "audio/wav", "ogg": "audio/ogg",
+                 "flac": "audio/flac", "m4a": "audio/mp4", "aac": "audio/aac"}
 
 
 def _pg_file_mime(name: str) -> str:
-    """The data-URI MIME for a stashed mesh, derived from its filename extension —
-    that MIME is the ONLY thing the API has to rebuild the extension with (see
-    main._EXT_BY_MIME), so an unknown one costs the file its type."""
+    """Data-URI MIME for a stashed mesh, video or audio file, from its extension.
+    This preserves the input type when the API reconstructs a filename from the URI.
+    """
     return _PG_FILE_MIME.get(os.path.splitext(name or "")[1].lstrip(".").lower(),
                              "application/octet-stream")
 
@@ -7403,8 +7532,9 @@ def _pg_history_opts() -> dict:
         head = f"{when} {j.get('alias') or '?'}"
         for r in j["results"]:
             kind = r.get("kind")
-            if kind in out:
-                out[kind].append((f"{j['id']}:r:{r['n']}", f"{head} · #{r['n']} {r.get('name') or ''}"))
+            if kind in out or kind in ("video", "audio"):
+                out[kind if kind in out else "file"].append(
+                    (f"{j['id']}:r:{r['n']}", f"{head} · #{r['n']} {r.get('name') or ''}"))
         for i in j["inputs"]:
             out["image"].append((f"{j['id']}:i:{i['n']}",
                                  f"{head} · in#{i['n']} {i.get('slot') or i.get('filename') or ''}"))
@@ -7444,6 +7574,35 @@ def _alias_defaults(cand: dict) -> dict:
     return out
 
 
+def _media_models() -> list:
+    """Stored aliases win collisions with healthy, directly callable catalog IDs."""
+    rows = [{"id": name, "name": name, "group": "Aliases"}
+            for name in store.list_aliases()]
+    seen = {row["id"] for row in rows}
+    modalities = {"images": "Images", "video": "Video", "3d": "3D"}
+    for row in sorted(_generation_models(), key=lambda r: (
+            str(r.get("backend", "")).lower(), {"images": 0, "video": 1, "3d": 2}.get(r.get("endpoint"), 3),
+            str(r.get("name", r.get("id", ""))).lower())):
+        if row.get("id") and row["id"] not in seen:
+            rows.append({**row, "group": str(row.get("backend", "")) + " · "
+                         + modalities.get(row.get("endpoint"), str(row.get("endpoint", "")))})
+            seen.add(row["id"])
+    return rows
+
+
+def _media_candidate(model: str, models: Optional[list] = None) -> Optional[dict]:
+    # The live callback enriches aliases with the currently selected model's schema.
+    current = _generation_candidate(model)
+    if current:
+        return current
+    stored = store.get(model)
+    if stored:
+        return stored[0]
+    return next((row.get("candidate") for row in
+                 (models if models is not None else _generation_models())
+                 if row.get("id") == model), None)
+
+
 def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Optional[dict] = None,
                      kept: Optional[dict] = None) -> str:
     """`kept` is the user's upload stash ({param: (filename, bytes)}) — membership drives
@@ -7465,11 +7624,22 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
                 + (f' <span class="muted">{_esc(name)}</span>' if show_name and name else "")
                 + ' <label class="muted" style="font-weight:normal">'
                   f'<input type="checkbox" name="clear__{_esc(param)}"> clear</label>')
-    # selecting an alias reloads with its workflow defaults pre-filled
-    opts = "".join(f'<option value="{_esc(a)}"{" selected" if a == vals.get("model") else ""}>{_esc(a)}</option>'
-                   for a in aliases)
-    # switching alias carries the current scalar fields over, so same-named params
-    # (prompt, lora_01, …) survive; the new alias just ignores the ones it lacks.
+    # A native grouped select keeps keyboard navigation and needs no widget script.
+    groups = {}
+    for row in aliases:
+        row = row if isinstance(row, dict) else {"id": row, "name": row, "group": "Aliases"}
+        groups.setdefault(row.get("group", "Aliases"), []).append(row)
+    opts = ""
+    for group, models in groups.items():
+        opts += f'<optgroup label="{_esc(group)}">'
+        for row in models:
+            model_id, label = row["id"], row.get("name") or row["id"]
+            if row.get("candidate") and row["candidate"].get("model") != label:
+                label += " (" + str(row["candidate"].get("model", model_id)) + ")"
+            opts += (f'<option value="{_esc(model_id)}"'
+                     f'{" selected" if model_id == vals.get("model") else ""}>{_esc(label)}</option>')
+        opts += "</optgroup>"
+    # Switching models carries same-named scalar controls, like prompt, across.
     alias_select = f'<select name="model" onchange="pgSwitch(this)">{opts}</select>'
     # one input per MAPPED param of the selected alias (dynamic — mirrors the request
     # fields configured in Mapping, in drag-set order). Image-loader fields render as
@@ -7505,14 +7675,27 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
         for p in params:
             cur = v(p["name"]) or ("" if p.get("default") in (None, "") else str(p["default"]))
             if p.get("choices"):
-                rows += _field(p["name"], _select(f"p__{p['name']}",
-                                                  [(c, c or "none") for c in p["choices"]], cur))
+                choices = [(str(c).lower(), str(c).lower()) if p["type"] == "bool" else (c, c or "none")
+                           for c in p["choices"]]
+                if p["type"] == "bool":
+                    cur = cur.lower()
+                if cur not in [str(c) for c, _ in choices]:
+                    choices.insert(0, (cur, cur or "model default"))
+                rows += _field(p["name"], _select(f"p__{p['name']}", choices, cur))
             elif p["type"] == "bool":
-                rows += _field(p["name"], _checkbox(f"p__{p['name']}",
-                                                    cur.lower() in ("true", "1", "on"), p["name"]))
+                if adapters.cloud_kind(cand) == "nanogpt":
+                    rows += _field(p["name"], _select(f"p__{p['name']}",
+                                   [("", "model default"), ("true", "true"), ("false", "false")], cur.lower()))
+                else:
+                    rows += _field(p["name"], _checkbox(f"p__{p['name']}",
+                                                      cur.lower() in ("true", "1", "on"), p["name"]))
+            elif p["name"] in ("prompt", "negative_prompt"):
+                rows += _field(p["name"], _textarea(f"p__{p['name']}", cur, 4), wide=True)
+            elif p["type"] in ("int", "float"):
+                rows += _field(p["name"], _num_input(f"p__{p['name']}", cur,
+                               {"step": 1 if p["type"] == "int" else "any", **p}))
             else:
-                rows += _field(p["name"], _inp(f"p__{p['name']}", cur,
-                                               typ="number" if p["type"] in ("int", "float") else "text"))
+                rows += _field(p["name"], _inp(f"p__{p['name']}", cur))
         mapping = {}                       # skip the workflow-driven loop below
     for p, m in mapping.items():
         label = (m or {}).get("label") or p
@@ -7560,6 +7743,8 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
                 rows += _field(label, _inp(f"p__{p}", v(p), typ=typ))
     rows = rows or "<p class='hint'>This alias has no request fields — add some in Aliases.</p>"
     bk_list = [c.get("backend") for c in (store.get(vals.get("model")) or [])]
+    if not bk_list and cand and cand.get("backend"):
+        bk_list = [cand["backend"]]
     sel_bk = vals.get("backend", "")
     bk_opts = ('<option value="">(auto · scheduler picks)</option>'
                + "".join(f'<option value="{_esc(b)}"{" selected" if b == sel_bk else ""}>{_esc(b)}</option>'
@@ -7572,10 +7757,11 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
                     "location.href='/ui/playground?'+q;}</script>")
     return ('<form action="/ui/playground/generate" method="post" enctype="multipart/form-data">'
             f'<div class="formbar"><h2>Media Playground</h2>{_btn("Generate", submit=True)}</div>'
-            + _field("alias", alias_select)
+            + _field("model", alias_select)
             + backend_field
             + rows
-            + '<p class="hint">synchronous; image backends ~1 min · each image reuses one slot</p></form>'
+            + '<p class="hint">Uses <code>POST /v1/generations</code>; results update here. '
+              'Catalog models need no alias. Reference uploads are kept for the next generation.</p></form>'
             + pg_switch_js)
 
 
@@ -7653,14 +7839,15 @@ async def playground_page(request: Request):
                                   refresh=vu_refresh, subnav=_subnav("playground", "voice")))
     if not store.is_active():
         return _inactive()
-    aliases = list(store.list_aliases().keys())
+    aliases = _media_models()
     if not aliases:
         return HTMLResponse(_page("Media Playground",
-            "<h2>Media Playground</h2><p class='hint'>Register an alias in "
-            "the <a href='/ui/aliases'>Aliases</a> tab first.</p>", "playground",
+            "<h2>Media Playground</h2><p class='hint'>No media models are available. "
+            "Enable a healthy media backend in <a href='/ui/backends'>Backends</a>, or "
+            "register a workflow in <a href='/ui/aliases?sub=media'>Aliases</a>.</p>", "playground",
             subnav=_subnav("playground", "media")))
-    model = qp.get("model", "") or aliases[0]   # first load: pick the first alias
-    cand = (store.get(model) or [None])[0]
+    model = qp.get("model", "") or aliases[0]["id"]
+    cand = _media_candidate(model, aliases)
     # values per request param, keyed by param name; query (p__<param>) overrides the
     # alias's workflow default. Params are dynamic — whatever Mapping configured.
     vals = {"model": model, "backend": qp.get("backend", "")}
@@ -7676,6 +7863,30 @@ async def playground_page(request: Request):
     for p in pnames:
         q = qp.get(f"p__{p}", "")
         vals[p] = q if q != "" else ("" if defaults.get(p) is None else str(defaults[p]))
+    if cand and adapters.cloud_kind(cand) == "nanogpt":
+        # Model changes carry compatible controls only. Refused POSTs bypass this
+        # GET normalization and still re-render exactly as typed.
+        for field in _pf:
+            name, value = field["name"], vals.get(field["name"], "")
+            if value == "":
+                continue
+            choices = {str(x).lower() if field.get("type") == "bool" else str(x)
+                       for x in field.get("choices") or []}
+            selected = value.lower() if field.get("type") == "bool" else value
+            if choices and selected not in choices:
+                vals[name] = ""
+                continue
+            if field.get("type") in ("int", "float"):
+                try:
+                    number = float(value)
+                    invalid = (not math.isfinite(number) or
+                               (field["type"] == "int" and not number.is_integer()) or
+                               ("min" in field and number < field["min"]) or
+                               ("max" in field and number > field["max"]))
+                except (TypeError, ValueError, OverflowError):
+                    invalid = True
+                if invalid:
+                    vals[name] = ""
     job_id = qp.get("job", "")
     refresh = None
     if job_id:
@@ -7695,6 +7906,11 @@ async def generate(request: Request):
     f = await _multipart(request)
     model = str(f.get("model", ""))
     force_bk = str(f.get("backend", "")).strip()       # pin to one backend (testing per-backend)
+    cand = _media_candidate(model)
+    bool_fields = set()
+    if cand and adapters.cloud_kind(cand) == "nanogpt":
+        params, _, _ = adapters.public_fields(cand)
+        bool_fields = {p["name"] for p in params if p.get("type") == "bool"}
     # dynamic request fields arrive as p__<param>. prompt/negative_prompt feed the
     # request's inputs; everything else goes into params (numeric-coerced when it
     # parses). The mapping in the alias decides which node each lands on.
@@ -7707,6 +7923,8 @@ async def generate(request: Request):
             continue
         if p in ("prompt", "negative_prompt"):
             body[p] = raw
+        elif p in bool_fields and raw.lower() in ("true", "false", "1", "0", "on", "off"):
+            body["params"][p] = raw.lower() in ("true", "1", "on")
         else:
             body["params"][p] = _num(raw)
     # per-field uploads: images (img__<param>, empty → the 8×8 placeholder downstream,
@@ -7717,13 +7935,12 @@ async def generate(request: Request):
     # artifact instead of a fresh upload.
     user = _session_user(request) or "default"
     stash = _pg_images.setdefault(user, {})
-    cand = (store.get(model) or [None])[0]
     wf_i = (cand.get("workflow_json") if cand else {}) or {}
     map_i = (cand.get("mapping") if cand else {}) or {}
     vals = {"model": model, "backend": force_bk, **submitted}
 
     def _err(msg: str, status: int = 404):
-        aliases = list(store.list_aliases().keys())
+        aliases = _media_models()
         result_html = f'<h2>Result</h2><p class="bad">Error {status}: {_esc(msg)}</p>'
         return HTMLResponse(_page("Media Playground",
                                   _playground_body(aliases, vals, cand, result_html, kept=dict(stash)),
@@ -7763,7 +7980,7 @@ async def generate(request: Request):
     else:
         slots = set(adapters.image_params(wf_i, map_i)) if wf_i else set()
         fset = set(adapters.file_params(wf_i, map_i))
-    if slots or fset:
+    if cand is not None:
         images = {p: v for p, v in stash.items() if p in slots}
         files = {p: v for p, v in stash.items() if p in fset}
     else:
