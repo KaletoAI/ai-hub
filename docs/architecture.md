@@ -2983,10 +2983,12 @@ satisfies it, `files[].required` in the schema, and the editor checkbox round-tr
 `test_kimodo_hub.py` (ops/comfyui-kimodo-hub, the ComfyUI side of motion-kimodo:
 upstream Kimodo splits segments on periods, returns "" for a missing rig and exports
 one clamped sample index, and its sampler drops `num_samples` for a one-segment
-prompt — a longer clip than the client computed, a `done` run without a file, a
-duplicate presented as a variant, one result where three were asked. Pins one segment
-per line, one segment handed over as a string with `num_samples`, the rig refusal, and
-one index-suffixed output per sample in sample order).
+prompt, and its post-process node corrects the 77-joint output against the 30-joint
+skeleton and swallows the failure — a longer clip than the client computed, a `done`
+run without a file, a duplicate presented as a variant, one result where three were
+asked, foot-skate correction that never ran. Pins one segment per line, one segment
+handed over as a string with `num_samples`, post-processing inside the model call, the
+rig refusal, and one index-suffixed output per sample in sample order).
 `test_audio_content_type.py` (the voice playground stash and stored call audio were
 served from the /ui origin under the BACKEND's content type — SVG or HTML from there
 runs script in the admin session. Pins: only `audio/*` plays, anything else is an

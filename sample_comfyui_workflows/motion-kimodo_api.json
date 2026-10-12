@@ -11,17 +11,12 @@
   },
   "4": {
     "class_type": "KimodoHub_Sampler",
-    "inputs": {"model": ["1", 0], "conditioning": ["2", 0], "duration": 4.0, "seed": 42, "num_samples": 1, "diffusion_steps": 100},
-    "_meta": {"title": "Kimodo sampler (duration per segment, seed, variants 1–4)"}
-  },
-  "5": {
-    "class_type": "KimodoHub_PostProcess",
-    "inputs": {"motion": ["4", 0], "root_margin": 0.04},
-    "_meta": {"title": "Foot-skate cleanup"}
+    "inputs": {"model": ["1", 0], "conditioning": ["2", 0], "duration": 4.0, "seed": 42, "num_samples": 1, "diffusion_steps": 100, "root_margin": 0.04},
+    "_meta": {"title": "Kimodo sampler (duration per segment, seed, variants 1–4, post-process)"}
   },
   "6": {
     "class_type": "KimodoHub_ExportFBX",
-    "inputs": {"motion": ["5", 0], "rig_path": "", "filename_prefix": "3D/kimodo"},
+    "inputs": {"motion": ["4", 0], "rig_path": "", "filename_prefix": "3D/kimodo"},
     "_meta": {"title": "Output"}
   }
 }

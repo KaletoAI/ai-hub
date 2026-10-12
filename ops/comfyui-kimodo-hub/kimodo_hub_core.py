@@ -65,14 +65,21 @@ def output_paths(output_dir: str, filename_prefix: str, count: int, uid: str) ->
     return [f"{base}_{uid}_{i}.fbx" for i in range(count)]
 
 
-def sampler_call(texts: list, frames: int, n: int, steps: int) -> tuple:
+def sampler_call(texts: list, frames: int, n: int, steps: int, root_margin: float) -> tuple:
     """(args, kwargs) for the Kimodo model call. Upstream Kimodo_Sampler always passes
     the texts as a LIST, and for ONE segment the model then takes the batch size from
     that list (`num_samples = len(prompts)`) — `num_samples` is dropped and a request
     for 3 variants silently yields 1. One segment therefore goes in as a plain string
-    (the path that honours num_samples), several as the multi-prompt sequence."""
+    (the path that honours num_samples), several as the multi-prompt sequence.
+
+    Post-processing (foot-skate / root correction) runs INSIDE this call: the model
+    corrects on its 30-joint SOMA skeleton and only then converts to the 77-joint
+    output. Upstream Kimodo_PostProcess corrects that 77-joint output against the
+    30-joint skeleton — "jointRotations has the wrong size" on every SOMA run, which
+    it swallowed and passed the motion on uncorrected."""
     kw = {"num_denoising_steps": steps, "num_samples": check_variants(n),
-          "constraint_lst": [], "post_processing": False, "return_numpy": True}
+          "constraint_lst": [], "post_processing": True, "root_margin": float(root_margin),
+          "return_numpy": True}
     if len(texts) == 1:
         return (texts[0], frames), kw
     return (list(texts), [frames] * len(texts)), {**kw, "multi_prompt": True}

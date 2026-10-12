@@ -7,6 +7,9 @@ SILENTLY:
 - Variants: upstream Kimodo_Sampler hands ONE segment to the model as a list, and the
   model then sizes the batch from that list — a request for 3 variants came back with
   one result, `done` (measured 2026-10-12, job 2ee76afbb2ec).
+- Post-process: upstream Kimodo_PostProcess corrects the 77-joint output against the
+  30-joint skeleton, fails on every SOMA run and passes the motion on uncorrected
+  (measured 2026-10-12, job 33c944a55735 once the failure was made loud).
 - Rig: upstream returns "" for a missing rig path and the run ends without a file.
 - Delivery order: one file per sample, index-suffixed, reported in sample order — the
   client maps results[n] to sample n. Upstream exported ONE clamped index (index 3 of a
@@ -36,20 +39,25 @@ class Segments(unittest.TestCase):
 
 class Sampler(unittest.TestCase):
     def test_one_segment_goes_in_as_a_string(self):
-        args, kw = core.sampler_call(["Walk."], 120, 3, 100)
+        args, kw = core.sampler_call(["Walk."], 120, 3, 100, 0.04)
         self.assertEqual(args, ("Walk.", 120))
         self.assertEqual(kw["num_samples"], 3)
         self.assertNotIn("multi_prompt", kw)
 
+    def test_post_processing_runs_inside_the_model_call(self):
+        _args, kw = core.sampler_call(["Walk."], 120, 1, 100, 0.04)
+        self.assertTrue(kw["post_processing"])
+        self.assertEqual(kw["root_margin"], 0.04)
+
     def test_several_segments_are_a_sequence(self):
-        args, kw = core.sampler_call(["Walk.", "Wave."], 120, 2, 100)
+        args, kw = core.sampler_call(["Walk.", "Wave."], 120, 2, 100, 0.04)
         self.assertEqual(args, (["Walk.", "Wave."], [120, 120]))
         self.assertTrue(kw["multi_prompt"])
         self.assertEqual(kw["num_samples"], 2)
 
     def test_variant_count_is_checked(self):
         with self.assertRaises(ValueError):
-            core.sampler_call(["Walk."], 120, 5, 100)
+            core.sampler_call(["Walk."], 120, 5, 100, 0.04)
 
 
 class Rig(unittest.TestCase):

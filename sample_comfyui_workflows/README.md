@@ -182,22 +182,24 @@ Backend `k12-gpu`, Output-Node `6`. Vertrag: Anima Verse
 | `input_num_samples` | `4.num_samples` | 1 (1–4 Varianten in EINEM Lauf) |
 | `files.input_rig_path` | `6.rig_path` | **Pflicht** (`required`): ohne Datei → `400` |
 
-Fest: 100 Diffusion-Steps, `Kimodo_PostProcess` mit `root_margin 0.04`, 30 fps.
+Fest: 100 Diffusion-Steps, Fußkorrektur mit `root_margin 0.04` (im Sampler), 30 fps.
 Ergebnis: genau `input_num_samples` FBX (`kimodo_<uid>_<n>.fbx`, Reihenfolge =
 Sample-Index), Armature = das hochgeladene Rig mit seinen Bone-Namen, eine Animation
 mit Segmente × `input_duration` × 30 Frames.
 
-Vier Hub-eigene Nodes aus `ops/comfyui-kimodo-hub` (auf VM 402 als
+Drei Hub-eigene Nodes aus `ops/comfyui-kimodo-hub` (auf VM 402 als
 `custom_nodes/ComfyUI-KimodoHub`, ComfyUI-Kimodo selbst bleibt unverändert):
 `KimodoHub_PromptLines` (Segmente pro Zeile statt pro Punkt),
 `KimodoHub_Sampler` (Upstream-`Kimodo_Sampler` ignoriert `num_samples` bei EINEM
 Segment — 3 angefragte Varianten ergaben 1 Result; Limit 1–4 prüft ComfyUI schon
-beim Einreihen), `KimodoHub_PostProcess` (Upstream verschluckt jeden Fehler und
-reicht die unkorrigierte Bewegung weiter) und `KimodoHub_ExportFBX` (alle Samples,
-meldet sie über `ui.fbx_file` an `/history`, bricht bei fehlendem/fremdem Rig oder
-Exportfehler ab). Das Upstream-`Kimodo_ExportFBX` meldet nichts an `/history`,
-verschluckt Fehler als Rückgabestring und klemmt `sample_index`.
-Die PostProcess-Korrektur braucht die C++-Erweiterung `motion_correction`: auf VM 402
+beim Einreihen; die Fußkorrektur `root_margin 0.04` läuft IM Modellaufruf auf dem
+30-Gelenk-Skelett — Upstream-`Kimodo_PostProcess` korrigiert die 77-Gelenk-Ausgabe
+gegen das 30er-Skelett, scheitert bei jedem SOMA-Lauf und verschluckt das) und
+`KimodoHub_ExportFBX` (alle Samples, meldet sie über `ui.fbx_file` an `/history`,
+bricht bei fehlendem/fremdem Rig oder Exportfehler ab). Das Upstream-`Kimodo_ExportFBX`
+meldet nichts an `/history`, verschluckt Fehler als Rückgabestring und klemmt
+`sample_index`.
+Die Fußkorrektur braucht die C++-Erweiterung `motion_correction`: auf VM 402
 für das venv-Python 3.13 gebaut (`cmake -DPython3_EXECUTABLE=<venv-python>`; das
 mitgelieferte `setup.py` greift zum System-Python 3.14) und als
 `_motion_correction.cpython-313-…so` neben das Paket in

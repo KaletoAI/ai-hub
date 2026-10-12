@@ -1,4 +1,4 @@
-"""ComfyUI-KimodoHub — the AI-Hub's four nodes around ComfyUI-Kimodo (alias
+"""ComfyUI-KimodoHub — the AI-Hub's three nodes around ComfyUI-Kimodo (alias
 `motion-kimodo`). Install next to it as custom_nodes/ComfyUI-KimodoHub; it uses
 Kimodo's own retargeting (`kimodo_retarget_fbx`, needs fbxsdkpy) and changes nothing
 in that package.
@@ -6,7 +6,8 @@ in that package.
 Why not the upstream nodes:
 - Kimodo_TextEncode splits segments on periods; the alias contract is one per LINE.
 - Kimodo_Sampler drops num_samples for a one-segment prompt (core.sampler_call).
-- Kimodo_PostProcess swallows every error and passes the motion on uncorrected.
+- Kimodo_PostProcess corrects the 77-joint output against the 30-joint skeleton (fails
+  on every SOMA run) and swallows that error — so the sampler post-processes instead.
 - Kimodo_ExportFBX returns a bare STRING (no `ui` dict), so its file never shows up in
   /history and the AI-Hub cannot find the result; it also swallows every error into
   that string, and exports ONE sample index (clamped, so index 3 of a 1-sample run is
@@ -75,9 +76,9 @@ def _upstream(name: str):
 
 
 class KimodoHub_Sampler:
-    """Kimodo_Sampler with num_samples honoured (core.sampler_call) and range-checked
-    1–4 by ComfyUI when the prompt is queued — a request for 5 is refused before
-    anything loads."""
+    """Kimodo_Sampler with num_samples honoured and the post-processing done where the
+    model does it (core.sampler_call); num_samples is range-checked 1–4 by ComfyUI
+    when the prompt is queued — a request for 5 is refused before anything loads."""
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {
@@ -88,6 +89,8 @@ class KimodoHub_Sampler:
             "seed": ("INT", {"default": 42, "min": 0, "max": 2**32 - 1}),
             "num_samples": ("INT", {"default": 1, "min": 1, "max": core.MAX_VARIANTS}),
             "diffusion_steps": ("INT", {"default": 100, "min": 10, "max": 500}),
+            "root_margin": ("FLOAT", {"default": 0.04, "min": 0.0, "max": 1.0, "step": 0.01,
+                                      "tooltip": "Post-process root correction margin (m)"}),
         }}
 
     RETURN_TYPES = ("KIMODO_MOTION",)
@@ -95,13 +98,15 @@ class KimodoHub_Sampler:
     FUNCTION = "sample"
     CATEGORY = "Kimodo/Hub"
 
-    def sample(self, model, conditioning, duration, seed, num_samples, diffusion_steps):
+    def sample(self, model, conditioning, duration, seed, num_samples, diffusion_steps, root_margin):
         _kimodo_imports()
         from kimodo.tools import seed_everything
         seed_everything(seed)
         texts = list(conditioning.texts)
         frames = int(duration * model.fps)
-        args, kw = core.sampler_call(texts, frames, num_samples, diffusion_steps)
+        # post-processing inside the model call; a missing motion_correction extension
+        # raises there instead of being skipped (core.sampler_call)
+        args, kw = core.sampler_call(texts, frames, num_samples, diffusion_steps, root_margin)
         print(f"[KimodoHub] sampling {len(texts)} segment(s) × {frames} frames, "
               f"{num_samples} sample(s), {diffusion_steps} steps", flush=True)
         output = model(*args, **kw)
@@ -110,47 +115,6 @@ class KimodoHub_Sampler:
             raise RuntimeError(f"KimodoHub sampler: asked for {num_samples} samples, model returned {got}")
         return (_upstream("Kimodo_Sampler")._wrap_output(
             model, output, texts, [frames] * len(texts), num_samples, []),)
-
-
-class KimodoHub_PostProcess:
-    """Kimodo_PostProcess (foot-skate / root correction), but a failure FAILS the run.
-    Upstream catches every error and returns the uncorrected motion — with the
-    motion_correction extension missing, every run skipped the correction unnoticed."""
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {"required": {
-            "motion": ("KIMODO_MOTION",),
-            "root_margin": ("FLOAT", {"default": 0.04, "min": 0.0, "max": 1.0, "step": 0.01}),
-        }}
-
-    RETURN_TYPES = ("KIMODO_MOTION",)
-    RETURN_NAMES = ("motion",)
-    FUNCTION = "process"
-    CATEGORY = "Kimodo/Hub"
-
-    def process(self, motion, root_margin):
-        _kimodo_imports()
-        import numpy as np
-        import torch
-        from kimodo.postprocess import post_process_motion
-        if motion.skeleton is None:
-            raise RuntimeError("KimodoHub post-process: the motion carries no skeleton")
-        out = motion.output_dict
-        t = {k: (torch.from_numpy(out[k]) if isinstance(out[k], np.ndarray) else out[k])
-             for k in ("local_rot_mats", "root_positions", "foot_contacts")}
-        corrected = post_process_motion(t["local_rot_mats"], t["root_positions"],
-                                        t["foot_contacts"], motion.skeleton,
-                                        motion.constraint_lst or [], root_margin=root_margin)
-        new_out = dict(out)
-        for k, v in corrected.items():
-            new_out[k] = v.cpu().numpy() if isinstance(v, torch.Tensor) else v
-        print(f"[KimodoHub] post-process done (root_margin={root_margin})", flush=True)
-        return (type(motion)(
-            output_dict=new_out, model_name=motion.model_name, skeleton_name=motion.skeleton_name,
-            fps=motion.fps, texts=motion.texts, num_frames=motion.num_frames,
-            num_samples=motion.num_samples, joint_parents=motion.joint_parents,
-            joint_names=motion.joint_names, neutral_joints=motion.neutral_joints,
-            skeleton=motion.skeleton, constraint_lst=motion.constraint_lst),)
 
 
 def _check_mixamo(rig: str) -> None:
@@ -218,12 +182,10 @@ class KimodoHub_ExportFBX:
 NODE_CLASS_MAPPINGS = {
     "KimodoHub_PromptLines": KimodoHub_PromptLines,
     "KimodoHub_Sampler": KimodoHub_Sampler,
-    "KimodoHub_PostProcess": KimodoHub_PostProcess,
     "KimodoHub_ExportFBX": KimodoHub_ExportFBX,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "KimodoHub_PromptLines": "Kimodo Prompt (one segment per line)",
     "KimodoHub_Sampler": "Kimodo Sampler (1–4 variants, AI-Hub)",
-    "KimodoHub_PostProcess": "Kimodo Post-Process (fails loudly, AI-Hub)",
     "KimodoHub_ExportFBX": "Kimodo Export FBX (all samples, AI-Hub)",
 }
