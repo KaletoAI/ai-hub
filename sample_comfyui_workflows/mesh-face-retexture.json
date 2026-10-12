@@ -98,13 +98,13 @@
         "Node name for S&R": "Load3DAdvanced"
       },
       "widgets_values": [
-        "",
+        "none",
         "",
         1024,
         1024
       ],
       "widgets_values_named": {
-        "model_file": "",
+        "model_file": "none",
         "viewport_state": "",
         "width": 1024,
         "height": 1024

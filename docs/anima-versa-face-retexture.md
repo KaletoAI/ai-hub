@@ -4,7 +4,7 @@
 
 Diese Integration ist **ein unabhängiger zweiter AI-Hub-Job nach erfolgreichem img2mesh und vor jedem Rigging**. Modellname: `GLB-Face-Retexture`, Task: `mesh2mesh`. Bestehende img2mesh-, Rigging- und Legacy-Face-Workflows bleiben unverändert; keine automatische Gateway-Kette voraussetzen.
 
-Auf **dx10-02** sind Node und sichtbarer Workflow installiert; der neue AI-Hub-Alias wurde mit einem echten GLB-/RGB-Upload und Ergebnisdownload geprüft. Vor Aktivierung in Anima-Versa mit dem normalen Benutzer-Key `GET /v1/generations/GLB-Face-Retexture/schema` abrufen und die Freigabe in der User-Allow-List sicherstellen. Die Anima-Versa-Clientintegration selbst ist nicht Teil dieser Installation.
+Auf **dx10-02 und k12** sind Node **v1.0.2** und sichtbarer Workflow installiert. Der AI-Hub-Alias wurde auf dx10-02 mit einem echten GLB-/RGB-Upload und Ergebnisdownload geprüft; auf k12 lief der native ComfyUI-Workflow erfolgreich. Vor Aktivierung in Anima-Versa mit dem normalen Benutzer-Key `GET /v1/generations/GLB-Face-Retexture/schema` abrufen und die Freigabe in der User-Allow-List sicherstellen. Die Anima-Versa-Clientintegration selbst ist nicht Teil dieser Installation.
 
 ## Eingangsbedingungen
 
@@ -59,11 +59,11 @@ Resultate bleiben nur bis zum Job-TTL verfügbar (Standard 24 Stunden): beide GL
 
 - Sichtbarer ComfyUI-Workflow: [`../sample_comfyui_workflows/mesh-face-retexture.json`](../sample_comfyui_workflows/mesh-face-retexture.json). In ComfyUI öffnen, eigene GLB-/Foto-Slots füllen, vier benannte Parameter an Node 3 setzen. Vorschau 4 zeigt das korrigierte GLB, Vorschau 5 den Vergleich, Note 7 erläutert Grenzen.
 - API-Workflow: [`../sample_comfyui_workflows/mesh-face-retexture_api.json`](../sample_comfyui_workflows/mesh-face-retexture_api.json).
-- Neuer Alias `GLB-Face-Retexture`, Task `mesh2mesh`, Backend-Name `dx10-02` (Health-ID `comfyui:dx10-02`); bestehende Aliase nicht bearbeiten.
+- Alias `GLB-Face-Retexture`, Task `mesh2mesh`, Backend-Namen `dx10-02` und `k12-gpu` (Health-IDs `comfyui:dx10-02` und `comfyui:k12-gpu`); andere Aliase nicht bearbeiten.
 
 | Öffentliches Feld | Node | Workflow-Feld | Default |
 |---|---|---|---|
-| `files.input_mesh_path` | 1 `Load3DAdvanced` | `model_file` | leer, Original-GLB hochladen |
+| `files.input_mesh_path` | 1 `Load3DAdvanced` | `model_file` | `none` (native Leerauswahl), Original-GLB hochladen |
 | `images.reference_image` | 2 `LoadImage` | `image` | leer; Slot `on_empty: required` |
 | `params.strength` | 3 `GLBFaceRetexture` | `strength` | 1 |
 | `params.feather` | 3 | `feather` | 0.18 |
@@ -89,8 +89,9 @@ Nach Installation erst die aktuelle ComfyUI-Queue prüfen. **Nur bei leerer lauf
 
 ## Geprüfter Stand
 
-- Linux ARM64/NVIDIA GB10, ComfyUI 0.37.0, Frontend 1.53.6 und Python 3.12.3; 14 Worker-Verhaltenstests bestanden.
+- Node v1.0.2 auf dx10-02 (Linux ARM64/NVIDIA GB10) und k12 (Linux x86_64); ComfyUI 0.37.0 und Frontend 1.53.6. Je 31 Verhaltenstests im isolierten Python-3.12-Worker bestanden; die ComfyUI-Hauptumgebungen bleiben unverändert.
 - Echter asynchroner AI-Hub-Job: originales Journal-GLB und RGB-Referenz über die oben genannten Upload-Felder, GLB und Vergleichs-PNG heruntergeladen.
 - Sichtbarer ComfyUI-Workflow per **Run** ausgeführt, auch mit `strength: 0.85`; alle vier Widgets benannt, keine fehlende Node. In der Bibliothek unter **GLB-Face-Retexture** verfügbar.
 - Im Test blieben alle 101.600 Dreiecke, Vertexattribute, ursprünglichen Binärdaten und Szenentransformationen erhalten; geschützte Körperbereiche: 0 veränderte Render-Pixel.
+- v1.0.2: Proof-Schema 2, echter Workflow-Lauf auf beiden Hosts; Geometrie unverändert und 0 veränderte Pixel in geschützter Körpertextur. Der Alias-Editor zeigt für `input_mesh_path` die native Leerauswahl `none` ohne `stale`.
 - Das Test-Ergebnis war 47 MB groß und erzeugte die bestehende AI-Hub-Größenwarnung. Asset-Größe im Client berücksichtigen; keine automatische Kompression oder Vereinfachung behaupten.

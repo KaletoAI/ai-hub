@@ -220,9 +220,12 @@ scalar controls to node 3. Native `FILE_3D` feeds preview 4 and authoritative
 the diagnostic comparison. `output_globs: ["GLB-Face-Retexture_Comparison_*.png"]`
 adds that PNG without replacing or normalizing the GLB. No new gateway mechanism:
 existing job-isolated uploads and node-plus-extras delivery handle the request.
-The editable frontend counterpart keeps the native camera link and blank input
-selectors. This is an independent post-img2mesh, pre-rigging job on an original
-static single-mesh/single-primitive textured GLB, not geometry reconstruction;
+The editable frontend counterpart keeps the native camera link, `model_file: "none"`
+and a blank image selector. The native loader's empty choice is `none`, not `""`;
+using a blank GLB default produces a stale choice in the alias editor. Uploaded
+`files.input_mesh_path` replaces that sentinel. This is an independent
+post-img2mesh, pre-rigging job on an original static single-mesh/single-primitive
+textured GLB, not geometry reconstruction;
 the corrected multi-primitive GLB is not a supported input for another pass.
 Alias creation and live verification are operator steps, not sample-file side
 effects. Client and installation contract: `docs/anima-versa-face-retexture.md`.
