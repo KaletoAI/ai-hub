@@ -402,6 +402,8 @@ virtual_models:
 #       successor:
 #         alias: Tripo-Rig            # the rigging alias (ComfyUI, Meshy or Tripo)
 #         mesh_param: input_mesh_path # must be a request field of that alias
+#         rig: tripo                  # tagged only - a cloud rig is never normalized
+#         # keep_from_mesh: ["preview.png"]   # stage-1 files to ship along
 #   "arli-image":
 #     - backend: arli-images
 #       task: text2img
@@ -434,8 +436,6 @@ virtual_models:
 #         endpoint: 3d
 #         options: {options_json: '{"face_count":500000,"enable_pbr":false}'}
 #       # No workflow JSON; normal /v1/generations jobs and result artifacts.
-#         rig: tripo                  # tagged only - a cloud rig is never normalized
-#         # keep_from_mesh: ["preview.png"]   # stage-1 files to ship along
 
 # Generation aliases: the `model` field of a POST /v1/generations request. Each
 # maps to a list of candidates — the fastest free unpaid one runs the job, an
