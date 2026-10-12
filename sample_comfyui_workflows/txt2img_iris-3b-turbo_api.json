@@ -1,0 +1,82 @@
+{
+  "1": {
+    "inputs": {
+      "model_name": "iris-3b.safetensors",
+      "weight_dtype": "bf16"
+    },
+    "class_type": "IrisModelLoader",
+    "_meta": {
+      "title": "input_model"
+    }
+  },
+  "2": {
+    "inputs": {
+      "encoder_folder": "Qwen3-VL-4B-Instruct"
+    },
+    "class_type": "IrisTextEncoderLoader",
+    "_meta": {
+      "title": "input_text_encoder"
+    }
+  },
+  "3": {
+    "inputs": {
+      "text_encoder": [
+        "2",
+        0
+      ],
+      "positive": "a red fox sleeping in fresh snow, golden hour",
+      "negative": ""
+    },
+    "class_type": "IrisTextEncode",
+    "_meta": {
+      "title": "input_prompt"
+    }
+  },
+  "4": {
+    "inputs": {
+      "model": [
+        "1",
+        0
+      ],
+      "lora_name": "iris-3b-turbo-r2-1000.safetensors",
+      "strength": 1.0
+    },
+    "class_type": "IrisTurboLoRA",
+    "_meta": {
+      "title": "input_turbo_lora"
+    }
+  },
+  "5": {
+    "inputs": {
+      "model": [
+        "4",
+        0
+      ],
+      "conditioning": [
+        "3",
+        0
+      ],
+      "resolution": "1:1 square (1024x1024)",
+      "steps": 4,
+      "seed": 0,
+      "batch_size": 1
+    },
+    "class_type": "IrisSamplerTurbo",
+    "_meta": {
+      "title": "input_sampler"
+    }
+  },
+  "6": {
+    "inputs": {
+      "images": [
+        "5",
+        0
+      ],
+      "filename_prefix": "Iris-3B-Turbo"
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "output_final"
+    }
+  }
+}

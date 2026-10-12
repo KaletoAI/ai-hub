@@ -1,0 +1,77 @@
+{
+  "1": {
+    "inputs": {
+      "model_name": "iris-3b.safetensors",
+      "weight_dtype": "bf16"
+    },
+    "class_type": "IrisModelLoader",
+    "_meta": {
+      "title": "input_model"
+    }
+  },
+  "2": {
+    "inputs": {
+      "encoder_folder": "Qwen3-VL-4B-Instruct"
+    },
+    "class_type": "IrisTextEncoderLoader",
+    "_meta": {
+      "title": "input_text_encoder"
+    }
+  },
+  "3": {
+    "inputs": {
+      "text_encoder": [
+        "2",
+        0
+      ],
+      "positive": "a red fox sleeping in fresh snow, golden hour",
+      "negative": ""
+    },
+    "class_type": "IrisTextEncode",
+    "_meta": {
+      "title": "input_prompt"
+    }
+  },
+  "4": {
+    "inputs": {
+      "model": [
+        "1",
+        0
+      ],
+      "conditioning": [
+        "3",
+        0
+      ],
+      "steps": 50,
+      "cfg": 3.0,
+      "seed": 0,
+      "batch_size": 1,
+      "mode": "text to image",
+      "denoise": 1.0,
+      "shift": 4.0,
+      "solver_order": 2,
+      "cfg_start": 0.0,
+      "cfg_end": 1.0,
+      "width": 1024,
+      "height": 1024,
+      "keep_model_on_gpu": false
+    },
+    "class_type": "IrisSamplerAdvanced",
+    "_meta": {
+      "title": "input_sampler"
+    }
+  },
+  "5": {
+    "inputs": {
+      "images": [
+        "4",
+        0
+      ],
+      "filename_prefix": "Iris-3B"
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "output_final"
+    }
+  }
+}

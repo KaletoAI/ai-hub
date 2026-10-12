@@ -139,6 +139,29 @@ Quad-Topologie). Gleiche Bindepunkte, aber `input_face_num` ist bei `-quad` eine
 Rückgabewert des Rig-Nodes (`fbx_output_path` bzw. `rigged_glb_path`), der über den
 Preview-Node in `/history` landet. `mesh-make-it-animatable` hat außerdem kein `input_name`.
 
+#### Iris-3B — Text2Img Normal, Turbo und separater Upscaler
+
+Live-Aliase ausschließlich für `k12-gpu` (VM 402 / RTX 3090):
+
+| Alias | API-Workflow | Gemappte Eingaben | Output-Node |
+|---|---|---|---|
+| `Iris-3B` | `txt2img_iris-3b_api.json` | `prompt` → `3.positive`, `negative_prompt` → `3.negative`, `width`, `height`, `steps`, `cfg`, `seed` → Node `4` | `5` |
+| `Iris-3B-Turbo` | `txt2img_iris-3b-turbo_api.json` | `prompt` → `3.positive`, `resolution`, `seed` → Node `5` | `6` |
+| `Iris-3B-Upscale` | `img2img_iris-3b-upscale_api.json` | `image` → `1.image` (**required**), `scale`, `color_fix` → Node `3` | `4` |
+
+Normal: 1024×1024, 50 Steps, CFG 3. Turbo: 4 Steps fest, Turbo-LoRA r2-1000
+mit Stärke 1; Größe über die Auflösungs-Presets des `IrisSamplerTurbo`, nicht über
+separate Breite/Höhe. Turbo hat keinen gemappten Negativprompt.
+
+Upscaler: Bild hochladen, standardmäßig Scale 4 und Color Fix an.
+`limit_input_size=false` ist gepinnt; ein 1024²-Eingang ergibt bei Scale 4 tatsächlich
+4096², keinen verkleinerten Zwischenstand. Text2Img enthält keinen automatischen Upscale.
+Alle Modell-Loader verwenden BF16, Modell-/Encoder-Dateinamen sind gepinnt.
+
+Visuelle Workflows stehen in `org/` und auf VM 402 unter `user/default/workflows/`
+mit gleichen Dateinamen ohne `_api`. Modellrevisionen, Installation und echte Abnahme:
+Quartermaster `kb/02-ai-serving.md`, Abschnitt „Iris-3B“.
+
 ### 1.2 Ausgaben
 
 | Workflow | Output-Node | erzeugte Dateien |

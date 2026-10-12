@@ -1,0 +1,53 @@
+{
+  "1": {
+    "inputs": {
+      "image": ""
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "input_image"
+    }
+  },
+  "2": {
+    "inputs": {
+      "model_name": "iris-3b-upscaler.safetensors",
+      "weight_dtype": "bf16"
+    },
+    "class_type": "IrisUpscalerLoader",
+    "_meta": {
+      "title": "input_model"
+    }
+  },
+  "3": {
+    "inputs": {
+      "upscaler": [
+        "2",
+        0
+      ],
+      "image": [
+        "1",
+        0
+      ],
+      "scale": 4.0,
+      "limit_input_size": false,
+      "color_fix": true
+    },
+    "class_type": "IrisUpscale",
+    "_meta": {
+      "title": "input_upscale"
+    }
+  },
+  "4": {
+    "inputs": {
+      "images": [
+        "3",
+        0
+      ],
+      "filename_prefix": "Iris-3B-Upscale"
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "output_final"
+    }
+  }
+}
