@@ -127,6 +127,34 @@ Quad-Topologie). Gleiche Bindepunkte, aber `input_face_num` ist bei `-quad` eine
 **Vertex**-Zahl (`vertex_count`), bei `mesh-shrink` eine **Face**-Zahl
 (`target_face_count`) — austauschbar nur bei angepasstem Wert.
 
+#### GLB-Face-Retexture — Original-GLB + RGB-Foto → korrigiertes GLB
+
+Neuer, unabhängiger `mesh2mesh`-Workflow:
+`mesh-face-retexture_api.json` für AI-Hub und
+`mesh-face-retexture.json` zum sichtbaren Öffnen in ComfyUI.
+Der Alias `GLB-Face-Retexture` wird separat vom Admin angelegt; bestehende
+Aliase und der eigenständige Legacy-Face-Workflow bleiben unverändert.
+
+| Request-Feld | Node | Feld | Default |
+|---|---|---|---|
+| `files.input_mesh_path` | 1 `Load3DAdvanced` | `model_file` | leer |
+| `images.reference_image` | 2 `LoadImage` | `image` | leer, required |
+| `params.strength` | 3 `GLBFaceRetexture` | `strength` | 1 |
+| `params.feather` | 3 | `feather` | 0.18 |
+| `params.render_resolution` | 3 | `render_resolution` | 768 |
+| `params.yaw` | 3 | `yaw` | 0 |
+
+Abweichend von den älteren Export-Konventionen ist **Node 6 `SaveGLB`**
+mit Titel `output_final` autoritativ; Prefix `3d/GLBFaceRetexture`.
+Node 8 speichert nur den diagnostischen Vergleich:
+`output_globs: ["GLB-Face-Retexture_Comparison_*.png"]`.
+Die nativen 3D-/Bildvorschauen 4/5 und Note 7 bleiben sichtbar.
+Nur ursprüngliche statische Single-Mesh-/Single-Primitive-GLBs mit eingebetteter
+unkomprimierter Textur verwenden, vor Rigging; Foto ist Original-RGB, keine Normalmap.
+Keine Geometrie- oder Facecount-Generierung.
+Konkreter Client-Ablauf und Installation:
+[Anima-Versa Face Retexture](../docs/anima-versa-face-retexture.md).
+
 #### mesh-reg-unirig / mesh-reg-mia / mesh-make-it-animatable
 
 | Workflow | `input_mesh_path` | `input_name` | `input_face_num` | `input_no_fingers` |

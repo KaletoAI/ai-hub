@@ -211,6 +211,22 @@ glob on the result; plain `output_globs` may accompany cases OR an
 an empty node still errors, never an extras-only delivery; globs WITHOUT a
 node are the whole delivery). A relative `/view` path keeps its dirs as the
 subfolder (`_view_params`).
+The separate sample `mesh-face-retexture_api.json` uses the public
+`GLBFaceRetexture` custom node, not the legacy standalone face workflow:
+`files.input_mesh_path` maps to native `Load3DAdvanced.model_file` (node 1),
+the required `images.reference_image` to `LoadImage.image` (node 2), and four
+scalar controls to node 3. Native `FILE_3D` feeds preview 4 and authoritative
+`SaveGLB` output 6 (`output_final`); preview 5 and `SaveImage` 8 consume only
+the diagnostic comparison. `output_globs: ["GLB-Face-Retexture_Comparison_*.png"]`
+adds that PNG without replacing or normalizing the GLB. No new gateway mechanism:
+existing job-isolated uploads and node-plus-extras delivery handle the request.
+The editable frontend counterpart keeps the native camera link and blank input
+selectors. This is an independent post-img2mesh, pre-rigging job on an original
+static single-mesh/single-primitive textured GLB, not geometry reconstruction;
+the corrected multi-primitive GLB is not a supported input for another pass.
+Alias creation and live verification are operator steps, not sample-file side
+effects. Client and installation contract: `docs/anima-versa-face-retexture.md`.
+
 `normalize_delivery` (case mode + chain level, normalize-once flagged; it,
 `validate_delivery` and `_check_glb_not_dummy` are PIL work and run via
 `asyncio.to_thread`, never on the loop) V-flips

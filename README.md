@@ -1572,6 +1572,15 @@ which bytes a delivered artifact was made from.
 See [docs/anima-versa-integration.md](docs/anima-versa-integration.md) for a full
 client-integration walkthrough.
 
+**Post-img2mesh face texture correction:** the separate
+`mesh-face-retexture_api.json` workflow takes the original GLB via
+`files.input_mesh_path` and its matching RGB photo via `images.reference_image`.
+Register it as a new `GLB-Face-Retexture` (`mesh2mesh`) alias before use; existing
+aliases are unchanged. Run it before rigging, not on normal maps or already-rigged
+meshes. It preserves geometry rather than generating a new face or mesh.
+See [the concrete Anima-Versa handoff](docs/anima-versa-face-retexture.md)
+for authenticated downloads, the async request, supported GLBs and installation.
+
 ---
 
 ## Managed hosts (Thunder Compute; RunPod later)

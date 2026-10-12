@@ -1,0 +1,100 @@
+{
+  "1": {
+    "inputs": {
+      "model_file": "",
+      "viewport_state": "",
+      "width": 1024,
+      "height": 1024
+    },
+    "class_type": "Load3DAdvanced",
+    "_meta": {
+      "title": "1 · Upload your static textured source GLB"
+    }
+  },
+  "2": {
+    "inputs": {
+      "image": ""
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "2 · Upload your matching RGB reference photo"
+    }
+  },
+  "3": {
+    "inputs": {
+      "source_glb": [
+        "1",
+        0
+      ],
+      "reference_image": [
+        "2",
+        0
+      ],
+      "strength": 1.0,
+      "feather": 0.18,
+      "render_resolution": 768,
+      "yaw": 0.0
+    },
+    "class_type": "GLBFaceRetexture",
+    "_meta": {
+      "title": "3 · GLB Face Retexture (Preserve Geometry)"
+    }
+  },
+  "4": {
+    "inputs": {
+      "model_3d": [
+        "3",
+        0
+      ],
+      "camera_info": [
+        "1",
+        2
+      ],
+      "viewport_state": "",
+      "width": 1024,
+      "height": 1024
+    },
+    "class_type": "Preview3DAdvanced",
+    "_meta": {
+      "title": "4 · Corrected GLB — native 3D viewer"
+    }
+  },
+  "5": {
+    "inputs": {
+      "images": [
+        "3",
+        1
+      ]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "5 · Real reference / before / after comparison"
+    }
+  },
+  "6": {
+    "inputs": {
+      "mesh": [
+        "3",
+        0
+      ],
+      "filename_prefix": "3d/GLBFaceRetexture"
+    },
+    "class_type": "SaveGLB",
+    "_meta": {
+      "title": "output_final"
+    }
+  },
+  "8": {
+    "inputs": {
+      "images": [
+        "3",
+        1
+      ],
+      "filename_prefix": "GLB-Face-Retexture_Comparison"
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "8 · Save diagnostic comparison PNG"
+    }
+  }
+}
