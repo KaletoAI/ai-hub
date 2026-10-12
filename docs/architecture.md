@@ -269,6 +269,99 @@ write through into the stored candidate) and the derived `CLOUD_TYPES`/
 `CloudNoCredits`/`CloudBusy` (the pre-Tripo `Meshy*` names and the `.meshy` request
 field are gone — nothing stored carries them; the candidate's `meshy` KEY is the kind
 and stays) have a `vendor` attribute that `main._fault_label`/`_gen_exhausted_msg` name.
+`ArliAIImageAdapter` is the synchronous exception to the cloud-task HTTP loop:
+it uses the same `arliai` candidate-kind/schema/editor seam, but subclasses
+`BackendAdapter` rather than `CloudTaskAdapter`. It discovers authorized SDNext
+checkpoint titles via `/sdapi/v1/sd-models`, then posts one `/v1/txt2img` request.
+The pure `arliai.py` builder pins the checkpoint and bounds the image by
+`max_image_pixels` (Core default 3,000,000); main preflights input errors as 400
+before creating a job. JSON serialization/parsing, base64 and PIL verification run
+in worker threads; real image bytes/MIME become ordinary `GenBlob` artifacts.
+Only pre-submit connect/pool errors keep transport semantics; an uncertain submit,
+HTTP rejection or malformed response is final, not another generation. No task id,
+credits or upstream cancellation are invented. `CLOUD_TYPES` identifies generation
+kinds, not billing: `CloudTaskAdapter.bills=True` and RunPod's `bills=True` produce
+`BILLING_TYPES`; a flat-subscription ArliAI backend keeps the operator's paid flag.
+Its LLM side reuses `OpenAIAdapter` with an explicit Core context rule.
+Flat-subscription uncertain submits carry `create_unconfirmed` for diagnosis, but
+`_billed_cloud_task` only recognizes `BILLING_TYPES`: the final job must not claim
+a per-task bill for ArliAI. `test_run_job_failover.py` checks that this remains
+final without self-retries or another candidate, alongside the paid-task guard.
+Existing ComfyUI/Meshy/Tripo workflow chains remain supported. ArliAI and NanoGPT
+are not chain stages: their public adapters refuse stage 1, and
+`_chain_mesh_param_error` refuses them as successors before any stage-1 task is
+bought. A native NanoGPT image file slot is not a mesh handoff contract.
+The cloud editor hides successor controls for these providers and refuses crafted
+successor POSTs without changing candidates. `test_run_job_failover.py` pins zero
+stage-1 submissions and released slots; `test_cloud_editor.py` pins refused saves.
+
+`NanoGPTAdapter` is the only registered `nanogpt` backend: its OpenAI text and
+cloud-media protocol components share the same backend dictionary, injected
+context and `nanogpt:<name>` accounting identity. All six discovery requests run
+concurrently; one complete snapshot is published after both components settle.
+Pending/failed discovery clears metadata rather than allowing stale metadata to
+validate a paid submit. State adoption requires the same account key and URL,
+deep-copies metadata and reapplies changed filters.
+
+`NanoGPTTextAdapter` inherits OpenAI dispatch, but discovers three dedicated
+catalogs atomically: detailed text, TTS and embeddings. A failed catalog makes
+the backend down rather than retaining partial inventory. The audio catalog
+also returns music; only `text_to_speech` entries are callable speech models.
+Legacy text filters never erase dedicated TTS/embedding inventories. Pricing is
+normalized separately from generic OpenRouter parsing: text prompt/completion
+are already USD/million, explicitly named cache-per-1k rates are multiplied by
+1000, embedding input uses `per_million_tokens`, and character-priced TTS stays
+unknown to the token-cost calculator. JSON/catalog normalization runs in workers.
+
+`NanoGPTMediaAdapter` is an internal `CloudTaskAdapter` protocol component, not a
+second backend type; candidate kind is `nanogpt`. Its image/video/3D catalogs
+exclude explicit retexture-only entries and apply model filters.
+Images deliver the documented synchronous OpenAI-compatible data array, or poll
+a real Midjourney ID. Video and 3D share `/generate-video` and unified
+`/video/status?requestId=…`. Accepted IDs are persisted before polling; uncertain
+submits carry `create_unconfirmed`. Only pre-submit connect/pool errors permit
+failover; an HTTP submit error, lost answer, malformed completion or asset failure
+is final, so neither self-retry nor another candidate buys a duplicate generation.
+Every path releases slots/progress; no USD-to-credit conversion is invented.
+Image decoding verifies actual bytes/MIME and the requested count. Download auth
+is absent except on the exact configured Sora content-proxy origin/path; that
+initial request does not follow redirects, and CDN retrieval never gets its key.
+Main preflights model/count/input errors before creating a job and leaves NanoGPT
+video seconds intact. The OpenAI image shim does not invent workflow dimensions
+for this kind, and retains native quality/format controls and strict counts.
+
+`main._is_llm` and `_is_gen` overlap for NanoGPT. `_llm_models` positively selects
+the current text/TTS/embedding inventory (plus explicit extras), so clearing
+catalog metadata during refresh cannot turn cached image IDs into chat models.
+Generation aliases still win; otherwise `_nano_direct_candidates` builds
+ephemeral candidates from current media metadata and runs them through the same
+health/drain/sync/busy/quarantine ordering. No alias rows are generated.
+`generation_models_info` and `generation_candidate` inject that inventory and
+fresh alias metadata into the console. `/v1/models` exposes six typed views;
+`@image` covers real direct media IDs without granting chat.
+`@chat` expands chat aliases only for LLM request gates, not for media requests
+sharing their names. Inventory checks consider both namespaces.
+The generation request gate explicitly enables media grants; chat dispatch cannot
+borrow `@image` through a colliding catalog ID/chat alias. Successful NanoGPT
+discovery rebuilds the route index even when cached IDs are unchanged: typed
+catalogs were absent when the restart (or mid-refresh) index was built.
+Native file decoding uses the resolved candidate's current schema, including
+direct video/audio uploads; an unavailable schema refuses the call instead of
+dropping files before a later discovery could make the model callable.
+
+`store.migrate_nanogpt` moves legacy type/candidate blocks transactionally,
+preserving encrypted secrets verbatim, caps and discovery caches. Name collisions
+get `-media`/numeric suffixes instead of overwriting a text account. Its persisted
+name map also normalizes old YAML on reload; different account profiles are not
+automatically merged. Legacy alias-only references also reserve a noncolliding
+identity, so a missing old profile cannot bind to another account. A later YAML
+collision with a saved migration target is refused instead of reassigning it.
+`load_config` publishes parsed configuration only after normalization succeeds.
+Generation backends activate jobs without aliases, including through console
+saves and YAML hot reload. `_activate_generation_jobs` retains the startup-only
+job DB/blob paths even when initialization was deferred on a text-only gateway.
+
+
 
 **The build/execute/deliver seam** (`ComfyUIAdapter.generate`). What used to be one
 method is three steps so a second backend can reuse the first: `_build_prompt(req, io)`
@@ -590,6 +683,53 @@ Tests (each guards a silent failure):
 - `tests/test_s3vol.py`: AWS signatures/raw Unicode encoding, XML readers, three-page ListV2, multipart/ETags, HTTP-200 errors, auth, timeouts, size boundaries, secret-free URLs and payload hashing off the event loop.
 - `tests/test_rpvolume.py`: adoption/gone/ownership money guards, pressure-only prune and capped growth, atomic cached readiness, HEAD ownership, batch splitting, fallbacks, multipart failures, writer reservations, persisted ghost holds, resume budgets/alias ownership, partial cleanup, retry resets, job-level versus item failures, HEAD caching/unknown sizes, one-unit readiness, current-byte growth accounting, backoff/auth pauses and shutdown.
 - `tests/test_rpvolume_main.py`: controller reconciliation, state persistence, live adapter/secrets wiring, routing gate, reference validation, transfer budget overrides and confirmed-gone deletion guards.
+### `arliai.py`
+
+Pure SDNext text-to-image request and public-field helpers, no I/O or main/adapters
+imports. Account-specific checkpoint names remain free text, never a fabricated
+enum/default. Client sampling controls override alias defaults but cannot change
+`sd_model_checkpoint` or enable batches. The public schema exposes one control per
+setting (`cfg`, `sampler`); native names still work through the API and take precedence
+when explicitly supplied. This avoids a Playground's untouched native default
+overwriting the short-name control the user changed. Alias form numbers are finite
+and whole where required; invalid saves re-render as typed without changing the store.
+`test_arliai.py` and `test_arliai_console.py` guard pins, pixel boundaries,
+image decoding, uncertain submits, form persistence and unsupported input refusal.
+
+### `nanogpt.py`
+
+Pure NanoGPT media request/schema/result helpers, no HTTP or main/adapters imports.
+Pinned model IDs are dynamic catalog IDs, not an enum or a fallback model.
+`candidate_for` supplies direct catalog candidates without database writes.
+`model_metadata` drives schema choices/ranges/defaults and supported upload slots:
+live flat `supported_parameters` arrays and documented nested descriptors are both
+accepted. Published scalar enums/ranges, output/reference counts and explicit
+unsupported inputs are checked before billing; unknown native controls remain
+allowed because catalogs are not exhaustive. Structured descriptors such as
+MiniMax's LoRA array stay opaque finite JSON via `params` or `options_json`, not
+guessed text controls. A media request captures its catalog metadata before its
+first worker await and uses that snapshot for validation and request construction,
+so a concurrent failed refresh cannot downgrade it to the legacy schema.
+OpenAI `size=auto` remains a provider-selected special value even when
+the resolution enum omits it. Console model selection derives the task and drops
+stashed uploads that the new schema cannot accept.
+GET model changes also drop carried enum values and numeric counts outside the new
+schema; refused POSTs still render their invalid typed values for correction.
+Boolean enum values use lowercase `true`/`false` in HTML controls and GET matching,
+so an explicit `false` survives the generate redirect instead of selecting a true default.
+Optional common defaults plus a finite JSON object become a model-native request;
+explicit client controls win, native guidance/steps beat short aliases, and model
+or credential overrides are refused. Image count is integral/positive; video/3D
+are one generation per submit. Upload MIME is read from image bytes or the file
+extension, then encoded as data URLs in workers; request metadata records byte
+counts rather than private base64 data. Single/multiple image controls differ.
+Completed tasks missing artifacts and unknown/failed/canceled states are final
+errors, never plausible successes. Both documented video envelopes are accepted.
+3D result fields come from NanoGPT's published frontend model3d consumer:
+`model_urls`, primary/rigged/animated GLB fields, animations, textures and
+`model3d_assets`. The 3D fixtures are source-derived contracts with real GLB/OBJ/PNG
+bytes, not captures of paid provider responses.
+
 - `tests/test_rpvolume_ui.py`: volume forms/cards, start versus grown size, reference links, recreation billing confirms, actions, secret presence, waiting-page polling, partial cleanup rows and backend fields in every pane.
 - `tests/test_runpod_worker.py` (`FetchOps`): path/link escape refusal, resumable downloads, hash-before-rename, HF token from env only, unknown-size verification, unmounted-operation refusal and mounted-volume info.
 - `tests/test_runpod_adapter.py` (`VolumeOps`): save-before-poll/cancel-on-save-failure, job-status recovery, account-key fallback and RunPod URL guard.
@@ -2119,8 +2259,8 @@ release the operator presses Probe.
   a misleading 503.
 - **Generation** (`POST /v1/generations`, and the OpenAI shims
   `/v1/images/generations` + `/v1/images/edits`): `get_gen_routes(alias)` resolves
-  the alias via the **separate** generation store (`image_models`/store), filtered
-  to enabled+healthy generation backends of the candidate's own kind
+  an alias via the **separate** generation store (`image_models`/store), or a direct
+  NanoGPT media catalog ID when no alias exists, filtered to enabled+healthy backends
   (`adapters.cand_kind` == `adapters.backend_kind`); LoRA-aware preference +
   busy→park. Everything the ROUTER reads off a candidate's workflow (image slots for the
   `images` filter and the shims, the params refusal, the schema, the chain export) goes
@@ -2249,6 +2389,15 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   again (`_run_gen_now` → `_run_gen_parked`) with its `state` — tried backends, attempts,
   execution faults — carried over. The chain claims the same way (busy check → inc →
   `try` → row updates).
+  `concurrency_group` adds an account-wide budget across protocol-specific backend
+  ids: `backend_busy` sums inflight for every current member, including disabled/
+  draining members, against the lowest finite effective cap. Ungrouped behavior is
+  unchanged; current membership/caps and the global default stay hot-reloadable.
+  Core's two backends share one slot, and a streamed LLM response holds it until the
+  body ends or is closed. Existing no-await reservations and wakeups remain unchanged.
+  A removed/re-grouped backend is no longer a member; drain active work before
+  changing group membership. `test_concurrency_group.py` pins the cross-type cap,
+  disabled/draining members, cap changes and complete/aborted stream lifecycles.
 - **Re-routing onto a returning backend**: waiting work is never pinned to the
   backend it queued for. `refresh_backend` calls `_notify_slot_free()` on DOWN→UP
   and on a model-set change (parked calls re-evaluate); `apply_backend_change` and
@@ -2566,8 +2715,10 @@ a bridge stopped on it and closed the source; the Responses bridge fails on any 
 
 ## Voice cloning (`/v1/audio/speech`)
 
-TTS backends read `voice` strictly as a
-file on THEIR host (no base64/URL/upload API — measured). The voice library
+The local voice-cloning TTS backends read `voice` strictly as a
+file on THEIR host (no base64/URL/upload API — measured). Cloud TTS such as NanoGPT
+instead receives the model-supported voice ID; it does not use reference scp.
+The local voice library
 (`voiceref/` blobs + store `voice_library`, UI in the Voice sub-tab) therefore
 ships references via scp to EVERY target in `voice_ref_hosts` (settings;
 comma-separated `user@host:/abs/host/dir`, host-side dirs may differ — docker
@@ -2584,6 +2735,31 @@ the /ui origin, so `admin._audio_headers` plays only `audio/*` and turns anythin
 ## Tests — what each one guards
 
 Every test file also says this in its own docstring; this is the overview.
+- `test_arliai.py`: checkpoint pins, client/default precedence, exact pixel boundary,
+  real PNG delivery, malformed results and final uncertain SDNext submits.
+- `test_arliai_console.py`: account-specific checkpoint saves, invalid saves preserving
+  both stored and typed values, and generation input refusals before a job exists.
+- `test_concurrency_group.py`: an account cap shared by chat and images, releases,
+  independent groups, cap reloads, disabled/draining members and streams held to EOF.
+- `test_nanogpt.py`: pinned models, current metadata-driven schemas and input limits,
+  default/client/native precedence, explicit auto, finite JSON, video seconds,
+  redacted media metadata and terminal result parsing.
+- `test_nanogpt_text.py`: atomic six-catalog publication/failure/adoption, correct
+  pricing units, purpose-separated inventories and worker-thread normalization.
+- `test_nanogpt_media_adapter.py`: all six protocols through one backend identity,
+  real image/video/audio/mesh artifacts, current-model preflight across refresh,
+  paid-submit finality, slot/progress cleanup and credential-free CDN redirects
+  from the authenticated Sora content proxy.
+- `test_nanogpt_console.py`: one backend type, alias-free catalog selection,
+  metadata-dependent controls/reference slots, retained/refused forms, optional
+  alias suggestions/defaults, explicit false boolean enums, image request limits and video/audio inputs.
+- `test_nanogpt_routing.py`: actual image delivery without aliases, six typed
+  inventories, prefixed-media chat refusal even during refresh, modality-scoped
+  media grants in both directions despite same-named chat aliases, uploaded video/audio retention,
+  unchanged-cache route recovery, YAML job activation with startup-only paths,
+  alias precedence and account-safe/idempotent store/config name migration,
+  including later collisions and orphaned legacy references.
+
 
 `ls tests/test_*.py` is the count of record (seventy-eight files on 2026-10-03). There
 is no blanket suite on purpose: each file exists because the mechanism it guards fails

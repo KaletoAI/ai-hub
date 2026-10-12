@@ -168,6 +168,37 @@ backends:
   #   serverless_only: false            # keep :free models; true = paid-only
   #                                     # (paid models need account credits, else HTTP 402)
 
+  # ArliAI Core: two protocols, one conservative shared account slot.
+  # Same provider API key on both; subscription pricing is not per-token billing.
+  # - name: arli-chat
+  #   type: openai
+  #   url: https://api.arliai.com        # no /v1 suffix
+  #   api_key: "<ArliAI API key>"
+  #   paid: true                        # fallback priority; no read-timeout failover
+  #   max_concurrent: 1
+  #   concurrency_group: arliai-core
+  #   model_context: "*=32768"          # Core context cap, not the model's maximum
+  # - name: arli-images
+  #   type: arliai                      # SDNext /v1/txt2img, not OpenAI images
+  #   url: https://api.arliai.com
+  #   api_key: "<ArliAI API key>"
+  #   paid: true
+  #   max_concurrent: 1
+  #   concurrency_group: arliai-core
+  #   max_image_pixels: 3000000         # Core: width * height <= 3 megapixels
+  #   max_wait: 600
+
+  # NanoGPT: one backend/key for text, images, video, 3D, TTS and embeddings.
+  # The gateway adds endpoint paths, so the base ends /api, not /api/v1.
+  # Catalog models are directly callable; no media aliases/workflows required.
+  # - name: nano
+  #   type: nanogpt
+  #   url: https://api.nano-gpt.com/api
+  #   api_key: "<NanoGPT API key>"
+  #   max_concurrent: 2                # one shared text/media cap; always paid
+  #   max_wait: 1800
+  #   poll_interval: 5
+
   # - name: anthropic-sub               # Claude Code frontdoor — see README
   #   type: anthropic                   # reachable through /v1/messages ONLY
   #   url: https://api.anthropic.com
@@ -373,6 +404,38 @@ virtual_models:
 #         mesh_param: input_mesh_path # must be a request field of that alias
 #         rig: tripo                  # tagged only - a cloud rig is never normalized
 #         # keep_from_mesh: ["preview.png"]   # stage-1 files to ship along
+#   "arli-image":
+#     - backend: arli-images
+#       task: text2img
+#       model: "<exact checkpoint title from /sdapi/v1/sd-models>"
+#       arliai:
+#         endpoint: txt2img
+#         options: {width: 1024, height: 1024, steps: 20, cfg_scale: 6.0,
+#                   sampler_name: Euler, seed: -1}
+#       # One image/request; no reference images or edits. No workflow JSON needed.
+#   # OPTIONAL NanoGPT aliases for fixed defaults; direct nano/<catalog ID> needs none.
+#   "nano-image":
+#     - backend: nano
+#       task: text2img
+#       model: "<exact image catalog ID>"
+#       nanogpt:
+#         endpoint: images
+#         options: {n: 1}
+#   "nano-video":
+#     - backend: nano
+#       task: text2vid
+#       model: "<exact video catalog ID>"
+#       nanogpt:
+#         endpoint: video
+#         options: {}
+#   "nano-mesh":
+#     - backend: nano
+#       task: text2mesh
+#       model: wavespeed-ai/hunyuan-3d-v3.1-rapid
+#       nanogpt:
+#         endpoint: 3d
+#         options: {options_json: '{"face_count":500000,"enable_pbr":false}'}
+#       # No workflow JSON; normal /v1/generations jobs and result artifacts.
 
 # Generation aliases: the `model` field of a POST /v1/generations request. Each
 # maps to a list of candidates — the fastest free unpaid one runs the job, an

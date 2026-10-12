@@ -326,6 +326,87 @@ def upsert_backend(backend: dict) -> None:
 def delete_backend(name: str, btype: str = "openai") -> None:
     _row_delete("backends", ("name", "type"), (name, btype))
 
+def migrate_nanogpt(config_backends=(), legacy_alias_backends=()) -> dict:
+    """Cut over the old media type without overwriting another account.
+
+    Persist the name mapping so reloads of an old config keep the same identity.
+    Encrypted secrets are moved verbatim, never decrypted or re-encrypted here.
+    """
+    with _conn() as c:
+        rows = c.execute("SELECT name,type,json FROM backends").fetchall()
+        saved = c.execute("SELECT value_json FROM settings WHERE key=?",
+                          ("nanogpt_migration_names",)).fetchone()
+        names = json.loads(saved["value_json"]) if saved else {}
+        previous = dict(names)
+        aliases = c.execute("SELECT alias,candidates_json FROM gen_aliases "
+                            "WHERE instr(candidates_json,?)>0", ('"nanogpt_media"',)).fetchall()
+        config_public = {b["name"] for b in config_backends if b.get("type") == "nanogpt"}
+        config_legacy = {b["name"] for b in config_backends if b.get("type") == "nanogpt_media"}
+        occupied = {r["name"] for r in rows} | {b["name"] for b in config_backends}
+        public = {r["name"] for r in rows if r["type"] == "nanogpt"} | {
+            b["name"] for b in config_backends if b.get("type") == "nanogpt"}
+        legacy = {r["name"] for r in rows if r["type"] == "nanogpt_media"} | {
+            b["name"] for b in config_backends if b.get("type") == "nanogpt_media"}
+        legacy |= set(legacy_alias_backends) | {
+            cand["backend"] for row in aliases for cand in json.loads(row["candidates_json"])
+            if "nanogpt_media" in cand and cand.get("backend")}
+        for name in sorted(legacy):
+            if name in names:
+                if name in config_legacy and names[name] in config_public:
+                    raise ValueError(f"NanoGPT migration target '{names[name]}' conflicts "
+                                     "with a configured account; rename that account")
+                continue
+            target = name
+            if target in public:
+                target = name + "-media"
+                n = 2
+                while target in occupied:
+                    target = f"{name}-media-{n}"
+                    n += 1
+            names[name] = target
+            occupied.add(target)
+            public.add(target)
+        for row in rows:
+            if row["type"] != "nanogpt_media":
+                continue
+            target = names[row["name"]]
+            data = json.loads(row["json"])
+            data.update(name=target, type="nanogpt")
+            if c.execute("SELECT 1 FROM backends WHERE name=? AND type='nanogpt'",
+                         (target,)).fetchone():
+                raise ValueError(f"NanoGPT migration target '{target}' already exists")
+            c.execute("UPDATE backends SET name=?,type='nanogpt',json=? WHERE name=? AND type=?",
+                      (target, json.dumps(data), row["name"], row["type"]))
+        # Config-only backends also have discovery caches, without a backend row.
+        for source, target in names.items():
+            old_bid, new_bid = "nanogpt_media:" + source, "nanogpt:" + target
+            for table, column in (("backend_models", "models_json"), ("backend_context", "context_json")):
+                c.execute(f"INSERT OR IGNORE INTO {table}(bid,{column},updated) "
+                          f"SELECT ?,{column},updated FROM {table} WHERE bid=?",
+                          (new_bid, old_bid))
+                c.execute(f"DELETE FROM {table} WHERE bid=?", (old_bid,))
+        for row in aliases:
+            candidates = json.loads(row["candidates_json"])
+            changed = False
+            for cand in candidates:
+                if "nanogpt_media" not in cand:
+                    continue
+                block = cand.pop("nanogpt_media")
+                if "nanogpt" in cand and cand["nanogpt"] != block:
+                    raise ValueError(f"Conflicting NanoGPT blocks in alias '{row['alias']}'")
+                cand["nanogpt"] = block
+                cand["backend"] = names.get(cand.get("backend"), cand.get("backend"))
+                changed = True
+            if changed:
+                c.execute("UPDATE gen_aliases SET candidates_json=?,updated=? WHERE alias=?",
+                          (json.dumps(candidates), int(time.time()), row["alias"]))
+        if names != previous:
+            c.execute("INSERT INTO settings(key,value_json,updated) VALUES(?,?,?) "
+                      "ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated=excluded.updated",
+                      ("nanogpt_migration_names", json.dumps(names), int(time.time())))
+    return names
+
+
 
 def rename_backend_references(old: str, new: str) -> int:
     """Re-point every alias that names `old` backend to `new` — generation-alias

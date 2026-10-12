@@ -209,8 +209,8 @@ An **empty** allow-list = everything allowed (the default). A non-empty list bot
 the key only sees what it's allowed. This is how you point an image client at the
 gateway and have it see just the image aliases instead of the whole 400-model
 catalog: give it a key whose allow-list is the image alias(es) (or the ComfyUI
-backend), and `GET /v1/models` returns only those. `?type=image` / `?type=chat`
-narrows by namespace too.
+backend), and `GET /v1/models` returns only those. `?type=image`, `chat`, `video`,
+`3d`, `tts` and `embedding` narrow the catalog; NanoGPT exposes each modality separately.
 
 ### Quotas
 
@@ -306,6 +306,13 @@ cloud API). Missing/`0` = unlimited. The counter is released when the response
 **completes** — including when a streamed response finishes, not when headers are
 sent. Busy state shows in `/health` and the **Input & Routing → Chat aliases** tab.
 
+`concurrency_group` optionally shares that budget across several backends, including
+different protocols. Set the same group name and `max_concurrent: 1` on an ArliAI
+Core chat backend and its image backend: a chat stream then occupies the image
+slot too, until its body ends. The group uses the **lowest finite effective cap**
+of its current members; disabled/draining members still count while requests run.
+Blank group = the existing independent per-backend limits. Editable in Backends.
+
 ### Per-backend model filters
 
 | Flag | Effect (at discovery) |
@@ -318,8 +325,8 @@ sent. Busy state shows in `/health` and the **Input & Routing → Chat aliases**
 
 `models_allow`/`models_deny` are glob-matched case-sensitively (an exact id is just a
 pattern without wildcards) and, unlike the two flags above, apply to **every** backend
-type — `openai`, `anthropic`, `comfyui`, `meshy`, `tripo` — because they narrow the
-discovered set itself. One source: `/v1/models`, routing, alias candidates and the
+type, because they narrow the discovered set itself. One source: `/v1/models`,
+routing, alias candidates and the
 Aliases editor's checkpoint dropdowns all see the filtered set. Edit them in the Backends
 tab under **Models**.
 
@@ -717,12 +724,13 @@ respect.
 
 ## Media generation
 
-Generation runs on four backend types: **`type: comfyui`** — a ComfyUI server on
+Generation runs on six backend types: **`type: comfyui`** — a ComfyUI server on
 your own GPU, or on a GPU rented on demand as a
 [managed host](#managed-hosts-thunder-compute-runpod-later) —, **`type: runpod`** (the
 same workflows on a [RunPod Serverless](#runpod-serverless-comfyui-workflows-pay-per-second)
-endpoint) and the two cloud mesh APIs **`type: meshy`** (Meshy.ai) and **`type: tripo`**
-(Tripo3D), both further down. A ComfyUI
+endpoint), the two cloud mesh APIs **`type: meshy`** (Meshy.ai) and **`type: tripo`**
+(Tripo3D), **`type: arliai`** (SDNext text-to-image), and **`type: nanogpt`**
+(NanoGPT: the same backend also serves text, TTS and embeddings). A ComfyUI
 backend speaks a different protocol, so it declares `type: comfyui`.
 Discovery is via `/object_info` (checkpoints/UNETs/VAEs **and** installed LoRAs);
 dispatch submits a parametrised workflow, polls `/history`, and fetches whatever
@@ -766,6 +774,211 @@ restarts the service via the **ComfyUI-Manager** reboot endpoint (requires the
 Manager extension and a systemd unit with `Restart=always`); auto-restart fires
 at most once per `restart_cooldown_s` (default 600 s). A GPU that fell off the
 bus needs a host reboot instead — the backend then simply stays down.
+
+### ArliAI Core (LLM + image generation)
+
+ArliAI uses two protocols at the same origin, <https://api.arliai.com>:
+**`type: openai`** for LLM requests and **`type: arliai`** for SDNext images.
+Do not append `/v1` to the backend URL. Both use the account's Bearer API key.
+The [Core plan](https://www.arliai.com/pricing) includes a 32,768-token context
+limit, one simultaneous request, and image generation up to 3 megapixels per
+generation. The shared group below conservatively serializes chat and image work.
+
+```yaml
+backends:
+  - name: arli-chat
+    type: openai
+    url: https://api.arliai.com
+    api_key: "<ArliAI API key>"
+    max_concurrent: 1
+    concurrency_group: arliai-core
+    model_context: "*=32768"
+    paid: true
+  - name: arli-images
+    type: arliai
+    url: https://api.arliai.com
+    api_key: "<ArliAI API key>"
+    max_concurrent: 1
+    concurrency_group: arliai-core
+    max_image_pixels: 3000000
+    max_wait: 600
+    paid: true
+image_models:
+  arli-image:
+    - backend: arli-images
+      task: text2img
+      model: "<exact checkpoint title from the image catalog>"
+      arliai:
+        endpoint: txt2img
+        options:
+          width: 1024
+          height: 1024
+          steps: 20
+          cfg_scale: 6.0
+          sampler_name: Euler
+          seed: -1
+```
+
+`paid: true` chooses fallback priority and prevents LLM read-timeout failover;
+it does not invent per-token/image prices for this subscription. The image type
+does not force that flag, unlike per-task Meshy/Tripo and per-second RunPod.
+
+In `/ui`, add both backends with the same **concurrency group** and cap. For the
+LLM backend, set **Models → context windows** to `*=32768`; do not enable
+`serverless_only`, which requires token pricing. Create a media alias on the
+ArliAI backend without a workflow JSON, then enter its exact **checkpoint** in
+the alias editor. Discovery reads `/v1/models` for chat and
+`/sdapi/v1/sd-models` for images. No account-specific model name is assumed.
+
+Clients call the normal gateway APIs:
+
+```bash
+curl "$B/v1/chat/completions" -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"arli-chat/<model id from /v1/models>","messages":[{"role":"user","content":"Hello"}]}'
+
+curl "$B/v1/images/generations" -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"arli-image","prompt":"a red apple on a wooden table","size":"1024x1024","response_format":"b64_json"}'
+```
+
+Native `/v1/generations` also supports this alias, synchronous or asynchronous,
+with the usual job/result endpoints. The media Playground uses the same path.
+Client `width`, `height`, `steps`, `cfg`/`cfg_scale`, `sampler`/`sampler_name`,
+`seed`, `clip_skip` and negative prompt override alias defaults; explicit SDNext
+names beat their short aliases. The checkpoint remains pinned by the alias.
+One image per request (`n=1`, `batch_size=1`, `n_iter=1`); larger counts, image
+edits/reference images and requests exceeding `max_image_pixels` are refused,
+not silently ignored or resized. There is no upstream task polling or targeted
+cancellation API: cancelling the gateway job does not promise the vendor stopped.
+A lost generation POST answer is final and never submitted again.
+See the [ArliAI API reference](https://www.arliai.com/docs/api) and
+[image guide](https://www.arliai.com/docs/imggen).
+
+### NanoGPT (text, image, 3D, TTS, video, embeddings)
+
+Add **one `nanogpt` backend and one API key** for all six capabilities. Use
+**`https://api.nano-gpt.com/api`**, without a trailing `/v1`: the gateway appends
+endpoint paths. `https://nano-gpt.com/api` also works as a configured base, but the
+[direct API host](https://docs.nano-gpt.com/api-reference/miscellaneous/api-hosts)
+is recommended for larger uploads and longer-running calls. Choose model IDs
+from the configured host's catalog.
+
+| Capability | Gateway endpoint | Catalog filter |
+|---|---|---|
+| Text, including streaming | `/v1/chat/completions` | `?type=chat` |
+| Embeddings | `/v1/embeddings` | `?type=embedding` |
+| TTS | `/v1/audio/speech` | `?type=tts` |
+| Images | `/v1/images/generations`, `/v1/generations` | `?type=image` |
+| Video | `/v1/generations` | `?type=video` |
+| 3D, text or image input | `/v1/generations` | `?type=3d` |
+
+```yaml
+backends:
+  - name: nano
+    type: nanogpt
+    url: https://api.nano-gpt.com/api
+    api_key: "<NanoGPT API key>"
+    max_concurrent: 2
+    max_wait: 1800
+    poll_interval: 5
+```
+
+The backend is always **paid**. `max_concurrent` covers text **and** media together;
+no second backend or `concurrency_group` is required. The job store starts for a
+generation backend even without configured aliases.
+
+In `/ui → Backends`, select `nanogpt`. Then open **Playground → Media** and select
+a discovered model, grouped by backend and modality. **No alias or workflow is
+required.** The form derives its task, choices, numeric bounds and reference
+slots from the current model's metadata. For example, Qwen Image 2.1 Turbo
+advertises three reference images, 1k/2k resolution and at most four outputs;
+an explicitly text-to-image-only model has no reference uploads. Unadvertised
+native controls can still be supplied through API `params`.
+Structured native controls, such as MiniMax LoRA arrays, remain JSON through API
+`params` or optional alias `options_json`; they are not turned into text-only form fields.
+
+Discovered IDs are directly callable as `nano/<exact model ID>` (bare IDs also
+route; `model_prefix: false` lists them bare). Optional media aliases retain
+defaults and take precedence over same-named catalog IDs; their candidate block
+is `nanogpt: {endpoint: images|video|3d, options: {...}}`. Their model field has
+catalog suggestions instead of requiring an external ID lookup.
+
+Legacy `nanogpt_media` config/store entries and alias blocks are migrated at the
+boundary. Different account profiles and their secrets/caps are preserved, not
+merged. A collision with an existing `nanogpt` name gets `-media` (then a numeric
+suffix); the persisted mapping keeps that identity stable across old-config
+reloads. Update old YAML to the unified type when convenient.
+If a later old-YAML reload adds an account that conflicts with a saved migration
+target, the reload is refused rather than redirecting existing aliases to that
+account. Orphaned legacy alias references remain unroutable instead of binding to
+an unrelated same-named backend.
+
+Discovery publishes all six catalogs together: text `/v1/models?detailed=true`,
+TTS `/v1/audio-models?type=tts&detailed=true`, `/v1/embedding-models`,
+`/v1/images/models`, `/v1/video-models` and `/v1/3d-models`. Non-TTS music and
+3D retexture-only entries are excluded. `chat_only`/`serverless_only` affect text
+only; allow/deny filters apply across modalities. Text prices are already USD
+per million tokens; embeddings use `per_million_tokens`. Character, image,
+second and per-run prices are not converted into token prices or invented credits.
+
+```bash
+curl "$B/v1/chat/completions" -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"nano/<text model ID>","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+
+curl "$B/v1/embeddings" -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"nano/<embedding model ID>","input":["first text","second text"]}'
+
+curl "$B/v1/audio/speech" -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"nano/<TTS model ID>","input":"Hello","voice":"<model-supported voice>","response_format":"mp3"}' \
+  -o speech.mp3
+
+curl "$B/v1/images/generations" -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"nano/qwen-image-2.1-turbo","prompt":"a ceramic lamp","n":2,"response_format":"b64_json"}'
+
+curl "$B/v1/generations" -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"nano/<video model ID>","prompt":"sunrise over a lake","params":{"seconds":8},"output":{"mode":"async"}}'
+
+curl "$B/v1/generations" -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"nano/wavespeed-ai/hunyuan-3d-v3.1-rapid","prompt":"a ceramic lamp","output":{"mode":"async"}}'
+```
+
+Media jobs use the usual `/v1/jobs/<id>` and result endpoints. Image models support
+multiple outputs and the advertised reference slots `input_image`, `input_image_2` …;
+single references use `imageDataUrl`, multiple references `imageDataUrls`. Where
+advertised, video/3D accept `images.input_image`; video also accepts
+`files.input_video` and `files.input_audio` (data URLs or downloadable URLs).
+The Playground uploads and
+retains these inputs. Choose model-supported controls only: alias defaults are
+optional; `options_json` carries additional model-specific defaults, and native
+client `params` override them. The model stays pinned. Explicit native
+`guidance_scale`/`num_inference_steps` beat `cfg`/`steps`; video `seconds` is passed
+to NanoGPT, not translated into workflow frames. The image shim retains quality,
+output format and model-specific sizes; explicit `auto` reaches the provider, while
+an omitted size or count leaves alias/provider defaults intact. Fractional/zero
+counts, excess references and discovered count
+limits are refused rather than silently changed. Multipart image references work
+through `/v1/images/edits`; masks use native `params.maskDataUrl` instead.
+
+Video and 3D share NanoGPT's submit/status transport; real task IDs and progress
+are saved on the gateway job. GLB and additional delivered mesh/texture assets
+become downloadable job artifacts, with the existing 3D viewer. CDN downloads
+receive no API key; only the configured host's Sora content proxy is authenticated,
+and its redirect is followed without credentials. Accepted or uncertain paid
+submits are never re-created after poll/download failures. Cancelling a gateway
+job stops waiting; it does **not** promise cancellation at NanoGPT.
+
+Provider contracts: [Images](https://docs.nano-gpt.com/api-reference/endpoint/image-generation-openai),
+[video submit](https://docs.nano-gpt.com/api-reference/endpoint/video-generation),
+[unified status](https://docs.nano-gpt.com/api-reference/endpoint/video-status-unified)
+and [3D model reference](https://nano-gpt.com/models/3d/wavespeed-ai/hunyuan-3d-v3.1-rapid).
+
 
 ### Meshy.ai (cloud mesh generation)
 
