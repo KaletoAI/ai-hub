@@ -2319,7 +2319,8 @@ def public_fields(cand: dict) -> tuple[list, list, list]:
         return cloud_module(k).public_fields(cand)
     wf = cand_workflow(cand) or {}
     mapping = cand.get("mapping") or {}
-    files = [{"name": ((mapping.get(p) or {}).get("label") or "").strip() or p, "required": False}
+    files = [{"name": ((mapping.get(p) or {}).get("label") or "").strip() or p,
+              "required": bool((mapping.get(p) or {}).get("required"))}   # main._missing_required_file
              for p in file_params(wf, mapping)]
     params, images = [], []
     for p, m in mapping.items():

@@ -393,6 +393,28 @@ Dateisystem, das Mesh reist als Datei mit (`required: true` im Schema).
 
 ---
 
+### 3.7 Text → Bewegung auf Mixamo-Rig (`motion-kimodo`)
+
+Lokaler `text2anim`-Alias auf VM 402 (`k12-gpu`), NVIDIA Kimodo (SOMA-RP-v1). Eingang
+ist ein **Mixamo-Skelett als FBX** (`mixamorig:`-Bones, ohne Mesh genügt); es gibt
+keinen Server-Default — ohne `files.input_rig_path` antwortet der AI-Hub `400`.
+
+```json
+{"model": "motion-kimodo", "mode": "async",
+ "prompt": "A person holds both hands together in front of the chest, then spreads the arms wide open.",
+ "params": {"seed": 42, "input_duration": 4.0, "input_num_samples": 3},
+ "files": {"input_rig_path": "data:application/octet-stream;base64,…"}}
+```
+
+Eine Prompt-Zeile = ein Segment (Punkte innerhalb der Zeile trennen nicht);
+mehrere Zeilen werden nacheinander abgespielt. `input_duration` = Sekunden pro
+Segment (0,5–30, Default 4), 30 fps. `input_num_samples` 1–4 Varianten aus einem
+Lauf (mehr → Job `failed` mit Bereichsfehler). `results[]` enthält genau so viele
+FBX (`kind: file`, `application/octet-stream`, mit `sha256`), Reihenfolge =
+Sample-Index; Armature und Bone-Namen sind die des gesendeten Rigs. Ein Rig ohne
+Mixamo-Kernknochen (Hips, Spine, Head, Arme, Oberschenkel) lässt den Job mit Fehler
+enden, statt eine unbewegte Datei zu liefern. Laufzeit ≈ 1 min pro Lauf.
+
 ## 4. Fehlerbilder
 
 | Symptom | Bedeutung / Reaktion |

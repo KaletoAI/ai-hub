@@ -1535,6 +1535,9 @@ ComfyUI's cache), so the first job after one frees.
   over 64 MB → `413`. Naming a backend PATH for such a file field in `params`
   instead is admin-only (`400` for a user key, unless the admin ticked *client may send
   a backend path* on that field in the Aliases media editor — `client_path: true`). A file
+  field ticked *required* in the same row (`required: true`, advertised as
+  `files[].required` in the schema) refuses a request that sends neither the file nor a
+  backend path for it with `400`, before any job exists. A file
   field is one whose name ends in `path` (`input_mesh_path`) or whose workflow field is
   a file field, and only a value that names a file (`/`, `\`, `~` or an extension) is
   judged — `mesh_format: glb` is a setting, not a path. And a list or object is never accepted as a mapped

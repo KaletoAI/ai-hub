@@ -5067,6 +5067,29 @@ def _client_param_refusal(params: dict, wf_maps: list, trusted: bool) -> Optiona
     return None
 
 
+def _missing_required_file(cand: dict, params: dict, upload_files: Optional[dict]) -> Optional[str]:
+    """The refusal for a ComfyUI alias whose `required` file field (mapping entry
+    `required: true`, adapters.file_params) the request left empty — or None. Satisfied
+    by `files.<name>` (keyed by param once decoded) or a non-empty backend path under
+    `params` (param or label; who may send one is _client_param_refusal's call).
+    Without it the workflow ran on its baked-in default — for motion-kimodo an empty
+    rig path, i.e. a job that fails late, or worse, a server-side default rig."""
+    if adapters.cloud_kind(cand):
+        return None
+    wf = adapters.cand_workflow(cand) or {}
+    mapping = cand.get("mapping") or {}
+    for p in adapters.file_params(wf, mapping):
+        m = mapping.get(p) or {}
+        if not m.get("required") or p in (upload_files or {}):
+            continue
+        lbl = (m.get("label") or "").strip()
+        if any(str(params.get(n) or "").strip() for n in {p, lbl} - {""}):
+            continue
+        return (f"`files.{lbl or p}` is required for this alias — send the file "
+                f"(see GET /v1/generations/<alias>/schema)")
+    return None
+
+
 JOB_MAX_TTL_DEFAULT = 7 * 86400
 
 
@@ -5141,7 +5164,8 @@ async def run_generation(body: dict, request: Request,
               or image_models.get(succ_alias) or [])
         if sc:
             wf_maps.append((adapters.cand_workflow(sc[0]) or {}, sc[0].get("mapping") or {}))
-    refusal = _client_param_refusal(params, wf_maps, _params_trusted(request))
+    refusal = (_client_param_refusal(params, wf_maps, _params_trusted(request))
+               or _missing_required_file(c0, params, upload_files))
     if refusal:
         raise HTTPException(400, refusal)
 

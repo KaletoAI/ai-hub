@@ -143,7 +143,15 @@ playground qualifies through its self-call's admin key, not by a /ui rule) or th
 entry carries `client_path: true` (Mapping editor checkbox *client may send a backend
 path* on every file row; unticked = cleared);
 judged over the alias's AND its successor's mapping, since params are threaded by
-label — `test_mapping_values.py`); a mapping `label` is the param's public
+label — `test_mapping_values.py`); a file field
+whose entry carries `required: true` (checkbox *required* on the same row, same
+unticked = cleared rule — the editor rebuilds the mapping from the form, so a flag
+without a checkbox would vanish on the next Save) is refused by
+`_missing_required_file` with 400 when the request sends neither `files.<name>` nor a
+non-empty path under `params`, right after `_client_param_refusal` and before the job
+row; the schema shows it as `files[].required` (`test_required_file_param.py` — without
+it the workflow ran on its baked-in value: a late failure on an empty path, or a result
+built on a file the client never sent); a mapping `label` is the param's public
 API name — incoming values are accepted under label OR param, and the
 auto-random seed keys on that effective name (`''` counts as unset);
 `_apply_lora_cascade` drops client LoRAs into free stack slots (so with a pinned
@@ -2968,6 +2976,17 @@ harmless-looking result. Pins that the injector skips lists and mismatched dicts
 admin key, bootstrap-open or `client_path: true` (a Mapping checkbox), only VALUES that
 name a file judged (`quad`, `5000` pass), the same 400 for a list prompt, and that
 `mesh_format`-style settings are no file fields).
+`test_required_file_param.py` (a file field marked `required` — motion-kimodo's
+`input_rig_path` — let a request without the file run on the workflow's default value.
+Pins the 400 from `_missing_required_file`, that an upload or a backend path in `params`
+satisfies it, `files[].required` in the schema, and the editor checkbox round-trip).
+`test_kimodo_hub.py` (ops/comfyui-kimodo-hub, the ComfyUI side of motion-kimodo:
+upstream Kimodo splits segments on periods, returns "" for a missing rig and exports
+one clamped sample index, and its sampler drops `num_samples` for a one-segment
+prompt — a longer clip than the client computed, a `done` run without a file, a
+duplicate presented as a variant, one result where three were asked. Pins one segment
+per line, one segment handed over as a string with `num_samples`, the rig refusal, and
+one index-suffixed output per sample in sample order).
 `test_audio_content_type.py` (the voice playground stash and stored call audio were
 served from the /ui origin under the BACKEND's content type — SVG or HTML from there
 runs script in the admin session. Pins: only `audio/*` plays, anything else is an

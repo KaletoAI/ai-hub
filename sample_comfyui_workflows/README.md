@@ -167,6 +167,46 @@ Konkreter Client-Ablauf und Installation:
 Rückgabewert des Rig-Nodes (`fbx_output_path` bzw. `rigged_glb_path`), der über den
 Preview-Node in `/history` landet. `mesh-make-it-animatable` hat außerdem kein `input_name`.
 
+#### motion-kimodo — Text → Bewegung auf hochgeladenem Mixamo-Rig (FBX)
+
+`motion-kimodo_api.json` verwendet NVIDIA Kimodo (`Kimodo-SOMA-RP-v1`) und retargetet
+auf das Rig, das der Client mitschickt. Alias `motion-kimodo`, Task `text2anim`,
+Backend `k12-gpu`, Output-Node `6`. Vertrag: Anima Verse
+`development_instructions/vertrag-hub-motion-kimodo.md` (2026-10-12).
+
+| Request-Feld | Node.Feld | Default |
+|---|---|---|
+| `prompt` | `2.prompt` | `A person walks forward.` — **eine Zeile pro Segment** |
+| `seed` | `4.seed` | 42 |
+| `input_duration` | `4.duration` | 4.0 s pro Segment (0,5–30) |
+| `input_num_samples` | `4.num_samples` | 1 (1–4 Varianten in EINEM Lauf) |
+| `files.input_rig_path` | `6.rig_path` | **Pflicht** (`required`): ohne Datei → `400` |
+
+Fest: 100 Diffusion-Steps, `Kimodo_PostProcess` mit `root_margin 0.04`, 30 fps.
+Ergebnis: genau `input_num_samples` FBX (`kimodo_<uid>_<n>.fbx`, Reihenfolge =
+Sample-Index), Armature = das hochgeladene Rig mit seinen Bone-Namen, eine Animation
+mit Segmente × `input_duration` × 30 Frames.
+
+Vier Hub-eigene Nodes aus `ops/comfyui-kimodo-hub` (auf VM 402 als
+`custom_nodes/ComfyUI-KimodoHub`, ComfyUI-Kimodo selbst bleibt unverändert):
+`KimodoHub_PromptLines` (Segmente pro Zeile statt pro Punkt),
+`KimodoHub_Sampler` (Upstream-`Kimodo_Sampler` ignoriert `num_samples` bei EINEM
+Segment — 3 angefragte Varianten ergaben 1 Result; Limit 1–4 prüft ComfyUI schon
+beim Einreihen), `KimodoHub_PostProcess` (Upstream verschluckt jeden Fehler und
+reicht die unkorrigierte Bewegung weiter) und `KimodoHub_ExportFBX` (alle Samples,
+meldet sie über `ui.fbx_file` an `/history`, bricht bei fehlendem/fremdem Rig oder
+Exportfehler ab). Das Upstream-`Kimodo_ExportFBX` meldet nichts an `/history`,
+verschluckt Fehler als Rückgabestring und klemmt `sample_index`.
+Die PostProcess-Korrektur braucht die C++-Erweiterung `motion_correction`: auf VM 402
+für das venv-Python 3.13 gebaut (`cmake -DPython3_EXECUTABLE=<venv-python>`; das
+mitgelieferte `setup.py` greift zum System-Python 3.14) und als
+`_motion_correction.cpython-313-…so` neben das Paket in
+`ComfyUI-Kimodo/kimodo/MotionCorrection/python/motion_correction/` gelegt.
+Lizenz: Kimodo-Code Apache-2.0, SOMA-Checkpoint NVIDIA Open Model License,
+Text-Encoder Llama 3 8B (Meta-Llama-3-Lizenz). Llama 3.1 passt nicht zu den
+LLM2Vec-Adaptern.
+
+
 #### Iris-3B — Text2Img Normal, Turbo und separater Upscaler
 
 Live-Aliase ausschließlich für `k12-gpu` (VM 402 / RTX 3090):
@@ -204,6 +244,7 @@ Quartermaster `kb/02-ai-serving.md`, Abschnitt „Iris-3B“.
 | `mesh-reg-unirig` | — (#7) | `<name>.fbx` |
 | `mesh-reg-mia` | — (#2) | `<name>.fbx` · daneben `<name>.glb` (nicht in `/history` gemeldet → Alias-Option `output_ext: glb`) |
 | `mesh-make-it-animatable` | — (#7) | `<name>.glb` (mixamo-Skin) |
+| `motion-kimodo` | `6` | `kimodo_<uid>_<n>.fbx` pro Variante, Animation auf dem hochgeladenen Rig |
 
 **triposplat liefert keine getrennten Texturen.** `SplatToMesh` gibt den Core-Typ `MESH` aus,
 die gesamte Textur-Werkzeugkette arbeitet auf `TRIMESH`, und es existiert kein Node, der

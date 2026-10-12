@@ -6340,7 +6340,14 @@ def _req_fields_rows(alias: str, wf: dict, mapping: dict, oi: dict) -> str:
                          'key may; everyone else sends the file itself under files.">'
                          f'<input type="checkbox" name="clientpath__{_esc(p)}"'
                          + (" checked" if m.get("client_path") else "")
-                         + '> client may send a backend path</label>')
+                         + '> client may send a backend path</label>'
+                         # main._missing_required_file: a request without this file → 400
+                         ' <label style="white-space:nowrap" title="Refuse a request that '
+                         'sends no file (and no backend path) for this field with 400, '
+                         'instead of running the workflow on its default.">'
+                         f'<input type="checkbox" name="required__{_esc(p)}"'
+                         + (" checked" if m.get("required") else "")
+                         + '> required</label>')
         tag = " <span class='tag'>image</span>" if is_img else ""
         if node and node not in wf:                      # node vanished after a workflow update
             tag += " <span class='badge bad' title='this node no longer exists in the workflow'>stale</span>"
@@ -7234,6 +7241,8 @@ def _apply_update_form(cands: list, f: dict) -> str:
                 # row where it can matter, so an unticked (= absent) box clears it.
                 if f.get(f"clientpath__{p}"):
                     entry["client_path"] = True
+                if f.get(f"required__{p}"):           # same row, same "absent = off" rule
+                    entry["required"] = True
                 mapping[p] = entry
     # Editable workflow defaults (the "=" column): default__<param> writes the
     # value a request-without-this-field runs with into the workflow JSON at the
