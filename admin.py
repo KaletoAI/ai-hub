@@ -7755,10 +7755,17 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
                     "f.querySelectorAll('[name^=\"p__\"]').forEach(function(el){"
                     "if(el.value!=='')q+='&'+encodeURIComponent(el.name)+'='+encodeURIComponent(el.value);});"
                     "location.href='/ui/playground?'+q;}</script>")
+    unavailable = bool(cand and cand.get("unavailable"))
+    generate = ('<button type="submit" disabled>Generate</button>' if unavailable
+                else _btn("Generate", submit=True))
+    notice = ("<p class='hint'>This backend is temporarily unavailable or refreshing its catalog. "
+              "The last successful model list remains visible; generation is disabled "
+              "until discovery succeeds. Reload this page to check availability.</p>" if unavailable else "")
     return ('<form action="/ui/playground/generate" method="post" enctype="multipart/form-data">'
-            f'<div class="formbar"><h2>Media Playground</h2>{_btn("Generate", submit=True)}</div>'
+            f'<div class="formbar"><h2>Media Playground</h2>{generate}</div>'
             + _field("model", alias_select)
             + backend_field
+            + notice
             + rows
             + '<p class="hint">Uses <code>POST /v1/generations</code>; results update here. '
               'Catalog models need no alias. Reference uploads are kept for the next generation.</p></form>'

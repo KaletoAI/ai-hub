@@ -4872,9 +4872,14 @@ class NanoGPTAdapter(BackendAdapter):
         self._text = NanoGPTTextAdapter(backend, ctx)
         self._media = NanoGPTMediaAdapter(backend, ctx)
         self.model_catalogs: dict[str, dict[str, dict]] = {}
+        # Display-only snapshot: never consulted by dispatch or paid validation.
+        self.display_media_catalogs: dict[str, dict[str, dict]] = {}
 
     def _publish_catalogs(self, catalogs: dict) -> None:
         self.model_catalogs = catalogs
+        if catalogs:
+            self.display_media_catalogs = {kind: catalogs[kind]
+                                          for kind in nanogpt.ENDPOINTS if kind in catalogs}
         self._text.model_catalogs = {kind: catalogs[kind]
                                     for kind, _ in self._text._CATALOGS if kind in catalogs}
         self._media.model_catalogs = {kind: catalogs[kind]
@@ -4905,17 +4910,22 @@ class NanoGPTAdapter(BackendAdapter):
                 or old.backend.get("api_key") != self.backend.get("api_key")):
             return
         self._media.adopt_state(old._media)
-        catalogs = copy.deepcopy(old.model_catalogs)
-        for kind, metadata in catalogs.items():
-            kept = set(metadata)
-            if kind == "text":
-                # Legacy text filters need normalized token prices, not flat fees.
-                rows = [dict(row, pricing=self._text._pricing(row.get("pricing"), kind))
-                        for row in metadata.values()]
-                kept = extract_models(rows, self.backend)
-            kept = filter_models(kept, self.backend)
-            catalogs[kind] = {mid: metadata[mid] for mid in kept}
-        self._publish_catalogs(catalogs)
+        for source, display_only in ((old.model_catalogs, False),
+                                     (old.display_media_catalogs, True)):
+            catalogs = copy.deepcopy(source)
+            for kind, metadata in catalogs.items():
+                kept = set(metadata)
+                if kind == "text":
+                    # Legacy text filters need normalized token prices, not flat fees.
+                    rows = [dict(row, pricing=self._text._pricing(row.get("pricing"), kind))
+                            for row in metadata.values()]
+                    kept = extract_models(rows, self.backend)
+                kept = filter_models(kept, self.backend)
+                catalogs[kind] = {mid: metadata[mid] for mid in kept}
+            if display_only:
+                self.display_media_catalogs = catalogs
+            else:
+                self._publish_catalogs(catalogs)
 
     def adopt_discovery(self, old: BackendAdapter) -> None:
         self.adopt_state(old)

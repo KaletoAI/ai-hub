@@ -93,6 +93,34 @@ class DirectNanoModels(_Fixture):
         self.assertEqual(main.resolve_routes("nano/qwen-image"), ([], []))
         self.assertEqual(self.c.get("/v1/models?type=chat").json()["data"], [])
 
+
+    def test_media_picker_survives_pending_and_failed_discovery_without_paid_routes(self):
+        """A refresh must not erase 3D selection or expose stale metadata to paid submit."""
+        import admin
+        from tests.test_nanogpt_console import _Controls
+        with patch.object(admin, "_generation_candidate", main.generation_candidate):
+            model = "nano/mesh-model"
+            first = self.c.get("/ui/playground?sub=media&model=" + model)
+            self.assertEqual(_Controls(first.text).selected["model"], model)
+            saved_catalogs = self.ad.model_catalogs
+            self.ad._publish_catalogs({})
+            for healthy in (True, False):
+                main.backend_healthy["nanogpt:nano"] = healthy
+                page = self.c.get("/ui/playground?sub=media&model=" + model)
+                controls = _Controls(page.text)
+                self.assertEqual(controls.selected.get("model"), model)
+                self.assertIn("nano/qwen-image", controls.options)
+                self.assertIn("temporarily unavailable", page.text)
+                self.assertIn('type="submit" disabled', page.text)
+                self.assertEqual(main.get_gen_routes(model), [])
+                self.assertEqual(main.generation_models_info(), [])
+            self.ad._publish_catalogs(saved_catalogs)
+            main.backend_healthy["nanogpt:nano"] = True
+            page = self.c.get("/ui/playground?sub=media&model=" + model)
+            self.assertEqual(_Controls(page.text).selected["model"], model)
+            self.assertNotIn('type="submit" disabled', page.text)
+            self.assertEqual(main.get_gen_routes(model)[0][1]["model"], "mesh-model")
+
     def test_media_only_user_cannot_call_same_named_chat_alias(self):
         """Catalog media IDs cannot open a same-named chat alias through @image."""
         main.virtual_models = {"qwen-image": "chat-model"}

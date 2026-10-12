@@ -334,6 +334,13 @@ second backend type; candidate kind is `nanogpt`. Its image/video/3D catalogs
 exclude explicit retexture-only entries and apply model filters.
 Images deliver the documented synchronous OpenAI-compatible data array, or poll
 a real Midjourney ID. Video and 3D share `/generate-video` and unified
+The adapter retains `display_media_catalogs`, the last successful media snapshot,
+for the console only. `generation_models_info(console=True)` keeps catalog-only
+models and their forms visible during refresh or failure, marks them unavailable,
+and disables Generate; ordinary API inventory and dispatch still require live
+metadata and healthy discovery. This prevents a 30-second refresh or a text-catalog
+timeout from silently erasing a selected 3D model. The display snapshot follows
+the same account-identity and filter rules on adapter replacement.
 `/video/status?requestId=…`. Accepted IDs are persisted before polling; uncertain
 submits carry `create_unconfirmed`. Only pre-submit connect/pool errors permit
 failover; an HTTP submit error, lost answer, malformed completion or asset failure
@@ -2791,6 +2798,8 @@ the Tripo backend brought:
 a missing `opt__<key>`, a type parsed wrong — does not error, it silently saves that
 key's DEFAULT, so an alias's textures quietly turn off on the next Save);
 `test_tripo.py` (the pure builder/parser: a body Tripo REJECTS costs a round trip, but
+  The media-picker regression covers selected 3D model retention through pending
+  and failed discovery, blocked stale routes and successful recovery.
 one it accepts with the wrong face cap, texture bucket or rig type delivers a
 plausible WRONG mesh — and a task status treated as "not finished yet" instead of
 terminal polls to `max_wait` holding the slot);
