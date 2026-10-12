@@ -3195,18 +3195,25 @@ def _nano_direct_candidates(model: str, pool=None) -> list[dict]:
     return out
 
 
-def generation_models_info() -> list[dict]:
-    """Current directly callable media inventory for the console, without secrets."""
+def generation_models_info(*, console: bool = False) -> list[dict]:
+    """Callable inventory; the console also shows the last successful snapshot."""
     out = []
     for b in _gen_backends:
-        if b.get("type") != "nanogpt" or is_draining(b) or not backend_healthy.get(backend_id(b)):
+        if b.get("type") != "nanogpt" or is_draining(b):
             continue
-        catalogs = getattr(backend_adapters.get(backend_id(b)), "model_catalogs", {})
+        ad = backend_adapters.get(backend_id(b))
+        current = getattr(ad, "model_catalogs", {})
+        available = bool(current) and bool(backend_healthy.get(backend_id(b)))
+        if not console and not available:
+            continue
+        catalogs = current if available else getattr(ad, "display_media_catalogs", {})
         for endpoint in ("images", "video", "3d"):
             for model, meta in sorted(catalogs.get(endpoint, {}).items()):
+                candidate = nanogpt.candidate_for(b["name"], model, endpoint, meta)
+                if not available:
+                    candidate["unavailable"] = True
                 out.append({"id": f"{b['name']}/{model}", "name": meta.get("name") or model,
-                            "backend": b["name"], "endpoint": endpoint,
-                            "candidate": nanogpt.candidate_for(b["name"], model, endpoint, meta)})
+                            "backend": b["name"], "endpoint": endpoint, "candidate": candidate})
     return out
 
 
@@ -9230,7 +9237,7 @@ def llm_backends_info() -> list[dict]:
 admin.bind(runpod_probe=runpod_probe, runpod_object_info=runpod_object_info,
            comfy_backends=lambda: [b for b in backends if b.get("type") == "comfyui"],
            gen_backends=lambda: [b for b in backends if _is_gen(b)],
-           generation_models=generation_models_info,
+           generation_models=lambda: generation_models_info(console=True),
            generation_candidate=generation_candidate,
            gateway_info=gateway_info,
            gen_speed_info=gen_speed_info,

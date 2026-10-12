@@ -313,6 +313,8 @@ class NanoUnifiedDiscovery(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(httpx.HTTPStatusError):
                     await adapter.discover(client)
             self.assertEqual(adapter.model_catalogs, {})
+            self.assertEqual({kind: set(rows) for kind, rows in adapter.display_media_catalogs.items()},
+                             {"images": {"image-model"}, "video": {"video-model"}, "3d": {"mesh-model"}})
 
     async def test_snapshot_is_not_published_while_one_catalog_is_pending(self):
         adapter = self.adapter()
@@ -354,6 +356,23 @@ class NanoUnifiedDiscovery(unittest.IsolatedAsyncioTestCase):
             changed_host = self.adapter(api_key="key", url="https://other.test/api")
             getattr(changed_host, hook)(old)
             self.assertEqual(changed_host.model_catalogs, {})
+
+    async def test_failed_discovery_display_survives_reload_without_crossing_accounts(self):
+        """A reload must keep the offline picker, not resurrect routes or another account's models."""
+        old = self.adapter(api_key="key")
+        async with self.client() as client:
+            await old.discover(client)
+        old._publish_catalogs({})
+        replacement = self.adapter(api_key="key", models_deny="image-*")
+        replacement.adopt_state(old)
+        self.assertEqual(replacement.model_catalogs, {})
+        self.assertEqual({kind: set(rows) for kind, rows in replacement.display_media_catalogs.items()},
+                         {"images": set(), "video": {"video-model"}, "3d": {"mesh-model"}})
+        for settings in ({"api_key": "different"},
+                         {"api_key": "key", "url": "https://other.test/api"}):
+            changed = self.adapter(**settings)
+            changed.adopt_state(old)
+            self.assertEqual(changed.display_media_catalogs, {})
 
     async def test_all_six_catalogs_decode_in_workers(self):
         threads = []

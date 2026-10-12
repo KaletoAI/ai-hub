@@ -897,6 +897,10 @@ an explicitly text-to-image-only model has no reference uploads. Unadvertised
 native controls can still be supplied through API `params`.
 Structured native controls, such as MiniMax LoRA arrays, remain JSON through API
 `params` or optional alias `options_json`; they are not turned into text-only form fields.
+During a catalog refresh or discovery failure, the last successful media list
+stays visible with the selected model and its fields. **Generate is disabled**
+and the form explains the temporary unavailability; reload after discovery
+recovers. This display-only snapshot never permits submission using stale metadata.
 
 Discovered IDs are directly callable as `nano/<exact model ID>` (bare IDs also
 route; `model_prefix: false` lists them bare). Optional media aliases retain
