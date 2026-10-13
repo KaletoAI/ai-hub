@@ -24,6 +24,7 @@ import copy
 import fnmatch
 import gzip
 import hashlib
+import ipaddress
 import json
 import logging
 import math
@@ -63,6 +64,16 @@ logger = logging.getLogger(__name__)
 _CHAT_TIMEOUT = httpx.Timeout(300.0, connect=10.0, pool=30.0)
 _DISCOVERY_TIMEOUT = 5.0
 _COMFY_DISCOVERY_TIMEOUT = 8.0
+# NanoGPT's direct API host (the one its docs recommend for API keys) answered the six
+# catalog GETs in 1–18 s first byte measured 2026-10-13 from prod, and 25–30+ s an hour
+# later; the website host was 0.1 s. 5 s put the backend DOWN in ~17 % of all time.
+_NANOGPT_DISCOVERY_TIMEOUT = 60.0
+# Background discovery cadence by what a poll can learn (seconds). LAN backends keep the
+# global `health_check_interval`: their loaded model and ComfyUI's watchdog change by
+# the second. A cloud catalog changes when the vendor ships a model; a balance when a
+# job runs or the account is topped up — a failed submit reports either itself.
+CLOUD_CATALOG_INTERVAL_S = 600.0
+CLOUD_BALANCE_INTERVAL_S = 300.0
 _UPLOAD_TIMEOUT = 20.0             # floor; the real budget scales with the file (_upload_timeout_for)
 _COMFY_STUCK_AFTER_S = 90.0        # default: pending-with-idle-executor this long → stuck
 _COMFY_RESTART_WAIT_S = 120.0      # restart(): max wait for the server to come back
@@ -262,6 +273,19 @@ def parse_model_filter(value) -> list[str]:
     that matches nothing (or, worse, everything)."""
     items = value if isinstance(value, (list, tuple, set)) else str(value or "").split(",")
     return [s for s in (str(x).strip() for x in items) if s]
+
+
+def is_lan_url(url) -> bool:
+    """A backend URL that points into our own network: a non-global IP (RFC 1918,
+    loopback — a managed host's tunnel —, link-local, Tailscale's CGNAT range) or a
+    bare / .local / .lan / .internal / .home.arpa name. Everything else is a vendor."""
+    host = (urlsplit(str(url or "")).hostname or "").lower()
+    if not host:
+        return False
+    try:
+        return not ipaddress.ip_address(host).is_global
+    except ValueError:
+        return "." not in host or host.endswith((".local", ".lan", ".internal", ".home.arpa"))
 
 
 def filter_models(models: set[str], backend: dict) -> set[str]:
@@ -614,6 +638,15 @@ class BackendAdapter(ABC):
         # stable id = type:name — keys in-flight + pricing so an LLM and a ComfyUI
         # backend can share a name without colliding.
         self.bid = f'{backend.get("type", "openai")}:{backend["name"]}'
+
+    def remote(self) -> bool:
+        """A vendor API rather than a box we run: the 3 s fast probe leaves it alone."""
+        return bool(getattr(self, "cloud", False)) or not is_lan_url(self.backend.get("url"))
+
+    def discovery_interval_default(self) -> Optional[float]:
+        """This type's background discovery cadence; None = `health_check_interval`.
+        A backend's own `discovery_interval_s` beats it (main.discovery_interval)."""
+        return None
 
     @abstractmethod
     async def discover(self, client: httpx.AsyncClient) -> Capabilities:
@@ -1058,6 +1091,11 @@ class OpenAIAdapter(BackendAdapter):
 
     type = "openai"
 
+    def discovery_interval_default(self) -> Optional[float]:
+        # Together/OpenRouter/Anthropic list a catalog; a LAN llama-swap's loaded model
+        # (`/running`) changes by the second.
+        return None if is_lan_url(self.backend.get("url")) else CLOUD_CATALOG_INTERVAL_S
+
     async def discover(self, client: httpx.AsyncClient) -> Capabilities:
         b = self.backend
         resp = await client.get(
@@ -1433,7 +1471,8 @@ class NanoGPTTextAdapter(OpenAIAdapter):
     """NanoGPT's three callable catalogs, with dispatch inherited unchanged.
 
     Discovery is atomic: any failed catalog marks the backend DOWN, never fresh
-    with stale speech/embedding routes. No catalog state survives a refresh.
+    with stale speech/embedding routes. A failed refresh clears the catalogs; a pending
+    one leaves the last complete snapshot in place (see NanoGPTAdapter.discover).
     """
 
     type = "nanogpt"
@@ -1450,12 +1489,21 @@ class NanoGPTTextAdapter(OpenAIAdapter):
         self.model_catalogs: dict[str, dict[str, dict]] = {}
 
     async def discover(self, client: httpx.AsyncClient) -> Capabilities:
+        try:
+            caps, catalogs = await self._fetch_snapshot(client)
+        except BaseException:
+            self.model_catalogs = {}
+            raise
+        self.model_catalogs = catalogs
+        return caps
+
+    async def _fetch_snapshot(self, client: httpx.AsyncClient) -> tuple[Capabilities, dict]:
+        """The three catalogs → (caps, catalogs), publishing nothing."""
         b = self.backend
-        self.model_catalogs = {}
         headers = self.ctx.auth_headers(b)
         responses = await asyncio.gather(*(
             client.get(f"{b['url'].rstrip('/')}{path}", headers=headers,
-                       timeout=_DISCOVERY_TIMEOUT)
+                       timeout=_NANOGPT_DISCOVERY_TIMEOUT)
             for _, path in self._CATALOGS
         ), return_exceptions=True)
         # Settle all three GETs before propagating an error; no orphan poll remains.
@@ -1463,9 +1511,7 @@ class NanoGPTTextAdapter(OpenAIAdapter):
             if isinstance(response, BaseException):
                 raise response
             response.raise_for_status()
-        caps, catalogs = await asyncio.to_thread(self._parse_snapshot, responses, b)
-        self.model_catalogs = catalogs
-        return caps
+        return await asyncio.to_thread(self._parse_snapshot, responses, b)
 
     @staticmethod
     def _pricing(price, kind: str) -> Optional[dict[str, float]]:
@@ -4021,6 +4067,9 @@ class ArliAIImageAdapter(BackendAdapter):
     bills = False                       # subscription, not per-generation credits
     vendor = arliai.VENDOR
 
+    def discovery_interval_default(self) -> Optional[float]:
+        return CLOUD_CATALOG_INTERVAL_S
+
     def __init__(self, backend: dict, ctx: AdapterContext):
         super().__init__(backend, ctx)
         self.checkpoint_metadata: dict = {}
@@ -4162,6 +4211,9 @@ class CloudTaskAdapter(BackendAdapter):
     serves_generation = True
     mod = meshy                      # the pure module; every subclass overrides it
     type = mod.KIND
+
+    def discovery_interval_default(self) -> Optional[float]:
+        return CLOUD_BALANCE_INTERVAL_S          # discovery = the credit balance call
 
     def __init__(self, backend: dict, ctx: AdapterContext):
         super().__init__(backend, ctx)
@@ -4481,19 +4533,27 @@ class NanoGPTMediaAdapter(CloudTaskAdapter):
             self.model_catalogs = copy.deepcopy(old.model_catalogs)
 
     async def discover(self, client: httpx.AsyncClient) -> Capabilities:
-        self.model_catalogs = {}
+        try:
+            caps, catalogs = await self._fetch_snapshot(client)
+        except BaseException:
+            self.model_catalogs = {}
+            raise
+        self.model_catalogs = catalogs
+        return caps
+
+    async def _fetch_snapshot(self, client: httpx.AsyncClient) -> tuple[Capabilities, dict]:
+        """The media catalogs → (caps, catalogs), publishing nothing."""
         responses = await asyncio.gather(*(
             client.get(self._api(path), headers=self._headers(),
-                       timeout=_CLOUD_DISCOVERY_TIMEOUT)
+                       timeout=_NANOGPT_DISCOVERY_TIMEOUT)
             for path in self.mod.CATALOG_PATHS.values()), return_exceptions=True)
         for response in responses:
             if isinstance(response, BaseException):
                 raise response
             response.raise_for_status()
         catalogs = await asyncio.to_thread(self._parse_catalogs, responses)
-        self.model_catalogs = catalogs
         return Capabilities(models=set().union(*(set(c) for c in catalogs.values())),
-                            pricing={}, context={})
+                            pricing={}, context={}), catalogs
 
     def _parse_catalogs(self, responses) -> dict:
         catalogs = {}
@@ -4684,6 +4744,9 @@ class NanoGPTAdapter(BackendAdapter):
     cloud = True
     bills = True
 
+    def discovery_interval_default(self) -> Optional[float]:
+        return CLOUD_CATALOG_INTERVAL_S
+
     def __init__(self, backend: dict, ctx: AdapterContext):
         super().__init__(backend, ctx)
         self._text = NanoGPTTextAdapter(backend, ctx)
@@ -4703,17 +4766,22 @@ class NanoGPTAdapter(BackendAdapter):
                                      for kind in nanogpt.ENDPOINTS if kind in catalogs}
 
     async def discover(self, client: httpx.AsyncClient) -> Capabilities:
-        # No partial or stale metadata may validate a paid request during refresh.
-        self._publish_catalogs({})
+        # While the six GETs are pending, the LAST COMPLETE snapshot stays published: a
+        # refresh takes up to a minute on NanoGPT's direct host, and clearing at its start
+        # took chat and media out of routing for ~a third of all time (2026-10-13, 30 s
+        # polls of ~11 s). Nothing partial is ever published — the components fetch
+        # without publishing and one snapshot replaces the other here — and a FAILED
+        # refresh still clears everything, so no metadata the vendor did not just
+        # confirm validates a paid submit after an error.
         try:
-            results = await asyncio.gather(self._text.discover(client),
-                                          self._media.discover(client),
+            results = await asyncio.gather(self._text._fetch_snapshot(client),
+                                          self._media._fetch_snapshot(client),
                                           return_exceptions=True)
             for result in results:
                 if isinstance(result, BaseException):
                     raise result
-            text, media = results
-            catalogs = {**self._text.model_catalogs, **self._media.model_catalogs}
+            (text, text_catalogs), (media, media_catalogs) = results
+            catalogs = {**text_catalogs, **media_catalogs}
         except BaseException:
             self._publish_catalogs({})
             raise

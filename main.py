@@ -719,8 +719,16 @@ def _classify_error(e: Exception) -> dict:
     "down" alone sends you hunting a network fault that may not exist: a rejected
     credential and an unplugged host look identical in the Backends tab, yet one is
     fixed in the api-key field and the other on the host. `kind` carries that
-    distinction; `detail` keeps the raw message for the tooltip."""
+    distinction; `detail` keeps the raw message for the tooltip — plus, for a transport
+    error, WHICH request failed: NanoGPT polls six catalogs and its fault rows read only
+    "ReadTimeout" (2026-10-13), which left the slow one to be measured by hand."""
     detail = str(e) or e.__class__.__name__
+    if isinstance(e, httpx.RequestError):
+        try:
+            req = e.request                # raises when httpx never attached one
+            detail += f" ({req.method} {req.url.path})"   # path only: no query secrets
+        except RuntimeError:
+            pass
     status = None
     resp = getattr(e, "response", None)
     if resp is not None:
@@ -919,7 +927,7 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
             hint = " (credential rejected — check the api key)" if info["kind"] == "auth" else ""
             # `_err_text`: an httpx timeout stringifies to "" — the journal read "DOWN —"
             # with nothing after it (measured 2026-09-12/13 on prod, a dozen times).
-            logger.warning(f"[{label}] DOWN — {_err_text(e)}{hint}")
+            logger.warning(f"[{label}] DOWN — {info['detail']}{hint}")
         if fault_since is None and info["kind"] not in faults.NOT_FAULT_KINDS:
             fault_since = int(time.time())
             _note_fault(backend, "health", info["kind"], info["detail"], status=info["status"])
@@ -936,14 +944,78 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
         _probing.discard(bid)
 
 
+# ── Discovery cadence ─────────────────────────────────────────────────────────
+# Every backend is polled on its OWN clock. One shared cycle (poll all, then sleep)
+# made the slowest backend set everybody's pace: NanoGPT's catalogs take up to 60 s
+# (adapters._NANOGPT_DISCOVERY_TIMEOUT), which would have stretched every LAN poll —
+# and ComfyUI's watchdog — to a minute. And a cloud catalog does not need the 30 s a
+# LAN llama-swap's loaded model does (adapters.discovery_interval_default).
+_polled: dict = {}                     # bid → (monotonic end of its last poll, the adapter polled)
+_poll_tasks: dict = {}                 # bid → its in-flight background poll (the strong ref)
+_HEALTH_TICK_S = 1.0                   # how often the scheduler looks for a due backend
+_BOOT_DISCOVERY_WAIT_S = 10.0          # boot waits this long for the first round, then serves
+
+
+def discovery_interval(b: dict) -> float:
+    """Seconds between two background polls of a HEALTHY backend: its own
+    `discovery_interval_s`, else its type's default, else `health_check_interval`."""
+    own = b.get("discovery_interval_s")
+    if isinstance(own, (int, float)) and not isinstance(own, bool) and own > 0:
+        return float(own)
+    ad = backend_adapters.get(backend_id(b))
+    default = ad.discovery_interval_default() if ad is not None else None
+    return float(default) if default else float(max(1, health_check_interval))
+
+
+def _poll_is_due(b: dict, now: float) -> bool:
+    """Never polled, its settings changed since (build_backend_adapters made a new
+    adapter — a new url/key/filter must not wait ten minutes), or its interval is up.
+    A DOWN backend is retried at least every `health_check_interval`: a cloud vendor's
+    outage must not keep it out of routing for a whole catalog interval."""
+    bid = backend_id(b)
+    last = _polled.get(bid)
+    if last is None or last[1] is not backend_adapters.get(bid):
+        return True
+    every = discovery_interval(b)
+    if not backend_healthy.get(bid, False):
+        every = min(every, float(max(1, health_check_interval)))
+    return now - last[0] >= every
+
+
+async def _poll(b: dict) -> None:
+    """One discovery poll that the cadence counts (scheduler, boot, fast probe)."""
+    bid = backend_id(b)
+    adapter = backend_adapters.get(bid)
+    try:
+        await refresh_backend(b, http_client)       # absorbs the backend's own errors
+    except Exception as e:
+        logger.warning(f"[{b.get('name')}] discovery poll crashed: {_err_text(e)}")
+    finally:
+        _polled[bid] = (time.monotonic(), adapter)
+
+
+def _start_due_polls() -> None:
+    """Start a background poll for every enabled backend that is due and idle."""
+    now = time.monotonic()
+    for b in enabled_backends():
+        bid = backend_id(b)
+        if bid in _poll_tasks or bid in _probing or not _poll_is_due(b, now):
+            continue
+        task = asyncio.create_task(_poll(b))
+        _poll_tasks[bid] = task
+        task.add_done_callback(lambda _t, bid=bid: _poll_tasks.pop(bid, None))
+
+
 async def health_loop() -> None:
-    """Poll every enabled backend, then sleep. Backends are polled CONCURRENTLY: a
-    sequential loop adds each unreachable backend's connect timeout to the cycle, so
-    the wait for a returning backend grew with the number of broken ones."""
-    while True:
-        await asyncio.gather(*[refresh_backend(b, http_client) for b in enabled_backends()],
-                             return_exceptions=True)     # refresh_backend absorbs its own errors
-        await asyncio.sleep(health_check_interval)
+    """The discovery scheduler: each tick, start the polls that are due. Polls run as
+    their own tasks, CONCURRENTLY — a slow or unreachable backend delays nobody else."""
+    try:
+        while True:
+            _start_due_polls()
+            await asyncio.sleep(_HEALTH_TICK_S)
+    finally:
+        for task in list(_poll_tasks.values()):
+            task.cancel()
 
 
 async def fast_probe_loop() -> None:
@@ -956,16 +1028,28 @@ async def fast_probe_loop() -> None:
     full cycle, and that wait is the whole delay a queued job sees.
 
     Only unhealthy backends are probed — a healthy-but-busy one needs no poll, its
-    freed slot is announced by `_inflight_dec` → `_notify_slot_free`."""
+    freed slot is announced by `_inflight_dec` → `_notify_slot_free`. And only our own
+    boxes (`adapter.remote()` False): "restarted outside the gateway" is a LAN event,
+    while a DOWN vendor API was asked six catalogs every 3 s (NanoGPT, 2026-10-13); the
+    scheduler retries it every `health_check_interval`."""
     while True:
         await asyncio.sleep(max(1.0, fast_probe_interval_s or 1.0))
         if not fast_probe_interval_s or not _capacity_wanted():
             continue
-        targets = [b for b in enabled_backends()
-                   if not backend_healthy.get(backend_id(b), False)]
+        targets = _fast_probe_targets()
         if targets:
-            await asyncio.gather(*[refresh_backend(b, http_client) for b in targets],
-                                 return_exceptions=True)
+            await asyncio.gather(*[_poll(b) for b in targets], return_exceptions=True)
+
+
+def _fast_probe_targets() -> list[dict]:
+    """The DOWN backends on our own boxes (see fast_probe_loop)."""
+    out = []
+    for b in enabled_backends():
+        bid = backend_id(b)
+        ad = backend_adapters.get(bid)
+        if not backend_healthy.get(bid, False) and not (ad is not None and ad.remote()):
+            out.append(b)
+    return out
 
 
 def reload_config() -> None:
@@ -1117,7 +1201,12 @@ async def lifespan(app: FastAPI):
     faults_prune_task = asyncio.create_task(faults.prune_loop(faults_cfg.get("retention_days", 7)))
 
     log_config_summary()
-    await asyncio.gather(*[refresh_backend(b, http_client) for b in enabled_backends()])
+    # The first round is the scheduler's; boot waits for it only so long — a slow vendor
+    # catalog (NanoGPT: up to 60 s) finishes in the background instead of holding the
+    # port closed for every other backend.
+    _start_due_polls()
+    if _poll_tasks:
+        await asyncio.wait(list(_poll_tasks.values()), timeout=_BOOT_DISCOVERY_WAIT_S)
     # Managed-host controllers exist since rebuild_backends(); now each reconciles its
     # persisted state with the provider's instance list (an instance that billed through
     # the restart gets its tunnel back) and starts its background loop.
@@ -5661,7 +5750,7 @@ def _activate_generation_jobs() -> None:
 
 def apply_backend_change() -> None:
     """Re-merge config + store backends, rebind adapters, and kick an immediate
-    discovery — called by the UI after a backend is added/edited/deleted/enabled.
+    discovery of the changed backends — called by the UI after a backend is added/edited/deleted/enabled.
     Wakes the park queue so calls waiting on 'all busy' re-evaluate against the new
     backend set now (a taken-offline backend drops out; a brought-online one is
     grabbed once discovery marks it healthy — see refresh_backend)."""
@@ -5670,11 +5759,12 @@ def apply_backend_change() -> None:
     _activate_generation_jobs()
     _notify_slot_free()
 
-    async def _discover():
-        await asyncio.gather(*[refresh_backend(b, http_client) for b in enabled_backends()])
+    # Only the backends this change touched are polled now: an unchanged backend kept
+    # its adapter instance (build_backend_adapters), so _poll_is_due leaves it on its
+    # own clock — a save no longer asks every vendor for its whole catalog.
     try:
         asyncio.get_running_loop()           # outside a loop (import-time callers) → skip
-        _bg(_discover())
+        _start_due_polls()
     except RuntimeError:
         pass
 

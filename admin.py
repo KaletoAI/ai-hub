@@ -2014,6 +2014,13 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
                      hint="Backends with the same group share one in-flight budget, including "
                           "chat streams and media jobs. Set <code>max_concurrent=1</code> on both "
                           "ArliAI Core backends. Blank = independent backend limits.")
+            + _field("discovery interval s", _inp("discovery_interval_s", g("discovery_interval_s"),
+                                                  placeholder="blank = type default", typ="number"),
+                     hint="Seconds between two background discovery polls while the backend is "
+                          "healthy. Blank: LAN backends follow the server's health check interval, "
+                          f"cloud catalogs {int(adapters.CLOUD_CATALOG_INTERVAL_S)} s, Meshy/Tripo "
+                          f"credit balance {int(adapters.CLOUD_BALANCE_INTERVAL_S)} s. A DOWN backend "
+                          "is retried at least every health check interval.")
             # Never rendered back (it is a cloud secret): blank keeps the stored key —
             # or a config backend's, see backend_save — and "clear" removes it.
             + _field("api key", _inp("api_key", "", typ="password",
@@ -3031,6 +3038,14 @@ async def backend_save(request: Request):
         b["concurrency_group"] = group
     else:
         b.pop("concurrency_group", None)
+    di, di_err = _int_field(f.get("discovery_interval_s"), "discovery interval s",
+                            "type default", minimum=1)
+    if di_err:
+        problems.append(di_err)
+    if di is not None:
+        b["discovery_interval_s"] = di
+    else:
+        b.pop("discovery_interval_s", None)
     host = mhost or host_txt
     if host:
         b["host"] = host
@@ -3287,6 +3302,7 @@ async def _refuse_backend(msg: str, b: dict, f: dict, orig: str) -> HTMLResponse
     cloud = b.get("type") in adapters.CLOUD_TYPES
     rp = b.get("type") == "runpod"
     for key, src in (("max_concurrent", "max_concurrent"), ("restart_cooldown_s", "restart_cooldown_s"),
+                     ("discovery_interval_s", "discovery_interval_s"),
                      ("stuck_after_s", "stuck_after_s"), ("self_retries", "self_retries"),
                      ("remote_port", "remote_port"),
                      ("max_wait", "cloud_max_wait" if cloud else ("rp_max_wait" if rp else "max_wait")),
