@@ -2442,7 +2442,29 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   tab, 0 = off) while `_capacity_wanted()` — `_parked` non-empty, or a gen park loop
   pinged `_gen_wait_ping()` within 5 s. A TIMESTAMP, not a counter: a cancelled job
   task cannot leave a phantom waiter. `_probing` guards against two concurrent polls
-  of one backend. `_run_job` re-points the job row (`jobs.set_backend`) at the
+  of one backend. The fast probe skips `adapter.remote()` backends (vendor APIs and
+  RunPod: `cloud` or a non-LAN url, `adapters.is_lan_url`) — "restarted outside the
+  gateway" is a LAN event, and a DOWN NanoGPT was asked six catalogs every 3 s.
+- **Discovery cadence** (2026-10-13): `health_loop` is a 1 s scheduler, not a shared
+  cycle. `_start_due_polls` starts one task per due, idle backend (`_poll_tasks` holds
+  the reference; `_poll` records `_polled[bid] = (end, adapter)`), so a slow backend
+  delays nobody — with one cycle, NanoGPT's 60 s catalog timeout would have stretched
+  every LAN poll and ComfyUI's stuck watchdog (≥ 2 checks in 90 s) to a minute.
+  `_poll_is_due`: never polled, or the adapter instance changed since (a saved
+  url/key/filter — `build_backend_adapters` keeps an unchanged backend's instance, so
+  `apply_backend_change` now polls only what a save touched), or
+  `discovery_interval(b)` is up: the backend's own `discovery_interval_s`, else
+  `adapter.discovery_interval_default()` — None (= `health_check_interval`) for LAN
+  backends and ComfyUI/RunPod, `CLOUD_CATALOG_INTERVAL_S` 600 for non-LAN OpenAI/
+  Anthropic, NanoGPT and ArliAI, `CLOUD_BALANCE_INTERVAL_S` 300 for Meshy/Tripo. A
+  DOWN backend is due after `min(interval, health_check_interval)`, so a vendor
+  outage does not keep it out of routing for a catalog interval. Boot starts the
+  first round through the same scheduler and waits at most `_BOOT_DISCOVERY_WAIT_S`
+  (10 s) for it. Measured cause: NanoGPT's direct API host answered its catalogs in
+  1–18 s against a 5 s timeout — DOWN 17 % of 36 h, 259 outages — and 25–30+ s an
+  hour later; hence also `_NANOGPT_DISCOVERY_TIMEOUT = 60`. `_classify_error` appends a transport
+  error's `METHOD /path` (never the query) to the fault detail; those rows used to read
+  only "ReadTimeout". `test_discovery_cadence.py` pins all of it. `_run_job` re-points the job row (`jobs.set_backend`) at the
   backend that actually claims it — a parked job routinely lands elsewhere, and a row
   naming the wrong backend sends you reading the wrong ComfyUI's log.
 - **Parking** vs 503: "all busy" is distinguished from "no backend" — only the
@@ -2793,6 +2815,11 @@ Every test file also says this in its own docstring; this is the overview.
   unchanged-cache route recovery, YAML job activation with startup-only paths,
   alias precedence and account-safe/idempotent store/config name migration,
   including later collisions and orphaned legacy references.
+- `test_discovery_cadence.py`: LAN/cloud URL classification, type default cadences,
+  own interval beats the default, fast probe skips remote backends, due rules
+  (changed adapter polls at once, DOWN retried on `health_check_interval`), a slow
+  poll delays nobody and never runs twice, the request path in a transport fault's
+  detail without its query, and the long timeout on all six NanoGPT catalogs.
 
 
 `ls tests/test_*.py` is the count of record (seventy-eight files on 2026-10-03). There

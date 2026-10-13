@@ -122,6 +122,20 @@ class Backends(_Fixture):
         self.assertEqual(self.post("/ui/backends/save", {**self.BASE, "max_concurrent": ""}).status_code, 303)
         self.assertNotIn("max_concurrent", store.get_backend("b1", "openai"))   # blank = unlimited
 
+    def test_discovery_interval_whole_seconds_blank_is_type_default(self):
+        """A per-backend poll cadence (test_discovery_cadence.py): 0 would poll every
+        scheduler tick, so it is refused rather than read as "unset"."""
+        for bad in ("0", "1.5", "-30", "x"):
+            r = self.post("/ui/backends/save", {**self.BASE, "discovery_interval_s": bad})
+            self.refused(r, "discovery interval s", f"'{bad}'")
+            self.assertIsNone(store.get_backend("b1", "openai"), bad)
+        r = self.post("/ui/backends/save", {**self.BASE, "discovery_interval_s": "120"})
+        self.assertEqual(r.status_code, 303)
+        self.assertEqual(store.get_backend("b1", "openai")["discovery_interval_s"], 120)
+        r = self.post("/ui/backends/save", {**self.BASE, "orig": "openai:b1", "discovery_interval_s": ""})
+        self.assertEqual(r.status_code, 303)
+        self.assertNotIn("discovery_interval_s", store.get_backend("b1", "openai"))
+
     def test_comfy_numbers_are_checked_for_comfy_only(self):
         comfy = {"name": "g", "type": "comfyui", "url": "http://10.0.0.3:8188"}
         self.refused(self.post("/ui/backends/save", {**comfy, "max_wait": "1.5"}), "max wait")

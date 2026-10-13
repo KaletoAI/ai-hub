@@ -117,7 +117,7 @@ console — both work.
 
 ```yaml
 api_key: "sk-change-me"                # master/admin key (see Authentication)
-health_check_interval: 30              # seconds between backend liveness polls
+health_check_interval: 30              # seconds between discovery polls of LAN backends
 log_per_call: true                     # one log line per forwarded request
 model_prefix: true                     # list models as <backend>/<model>
 # max_concurrent: 1                    # global default in-flight cap per backend
@@ -480,7 +480,18 @@ or a `503` (with `Retry-After`) if the wait runs out.
   used the moment it is available. To keep *noticing* it
   fast, unhealthy backends are re-polled every `fast_probe_interval_s` (**3 s**,
   Server → Runtime; `0` = off) for as long as something is waiting, instead of only once
-  per `health_check_interval`. Nothing waiting → no extra polling.
+  per `health_check_interval`. Nothing waiting → no extra polling. Cloud backends
+  (vendor APIs, RunPod) are left out of the fast probe; a DOWN one is retried every
+  `health_check_interval`.
+
+**Discovery cadence.** Every backend is polled on its own clock, so a slow vendor
+never delays a LAN poll. A healthy backend is polled every `discovery_interval_s`
+(per backend, Backends tab; blank = type default): LAN backends and ComfyUI/RunPod
+follow `health_check_interval` (30 s), cloud catalogs (OpenAI-compatible vendors,
+Anthropic, NanoGPT, ArliAI) 600 s, Meshy/Tripo credit balance 300 s. A saved change
+to a backend polls that backend at once; a DOWN backend is retried at least every
+`health_check_interval`. A fault row names the request that failed
+(`ReadTimeout (GET /api/v1/models)`).
 
 Applies to `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`,
 `/v1/responses`, and the generation path (a busy ComfyUI backend queues the job
@@ -862,7 +873,9 @@ Add **one `nanogpt` backend and one API key** for all six capabilities. Use
 endpoint paths. `https://nano-gpt.com/api` also works as a configured base, but the
 [direct API host](https://docs.nano-gpt.com/api-reference/miscellaneous/api-hosts)
 is recommended for larger uploads and longer-running calls. Choose model IDs
-from the configured host's catalog.
+from the configured host's catalog. The direct host answers its catalogs slowly
+(1–18 s, at times over 30 s measured), so NanoGPT discovery allows 60 s per catalog and
+runs every 600 s.
 
 | Capability | Gateway endpoint | Catalog filter |
 |---|---|---|
