@@ -19,6 +19,9 @@ RSYNC_EXCLUDES=(
     --exclude='.remember/'   --exclude='.superpowers/'  --exclude='.agents/'
     --exclude='skills-lock.json*'
     --exclude='sample_comfyui_workflows/org/'
+    # Prod-only too: store/admin snapshots taken before risky edits, and photos
+    # dropped next to the samples (seen in a --delete dry run on 2026-10-13).
+    --exclude='backups/'     --exclude='sample_comfyui_workflows/*.heic*'
     --exclude='__pycache__/' --exclude='*.pyc'
     --exclude='.venv/'       --exclude='venv/'        --exclude='.env'
     --exclude='config.yaml'  --exclude='config.yaml.bak*'  --exclude='config.prod.yaml'
@@ -37,6 +40,7 @@ TAR_EXCLUDES=(
     --exclude='./.remember'   --exclude='./.superpowers' --exclude='./.agents'
     --exclude='./skills-lock.json*'
     --exclude='./sample_comfyui_workflows/org'
+    --exclude='./backups'     --exclude='./sample_comfyui_workflows/*.heic*'
     --exclude='__pycache__'   --exclude='*.pyc'
     --exclude='./.venv'       --exclude='./venv'        --exclude='./.env'
     --exclude='./config.yaml' --exclude='./config.yaml.bak*' --exclude='./config.prod.yaml'
