@@ -338,6 +338,40 @@ class NanoUnifiedDiscovery(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(adapter.model_catalogs),
                          {"text", "tts", "embedding", "images", "video", "3d"})
 
+    async def test_pending_refresh_keeps_last_complete_snapshot_then_swaps_whole(self):
+        """A refresh takes up to a minute on NanoGPT's direct host; clearing at its start
+        took chat and media out of routing for ~a third of all time (2026-10-13). While it
+        is pending, the OLD snapshot stays — in the routing view and in both components —
+        with nothing of the new one leaking in early; on success it is replaced whole."""
+        adapter = self.adapter()
+        async with self.client() as client:
+            await adapter.discover(client)
+        old = copy.deepcopy(adapter.model_catalogs)
+        changed = self.catalogs()
+        changed["/api/v1/embedding-models"]["data"][0]["id"] = "new-embedding"
+        changed["/api/v1/images/models"]["data"][0]["id"] = "new-image"
+        waiting, release = asyncio.Event(), asyncio.Event()
+
+        async def handler(request):
+            if request.url.path == "/api/v1/video-models":
+                waiting.set()
+                await release.wait()
+            return httpx.Response(200, json=changed[request.url.path])
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            task = asyncio.create_task(adapter.discover(client))
+            try:
+                await waiting.wait()
+                await asyncio.sleep(0.01)          # the other five catalogs have answered
+                self.assertEqual(adapter.model_catalogs, old)
+                self.assertEqual(set(adapter._text.model_catalogs["embedding"]), {"embedding-model"})
+                self.assertEqual(set(adapter._media.model_catalogs["images"]), {"image-model"})
+            finally:
+                release.set()
+                await task
+        self.assertEqual(set(adapter.model_catalogs["embedding"]), {"new-embedding"})
+        self.assertEqual(set(adapter._media.model_catalogs["images"]), {"new-image"})
+
     async def test_replacement_preserves_account_snapshot_but_refilters_settings(self):
         old = self.adapter(api_key="key")
         async with self.client() as client:

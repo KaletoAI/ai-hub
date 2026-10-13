@@ -325,9 +325,13 @@ stage-1 submissions and released slots; `test_cloud_editor.py` pins refused save
 `NanoGPTAdapter` is the only registered `nanogpt` backend: its OpenAI text and
 cloud-media protocol components share the same backend dictionary, injected
 context and `nanogpt:<name>` accounting identity. All six discovery requests run
-concurrently; one complete snapshot is published after both components settle.
-Pending/failed discovery clears metadata rather than allowing stale metadata to
-validate a paid submit. State adoption requires the same account key and URL,
+concurrently; one complete snapshot is published after both components settle
+(they fetch through `_fetch_snapshot` without publishing). While a refresh is
+PENDING the last complete snapshot stays published — a refresh takes up to a
+minute on the direct host, and clearing at its start took chat and media out of
+routing for ~a third of all time (2026-10-13, 30 s polls of ~11 s). A FAILED
+refresh clears all metadata, so nothing the vendor did not just confirm validates
+a paid submit after an error. State adoption requires the same account key and URL,
 deep-copies metadata and reapplies changed filters.
 
 `NanoGPTTextAdapter` inherits OpenAI dispatch, but discovers three dedicated
@@ -2800,7 +2804,8 @@ Every test file also says this in its own docstring; this is the overview.
 - `test_nanogpt.py`: pinned models, current metadata-driven schemas and input limits,
   default/client/native precedence, explicit auto, finite JSON, video seconds,
   redacted media metadata and terminal result parsing.
-- `test_nanogpt_text.py`: atomic six-catalog publication/failure/adoption, correct
+- `test_nanogpt_text.py`: atomic six-catalog publication/failure/adoption, the last
+  complete snapshot kept (in both components) while a refresh is pending, correct
   pricing units, purpose-separated inventories and worker-thread normalization.
 - `test_nanogpt_media_adapter.py`: all six protocols through one backend identity,
   real image/video/audio/mesh artifacts, current-model preflight across refresh,

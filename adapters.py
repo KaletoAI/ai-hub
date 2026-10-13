@@ -1497,7 +1497,8 @@ class NanoGPTTextAdapter(OpenAIAdapter):
     """NanoGPT's three callable catalogs, with dispatch inherited unchanged.
 
     Discovery is atomic: any failed catalog marks the backend DOWN, never fresh
-    with stale speech/embedding routes. No catalog state survives a refresh.
+    with stale speech/embedding routes. A failed refresh clears the catalogs; a pending
+    one leaves the last complete snapshot in place (see NanoGPTAdapter.discover).
     """
 
     type = "nanogpt"
@@ -1514,8 +1515,17 @@ class NanoGPTTextAdapter(OpenAIAdapter):
         self.model_catalogs: dict[str, dict[str, dict]] = {}
 
     async def discover(self, client: httpx.AsyncClient) -> Capabilities:
+        try:
+            caps, catalogs = await self._fetch_snapshot(client)
+        except BaseException:
+            self.model_catalogs = {}
+            raise
+        self.model_catalogs = catalogs
+        return caps
+
+    async def _fetch_snapshot(self, client: httpx.AsyncClient) -> tuple[Capabilities, dict]:
+        """The three catalogs → (caps, catalogs), publishing nothing."""
         b = self.backend
-        self.model_catalogs = {}
         headers = self.ctx.auth_headers(b)
         responses = await asyncio.gather(*(
             client.get(f"{b['url'].rstrip('/')}{path}", headers=headers,
@@ -1527,9 +1537,7 @@ class NanoGPTTextAdapter(OpenAIAdapter):
             if isinstance(response, BaseException):
                 raise response
             response.raise_for_status()
-        caps, catalogs = await asyncio.to_thread(self._parse_snapshot, responses, b)
-        self.model_catalogs = catalogs
-        return caps
+        return await asyncio.to_thread(self._parse_snapshot, responses, b)
 
     @staticmethod
     def _pricing(price, kind: str) -> Optional[dict[str, float]]:
@@ -4709,7 +4717,16 @@ class NanoGPTMediaAdapter(CloudTaskAdapter):
             self.model_catalogs = copy.deepcopy(old.model_catalogs)
 
     async def discover(self, client: httpx.AsyncClient) -> Capabilities:
-        self.model_catalogs = {}
+        try:
+            caps, catalogs = await self._fetch_snapshot(client)
+        except BaseException:
+            self.model_catalogs = {}
+            raise
+        self.model_catalogs = catalogs
+        return caps
+
+    async def _fetch_snapshot(self, client: httpx.AsyncClient) -> tuple[Capabilities, dict]:
+        """The media catalogs → (caps, catalogs), publishing nothing."""
         responses = await asyncio.gather(*(
             client.get(self._api(path), headers=self._headers(),
                        timeout=_NANOGPT_DISCOVERY_TIMEOUT)
@@ -4719,9 +4736,8 @@ class NanoGPTMediaAdapter(CloudTaskAdapter):
                 raise response
             response.raise_for_status()
         catalogs = await asyncio.to_thread(self._parse_catalogs, responses)
-        self.model_catalogs = catalogs
         return Capabilities(models=set().union(*(set(c) for c in catalogs.values())),
-                            pricing={}, context={})
+                            pricing={}, context={}), catalogs
 
     def _parse_catalogs(self, responses) -> dict:
         catalogs = {}
@@ -4934,17 +4950,22 @@ class NanoGPTAdapter(BackendAdapter):
                                      for kind in nanogpt.ENDPOINTS if kind in catalogs}
 
     async def discover(self, client: httpx.AsyncClient) -> Capabilities:
-        # No partial or stale metadata may validate a paid request during refresh.
-        self._publish_catalogs({})
+        # While the six GETs are pending, the LAST COMPLETE snapshot stays published: a
+        # refresh takes up to a minute on NanoGPT's direct host, and clearing at its start
+        # took chat and media out of routing for ~a third of all time (2026-10-13, 30 s
+        # polls of ~11 s). Nothing partial is ever published — the components fetch
+        # without publishing and one snapshot replaces the other here — and a FAILED
+        # refresh still clears everything, so no metadata the vendor did not just
+        # confirm validates a paid submit after an error.
         try:
-            results = await asyncio.gather(self._text.discover(client),
-                                          self._media.discover(client),
+            results = await asyncio.gather(self._text._fetch_snapshot(client),
+                                          self._media._fetch_snapshot(client),
                                           return_exceptions=True)
             for result in results:
                 if isinstance(result, BaseException):
                     raise result
-            text, media = results
-            catalogs = {**self._text.model_catalogs, **self._media.model_catalogs}
+            (text, text_catalogs), (media, media_catalogs) = results
+            catalogs = {**text_catalogs, **media_catalogs}
         except BaseException:
             self._publish_catalogs({})
             raise
