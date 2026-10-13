@@ -52,7 +52,7 @@ def free_vram_before_job(last_key: Optional[str], next_key: str,
 
 
 _LOADER_CLASS = re.compile(r"load", re.I)
-# Loaders whose "file" is a per-job INPUT (the uploaded image, the chain's mesh), not a
+# Loaders whose "file" is a per-job INPUT (uploaded image or mesh), not a
 # weight set: their values change on every job and mean nothing for the VRAM.
 _INPUT_LOADER = re.compile(r"image|mask|mesh|path|video|audio", re.I)
 # The loader inputs that name a weight set. Everything else on a loader (device,

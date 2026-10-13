@@ -771,8 +771,9 @@ Image/Multiview 40 (ohne Textur) / 50 (mit); der Changelog nennt für
 | Mesh-Segmentierung (V2) | 40 |
 | Mesh-Completion (V2) | 50 |
 
-**Beispielrechnung für eine typische Gateway-Kette**
-(Bild → Modell mit Textur → Rig-Check → Auto-Rig mit Mixamo-Spec, FBX-Ausgabe):
+**Beispielrechnung für separat angefragte Modell-Erzeugung und Rigging**
+(Bild → Modell mit Textur; danach neuer Rigging-Request mit Rig-Check,
+Auto-Rig mit Mixamo-Spec und FBX-Ausgabe):
 30 + 0 + 25 = **55 Credits ≈ 0,55 USD**. Ein Convert-Schritt entfällt, weil
 `animations/rig` `out_format: "fbx"` direkt kann.
 

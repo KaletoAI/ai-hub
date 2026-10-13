@@ -404,7 +404,8 @@
       "keep_models_loaded": false,
       "conv_backend": "flex_gemm",
       "sparse_backend": "xformers",
-      "use_reconviagen": false
+      "use_reconviagen": false,
+      "pixal3d_multiview": false
     },
     "class_type": "Trellis2LoadModel",
     "_meta": {

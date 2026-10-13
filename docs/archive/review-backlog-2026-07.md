@@ -8,8 +8,7 @@ schwersten Root-Causes sind bereits gefixt (Commit `c4b73ad`), 2 wurden widerleg
 ## Arbeitsregeln
 
 - **Zeilennummern sind Stand des Review-Baums und damit STALE.** Seit dem Review
-  wurden `_run_chain` komplett umgebaut und die Artefakt-Delivery restrukturiert
-  (Commits `c4b73ad`, `ed19146`, `b6ff280`). Jedes Finding ZUERST gegen HEAD
+  wurde die Artefakt-Delivery restrukturiert. Jedes Finding ZUERST gegen HEAD
   verifizieren; erledigte/hinfällige direkt hier in der Datei als `~~erledigt~~`
   mit Ein-Zeilen-Begründung markieren statt sie zu fixen.
 - Konventionen aus CLAUDE.md gelten: kein Test-Framework — verifizieren per
@@ -71,12 +70,6 @@ schwersten Root-Causes sind bereits gefixt (Commit `c4b73ad`), 2 wurden widerleg
 12. ~~**previewanim.py:34 — GLB-Chunk-Walk re-implementiert**~~
     ✓ Gemeinsamer Leaf `adapters.glb_chunks` (pure, kein `main`); `_glb_info` und
     `previewanim._parse` (lazy import) nutzen ihn.
-13. ~~**main.py:1931 — ComfyUI-Protokoll leckt in `main._run_chain`**~~
-    ✓ Als ComfyUIAdapter-Methoden gekapselt (`export_pin`, `pinned_output_name`,
-    `fetch_output`, Geschwister von `upload_input`); `main` ruft nur noch adapter-agnostisch.
-14. ~~**main.py:1928 — `_gen_inputs_params`/`_apply_seconds` doppelt berechnet**~~
-    ✓ Endpoint berechnet einmal, reicht `inputs`/`params` in `_run_chain` durch (fps/mapping
-    sind alias-weit → identisch); per-Attempt `_apply_seconds` bleibt als Failover-No-op.
 15. ~~**main.py:1734 — `view['workflow']` dup; admin.py — Download-Karten**~~
     ✓ Redundantes `view['workflow']` entfernt (Consumer nutzen `alias`); vier Download-Karten
     → ein `_dl_card()`-Helper (`_media_tag` file + `_job_thumbs` GLB/FBX/other).

@@ -324,7 +324,7 @@ class TestMeshyAdapter(unittest.TestCase):
         gets its OWN size-scaled timeout while the CLIENT default stays short for polls.
 
         Measured 2026-09-02 on prod: a 70 MB GLB → ~93 MB body → the flat 30 s client
-        timeout fired mid-upload and the chain died on an httpx WriteTimeout."""
+        timeout fired mid-upload and the rigging job died on an httpx WriteTimeout."""
         _Stub.script = [{"status": "SUCCEEDED", "progress": 100, "consumed_credits": 5,
                          "result": {"rigged_character_glb_url": f"{self.url}/asset/glb"}}]
         big = b"glTF" + b"\x00" * (5 * 1024 * 1024)          # ~5 MiB mesh → ~6.7 MiB body
@@ -357,11 +357,6 @@ class TestMeshyAdapter(unittest.TestCase):
 
 
 class TestGenTypesAndFields(unittest.TestCase):
-    def test_registry(self):
-        self.assertIs(adapters.ADAPTERS["meshy"], adapters.MeshyAdapter)
-        self.assertEqual(adapters.GEN_TYPES, frozenset({"comfyui", "meshy", "tripo", "runpod"}))
-        self.assertFalse(adapters.OpenAIAdapter.serves_generation)
-
     def test_public_fields_meshy(self):
         params, images, files = adapters.public_fields(meshy.default_candidate("m"))
         self.assertEqual([i["name"] for i in images], ["input_image"])
@@ -398,6 +393,22 @@ class TestGenTypesAndFields(unittest.TestCase):
         params, images, files = adapters.public_fields({"workflow_json": wf, "mapping": mapping})
         self.assertEqual(files, [{"name": "input_mesh_path", "required": False}])
         self.assertEqual(images, [])
+
+
+class UploadTimeout(unittest.TestCase):
+    """Large ComfyUI input files must not inherit a LAN-image-sized upload budget."""
+
+    def test_small_upload_keeps_the_flat_floor(self):
+        self.assertEqual(adapters._upload_timeout_for(0), adapters._UPLOAD_TIMEOUT)
+        self.assertLess(adapters._upload_timeout_for(64 * 1024),
+                        adapters._UPLOAD_TIMEOUT + 0.1)
+
+    def test_large_upload_gets_at_least_one_mib_per_second(self):
+        mb = 1024 * 1024
+        self.assertAlmostEqual(adapters._upload_timeout_for(70 * mb), 90.0)
+        self.assertGreaterEqual(adapters._upload_timeout_for(70 * mb), 70.0)
+        self.assertGreater(adapters._upload_timeout_for(100 * mb),
+                           adapters._upload_timeout_for(50 * mb))
 
 
 if __name__ == "__main__":

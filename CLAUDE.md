@@ -11,7 +11,7 @@ local LLM servers (llama.cpp / llama-swap / vLLM / Ollama), cloud APIs (Together
 OpenAI / OpenRouter / Anthropic), ComfyUI image/video/3D servers and cloud 3D services
 (Meshy, Tripo). It adds per-backend discovery, one queued scheduler with failover,
 virtual aliases, concurrency caps, multi-user auth + quotas, call parking, a
-media-generation subsystem (workflow mapping, LoRAs, chains, jobs), a normalized
+media-generation subsystem (workflow mapping, LoRAs, jobs), a normalized
 reasoning toggle, **managed hosts** (GPU machines rented on demand from Thunder Compute,
 with tunnels, service setup and a model sync) and a server-rendered `/ui` console.
 
@@ -102,7 +102,7 @@ hot-reload-safe. Modules marked *pure* do no I/O and import neither `main` nor
 Requests: chat/completions/embeddings/speech and `/v1/messages` all funnel through
 `_dispatch_or_park()` (resolve → ready/busy split → dispatch with failover → park FIFO
 when all busy). Generation (`/v1/generations` + OpenAI image shims) runs as a job via
-`get_gen_routes` → `_run_job` / `_run_chain`. Details: `docs/architecture.md`.
+`get_gen_routes` → `_run_job`. Each job runs one alias. Details: `docs/architecture.md`.
 
 ## Invariants — the rules that break silently
 

@@ -168,15 +168,14 @@ class Backends(_Fixture):
         self.assertIsNotNone(store.get_backend("gpu", "runpod"))
 
     def test_runpod_save_is_paid_checks_the_url_and_drops_comfy_keys(self):
-        r = self.post("/ui/backends/save", {**self.RP, "comfy_output_dir": "/o",
-                                            "comfy_input_dir": "/i", "auto_restart": "on",
+        r = self.post("/ui/backends/save", {**self.RP, "comfy_input_dir": "/i", "auto_restart": "on",
                                             "restart_cooldown_s": "60", "stuck_after_s": "30",
                                             "rp_max_wait": "900", "queue_max_s": "120",
                                             "cost_per_hour": "1.75"})
         self.assertEqual(r.status_code, 303, r.text[-400:])
         b = store.get_backend("gpu", "runpod")
         self.assertIs(b["paid"], True)                 # the form never sends the box
-        for k in ("comfy_output_dir", "comfy_input_dir", "auto_restart", "restart_cooldown_s",
+        for k in ("comfy_input_dir", "auto_restart", "restart_cooldown_s",
                   "stuck_after_s"):
             self.assertNotIn(k, b)
         self.assertEqual((b["max_wait"], b["queue_max_s"], b["cost_per_hour"]), (900, 120, 1.75))

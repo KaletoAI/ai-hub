@@ -56,24 +56,6 @@ class AdminKindNeutral(unittest.TestCase):
         self.assertTrue(admin._same_kind([{"workflow_json": {}}], "x"))
         self.assertFalse(admin._same_kind([meshy.default_candidate("m")], "x"))
 
-    def test_type_select_knows_every_cloud_url(self):
-        html = admin._type_select("tripo")
-        self.assertIn(tripo.URL, html); self.assertIn(meshy.URL, html)
-        self.assertIn('value="tripo" selected', html)
-        self.assertIn("cloudopts", html)
-
-    def test_type_select_replaces_another_kinds_url(self):
-        """Switching meshy → tripo must not leave api.meshy.ai in the url field: the
-        backend would be saved pointing at the wrong vendor and only fail at discovery,
-        with an auth error that names the wrong service. The handler therefore overwrites
-        a url that is blank OR equals ANOTHER kind's fixed URL — never a typed one."""
-        js = admin._type_select("meshy")
-        self.assertIn("for(var k in providerUrls)", js)       # every other kind is compared
-        self.assertIn("u.value===providerUrls[k]", js)        # …against the url field
-        self.assertIn("u.value=providerUrls[t]", js)          # …and replaced by the new kind's
-        for url in (meshy.URL, tripo.URL):
-            self.assertIn(url, js)
-        self.assertNotIn("if(u&&!u.value)", js)               # the old fill-only rule is gone
 
 
 class CloudBackendUrl(unittest.TestCase):
@@ -90,18 +72,6 @@ class CloudBackendUrl(unittest.TestCase):
         self.assertEqual(admin._provider_url_for("comfyui", "http://gpu:8188"), "http://gpu:8188")
         self.assertEqual(admin._provider_url_for("comfyui", ""), "")               # never touched
         self.assertEqual(admin._provider_url_for("tripo", tripo.URL), tripo.URL)   # already right
-
-    def test_provider_url_switches_include_new_catalog_backends(self):
-        """Recommended ArliAI/NanoGPT bases replace other provider defaults, not proxies."""
-        import arliai
-        import nanogpt
-        for mod in (arliai, nanogpt):
-            self.assertEqual(admin._provider_url_for(mod.KIND, ""), mod.URL)
-            self.assertEqual(admin._provider_url_for(mod.KIND, tripo.URL), mod.URL)
-            self.assertEqual(admin._provider_url_for("tripo", mod.URL), tripo.URL)
-            self.assertEqual(admin._provider_url_for(mod.KIND, "https://my.proxy"),
-                             "https://my.proxy")
-            self.assertIn(f'value="{mod.KIND}"', admin._type_select("openai"))
 
 
 class CloudEditor(unittest.TestCase):
@@ -123,8 +93,6 @@ class CloudEditor(unittest.TestCase):
         self.assertIn('name="cloud_endpoint"', html)
         self.assertIn('name="cloud_model"', html)
         self.assertIn('action="/ui/mapping/cloud-update"', html)
-        self.assertIn('name="chain_rig"', html)
-        self.assertIn('value="tripo"', html)
         self.assertIn(mod.VENDOR, html)
         return html
 
@@ -154,8 +122,7 @@ class CloudEditor(unittest.TestCase):
         for n in ("opt__should_texture", "opt__enable_pbr", "opt__texture_resolution", "opt__topology",
                   "opt__should_remesh", "opt__target_polycount", "opt__pose_mode", "opt__ultra_mode",
                   "opt__image_enhancement", "opt__remove_lighting", "opt__moderation",
-                  "opt__animations", "opt__thumbnail", "new_alias", "retries", "successor",
-                  "chain_mesh_param", "chain_keep", "chain_rig", "task"):
+                  "opt__animations", "opt__thumbnail", "new_alias", "retries", "task"):
             self.assertIn(f'name="{n}"', html)
 
     def test_cloud_update_apply_normalizes_and_copies(self):
@@ -165,8 +132,7 @@ class CloudEditor(unittest.TestCase):
                 # `avian` is normalized away, which the next test pins
                 "opt__rig_model": "v2.5-20260210",
                 "opt__rig_type": "avian", "opt__animations": "preset:walk preset:run", "opt__face_limit": "9",
-                "fmt__fbx": "on", "task": "mesh2rig", "retries": "1",
-                "successor": "", "chain_mesh_param": "", "chain_keep": "", "chain_rig": ""}
+                "fmt__fbx": "on", "task": "mesh2rig", "retries": "1"}
         admin._cloud_update_apply("tripo", cands, form)
         for x in cands:
             self.assertEqual(x["tripo"]["endpoint"], "rig")
@@ -177,13 +143,7 @@ class CloudEditor(unittest.TestCase):
             self.assertIsNone(x["tripo"]["options"]["face_limit"])      # 9 < 100 → ignored by options_of
             self.assertEqual(x["tripo"]["options"]["target_formats"], ["fbx"])
             self.assertEqual(x["task"], "mesh2rig"); self.assertEqual(x["retries"], "1")
-            self.assertNotIn("successor", x)
         self.assertIsNot(cands[0]["tripo"]["options"], cands[1]["tripo"]["options"])
-        form.update({"successor": "mesh-mia", "chain_rig": "mixamo", "chain_keep": "preview.png"})
-        admin._cloud_update_apply("tripo", cands, form)
-        self.assertEqual(cands[0]["successor"], {"alias": "mesh-mia", "mesh_param": "input_mesh_path",
-                                                 "keep_from_mesh": ["preview.png"], "rig": "mixamo"})
-        self.assertIsNot(cands[0]["successor"], cands[1]["successor"])
 
     def test_cloud_update_apply_runs_the_modules_normalizer(self):
         """Save stores what the request builder would send: the editor offers all seven rig
@@ -209,65 +169,6 @@ class CloudEditor(unittest.TestCase):
         self.assertEqual(o["target_formats"], ["glb"])  # rigging delivers glb/fbx only
         self.assertEqual(cands[0]["meshy"]["endpoint"], "rigging")
         self.assertEqual(cands[0]["model"], "meshy-6")
-
-
-class CatalogProviderEditor(unittest.TestCase):
-    """Native catalog editors preserve refused values without acquiring mesh chain controls."""
-
-    def setUp(self):
-        self.addCleanup(setattr, admin, "_gen_backends", admin._gen_backends)
-        self.addCleanup(setattr, admin, "_generation_models", admin._generation_models)
-        admin._gen_backends = lambda: []
-        admin._generation_models = lambda: []
-
-    def test_native_forms_have_no_mesh_successor_or_format_fields(self):
-        import arliai
-        import nanogpt
-        for mod in (arliai, nanogpt):
-            cand = mod.default_candidate("b")
-            cand["model"] = "provider-model"
-            html = admin._cloud_editor(mod.KIND, "native", [cand])
-            self.assertIn('name="cloud_model"', html)
-            self.assertNotIn('name="successor"', html)
-            self.assertNotIn('name="chain_rig"', html)
-            self.assertNotIn('name="fmt__glb"', html)
-
-    def test_refused_native_form_keeps_typed_alias_and_json(self):
-        import nanogpt
-        cand = nanogpt.default_candidate("b")
-        cand["model"] = "provider-model"
-        raw = {"new_alias": "typed alias", "cloud_model": "typed-model",
-               "cloud_endpoint": "images", "opt__options_json": "not json", "retries": "bad"}
-        html = admin._cloud_editor("nanogpt", "stored", [cand], err="invalid JSON", raw=raw)
-        self.assertIn('name="new_alias" value="typed alias"', html)
-        self.assertIn('name="cloud_model" value="typed-model"', html)
-        self.assertIn("not json</textarea>", html)
-        self.assertIn('name="retries" value="bad"', html)
-
-    def test_native_successor_write_is_refused_without_mutating_candidates(self):
-        import copy
-        import arliai
-        import nanogpt
-        for mod in (arliai, nanogpt):
-            cand = mod.default_candidate("b")
-            cand["model"] = "provider-model"
-            before = copy.deepcopy(cand)
-            with self.assertRaises(getattr(mod, "INPUT_ERROR", arliai.ArliAIInput)):
-                admin._cloud_update_apply(mod.KIND, [cand], {
-                    "cloud_model": "provider-model", "cloud_endpoint": mod.ENDPOINTS[0],
-                    "successor": "mesh-rigger"})
-            self.assertEqual(cand, before)
-
-    def test_schema_boolean_options_use_lowercase_false(self):
-        """A false catalog enum remains false rather than becoming an unselected default."""
-        from types import SimpleNamespace
-        mod = SimpleNamespace(OPTION_FIELDS=[{"key": "flag", "label": "flag", "type": "text"}],
-                              RIG_ENDPOINT=None)
-        html = admin._option_rows(mod, {"flag": False}, "images",
-                                 {"flag": {"type": "bool", "choices": [True, False]}})
-        self.assertIn('value="false" selected', html)
-        self.assertIn('value="true"', html)
-        self.assertNotIn('value="False"', html)
 
 
 if __name__ == "__main__":

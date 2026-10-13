@@ -1,8 +1,7 @@
 """A job row and a log line must never end in a bare colon.
 
-Measured 2026-09-02 on prod: chain job dbab9494 died with the error text "chain failed: "
-and the journal line "✗ chain job … failed:" — nothing after either colon. The cause was
-an httpx WriteTimeout on a ~93 MB task-create POST, and EVERY httpx timeout that comes
+An httpx WriteTimeout on a large task-create POST once left both the job error
+and its journal line ending in a bare colon. Every httpx timeout that comes
 off the transport is constructed with an empty message, so `str(e)` is "". `_err_text`
 falls back to the class name, which is a poor message but an infinitely better one than
 none. These tests pin that fallback and the two renderings that reach a job row.

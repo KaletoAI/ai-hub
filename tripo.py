@@ -48,7 +48,7 @@ OPTION_DEFAULTS: dict = {
     "texture_alignment": "original_image", "geometry_quality": "standard",
     # Admin face budget: None = Tripo's adaptive default. Set → sent with every request,
     # but a client `input_face_num` still wins (a DEFAULT, not a pin — as with Meshy's
-    # target_polycount, which a chained alias needs so the rigger gets a sane mesh).
+    # target_polycount).
     "face_limit": None, "quad": False, "smart_low_poly": False, "generate_parts": False,
     "auto_size": False, "orientation": "default", "enable_image_autofix": False, "compress": "",
     "target_formats": ["glb"], "thumbnail": True,
@@ -481,12 +481,3 @@ ENDPOINT_HINT = (
     "option below. <b>deliver formats</b>: Tripo generates <b>glb</b> and nothing else (the rig "
     "endpoint delivers the FIRST ticked format directly), so every other format is a separate "
     "convert task at 5 credits.")
-CHAIN_HINT = (
-    "The successor may itself be a <b>Tripo alias</b> (e.g. <code>Tripo-Rig</code>, endpoint "
-    "<code>rig</code>) — it then takes the mesh as its file field <code>input_mesh_path</code>, the "
-    "<b>delivered rig type</b> is <code>tripo</code>, and the bone names follow the rig alias's "
-    "<b>skeleton</b> option (<code>mixamo</code> by default). Tripo embeds its texture in the GLB, "
-    "so <b>keep from this stage</b> is usually empty — <code>preview.png</code> is the one "
-    "candidate. Any OTHER format in <b>deliver formats</b> is wasted on a chained alias: each one "
-    "is a paid convert task, but only the successor's result (plus what <b>keep from this "
-    "stage</b> matches) is delivered.")

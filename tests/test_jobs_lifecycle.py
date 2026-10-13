@@ -69,8 +69,8 @@ class JobLifecycle(unittest.TestCase):
         self.assertEqual(jobs.get(jid2)["status"], "failed")
 
     def test_a_cancelled_job_is_not_re_pointed_to_another_backend(self):
-        # the row names the backend it was cancelled on; a worker's late hand-off
-        # (chain stage 2, a failover claim) must not rewrite it afterwards
+        # The row names the backend it was cancelled on; a late failover claim
+        # must not rewrite it afterwards.
         jid = self._job()
         jobs.set_backend(jid, "gpu-b")
         self.assertEqual(jobs.get(jid)["backend"], "gpu-b")

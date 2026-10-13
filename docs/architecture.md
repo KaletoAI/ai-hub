@@ -142,8 +142,7 @@ a path on the backend box, another job's output included, unless `_params_truste
 playground qualifies through its self-call's admin key, not by a /ui rule) or the
 entry carries `client_path: true` (Mapping editor checkbox *client may send a backend
 path* on every file row; unticked = cleared);
-judged over the alias's AND its successor's mapping, since params are threaded by
-label — `test_mapping_values.py`); a file field
+judged over the requested alias's mapping — `test_mapping_values.py`); a file field
 whose entry carries `required: true` (checkbox *required* on the same row, same
 unticked = cleared rule — the editor rebuilds the mapping from the form, so a flag
 without a checkbox would vanish on the next Save) is refused by
@@ -151,7 +150,8 @@ without a checkbox would vanish on the next Save) is refused by
 non-empty path under `params`, right after `_client_param_refusal` and before the job
 row; the schema shows it as `files[].required` (`test_required_file_param.py` — without
 it the workflow ran on its baked-in value: a late failure on an empty path, or a result
-built on a file the client never sent); a mapping `label` is the param's public
+built on a file the client never sent); a mapping
+`label` is the param's public
 API name — incoming values are accepted under label OR param, and the
 auto-random seed keys on that effective name (`''` counts as unset);
 `_apply_lora_cascade` drops client LoRAs into free stack slots (so with a pinned
@@ -238,13 +238,30 @@ the corrected multi-primitive GLB is not a supported input for another pass.
 Alias creation and live verification are operator steps, not sample-file side
 effects. Client and installation contract: `docs/anima-versa-face-retexture.md`.
 
-`normalize_delivery` (case mode + chain level, normalize-once flagged; it,
+UniRig runtime compatibility (2026-10-13, K12 RTX 3090): the isolated
+`cumm 0.8.2+cu130torch2.11` / `spconv 2.3.8+cu130torch2.11` wheels omitted
+`sm_86`, entering an NVRTC path whose bundled CCCL include layout, C++ dialect
+and TensorView shims were incompatible. The fix is a matched official pair,
+`spconv-cu126 2.3.8` / `cumm-cu126 0.7.11`, pinned in the node's source manifest
+and the generated Pixi manifest/lock, not a gateway retry or a driver downgrade.
+The K12 alias also pins node 8 (`UniRigLoadModel`) `precision: fp16`: `auto`
+chooses BF16, unsupported by that pair. Numerical smoke compares a native
+FP16 `SubMConv3d` against dense PyTorch convolution on the actual GPU; acceptance
+must also execute the standalone alias with an unrigged quadruped GLB and
+import the delivered FBX to check its armature and skin weights. No gateway
+dispatch or artifact contract changes.
+The original 11.7 MiB cat passed in 17.4 s after the repair: a 20,000-triangle
+FBX with 27,902 weighted vertices, normalized weights and working deformation.
+UniRig generated only three generic bones for this input; runtime success
+does not imply an anatomically complete quadruped skeleton.
+
+`normalize_delivery` (case mode, normalize-once flagged; it,
 `validate_delivery` and `_check_glb_not_dummy` are PIL work and run via
 `asyncio.to_thread`, never on the loop) V-flips
 generic texture PNGs and — alias Output option `texture_format: jpeg` —
 transcodes them to JPEG q90 (real alpha keeps PNG; ComfyUI has no JPEG export).
 **Input isolation** (`upload_prefix` on `NormalizedRequest`, `upload_prefix_for`
-+ `upload_slot_name`): EVERY uploaded input is named `gw_<job id>[_s1|_s2]_<param>
++ `upload_slot_name`): EVERY uploaded input is named `gw_<job id>_<param>
 .<ext>` — no two jobs share input state, ever. ComfyUI reads an input file at
 EXECUTION time, so a shared name is a corruption window the gateway's one-slot
 cap does NOT close (a poll timeout frees the slot while the prompt runs on) —
@@ -259,9 +276,8 @@ A failed run returns no `GenOutput`, so the job meta every cloud success carries
 be lost exactly when it is needed: `_create` therefore records each task on the REQUEST
 (`NormalizedRequest.cloud_trace`, per-request so concurrent jobs cannot overwrite each
 other) under the SAME keys the success meta uses — `cloud`, `cloud_task_id`, `endpoint`,
-`request`, `tasks` — and `main._gen_fail_meta`/`_run_chain`'s `fail_meta()` put them on
-the failed row (a cloud stage 2 at top level, stage 1 under `chain_stage1`, mirroring
-success). `admin._cloud_table` then renders a failed run with no special case. Recording
+`request`, `tasks` — and `main._gen_fail_meta` puts them on the failed row.
+`admin._cloud_table` then renders a failed run with no special case. Recording
 from `_create` and not from each `_run` is what makes it unforgettable — Tripo's converts
 and clips pass through there too; those carry a `role` and join `tasks` WITHOUT claiming
 `cloud_task_id`/`endpoint`, which name the primary task on both paths. No `credits` is
@@ -270,7 +286,7 @@ ever guessed onto a failed row: only a poll knows what was consumed.
 half of every cloud task backend — `MeshyAdapter` and `TripoAdapter` are subclasses,
 and a third vendor is a subclass plus a pure module, not a second copy of the
 ~60 sites Meshy used to be wired into. It owns the in-flight slot (incl. the `finally`
-decrement and `slot_held` for chain stages), `generate()` (run → download every
+decrement and `slot_held` for `_run_job`'s preclaimed slot), `generate()` (run → download every
 `state.downloads` in order → thumbnail outside the rig endpoint → the job meta),
 `_create` (serialise ONCE — to bytes, in a worker thread, like Meshy's body build: a
 rigging body is ~93 MB of base64 and dumping it on the loop stalled every request —
@@ -282,7 +298,7 @@ errors, 5xx and 429 are about the SERVICE and get `disconnect_grace` — a poll-
 the vendor's percentage to `ctx.note_progress` as step N/100 — `_note_cloud_progress`,
 keyed by the `_CLOUD_JOB` ContextVar `generate()` sets per request and clears with
 `None` at the end), `_download` (NO auth
-header: signed CDN urls, the bearer must not leak there) and the three chain hooks.
+header: signed CDN urls, the bearer must not leak there).
 A subclass supplies only `discover`, `_run` (build → create → poll, plus whatever
 follow-up tasks the vendor needs, returning `RunResult`), `_task_request`,
 `_task_body`, `_classify_create` (→ `nocredits`/`busy`/`server`/`rejected`/None),
@@ -296,6 +312,7 @@ write through into the stored candidate) and the derived `CLOUD_TYPES`/
 `CloudNoCredits`/`CloudBusy` (the pre-Tripo `Meshy*` names and the `.meshy` request
 field are gone — nothing stored carries them; the candidate's `meshy` KEY is the kind
 and stays) have a `vendor` attribute that `main._fault_label`/`_gen_exhausted_msg` name.
+
 `ArliAIImageAdapter` is the synchronous exception to the cloud-task HTTP loop:
 it uses the same `arliai` candidate-kind/schema/editor seam, but subclasses
 `BackendAdapter` rather than `CloudTaskAdapter`. It discovers authorized SDNext
@@ -314,13 +331,6 @@ Flat-subscription uncertain submits carry `create_unconfirmed` for diagnosis, bu
 `_billed_cloud_task` only recognizes `BILLING_TYPES`: the final job must not claim
 a per-task bill for ArliAI. `test_run_job_failover.py` checks that this remains
 final without self-retries or another candidate, alongside the paid-task guard.
-Existing ComfyUI/Meshy/Tripo workflow chains remain supported. ArliAI and NanoGPT
-are not chain stages: their public adapters refuse stage 1, and
-`_chain_mesh_param_error` refuses them as successors before any stage-1 task is
-bought. A native NanoGPT image file slot is not a mesh handoff contract.
-The cloud editor hides successor controls for these providers and refuses crafted
-successor POSTs without changing candidates. `test_run_job_failover.py` pins zero
-stage-1 submissions and released slots; `test_cloud_editor.py` pins refused saves.
 
 `NanoGPTAdapter` is the only registered `nanogpt` backend: its OpenAI text and
 cloud-media protocol components share the same backend dictionary, injected
@@ -329,6 +339,13 @@ concurrently; one complete snapshot is published after both components settle.
 Pending/failed discovery clears metadata rather than allowing stale metadata to
 validate a paid submit. State adoption requires the same account key and URL,
 deep-copies metadata and reapplies changed filters.
+The adapter retains `display_media_catalogs`, the last successful media snapshot,
+for the console only. `generation_models_info(console=True)` keeps catalog-only
+models and their forms visible during refresh or failure, marks them unavailable,
+and disables Generate; ordinary API inventory and dispatch still require live
+metadata and healthy discovery. This prevents a 30-second refresh or a text-catalog
+timeout from silently erasing a selected 3D model. The display snapshot follows
+the same account-identity and filter rules on adapter replacement.
 
 `NanoGPTTextAdapter` inherits OpenAI dispatch, but discovers three dedicated
 catalogs atomically: detailed text, TTS and embeddings. A failed catalog makes
@@ -345,13 +362,6 @@ second backend type; candidate kind is `nanogpt`. Its image/video/3D catalogs
 exclude explicit retexture-only entries and apply model filters.
 Images deliver the documented synchronous OpenAI-compatible data array, or poll
 a real Midjourney ID. Video and 3D share `/generate-video` and unified
-The adapter retains `display_media_catalogs`, the last successful media snapshot,
-for the console only. `generation_models_info(console=True)` keeps catalog-only
-models and their forms visible during refresh or failure, marks them unavailable,
-and disables Generate; ordinary API inventory and dispatch still require live
-metadata and healthy discovery. This prevents a 30-second refresh or a text-catalog
-timeout from silently erasing a selected 3D model. The display snapshot follows
-the same account-identity and filter rules on adapter replacement.
 `/video/status?requestId=…`. Accepted IDs are persisted before polling; uncertain
 submits carry `create_unconfirmed`. Only pre-submit connect/pool errors permit
 failover; an HTTP submit error, lost answer, malformed completion or asset failure
@@ -394,7 +404,6 @@ collision with a saved migration target is refused instead of reassigning it.
 Generation backends activate jobs without aliases, including through console
 saves and YAML hot reload. `_activate_generation_jobs` retains the startup-only
 job DB/blob paths even when initialization was deferred on a text-only gateway.
-
 
 
 **The build/execute/deliver seam** (`ComfyUIAdapter.generate`). What used to be one
@@ -515,10 +524,7 @@ snapshot, the running jobs and a probe finished on a replaced instance across a 
 `_settled_probe`). `/health` and the Backends tab carry `runpod` (idle/running workers,
 queue, max workers, probe state).
 
-**Fences.** A RunPod backend refuses every chain role (`chain_export` returns an error,
-`chain_take_mesh`/`chain_feed_mesh` raise): the inherited ComfyUI hooks would run a
-billed stage 1 and then `GET /view` on api.runpod.ai, or upload to it — failing only
-after the money is spent. A name shared by a `comfyui` and a `runpod` backend is refused
+**Fences.** A name shared by a `comfyui` and a `runpod` backend is refused
 on Save (`admin.backend_save`) and warned for config (`main.gen_name_clashes` /
 `_warn_gen_name_clashes`): backends are keyed `(name, type)` but a workflow candidate
 names its backend by NAME, so `_gen_backend_for` would pick whichever comes first and
@@ -717,6 +723,10 @@ Tests (each guards a silent failure):
 - `tests/test_s3vol.py`: AWS signatures/raw Unicode encoding, XML readers, three-page ListV2, multipart/ETags, HTTP-200 errors, auth, timeouts, size boundaries, secret-free URLs and payload hashing off the event loop.
 - `tests/test_rpvolume.py`: adoption/gone/ownership money guards, pressure-only prune and capped growth, atomic cached readiness, HEAD ownership, batch splitting, fallbacks, multipart failures, writer reservations, persisted ghost holds, resume budgets/alias ownership, partial cleanup, retry resets, job-level versus item failures, HEAD caching/unknown sizes, one-unit readiness, current-byte growth accounting, backoff/auth pauses and shutdown.
 - `tests/test_rpvolume_main.py`: controller reconciliation, state persistence, live adapter/secrets wiring, routing gate, reference validation, transfer budget overrides and confirmed-gone deletion guards.
+- `tests/test_rpvolume_ui.py`: volume forms/cards, start versus grown size, reference links, recreation billing confirms, actions, secret presence, waiting-page polling, partial cleanup rows and backend fields in every pane.
+- `tests/test_runpod_worker.py` (`FetchOps`): path/link escape refusal, resumable downloads, hash-before-rename, HF token from env only, unknown-size verification, unmounted-operation refusal and mounted-volume info.
+- `tests/test_runpod_adapter.py` (`VolumeOps`): save-before-poll/cancel-on-save-failure, job-status recovery, account-key fallback and RunPod URL guard.
+
 ### `arliai.py`
 
 Pure SDNext text-to-image request and public-field helpers, no I/O or main/adapters
@@ -763,10 +773,6 @@ errors, never plausible successes. Both documented video envelopes are accepted.
 `model_urls`, primary/rigged/animated GLB fields, animations, textures and
 `model3d_assets`. The 3D fixtures are source-derived contracts with real GLB/OBJ/PNG
 bytes, not captures of paid provider responses.
-
-- `tests/test_rpvolume_ui.py`: volume forms/cards, start versus grown size, reference links, recreation billing confirms, actions, secret presence, waiting-page polling, partial cleanup rows and backend fields in every pane.
-- `tests/test_runpod_worker.py` (`FetchOps`): path/link escape refusal, resumable downloads, hash-before-rename, HF token from env only, unknown-size verification, unmounted-operation refusal and mounted-volume info.
-- `tests/test_runpod_adapter.py` (`VolumeOps`): save-before-poll/cancel-on-save-failure, job-status recovery, account-key fallback and RunPod URL guard.
 
 ### `meshy.py`
 
@@ -829,9 +835,9 @@ TASK (3 in a row → final `RuntimeError` naming the status) while transport err
 5xx and 429 are about the SERVICE and get `disconnect_grace` seconds (default 30,
 same key as ComfyUI) of CONTINUOUS failure before the failover-class error — a
 poll-rate 429 must not end a task that is running and already paid for. A
-standalone rigging job tags its own meta `rig: "meshy"` (a CHAIN's `rig` comes from
-the successor config instead), so a rigged delivery is recognisable by that field on
-either path; `normalize_delivery`/`validate_delivery` never run for `meshy` — the
+standalone rigging job tags its own meta `rig: "meshy"`, so a rigged delivery is
+recognisable by that field; `normalize_delivery`/`validate_delivery` never run for
+`meshy` — the
 cloud rigs to its own conventions, so the files ship exactly as they arrive.
 Since Tripo joined, everything above is ONE half of a two-vendor interface: `meshy.py`
 and `tripo.py` export the same names and nothing but those names is read by the
@@ -842,8 +848,8 @@ adapter, the console editor and `main` (duck-typed, no ABC — they are modules)
 `OPTION_FIELDS` (the console's option FORM as data), `SLOTS`/`FILES`/
 `IGNORED_PARAMS`, `endpoint_of`/`options_of`/`default_candidate`/`public_fields`/
 `build_request`/`request_summary`/`parse_task`, a `<Kind>Input(RuntimeError)` for
-final content errors, and the three help texts `BACKEND_HINT`/`ENDPOINT_HINT`/
-`CHAIN_HINT`. `parse_task(task, formats, endpoint, options=…)` takes the whole option
+final content errors, and the help texts `BACKEND_HINT`/`ENDPOINT_HINT`.
+`parse_task(task, formats, endpoint, options=…)` takes the whole option
 block so the signature is identical for both (Meshy reads `options["animations"]`).
 
 ### `cloudtask.py`
@@ -949,7 +955,7 @@ which is what downtime sums from; the open-outage downtime in `faults_info` read
 same key. Keyed on the CURRENT kind instead, a timeout→unreachable outage was never
 closed and an unreachable→timeout one closed without opening), `call` in `_dispatch_over` (failover exceptions,
 llama-swap's 502, and any 5xx passed to the client, with the body snippet), `job` in
-`_run_job`/`_run_chain` (EVERY failed attempt, self-retries included — the job row
+`_run_job` (EVERY failed attempt, self-retries included — the job row
 hides those), `watchdog` in `_spawn_comfy_restart`. Always on and independent of
 `stats.enabled`: a bounded memory ring plus SQLite `faults.db` (`faults.db_path`,
 `retention_days` default 7, startup-only; an unopenable DB degrades to memory and the
@@ -973,7 +979,7 @@ lifecycle `queued→running→done|failed`, TTL pruning. Also persists job **inp
 result entry — the job view proves WHICH bytes ran; JSON in meta, no migration)
 and `reconcile_orphans()` (startup:
 mark interrupted `running`/`queued` as failed). Terminal states are FINAL: every status
-writer (`set_status`, `set_stage`, `fail`, `complete`, `complete_json`) is conditioned
+writer (`set_status`, `fail`, `complete`, `complete_json`) is conditioned
 on the row still being queued/running, so the first terminal write wins — a worker
 finishing after a cancel can neither mark the job `done` nor resurrect it to `running`
 (`set_status` returns False then, and the worker stops), and `complete()` of a row that
@@ -984,10 +990,12 @@ a short client `ttl_s` used to delete a running job under its worker.
 **background Responses** jobs (task type `response`, result via `complete_json`).
 A job's DURATION is its run time, `jobs.RUN_S` = updated − COALESCE(`started`,
 created): the first `set_status(…, "running")` (the claim) stamps `started` once, a
-failover/chain re-claim keeps it. updated − created counted the time a job sat parked
+failover re-claim keeps it. updated − created counted the time a job sat parked
 behind a busy backend, so the `dur` column, the ETA median, the Media generation avg
 and the scheduler's boot seed all called a backend with a long queue slow. Rows from
 before the column fall back to `created`. `test_job_run_time.py`.
+The schema has no execution-stage column or stage writer. `init()` removes the
+obsolete `stage` column from existing databases; every row represents one alias job.
 
 ### `store.py`
 
@@ -1063,13 +1071,30 @@ redirect with their query intact (`mapping_legacy`: `/ui/mapping?…` → `/ui/a
 `/ui/routing?sub=chat|gen` → `?sub=chat|media`); the ACTION routes stay under
 `/ui/mapping/<action>` and redirect back to `/ui/aliases`. `test_aliases_tab.py`.
 The workflow editor (the media half of Aliases) owns a pasted
-ComfyUI API JSON and offers discovery-fed dropdowns. A CLOUD alias has no workflow at
-all: `_cloud_editor(kind, …)` + `cloud_update` (`POST /ui/mapping/cloud-update`, which
+ComfyUI API JSON and offers discovery-fed dropdowns.
+`admin._object_info` fetches loader classes plus every mapped AND pinned class;
+`_editor_object_info` and `_pinned_block` pass the shared pin slots when probing
+each candidate, so non-loader enums use that backend's definitions too. The existing
+`_oi_fields` parser handles old list combos, new `COMBO/options` combos and INT/FLOAT
+bounds. `_value_control` renders any combo, not just `_is_model_field` model-file
+lists (that predicate remains for automatic model-pin detection). Image pins keep
+their placeholder control. Combo membership compares form-visible values, so saved
+`"0"` and discovered `0` do not create duplicate/stale options; a genuinely missing
+choice stays selected with a stale flag. `_apply_update_form` saves scalar pins and
+backend overrides through `adapters._coerce`, like workflow defaults, preserving
+numbers/booleans instead of storing every POST value as a string.
+WHY: an unmapped Trellis sampler/pipeline/resolution pin silently became free text,
+although the same node's mapped field offered choices in Playground; only loaders
+and mapped nodes were fetched and only model enums rendered as selects.
+`tests/test_pinned_widgets.py` guards per-backend non-loader discovery, zero/stale
+numeric selections, bounds/booleans and typed save/inheritance.
+A CLOUD alias has no workflow at all: `_cloud_editor(kind, …)` + `cloud_update`
+(POST `/ui/mapping/cloud-update`, which
 REPLACED the Meshy-only `/ui/mapping/meshy-update`) render the vendor's option block
 from `mod.OPTION_FIELDS` and read it back through `cloudtask.parse_options` →
 `mod.options_of` — the same normalization the request builder applies, so editor and
 builder cannot drift; the structural fields (alias, task, endpoint, model, deliver
-formats, retries, the chain block, the request-field table) stay the editor's and the
+formats, retries, the request-field table) stay the editor's and the
 vendor supplies only the hints. The backend form's `#cloudopts` block carries
 `cloud_max_wait`/`cloud_poll_interval` (named `cloud_*` because `#comfyopts` already
 spends `max_wait`/`poll_interval`, and one form may carry each name only once), and
@@ -1194,7 +1219,15 @@ only the Users page's *Save resolved names* POST stores them) and crawls the ren
 link, no `location.href` to an action). Editor forms carry `data-guard`: an edited one
 left by anything but its own submit (an action, a nav tab) gets the browser's
 unsaved-changes prompt; **Update workflow** applies the whole editor form before it
-swaps the JSON (`_apply_update_form`, shared with Save), and the request-field
+swaps the JSON (`_apply_update_form`, shared with Save) — and first ASKS: the click is
+held, the whole form goes to `POST /ui/mapping/workflow-diff` (writes nothing; the
+typed bindings are applied to a copy) and the `#gw-wfdiff` dialog shows the node-level
+`_workflow_diff` (nodes added/removed/changed with each input's old → new value or link,
+and every request field, pin and bypass that would go stale). *Replace workflow* clicks
+the same button again with the hold lifted, so the update path is unchanged; a file the
+update would refuse disables it (`_read_workflow_upload` is shared). A re-export from
+the wrong tab used to replace the alias on the click and simply run from then on. The
+request-field
 drag-reorder SAVES the form — `update` builds the mapping in row order, so the DOM order
 is the stored order. A refused create/save answers **400 with the form re-rendered as
 typed** plus the reason (`_backends_view`/`_users_view`/`_mapping_view` take a `detail`
@@ -1324,6 +1357,20 @@ Injects a short looping idle animation into a rigged GLB for
 the `/ui` inspection view ONLY (`add_idle(glb) → glb`), so bad skin weights show as
 spikes/rings once it deforms. Pure struct/json on the glTF binary, append-only; the
 result route applies it on `?anim=idle`, never to the delivered file.
+
+`admin._glb_stats` reads just the JSON chunk once per artifact render and supplies
+both the geometry line (`_glb_stats_html`) and native clip/skin metadata to
+`_media_tag`. Media Playground results and Job detail GLBs play exported native
+clips directly from the original artifact URL, with play/pause and a selector when
+there are multiple clips. Clip labels are HTML-escaped; selection uses the viewer's
+`availableAnimations` index, never a clip name embedded in JavaScript. Native motion
+never requests `?anim=idle` and does not auto-rotate the camera. Only an inspection
+of a skinned GLB without native clips asks for the diagnostic idle; static meshes
+and unknown/unreadable metadata do not claim to have motion. Inline ES5 controls
+need no newly inserted script, so the existing hoisted model-viewer module also
+covers a queued→done live morph. `tests/test_admin_glb_preview.py` exercises both
+result surfaces with actual stored GLBs, hostile/unnamed clip labels and the
+header-only read boundary.
 
 ### `netscan.py`
 
@@ -1799,7 +1846,7 @@ controller forwards for THIS backend wins over a row that merely claims it (the
 claimant moves), and `prev` (a console rename's old identity) keeps the port across the
 rename — a port that moves takes the URL from under running jobs. Lookups all go
 backend → `host` → controller → service (R-W7, `_host_ctl`, only if `has_service`):
-`modelsync_gate`, `_gated_only_aliases`, `_chain_successor_on`, `host_view`.
+`modelsync_gate`, `_gated_only_aliases`, `host_view`.
 `host_action(name, start|stop|restart_service <bid>|resetup <bid>|forget_unreconciled|
 sync|delete_unknown <paths>)` always answers text ("not driven: …" for a host without a
 controller). `managed_host_refusal(name, entry, new)`: name `[a-z0-9-]` 1–40, not
@@ -2057,7 +2104,7 @@ or a listing. `test_model_sources.Overview`.
 
 ### `ops/`
 
-(not Python — runs on other boxes). Both bootstraps are streamed to the
+Runs on other boxes; gateway modules do not import these helpers. Both bootstraps are streamed to the
 instance and keep everything inside `main()` called on the LAST line (bash reads a
 piped script as it runs and a child reading stdin would swallow the rest; `main` also
 gets `</dev/null`), speak the `GW:` protocol, and never even contain the any-address
@@ -2231,6 +2278,25 @@ changes — that every job reports back as `worker_version`); commit, push and
 `gh release create v<N>` (which starts the billed build) stay the operator's. After each
 release the operator presses Probe.
 
+`ops/comfyui-face-texture/` is a standalone ComfyUI custom-node package, not a
+gateway alias or an Anima integration. Its frontend JSON graph uses native
+`FILE_3D` loaders/viewers and `SaveGLB`; the adapter runs `worker.py` in a
+separate Python 3.12 CPU environment so MediaPipe cannot alter ComfyUI's torch
+dependencies. The installer excludes optional live-audio `sounddevice` from
+that vision-only environment: MediaPipe supports its absence, whereas importing
+it initializes PortAudio/PulseAudio even for image processing on a headless host.
+`face_core.py` renders the actual static Trellis mesh, observes source/photo face
+landmarks and skin/hair masks anew, registers outer eyes/chin, and projects
+only visible face texels with feathered boundaries and four-pixel UV gutters.
+It appends a private face atlas/material and two index partitions to the native
+GLB, preserving its original binary prefix, vertex attributes, every ordered
+triangle, scene transforms and embedded images. Sharing original UVs cannot
+recolor protected body triangles because they keep their original material.
+Unsupported rigged/compressed/multi-primitive inputs fail explicitly.
+`tests/test_face_texture_only.py` guards attribute/triangle preservation,
+shared-UV body isolation, texel centers/gutters and occlusion; it skips when
+the optional worker's scientific dependencies are absent from the gateway venv.
+
 ## Request flow
 
 - **Chat/LLM** (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`,
@@ -2297,7 +2363,7 @@ release the operator presses Probe.
   NanoGPT media catalog ID when no alias exists, filtered to enabled+healthy backends
   (`adapters.cand_kind` == `adapters.backend_kind`); LoRA-aware preference +
   busy→park. Everything the ROUTER reads off a candidate's workflow (image slots for the
-  `images` filter and the shims, the params refusal, the schema, the chain export) goes
+  `images` filter and the shims, the params refusal, the schema) goes
   through `adapters.cand_workflow` — `workflow_json`, else the `workflow:` FILE the adapter
   loads, else None = unknown, which filters nothing: reading a path alias as `{}` dropped
   every reference image (`test_gen_inputs.py`); a
@@ -2308,68 +2374,16 @@ release the operator presses Probe.
   then cancels the worker task, whose adapter stops its OWN prompt (`_stop_prompt`) and
   whose CancelledError arm records a created cloud task on the row; `adapter.cancel(job_id)`
   is the targeted fallback when no worker task exists.
-- **Workflow chains** (`_run_chain`): a gen alias's stage-1 config carries a
-  `successor` (`{alias, export_node, mesh_param, relay?, keep_from_mesh?, rig?}`);
-  stage 1 exports a mesh under a gateway-pinned filename (`gwchain_<jobid>`) and
-  ONLY stage 2's result is delivered (+ any `keep_from_mesh` files). The three
-  backend-specific spots are **adapter hooks**, not branches in the router
-  (`ChainExport` + `chain_export`/`chain_take_mesh`/`chain_feed_mesh`; the base class
-  refuses both roles, so a new backend type is opt-in): ComfyUI pins the export node's
-  `filename_prefix` (extension from pins/mapped params on `file_format`), takes the
-  mesh off `/view` and feeds a PATH (shared disk) or an upload into the stage-2 input
-  dir; a **cloud stage** (`CloudTaskAdapter`, so Meshy AND Tripo) names it
-  `gwchain_<jobid>.glb` with NO pins, takes the `model.glb`
-  RESULT BLOB and feeds it as `req2.upload_files[mesh_param]` (Meshy embeds it as the
-  rigging `model_url` data URI, Tripo uploads it to `/v3/files` and sends the token;
-  `mesh_ref` = `<upload:… (N MB)>` either way). So EITHER stage may be a cloud one, and all nine
-  ComfyUI/Meshy/Tripo × ComfyUI/Meshy/Tripo combinations run: `Meshy-Humanoid` →
-  `mesh-mia`, `Trellis2-…` → `Meshy-Rig` and `Tripo-Humanoid` → `Tripo-Rig` are the
-  same code path. A cloud stage
-  has no shared disk, so `_kind_cloud` on either side FORCES
-  `relay: upload` whatever the alias stored (the editor hides the field); a cloud
-  stage 1 without `glb` in `target_formats`, and a rigging alias (`mod.RIG_ENDPOINT`)
-  as stage 1 at all,
-  are refused by `chain_export` BEFORE credits are spent. `mesh_param` is validated
-  against the successor's mapping (param or label) or — a cloud successor has no
-  mapping — against its file fields (`public_fields()[2]`). A paid stage-1 cloud task
-  keeps its own kind/task id/endpoint/request/sub-tasks/credits under
-  `meta.chain_stage1` (keys `backend, cloud, cloud_task_id, meshy_task_id, endpoint,
-  consumed_credits, request, tasks`; stage 2's
-  are the top-level meta, which would otherwise overwrite them in the merge), and
-  `admin._cloud_table` renders one table per cloud stage — naming the VENDOR from that
-  stage's own meta, because the two stages may be different vendors. `rig` accepts the
-  cloud values `meshy` and `tripo`: tagged on the delivery like the others, but NEVER
-  normalized or validated —
-  `normalize_delivery`/`validate_delivery` run for `generic`/`mixamo` only, a cloud rig
-  follows its vendor's conventions (which bone names a `tripo` one carries is
-  `meta.rig_spec`). Stage 1 gets
-  the normal routing guarantees: candidates re-resolved while parked (force pin +
-  LoRA eligibility kept), misconfigured candidates skipped, connection errors fail
-  over (stage-2/hand-off errors are FINAL). The job row's `backend` is re-pointed
-  at claim and hand-off (`jobs.set_backend`) so cancel interrupts the LIVE backend.
-  Stage-1 params are threaded to the successor by mapping **label** (never the raw
-  node-based name), and `_apply_mapping` SILENTLY skips a name the successor does not
-  bind — so what stage 2 was handed is recorded on the job (`meta.chain_stage2`:
-  alias/backend/relay/mesh_param/mesh_ref/params, plus stage 2's `applied` on success)
-  and rendered by `admin._stage2_section` as handed / applied / dropped. Recorded at
-  run time, never re-derived from config (the mapping may have moved since); written
-  into `jobs.complete`'s meta AND, via `fail_meta()`, onto a failed row — a stage-2
-  failure is when the hand-off matters most. Without it, "did my param reach the
-  rigger?" was only answerable from the backend's own ComfyUI history.
-  Chain stages run with `slot_held` (the chain claims the one slot itself — no
-  double count). Two hand-offs (ComfyUI↔ComfyUI; with a cloud stage the second is
-  forced):
-  `relay: path` (default) keeps both stages on ONE backend (shared disk, one slot
-  held across both — queue-isolated) and passes the mesh's absolute output path;
-  `relay: upload` lets the successor run on a **different** backend — the gateway
-  fetches the mesh (`/view`), uploads it into the stage-2 backend's input dir
-  (`adapter.upload_input` → ComfyUI `/upload/image`) and passes the file's
-  **absolute input-dir path** (backend `comfy_input_dir`, blank = derived from
-  `comfy_output_dir`'s `…/input` sibling) — the successor consumes it exactly like
-  a path hand-off; only with no input dir known does the bare stored name go over
-  (then a load-from-input node is required). Cross-backend releases the stage-1
-  slot AND frees its ComfyUI VRAM once the mesh is in hand, then claims the
-  stage-2 slot.
+- **Independent generation jobs:** each request runs one alias through `_run_job`.
+  Automatic alias handoff was removed on 2026-10-10, together with its configuration,
+  execution hooks, editor and stage metadata; there is no compatibility path.
+  Shrinking or rigging remains available as a separate request. The caller downloads
+  the mesh and submits it via the target alias's normal `files.input_mesh_path`
+  upload, supplying that alias's parameters explicitly. Jobs do not forward params,
+  merge artifacts or transfer backend slots. Each job owns its routing, cancellation,
+  outcome and cloud billing. FBX consumers must retain and bind texture files from
+  the mesh job themselves. Normal ComfyUI file uploads resolve against the explicit
+  backend `comfy_input_dir`; that setting is not an output handoff mechanism.
 
 ## Routing rules (`resolve_routes`/`get_gen_routes` + `alias_entry`)
 
@@ -2421,8 +2435,7 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   between claim and `try` leaked the slot for good. A candidate busy at claim time is
   skipped; if that leaves the job unfinished, `_run_job` returns False and the job parks
   again (`_run_gen_now` → `_run_gen_parked`) with its `state` — tried backends, attempts,
-  execution faults — carried over. The chain claims the same way (busy check → inc →
-  `try` → row updates).
+  execution faults — carried over.
   `concurrency_group` adds an account-wide budget across protocol-specific backend
   ids: `backend_busy` sums inflight for every current member, including disabled/
   draining members, against the lowest finite effective cap. Ungrouped behavior is
@@ -2473,9 +2486,8 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   there, one without gets `_gen_pick`'s 503 carrying the gate texts (`models for
   <alias> are syncing on <backend> (12.3 of 31.0 GB)` / `… blocked on <backend>:
   <reason>`) instead of "no healthy backend" about a backend that is UP. The waiter
-  designation, a force pin and `_entry_can_use` inherit it through `_gen_routes`; the
-  chain's path-relay successor, read from the store, is judged by
-  `_chain_successor_on`. In-memory only (`is_alias_ready`/`alias_status` do no I/O) —
+  designation, a force pin and `_entry_can_use` inherit it through `_gen_routes`.
+  In-memory only (`is_alias_ready`/`alias_status` do no I/O) —
   it runs per waiter × backend in a worker thread. While gated, an alias that runs only
   on managed hosts (`_gated_only_aliases`) reads its schema, image slots and LoRAs empty
   (`host_view`'s `gated_only` says so on the
@@ -2510,7 +2522,7 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   FAILOVER-class errors a cloud task raises after it exists (`_poll`'s ConnectionError
   past `disconnect_grace`, its `max_wait` TimeoutError, a create POST whose answer was
   lost — `_create` marks that `create_unconfirmed` on the trace): `main._billed_cloud_task`
-  makes them FINAL in `_run_job` AND in the chain's stage 1 — no self-retry, no next
+  makes them FINAL in `_run_job` — no self-retry, no next
   candidate, the row names the task id and that it may still run at the vendor. Only
   `CloudTaskRetryable` (vendor-side, zero credits) still retries. A cancelled job's
   CancelledError arm writes the trace too (`jobs.merge_meta`), so a cancelled cloud row
@@ -2613,12 +2625,8 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   the NEXT prompt ran. `_comfy_free(settle_s=…)` therefore polls `/system_stats`'
   `torch_vram_total` (torch's reserved pool, what other processes cannot use) and
   re-posts every 2 s until it dropped to ≤ 20 %, else reports False after 30 s
-  (`test_run_job_failover.py::ComfyFreeSettles`). It is also the only hook that sits between two CHAIN stages — two
-  workflows on one backend with no job end in between (measured 2026-09-05, job
-  `cc604da29e0e`, Meshy→`mesh-mia` on k12-gpu: stage 2 died on
-  `CUDA out of memory. Tried to allocate 20.00 MiB` with 21.4 of 23.5 GiB held by
-  the ComfyUI process, and Make-It-Animatable runs in its OWN venv/process, so it can
-  never share that cache). The after-job free (`_free_comfy_vram`, flag
+  (`test_run_job_failover.py::ComfyFreeSettles`).
+  The after-job free (`_free_comfy_vram`, flag
   `comfy_free_after_job`, default on for shared hosts only — all four host flags and
   their defaults live in ONE table, `scheduler.HOST_FLAGS`, read by `main._host_flag`,
   the console's host form/panel and `host_save`, and `host_save` derives "shared" from
@@ -2627,8 +2635,8 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   next llama-swap load aborts — and skips when the waiter the scheduler will hand
   this backend next (`_designated_gen_waiter`, so `exclude`/force/LoRA eligibility
   apply) wants the alias its VRAM holds. Asking the scheduler, not scanning the queue
-  by alias, is what keeps a waiter that can never run here (a chain that excluded the
-  backend after a failed stage 1) from suppressing the free forever
+  by alias, is what keeps a waiter excluded from this backend after a failed attempt
+  from suppressing the free forever
   (`test_run_job_failover.py::FreeAfterJob`).
 
 ## Auth / multi-user
@@ -2769,6 +2777,7 @@ the /ui origin, so `admin._audio_headers` plays only `audio/*` and turns anythin
 ## Tests — what each one guards
 
 Every test file also says this in its own docstring; this is the overview.
+
 - `test_arliai.py`: checkpoint pins, client/default precedence, exact pixel boundary,
   real PNG delivery, malformed results and final uncertain SDNext submits.
 - `test_arliai_console.py`: account-specific checkpoint saves, invalid saves preserving
@@ -2793,15 +2802,15 @@ Every test file also says this in its own docstring; this is the overview.
   unchanged-cache route recovery, YAML job activation with startup-only paths,
   alias precedence and account-safe/idempotent store/config name migration,
   including later collisions and orphaned legacy references.
-
+  The media-picker regression covers selected 3D model retention through pending
+  and failed discovery, blocked stale routes and successful recovery.
 
 `ls tests/test_*.py` is the count of record (seventy-eight files on 2026-10-03). There
 is no blanket suite on purpose: each file exists because the mechanism it guards fails
 SILENTLY — the result looks plausible, nothing raises.
 `test_anthropic_bridge.py`, `test_prune_branch.py` (a
 dead-branch prune that cascades one node too far or too few surfaces as an aborted
-generation, not an exception), `test_chain_export_node.py`, `test_chain_hooks.py`,
-`test_chain_mesh_param.py`, `test_ratelimit_headers.py`, `test_scheduler.py`,
+generation, not an exception), `test_ratelimit_headers.py`, `test_scheduler.py`,
 `test_admin_live.py`, `test_err_text.py`, `test_gen_backend_for.py`,
 `test_playground_files.py`, `test_meshy.py`, `test_meshy_adapter.py` — plus the four
 the Tripo backend brought:
@@ -2809,8 +2818,6 @@ the Tripo backend brought:
 a missing `opt__<key>`, a type parsed wrong — does not error, it silently saves that
 key's DEFAULT, so an alias's textures quietly turn off on the next Save);
 `test_tripo.py` (the pure builder/parser: a body Tripo REJECTS costs a round trip, but
-  The media-picker regression covers selected 3D model retention through pending
-  and failed discovery, blocked stale routes and successful recovery.
 one it accepts with the wrong face cap, texture bucket or rig type delivers a
 plausible WRONG mesh — and a task status treated as "not finished yet" instead of
 terminal polls to `max_wait` holding the slot);
@@ -2972,7 +2979,7 @@ fleet. Pins `_clamp_ttl` to `jobs.max_ttl_s` and the 503 with `Retry-After` from
 node LINK in ComfyUI's API format and rewires the graph; a path in a mapped file field
 reads any file ComfyUI can read — another job's output included — and delivers it as a
 harmless-looking result. Pins that the injector skips lists and mismatched dicts,
-`_client_param_refusal`'s 400 for stage 1 and successor, backend paths only for an
+`_client_param_refusal`'s 400 for the requested alias, backend paths only for an
 admin key, bootstrap-open or `client_path: true` (a Mapping checkbox), only VALUES that
 name a file judged (`quad`, `5000` pass), the same 400 for a list prompt, and that
 `mesh_format`-style settings are no file fields).
@@ -3085,6 +3092,10 @@ no exceptions), crawls the rendered pages
 every action URL — the HTML escape split `a&b` into `a` + `amp;b` and ran the action on
 another alias — and that the Mapping editor keeps typed edits across Update workflow, a
 refused file, drag-reorder and a refused rename).
+`test_workflow_diff.py` (Update workflow asks first: the diff names added/removed/
+changed nodes, value vs link changes and the bindings that would go stale — judged on the
+editor's TYPED bindings; the preview never writes the store; the editor carries the
+dialog and its script, since a later page state cannot insert one).
 `test_ui_form_validation.py` (create/save forms refuse out loud and overwrite nothing: a
 taken name used to REPLACE or MERGE the existing chat alias/user/backend/media alias,
 and "1.5"/"-1"/"1e3" became an UNLIMITED cap or quota. Each refusal is a 400 with the
@@ -3250,7 +3261,7 @@ private name);
 ComfyUI backend is healthy, free and a perfect candidate, and a job routed there comes
 back as a plausible "value not in list". Pins leaving `ready` AND `allc`, other
 backends untouched, a force pin not bypassing it, `_entry_can_use` following, the
-chain's path-relay successor, the lookup through the backend's `host`, and the 503
+lookup through the backend's `host`, and the 503
 carrying the sync progress or the block reason instead of "no healthy backend");
 `test_modelsrc_serve.py` (the forced command on the share host, run by subprocess
 against a tmp share: a path escaping the share hands out /etc as model bytes,
@@ -3332,6 +3343,6 @@ GPU billing, a queued job without a CUDA-13 worker holds the slot for the whole
 `max_wait`, a manifest read unlike `/view` delivers less than asked, and the workflow
 must equal a local ComfyUI's; pins the status table, the two clocks, the settled/unconfirmed
 trace and `main._billed_cloud_task`, a COMPLETED result found while giving up, the
-startup orphan cancel, the probe record's endpoint check, the chain refusal, the name
+startup orphan cancel, the probe record's endpoint check, the name
 clash and the url rule).
 Run them all with `python -m unittest discover -s tests -t .` (no runner dependency).

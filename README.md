@@ -1056,9 +1056,9 @@ alias option **animations**, Meshy's `walking.*` / `running.*` clips as extra re
 A missing file, or one that is not a binary glTF (sniffed by magic, so a renamed OBJ
 is caught), is refused *before* the task is created and costs nothing.
 
-A Meshy alias can also be **either stage of a workflow chain** — a Meshy mesh rigged by
-a local ComfyUI rigger, or a locally generated mesh rigged by `Meshy-Rig` (or by
-`Tripo-Rig`, see below); see [Workflow chains](#workflow-chains-successor-aliases).
+A mesh result can be rigged in a separate request to a local ComfyUI rigger,
+`Meshy-Rig` or `Tripo-Rig`. The caller downloads the result and submits it through
+the rigging alias's normal `files.input_mesh_path` upload.
 
 *Console note:* since Tripo joined, **one** schema-driven editor serves every cloud
 alias, and its form posts to `/ui/mapping/cloud-update`. The Meshy-only
@@ -1180,12 +1180,12 @@ V3, so the task finishes and is billed.
 
 The Tripo alias set this is built for (register them in **Aliases › Media**):
 
-| Alias | Task | Tripo endpoint | Successor |
-|---|---|---|---|
-| `Tripo-Object` | `img2mesh` | image-to-model | – |
-| `Tripo-Multiview` | `img2mesh` | multiview-to-model (front + ≥1 more view) | – |
-| `Tripo-Humanoid` | `img2mesh` | image-to-model, `face_limit: 150000` | `Tripo-Rig` · `input_mesh_path` · `rig: tripo` |
-| `Tripo-Rig` | `mesh2rig` | rig (`spec: mixamo`) | – |
+| Alias | Task | Tripo endpoint |
+|---|---|---|
+| `Tripo-Object` | `img2mesh` | image-to-model |
+| `Tripo-Multiview` | `img2mesh` | multiview-to-model (front + ≥1 more view) |
+| `Tripo-Humanoid` | `img2mesh` | image-to-model, `face_limit: 150000` |
+| `Tripo-Rig` | `mesh2rig` | rig (`spec: mixamo`) |
 
 ### RunPod Serverless (ComfyUI workflows, pay per second)
 
@@ -1253,8 +1253,8 @@ Behaviour worth knowing:
 
 Milestone 1 limits: files travel **base64 inside the request/response** — all inputs
 together ≤ 9 MB, outputs ≤ 7 MB (images and small files; larger ones fail with a message
-naming the limit); **no 3D, no video**; a RunPod backend cannot be a **chain** stage; one
-workflow image profile (Qwen-Image 2.1 nodes); the cost figure is an estimate only.
+naming the limit); **no 3D, no video**; one workflow image profile (Qwen-Image 2.1
+nodes); the cost figure is an estimate only.
 
 ### RunPod volumes
 
@@ -1373,6 +1373,11 @@ Key mapping concepts:
   the same alias can use a different checkpoint on each GPU while looking
   identical from outside. A request param that targets a pinned node/field is
   **ignored** — a pin is authoritative; the API can't override it.
+  Enum pins (sampler, pipeline type, resolution, etc.) offer the backend's
+  `/object_info` choices even on non-loader nodes; numeric choices remain numbers
+  on save, including zero. Unlisted saved choices stay selected and marked stale,
+  never silently replaced. A backend that cannot answer borrows the available
+  candidate's definitions, as with model dropdowns.
 - **Image input slots** (a `LoadImage` / `LoadImageMask` node) become file-upload
   request fields. The Aliases media editor picks one of three behaviours per slot for a
   request that sends no image:
@@ -1404,53 +1409,68 @@ Key mapping concepts:
 - **Numeric fields** (strength, steps, cfg) render with `min`/`max`/`step` pulled
   live from `/object_info`.
 
-### Workflow chains (successor aliases)
+### Independent mesh, shrink and rigging jobs
 
-A generation alias can carry a **`successor`**: a second alias the gateway runs on the
-first stage's mesh, delivering only the second stage's result (plus any
-`keep_from_mesh` files of the first). Both stages may be either backend kind — the
-stage-specific parts (how the mesh is exported, taken and fed) are adapter hooks:
+Each generation request runs one alias and delivers that alias's output. To shrink
+or rig a generated mesh, the caller downloads the desired result and submits a
+new request to `mesh-shrink`, `mesh-shrink-quad`, `mesh-rig-unirig`, `mesh-mia`,
+`Meshy-Rig` or `Tripo-Rig`, using the normal `files.input_mesh_path` upload.
+Parameters belong to the requested alias; they are not forwarded to another job.
+Each request has its own job id, scheduling, cancellation and cloud billing.
 
-| stage 1 | stage 2 | hand-off |
+When using an FBX rigger, the caller must retain the mesh job's texture files and
+bind them to the rigged asset as needed: separate jobs do not merge their results.
+Cloud rigging deliveries carry `rig: meshy` or `rig: tripo` and follow the vendor's
+conventions without local texture normalization or rig validation.
+
+**UniRig on Ampere GPUs (verified on RTX 3090).** Use the official, matched
+[`spconv-cu126==2.3.8`](https://pypi.org/project/spconv-cu126/2.3.8/) and
+[`cumm-cu126==0.7.11`](https://pypi.org/project/cumm-cu126/0.7.11/) wheels in
+UniRig's isolated environment, with a backend pin on `UniRigLoadModel.precision`
+set to `fp16`. `auto` selects BF16 on an RTX 3090, which this spconv pair does
+not support. These wheels do not depend on the PyTorch binary; ComfyUI's
+CUDA-13 torch environment need not be downgraded.
+For a rebuild, remove `cumm` and `spconv` from the node pack's
+`nodes/comfy-env.toml` `[cuda].packages` and pin the two official packages in
+`[pypi-dependencies]`. Uninstall the old `cumm`/`spconv` distributions before
+installing the replacements: both package families own the same import paths.
+The CUDA-13 `cuda-wheels` builds tested on 2026-10-13 omitted native `sm_86`
+kernels and failed NVRTC compilation with incompatible bundled TensorView/CCCL
+headers (`cuda/std/cassert`); merely installing more CUDA headers was not enough.
+
+Example Meshy aliases (register them in **Aliases › Media**):
+
+| Alias | Task | Meshy endpoint |
 |---|---|---|
-| ComfyUI | ComfyUI | the mesh's absolute path on a shared disk (`relay: path`), or an upload into the stage-2 backend's input dir (`relay: upload`) |
-| ComfyUI | Meshy (`Meshy-Rig`) | the mesh bytes ride in the rigging request as its `model_url` |
-| ComfyUI | Tripo (`Tripo-Rig`) | the mesh bytes are uploaded to `/v3/files` and ride in the rig request as their file token |
-| Meshy | ComfyUI (`mesh-mia`, `mesh-rig-unirig`) | the mesh comes back as a result blob and is uploaded into the rigger's input dir |
-| Tripo | ComfyUI (`mesh-mia`, `mesh-rig-unirig`) | as above |
-| Meshy | Meshy, or Tripo (`Tripo-Rig`) | as above, bytes in the second stage's request |
-| Tripo | Tripo (`Tripo-Rig`), or Meshy | as above |
+| `Meshy-Object`, `Meshy-Multiview` | `img2mesh` | image-to-3d / multi-image-to-3d |
+| `Meshy-Humanoid` | `img2mesh` | image-to-3d, `pose_mode: t-pose` |
+| `Meshy-Humanoid-Multiview` | `img2mesh` | multi-image-to-3d, `pose_mode: t-pose` |
+| `Meshy-Humanoid-Cloud` | `img2mesh` | image-to-3d, `pose_mode: t-pose` |
+| `Meshy-Rig` | `mesh2rig` | rigging |
 
-A **cloud stage (Meshy, Tripo) shares no disk with anything**, so with a cloud alias on
-**either** side the gateway forces `relay: upload` whatever the alias stored (the editor
-hides the field for a cloud stage 1). A cloud stage 1 must deliver `glb` — otherwise the
-job is refused up front, before credits are spent — and a rigging alias (Meshy's
-`rigging`, Tripo's `rig`) cannot be stage 1 at all (it rigs an existing mesh and would
-have no way to obtain one). `successor.mesh_param` must be a request field of the
-successor: a mapped param or label on a ComfyUI alias, a **file field** on a cloud one
-(`input_mesh_path` for both kinds). Stage-1 params are threaded on, so a
-`Meshy-Humanoid-Cloud` request can carry `input_height_m` for the rigging stage, and a
-`Tripo-Humanoid` one an `input_rig_type`.
+### Standalone ComfyUI face-texture workflow
 
-`successor.rig` tags the delivery for the client. `mixamo`/`generic` are additionally
-normalized (texture V-flip, optional JPEG) and validated at chain level; the cloud
-values **`meshy`** and **`tripo`** are only tagged — a cloud rig follows its vendor's
-own conventions, and re-flipping or validating it against ComfyUI-shaped rules would
-only break it. (Which bone names a `tripo` delivery carries is `meta.rig_spec`.) A cloud
-stage of a chain keeps its own task id, request, sub-tasks and credits on the job
-(`meta.chain_stage1` for stage 1, the top-level meta for stage 2), so the Media Jobs
-view shows one table per cloud stage — and the two stages may be different vendors.
+[`ops/comfyui-face-texture/`](ops/comfyui-face-texture/) contains an optional
+`FaceTextureOnly` custom node and a **frontend workflow**, not just API JSON.
+Copy that directory into ComfyUI's `custom_nodes/ComfyUI-FaceTextureOnly`,
+run `bash install-worker.sh` there, and restart ComfyUI when its queue is idle.
+The installer uses a separate Python 3.12 CPU environment; it does not change
+ComfyUI's Python/torch packages. Python 3.12 or `uv` is required.
 
-The Meshy alias set this is built for (register them in **Aliases › Media**; the
-successor column is the chain config above):
+Open `workflows/face-texture-only.json` in ComfyUI, upload the original
+static textured Trellis GLB and its matching frontal RGB image, then Run.
+The graph shows the source model, reference image, texture node, corrected
+3D viewer, before/after image and `SaveGLB` output (`3d/FaceTextureOnly_*`).
+Replace the example input filenames with your own uploads.
 
-| Alias | Task | Meshy endpoint | Successor |
-|---|---|---|---|
-| `Meshy-Object`, `Meshy-Multiview` | `img2mesh` | image-to-3d / multi-image-to-3d | – |
-| `Meshy-Humanoid` | `img2mesh` | image-to-3d, `pose_mode: t-pose` | `mesh-mia` · `input_mesh_path` · `rig: mixamo` |
-| `Meshy-Humanoid-Multiview` | `img2mesh` | multi-image-to-3d, `pose_mode: t-pose` | as above |
-| `Meshy-Humanoid-Cloud` | `img2mesh` | image-to-3d, `pose_mode: t-pose` | `Meshy-Rig` · `input_mesh_path` · `rig: meshy` |
-| `Meshy-Rig` | `mesh2rig` | rigging | – |
+The node detects and registers the face anew, then projects the photograph
+only onto visible face triangles with feathered skin/hair masks. Original
+positions, UVs, triangle winding and embedded images remain unchanged;
+a private face material prevents shared UVs from recoloring the body.
+It does not improve geometry or recover details absent from the photograph.
+The source must have one unskinned, opaque, uncompressed mesh primitive with
+embedded PNG/JPEG textures. This is a standalone ComfyUI tool:
+**no AI-Hub alias is registered or modified, and no Anima integration is added.**
 
 ### LoRAs
 
@@ -1587,6 +1607,7 @@ aliases are unchanged. Run it before rigging, not on normal maps or already-rigg
 meshes. It preserves geometry rather than generating a new face or mesh.
 See [the concrete Anima-Versa handoff](docs/anima-versa-face-retexture.md)
 for authenticated downloads, the async request, supported GLBs and installation.
+
 
 ---
 
@@ -2243,6 +2264,13 @@ reached) — the time of the last good update, i.e. how old the numbers are. The
 Media Jobs list is always live (every 15 s when idle, so a job started from another
 client shows up without F5), sortable like the other lists, and pages back through
 older jobs 100 at a time (`older →`).
+
+**Animated GLB previews** in Media Playground and Media Job detail play the file's
+own animation, with a play/pause checkbox and clip selection when the file contains
+multiple animations. The camera stays still while motion plays; you can orbit it
+manually. For a rigged GLB with no animation, the Playground inspection still offers
+the diagnostic idle that reveals bad skin weights. That idle is preview-only —
+downloads always keep the original artifact.
 
 ---
 

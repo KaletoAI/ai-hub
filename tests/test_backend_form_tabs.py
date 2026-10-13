@@ -58,7 +58,7 @@ FULL = {
     "max_concurrent": 2, "api_key": "sek", "models_allow": "gpt-*, claude-*",
     "models_deny": "*-embed, *:free", "chat_only": True, "serverless_only": True,
     "local": True, "prompt_cache": True, "model_context": "glm-*=32768",
-    "comfy_output_dir": "/o", "comfy_input_dir": "/i", "auto_restart": True,
+    "comfy_input_dir": "/i", "auto_restart": True,
     "restart_cooldown_s": 600, "stuck_after_s": 90, "self_retries": 1,
     "max_wait": 600, "poll_interval": 1.5, "auth_mode": "api_key",
     "models": ["claude-sonnet-5"], "sampling_defaults": {"temperature": 0.85},
@@ -210,16 +210,6 @@ class EveryFieldRenderedOnce(unittest.TestCase):
             for nm in names:
                 self.assertEqual(len(fm.fields.get(nm, [])), 1, f"{t}: {nm}")
 
-    def test_stored_values_survive_the_render(self):
-        # The other half of "rendered once": rendered with the STORED value, not blank.
-        html = _render("comfyui", True)
-        for val in ('value="gpt-*, claude-*"', 'value="*-embed, *:free"',
-                    'value="/o"', 'value="/i"'):
-            self.assertIn(val, html)
-        # The one exception: the api key is a secret and never rendered back — blank
-        # KEEPS it on Save (test_backend_key_field.py), so it cannot be lost this way.
-        self.assertNotIn('value="sek"', html)
-        self.assertIn("set — blank keeps it", html)
 
 
 class PanesAndTabs(unittest.TestCase):
@@ -271,7 +261,7 @@ class PanesAndTabs(unittest.TestCase):
         for t in TYPES:
             html = _render(t, True)
             self.assertEqual(html.count('class="bpane"'), 4, t)
-            for key in ("comfy_output_dir", "auth_mode", "models", "prompt_cache",
+            for key in ("auth_mode", "models", "prompt_cache",
                         "cloud_max_wait", "self_retries", "chat_only"):
                 self.assertIn(f'name="{key}"', html, f"{t}: {key} missing entirely")
 

@@ -71,10 +71,9 @@ _COMFY_RESTART_WAIT_S = 120.0      # restart(): max wait for the server to come 
 def _upload_timeout_for(nbytes: int) -> float:
     """Seconds to allow one ComfyUI `/upload/image` POST of `nbytes`.
 
-    A flat 20 s was sized for LAN image posts, but the chain relays MESHES through the
-    same endpoint: measured 2026-09-02 on prod, a no-remesh Meshy humanoid came back at
-    70 MB — on a 20 s budget that upload is a coin flip, and a lost mesh fails the whole
-    (already paid for) chain. Budget a conservative 1 MiB/s on top of the flat floor."""
+    Large mesh uploads use the same endpoint as LAN images. A measured 70 MB
+    mesh cannot reliably finish on a flat 20 s budget. Allow a conservative
+    1 MiB/s on top of the flat floor."""
     return max(_UPLOAD_TIMEOUT, 20.0 + max(0, nbytes) / (1024 * 1024))
 
 
@@ -452,7 +451,7 @@ class NormalizedRequest:
                                                     # NAME is rebuilt from `upload_prefix` (see below).
     upload_prefix: str = ""                         # job-unique namespace for EVERY input file this request
                                                     # uploads (`<prefix>_<param>.<ext>`). Filled from the job
-                                                    # id by run_generation/_run_chain; blank → the adapter
+                                                    # id by run_generation; blank → the adapter
                                                     # mints a random one. NEVER a name shared between jobs:
                                                     # ComfyUI opens an input file at EXECUTION time, so a
                                                     # queued prompt reads whatever bytes sit under that name
@@ -471,7 +470,7 @@ class NormalizedRequest:
     cloud: Optional[dict] = None                    # cloud alias candidate block {endpoint, options} of
                                                     # whatever kind — `cloud_block(cand)`; None on ComfyUI
                                                     # candidates
-    slot_held: bool = False                         # caller already holds the in-flight slot (chain) —
+    slot_held: bool = False                         # caller already holds the in-flight slot —
                                                     # generate() must not inc/dec it a second time
     job_id: str = ""                                # the job row this request runs for. Only live progress
                                                     # uses it (ctx.note_progress keys on it); blank simply
@@ -537,17 +536,6 @@ class GenOutput:
     """Result of a generation dispatch: the artifacts plus run metadata."""
     blobs: list[GenBlob]
     meta: dict = field(default_factory=dict)
-
-
-@dataclass
-class ChainExport:
-    """What a stage-1 adapter contributes before the chain runs: the name the mesh
-    will have (`mesh_name`), pins the stage-1 request needs (`extra_fixed`) and, when
-    the candidate cannot be a stage 1 as configured, a NAMED `error` — the chain fails
-    the job with it before any GPU-minutes or credits are spent."""
-    mesh_name: str
-    extra_fixed: list = field(default_factory=list)
-    error: Optional[str] = None
 
 
 @dataclass
@@ -665,20 +653,6 @@ class BackendAdapter(ABC):
         Default: nothing."""
         return None
 
-    # ── workflow chains (main._run_chain) — the three places a stage is backend-specific ──
-    def chain_export(self, cand: dict, succ: dict, params: dict, prefix: str) -> ChainExport:
-        """Stage 1: how this backend will name/export the mesh. Default: not a stage 1."""
-        return ChainExport("", error=f"a {self.type} backend cannot be a chain stage 1")
-
-    async def chain_take_mesh(self, out: GenOutput, export: ChainExport, want_bytes: bool) -> Optional[bytes]:
-        """Stage 1: the produced mesh (bytes; b'' when only existence is asked for), None if absent."""
-        return None
-
-    async def chain_feed_mesh(self, req2: NormalizedRequest, backend2: dict, mesh_param: str,
-                              mesh_name: str, mesh_bytes: Optional[bytes], outdir: str) -> str:
-        """Stage 2: put the mesh where THIS backend reads it and return the `mesh_ref`
-        recorded on the job (a path, or a marker for an embedded upload)."""
-        raise RuntimeError(f"a {self.type} backend cannot be a chain stage 2")
 
 
 # ── OpenAI-compatible adapter (the only one in Phase 0) ───────────────────────
@@ -1932,8 +1906,8 @@ def normalize_delivery(blobs: list, rig: Optional[str],
     is the ONE place that corrects this, so every consumer renders the pair
     as delivered, without client-side compensation. All PNGs of a generic
     delivery share the FBX's UV set (basecolor, metallic, …), so all are
-    flipped. A blob flag guards against double application (the adapter
-    normalizes case deliveries, the chain level normalizes the combined one).
+    flipped. A blob flag guards against double application when a delivery is
+    normalized more than once.
     A failed normalize delivers the original bytes instead of failing the job.
 
     `texture_format="jpeg"` (alias Output option) additionally transcodes the
@@ -2135,10 +2109,6 @@ def final_output_node(wf: dict) -> Optional[str]:
     node (trellis2_high 82→83, low 100→101, Pixal3D 312→317, hunyuan3d 50→51,
     mesh-shrink 30→31). Core save nodes carry their own `ui` dict and have no
     such consumer, so they stay themselves (triposplat's SaveGLB 107).
-
-    NOTE this is the DELIVERY node only. A chain's `successor.export_node` stays
-    the EXPORT node (82/100/312/50) — that is where the gateway pins
-    `filename_prefix`, which a preview node has no field for.
 
     Backs the auto delivery mode and the registration pre-fill; None when the
     workflow declares neither title."""
@@ -2830,8 +2800,7 @@ def suggest_mapping(wf: dict) -> dict:
     # Every REMAINING node titled `input_<name>` is a declared bind point (the mesh
     # workflows follow this strictly — see sample_comfyui_workflows/README.md): the
     # title IS the param's public name, so bind it under the title AND set it as the
-    # label — labels are the stable cross-stage names a chain threads params by
-    # (raw `value` collides between stages). Nodes already bound above (prompt /
+    # label, giving clients a stable public name. Nodes already bound above (prompt /
     # width / seed / …) keep their conventional param name; multi-field nodes (a
     # LoRA stack) are skipped — those are placed by _apply_lora_*.
     bound = {(b or {}).get("node") for b in m.values()}
@@ -2926,23 +2895,13 @@ def _gen_values(req: NormalizedRequest) -> dict:
 
 
 def comfy_input_dir(backend: dict) -> str:
-    """The absolute path of a ComfyUI backend's input directory (as the ComfyUI
-    process sees it): explicit `comfy_input_dir`, else derived as the sibling of
-    `comfy_output_dir` (…/output → …/input — ComfyUI's standard layout).
-    '' when neither is known."""
-    d = (backend.get("comfy_input_dir") or "").rstrip("/")
-    if d:
-        return d
-    out = (backend.get("comfy_output_dir") or "").rstrip("/")
-    if out.endswith("/output"):
-        return out[:-len("output")] + "input"
-    return ""
+    """The explicitly configured input directory as the ComfyUI process sees it."""
+    return (backend.get("comfy_input_dir") or "").rstrip("/")
 
 
 def input_path_ref(backend: dict, stored: str) -> str:
-    """What a mesh param receives after an upload hand-off: the uploaded file's
-    ABSOLUTE path in that backend's input dir, so the workflow loads it exactly like
-    a shared-disk path (no load-from-input node needed). Falls back to the bare
+    """The uploaded file's absolute path in this backend's input dir, so the
+    workflow can load it without a load-from-input node. Falls back to the bare
     stored name when no input dir is known — only a load-from-input node can
     resolve that."""
     indir = comfy_input_dir(backend)
@@ -3023,7 +2982,7 @@ class ComfyIO(GenIO):
     def files_unsupported(self) -> Optional[str]:
         if comfy_input_dir(self.a.backend):
             return None
-        return (f"backend '{self.a.name}' has no comfy_input_dir/comfy_output_dir "
+        return (f"backend '{self.a.name}' has no comfy_input_dir "
                 "— cannot resolve uploaded file to an absolute path")
 
     def input_ref(self, stored: str) -> str:
@@ -3278,11 +3237,9 @@ class ComfyUIAdapter(BackendAdapter):
 
     async def upload_input(self, data: bytes, name: str,
                            content_type: str = "application/octet-stream") -> str:
-        """Upload an arbitrary file (a chain's intermediate mesh) into this backend's
-        ComfyUI input dir and return the stored name. Lets a two-stage chain relay
-        stage 1's mesh to a stage-2 backend that does NOT share disk — the successor
-        workflow then loads it from input/ by this name (overwrite=true, one slot).
-        Raises on failure (a lost mesh must fail the chain, not run stage 2 blind)."""
+        """Upload an arbitrary input file into this backend's ComfyUI input dir
+        and return its stored name. Raises on failure rather than letting a
+        workflow run against an absent or stale input."""
         async with _pooled_client(self.ctx) as c:
             r = await self._post_upload(c, data, name, content_type)
         if r.status_code != 200:
@@ -3293,108 +3250,6 @@ class ComfyUIAdapter(BackendAdapter):
         nm = j.get("name", name)
         return f"{sub}/{nm}" if sub else nm
 
-    # ── Chain hand-off primitives (keep ComfyUI's filename/output conventions out of
-    #    main._run_chain so chains stay adapter-agnostic; siblings of upload_input) ──
-    @staticmethod
-    def export_pin(node: str, prefix: str) -> dict:
-        """The `fixed` pin that makes an export/save node write under a known prefix."""
-        return {"node": node, "field": "filename_prefix", "value": prefix}
-
-    @staticmethod
-    def export_node_error(wf: dict, node: Optional[str]) -> Optional[str]:
-        """Why `node` cannot serve as a chain's stage-1 export node — None if it can.
-
-        The pin from `export_pin` is what makes stage 1 write under OUR filename, and
-        `_apply_fixed` silently drops a binding whose `(node, field)` isn't there. So a
-        node without a `filename_prefix` input keeps its own name, stage 1 runs to
-        completion (tens of GPU-minutes for a mesh) and only the /view fetch afterwards
-        reports 'produced no mesh' — pointing at the export node instead of at the whole
-        wasted run. Node ids drift when a workflow is rebuilt (measured 2026-08-31: a
-        multi-view Trellis2 alias inherited `export_node: 82` from the revision where 82
-        WAS the export node; there it is the model loader), so name the node's real class
-        and list the workflow's actual export candidates."""
-        n = wf.get(node) if node else None
-        if not isinstance(n, dict):
-            return f"chain export node '{node}' is not in the mesh workflow"
-        if "filename_prefix" in (n.get("inputs") or {}):
-            return None
-        cls = n.get("class_type") or "?"
-        title = ((n.get("_meta") or {}).get("title") or "").strip()
-        cands = [f"{nid} ({(nn.get('class_type') or '?')}"
-                 + (f" '{t}'" if (t := ((nn.get("_meta") or {}).get("title") or "").strip()) else "")
-                 + ")"
-                 for nid, nn in sorted(wf.items(), key=lambda kv: (not str(kv[0]).isdigit(),
-                                                                   int(kv[0]) if str(kv[0]).isdigit() else 0,
-                                                                   str(kv[0])))
-                 if isinstance(nn, dict) and "filename_prefix" in (nn.get("inputs") or {})]
-        hint = ("; the workflow's export/save nodes are " + ", ".join(cands[:4])
-                if cands else "; this workflow has no node with a 'filename_prefix' input")
-        return (f"chain export node '{node}' is a {cls}"
-                + (f" '{title}'" if title else "")
-                + " with no 'filename_prefix' input — it cannot be pinned, so stage 1 "
-                  "would keep its own output name" + hint)
-
-    @staticmethod
-    def pinned_output_name(prefix: str, ext: str) -> str:
-        """The file an export node writes for `filename_prefix=prefix`: ComfyUI's %05d
-        counter, and a fresh prefix always yields `_00001_`."""
-        return f"{prefix}_00001_.{ext}"
-
-    async def fetch_output(self, name: str, *, want_bytes: bool = True) -> Optional[bytes]:
-        """Fetch a produced output file from ComfyUI /view by name. Returns its bytes
-        (want_bytes), or b"" for an existence-only check (a cheap 1-byte Range GET — the
-        caller only needs to know the file is there); None if absent (404); raises on any
-        other status (a backend error must not read as 'file missing')."""
-        url = self.backend["url"].rstrip("/")
-        headers = None if want_bytes else {"Range": "bytes=0-0"}
-        async with _pooled_client(self.ctx) as c:
-            r = await c.get(f"{url}/view", params={"filename": name, "type": "output"},
-                            headers=headers, timeout=30.0)
-        if r.status_code in (200, 206):
-            return r.content if want_bytes else b""
-        if r.status_code == 404:
-            return None
-        raise RuntimeError(f"/view '{name}' → HTTP {r.status_code}")
-
-    # ── the chain roles, built from the primitives above (main._run_chain calls these) ──
-    def chain_export(self, cand: dict, succ: dict, params: dict, prefix: str) -> ChainExport:
-        """Stage 1 on ComfyUI: pin the export node's `filename_prefix` and predict the
-        name it writes. A node that cannot be pinned is refused HERE — `_apply_fixed`
-        drops such a binding silently, so stage 1 would run to completion (tens of
-        GPU-minutes) under its own name and only the /view fetch would notice."""
-        wf = cand_workflow(cand) or {}
-        node = str(succ.get("export_node") or "").strip()
-        why = self.export_node_error(wf, node)
-        if why:
-            return ChainExport("", error=why)
-        # The extension is what ComfyUI will WRITE: the node's file_format as applied —
-        # a mapped request param overrides the workflow value, an admin pin beats both.
-        ext = str(((wf.get(node) or {}).get("inputs") or {}).get("file_format") or "glb")
-        for p, m in (cand.get("mapping") or {}).items():
-            m = m or {}
-            if str(m.get("node")) == node and m.get("field") == "file_format":
-                v = params.get(p)
-                if v in (None, "") and (m.get("label") or "").strip():
-                    v = params.get((m.get("label") or "").strip())
-                if v not in (None, ""):
-                    ext = str(v)
-        for fx in (cand.get("fixed") or []):
-            if (str(fx.get("node")) == node and fx.get("field") == "file_format"
-                    and fx.get("value") not in (None, "")):
-                ext = str(fx["value"])
-        return ChainExport(self.pinned_output_name(prefix, ext), [self.export_pin(node, prefix)])
-
-    async def chain_take_mesh(self, out: GenOutput, export: ChainExport, want_bytes: bool) -> Optional[bytes]:
-        """Stage 1's mesh comes off the backend's disk, not out of the response: the
-        export node wrote it under our pinned name (existence-only = cheap Range GET)."""
-        return await self.fetch_output(export.mesh_name, want_bytes=want_bytes)
-
-    async def chain_feed_mesh(self, req2, backend2, mesh_param, mesh_name, mesh_bytes, outdir) -> str:
-        """Stage 2 on ComfyUI reads a FILE: either the shared-disk output path (path
-        relay, no bytes travelled) or the mesh uploaded into this backend's input dir."""
-        if mesh_bytes is None:                       # path relay: shared disk, absolute path
-            return f"{outdir}/{mesh_name}"
-        return input_path_ref(backend2, await self.upload_input(mesh_bytes, mesh_name))
 
     async def _resolve_image_sentinels(self, fixed: list, io: Optional["GenIO"] = None) -> list:
         """Replace the placeholder sentinel in fixed bindings with the uploaded 8×8
@@ -4592,45 +4447,6 @@ class CloudTaskAdapter(BackendAdapter):
             raise RuntimeError(f"asset download failed ({r.status_code}) for {url.split('?')[0]}")
         return r.content
 
-    # ── the chain roles (main._run_chain calls these) ─────────────────────────
-    def chain_export(self, cand: dict, succ: dict, params: dict, prefix: str) -> ChainExport:
-        """Stage 1 in the cloud: nothing to pin — the mesh comes back as a RESULT BLOB, not
-        off a disk, so the name is ours to choose (it only labels the hand-off upload).
-        A task that does not deliver glb is refused here, before credits are spent: the
-        successor is fed a glb, and the vendor bills the task either way."""
-        mod = self.mod
-        if mod.endpoint_of(cand) == mod.RIG_ENDPOINT:
-            # A rigging alias is a stage-2 product: it delivers `rigged.glb`, and its
-            # request needs a mesh it has no way to get here. Refused by name — the
-            # generic path would spend credits and then fail on "produced no mesh"
-            # (chain_take_mesh looks for `model.glb`, which a rig task never returns).
-            return ChainExport("", error=f"chain: a {self.vendor} rigging alias cannot be stage 1 — "
-                                         f"it rigs an existing mesh; use an image-to-3d alias")
-        opts = mod.options_of({mod.KIND: cand.get(mod.KIND) or {}, "model": cand.get("model")})
-        if "glb" not in opts["target_formats"]:
-            return ChainExport("", error=f"chain: {self.vendor} stage 1 must deliver glb — add it to "
-                                         f"target_formats (now {opts['target_formats']})")
-        return ChainExport(f"{prefix}.glb")             # no pins: the mesh is a result blob
-
-    async def chain_take_mesh(self, out: GenOutput, export: ChainExport, want_bytes: bool) -> Optional[bytes]:
-        """Stage 1's mesh is already in hand: the `model.glb` blob `generate()` downloaded
-        (b'' when only its existence is asked for — nothing to fetch either way). Both
-        kinds name it that: the pure module's `parse_task` decides the stem."""
-        blob = next((b for b in (out.blobs or []) if (b.name or "") == "model.glb"), None)
-        if blob is None:
-            return None
-        return blob.data if want_bytes else b""
-
-    async def chain_feed_mesh(self, req2, backend2, mesh_param, mesh_name, mesh_bytes, outdir) -> str:
-        """Stage 2 in the cloud reads the mesh off the REQUEST — `build_request` embeds
-        `upload_files[mesh_param]` (Meshy as the `model_url` data URI, Tripo as an uploaded
-        file token). There is no disk to upload to and no path the vendor could resolve, so
-        the bytes are mandatory (a `path` relay is forced to `upload` in _run_chain whenever
-        either stage is a cloud kind)."""
-        if mesh_bytes is None:
-            raise RuntimeError(f"chain: a {self.vendor} stage 2 needs the mesh bytes (upload relay)")
-        req2.upload_files[mesh_param] = (mesh_name, mesh_bytes)
-        return f"<upload:{mesh_name} ({len(mesh_bytes) / (1024 * 1024):.1f} MB)>"
 
 class NanoGPTMediaAdapter(CloudTaskAdapter):
     """NanoGPT paid media: synchronous images or real asynchronous vendor tasks."""
@@ -5535,19 +5351,6 @@ class RunpodAdapter(ComfyUIAdapter):
     async def restart(self) -> str:
         raise RuntimeError("a RunPod endpoint has no service to restart")
 
-    # ── chains: refused in milestone 1. The inherited ComfyUI roles would run a billed
-    # stage 1 and then GET /view on api.runpod.ai (no such route, no auth), or upload a
-    # stage-2 mesh to api.runpod.ai/upload/image — both fail only AFTER the money is spent.
-    _NO_CHAIN = "a runpod backend cannot be a chain stage (milestone 1)"
-
-    def chain_export(self, cand: dict, succ: dict, params: dict, prefix: str) -> ChainExport:
-        return ChainExport("", error=self._NO_CHAIN)
-
-    async def chain_take_mesh(self, out: GenOutput, export: ChainExport, want_bytes: bool) -> Optional[bytes]:
-        raise RuntimeError(self._NO_CHAIN)
-
-    async def chain_feed_mesh(self, req2, backend2, mesh_param, mesh_name, mesh_bytes, outdir) -> str:
-        raise RuntimeError(self._NO_CHAIN)
 
     async def cancel(self, job_id: str = "") -> None:
         ent = self._rp_jobs.get(job_id) if job_id else None
@@ -5594,7 +5397,7 @@ class RunpodAdapter(ComfyUIAdapter):
         tr = req.cloud_trace
         tr.setdefault("backend", self.name)
         tr["runpod"] = True
-        # A request is reused across self-retries (the chain): each attempt's trace must
+        # A request may be reused across attempts: each attempt's trace must
         # describe only that attempt, or a settled earlier job hides a lost answer now.
         for k in ("runpod_job_id", "runpod_settled", "create_unconfirmed"):
             tr.pop(k, None)

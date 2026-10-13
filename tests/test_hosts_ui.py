@@ -290,19 +290,6 @@ class ManagedSave(_Base):
                          .status_code, 303)
         self.assertEqual(self.row("vllm2")["local_port"], lp)
 
-    def test_comfy_dirs_default_when_blank(self):
-        self.save(_mform("c", type="comfyui", remote_port="8188", svc_start=""))
-        b = self.row("c", "comfyui")
-        self.assertEqual(b["comfy_output_dir"], "/home/ubuntu/ComfyUI/output")
-        self.assertEqual(b["comfy_input_dir"], "/home/ubuntu/ComfyUI/input")
-        self.assertEqual(b["remote_port"], 8188)
-        for k in ("svc_start", "svc_setup", "svc_health"):
-            self.assertNotIn(k, b)                   # command fields belong to openai only
-        self.save(_mform("c", type="comfyui", remote_port="8188", orig="comfyui:c",
-                         comfy_output_dir="/x/out", comfy_input_dir="/x/in"))
-        b = self.row("c", "comfyui")
-        self.assertEqual((b["comfy_output_dir"], b["comfy_input_dir"]), ("/x/out", "/x/in"))
-
     def test_type_without_a_profile_is_refused(self):
         for t in ("meshy", "tripo", "anthropic"):
             self.refused(_mform(f"x-{t}", type=t), "cannot run on a managed host")

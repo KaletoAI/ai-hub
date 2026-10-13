@@ -1198,11 +1198,13 @@ def _dl_card(src: str, label: str = "download", *, dl: str = " download",
 
 
 def _media_tag(src: str, mime: str = "", kind: str = "", cls: str = "",
-               style: str = "", autoplay: bool = False) -> str:
+               style: str = "", autoplay: bool = False,
+               glb_stats: Optional[dict] = None) -> str:
     """Right media element for a generation artifact: <video> for video, <audio>
     for audio, <model-viewer> for glTF/GLB, else <img>. The serving route sets the
     real content-type; mime/kind here only pick the tag (unknown → <img>). `src`
-    must already be escaped."""
+    must already be escaped. `glb_stats` is the shared header-only artifact metadata:
+    native clips always play; diagnostic idle is inspection-only for a bare rig."""
     m, k = (mime or "").lower(), (kind or "").lower()
     c = f' class="{cls}"' if cls else ""
     s = f' style="{style}"' if style else ""
@@ -1217,19 +1219,37 @@ def _media_tag(src: str, mime: str = "", kind: str = "", cls: str = "",
         box = style or "width:720px;max-width:100%;height:640px"
         box += ";background:#0c0e12;border:1px solid #313a46;border-radius:10px"
         head = f'<script type="module" src="{_MODELVIEWER_SRC}"></script>'
-        if autoplay and m == "model/gltf-binary":
-            # inspection view: play an injected idle so bad skin weights show (a spike
-            # shoots out, the crotch webs). A toggle pauses back to bind pose. No
-            # auto-rotate here — you want to watch the deformation, not the camera.
-            sep = "&" if "?" in src else "?"
-            mvid = "mv%d" % (abs(hash(src)) % 1000000)
-            return (head + f'<model-viewer id="{mvid}"{c} style="{box}" src="{src}{sep}anim=idle" '
-                    f'camera-controls autoplay animation-name="idle" shadow-intensity="1" '
+        clips = (glb_stats or {}).get("animations") or []
+        idle = (autoplay and m == "model/gltf-binary" and glb_stats
+                and glb_stats.get("skins") and not clips)
+        if clips or idle:
+            # Native motion takes precedence over the diagnostic idle. Controls use
+            # their own wrapper, not a hashed id (the same artifact can appear twice).
+            # Inline ES5 handlers survive live insertion; the module is already hoisted.
+            motion_src = src
+            animation = ""
+            if idle:
+                sep = "&amp;" if "?" in src else "?"
+                motion_src += sep + "anim=idle"
+                animation = ' animation-name="idle"'
+            choice = ""
+            if len(clips) > 1:
+                options = "".join(f'<option value="{i}">{_esc(name)}</option>'
+                                  for i, name in enumerate(clips))
+                choice = (f'<label style="margin-top:6px;display:block">Animation '
+                          f'<select aria-label="Animation clip" onchange="'
+                          f'var w=this.closest(\'.glb-motion\'),m=w.querySelector(\'model-viewer\');'
+                          f'm.animationName=m.availableAnimations[Number(this.value)];'
+                          f'w.querySelector(\'input\').checked?m.play():m.pause();">{options}</select></label>')
+            label = ('idle animation <span class="muted">— reveals bad skin weights '
+                     '(spikes / crotch ring)</span>') if idle else "play animation"
+            return (head + f'<div class="glb-motion"><model-viewer{c} style="{box}" src="{motion_src}" '
+                    f'camera-controls autoplay{animation} shadow-intensity="1" '
                     f'interaction-prompt="none" ar-status="not-presenting"></model-viewer>'
                     f'<label class="ckbox" style="margin-top:6px;display:block"><input type="checkbox" '
-                    f'checked onchange="var m=document.getElementById(\'{mvid}\');'
-                    f'this.checked?m.play():m.pause();"> idle animation '
-                    f'<span class="muted">— reveals bad skin weights (spikes / crotch ring)</span></label>')
+                    f'checked aria-label="Play animation" onchange="'
+                    f'var m=this.closest(\'.glb-motion\').querySelector(\'model-viewer\');'
+                    f'this.checked?m.play():m.pause();"> {label}</label>{choice}</div>')
         return (head + f'<model-viewer{c} style="{box}" src="{src}" camera-controls auto-rotate '
                 f'shadow-intensity="1" interaction-prompt="none" '
                 f'ar-status="not-presenting"></model-viewer>')
@@ -1239,9 +1259,9 @@ def _media_tag(src: str, mime: str = "", kind: str = "", cls: str = "",
 
 
 def _glb_stats(path: str) -> Optional[dict]:
-    """Cheap mesh stats from a GLB's JSON chunk (header-only read, never the whole
-    file): vertex/triangle counts, vertex-color/texture presence, bounding-box dims.
-    Any parse problem returns None — stats are decoration, never an error."""
+    """Cheap mesh/animation metadata from a GLB's JSON chunk (header-only read,
+    never the whole file): geometry, colors/textures, bounds, skins and native clips.
+    Any parse problem returns None — metadata is decoration, never an error."""
     try:
         size = os.path.getsize(path)
         with open(path, "rb") as fh:
@@ -1277,15 +1297,18 @@ def _glb_stats(path: str) -> Optional[dict]:
                         lo[i] = amin[i] if lo[i] is None else min(lo[i], amin[i])
                         hi[i] = amax[i] if hi[i] is None else max(hi[i], amax[i])
         dims = tuple(hi[i] - lo[i] for i in range(3)) if lo[0] is not None else None
+        clips = [a.get("name") or f"Animation {i + 1}"
+                 for i, a in enumerate(doc.get("animations", []))
+                 if a.get("channels") and a.get("samplers")]
         return {"size": size, "vertices": verts, "triangles": tris,
-                "colors": colors, "textures": len(doc.get("images", [])), "dims": dims}
+                "colors": colors, "textures": len(doc.get("images", [])), "dims": dims,
+                "skins": len(doc.get("skins", [])), "animations": clips}
     except Exception:
         return None
 
 
-def _glb_stats_html(path: Optional[str]) -> str:
-    """One muted line under a GLB viewer: vertices · triangles · colors · size."""
-    st = _glb_stats(path) if path else None
+def _glb_stats_html(st: Optional[dict]) -> str:
+    """One muted geometry line, reusing the viewer's already-read GLB metadata."""
     if not st:
         return ""
     parts = [f"{st['vertices']:,} vertices", f"{st['triangles']:,} triangles"]
@@ -1653,11 +1676,11 @@ async def _fetch_oi_class(client, url: str, cls: str):
         return cls, None
 
 
-async def _object_info(backend_name: str, wf: dict, mapping: Optional[dict] = None) -> dict:
-    """Per-class /object_info for the workflow's loader nodes PLUS every mapped node
-    (a request field may be a combo/number on any node — e.g. UniRigAutoRig's
-    skeleton_template — and those need widget metadata too). Fetches uncached classes
-    in parallel and caches them with a short TTL, so re-opening an alias is instant."""
+async def _object_info(backend_name: str, wf: dict, mapping: Optional[dict] = None,
+                       fixed: Optional[list] = None) -> dict:
+    """Per-class /object_info for loader, mapped AND pinned nodes. Any scalar field
+    can need combo/numeric metadata, not only model-file loaders. Fetches uncached
+    classes in parallel and caches them with a short TTL."""
     snap = _runpod_object_info(backend_name)
     if snap:
         # A RunPod endpoint has no /object_info to ask — its probe snapshot answers.
@@ -1673,7 +1696,8 @@ async def _object_info(backend_name: str, wf: dict, mapping: Optional[dict] = No
         return {}
     classes = {n.get("class_type", "") for n in wf.values()
                if any(h in (n.get("class_type", "") or "").lower() for h in _LOADER_HINTS)}
-    for m in (mapping or {}).values():                # mapped nodes' combos/numbers → widgets
+    bindings = list((mapping or {}).values()) + list(fixed or [])
+    for m in bindings:                              # request fields and pins need widgets
         cls = (wf.get((m or {}).get("node")) or {}).get("class_type", "")
         if cls:
             classes.add(cls)
@@ -1717,7 +1741,8 @@ async def _editor_object_info(cands: list, wf: dict, mapping: Optional[dict]) ->
     per-backend tabs. Returns `(oi, borrowed_from)` — `borrowed_from` names the backend
     whose defs stood in, and is None when the primary answered (the normal case)."""
     names = [str(c.get("backend") or "") for c in cands]
-    ois = await asyncio.gather(*[_object_info(n, wf, mapping) for n in names])
+    fixed = cands[0].get("fixed") if cands else []
+    ois = await asyncio.gather(*[_object_info(n, wf, mapping, fixed) for n in names])
     for i, (name, oi) in enumerate(zip(names, ois)):
         if oi:
             return oi, (None if i == 0 else name)
@@ -1744,21 +1769,14 @@ def _num_input(name: str, value, spec: dict) -> str:
 
 
 def _value_control(name: str, node: str, field: str, value, wf: dict, oi: dict) -> str:
-    """Render the right input widget for a pinned node field: model dropdown, bounded
-    number, true/false, image (placeholder/upload), or a plain text box."""
+    """Render a pinned field's combo, bounded number, true/false, image slot or text.
+    Unlisted combo values stay selected and visible instead of being replaced."""
     cls = wf.get(node, {}).get("class_type", "")
     file_val = (wf.get(node, {}).get("inputs") or {}).get(field)
     cur = value if value is not None else file_val
     opts = oi.get(cls, {}).get(field)
     if isinstance(opts, dict) and opts.get("_num"):       # FLOAT/INT with discovery bounds
         return _num_input(name, cur, opts)
-    if opts and _is_model_field(opts, cur):
-        o = list(opts)
-        stale = cur not in o and o
-        if cur not in o:
-            o = [cur] + o
-        flag = ' <span class="bad">(stale)</span>' if stale else ""
-        return _select(name, o, cur) + flag
     if adapters.is_img_loader_class(cls) and field == "image":
         # A request image is an image SLOT (Request fields); a pin is the admin's fixed
         # value — the 8×8 placeholder or one of the workflow's own files.
@@ -1766,6 +1784,14 @@ def _value_control(name: str, node: str, field: str, value, wf: dict, oi: dict) 
         if cur and cur != adapters.PLACEHOLDER_SENTINEL:
             o.append((cur, cur))
         return _select(name, o, cur)
+    if isinstance(opts, list):
+        o = list(opts)
+        present = any(str(cur) == str(v) for v in o)
+        stale = bool(o) and not present
+        if not present:
+            o.insert(0, "" if cur is None else cur)
+        flag = ' <span class="bad">(stale)</span>' if stale else ""
+        return _select(name, o, cur) + flag
     if isinstance(file_val, bool):
         return _select(name, ["true", "false"], str(cur).lower())
     return _inp(name, "" if cur is None else cur)
@@ -1816,11 +1842,9 @@ def _btype_block(types: str, cur_type: str, inner: str) -> str:
     return f'<div data-btype="{types}"{style}>{inner}</div>'
 
 
-# A ComfyUI backend on a managed host: the dirs the ComfyUI bootstrap lays out on the
-# VM (ops/thunder-bootstrap.sh), filled in where the form left them blank — chains read
-# and write meshes there by full path.
-_MANAGED_COMFY_DIRS = {"comfy_output_dir": "/home/ubuntu/ComfyUI/output",
-                       "comfy_input_dir": "/home/ubuntu/ComfyUI/input"}
+# A ComfyUI backend on a managed host: bootstrap input directory, filled in where
+# the form left it blank. It resolves normal uploaded file paths.
+_MANAGED_COMFY_DIRS = {"comfy_input_dir": "/home/ubuntu/ComfyUI/input"}
 
 
 def _managed_host_entries() -> Optional[dict]:
@@ -2114,17 +2138,10 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
             # ComfyUI-only options — hidden for openai (none of these apply to an LLM backend)
             + f'<div id="comfyopts" style="{"" if cur_type == "comfyui" else "display:none"}">'
             + '<div class="grouphdr">ComfyUI</div>'
-            + _field("comfy output dir", _inp("comfy_output_dir", g("comfy_output_dir"),
-                     placeholder="e.g. /home/kai/ComfyUI/output"))
-            + "<p class='hint' style='margin:-4px 0 10px'>Absolute path to this ComfyUI's <b>output</b> "
-              "directory — only needed for <b>workflow chains</b> (a successor stage reads the previous "
-              "stage's mesh by full path from here). Leave blank otherwise.</p>"
             + _field("comfy input dir", _inp("comfy_input_dir", g("comfy_input_dir"),
-                     placeholder="blank = derived: output dir's …/input sibling"))
+                     placeholder="e.g. /home/kai/ComfyUI/input"))
             + "<p class='hint' style='margin:-4px 0 10px'>Absolute path to this ComfyUI's <b>input</b> "
-              "directory — used by chain <b>upload</b> hand-offs: the relayed mesh lands here and the "
-              "successor gets its full path. Blank = derived from the output dir "
-              "(<code>…/output</code> → <code>…/input</code>).</p>"
+              "directory — required for normal uploaded file inputs that need an absolute path.</p>"
             + _field("comfy watchdog",
                      _checkbox("auto_restart", gb("auto_restart"), "auto_restart",
                                "restart the ComfyUI service automatically when the executor is stuck"))
@@ -3019,16 +3036,11 @@ async def backend_save(request: Request):
         b["host"] = host
     else:
         b.pop("host", None)                    # blank = derive from the URL host/IP
-    cod = (f.get("comfy_output_dir", "") or "").strip().rstrip("/")
-    if cod:
-        b["comfy_output_dir"] = cod
-    else:
-        b.pop("comfy_output_dir", None)
     cid = (f.get("comfy_input_dir", "") or "").strip().rstrip("/")
     if cid:
         b["comfy_input_dir"] = cid
     else:
-        b.pop("comfy_input_dir", None)         # blank = derive from the output dir
+        b.pop("comfy_input_dir", None)
     # ── the service on a managed host (hostctl runs it; services.py profiles) ──
     # The command service's text is kept as typed (a script's whitespace is its own);
     # only a blank one is "unset". Kept for an openai backend whatever its host, so a
@@ -3135,7 +3147,7 @@ async def backend_save(request: Request):
                 b[dst] = val
             else:
                 b.pop(dst, None)               # blank = the kind's own defaults
-        for k in ("comfy_output_dir", "comfy_input_dir", "auto_restart", "restart_cooldown_s",
+        for k in ("comfy_input_dir", "auto_restart", "restart_cooldown_s",
                   "stuck_after_s", "self_retries"):
             b.pop(k, None)
     if new_type == "arliai":
@@ -3176,7 +3188,7 @@ async def backend_save(request: Request):
                 b[dst] = val
             else:
                 b.pop(dst, None)
-        for k in ("comfy_output_dir", "comfy_input_dir", "auto_restart", "restart_cooldown_s",
+        for k in ("comfy_input_dir", "auto_restart", "restart_cooldown_s",
                   "stuck_after_s"):
             b.pop(k, None)
     else:
@@ -6073,7 +6085,7 @@ async def register_post(request: Request):
         return await err("alias and backend are required")
     if store.get(alias):
         # Registering used to REPLACE an existing alias wholesale — its mapping, pins,
-        # extra backends and chain gone, without a word.
+        # extra backends gone, without a word.
         return await err(f"alias '{alias}' already exists — pick another name, or edit "
                          "it and use Update workflow to replace its JSON")
     # A cloud alias (Meshy, Tripo) has no workflow at all: its request fields are the
@@ -6117,12 +6129,194 @@ async def register_post(request: Request):
     # (`Output` / `output_final`) — same node the auto mode would pick, but visible
     # and editable here, and a run producing nothing then fails clearly. Note the
     # mesh export classes report nothing themselves; final_output_node redirects to
-    # the Preview3D node that consumes them (chain export_node is NOT this one).
+    # the Preview3D node that consumes them.
     if (out_node := adapters.final_output_node(wf)):
         cand["output_node"] = out_node
     store.upsert(alias, [cand])
     logger.info(f"ui: registered '{alias}' → {backend} ({len(wf)} nodes, {len(cand['fixed'])} model slots)")
     return RedirectResponse(f"/ui/aliases?edit={_q(alias)}", status_code=303)
+
+
+def _read_workflow_upload(f: dict):
+    """The new API JSON of an Update workflow form (file upload, else share path) →
+    (workflow, None) or (None, reason). Shared by the diff preview and the update, so
+    the dialog refuses exactly what the update would."""
+    upload = f.get("workflow_file")
+    path = str(f.get("workflow_path", "")).strip()
+    try:
+        if isinstance(upload, (bytes, bytearray)) and upload.strip():
+            wf = json.loads(upload.decode("utf-8"))
+        elif path:
+            with open(path) as fh:
+                wf = json.load(fh)
+        else:
+            return None, "upload an API JSON file or give a share path"
+    except Exception as e:
+        return None, f"invalid workflow JSON: {e}"
+    if not isinstance(wf, dict):
+        return None, "workflow JSON must be an object of nodes (API format)"
+    return wf, None
+
+
+def _nid_key(nid):
+    """Node ids in numeric order ("2" < "10"; subgraph ids like "12:3" by part)."""
+    return [(0, int(p), "") if p.isdigit() else (1, 0, p) for p in str(nid).split(":")]
+
+
+def _wf_val(v) -> str:
+    """An input value as the diff shows it: a link `["5", 0]` → `5:0`, else JSON."""
+    if isinstance(v, list) and len(v) == 2 and isinstance(v[0], str) and isinstance(v[1], int):
+        return f"{v[0]}:{v[1]}"
+    return v if isinstance(v, str) and v else json.dumps(v, ensure_ascii=False)   # "" stays visible
+
+
+def _is_link(v) -> bool:
+    return isinstance(v, list) and len(v) == 2 and isinstance(v[0], str) and isinstance(v[1], int)
+
+
+def _workflow_diff(old: dict, new: dict, mapping: dict, fixed: list, bypass: list) -> dict:
+    """Node-level diff of two ComfyUI API workflows, for the Update workflow dialog.
+    Pure. `added`/`removed`/`changed` per node (class, title, each input: a widget value,
+    a link, or an input that appeared/vanished); `stale` names every request field, pin
+    and bypass entry that would point at a node or input the new workflow lacks."""
+    def node(wf, nid):
+        n = wf.get(nid)
+        return n if isinstance(n, dict) else {}
+
+    def head(wf, nid):
+        n = node(wf, nid)
+        return {"id": nid, "class": str(n.get("class_type", "")),
+                "title": str((n.get("_meta") or {}).get("title", "") or "")}
+
+    # who points at which node — a removed node names what goes stale with it
+    users: dict = {}
+    for p, m in (mapping or {}).items():
+        if m and m.get("node") is not None:
+            users.setdefault(str(m["node"]), []).append(f"request field {p}")
+    for b in fixed or []:
+        if b and b.get("node") is not None:
+            users.setdefault(str(b["node"]), []).append(f"pinned {b.get('field', '')}")
+    for n in bypass or []:
+        users.setdefault(str(n), []).append("bypass")
+
+    added = [head(new, n) for n in sorted(set(new) - set(old), key=_nid_key)]
+    removed = [dict(head(old, n), used_by=list(dict.fromkeys(users.get(n, []))))
+               for n in sorted(set(old) - set(new), key=_nid_key)]
+    changed = []
+    for nid in sorted(set(old) & set(new), key=_nid_key):
+        a, b = node(old, nid), node(new, nid)
+        ai, bi = a.get("inputs") or {}, b.get("inputs") or {}
+        fields = []
+        for k in sorted(set(ai) | set(bi)):
+            if k not in bi:
+                fields.append({"field": k, "kind": "removed", "old": _wf_val(ai[k]), "new": ""})
+            elif k not in ai:
+                fields.append({"field": k, "kind": "added", "old": "", "new": _wf_val(bi[k])})
+            elif ai[k] != bi[k]:
+                kind = "link" if _is_link(ai[k]) or _is_link(bi[k]) else "value"
+                fields.append({"field": k, "kind": kind, "old": _wf_val(ai[k]), "new": _wf_val(bi[k])})
+        h, ho = head(new, nid), head(old, nid)
+        if fields or h["class"] != ho["class"] or h["title"] != ho["title"]:
+            if h["class"] != ho["class"]:
+                h["class_from"] = ho["class"]
+            if h["title"] != ho["title"]:
+                h["title_from"] = ho["title"]
+            changed.append(dict(h, fields=fields))
+
+    stale = []
+
+    def check(who, nid, fld):
+        nid = str(nid)
+        if nid not in new:
+            stale.append(f"{who} → node {nid} (removed)")
+        elif fld and fld in (node(old, nid).get("inputs") or {}) \
+                and fld not in (node(new, nid).get("inputs") or {}):
+            stale.append(f"{who} → {nid}.{fld} (input removed)")
+    for p, m in (mapping or {}).items():
+        if m and m.get("node") is not None:
+            check(f"request field {p}", m["node"], m.get("field"))
+    for b in fixed or []:
+        if b and b.get("node") is not None:
+            check("pinned value", b["node"], b.get("field"))
+    for n in bypass or []:
+        check("bypass", n, None)
+    stale = list(dict.fromkeys(stale))                  # a pin repeats once per backend
+    return {"added": added, "removed": removed, "changed": changed, "stale": stale,
+            "same": not (added or removed or changed)}
+
+
+_DIFF_CELL = 90
+
+
+def _diff_cell(v: str, cls: str = "") -> str:
+    short = v if len(v) <= _DIFF_CELL else v[:_DIFF_CELL - 1] + "…"
+    tip = f' title="{_esc(v)}"' if short != v else ""
+    return f'<td class="wfd-v {cls}"{tip}>{_esc(short)}</td>'
+
+
+def _workflow_diff_html(d: dict) -> str:
+    """The Update workflow dialog's body for a `_workflow_diff` result."""
+    if d["same"] and not d["stale"]:
+        return "<p class='muted'>No differences — the new workflow is identical to the stored one.</p>"
+
+    def name(n):
+        t = f" · {_esc(n['title'])}" if n.get("title") else ""
+        return f"<b>{_esc(n['id'])}</b> {_esc(n['class'])}{t}"
+    out = [f"<p class='wfd-sum'><span class='ok'>+{len(d['added'])} added</span> · "
+           f"<span class='bad'>−{len(d['removed'])} removed</span> · "
+           f"<span class='warn'>{len(d['changed'])} changed</span> node(s)</p>"]
+    if d["stale"]:
+        out.append("<div class='wfd-stale'><b>These bindings would go stale:</b><ul>"
+                   + "".join(f"<li>{_esc(s)}</li>" for s in d["stale"]) + "</ul></div>")
+    if d["removed"]:
+        out.append("<h3>Removed nodes</h3><ul class='wfd-list'>" + "".join(
+            f"<li class='bad'>{name(n)}"
+            + (f" <span class='badge bad'>used by {_esc(', '.join(n['used_by']))}</span>"
+               if n["used_by"] else "") + "</li>" for n in d["removed"]) + "</ul>")
+    if d["added"]:
+        out.append("<h3>Added nodes</h3><ul class='wfd-list'>"
+                   + "".join(f"<li class='ok'>{name(n)}</li>" for n in d["added"]) + "</ul>")
+    if d["changed"]:
+        out.append("<h3>Changed nodes</h3>")
+        for n in d["changed"]:
+            notes = []
+            if "class_from" in n:
+                notes.append(f"class {_esc(n['class_from'])} → {_esc(n['class'])}")
+            if "title_from" in n:
+                notes.append(f"title “{_esc(n['title_from'])}” → “{_esc(n['title'])}”")
+            out.append(f"<div class='wfd-node'>{name(n)}"
+                       + (f" <span class='muted'>({'; '.join(notes)})</span>" if notes else "")
+                       + "</div>")
+            if n["fields"]:
+                rows = "".join(
+                    f"<tr><td class='wfd-f'>{_esc(r['field'])}"
+                    + ("" if r["kind"] in ("value",) else f" <span class='muted'>{r['kind']}</span>")
+                    + "</td>" + _diff_cell(r["old"], "bad") + "<td class='muted'>→</td>"
+                    + _diff_cell(r["new"], "ok") + "</tr>" for r in n["fields"])
+                out.append(f"<table class='wfd-t'>{rows}</table>")
+    return "".join(out)
+
+
+async def workflow_diff(request: Request):
+    """The Update workflow dialog's preview: the new API JSON against the stored one.
+    Writes nothing. The editor's unsaved bindings are applied to a COPY first, so
+    "would go stale" judges the request fields as they were typed."""
+    f = await _multipart(request)
+    alias = str(f.get("alias", "")).strip()
+    cands = store.get(alias)
+    if not cands:
+        return HTMLResponse(f"<p class='bad'>alias '{_esc(alias)}' not found</p>", status_code=404)
+    cands = json.loads(json.dumps(cands))              # a copy: the preview never writes
+    if "new_alias" in f:
+        _apply_update_form(cands, f)
+    wf, why = _read_workflow_upload(f)
+    if why:
+        return HTMLResponse(f"<p class='bad'>{_esc(why)}</p>", status_code=400)
+    old = cands[0].get("workflow_json") or {}
+    bypass = sorted({str(n) for c in cands for n in (c.get("bypass") or [])})
+    fixed = [b for c in cands for b in (c.get("fixed") or [])]
+    d = await asyncio.to_thread(_workflow_diff, old, wf, cands[0].get("mapping") or {}, fixed, bypass)
+    return HTMLResponse(_workflow_diff_html(d))
 
 
 async def update_workflow(request: Request):
@@ -6144,23 +6338,10 @@ async def update_workflow(request: Request):
         _apply_update_form(cands, f)
         alias, taken = _rename_gen_alias(alias, f)
 
-    async def err(msg):
+    wf, why = _read_workflow_upload(f)
+    if why:
         store.upsert(alias, cands)
-        return await _mapping_view({"edit": alias, "taken": taken}, err=msg, status=400)
-    upload = f.get("workflow_file")
-    path = str(f.get("workflow_path", "")).strip()
-    try:
-        if isinstance(upload, (bytes, bytearray)) and upload.strip():
-            wf = json.loads(upload.decode("utf-8"))
-        elif path:
-            with open(path) as fh:
-                wf = json.load(fh)
-        else:
-            return await err("upload an API JSON file or give a share path")
-    except Exception as e:
-        return await err(f"invalid workflow JSON: {e}")
-    if not isinstance(wf, dict):
-        return await err("workflow JSON must be an object of nodes (API format)")
+        return await _mapping_view({"edit": alias, "taken": taken}, err=why, status=400)
     base_mapping = cands[0].get("mapping") or {}
     for c in cands:
         c["workflow_json"] = wf                          # workflow + mapping are backend-independent →
@@ -6180,6 +6361,53 @@ async def update_workflow(request: Request):
     logger.info(f"ui: workflow updated for '{alias}' ({len(wf)} nodes); {len(stale)} stale binding(s): {stale}"
                 + (f"; {len(stale_byp)} stale bypass node(s): {stale_byp}" if stale_byp else ""))
     return RedirectResponse(_saved_url(alias, taken), status_code=303)
+
+
+# Update workflow asks first: the button's click is held, the whole editor form goes to
+# /ui/mapping/workflow-diff (writes nothing) and the dialog shows what the new API JSON
+# changes — nodes added/removed/changed and the bindings that would go stale. "Replace
+# workflow" then clicks the SAME button again with the hold lifted, so the update path
+# (and the editor edits it saves) stays exactly as before. A refused file disables the
+# replace (the update would refuse it too); a failed preview still lets you replace, but
+# says that no diff could be made. Without <dialog> support: a plain confirm().
+_WFDIFF_DIALOG = (
+    '<dialog id="gw-wfdiff" class="wfd"><h2 style="margin-top:0">Replace workflow?</h2>'
+    '<div class="wfd-body"></div>'
+    '<div class="wfd-bar"><button type="button" class="btn" data-wfd-ok>Replace workflow</button>'
+    '<button type="button" class="btn secondary" data-wfd-cancel>Cancel</button></div></dialog>'
+    "<style>.wfd{background:var(--panel);color:var(--text);border:1px solid var(--line-2);"
+    "border-radius:10px;padding:18px 20px;width:min(960px,92vw);max-height:84vh;box-sizing:border-box}"
+    ".wfd[open]{display:flex;flex-direction:column}"
+    ".wfd::backdrop{background:rgba(0,0,0,.6)}"
+    ".wfd-body{overflow:auto;flex:1 1 auto;min-height:60px}"
+    ".wfd-body h3{font-size:13px;margin:14px 0 6px}"
+    ".wfd-bar{display:flex;gap:8px;justify-content:flex-end;padding-top:12px;border-top:1px solid var(--line);margin-top:12px}"
+    ".wfd-list{margin:0;padding-left:20px}.wfd-node{margin:10px 0 4px}"
+    ".wfd-t{width:100%;table-layout:fixed;margin:0 0 6px}.wfd-t td{padding:2px 6px;vertical-align:top}"
+    ".wfd-f{width:22%;word-break:break-all}.wfd-t td.muted{width:20px}"
+    ".wfd-v{font-family:ui-monospace,monospace;font-size:12px;word-break:break-all}"
+    ".wfd-stale{border:1px solid var(--bad);border-radius:8px;padding:8px 12px;margin:8px 0}"
+    ".wfd-stale ul{margin:4px 0 0;padding-left:20px}</style>"
+    "<script>(function(){var d=document.getElementById('gw-wfdiff');if(!d)return;"
+    "var body=d.querySelector('.wfd-body'),ok=d.querySelector('[data-wfd-ok]'),btn=null,seq=0;"
+    "function go(){var b=btn;d.close();if(!b)return;b.setAttribute('data-wfd-pass','1');b.click();}"
+    "ok.addEventListener('click',go);"
+    "d.querySelector('[data-wfd-cancel]').addEventListener('click',function(){btn=null;d.close();});"
+    "document.addEventListener('click',function(e){"
+    "var b=e.target&&e.target.closest?e.target.closest('[data-wfdiff]'):null;if(!b||!b.form)return;"
+    "if(b.getAttribute('data-wfd-pass')){b.removeAttribute('data-wfd-pass');return;}"
+    "e.preventDefault();e.stopPropagation();"
+    "if(!d.showModal||!window.fetch||!window.FormData){"
+    "if(window.confirm('Replace the stored workflow with the new API JSON?')){"
+    "b.setAttribute('data-wfd-pass','1');b.click();}return;}"
+    "btn=b;var n=++seq;body.innerHTML='<p class=\"muted\">Comparing with the stored workflow…</p>';"
+    "ok.disabled=true;d.showModal();"
+    "fetch('/ui/mapping/workflow-diff',{method:'POST',body:new FormData(b.form),credentials:'same-origin'})"
+    ".then(function(r){return r.text().then(function(t){if(n!==seq)return;"
+    "body.innerHTML=t;ok.disabled=!r.ok;});})"
+    "['catch'](function(){if(n!==seq)return;body.innerHTML='<p class=\"warn\">Could not compute the diff "
+    "(network error). Replace anyway?</p>';ok.disabled=false;});"
+    "},true);})();</script>")
 
 
 def _reorder_js() -> str:
@@ -6448,8 +6676,7 @@ def _output_section(wf: dict, cands: list) -> str:
             + _field("deliver textures as", f'<select name="texture_format">{_tf_opts(cands)}</select>', short=True)
             + "<p class='hint'>For <b>generic</b>-rig deliveries: <b>jpeg</b> transcodes the baked texture "
               "PNGs to JPEG (quality 90) at delivery — ComfyUI has no JPEG export, so the gateway shrinks "
-              "the multi-MB bake here. A texture with a real alpha channel keeps PNG. On a chain set this "
-              "on the client-facing (stage-1) alias.</p>"
+              "the multi-MB bake here. A texture with a real alpha channel keeps PNG.</p>"
             + _field("texture check", _checkbox("dummy_check",
                      all(c.get("dummy_check") is not False for c in cands),
                      "fail on a 2×2-dummy texture (known export-node bug)"))
@@ -6473,110 +6700,11 @@ def _output_section(wf: dict, cands: list) -> str:
               "<code>generic</code> → a rigged FBX + its basecolor PNG). Plain glob lines may be MIXED "
               "with cases — they ship unconditionally on top of the matched case. Unmatched cases/globs "
               "are simply absent, so a split workflow still works; the job fails if nothing matches or "
-              "validation fails (e.g. the 2×2-dummy-texture bug).</p>"
-            + _chain_section(wf, cands))
+              "validation fails (e.g. the 2×2-dummy-texture bug).</p>")
 
 
-def _chain_section(wf: dict, cands: list) -> str:
-    """Workflow chain: this alias is stage 1 (the client interface); on success the
-    gateway runs a `successor` alias on the SAME backend, feeding it this stage's
-    exported mesh (by full path) + this stage's params, and delivers ONLY the
-    successor's result. Both runs are back-to-back (queue-isolated)."""
-    s = next((c.get("successor") for c in cands if c.get("successor")), None) or {}
-    cur_exp = str(s.get("export_node") or "")
-    node_opts = '<option value="">— export node —</option>'
-    listed = False
-    for nid, n in sorted(wf.items(), key=lambda kv: (len(kv[0]), kv[0])):
-        cls = n.get("class_type", "")
-        # shortlist writer-ish classes, but ALWAYS include the stored choice — a
-        # custom writer class without export/save in its name would otherwise render
-        # unselected and the next unrelated Save would silently clear it.
-        if "export" in cls.lower() or "save" in cls.lower() or nid == cur_exp:
-            title = ((n.get("_meta") or {}).get("title") or "")
-            lbl = f"{nid} — {cls}" + (f" “{title}”" if title else "")
-            sel = " selected" if cur_exp == nid else ""
-            listed = listed or cur_exp == nid
-            node_opts += f'<option value="{_esc(nid)}"{sel}>{_esc(lbl)}</option>'
-    if cur_exp and not listed:                       # keep a stale choice visible instead of silently clearing
-        node_opts += f'<option value="{_esc(cur_exp)}" selected>{_esc(cur_exp)} — (stale: node missing)</option>'
-    cur_relay = (s.get("relay") or "path").strip().lower()
-    # A cloud successor (Meshy, Tripo) never reads a shared disk — the mesh always travels
-    # as bytes. Offering a hand-off choice there would only let the user pick one that is
-    # ignored.
-    succ_kind = adapters.cloud_kind((store.get(str(s.get("alias") or "").strip()) or [{}])[0])
-    if succ_kind:
-        relay_field = ('<input type="hidden" name="chain_relay" value="upload">'
-                       '<p class="hint" style="margin:0">upload — forced: the successor runs on '
-                       f'{adapters.cloud_module(succ_kind).VENDOR}</p>')
-    else:
-        relay_opts = "".join(
-            f'<option value="{v}"{" selected" if cur_relay == v else ""}>{lbl}</option>'
-            for v, lbl in (("path", "path — same backend, shared disk (default)"),
-                           ("upload", "upload — relay bytes to a stage-2 backend")))
-        relay_field = f'<select name="chain_relay">{relay_opts}</select>'
-    return ("<h2 style='margin-top:18px'>Chain (successor)</h2>"
-            "<p class='hint'>Optional: run a second alias after this one and deliver only its result — "
-            "e.g. mesh here, rigging as the successor (a ComfyUI rigger on the same or another backend, "
-            "or a cloud rigging alias — Meshy-Rig, Tripo-Rig). The path hand-off needs the backend's "
-            "<b>comfy output dir</b>; "
-            "the upload hand-off does not. Leave the successor blank for a normal single-stage alias.</p>"
-            + _field("successor alias", _inp("successor", s.get("alias", ""),
-                     placeholder="e.g. mesh-reg-mia"), short=True)
-            + _field("mesh export node", f'<select name="chain_export_node">{node_opts}</select>')
-            + _field("successor mesh param", _inp("chain_mesh_param", s.get("mesh_param", ""),
-                     placeholder="mesh_path (mesh workflows: input_mesh_path)"), short=True)
-            + _field("mesh hand-off", relay_field)
-            + "<p class='hint'>The gateway pins that export node's filename, so it knows the mesh, and passes "
-              "it to the successor under the <b>mesh param</b> (blank = <code>mesh_path</code>; the mesh "
-              "workflows label their mesh input <code>input_mesh_path</code>) — must be a request field "
-              "(param or label) on the successor. <b>Hand-off</b>: <code>path</code> keeps both stages on ONE "
-              "backend (shared disk) and passes the mesh's absolute output path. <code>upload</code> lets the "
-              "successor run on a DIFFERENT backend — the gateway fetches the mesh, uploads it into that "
-              "backend's <b>input</b> dir and passes its absolute path there (the backend's <b>comfy input "
-              "dir</b>, blank = derived from the output dir), so the successor loads it exactly like a path "
-              "hand-off — no special loader needed. Stage 2 runs on an <b>allowed</b> "
-              "successor candidate, preferring the same backend as stage 1; so only list the successor on "
-              "backends that can actually run it. This stage's other params (name, no_fingers, …) are "
-              "threaded to the successor by matching param name. The successor may also be a "
-              "<b>cloud alias</b> (e.g. <code>Meshy-Rig</code> endpoint <code>rigging</code>, "
-              "<code>Tripo-Rig</code> endpoint <code>rig</code>) — the mesh then travels to that vendor as "
-              "bytes (the hand-off setting is ignored), the <b>mesh param</b> must be one "
-              "of that alias's file fields (<code>input_mesh_path</code>) and the <b>delivered rig type</b> is "
-              "<code>meshy</code> / <code>tripo</code>.</p>"
-            + _field("keep from this stage", _inp("chain_keep", ", ".join(s.get("keep_from_mesh") or []),
-                     placeholder="e.g. *_basecolor*.png"), short=True)
-            + _field("delivered rig type", _inp("chain_rig", s.get("rig", ""),
-                     placeholder="blank · mixamo · generic · meshy · tripo"), short=True)
-            + "<p class='hint'><b>keep from this stage</b>: globs for files THIS (mesh) stage produces that "
-              "must ship with the successor's result — e.g. the <code>*_basecolor*.png</code> the texturing "
-              "bakes here (the UniRig fbx only references its texture). <b>delivered rig type</b>: set "
-              "<code>generic</code>/<code>mixamo</code> to tag + validate the COMBINED delivery at the chain "
-              "level (generic needs fbx + basecolor); <code>meshy</code>/<code>tripo</code> (a cloud rig) are "
-              "only tagged, never re-normalized or validated. Blank = trust the successor's own output "
-              "config.</p>"
-            + _chain_rig_warning(wf, s))
 
 
-def _chain_rig_warning(wf: dict, s: dict) -> str:
-    """Static pre-flight for a `generic` (FBX) chain: the rigger's FBX only references
-    its texture by a temp path, so the basecolor PNG has to come from THIS stage —
-    `validate_delivery` fails the (long) job at the very end if it doesn't. Two
-    misconfigurations are visible from the workflow alone: a stage that bakes no
-    texture at all (triposplat — SplatToMesh emits the core MESH type, the texture
-    tool chain is TRIMESH-only, so its texture stays embedded in the GLB), and an
-    empty `keep from this stage`."""
-    if (s.get("rig") or "").strip().lower() != "generic":
-        return ""
-    if not any((n or {}).get("class_type") == "SaveImage" for n in wf.values()):
-        why = ("this stage exports no texture PNG (no <code>SaveImage</code> node), so a "
-               "<code>generic</code> delivery can never be complete — put a texturing stage "
-               "(e.g. <code>mesh-shrink</code>) in between, or deliver via <code>mixamo</code>")
-    elif not [g for g in (s.get("keep_from_mesh") or []) if str(g).strip()]:
-        why = ("<b>keep from this stage</b> is empty — add <code>*_basecolor*.png</code>, else the "
-               "chain fails validation after stage 2 has already run")
-    else:
-        return ""
-    return f"<p class='hint'><span class='bad'>⚠ generic rig: {why}.</span></p>"
 
 
 async def _pinned_block(alias: str, cands: list, fixed: list, wf: dict, oi: dict,
@@ -6599,11 +6727,12 @@ async def _pinned_block(alias: str, cands: list, fixed: list, wf: dict, oi: dict
         f"onclick=\"pinTab(this,this.getAttribute('data-pt'))\">{_esc(str(c.get('backend')))}</button>"
         for i, c in enumerate(cands))
     panels = f'<div class="ppanel" data-pt="{_esc(bn0)}">{primary_rows}</div>'
-    # override backends' own models fetched in PARALLEL (cold /object_info is slow)
-    oi_others = await asyncio.gather(*[_object_info(str(c.get("backend")), wf) for c in cands[1:]])
+    # Override backends' own pin metadata fetched in PARALLEL.
+    oi_others = await asyncio.gather(*[_object_info(str(c.get("backend")), wf, fixed=fixed)
+                                      for c in cands[1:]])
     for c, oi_bn in zip(cands[1:], oi_others):
         bn = str(c.get("backend"))
-        rows = _pin_tab_rows(alias, c, False, fixed, wf, oi_bn or oi)  # fall back to primary's models
+        rows = _pin_tab_rows(alias, c, False, fixed, wf, oi_bn or oi)  # unavailable → primary defs
         panels += (f'<div class="ppanel" data-pt="{_esc(bn)}" style="display:none">'
                    f"<p class='hint'>Models/values installed on <b>{_esc(bn)}</b> "
                    f"(slots from primary <b>{_esc(bn0)}</b>; “inherited” = same as primary).</p>{rows}</div>")
@@ -6732,19 +6861,10 @@ def _cloud_editor(kind: str, alias: str, cands: list, saved: bool = False, taken
     the vendor module). Everything vendor-specific is READ from that module (OPTION_FIELDS,
     the endpoint/model/format tuples, the two hints), so a second cloud kind gets this
     editor instead of a fork of it — and a vendor option can never be offered here without
-    the request builder knowing it.
-    It DOES carry the chain successor: a cloud alias can be stage 1 (mesh here, rigging in
-    the successor) — without an export node or a hand-off choice, because the mesh comes
-    back as a result blob and always travels to stage 2 as bytes."""
+    the request builder knowing it."""
     mod = adapters.cloud_module(kind)
     vendor = mod.VENDOR
     cand = cands[0]
-    s = next((c.get("successor") for c in cands if c.get("successor")), None) or {}
-    keep = [g for g in (s.get("keep_from_mesh") or []) if str(g).strip()]
-    rig_cur = (s.get("rig") or "").strip()
-    rig_opts: list = [("", "blank — trust the successor"), "mixamo", "generic", "meshy", "tripo"]
-    if rig_cur and rig_cur not in rig_opts:      # keep an unknown stored value visible
-        rig_opts.append((rig_cur, f"{rig_cur} — (unknown)"))   # …a Save would clear it otherwise
     ep = mod.endpoint_of(cand)
     opts = mod.options_of(cand)
     if raw is not None:
@@ -6829,26 +6949,6 @@ def _cloud_editor(kind: str, alias: str, cands: list, saved: bool = False, taken
             + (_field("deliver formats", fmts) if fmts else "")
             + _field("retries", _inp("retries", str(retries), placeholder="blank = try all backends",
                                      typ="number"), short=True)
-            + ('<h2 style="margin-top:18px">Chain (successor)</h2>'
-            + "<p class='hint'>Optional: run a second alias (a rigger) on this alias's mesh and deliver "
-              "ONLY its result. Leave blank for a normal single-stage alias.</p>"
-            + _field("successor alias", _inp("successor", s.get("alias", ""),
-                     placeholder="e.g. mesh-mia"), short=True)
-            + _field("successor mesh param", _inp("chain_mesh_param", s.get("mesh_param", ""),
-                     placeholder="input_mesh_path"), short=True)
-            + _field("keep from this stage", _inp("chain_keep", ", ".join(keep),
-                     placeholder="e.g. preview.png"), short=True)
-            + _field("delivered rig type", _select("chain_rig", rig_opts, rig_cur), short=True)
-            + "<p class='hint'>The mesh (glb) is relayed as <b>bytes</b> to the successor's backend — no "
-              f"export node, no hand-off choice (a {_esc(vendor)} stage shares no disk with anything). It "
-              "arrives under the <b>mesh param</b> (blank = <code>input_mesh_path</code>, what the mesh "
-              "workflows label their mesh input), which must be a request field (param or label) of the "
-              "successor. <b>keep from this stage</b>: globs for files THIS stage produces that must ship "
-              "with the successor's result. <b>delivered rig type</b> tags the delivery; "
-              "<code>generic</code>/<code>mixamo</code> are additionally normalized and validated at chain "
-              "level, <code>meshy</code>/<code>tripo</code> are only tagged (a cloud vendor rigs to its own "
-              "conventions). Requires <code>glb</code> in <b>deliver formats</b> — the job is refused up "
-              f"front otherwise, before credits are spent. {mod.CHAIN_HINT}</p>" if kind in ("meshy", "tripo") else "")
             + '<h2 style="margin-top:18px">Request fields</h2>'
             + f"<p class='hint'>Request fields for {_esc(vendor)} — what "
               f"<code>GET /v1/generations/{{alias}}/schema</code> advertises.{ign_hint}</p>"
@@ -6928,7 +7028,7 @@ async def _alias_editor(alias: str, saved: bool = False, taken: str = "", err: s
             + _field("…or share path", _inp("workflow_path", "", placeholder="/mnt/share/flux_api.json"))
             + '<div class="field"><label></label><div class="control">'
               '<button class="btn secondary" formaction="/ui/mapping/update-workflow" '
-              'formenctype="multipart/form-data">Update workflow</button></div></div>'
+              'formenctype="multipart/form-data" data-wfdiff>Update workflow</button></div></div>'
             + "<h2>Backends</h2>"
             + "<p class='hint'>Allowed backends for this alias — a job takes the fastest free "
               "unpaid one; on a connection error the next one is used.</p>"
@@ -6959,7 +7059,7 @@ async def _alias_editor(alias: str, saved: bool = False, taken: str = "", err: s
             + pinned_block
             + _bypass_block(alias, cands, wf)
             + _output_section(wf, cands)
-            + '</form>' + pin_extra + _reorder_js())
+            + '</form>' + _WFDIFF_DIALOG + pin_extra + _reorder_js())
     return form, _available_fields(alias, wf, mapped, oi)
 
 
@@ -7275,6 +7375,8 @@ def _apply_update_form(cands: list, f: dict) -> str:
     for key, val in f.items():
         if key.startswith("fixed__") and val != "":
             _, nid, fld = key.split("__", 2)
+            old = ((cands[0].get("workflow_json") or {}).get(nid, {}).get("inputs") or {}).get(fld)
+            val = adapters._coerce(val, old)
             fixed.append({"node": nid, "field": fld, "value": val})
     # per-backend overrides of pinned values: ovr__<backend>__<node>__<field>
     ovr = {}
@@ -7291,8 +7393,12 @@ def _apply_update_form(cands: list, f: dict) -> str:
     cands[0]["fixed"] = fixed
     for c in cands[1:]:
         bn = c.get("backend")
+        wf = c.get("workflow_json") or {}
         c["fixed"] = [{"node": b["node"], "field": b["field"],
-                       "value": ovr.get((bn, b["node"], b["field"]), b["value"])} for b in fixed]
+                       "value": adapters._coerce(
+                           ovr.get((bn, b["node"], b["field"]), b["value"]),
+                           (wf.get(b["node"], {}).get("inputs") or {}).get(b["field"]))}
+                      for b in fixed]
     # per-backend node bypass: a byp__<backend>__<node> checkbox grid. The hidden
     # bypass_nodes (union managed set) is authoritative — an unchecked (=absent) box clears.
     managed_byp = [n for n in (f.get("bypass_nodes", "") or "").split(",") if n]
@@ -7365,31 +7471,6 @@ def _apply_update_form(cands: list, f: dict) -> str:
             c["output_cases"] = out_cases
         if out_flat:                       # plain globs may accompany cases: unconditional extras
             c["output_globs"] = out_flat
-    # chain successor (blank alias → not a chain)
-    succ_alias = (f.get("successor", "") or "").strip()
-    keep = [g.strip() for g in re.split(r"[\r\n,]+", f.get("chain_keep", "") or "") if g.strip()]
-    relay = (f.get("chain_relay", "") or "path").strip().lower()
-    # A cloud successor (Meshy, Tripo) has exactly one file field and no mapping to rename
-    # it, so a blank mesh param must default to ITS name (`input_mesh_path`) — ComfyUI's
-    # `mesh_path` would be a param the cloud stage cannot bind. Read off the successor's
-    # own file fields rather than hard-coding a name per vendor.
-    succ_cand = (store.get(succ_alias) or [{}])[0]
-    succ_kind = adapters.cloud_kind(succ_cand)
-    files = adapters.public_fields(succ_cand)[2] if succ_kind else []
-    succ = ({"alias": succ_alias,
-             "export_node": (f.get("chain_export_node", "") or "").strip(),
-             "mesh_param": ((f.get("chain_mesh_param", "") or "").strip()
-                            or (files[0]["name"] if files else
-                                ("input_mesh_path" if succ_kind else "mesh_path"))),
-             **({"relay": relay} if relay == "upload" else {}),
-             **({"keep_from_mesh": keep} if keep else {}),
-             **({"rig": (f.get("chain_rig", "") or "").strip()} if (f.get("chain_rig", "") or "").strip() else {})}
-            if succ_alias else None)
-    for c in cands:
-        if succ:
-            c["successor"] = succ
-        else:
-            c.pop("successor", None)
     return f"{len(mapping)} params, {len(fixed)} pinned, retries={retries or 'all'}"
 
 
@@ -7420,34 +7501,16 @@ def _cloud_update_apply(kind: str, cands: list, f: dict) -> None:
     if getattr(mod, "task_for", None):
         task = mod.task_for(ep, task or cands[0].get("task", ""))
     retries = (f.get("retries", "") or "").strip()
-    # chain successor (blank alias → not a chain). No export_node and no relay: a cloud
-    # stage's mesh is a result blob and always travels to stage 2 as bytes (_run_chain
-    # forces `upload`), so those two ComfyUI fields would only be misleading here.
-    succ_alias = (f.get("successor", "") or "").strip()
-    keep = [g.strip() for g in re.split(r"[\r\n,]+", f.get("chain_keep", "") or "") if g.strip()]
-    rig = (f.get("chain_rig", "") or "").strip()
-    succ = ({"alias": succ_alias,
-             "mesh_param": (f.get("chain_mesh_param", "") or "").strip() or "input_mesh_path",
-             **({"keep_from_mesh": keep} if keep else {}),
-             **({"rig": rig} if rig else {})}
-            if succ_alias else None)
     if getattr(mod, "INPUT_ERROR", None):
         _, retry_err = _int_field(retries, "retries", "try all backends")
         if retry_err:
             raise mod.INPUT_ERROR(retry_err)
-    if kind not in ("meshy", "tripo") and succ:
-        input_error = getattr(mod, "INPUT_ERROR", arliai.ArliAIInput)
-        raise input_error(f"{mod.VENDOR} does not support workflow chains")
     for c in cands:
         # a fresh options dict per candidate — one shared object would let a later
         # in-place edit of one candidate rewrite the others
         c[mod.KIND] = {"endpoint": ep, "options": json.loads(json.dumps(opts))}
         c["model"] = model
         c["retries"] = retries
-        if succ:
-            c["successor"] = json.loads(json.dumps(succ))    # own copy per candidate (see above)
-        else:
-            c.pop("successor", None)
         if task:
             c["task"] = task
 
@@ -7805,11 +7868,12 @@ def _job_result_html(job_id: str, job: Optional[dict]):
     cells = []
     for r in job.get("results", []):
         src = f"/ui/playground/result/{_esc(job_id)}/{r['n']}"
-        extra = ""
+        st = None
         if (r.get("mime") or "").lower() == "model/gltf-binary":
             rp = jobs.result_path(job_id, r["n"])
-            extra = _glb_stats_html(rp[0] if rp else None)
-        cells.append(f"<div>{_media_tag(src, r.get('mime'), r.get('kind'), cls='result', autoplay=True)}{extra}</div>")
+            st = _glb_stats(rp[0]) if rp else None
+        extra = _glb_stats_html(st)
+        cells.append(f"<div>{_media_tag(src, r.get('mime'), r.get('kind'), cls='result', autoplay=True, glb_stats=st)}{extra}</div>")
     imgs = "".join(cells)
     meta = job.get("meta") or {}
     tags = ""
@@ -8397,15 +8461,11 @@ _JOB_SCLS = {"done": "ok", "failed": "bad", "running": "warn", "queued": "warn"}
 
 
 def _job_status_text(j: dict) -> str:
-    """Status label with the multi-stage sub-step appended while running — a chain in
-    stage 1 shows 'running 1/2', in stage 2 'running 2/2'. Single-stage jobs are plain.
-
-    Plus the backend's own step counter when its websocket feed is reporting one:
+    """Status label with the backend's step counter when its websocket feed reports one:
     'running 25/35' is the answer to "is it stuck?", and it is the same number ComfyUI
     prints in its log. Absent for a backend that does not report — never faked."""
     st = j.get("status") or ""
-    stg = j.get("stage")
-    txt = f"{st} {stg}" if st == "running" and stg else st
+    txt = st
     if st == "running":
         live = _job_progress(j.get("id") or "") or {}
         if live.get("step") is not None and live.get("steps"):
@@ -8703,11 +8763,12 @@ def _job_thumbs(jid: str, kind: str, entries: list) -> str:
         if mk in ("video", "audio") or m.startswith("video/") or m.startswith("audio/"):
             cells += f"<div>{_media_tag(src, r.get('mime'), r.get('kind'), style=style)}</div>"
         elif m in ("model/gltf-binary", "model/gltf+json"):   # GLB → <model-viewer> + download
-            stats = ""
-            if kind == "result" and m == "model/gltf-binary":
-                rp = jobs.result_path(jid, r["n"])
-                stats = _glb_stats_html(rp[0] if rp else None)
-            cells += (f"<div>{_media_tag(src, r.get('mime'), 'file', style=box3d)}{stats}"
+            st = None
+            if m == "model/gltf-binary":
+                rp = jobs.result_path(jid, r["n"]) if kind == "result" else jobs.input_path(jid, r["n"])
+                st = _glb_stats(rp[0]) if rp else None
+            stats = _glb_stats_html(st) if kind == "result" else ""
+            cells += (f"<div>{_media_tag(src, r.get('mime'), 'file', style=box3d, glb_stats=st)}{stats}"
                       f"<div>{_dl_card(src, label, dl=dl, compact=True)}</div></div>")
         elif name.lower().endswith(".fbx"):               # FBX → three.js viewer + download
             tex_attr = f' data-tex="{_esc(tex_url)}"' if tex_url else ""
@@ -8749,12 +8810,8 @@ def _cloud_table(title: str, m: dict) -> str:
     """One cloud run (Meshy, Tripo) in the job view: the body actually sent (image data
     replaced by its size) plus the task id — the id is what the vendor's own dashboard is
     searched by, and the body answers "which options did this run use?" without
-    re-deriving them from today's config. '' when `m` is not a cloud run (no task id), so
-    a chain renders a table per cloud STAGE: the top-level meta is the last stage's, a
-    stage-1 cloud run is kept beside it under `meta.chain_stage1`.
-
-    `title` names the stage generically ("Cloud · stage 1"); the VENDOR is substituted
-    from the run's own meta, because the two stages of a chain may be different vendors.
+    re-deriving them from today's config. '' when `m` is not a cloud run (no task id).
+    The vendor is substituted from the run's own meta.
     `meshy_task_id` is read as well: rows written before the kind existed carry only that
     key and no `cloud`, and a job view that suddenly renders nothing for them would look
     like the run was never recorded."""
@@ -8813,84 +8870,6 @@ def _lora_landing(params: dict, placed: list) -> dict:
     return out
 
 
-def _stage2_section(s2: dict) -> str:
-    """The chain hand-off, for the job view: what stage 2 was actually HANDED and which
-    of it the successor mapped. Stage-1 params are threaded to the successor by mapping
-    LABEL, and `_apply_mapping` silently skips a name the successor does not bind — so a
-    param that never arrives (a renamed label on either side) is invisible in the result
-    and used to be answerable only from the backend's own ComfyUI history.
-
-    `s2` is recorded at run time by `_run_chain` (meta.chain_stage2); only the node/field
-    DETAIL is looked up in the alias config live, and marked as such — the mapping may
-    have changed since the run. `applied` is absent when stage 2 never reported back
-    (a failed hand-off); the rows then say what the CURRENT config would bind, and say so.
-
-    A **cloud** successor (Meshy, Tripo) has no mapping at all — its request fields are a
-    fixed label table (the kind's public_fields) and it reports no `applied` set. Its rows
-    therefore say "handed", never "dropped": claiming a loss nobody measured would send
-    you hunting a mapping that does not exist."""
-    alias2, b2 = s2.get("alias") or "?", s2.get("backend") or "?"
-    params = s2.get("params") or {}
-    mesh_param = s2.get("mesh_param") or ""
-    applied = s2.get("applied")               # None → stage 2 never got that far
-    mapping2, cloud2 = {}, None
-    if store.is_active():
-        cs = store.get(alias2) or []
-        c2 = next((x for x in cs if x.get("backend") == b2), cs[0] if cs else None) or {}
-        mapping2 = c2.get("mapping") or {}
-        cloud2 = adapters.cloud_kind(c2)
-    vendor2 = adapters.cloud_module(cloud2).VENDOR if cloud2 else ""
-
-    def target(k):                            # (node, field) the successor binds `k` to, per CURRENT config
-        for p, m in mapping2.items():
-            m = m or {}
-            if p == k or ((m.get("label") or "").strip() == k):
-                return str(m.get("node")), str(m.get("field") or "")
-        return None, None
-
-    rows, n_app, n_drop = [], 0, 0
-    for k, v in params.items():
-        if k == mesh_param:                   # the mesh itself gets its own line below
-            continue
-        node, field = target(k)
-        if cloud2:                            # no mapping to look up — and none to miss
-            hit = True
-            tag = (f"<span class='muted' title='{_esc(vendor2)} binds a fixed label table; a name "
-                   f"it does not know is ignored'>handed · {_esc(vendor2)} fixed table</span>")
-        elif applied is None:                 # unverified: describe the binding, don't claim it ran
-            hit = node is not None
-            tag = (f"<span class='muted' title='from the successor alias config as it "
-                   f"stands now'>→ node {_esc(node)}.{_esc(field)}</span>" if hit else
-                   "<span class='muted'>not mapped by successor</span>")
-        else:
-            hit = k in applied
-            # node None while applied says otherwise = the mapping moved since the run;
-            # still say "applied", never leave the cell blank.
-            tag = ((f"<span class='muted' title='from the successor alias config as it "
-                    f"stands now'>→ node {_esc(node)}.{_esc(field)}</span>" if node else
-                    "<span class='muted'>applied</span>")
-                   if hit else "<span class='muted'>dropped · not mapped by successor</span>")
-        n_app, n_drop = (n_app + 1, n_drop) if hit else (n_app, n_drop + 1)
-        s = "" if hit else " style='text-decoration:line-through;opacity:.55'"
-        rows.append(f"<tr><td{s}><code>{_esc(k)}</code></td><td{s}>{_esc(str(v))}</td>"
-                    f"<td>{tag}</td></tr>")
-    verb = "applied" if applied is not None else "mapped"
-    tally = (f"{len(rows)} param(s) handed · {n_app} {verb} · {n_drop} dropped"
-             if rows else "no params handed besides the mesh")
-    warn = ("" if applied is not None else
-            " <span class='bad'>· stage 2 did not report back — bindings shown are from "
-            "the current alias config</span>")
-    if cloud2:                                # nothing to tally against: no mapping, no `applied`
-        tally = (f"{len(rows)} param(s) handed · {vendor2} takes its fixed label table and "
-                 f"ignores the rest" if rows else "no params handed besides the mesh")
-        warn = "" if applied is not None else " <span class='bad'>· stage 2 did not report back</span>"
-    mesh = (f"<p style='margin:6px 0'><code>{_esc(mesh_param)}</code> "
-            f"<span class='muted'>← the relayed mesh</span><br>"
-            f"<code style='font-size:12px'>{_esc(str(s2.get('mesh_ref') or ''))}</code></p>")
-    tbl = f"<table>{''.join(rows)}</table>" if rows else ""
-    return (f"<h3>Successor <span class='muted' style='font-weight:normal'>· stage 2 · "
-            f"{_esc(alias2)} · {_esc(b2)} · {_esc(s2.get('relay') or 'path')} hand-off</span></h3>"
-            f"<p class='hint' style='margin:2px 0 8px'>{tally}{warn}</p>{mesh}{tbl}")
 
 
 async def job_detail_page(job_id: str, request: Request):
@@ -8983,17 +8962,6 @@ async def job_detail_page(job_id: str, request: Request):
                   f"<ul class='muted' style='margin:4px 0 0 18px;font-size:12px'>{ids}</ul>")
     if not inbox:
         inbox = "<p class='muted'>No stored inputs (job predates this feature).</p>"
-    # Chain hand-off: what stage 2 was handed. Recorded per run; a job from before that
-    # says so rather than being reconstructed from today's config, which may have moved.
-    if meta.get("chain_stage2"):
-        inbox += _stage2_section(meta["chain_stage2"])
-    elif meta.get("chain") or cand.get("successor"):
-        inbox += ("<h3>Successor <span class='muted' style='font-weight:normal'>· stage 2</span></h3>"
-                  "<p class='muted'>Hand-off params not recorded (job predates this feature).</p>")
-    # Cloud runs (task id + the body actually sent + credits — see _cloud_table): a
-    # chain's stage-1 cloud run FIRST, then the top-level meta (stage 2's on a chain),
-    # so a cloud→cloud chain reads in the order it ran. Each table names its OWN vendor.
-    inbox += _cloud_table("Cloud · stage 1", meta.get("chain_stage1") or {})
     inbox += _cloud_table("Cloud", meta)
     inbox += _runpod_table(meta)
     if st in ("queued", "running"):
@@ -11453,6 +11421,7 @@ def register(app) -> None:
     app.add_api_route("/ui/mapping", mapping_legacy, methods=["GET"])
     app.add_api_route("/ui/mapping/register", register_post, methods=["POST"])
     app.add_api_route("/ui/mapping/update-workflow", update_workflow, methods=["POST"])
+    app.add_api_route("/ui/mapping/workflow-diff", workflow_diff, methods=["POST"])
     app.add_api_route("/ui/mapping/field-add", edit_add, methods=["POST"])
     app.add_api_route("/ui/mapping/field-map", field_map, methods=["POST"])
     app.add_api_route("/ui/mapping/field-clear", field_clear, methods=["POST"])

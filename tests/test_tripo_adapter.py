@@ -489,31 +489,6 @@ class TestTripoAdapter(unittest.TestCase):
         self.assertEqual(_Stub.posted[1][1]["format"], "OBJ")
         self.assertIs(_Stub.posted[1][1]["with_animation"], False)
 
-    # ── chain roles ──────────────────────────────────────────────────────────
-    def test_chain_hooks(self):
-        cand = tripo.default_candidate("tripo")
-        rig = tripo.default_candidate("tripo")
-        rig["tripo"]["endpoint"] = "rig"
-        self.assertIn("cannot be stage 1", self.ad.chain_export(rig, {}, {}, "gwchain_x").error)
-        noglb = tripo.default_candidate("tripo")
-        noglb["tripo"]["options"]["target_formats"] = ["fbx"]
-        self.assertIn("glb", self.ad.chain_export(noglb, {}, {}, "gwchain_x").error)
-        exp = self.ad.chain_export(cand, {}, {}, "gwchain_x")
-        self.assertEqual((exp.mesh_name, exp.error), ("gwchain_x.glb", None))
-
-        out = adapters.GenOutput(blobs=[adapters.GenBlob(data=GLB, mime="model/gltf-binary",
-                                                         kind="file", name="model.glb")], meta={})
-        self.assertEqual(self._run(self.ad.chain_take_mesh(out, exp, True)), GLB)
-
-        req2 = adapters.NormalizedRequest(alias="Tripo-Rig")
-        with self.assertRaises(RuntimeError):
-            self._run(self.ad.chain_feed_mesh(req2, {}, "input_mesh_path", "gwchain_x.glb",
-                                              None, ""))
-        ref = self._run(self.ad.chain_feed_mesh(req2, {}, "input_mesh_path", "gwchain_x.glb",
-                                                GLB, ""))
-        self.assertEqual(req2.upload_files["input_mesh_path"], ("gwchain_x.glb", GLB))
-        self.assertIn("upload:", ref)
-
     # ── transport ────────────────────────────────────────────────────────────
     def test_upload_transport_error_fails_over(self):
         """An upload that cannot reach Tripo is a failover-class ConnectionError (an

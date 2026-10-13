@@ -4102,7 +4102,7 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         # a config-defined backend toggled in the console: each toggle writes a store
         # copy that overrides config WHOLESALE — every configured key must survive
         m = self.m
-        extra = {"host": "gpu-box", "comfy_output_dir": "/home/ubuntu/ComfyUI/output",
+        extra = {"host": "gpu-box",
                  "max_wait": 900, "auto_restart": True,
                  "models_allow": "flux*", "bypass": ["12"],
                  "sampling_defaults": {"stop": ["a"]}}

@@ -111,7 +111,8 @@
       "keep_models_loaded": true,
       "conv_backend": "flex_gemm",
       "sparse_backend": "flash_attn",
-      "use_reconviagen": false
+      "use_reconviagen": false,
+      "pixal3d_multiview": false
     },
     "class_type": "Trellis2LoadModel",
     "_meta": {
@@ -226,7 +227,10 @@
       "texture_guidance_rescale": 0.2,
       "texture_rescale_t": 3,
       "max_num_tokens": 999999,
-      "sparse_structure_resolution": 32,
+      "sparse_structure_resolution": [
+        "121",
+        0
+      ],
       "generate_texture_slat": true,
       "sparse_structure_guidance_interval_start": 0.1,
       "sparse_structure_guidance_interval_end": 1,
@@ -598,6 +602,15 @@
     "class_type": "easy imageRemBg",
     "_meta": {
       "title": "Image Remove Bg - Right"
+    }
+  },
+  "121": {
+    "inputs": {
+      "value": 32
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "input_structure_resolution"
     }
   }
 }

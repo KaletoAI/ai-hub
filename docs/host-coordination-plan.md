@@ -159,14 +159,7 @@ gefallen ist (sonst nach 30 s Urteil False). Ein Pool, der schon vorher ≤ 256 
 hält, gilt als leer (Urteil True); sind die `/system_stats` nicht lesbar, bleibt
 es beim alten Fire-and-forget. Review 2026-09-08.
 
-Zwei Dinge, die Flag 1 nicht abdecken konnte:
-- **Chain-Stages.** Stage 1 und Stage 2 sind zwei Workflows, oft auf DEMSELBEN
-  Backend, ohne Job-Ende dazwischen — vorher lief dort nie ein Free. Gemessen
-  2026-09-05 (Job `cc604da29e0e`, Meshy → `mesh-mia` auf k12-gpu): Stage 2 starb
-  an `torch.OutOfMemoryError: Tried to allocate 20.00 MiB`, weil der ComfyUI-
-  Prozess 21,4 von 23,5 GiB hielt. Der Rig-Node (Make-It-Animatable) läuft in
-  einem EIGENEN venv/Prozess und kann diesen Cache prinzipiell nicht mitbenutzen.
-- **Free über den Gateway-Neustart hinweg** (siehe oben).
+Flag 2 deckt auch **Free über den Gateway-Neustart hinweg** ab (siehe oben).
 
 Flag 1 bleibt, aber nur noch für seinen einen eigenen Zweck: eine geteilte Box
 soll auch dann freigeben, wenn gar kein Media-Job folgt, sonst scheitert der
@@ -178,7 +171,7 @@ overdue > Typ-Affinität > ältester), und verglichen wird gegen
 `backend_vram_key`, nicht gegen den zuletzt gelaufenen Alias. Ein unbekannter
 Stand (`None`) gibt unabhängig von Wartenden frei. Ein Scan der ganzen Queue nach
 Alias wäre falsch und war es: ein Wartender, der dieses Backend gar nicht nehmen
-kann (nach einer fehlgeschlagenen Chain-Stage ausgeschlossen, anderswo
+kann (nach einer fehlgeschlagenen Ausführung ausgeschlossen oder anderswo
 force-gepinnt), unterdrückte den Free dauerhaft — und damit gab auf einer
 geteilten Box nichts mehr die GPU frei (Review 2026-09-08).
 

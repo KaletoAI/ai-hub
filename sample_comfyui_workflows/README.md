@@ -12,10 +12,8 @@ liegen in `org/backups/`.
 **Konventionen:**
 
 * Nodes mit Titel `input_*` sind die Bindepunkte des Gateways.
-* Der Haupt-Export trägt den Titel **`Output`** und bekommt `filename_prefix` aus `input_name`
-  — außer als Stage 1 einer Kette: dort pinnt das Gateway den Prefix auf `gwchain_<job-id>`
-  (`main.py`, `adapters.chain_export`). Die `Save Image`-Artefakte behalten auch dann ihren
-  `input_name`-Prefix.
+* Der Haupt-Export trägt den Titel **`Output`** und bekommt `filename_prefix` aus
+  `input_name`. Die `Save Image`-Artefakte nutzen ebenfalls diesen Prefix.
 * Dateinamen: `<name>.<ext>` für das Hauptergebnis, `<name>_<artefakt>.<ext>` für alles andere,
   Artefaktnamen klein. `<name>` = Wert von `input_name`.
 * ComfyUI hängt an Export-/Save-Nodes einen laufenden Zähler an: aus `<name>_basecolor` wird auf
@@ -41,7 +39,7 @@ und kollidiert in der Kette (siehe `main.py`, Kommentar zu `s2_params`).
 | `input_face_num` | `62` | `value` | `20000` | ja |
 | `input_texture_resolution` | `84` | `value` | `1024` | ja |
 | `input_remove_background` | `61` | `value` | `True` | ja |
-| `input_no_fingers` | `80` | `value` | `False` | **nein** — Pass-through an Stage 2 |
+| `input_no_fingers` | `80` | `value` | `False` | **nein** — unverdrahtet, keine Wirkung |
 
 #### img2mesh-trellis2_low
 
@@ -52,7 +50,7 @@ und kollidiert in der Kette (siehe `main.py`, Kommentar zu `s2_params`).
 | `input_face_num` | `62` | `value` | `20000` | ja |
 | `input_texture_resolution` | `102` | `value` | `1024` | ja |
 | `input_remove_background` | `61` | `value` | `True` | ja |
-| `input_no_fingers` | `66` | `value` | `False` | **nein** — Pass-through an Stage 2 |
+| `input_no_fingers` | `66` | `value` | `False` | **nein** — unverdrahtet, keine Wirkung |
 
 #### img2mesh-trellis2_multiview
 
@@ -66,10 +64,17 @@ und kollidiert in der Kette (siehe `main.py`, Kommentar zu `s2_params`).
 | `input_face_num` | `90` | `value` | `50000` | ja |
 | `input_steps` | `91` | `value` | `35` | ja |
 | `input_remove_background` | `92` | `value` | `True` | ja |
-| `input_no_fingers` | `93` | `value` | `False` | **nein** — Pass-through an Stage 2 |
+| `input_no_fingers` | `93` | `value` | `False` | **nein** — unverdrahtet, keine Wirkung |
 
 Vier Bild-Slots; leere Seitenansichten werden über `on_empty: disable` samt ihrem
 Zweig entfernt (siehe CLAUDE.md, `_prune_branch`).
+
+`Trellis2LoadModel` verlangt seit der Pixal3D-MultiView-Erweiterung den expliziten
+Eingang `pixal3d_multiview`. Die TRELLIS.2-Workflows (Low/High/MultiView) setzen
+ihn auf `false`: TRELLIS-MultiView ist nicht der Pixal3D-MultiView-Gewichtspfad.
+Bei fehlendem Eingang meldet ComfyUI `Required input is missing`, obwohl die
+Modellgewichte vorhanden sind. Änderungen an Beispiel-JSONs aktualisieren keine
+bereits in `store.db` registrierten Aliase; deren Workflows separat aktualisieren.
 
 #### img2mesh-Pixal3D
 
@@ -80,7 +85,12 @@ Zweig entfernt (siehe CLAUDE.md, `_prune_branch`).
 | `input_face_num` | `307` | `value` | `50000` | ja |
 | `input_texture_resolution` | `318` | `value` | `2048` | ja |
 | `input_remove_background` | `309` | `value` | `True` | ja |
-| `input_no_fingers` | `310` | `value` | `False` | **nein** — Pass-through an Stage 2 |
+| `input_no_fingers` | `310` | `value` | `False` | **nein** — unverdrahtet, keine Wirkung |
+
+Der BF16-Loader verwendet `TencentARC/Pixal3D` mit `pixal3d_multiview: false`.
+Die identische Single-View-Kopie `TencentARC/Pixal3D-T` wurde am 2026-10-12 auf
+K12 und EVO entfernt und vom Modell-Sync ausgeschlossen. Der GGUF-Zweig bleibt
+unverändert; seine Auswahl und sein Bypass sind pro Backend gespeichert.
 
 #### img2mesh-triposplat
 
@@ -104,7 +114,7 @@ Kein `input_face_num`: `SplatToMesh` kennt kein Face-Ziel, die Dichte kommt übe
 | `input_face_num` | `3` | `value` | `40000` | ja |
 | `input_texture_resolution` | `4` | `value` | `1024` | ja |
 | `input_remove_background` | `2` | `value` | `True` | ja |
-| `input_no_fingers` | `6` | `value` | `False` | **nein** — Pass-through an Stage 2 |
+| `input_no_fingers` | `6` | `value` | `False` | **nein** — unverdrahtet, keine Wirkung |
 
 > `input_face_num` **nicht über 40000** setzen. Bei 100000 friert die VM im UV-Unwrap ein
 > (kein OOM-Kill, kein Traceback — der Gast reagiert nicht mehr). 40000 ist der höchste
@@ -119,13 +129,14 @@ Kein `input_face_num`: `SplatToMesh` kennt kein Face-Ziel, die Dichte kommt übe
 | `input_face_num` | `2` | `value` | `5000` | ja |
 | `input_texture_resolution` | `3` | `value` | `1024` | ja |
 | `input_keep_borders` | `8` | `value` | `'true'` | ja |
-| `input_no_fingers` | `6` | `value` | `False` | **nein** — Pass-through an Stage 2 |
+| `input_no_fingers` | `6` | `value` | `False` | **nein** — unverdrahtet, keine Wirkung |
 
 Unterschied: `mesh-shrink` dezimiert (Quadric Edge Collapse), `mesh-shrink-quad` dezimiert
 erst fest auf 20000 Faces (#11) und remesht dann (`Hy3D21IMRemesh`, Instant Meshes,
 Quad-Topologie). Gleiche Bindepunkte, aber `input_face_num` ist bei `-quad` eine
 **Vertex**-Zahl (`vertex_count`), bei `mesh-shrink` eine **Face**-Zahl
 (`target_face_count`) — austauschbar nur bei angepasstem Wert.
+
 
 #### GLB-Face-Retexture — Original-GLB + RGB-Foto → korrigiertes GLB
 
@@ -166,6 +177,33 @@ Konkreter Client-Ablauf und Installation:
 **Abweichung:** Diese drei haben **keinen** Node mit Titel `Output`. Ihr Ergebnis ist der
 Rückgabewert des Rig-Nodes (`fbx_output_path` bzw. `rigged_glb_path`), der über den
 Preview-Node in `/history` landet. `mesh-make-it-animatable` hat außerdem kein `input_name`.
+
+#### mesh-unimate — geriggter Mesh + Text → Animation
+
+`mesh-unimate_api.json` verwendet UniMate v3 (`unimate_uniml3d_f60_v3`) auf einem
+bereits geriggten GLB. Kein automatisches Rigging: bei Bedarf vorher `mesh-mia` aufrufen.
+Alias `mesh-unimate`, Task `mesh2anim`, Backend `k12-gpu`, Output-Node `10`.
+
+| Request-Feld | Node (`value`) | Default |
+|---|---|---|
+| `files.input_mesh_path` | `2` | GLB hochladen oder aus der Job-Historie wählen |
+| `prompt` | `4` | `An object walks forward.` |
+| `seed` | `6` | 42 |
+| `input_cfg_scale` | `5` | 3 |
+| `input_num_repetitions` | `7` | 1 |
+| `input_chain_overlap` | `8` | 10 Frames |
+
+Eine Prompt-Zeile erzeugt 60 Frames bei 30 fps. Mehrere Zeilen verketten Bewegungen:
+`60 + (60 - overlap) × (Zeilen - 1)` Frames. Modellgrenze: 71 Gelenke.
+Der stabile Asset-Name `mesh` erlaubt den Preprocessing-Cache trotz job-eigener Upload-Namen.
+Ausgabe: animiertes GLB mit Skin und eingebetteten Texturen; native Animation wird im
+AI-Hub abgespielt, nicht durch die diagnostische Idle-Animation ersetzt.
+Modelllizenz: **CC BY-NC 4.0**, nicht kommerziell.
+
+VM-402-Abnahme am 2026-10-11: vorhandener 52-Gelenk-Mesh, erster AI-Hub-Lauf
+32,95 s inklusive Vorbereitung/Laden/Auslieferung; 60 Frames, 53 Tracks, davon 40 bewegt.
+Der visuelle ComfyUI-Workflow liegt unter `user/default/workflows/mesh-unimate.json`;
+Core/Blender/Sampling verwenden das separate `~/UniMate/venv`, ohne ComfyUI-Paketänderung.
 
 #### motion-kimodo — Text → Bewegung auf hochgeladenem Mixamo-Rig (FBX)
 
@@ -246,37 +284,26 @@ Quartermaster `kb/02-ai-serving.md`, Abschnitt „Iris-3B“.
 | `mesh-reg-unirig` | — (#7) | `<name>.fbx` |
 | `mesh-reg-mia` | — (#2) | `<name>.fbx` · daneben `<name>.glb` (nicht in `/history` gemeldet → Alias-Option `output_ext: glb`) |
 | `mesh-make-it-animatable` | — (#7) | `<name>.glb` (mixamo-Skin) |
+| `mesh-unimate` | `10` | `UniMate_<counter>_.glb` pro Wiederholung, native Animation + Skin/Texturen |
 | `motion-kimodo` | `6` | `kimodo_<uid>_<n>.fbx` pro Variante, Animation auf dem hochgeladenen Rig |
 
 **triposplat liefert keine getrennten Texturen.** `SplatToMesh` gibt den Core-Typ `MESH` aus,
 die gesamte Textur-Werkzeugkette arbeitet auf `TRIMESH`, und es existiert kein Node, der
-zwischen beiden übersetzt. Seine Textur steckt eingebettet im GLB. Folge: **triposplat darf
-nicht direkt an einen `generic`-Rigger gekettet werden** (siehe 2.2) — entweder `mesh-shrink`
-dazwischenschalten, das die PNGs aus dem GLB erzeugt, oder nur den `mixamo`-Weg nutzen.
+zwischen beiden übersetzt. Seine Textur steckt eingebettet im GLB. Für einen
+FBX-Rigger benötigt der Client zusätzlich eine passende Basecolor (siehe 2.2):
+zuerst einen separaten `mesh-shrink`-Job mit dem GLB aufrufen, der die PNGs erzeugt,
+oder einen GLB-Rigger nutzen.
 
-### 1.3 Ketten
+### 1.3 Unabhängige Aufrufe
 
-Konfiguration des Nachfolgers: `{alias, export_node, mesh_param, relay?, keep_from_mesh?, rig?}`.
+Jeder Job führt genau den angefragten Alias aus. Für Verdichtung oder Rigging
+lädt der Client das Mesh-Ergebnis herunter und stellt einen neuen Request an den
+gewünschten Alias mit dem normalen Upload `files.input_mesh_path`.
+Parameter müssen bei diesem Request explizit gesetzt werden. Es gibt keine
+automatische Übergabe oder Zusammenführung von Ergebnissen.
 
-* `export_node` — die Node-ID aus 1.2, deren Datei an Stage 2 übergeben wird.
-* `mesh_param` — Label des Mesh-Eingangs bei Stage 2, hier durchgehend `input_mesh_path`.
-* `keep_from_mesh` — Globs für Stage-1-Dateien, die in die Auslieferung übernommen werden.
-  Für `generic`-Rigger **zwingend** `*_basecolor*.png` (Begründung in 2.2).
-* `rig` — `generic` (FBX-Ergebnis) oder `mixamo` (GLB-Ergebnis); steuert Validierung und
-  Textur-Normalisierung. Zusätzlich erlaubt: `meshy` / `tripo` für Cloud-Rigger — die werden
-  nur getaggt, nie normalisiert oder validiert (Cloud-Konventionen).
-
-Übergabe: bei geteiltem Dateisystem als absoluter Pfad, sonst per Upload ins `input/` von
-Stage 2. Relative Pfade (`output/3D/…glb`) funktionieren, weil ComfyUI mit
-`WorkingDirectory=/home/kai/ComfyUI` läuft.
-
-**Genau zwei Stufen.** Das Gateway kennt `1/2` → `2/2`, ein Nachfolger ohne Rekursion.
-`img2mesh → mesh-shrink` und `img2mesh → rig` gehen, `img2mesh → shrink → rig` in **einem**
-Job nicht.
-
-Stage-1-Parameter werden per **Label** an Stage 2 weitergereicht — daher der unverdrahtete
-`input_no_fingers` in den img2mesh-Workflows: er ist der Anker, damit der Parameter an Stage 1
-annehmbar ist, wirken tut er erst beim Rigger.
+Unverdrahtete `input_no_fingers`-Nodes in Mesh-Workflows haben keine Wirkung.
+Der Parameter gehört in den Request an `mesh-mia`, wo er tatsächlich gebunden ist.
 
 ---
 
@@ -301,19 +328,17 @@ braucht ausschließlich diese eine Datei.
 | Datei | Inhalt | speichern? |
 |---|---|---|
 | `<name>.fbx` | geriggtes Mesh mit Skelett | **Pflicht** |
-| `<name>_basecolor.png` | Albedo — aus der Mesh-Stufe übernommen | **Pflicht, untrennbar vom FBX** |
-| `<name>_metallic.png` | Metallic/Roughness | optional |
-| `<name>.glb` (Stage 1) | untexturiertes Vorstadium | optional — Referenz |
+| `<name>_basecolor.png` | Albedo — vom Client aus dem Mesh-Job behalten | **Pflicht, untrennbar vom FBX** |
+| `<name>_metallic.png` | Metallic/Roughness aus dem Mesh-Job | optional |
+| `<name>.glb` | Mesh-Eingang des separaten Rigging-Jobs | optional — Referenz |
 
 **Die FBX enthält die Textur nicht.** Sie referenziert sie nur über einen Temp-Pfad, der beim
 Abnehmer ins Leere zeigt; der Client bindet über den ausgelieferten Dateinamen neu. Wird das
-PNG nicht mitgespeichert, ist das Asset unbrauchbar und nicht wiederherstellbar. Das Gateway
-erzwingt das Paar (`validate_delivery` bricht ohne PNG hart ab), aber nur die Auslieferung —
-**das Speichern liegt beim Abnehmer.**
-
-Die Texturen kommen **V-gespiegelt** aus dem Bake und werden vom Gateway einmal zentral
-gedreht (`normalize_delivery`), optional nach JPEG umkodiert. Der Abnehmer speichert sie
-unverändert und kompensiert nichts.
+PNG nicht mitgespeichert, ist das Asset unbrauchbar und nicht wiederherstellbar.
+Ein separater Rigging-Job liefert keine Textur aus dem vorherigen Mesh-Job mit;
+**Aufbewahrung, Zuordnung und Binden liegen beim Abnehmer.**
+Textur-Normalisierung richtet sich nach den Output-Cases des Mesh-Alias,
+nicht nach einem später angefragten Rigger. Keine automatische V-Korrektur annehmen.
 
 ### 2.3 Mit `mixamo`-Rigger (Make-It-Animatable → GLB)
 
@@ -321,8 +346,9 @@ unverändert und kompensiert nichts.
 |---|---|---|
 | `<name>.glb` | geriggtes Mesh, mixamorig-Skin, **eingebettete** Textur | **Pflicht — genügt allein** |
 
-Hier gilt das Gegenteil von 2.2: eine Datei, alles drin. Das Gateway prüft Skin und Textur
-(eine 2×2-Dummy-Textur ist ein bekannter Node-Bug und schlägt fehl).
+Hier genügt ein GLB, wenn Skin und Textur darin vollständig sind.
+Der Client beurteilt das konkrete Rigging-Ergebnis; der Aliasname garantiert keine
+automatische Skin-/Textur-Validierung.
 
 ### 2.4 Kurzfassung fürs Speichern
 

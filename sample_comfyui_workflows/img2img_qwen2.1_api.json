@@ -80,6 +80,16 @@
       "title": "input_vae"
     }
   },
+  "119": {
+    "inputs": {
+      "unet_name": "qwen_image_edit_fp8.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "input_model"
+    }
+  },
   "121": {
     "inputs": {
       "clip_name": "qwen3vl_8b_heretic_int8_convrot.safetensors",
@@ -191,6 +201,10 @@
   },
   "144": {
     "inputs": {
+      "any_01": [
+        "119",
+        0
+      ],
       "any_02": [
         "150",
         0

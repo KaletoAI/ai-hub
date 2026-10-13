@@ -252,10 +252,8 @@ virtual_models:
 #   restart_cooldown_s → at most one auto-restart attempt per this many seconds (600)
 #   self_retries      → extra attempts on the SAME generation backend before failing
 #                       over (default 0; the in-flight slot is held across them)
-#   comfy_output_dir  → ComfyUI's output dir on that host — needed for a `relay: path`
-#                       chain hand-off (both stages on one backend, shared disk)
-#   comfy_input_dir   → its input dir, for a `relay: upload` hand-off; blank = derived
-#                       from comfy_output_dir's `…/input` sibling
+#   comfy_input_dir   → absolute ComfyUI input dir on that host; required to resolve
+#                       normal file uploads for workflows loading absolute paths
 # (Backends still take `paid`, `enabled`, `max_concurrent`, `host` like any other.)
 #
 #   - name: ct452-comfy
@@ -264,7 +262,7 @@ virtual_models:
 #     max_concurrent: 1               # one generation at a time on this GPU
 #     poll_interval: 1.0
 #     max_wait: 600
-#     comfy_output_dir: /opt/ComfyUI/output   # enables a `relay: path` chain hand-off
+#     comfy_input_dir: /opt/ComfyUI/input
 #     stuck_after_s: 90               # executor watchdog threshold
 #     auto_restart: true              # let the gateway reboot it when the watchdog fires
 #     restart_cooldown_s: 600         # …at most once per 10 minutes
@@ -312,13 +310,9 @@ virtual_models:
 #         endpoint: rigging
 #         options: {target_formats: [glb], animations: false}
 #
-# Workflow chain: a stage-1 alias carries a `successor` and the gateway delivers ONLY
-# the successor's result (the mesh stage's own output is dropped, minus keep_from_mesh).
-# Either stage may be ComfyUI or Meshy — here a Meshy mesh rigged locally by mesh-mia.
-# A Meshy stage shares no disk with anything, so the mesh always travels as BYTES (any
-# stored `relay` is ignored) and glb must be in target_formats, else the job is refused
-# before credits are spent. Point `successor.alias` at "Meshy-Rig" instead to rig in the
-# cloud — then `rig: meshy`, and the mesh never leaves Meshy.
+# Independent mesh generation with a t-pose suitable for a later rigging request.
+# Download the mesh result, then submit it explicitly to a rigging alias using
+# files.input_mesh_path. Each request is a separate job with its own billing.
 #   "Meshy-Humanoid":
 #     - backend: meshy
 #       task: img2mesh
@@ -326,11 +320,6 @@ virtual_models:
 #       meshy:
 #         endpoint: image-to-3d
 #         options: {target_formats: [glb], pose_mode: t-pose}
-#       successor:
-#         alias: mesh-mia             # the rigging alias (a ComfyUI or a Meshy one)
-#         mesh_param: input_mesh_path # must be a request field of that alias
-#         rig: mixamo                 # client-facing rig tag: mixamo | generic | meshy | tripo
-#         # keep_from_mesh: ["preview.png"]   # stage-1 files to ship along
 
 # Tripo3D (https://developers.tripo3d.ai, API V3) is the second cloud mesh backend —
 # same idea as Meshy, billed per task in credits, hence ALWAYS paid. Two differences
@@ -388,10 +377,9 @@ virtual_models:
 #                   rig_check: true, rig_model: v1.0-20240301, rig_type: biped,
 #                   spec: mixamo, animations: [preset:walk]}
 #
-# Chained: a Tripo mesh rigged by Tripo itself (either stage may also be ComfyUI or
-# Meshy — all combinations run). A cloud stage shares no disk, so the mesh always
-# travels as BYTES and glb must be in the stage-1 target_formats. `face_limit` matters
-# here: a rigger should not be handed a multi-million-face mesh.
+# Independent Tripo mesh generation. To rig its result, download the mesh and
+# submit a separate Tripo-Rig request using files.input_mesh_path.
+# `face_limit` matters: a rigger should not be handed a multi-million-face mesh.
 #   "Tripo-Humanoid":
 #     - backend: tripo
 #       task: img2mesh
@@ -399,11 +387,21 @@ virtual_models:
 #       tripo:
 #         endpoint: image-to-model
 #         options: {target_formats: [glb], face_limit: 150000}
-#       successor:
-#         alias: Tripo-Rig            # the rigging alias (ComfyUI, Meshy or Tripo)
-#         mesh_param: input_mesh_path # must be a request field of that alias
-#         rig: tripo                  # tagged only - a cloud rig is never normalized
-#         # keep_from_mesh: ["preview.png"]   # stage-1 files to ship along
+
+# Generation aliases: the `model` field of a POST /v1/generations request. Each
+# maps to a list of candidates — the fastest free unpaid one runs the job, an
+# execution error fails over to the next, and a backend that keeps failing is
+# quarantined for 15 min (see the Backends tab). VRAM on a shared GPU box is freed
+# before a job whose model set differs from the last one (per-host policy). A candidate
+# names the backend, the task, the workflow file (API-format JSON), and optionally
+# a model/checkpoint to inject into the workflow's loader node.
+# `mapping` binds logical params to concrete workflow nodes+fields, e.g.
+# "prompt → node 6, field text". This is convention-FREE: it works with any
+# workflow regardless of how its nodes are named. Omit `mapping` to let the
+# gateway auto-detect via naming heuristics (fine for templated workflows; the
+# explicit form always wins). The /ui Mapping tab authors these for you — paste a
+# workflow's API JSON and it pre-fills the bindings from the same heuristics.
+# image_models:
 #   "arli-image":
 #     - backend: arli-images
 #       task: text2img
@@ -436,21 +434,6 @@ virtual_models:
 #         endpoint: 3d
 #         options: {options_json: '{"face_count":500000,"enable_pbr":false}'}
 #       # No workflow JSON; normal /v1/generations jobs and result artifacts.
-
-# Generation aliases: the `model` field of a POST /v1/generations request. Each
-# maps to a list of candidates — the fastest free unpaid one runs the job, an
-# execution error fails over to the next, and a backend that keeps failing is
-# quarantined for 15 min (see the Backends tab). VRAM on a shared GPU box is freed
-# before a job whose model set differs from the last one (per-host policy). A candidate
-# names the backend, the task, the workflow file (API-format JSON), and optionally
-# a model/checkpoint to inject into the workflow's loader node.
-# `mapping` binds logical params to concrete workflow nodes+fields, e.g.
-# "prompt → node 6, field text". This is convention-FREE: it works with any
-# workflow regardless of how its nodes are named. Omit `mapping` to let the
-# gateway auto-detect via naming heuristics (fine for templated workflows; the
-# explicit form always wins). The /ui Mapping tab authors these for you — paste a
-# workflow's API JSON and it pre-fills the bindings from the same heuristics.
-# image_models:
 #   "flux":
 #     - backend:  ct452-comfy
 #       task:     text2img
@@ -488,12 +471,6 @@ virtual_models:
 #       # output_cases: [...]                  # conditional deliveries, fetched once each
 #       # texture_format: jpeg                 # transcode a generic texture PNG to JPEG q90
 #       # dummy_check: false                   # opt out of the placeholder-image check (on)
-#       # successor:                           # workflow chain — deliver ONLY stage 2
-#       #   alias: mesh-mia                    # (same fields as the Meshy/Tripo examples
-#       #   mesh_param: input_mesh_path        #  above: alias, export_node, mesh_param,
-#       #   export_node: "31"                  #  relay, keep_from_mesh, rig)
-#       #   relay: path                        # path (one backend, shared disk) | upload
-#       #   rig: mixamo
 #   "sdxl":
 #     - backend:  ct452-comfy                # no `mapping` → auto-detected
 #       task:     text2img

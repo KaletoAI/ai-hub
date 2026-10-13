@@ -5,7 +5,7 @@ so a job that sat parked behind a busy backend for ten minutes and rendered for 
 showed "11 min" — a plausible number, just the wrong one. The same span fed the ETA
 median, the Media generation panel's avg and the scheduler's boot seed, so a backend
 with a long queue looked SLOW. `jobs.set_status(…, "running")` now stamps `started`
-once (a failover / chain re-claim keeps it) and every duration is `jobs.RUN_S`.
+once (a failover re-claim keeps it) and every duration is `jobs.RUN_S`.
 
 Also pinned here: the per-backend Pinned-values tabs carry a "default" button that
 copies the primary's slot value — its data-src must name the primary's field exactly,
@@ -47,7 +47,7 @@ class StartedStamp(unittest.TestCase):
         first = jobs.get(jid)["started"]
         self.assertIsNotNone(first)
         self._set(jid, started=first - 50)
-        jobs.set_status(jid, "running")                  # failover / chain re-claim
+        jobs.set_status(jid, "running")                  # failover re-claim
         self.assertEqual(jobs.get(jid)["started"], first - 50)
 
     def test_median_excludes_the_queue_wait(self):

@@ -9,10 +9,9 @@ The gate finds the controller the way every lookup does since managed hosts (R-W
 backend → its `host` → that host's controller → the service (a backend the controller
 does not carry — a config backend naming the host, a same-named LLM — is never gated).
 So a not-ready alias must leave BOTH lists (`ready` and `allc`) of `_gen_routes`, the
-waiter designation must inherit that, a force pin must not bypass it, the chain's
-path-relay successor (read straight from the store, not via `_gen_routes`) must be
-judged too, and the 503 must say WHY — the sync progress — instead of "no healthy
-backend" about a backend that is up.
+waiter designation must inherit that, a force pin must not bypass it, and the 503
+must say WHY — the sync progress — instead of "no healthy backend" about a backend
+that is up.
 
 Run: python -m unittest tests.test_modelsync_routing -v
 """
@@ -92,7 +91,7 @@ class _Base(unittest.TestCase):
             "img": [_wf("thunder"), _wf("gpu")],        # mixed alias
             "only": [_wf("thunder")],                   # Thunder-only alias
             "both": [_wf("thunder"), _wf("thunder2")],  # two Thunder backends
-            "rig": [_wf("thunder"), _wf("gpu")],        # a chain successor
+            "rig": [_wf("thunder"), _wf("gpu")],        # independent rigging alias
         })
         main.backend_healthy.clear()
         for b in (THUNDER, THUNDER2, GPU):
@@ -182,8 +181,7 @@ class GenRoutes(_Base):
         main._gen_routes("img", gated)
         self.assertEqual(gated, [("thunder", SYNC_TEXT)])
 
-    def test_successor_via_get_gen_routes_is_gated(self):
-        # the upload relay resolves the successor with get_gen_routes
+    def test_rig_alias_via_get_gen_routes_is_gated(self):
         self.assertEqual(self.names(main.get_gen_routes("rig")), ["gpu"])
         self.ctl.ready.add("rig")
         self.assertEqual(sorted(self.names(main.get_gen_routes("rig"))), ["gpu", "thunder"])
@@ -234,35 +232,6 @@ class NoBackend503(_Base):
         main.backend_healthy[main.backend_id(GPU)] = False
         e = self.pick_error("img", force="gpu")
         self.assertEqual(e.detail, "No healthy backend for generation model 'img' on backend 'gpu'")
-
-
-class ChainPathRelaySuccessor(_Base):
-    """The path relay pins stage 2 to stage 1's backend and reads the successor's
-    candidate from the store — not through _gen_routes — so the gate is applied there
-    explicitly: stage 1 ready on the Thunder box must not hand a mesh to a rigger
-    whose weights are still downloading."""
-
-    def test_successor_not_ready_on_the_stage1_backend_is_a_skip_reason(self):
-        self.ctl.texts["rig"] = "models for rig are syncing on thunder (1.0 of 2.0 GB)"
-        s2, why = main._chain_successor_on(THUNDER, "rig")
-        self.assertIsNone(s2)
-        self.assertEqual(why, "successor: models for rig are syncing on thunder (1.0 of 2.0 GB)")
-
-    def test_successor_ready_is_resolved(self):
-        self.ctl.ready.add("rig")
-        s2, why = main._chain_successor_on(THUNDER, "rig")
-        self.assertIsNone(why)
-        self.assertEqual(s2["backend"], "thunder")
-
-    def test_backend_without_controller_unchanged(self):
-        s2, why = main._chain_successor_on(GPU, "rig")
-        self.assertIsNone(why)
-        self.assertEqual(s2["backend"], "gpu")
-
-    def test_unconfigured_successor_keeps_its_message(self):
-        s2, why = main._chain_successor_on(THUNDER2, "rig")
-        self.assertIsNone(s2)
-        self.assertEqual(why, "successor 'rig' is not configured for backend 'thunder2'")
 
 
 if __name__ == "__main__":

@@ -101,21 +101,7 @@ class MainKindNeutral(unittest.TestCase):
     candidate's/backend's kind (adapters.cand_kind / backend_kind / cloud_kind) and name
     the vendor from the exception, never a hardcoded "meshy"/"Meshy"."""
 
-    def test_chain_mesh_param_error_for_cloud_successors(self):
-        s2 = tripo.default_candidate("tripo")
-        s2["tripo"]["endpoint"] = "rig"
-        self.assertIsNone(main._chain_mesh_param_error(s2, "input_mesh_path", "Tripo-Rig"))
-        err = main._chain_mesh_param_error(s2, "mesh_path", "Tripo-Rig")
-        self.assertIsNotNone(err)
-        self.assertIn("Tripo", err)
-        self.assertIn("input_mesh_path", err)
-        s2m = meshy.default_candidate("meshy")
-        s2m["meshy"]["endpoint"] = "rigging"
-        self.assertIsNone(main._chain_mesh_param_error(s2m, "input_mesh_path", "Meshy-Rig"))
-        gen = tripo.default_candidate("tripo")        # an image endpoint takes no file at all
-        why = main._chain_mesh_param_error(gen, "input_mesh_path", "Tripo-Object")
-        self.assertIsNotNone(why)
-        self.assertIn("no file input", why)
+    
 
     def test_gen_backend_for_matches_kind(self):
         pool = [{"name": "gpu", "type": "comfyui"}, {"name": "gpu", "type": "tripo"},

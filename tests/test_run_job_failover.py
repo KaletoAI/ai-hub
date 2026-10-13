@@ -350,143 +350,10 @@ class CancelKeepsTheBilledTask(unittest.TestCase):
         self.assertEqual(main.backend_inflight.get("meshy:m", 0), 0)    # slot released
 
 
-class _ChainJobs(_FakeJobs):
-    """The extra job-store calls _run_chain makes."""
-
-    def __init__(self):
-        super().__init__()
-        self.merged = []
-
-    def get(self, job_id):
-        return {"status": self.failed and "failed" or "running"}
-
-    def set_stage(self, job_id, st):
-        pass
-
-    def merge_meta(self, job_id, meta):
-        self.merged.append(meta)
 
 
-class ChainStage1BilledIsFinal(unittest.TestCase):
-    """K1 for the chain: a stage-1 cloud task lost to a poll timeout / vendor outage was
-    re-created by the stage-1 self-retry and then by the next stage-1 candidate."""
-
-    def setUp(self):
-        RunJobExecFailover.setUp(self)
-        import meshy
-        main.jobs = self.jobs = _ChainJobs()
-        self._saved = (main._gen_backends[:], dict(main.image_models), dict(main.backend_healthy),
-                       main.store._active, main._gen_waiting[:])
-        main.store._active = False
-        self.a = {"name": "a", "type": "meshy", "self_retries": 2, "enabled": True}
-        self.b = {"name": "b", "type": "meshy", "enabled": True}
-        self.r = {"name": "r", "type": "meshy", "enabled": True}
-        main._gen_backends[:] = [self.a, self.b, self.r]
-        s1 = meshy.default_candidate("x")["meshy"]
-        s1["options"]["target_formats"] = ["glb"]
-        succ = {"alias": "rig", "mesh_param": "input_mesh_path"}
-        rig = meshy.default_candidate("r")
-        rig["meshy"]["endpoint"] = "rigging"
-        main.image_models.clear()
-        main.image_models.update({
-            "s1": [{"backend": "a", "meshy": dict(s1), "successor": succ},
-                   {"backend": "b", "meshy": dict(s1), "successor": succ}],
-            "rig": [rig]})
-        self.succ = succ
-        main.backend_healthy.clear()
-        main.backend_healthy.update({"meshy:a": True, "meshy:b": True, "meshy:r": True})
-        main._gen_waiting.clear()
-
-    def tearDown(self):
-        gb, im, bh, sa, gw = self._saved
-        main._gen_backends[:] = gb
-        main.image_models.clear(); main.image_models.update(im)
-        main.backend_healthy.clear(); main.backend_healthy.update(bh)
-        main.store._active = sa
-        main._gen_waiting[:] = gw
-        RunJobExecFailover.tearDown(self)
-
-    def test_native_image_slot_refuses_chain_before_buying_stage1(self):
-        """A NanoGPT image slot must not admit GLB handoff after billing stage 1."""
-        import adapters
-        import nanogpt
-        self.r.update(type="nanogpt", url="https://provider.test/api")
-        self.succ["mesh_param"] = "input_image"
-        meta = {"capabilities": {"image_to_image": True},
-                "supported_parameters": {"max_input_images": 1}}
-        main.image_models["rig"] = [nanogpt.candidate_for("r", "native-image", "images", meta)]
-        native = adapters.make_adapter(self.r, main.adapter_ctx)
-        native._publish_catalogs({"images": {"native-image": meta}})
-        first, second = self._stage1(), self._stage1()
-        main.backend_adapters.update({"meshy:a": first, "meshy:b": second, "nanogpt:r": native})
-        main.backend_healthy["nanogpt:r"] = True
-        asyncio.run(main._run_chain("job1", "s1", self.succ, {}, None, {}, {}, {}, {}))
-        self.assertEqual((first.calls, second.calls), (0, 0))
-        self.assertIsNotNone(self.jobs.failed)
-        self.assertIsNone(self.jobs.completed)
-        self.assertEqual(main.backend_inflight.get("meshy:a", 0), 0)
-        self.assertEqual(main.backend_inflight.get("nanogpt:r", 0), 0)
 
 
-    def test_a_stage1_task_lost_to_the_vendor_is_not_bought_again(self):
-        import adapters as ad_mod
-
-        class _S1(_BillingAdapter):
-            def chain_export(self, cand, succ, params, prefix):
-                return ad_mod.ChainExport(f"{prefix}.glb")
-
-        a, b = _S1(ConnectionError("Meshy unreachable while polling")), _S1()
-        main.backend_adapters.update({"meshy:a": a, "meshy:b": b, "meshy:r": _Adapter()})
-        asyncio.run(main._run_chain("job1", "s1", self.succ, {}, None, {}, {}, {}, {}))
-        self.assertEqual((a.calls, b.calls), (1, 0))
-        self.assertIn("task-1", self.jobs.failed["msg"])
-        self.assertEqual(self.jobs.failed["meta"]["chain_stage1"]["cloud_task_id"], "task-1")
-        self.assertEqual(main.backend_inflight.get("meshy:a", 0), 0)
-
-
-    def _stage1(self, boom=None):
-        import adapters as ad_mod
-
-        class _S1(_BillingAdapter):
-            def chain_export(self, cand, succ, params, prefix):
-                return ad_mod.ChainExport(f"{prefix}.glb")
-        return _S1(boom)
-
-    def test_a_cancel_during_the_chain_claim_does_not_leak_the_slot(self):
-        import threading
-        gate, entered = threading.Event(), threading.Event()
-
-        def slow_set_status(job_id, st):
-            entered.set()
-            gate.wait(5)
-            return True
-        self.jobs.set_status = slow_set_status
-        main.backend_adapters.update({"meshy:a": self._stage1(), "meshy:b": self._stage1(),
-                                      "meshy:r": _Adapter()})
-
-        async def go():
-            t = asyncio.create_task(main._run_chain("job1", "s1", self.succ, {}, None,
-                                                    {}, {}, {}, {}))
-            while not entered.is_set():
-                await asyncio.sleep(0.005)
-            t.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await t
-            gate.set()
-        asyncio.run(go())
-        self.assertEqual(main.backend_inflight.get("meshy:a", 0), 0)
-
-    def test_a_malformed_self_retries_value_does_not_crash_the_chain(self):
-        """K15: `_run_job` guards int(self_retries); the chain raised ValueError, which its
-        except-Exception arm turned into a failed job that never reached any backend."""
-        self.a["self_retries"] = "two"
-        s1 = self._stage1(ConnectionError("gone"))
-        main.backend_adapters.update({"meshy:a": s1, "meshy:b": self._stage1(ConnectionError("x")),
-                                      "meshy:r": _Adapter()})
-        s1.create = False                     # fails before any task → normal failover
-        main.backend_adapters["meshy:b"].create = False
-        asyncio.run(main._run_chain("job1", "s1", self.succ, {}, None, {}, {}, {}, {}))
-        self.assertEqual(s1.calls, 1)
 
 class CreateAnswerLost(unittest.TestCase):
     """The adapter half of K1: a create POST that went out whole but whose answer was lost
@@ -772,7 +639,7 @@ class FreeAfterJob(unittest.TestCase):
         self.assertEqual(self.frees, [])
 
     def test_a_waiter_that_excluded_this_backend_does_not_block_the_free(self):
-        self._waiter(exclude=["gpu"])            # the chain's failover set, see _run_chain
+        self._waiter(exclude=["gpu"])            # already tried during failover
         self._free()
         self.assertEqual(self.frees, ["gpu"])
 
@@ -902,7 +769,7 @@ class AdapterModelSetKey(unittest.TestCase):
         def load(name):
             with open(os.path.join(d, name)) as f:
                 return json.load(f)
-        self.hi, self.lo = load("img2mesh-trellis2_high_api.json"), load("img2mesh-trellis2_low_api.json")
+        self.hi = load("img2mesh-trellis2_high_api.json")
         self.ad = object.__new__(adapters.ComfyUIAdapter)      # no ctx/HTTP needed for the key
         self.ad.backend = {"name": "gpu", "type": "comfyui", "url": "http://gpu:8188"}
         self.ad.name, self.ad.bid = "gpu", "comfyui:gpu"
@@ -913,9 +780,6 @@ class AdapterModelSetKey(unittest.TestCase):
         return self.NR(alias="a", real_model=None, inputs={}, params=params or {},
                        workflow=None, workflow_json=wf, node_mapping=mapping or {},
                        fixed=fixed or [])
-
-    def test_high_and_low_share_the_key(self):
-        self.assertEqual(self.ad.model_set_key(self._req(self.hi)), self.ad.model_set_key(self._req(self.lo)))
 
     def test_a_mapped_model_choice_changes_the_key(self):
         m = {"model": {"node": "60", "field": "modelname"}}

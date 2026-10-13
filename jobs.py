@@ -62,14 +62,13 @@ def init(db_path: str = "jobs.db", blob_dir: str = "jobs", default_ttl_s: int = 
                 result_count INTEGER NOT NULL DEFAULT 0,
                 results_json TEXT,
                 meta_json    TEXT,
-                stage        TEXT,
                 started      INTEGER
             )
         """)
         c.execute("CREATE INDEX IF NOT EXISTS jobs_created ON jobs(created)")
         cols = {r[1] for r in c.execute("PRAGMA table_info(jobs)").fetchall()}
-        if "stage" not in cols:                # migrate existing DBs (multi-stage progress, e.g. "1/2")
-            c.execute("ALTER TABLE jobs ADD COLUMN stage TEXT")
+        if "stage" in cols:                    # remove obsolete multi-stage progress
+            c.execute("ALTER TABLE jobs DROP COLUMN stage")
         if "started" not in cols:              # migrate: run start, so durations exclude the queue wait
             c.execute("ALTER TABLE jobs ADD COLUMN started INTEGER")
     logger.info(f"jobs: store at {_DB_PATH}, blobs in {_BLOB_DIR}/ (default ttl {_DEFAULT_TTL}s)")
@@ -156,7 +155,7 @@ def recent(limit: int = 20, media_only: bool = False, owner: Optional[str] = Non
     flt = f" WHERE {' AND '.join(conds)}" if conds else ""
     with _conn() as c:
         rows = c.execute(
-            f"SELECT id, created, updated, status, task, alias, backend, owner, result_count, error, stage, "
+            f"SELECT id, created, updated, status, task, alias, backend, owner, result_count, error, "
             f"started "
             f"FROM jobs{flt} ORDER BY created DESC, rowid DESC LIMIT ?", (*args, limit)).fetchall()
     return [dict(r) for r in rows]
@@ -279,9 +278,7 @@ def gen_speed_rows() -> list:
     probing every backend once per alias. The job store is the only place media
     runtimes are kept (stats.calls never sees a ComfyUI generation).
 
-    Accepted skew, no action: a chain job counts both stages under its stage-1 alias,
-    which makes the seed pessimistic, and the EMA (alpha 0.3) corrects it within a few
-    real jobs. The queue wait is NOT in it (`RUN_S` starts at the claim).
+    The queue wait is NOT in it (`RUN_S` starts at the claim).
     Empty if the job store is off."""
     if not _active:
         return []
@@ -344,8 +341,8 @@ def set_status(job_id: str, status: str) -> bool:
     """Move a LIVE job to `status` (in practice queued → running). False when the row is
     already terminal (cancelled meanwhile) or gone — the caller must not start work.
 
-    The FIRST move to `running` stamps `started` (a failover or chain re-claim keeps
-    it): the run time is updated − started, not updated − created, which also counted
+    The FIRST move to `running` stamps `started` (a failover re-claim keeps it):
+    the run time is updated − started, not updated − created, which also counted
     the time the job sat parked waiting for a free backend."""
     now = int(time.time())
     with _conn() as c:
@@ -355,18 +352,10 @@ def set_status(job_id: str, status: str) -> bool:
         return cur.rowcount > 0
 
 
-def set_stage(job_id: str, stage: Optional[str]) -> None:
-    """Set a job's sub-stage label (e.g. "1/2" for a multi-stage chain), shown next
-    to `running` in the UI. Cleared (None) when the job leaves the running state."""
-    with _conn() as c:
-        c.execute(f"UPDATE jobs SET stage=?, updated=? WHERE id=? AND {_LIVE}",
-                  (stage, int(time.time()), job_id))
-
-
 def set_backend(job_id: str, backend: str) -> None:
-    """Re-point a live job's `backend` to where it currently runs — a chain hand-off
-    moves a job to another backend mid-run, and cancel/UI target this column. A no-op
-    on a terminal row (_LIVE): a cancelled job keeps naming the backend it was on."""
+    """Re-point a live job's `backend` to where it currently runs after failover,
+    so cancel/UI target the active backend. A no-op on a terminal row (_LIVE):
+    a cancelled job keeps naming the backend it was on."""
     with _conn() as c:
         c.execute(f"UPDATE jobs SET backend=?, updated=? WHERE id=? AND {_LIVE}",
                   (backend, int(time.time()), job_id))
@@ -378,7 +367,7 @@ def fail(job_id: str, error: str, meta: Optional[dict] = None) -> None:
     show its attempt count, or retries would mask the fault rate. A no-op on a job that
     is already terminal (see _LIVE)."""
     with _conn() as c:
-        sets = "status='failed', error=?, stage=NULL, updated=?"
+        sets = "status='failed', error=?, updated=?"
         args: list = [str(error), int(time.time())]
         if meta:
             sets += ", meta_json=?"
@@ -450,7 +439,7 @@ def complete_json(job_id: str, payload, meta: Optional[dict] = None) -> None:
 def _mark_done(c, job_id: str, meta: dict, results: list) -> None:
     """The one done-UPDATE. Re-points `backend` to where the job actually ran
     (meta['backend']) — after a failover that differs from the create() value."""
-    sets = "status='done', error=NULL, stage=NULL, updated=?, result_count=?, results_json=?, meta_json=?"
+    sets = "status='done', error=NULL, updated=?, result_count=?, results_json=?, meta_json=?"
     args = [int(time.time()), len(results), json.dumps(results), json.dumps(meta)]
     if meta.get("backend"):
         sets += ", backend=?"

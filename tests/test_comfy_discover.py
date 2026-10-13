@@ -97,7 +97,11 @@ class NoCredentialsToComfy(unittest.TestCase):
             if p == "/prompt":
                 return httpx.Response(200, json={"prompt_id": "p1", "number": 1})
             if p.startswith("/history/"):
-                return httpx.Response(200, json={})
+                # finished, with one output — so the job fetches it over /view
+                return httpx.Response(200, json={"p1": {
+                    "status": {"completed": True, "status_str": "success"},
+                    "outputs": {"9": {"images": [{"filename": "x.png", "subfolder": "",
+                                                  "type": "output"}]}}}})
             if p == "/upload/image":
                 return httpx.Response(200, json={"name": "m.glb", "subfolder": ""})
             if p == "/view":
@@ -127,13 +131,11 @@ class NoCredentialsToComfy(unittest.TestCase):
             async with client() as c:
                 await a.discover(c)
                 await a._stop_prompt(c, "http://127.0.0.1:18188", "p1")
-            await a.fetch_output("x.png")
-            await a.fetch_output("x.png", want_bytes=False)
             await a.upload_input(b"glTF", "m.glb")
             t = asyncio.create_task(a.generate(req))
             for _ in range(500):
                 await asyncio.sleep(0.01)
-                if any(p.startswith("/history/") for _, p, _ in seen):
+                if any(p == "/view" for _, p, _ in seen):
                     break
             t.cancel()
             try:

@@ -10,7 +10,7 @@
   },
   "58": {
     "inputs": {
-      "image": "ComfyUI_temp_dqvgq_00001_.png"
+      "image": "0 (1).png"
     },
     "class_type": "Trellis2LoadImageWithTransparency",
     "_meta": {
@@ -19,7 +19,7 @@
   },
   "61": {
     "inputs": {
-      "value": true
+      "value": false
     },
     "class_type": "PrimitiveBoolean",
     "_meta": {
@@ -28,7 +28,7 @@
   },
   "62": {
     "inputs": {
-      "value": 20000
+      "value": 50000
     },
     "class_type": "PrimitiveInt",
     "_meta": {
@@ -47,12 +47,12 @@
   "67": {
     "inputs": {
       "seed": 123456,
-      "pipeline_type": "512",
+      "pipeline_type": "1024",
       "sparse_structure_steps": 12,
       "sparse_structure_guidance_strength": 6.5,
       "sparse_structure_guidance_rescale": 0.2,
       "sparse_structure_rescale_t": 4,
-      "shape_steps": 12,
+      "shape_steps": 20,
       "shape_guidance_strength": 6.5,
       "shape_guidance_rescale": 0.2,
       "shape_rescale_t": 4,
@@ -85,7 +85,7 @@
         0
       ],
       "image": [
-        "83",
+        "105",
         0
       ]
     },
@@ -156,7 +156,7 @@
   "72": {
     "inputs": {
       "seed": 123456,
-      "texture_steps": 12,
+      "texture_steps": 20,
       "texture_guidance_strength": 3,
       "texture_guidance_rescale": 0.2,
       "texture_rescale_t": 3,
@@ -265,7 +265,8 @@
       "keep_models_loaded": true,
       "conv_backend": "flex_gemm",
       "sparse_backend": "xformers",
-      "use_reconviagen": false
+      "use_reconviagen": false,
+      "pixal3d_multiview": false
     },
     "class_type": "Trellis2LoadModel",
     "_meta": {
@@ -377,7 +378,7 @@
     },
     "class_type": "Preview3D",
     "_meta": {
-      "title": "Preview 3D & Animation"
+      "title": "Preview 3D & Animation (DEPRECATED)"
     }
   },
   "102": {
@@ -402,6 +403,52 @@
     "class_type": "VRAM_Debug",
     "_meta": {
       "title": "free mem vor MeshTexturing"
+    }
+  },
+  "104": {
+    "inputs": {
+      "processing_resolution": 2048,
+      "controlnet_strength": 1,
+      "seed": 1234567,
+      "pipeline": [
+        "106",
+        0
+      ],
+      "image": [
+        "83",
+        0
+      ]
+    },
+    "class_type": "StableXProcessImage",
+    "_meta": {
+      "title": "StableX Process Image - Front"
+    }
+  },
+  "105": {
+    "inputs": {
+      "rem_mode": "BEN2",
+      "image_output": "Preview",
+      "save_prefix": "ComfyUI",
+      "torchscript_jit": false,
+      "add_background": "none",
+      "refine_foreground": false,
+      "images": [
+        "104",
+        0
+      ]
+    },
+    "class_type": "easy imageRemBg",
+    "_meta": {
+      "title": "Image Remove Bg - Front"
+    }
+  },
+  "106": {
+    "inputs": {
+      "model": "yoso-normal-v1-8-1"
+    },
+    "class_type": "DownloadAndLoadStableXModel",
+    "_meta": {
+      "title": "(Down)load StableX Model"
     }
   }
 }

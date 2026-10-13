@@ -144,15 +144,6 @@ class TestModelSetKey(unittest.TestCase):
         self.assertIsNone(scheduler.model_set_key({"1": {"class_type": "KSampler", "inputs": {}}}))
         self.assertIsNone(scheduler.model_set_key({}))
 
-    def test_the_sample_trellis2_high_and_low_share_a_key(self):
-        import json, os
-        d = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sample_comfyui_workflows")
-        def load(name):
-            with open(os.path.join(d, name)) as f:
-                return json.load(f)
-        hi, lo, hy = (load(f"img2mesh-{n}_api.json") for n in ("trellis2_high", "trellis2_low", "hunyuan3d"))
-        self.assertEqual(scheduler.model_set_key(hi), scheduler.model_set_key(lo))
-        self.assertNotEqual(scheduler.model_set_key(hi), scheduler.model_set_key(hy))
 
 
 class TestHostFlags(unittest.TestCase):

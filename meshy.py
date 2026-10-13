@@ -43,9 +43,9 @@ OPTION_DEFAULTS: dict = {
     "remove_lighting": True, "moderation": False,
     # Admin face budget: None = don't ask for one (Meshy's per-model default, i.e. no
     # remesh). Measured 2026-09-02 on prod: a humanoid generated WITHOUT a polycount
-    # came back at 70 MB, which then blew up the chain's rigging hand-off — and Meshy's
-    # rigging endpoint refuses more than 300k faces anyway. So a chained alias needs a
-    # cap even when the client sends no `input_face_num`. Set → also forces should_remesh.
+    # came back at 70 MB. Meshy's rigging endpoint refuses more than 300k faces,
+    # so meshes intended for rigging need a cap even when the client sends no
+    # `input_face_num`. Set → also forces should_remesh.
     "target_polycount": None,
     "target_formats": ["glb"], "thumbnail": True,
     "animations": False,            # rigging: also deliver Meshy's walking/running clips
@@ -387,10 +387,9 @@ OPTION_FIELDS: list = [
     {"key": "target_polycount", "label": "target polycount", "type": "int",
      "placeholder": "blank = Meshy default / no remesh",
      "hint": "Face budget applied when the client sends no <code>input_face_num</code> "
-             "(100–300000; turns remesh on). A client value still wins. An alias that "
-             "<b>chains into a rigger</b> should stay ≤ 300000: Meshy's rigging endpoint refuses "
-             "more, and a no-remesh humanoid came back at <b>70 MB</b> (measured 2026-09-02), "
-             "which is a mesh the hand-off then has to push through as base64."},
+             "(100–300000; turns remesh on). A client value still wins. A mesh intended "
+             "for <b>rigging</b> should stay ≤ 300000: Meshy's rigging endpoint refuses "
+             "more, and a no-remesh humanoid came back at <b>70 MB</b> (measured 2026-09-02)."},
     {"key": "pose_mode", "label": "pose", "type": "select", "choices": [(p, p or "none") for p in POSES]},
     {"key": "image_enhancement", "label": "input", "type": "bool"},
     {"key": "remove_lighting", "label": "", "type": "bool"},
@@ -417,11 +416,3 @@ ENDPOINT_HINT = (
     "same slot names as the Trellis2 multiview alias. <b>rigging</b> takes no image at all: it rigs "
     "an uploaded <code>input_mesh_path</code> (a <code>.glb</code> biped, 5 credits) and ignores every "
     "option below except <b>deliver formats</b> (glb/fbx) and <b>animations</b>.")
-CHAIN_HINT = (
-    "The successor may itself be a <b>Meshy alias</b> (e.g. <code>Meshy-Rig</code>, endpoint "
-    "<code>rigging</code>) — it then takes the mesh as its file field <code>input_mesh_path</code>, "
-    "and the <b>delivered rig type</b> is <code>meshy</code>. Meshy embeds its texture in the GLB, so "
-    "<b>keep from this stage</b> is usually empty — <code>preview.png</code> is the one candidate. "
-    "Any OTHER format in <b>deliver formats</b> is wasted on a chained alias: Meshy bills every one "
-    "of them, but only the successor's result (plus what <b>keep from this stage</b> matches) is "
-    "delivered.")

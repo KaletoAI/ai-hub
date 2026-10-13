@@ -15,8 +15,6 @@ only from an admin key (the documented "a backend path in params is for server a
 the console playground's self-call carries the logged-in admin's key), in bootstrap-open
 mode, or when the mapping entry says `client_path:
 true`. Everyone else sends the file under `files`, which the gateway uploads itself.
-The gateway's own chain hand-off (the stage-2 mesh path) is not a client value and is
-untouched.
 """
 import os
 import sys

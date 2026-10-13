@@ -452,16 +452,13 @@ class LookupsViaHost(_StoreCase):
         # the host names a controller that does not carry this backend (not attached)
         self.assertIsNone(main.modelsync_gate(self.comfy("other"), "x"))
 
-    def test_gated_only_aliases_and_chain_successor(self):
+    def test_gated_only_aliases(self):
         store.upsert("solo", [{"backend": "tc", "workflow_json": {}}])
         store.upsert("mixed", [{"backend": "tc", "workflow_json": {}},
                                {"backend": "tc2", "workflow_json": {}}])
         self.assertEqual(main._gated_only_aliases(["solo", "mixed"]), {"solo"})
         rows = main.host_view("vm1")["plan"]["aliases"]
         self.assertTrue(rows["solo"]["gated_only"])
-        s2, why = main._chain_successor_on(self.b, "solo")
-        self.assertIsNone(s2)
-        self.assertIn("syncing", why)
 
     def test_host_coordination_groups_attached_backends(self):
         store.set_managed_host("vm1", _host())
