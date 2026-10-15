@@ -2447,6 +2447,11 @@ The gateway therefore keeps a **voice reference library** (Playground → Voice)
 | `GET` | `/v1/jobs/{id}/input/{n}` | a stored reference image (owner-gated) |
 | `POST` | `/v1/jobs/{id}/cancel` | cancel a queued/running job (interrupts ComfyUI; a cloud task — Meshy, Tripo — keeps running and is billed) |
 
+`{id}` in the four `/v1/jobs/…` routes may also be a unique prefix of at least 8 hex
+characters — e.g. the 12-character short id the console shows. Answers always carry the
+full `job_id`. An ambiguous prefix is `409` ("ambiguous job id prefix, N matches"); a
+prefix that matches nothing — or only another owner's job — is `404`.
+
 ### Other
 
 | Method | Path | Notes |

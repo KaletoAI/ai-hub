@@ -4968,27 +4968,39 @@ async def gen_alias_schema(alias: str, request: Request, authorization: Optional
     return out
 
 
-async def _require_job_owner(authorization: Optional[str], request: Request, job_id: str) -> None:
+async def _require_job_owner(authorization: Optional[str], request: Request, job_id: str) -> str:
     """A caller may only touch its own jobs: non-admin users by name, and — open
     mode — anonymous callers by IP (_check_owner does the matching). admin/master
-    see all; a 'default'/legacy-owned job stays open to everyone."""
+    see all; a 'default'/legacy-owned job stays open to everyone.
+
+    Returns the FULL job id every /v1/jobs route continues with: the one place a short
+    id (the /ui shows `id[:12]`) is resolved — jobs.resolve_id, counting only jobs this
+    caller may see, so a foreign match is the same 404 as none (never a 403/409 leak)
+    and an ambiguous prefix is a 409, never silently the first match."""
     user = authenticate(authorization)
-    if user and (user.get("_master") or user.get("role") == "admin"):
-        return
-    job = await asyncio.to_thread(jobs.get, job_id)
-    _check_owner(job, user, status=403, detail="not your job",
-                 anon_owner=_request_owner(request))
+    admin = bool(user and (user.get("_master") or user.get("role") == "admin"))
+    anon = _request_owner(request)
+    caller = None if admin else (user.get("name") if user else anon)
+    full, matches = await asyncio.to_thread(jobs.resolve_id, job_id, caller)
+    if matches > 1:
+        raise HTTPException(409, f"ambiguous job id prefix, {matches} matches")
+    if full is None:
+        raise HTTPException(404, f"job '{job_id}' not found")
+    if not admin:
+        job = await asyncio.to_thread(jobs.get, full)
+        _check_owner(job, user, status=403, detail="not your job", anon_owner=anon)
+    return full
 
 
 @app.get("/v1/jobs/{job_id}")
 async def get_job(job_id: str, request: Request, authorization: Optional[str] = Header(None)):
-    await _require_job_owner(authorization, request, job_id)
+    job_id = await _require_job_owner(authorization, request, job_id)
     return await _job_view(job_id, request)
 
 
 @app.get("/v1/jobs/{job_id}/result/{n}")
 async def get_job_result(job_id: str, n: int, request: Request, authorization: Optional[str] = Header(None)):
-    await _require_job_owner(authorization, request, job_id)
+    job_id = await _require_job_owner(authorization, request, job_id)
     rp = await asyncio.to_thread(jobs.result_path, job_id, n)
     if rp is None:
         raise HTTPException(404, f"result {n} of job '{job_id}' not found")
@@ -5002,7 +5014,7 @@ async def get_job_result(job_id: str, n: int, request: Request, authorization: O
 @app.get("/v1/jobs/{job_id}/input/{n}")
 async def get_job_input(job_id: str, n: int, request: Request, authorization: Optional[str] = Header(None)):
     """Reference image `n` that was submitted with a generation job (kept within TTL)."""
-    await _require_job_owner(authorization, request, job_id)
+    job_id = await _require_job_owner(authorization, request, job_id)
     ip = await asyncio.to_thread(jobs.input_path, job_id, n)
     if ip is None:
         raise HTTPException(404, f"input {n} of job '{job_id}' not found")
@@ -5013,7 +5025,7 @@ async def get_job_input(job_id: str, n: int, request: Request, authorization: Op
 @app.post("/v1/jobs/{job_id}/cancel")
 async def cancel_job(job_id: str, request: Request, authorization: Optional[str] = Header(None)):
     """Cancel a queued/running generation job (interrupts the backend, frees the GPU)."""
-    await _require_job_owner(authorization, request, job_id)
+    job_id = await _require_job_owner(authorization, request, job_id)
     if not await cancel_generation(job_id):
         raise HTTPException(409, f"job '{job_id}' is not cancellable (already done/failed/unknown)")
     return {"job_id": job_id, "status": "failed", "cancelled": True}

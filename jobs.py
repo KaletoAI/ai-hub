@@ -531,6 +531,33 @@ def input_path(job_id: str, n: int) -> Optional[tuple[str, str]]:
     return (r[0], r[1]) if r else None
 
 
+_ID_PREFIX = re.compile(r"[0-9a-f]{8,31}")
+
+
+def resolve_id(job_id: str, owner: Optional[str]) -> tuple[Optional[str], int]:
+    """A job id as a client typed it → (full id | None, matches). The /ui shows
+    `id[:12]` and clients copy exactly that, so a unique prefix of >= 8 hex chars
+    stands for the job. Anything else is handed back unchanged as a full id
+    (matches 1) when it is full length, else (None, 0) — never searched.
+
+    `owner` None = admin (every job counts); otherwise only jobs that owner may see
+    count — its own and the open 'default'/NULL ones, the same rule as
+    main._check_owner — so a foreign job neither resolves nor makes a prefix
+    ambiguous (no existence leak). (None, n > 1) = ambiguous; the caller says so."""
+    if len(job_id) >= 32:
+        return job_id, 1
+    prefix = job_id.lower()
+    if not _active or not _ID_PREFIX.fullmatch(prefix):
+        return None, 0
+    sql, args = "SELECT id FROM jobs WHERE id LIKE ?", [prefix + "%"]   # hex only: no wildcards
+    if owner is not None:
+        sql += " AND (owner=? OR owner IS NULL OR owner='default')"
+        args.append(owner)
+    with _conn() as c:
+        ids = [r[0] for r in c.execute(sql, args).fetchall()]
+    return (ids[0] if len(ids) == 1 else None), len(ids)
+
+
 def get(job_id: str) -> Optional[dict]:
     if not _active:            # store off → clean "not found" instead of a 500 on a missing table
         return None

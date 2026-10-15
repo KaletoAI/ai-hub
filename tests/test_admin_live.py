@@ -371,6 +371,29 @@ class LiveScriptInvariant(unittest.TestCase):
         self.assertNotIn("<script type='importmap'", gal)
 
 
+class JobIdCopy(unittest.TestCase):
+    """The job page heading keeps the short id (`id[:12]`) but carries the FULL id as its
+    title and on a copy button — clients copied the short form and the API knew only the
+    full one (see test_job_id_prefix). The button is DATA (`data-copy`), read by the one
+    delegated handler every page emits in _CONFIRM_JS: no inline JS, and it still works
+    after a live morph replaced the heading."""
+
+    setUp, tearDown = LiveScriptInvariant.setUp, LiveScriptInvariant.tearDown   # the harness only,
+    _render = LiveScriptInvariant._render                                     # not its tests
+
+    def test_heading_shows_short_id_with_full_id_title_and_copy_button(self):
+        full = "f3acdaed52ef428e881a51a9fadfd4bd"
+        html = self._render(dict(_RUNNING_JOB, id=full))
+        self.assertIn(f"<code title=\"{full}\">{full[:12]}</code>", html)
+        btn = re.search(r"<button[^>]*data-copy=\"([^\"]*)\"[^>]*>", html)
+        self.assertIsNotNone(btn)
+        self.assertEqual(btn.group(1), full)
+        self.assertNotIn("onclick", btn.group(0))
+
+    def test_copy_handler_is_in_every_page(self):
+        self.assertIn("[data-copy]", admin._CONFIRM_JS)
+
+
 class PlaygroundScriptInvariant(unittest.TestCase):
     """The Media Playground is the other live page whose column grows a 3D preview."""
 

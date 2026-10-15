@@ -893,8 +893,21 @@ _ACTION_JS = ("window.gwPost=function(u,fid){"
               "window.addEventListener('beforeunload',function(e){"
               "if(dirty&&document.body.contains(dirty)){e.preventDefault();e.returnValue='';return '';}});"
               "})();")
+# A `data-copy` button copies its value (e.g. the job page's full id). Delegated, so a
+# button the live morph inserts works too. navigator.clipboard exists only in a secure
+# context — the console is plain http on the LAN — hence the textarea + execCommand path.
+_COPY_JS = ("document.addEventListener('click',function(e){"
+            "var b=e.target&&e.target.closest?e.target.closest('[data-copy]'):null;"
+            "if(!b)return;var v=b.getAttribute('data-copy'),l=b.textContent;"
+            "var d=function(){b.textContent='✓ Copied';setTimeout(function(){b.textContent=l;},1200);};"
+            "var fb=function(){var t=document.createElement('textarea'),ok=false;t.value=v;"
+            "t.style.position='fixed';t.style.opacity='0';document.body.appendChild(t);"
+            "t.focus();t.select();try{ok=document.execCommand('copy');}catch(x){}"
+            "document.body.removeChild(t);b.focus();if(ok)d();};"
+            "if(navigator.clipboard&&window.isSecureContext){"
+            "navigator.clipboard.writeText(v).then(d,fb);return;}fb();});")
 # Joined INTO the confirm script (one block) and followed by the empty action form.
-_CONFIRM_JS = (_CONFIRM_JS[:-len("</script>")] + _ACTION_JS + "</script>"
+_CONFIRM_JS = (_CONFIRM_JS[:-len("</script>")] + _ACTION_JS + _COPY_JS + "</script>"
                + f'<form id="{_ACT_FORM_ID}" method="post" hidden></form>')
 
 
@@ -9037,7 +9050,9 @@ async def job_detail_page(job_id: str, request: Request):
     # with nothing in any log. So the import map goes FIRST. Pinned by
     # test_admin_live.LiveScriptInvariant.test_import_map_precedes_any_module_script.
     page = (f'{_FBX_VIEWER_JS}<script type="module" src="{_MODELVIEWER_SRC}"></script>'
-            f"<div class='bar'><h2>Job <code>{_esc(job_id[:12])}</code> "
+            f"<div class='bar'><h2>Job <code title=\"{_esc(job_id)}\">{_esc(job_id[:12])}</code> "
+            f"<button type='button' class='btn secondary sm' data-copy=\"{_esc(job_id)}\" "
+            f"title='copy the full job id'>📋 Copy ID</button> "
             f"<span class='badge {_JOB_SCLS.get(st, 'muted')}'>{_esc(_job_status_text(job))}</span></h2>"
             f"<div style='display:flex;gap:8px'>{cancel_btn}{to_pg}{nav}{back}</div></div>{info}"
             f"<div style='display:flex;gap:28px;flex-wrap:wrap;align-items:flex-start'>"
