@@ -3751,6 +3751,12 @@ def _billed_cloud_task(cand: dict, trace: dict, e: BaseException,
 
 def _billed_final_msg(e: BaseException, billed: str) -> str:
     """The job-row error for a cloud failure that must not be repeated (_billed_cloud_task)."""
+    if isinstance(e, adapters.CloudArtifactLost):
+        # The task is DONE — only its files did not arrive. "May still be running" would
+        # point at the vendor's dashboard; the files wait under the task id instead.
+        return (f"{_err_text(e)} — {billed} finished at the vendor (billed) and was not "
+                f"re-created, which would pay for it twice; its files can still be fetched "
+                f"there by the task id")
     return (f"{_fault_label(e)}: {_err_text(e)} — {billed} may still be running (and "
             f"billing) at the vendor; not re-created on another attempt, which would pay "
             f"for it twice")

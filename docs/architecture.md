@@ -298,7 +298,15 @@ errors, 5xx and 429 are about the SERVICE and get `disconnect_grace` — a poll-
 the vendor's percentage to `ctx.note_progress` as step N/100 — `_note_cloud_progress`,
 keyed by the `_CLOUD_JOB` ContextVar `generate()` sets per request and clears with
 `None` at the end), `_download` (NO auth
-header: signed CDN urls, the bearer must not leak there).
+header: signed CDN urls, the bearer must not leak there; a dropped transfer or a 5xx
+is retried — `_CLOUD_DOWNLOAD_ATTEMPTS`, 1/2/4 s backoff — because the GET is free
+and assets.meshy.ai's CloudFront cuts bodies mid-transfer: measured 2026-10-15, 1 in 3
+GETs of one 9 MB GLB, and with one try two paid meshes became failed jobs; a 4xx is
+final at once; `test_cloudtask.ArtifactDownloadRetry`). When the tries run out,
+`generate()` raises `CloudArtifactLost` (a RuntimeError — final, never failover), and
+`main._billed_final_msg` says the task FINISHED and its files wait under the task id
+instead of "may still be running (and billing)"
+(`test_run_job_failover…test_a_lost_artifact_download_says_the_task_finished`).
 A subclass supplies only `discover`, `_run` (build → create → poll, plus whatever
 follow-up tasks the vendor needs, returning `RunResult`), `_task_request`,
 `_task_body`, `_classify_create` (→ `nocredits`/`busy`/`server`/`rejected`/None),

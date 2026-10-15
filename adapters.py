@@ -137,6 +137,18 @@ class CloudTaskRetryable(ConnectionError):
         self.vendor = vendor
 
 
+class CloudArtifactLost(RuntimeError):
+    """A cloud task FINISHED (and is billed) but fetching its files kept failing
+    (CloudTaskAdapter._download gave up). A RuntimeError on purpose — never failover-class:
+    a re-run would pay for the same mesh again. Its own class so the job row can say the
+    task is done and its files wait under the task id, instead of the generic
+    "may still be running (and billing)" (main._billed_final_msg)."""
+
+    def __init__(self, msg: str = "", vendor: str = "cloud"):
+        super().__init__(msg)
+        self.vendor = vendor
+
+
 # ── OpenAI /v1/models discovery helpers (moved verbatim from main.py) ──────────
 
 def _to_float(v) -> float:
@@ -4032,6 +4044,8 @@ class ComfyUIAdapter(BackendAdapter):
 _CLOUD_DISCOVERY_TIMEOUT = 8.0
 _CLOUD_HTTP_TIMEOUT = 30.0
 _CLOUD_DOWNLOAD_TIMEOUT = 120.0
+_CLOUD_DOWNLOAD_ATTEMPTS = 4          # artifact GETs are free — see CloudTaskAdapter._download
+_CLOUD_DOWNLOAD_BACKOFF_S = 1.0       # 1, 2, 4 s between the tries
 
 
 class _TaskVerdict(RuntimeError):
@@ -4305,8 +4319,9 @@ class CloudTaskAdapter(BackendAdapter):
                         # (httpx's transport errors are listed there literally): _run_job
                         # would re-run the whole task on the next candidate and pay again.
                         # Final, naming the paid task so the file can be fetched by hand.
-                        raise RuntimeError(f"{self.vendor} artifact download failed after "
-                                           f"the paid task {run.task_id}: {name}: {e}") from e
+                        raise CloudArtifactLost(f"{self.vendor} artifact download failed after "
+                                                f"the paid task {run.task_id}: {name}: {e}",
+                                                vendor=self.vendor) from e
                     mime, kind = _mime_and_kind(name)
                     blobs.append(GenBlob(data=data, mime=mime, kind=kind, name=name))
                 # the rig endpoint has no thumbnail — its input already had a preview
@@ -4494,10 +4509,27 @@ class CloudTaskAdapter(BackendAdapter):
     @staticmethod
     async def _download(client, url: str) -> bytes:
         # NO auth header: signed asset URLs on a CDN host; the bearer must not leak there.
-        r = await client.get(url, timeout=_CLOUD_DOWNLOAD_TIMEOUT, follow_redirects=True)
-        if r.status_code != 200:
-            raise RuntimeError(f"asset download failed ({r.status_code}) for {url.split('?')[0]}")
-        return r.content
+        # A GET of a finished task's artifact is free and idempotent, so a dropped
+        # transfer or a 5xx is retried here. assets.meshy.ai (CloudFront) cuts a download
+        # mid-body now and then (measured 2026-10-15: 1 in 3 GETs of one 9 MB GLB died
+        # after 1–2 MB, the next took 0.4 s); with one try that failed two paid meshes.
+        # A 4xx (expired/wrong signed URL) is final at once.
+        for attempt in range(_CLOUD_DOWNLOAD_ATTEMPTS):
+            last = attempt == _CLOUD_DOWNLOAD_ATTEMPTS - 1
+            try:
+                r = await client.get(url, timeout=_CLOUD_DOWNLOAD_TIMEOUT, follow_redirects=True)
+            except httpx.TransportError as e:
+                if last:
+                    raise
+                logger.warning(f"cloud artifact download {attempt + 1}/{_CLOUD_DOWNLOAD_ATTEMPTS} "
+                               f"broke ({e}) — retrying {url.split('?')[0]}")
+            else:
+                if r.status_code == 200:
+                    return r.content
+                if r.status_code < 500 or last:
+                    raise RuntimeError(f"asset download failed ({r.status_code}) for "
+                                       f"{url.split('?')[0]}")
+            await asyncio.sleep(_CLOUD_DOWNLOAD_BACKOFF_S * 2 ** attempt)
 
 
 class NanoGPTMediaAdapter(CloudTaskAdapter):

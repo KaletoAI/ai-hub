@@ -149,5 +149,66 @@ class RunResultEndpoint(unittest.TestCase):
         self.assertNotIn("rig", meta)
 
 
+class ArtifactDownloadRetry(unittest.TestCase):
+    """A finished cloud task's artifact GET is free and idempotent, so a dropped transfer
+    is retried instead of failing the job. assets.meshy.ai (CloudFront) cuts a download
+    mid-body now and then — measured 2026-10-15: 1 in 3 GETs of the same 9 MB GLB died
+    after 1–2 MB while the next took 0.4 s. With ONE try, two paid meshes became failed
+    jobs ("peer closed connection without sending complete message body"), and the
+    billing rule (never re-create a paid task) left them unrecoverable from the client."""
+
+    def setUp(self):
+        import adapters
+        self.adapters = adapters
+        self._backoff = adapters._CLOUD_DOWNLOAD_BACKOFF_S
+        adapters._CLOUD_DOWNLOAD_BACKOFF_S = 0.0
+
+    def tearDown(self):
+        self.adapters._CLOUD_DOWNLOAD_BACKOFF_S = self._backoff
+
+    def _get(self, outcomes: list):
+        import httpx
+        calls = []
+
+        def handler(request):
+            calls.append(request)
+            o = outcomes[min(len(calls), len(outcomes)) - 1]
+            if isinstance(o, Exception):
+                raise o
+            return httpx.Response(o, content=b"GLB" if o == 200 else b"err")
+
+        async def run():
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                return await self.adapters.CloudTaskAdapter._download(client, "https://cdn/x.glb")
+        return run, calls
+
+    def test_dropped_transfer_is_retried(self):
+        import httpx
+        run, calls = self._get([httpx.RemoteProtocolError("peer closed connection"), 200])
+        self.assertEqual(asyncio.run(run()), b"GLB")
+        self.assertEqual(len(calls), 2)
+
+    def test_server_error_is_retried(self):
+        run, calls = self._get([503, 200])
+        self.assertEqual(asyncio.run(run()), b"GLB")
+        self.assertEqual(len(calls), 2)
+
+    def test_client_error_is_final_at_once(self):
+        """A 403/404 (expired or wrong signed URL) does not get better by asking again."""
+        run, calls = self._get([404, 200])
+        with self.assertRaises(RuntimeError):
+            asyncio.run(run())
+        self.assertEqual(len(calls), 1)
+
+    def test_gives_up_with_the_transport_error(self):
+        """Still a transport error after the last try — generate() turns exactly that into
+        the final, non-failover RuntimeError naming the paid task."""
+        import httpx
+        run, calls = self._get([httpx.ReadError("reset")])
+        with self.assertRaises(httpx.TransportError):
+            asyncio.run(run())
+        self.assertEqual(len(calls), self.adapters._CLOUD_DOWNLOAD_ATTEMPTS)
+
+
 if __name__ == "__main__":
     unittest.main()

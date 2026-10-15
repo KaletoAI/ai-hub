@@ -260,6 +260,23 @@ class CloudBilledTaskIsFinal(unittest.TestCase):
     def test_a_vendor_lost_while_polling_never_creates_a_second_task(self):
         self._assert_final_on_first(ConnectionError("Meshy unreachable for >30s while polling"))
 
+    def test_a_lost_artifact_download_says_the_task_finished(self):
+        """The task SUCCEEDED and only fetching its files broke (CloudArtifactLost): final
+        like any billed failure, but the row must not claim the task "may still be running
+        (and billing)" under a "connection issue" label — that sent the reader to the
+        vendor's dashboard instead of to the files waiting under the task id (2026-10-15)."""
+        import adapters
+        a, b = _BillingAdapter(adapters.CloudArtifactLost(
+            "Meshy artifact download failed after the paid task task-1: model.glb: peer closed",
+            vendor="Meshy")), _BillingAdapter()
+        self._run([self._cloud("a", retries=2), self._cloud("b")], {"meshy:a": a, "meshy:b": b})
+        self.assertEqual((a.calls, b.calls), (1, 0))
+        msg = self.jobs.failed["msg"]
+        self.assertNotIn("still be running", msg)
+        self.assertNotIn("connection issue", msg)
+        self.assertIn("finished", msg)
+        self.assertIn("task-1", msg)
+
     def test_a_create_whose_answer_was_lost_is_final_too(self):
         """A read timeout on the create POST: the body went out whole, the task may exist."""
         import httpx
