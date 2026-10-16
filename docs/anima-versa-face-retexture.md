@@ -97,7 +97,7 @@ Nach Installation erst die aktuelle ComfyUI-Queue prüfen. **Nur bei leerer lauf
 
 ## Geprüfter Stand
 
-- Node **v1.1.0** (2026-10-16, Tag `v1.1.0`) auf dx10-02 und k12 installiert; je 36 Worker-Tests grün; GitHub-CI Ubuntu/Windows grün. Echter Lauf mit generiertem Gesicht und Trellis-Mesh: Wangenverhältnis 0,71 → 0,94 bei `light_balance` 1, Hautton-Gewinn RGB 1,21/1,04/1,09 bei `tone_match` 1 (v1.1.1).
+- Node **v1.1.1** (2026-10-16, Tag `v1.1.1`) auf dx10-02 und k12 installiert; je 36 Worker-Tests grün; GitHub-CI Ubuntu/Windows grün. Echter Lauf mit generiertem Gesicht und Trellis-Mesh: Wangenverhältnis 0,71 → 0,94 bei `light_balance` 1, Hautton-Gewinn RGB 1,21/1,04/1,09 bei `tone_match` 1 (v1.1.1).
 
 - Node v1.0.2 auf dx10-02 (Linux ARM64/NVIDIA GB10) und k12 (Linux x86_64); ComfyUI 0.37.0 und Frontend 1.53.6. Je 31 Verhaltenstests im isolierten Python-3.12-Worker bestanden; die ComfyUI-Hauptumgebungen bleiben unverändert.
 - Echter asynchroner AI-Hub-Job: originales Journal-GLB und RGB-Referenz über die oben genannten Upload-Felder, GLB und Vergleichs-PNG heruntergeladen.
