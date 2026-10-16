@@ -45,12 +45,13 @@ Content-Type: application/json
     "yaw": 0,
     "light_balance": 1,
     "tone_match": 1,
-    "brightness": 1
+    "brightness": 1,
+    "skin_recolor": 1
   }
 }
 ```
 
-Ab Node **v1.1.0** sind `light_balance`, `tone_match` und `brightness` optional (Node-Defaults 0 / 0 / 1 = Verhalten wie v1.0.2, bytegleich). Sie bearbeiten das Foto im linearen Licht vor der Projektion: Entfernen der großflächigen Schattierung (ab v1.2.0: Tiefpass der Hautluminanz wird herausgeteilt und durch den Median ersetzt — Seitenlicht und dunklere Gesichtsränder; v1.1 glich nur links gegen rechts aus; Merkmale werden nie gespiegelt), dann Hautton-Abgleich an die eigene Gesichtshaut des Meshes (semantische Gesichtsmaske des Mesh-Renders; ab v1.1.1, v1.1.0 nahm einen Ring um das Gesicht, der auf generierten Meshes vor allem Hals-Schatten und Haaransatz traf), dann Helligkeit. Das Proof meldet aktive Werte unter `photo_adjust`. Anima-Versa erkennt die drei Namen im Schema und schickt dann seine gespeicherten Werte (Default 1 / 1 / 1); ohne sie gleicht es lokal aus.
+Ab Node **v1.1.0** sind `light_balance`, `tone_match` und `brightness` optional (Node-Defaults 0 / 0 / 1 = Verhalten wie v1.0.2, bytegleich). Sie bearbeiten das Foto im linearen Licht vor der Projektion: Entfernen der großflächigen Schattierung (ab v1.2.0: Tiefpass der Hautluminanz wird herausgeteilt und durch den Median ersetzt — Seitenlicht und dunklere Gesichtsränder; v1.1 glich nur links gegen rechts aus; Merkmale werden nie gespiegelt), dann Hautton-Abgleich an die eigene Gesichtshaut des Meshes (semantische Gesichtsmaske des Mesh-Renders; ab v1.1.1, v1.1.0 nahm einen Ring um das Gesicht, der auf generierten Meshes vor allem Hals-Schatten und Haaransatz traf), dann Helligkeit. Ab **v1.3.0** korrigiert `skin_recolor` (0–1, Default 0) zusätzlich die Haut des ganzen Meshes (Gesicht, Hals, Arme, Hände) farblich zum Foto hin — nur der Farbton, die Helligkeit bleibt —, weil generierte Meshes oft zu rot herauskommen; das korrigierte GLB hängt dafür einen eigenen Körper-Atlas samt Material an (Original-Bild bleibt unverändert in der Datei, Primitive-Reihenfolge [Körper, Gesicht]). Das Proof meldet aktive Werte unter `photo_adjust` und `skin_recolor`. Anima-Versa erkennt die drei Namen im Schema und schickt dann seine gespeicherten Werte (Default 1 / 1 / 1); ohne sie gleicht es lokal aus.
 
 Bei JPEG-Foto `data:image/jpeg;base64,` verwenden. Die Base64-Platzhalter durch echte Bytes ersetzen. Einzelne Uploads sind auf 64 MB begrenzt; zusätzlich gilt das konfigurierte HTTP-Body-Limit einschließlich Base64-Overhead. Ein direkter URL-Upload ist hier nicht erforderlich: geschützte AI-Hub-URLs nicht als `files`-URL weiterreichen, da der Gateway-URL-Fetch keine Benutzer-Download-Authentifizierung übernimmt und private Adressen verweigert.
 
@@ -77,6 +78,7 @@ Resultate bleiben nur bis zum Job-TTL verfügbar (Standard 24 Stunden): beide GL
 | `params.light_balance` | 3 | `light_balance` | 0 |
 | `params.tone_match` | 3 | `tone_match` | 0 |
 | `params.brightness` | 3 | `brightness` | 1 |
+| `params.skin_recolor` | 3 | `skin_recolor` | 0 |
 
 Autoritativer Output: Node **6 `SaveGLB`**, Titel `output_final`, Prefix `3d/GLBFaceRetexture`. Zusätzlich Node **8 `SaveImage`**, Prefix `GLB-Face-Retexture_Comparison`; `output_globs: ["GLB-Face-Retexture_Comparison_*.png"]`. Keine Legacy-Skripte, keine Image-Normalisierung/Texture-Sidecar-Regeln hinzufügen. Native `FILE_3D`-Verbindungen zur Vorschau und SaveGLB erhalten; Loader-/Preview-Viewport-State ist leer, Breite/Höhe 1024, vorhandener Kamera-Link 1→4 bleibt bestehen.
 
@@ -97,7 +99,7 @@ Nach Installation erst die aktuelle ComfyUI-Queue prüfen. **Nur bei leerer lauf
 
 ## Geprüfter Stand
 
-- Node **v1.2.0** (2026-10-16, Tag `v1.2.0`) auf dx10-02 und k12 installiert; je 37 Worker-Tests grün; GitHub-CI Ubuntu/Windows grün. Echter Lauf mit generiertem Gesicht und Trellis-Mesh: Schattierungs-Spanne p10/p90 0,57 → 0,89 und links/rechts 0,73 → 0,96 bei `light_balance` 1 (v1.2.0), Hautton-Gewinn RGB 1,21/1,04/1,09 bei `tone_match` 1 (v1.1.1).
+- Node **v1.3.0** (2026-10-16, Tag `v1.3.0`) auf dx10-02 und k12 installiert; je 41 Worker-Tests grün; echter Hub-Job mit allen vier Parametern; GitHub-CI Ubuntu/Windows grün. Echter Lauf mit generiertem Gesicht und Trellis-Mesh: Schattierungs-Spanne p10/p90 0,57 → 0,89 und links/rechts 0,73 → 0,96 bei `light_balance` 1 (v1.2.0), Hautton-Gewinn RGB 1,21/1,04/1,09 bei `tone_match` 1 (v1.1.1).
 
 - Node v1.0.2 auf dx10-02 (Linux ARM64/NVIDIA GB10) und k12 (Linux x86_64); ComfyUI 0.37.0 und Frontend 1.53.6. Je 31 Verhaltenstests im isolierten Python-3.12-Worker bestanden; die ComfyUI-Hauptumgebungen bleiben unverändert.
 - Echter asynchroner AI-Hub-Job: originales Journal-GLB und RGB-Referenz über die oben genannten Upload-Felder, GLB und Vergleichs-PNG heruntergeladen.

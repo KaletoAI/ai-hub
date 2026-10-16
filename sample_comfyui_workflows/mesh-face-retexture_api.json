@@ -36,7 +36,8 @@
       "yaw": 0.0,
       "light_balance": 0.0,
       "tone_match": 0.0,
-      "brightness": 1.0
+      "brightness": 1.0,
+      "skin_recolor": 0.0
     },
     "class_type": "GLBFaceRetexture",
     "_meta": {

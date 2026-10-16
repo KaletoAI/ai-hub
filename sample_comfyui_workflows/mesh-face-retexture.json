@@ -186,7 +186,7 @@
       ],
       "size": [
         370,
-        310
+        340
       ],
       "flags": {},
       "order": 2,
@@ -260,6 +260,15 @@
           },
           "link": null,
           "shape": 7
+        },
+        {
+          "name": "skin_recolor",
+          "type": "FLOAT",
+          "widget": {
+            "name": "skin_recolor"
+          },
+          "link": null,
+          "shape": 7
         }
       ],
       "outputs": [
@@ -297,7 +306,8 @@
         0,
         0,
         0,
-        1
+        1,
+        0
       ],
       "widgets_values_named": {
         "strength": 1,
