@@ -154,6 +154,9 @@ Aliase und der eigenständige Legacy-Face-Workflow bleiben unverändert.
 | `params.feather` | 3 | `feather` | 0.18 |
 | `params.render_resolution` | 3 | `render_resolution` | 768 |
 | `params.yaw` | 3 | `yaw` | 0 |
+| `params.light_balance` | 3 | `light_balance` | 0 |
+| `params.tone_match` | 3 | `tone_match` | 0 |
+| `params.brightness` | 3 | `brightness` | 1 |
 
 Abweichend von den älteren Export-Konventionen ist **Node 6 `SaveGLB`**
 mit Titel `output_final` autoritativ; Prefix `3d/GLBFaceRetexture`.

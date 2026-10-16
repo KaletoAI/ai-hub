@@ -33,7 +33,10 @@
       "strength": 1.0,
       "feather": 0.18,
       "render_resolution": 768,
-      "yaw": 0.0
+      "yaw": 0.0,
+      "light_balance": 0.0,
+      "tone_match": 0.0,
+      "brightness": 1.0
     },
     "class_type": "GLBFaceRetexture",
     "_meta": {

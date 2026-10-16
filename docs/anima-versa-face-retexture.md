@@ -42,10 +42,15 @@ Content-Type: application/json
     "strength": 1,
     "feather": 0.18,
     "render_resolution": 768,
-    "yaw": 0
+    "yaw": 0,
+    "light_balance": 1,
+    "tone_match": 1,
+    "brightness": 1
   }
 }
 ```
+
+Ab Node **v1.1.0** sind `light_balance`, `tone_match` und `brightness` optional (Node-Defaults 0 / 0 / 1 = Verhalten wie v1.0.2, bytegleich). Sie bearbeiten das Foto im linearen Licht vor der Projektion: Seitenlicht-Ausgleich entlang der aus Landmarken bestimmten Gesichtsmittellinie innerhalb der semantischen Hautmaske (Merkmale werden nie gespiegelt), dann Hautton-Abgleich an den Hautring um das Gesicht im Mesh-Render (Fallback: Mesh-Gesicht), dann Helligkeit. Das Proof meldet aktive Werte unter `photo_adjust`. Anima-Versa erkennt die drei Namen im Schema und schickt dann seine gespeicherten Werte (Default 1 / 1 / 1); ohne sie gleicht es lokal aus.
 
 Bei JPEG-Foto `data:image/jpeg;base64,` verwenden. Die Base64-Platzhalter durch echte Bytes ersetzen. Einzelne Uploads sind auf 64 MB begrenzt; zusätzlich gilt das konfigurierte HTTP-Body-Limit einschließlich Base64-Overhead. Ein direkter URL-Upload ist hier nicht erforderlich: geschützte AI-Hub-URLs nicht als `files`-URL weiterreichen, da der Gateway-URL-Fetch keine Benutzer-Download-Authentifizierung übernimmt und private Adressen verweigert.
 
@@ -57,7 +62,7 @@ Resultate bleiben nur bis zum Job-TTL verfügbar (Standard 24 Stunden): beide GL
 
 ## Workflow und Admin-Mapping
 
-- Sichtbarer ComfyUI-Workflow: [`../sample_comfyui_workflows/mesh-face-retexture.json`](../sample_comfyui_workflows/mesh-face-retexture.json). In ComfyUI öffnen, eigene GLB-/Foto-Slots füllen, vier benannte Parameter an Node 3 setzen. Vorschau 4 zeigt das korrigierte GLB, Vorschau 5 den Vergleich, Note 7 erläutert Grenzen.
+- Sichtbarer ComfyUI-Workflow: [`../sample_comfyui_workflows/mesh-face-retexture.json`](../sample_comfyui_workflows/mesh-face-retexture.json). In ComfyUI öffnen, eigene GLB-/Foto-Slots füllen, die benannten Parameter an Node 3 setzen. Vorschau 4 zeigt das korrigierte GLB, Vorschau 5 den Vergleich, Note 7 erläutert Grenzen.
 - API-Workflow: [`../sample_comfyui_workflows/mesh-face-retexture_api.json`](../sample_comfyui_workflows/mesh-face-retexture_api.json).
 - Alias `GLB-Face-Retexture`, Task `mesh2mesh`, Backend-Namen `dx10-02` und `k12-gpu` (Health-IDs `comfyui:dx10-02` und `comfyui:k12-gpu`); andere Aliase nicht bearbeiten.
 
@@ -69,6 +74,9 @@ Resultate bleiben nur bis zum Job-TTL verfügbar (Standard 24 Stunden): beide GL
 | `params.feather` | 3 | `feather` | 0.18 |
 | `params.render_resolution` | 3 | `render_resolution` | 768 |
 | `params.yaw` | 3 | `yaw` | 0 |
+| `params.light_balance` | 3 | `light_balance` | 0 |
+| `params.tone_match` | 3 | `tone_match` | 0 |
+| `params.brightness` | 3 | `brightness` | 1 |
 
 Autoritativer Output: Node **6 `SaveGLB`**, Titel `output_final`, Prefix `3d/GLBFaceRetexture`. Zusätzlich Node **8 `SaveImage`**, Prefix `GLB-Face-Retexture_Comparison`; `output_globs: ["GLB-Face-Retexture_Comparison_*.png"]`. Keine Legacy-Skripte, keine Image-Normalisierung/Texture-Sidecar-Regeln hinzufügen. Native `FILE_3D`-Verbindungen zur Vorschau und SaveGLB erhalten; Loader-/Preview-Viewport-State ist leer, Breite/Höhe 1024, vorhandener Kamera-Link 1→4 bleibt bestehen.
 
@@ -88,6 +96,8 @@ Der `--python`-Interpreter muss Python 3.12 sein. Bei bereits vorhandenem Clone 
 Nach Installation erst die aktuelle ComfyUI-Queue prüfen. **Nur bei leerer laufender und wartender Queue und freigegebenem Idle-Zeitpunkt** ComfyUI mit dem vorhandenen Service-Verfahren neu starten, danach Browser hart aktualisieren. AI-Hub nicht neu starten. Der Operator prüft anschließend Node-Registrierung und native Schema-Kompatibilität auf dx10-02, öffnet den sichtbaren Workflow im echten Browser und führt einen echten Job einschließlich GLB- und Vergleichsdownload aus, bevor Anima-Versa die Funktion freischaltet.
 
 ## Geprüfter Stand
+
+- Node **v1.1.0** (2026-10-16, Tag `v1.1.0`) auf dx10-02 und k12 installiert; je 36 Worker-Tests grün; GitHub-CI Ubuntu/Windows grün. Echter Lauf mit generiertem Gesicht und Trellis-Mesh: Wangenverhältnis 0,71 → 0,94 bei `light_balance` 1, Hautton-Gewinn RGB 0,79/0,65/0,52 bei `tone_match` 1.
 
 - Node v1.0.2 auf dx10-02 (Linux ARM64/NVIDIA GB10) und k12 (Linux x86_64); ComfyUI 0.37.0 und Frontend 1.53.6. Je 31 Verhaltenstests im isolierten Python-3.12-Worker bestanden; die ComfyUI-Hauptumgebungen bleiben unverändert.
 - Echter asynchroner AI-Hub-Job: originales Journal-GLB und RGB-Referenz über die oben genannten Upload-Felder, GLB und Vergleichs-PNG heruntergeladen.

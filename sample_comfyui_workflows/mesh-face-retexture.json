@@ -186,7 +186,7 @@
       ],
       "size": [
         370,
-        230
+        310
       ],
       "flags": {},
       "order": 2,
@@ -233,6 +233,33 @@
             "name": "yaw"
           },
           "link": null
+        },
+        {
+          "name": "light_balance",
+          "type": "FLOAT",
+          "widget": {
+            "name": "light_balance"
+          },
+          "link": null,
+          "shape": 7
+        },
+        {
+          "name": "tone_match",
+          "type": "FLOAT",
+          "widget": {
+            "name": "tone_match"
+          },
+          "link": null,
+          "shape": 7
+        },
+        {
+          "name": "brightness",
+          "type": "FLOAT",
+          "widget": {
+            "name": "brightness"
+          },
+          "link": null,
+          "shape": 7
         }
       ],
       "outputs": [
@@ -267,7 +294,10 @@
         1,
         0.18,
         768,
-        0
+        0,
+        0,
+        0,
+        1
       ],
       "widgets_values_named": {
         "strength": 1,
