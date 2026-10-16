@@ -50,7 +50,7 @@ Content-Type: application/json
 }
 ```
 
-Ab Node **v1.1.0** sind `light_balance`, `tone_match` und `brightness` optional (Node-Defaults 0 / 0 / 1 = Verhalten wie v1.0.2, bytegleich). Sie bearbeiten das Foto im linearen Licht vor der Projektion: Seitenlicht-Ausgleich entlang der aus Landmarken bestimmten Gesichtsmittellinie innerhalb der semantischen Hautmaske (Merkmale werden nie gespiegelt), dann Hautton-Abgleich an den Hautring um das Gesicht im Mesh-Render (Fallback: Mesh-Gesicht), dann Helligkeit. Das Proof meldet aktive Werte unter `photo_adjust`. Anima-Versa erkennt die drei Namen im Schema und schickt dann seine gespeicherten Werte (Default 1 / 1 / 1); ohne sie gleicht es lokal aus.
+Ab Node **v1.1.0** sind `light_balance`, `tone_match` und `brightness` optional (Node-Defaults 0 / 0 / 1 = Verhalten wie v1.0.2, bytegleich). Sie bearbeiten das Foto im linearen Licht vor der Projektion: Seitenlicht-Ausgleich entlang der aus Landmarken bestimmten Gesichtsmittellinie innerhalb der semantischen Hautmaske (Merkmale werden nie gespiegelt), dann Hautton-Abgleich an die eigene Gesichtshaut des Meshes (semantische Gesichtsmaske des Mesh-Renders; ab v1.1.1, v1.1.0 nahm einen Ring um das Gesicht, der auf generierten Meshes vor allem Hals-Schatten und Haaransatz traf), dann Helligkeit. Das Proof meldet aktive Werte unter `photo_adjust`. Anima-Versa erkennt die drei Namen im Schema und schickt dann seine gespeicherten Werte (Default 1 / 1 / 1); ohne sie gleicht es lokal aus.
 
 Bei JPEG-Foto `data:image/jpeg;base64,` verwenden. Die Base64-Platzhalter durch echte Bytes ersetzen. Einzelne Uploads sind auf 64 MB begrenzt; zusätzlich gilt das konfigurierte HTTP-Body-Limit einschließlich Base64-Overhead. Ein direkter URL-Upload ist hier nicht erforderlich: geschützte AI-Hub-URLs nicht als `files`-URL weiterreichen, da der Gateway-URL-Fetch keine Benutzer-Download-Authentifizierung übernimmt und private Adressen verweigert.
 
@@ -97,7 +97,7 @@ Nach Installation erst die aktuelle ComfyUI-Queue prüfen. **Nur bei leerer lauf
 
 ## Geprüfter Stand
 
-- Node **v1.1.0** (2026-10-16, Tag `v1.1.0`) auf dx10-02 und k12 installiert; je 36 Worker-Tests grün; GitHub-CI Ubuntu/Windows grün. Echter Lauf mit generiertem Gesicht und Trellis-Mesh: Wangenverhältnis 0,71 → 0,94 bei `light_balance` 1, Hautton-Gewinn RGB 0,79/0,65/0,52 bei `tone_match` 1.
+- Node **v1.1.0** (2026-10-16, Tag `v1.1.0`) auf dx10-02 und k12 installiert; je 36 Worker-Tests grün; GitHub-CI Ubuntu/Windows grün. Echter Lauf mit generiertem Gesicht und Trellis-Mesh: Wangenverhältnis 0,71 → 0,94 bei `light_balance` 1, Hautton-Gewinn RGB 1,21/1,04/1,09 bei `tone_match` 1 (v1.1.1).
 
 - Node v1.0.2 auf dx10-02 (Linux ARM64/NVIDIA GB10) und k12 (Linux x86_64); ComfyUI 0.37.0 und Frontend 1.53.6. Je 31 Verhaltenstests im isolierten Python-3.12-Worker bestanden; die ComfyUI-Hauptumgebungen bleiben unverändert.
 - Echter asynchroner AI-Hub-Job: originales Journal-GLB und RGB-Referenz über die oben genannten Upload-Felder, GLB und Vergleichs-PNG heruntergeladen.
