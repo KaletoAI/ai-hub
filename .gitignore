@@ -49,3 +49,6 @@ docs/superpowers/
 # prod-only: pre-edit snapshots and stray photos next to the samples (deploy.sh excludes them)
 backups/
 sample_comfyui_workflows/*.heic*
+
+# graphify knowledge-graph output (generated)
+graphify-out/
