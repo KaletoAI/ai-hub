@@ -1,0 +1,573 @@
+{
+  "id": "1d5c1a2c-c2f3-4bb6-9783-b5bc17ddda58",
+  "revision": 0,
+  "last_node_id": 7,
+  "last_link_id": 6,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "Load3DAdvanced",
+      "pos": [
+        40,
+        80
+      ],
+      "size": [
+        440,
+        600
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "model_file",
+          "name": "model_file",
+          "type": "COMBO",
+          "widget": {
+            "name": "model_file"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "viewport_state",
+          "name": "viewport_state",
+          "type": "LOAD_3D_ADVANCED",
+          "widget": {
+            "name": "viewport_state"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "width",
+          "name": "width",
+          "type": "INT",
+          "widget": {
+            "name": "width"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "height",
+          "name": "height",
+          "type": "INT",
+          "widget": {
+            "name": "height"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "model_3d",
+          "name": "model_3d",
+          "type": "FILE_3D",
+          "links": [
+            1
+          ]
+        },
+        {
+          "localized_name": "model_3d_info",
+          "name": "model_3d_info",
+          "type": "LOAD3D_MODEL_INFO",
+          "links": null
+        },
+        {
+          "localized_name": "camera_info",
+          "name": "camera_info",
+          "type": "LOAD3D_CAMERA",
+          "links": [
+            6
+          ]
+        },
+        {
+          "localized_name": "width",
+          "name": "width",
+          "type": "INT",
+          "links": null
+        },
+        {
+          "localized_name": "height",
+          "name": "height",
+          "type": "INT",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.37.0",
+        "Node name for S&R": "Load3DAdvanced"
+      },
+      "widgets_values": [
+        "3d/face-texture-example/source.glb",
+        "",
+        1024,
+        1024
+      ],
+      "widgets_values_named": {
+        "model_file": "3d/face-texture-example/source.glb",
+        "viewport_state": "",
+        "width": 1024,
+        "height": 1024
+      },
+      "title": "1 · Original static Trellis GLB — upload / choose source"
+    },
+    {
+      "id": 2,
+      "type": "LoadImage",
+      "pos": [
+        40,
+        730
+      ],
+      "size": [
+        440,
+        380
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "image",
+          "name": "image",
+          "type": "COMBO",
+          "widget": {
+            "name": "image"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "choose file to upload",
+          "name": "upload",
+          "type": "IMAGEUPLOAD",
+          "widget": {
+            "name": "upload"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "IMAGE",
+          "name": "IMAGE",
+          "type": "IMAGE",
+          "links": [
+            2
+          ]
+        },
+        {
+          "localized_name": "MASK",
+          "name": "MASK",
+          "type": "MASK",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.37.0",
+        "Node name for S&R": "LoadImage"
+      },
+      "widgets_values": [
+        "face-texture-example-rgb.png",
+        "image"
+      ],
+      "widgets_values_named": {
+        "image": "face-texture-example-rgb.png",
+        "upload": "image"
+      },
+      "title": "2 · Matching RGB photo — one image"
+    },
+    {
+      "id": 3,
+      "type": "FaceTextureOnly",
+      "title": "3 · FACE TEXTURE ONLY — geometry unchanged",
+      "pos": [
+        540,
+        240
+      ],
+      "size": [
+        370,
+        230
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "name": "source_glb",
+          "type": "FILE_3D",
+          "link": 1
+        },
+        {
+          "name": "reference_image",
+          "type": "IMAGE",
+          "link": 2
+        },
+        {
+          "name": "strength",
+          "type": "FLOAT",
+          "widget": {
+            "name": "strength"
+          },
+          "link": null
+        },
+        {
+          "name": "feather",
+          "type": "FLOAT",
+          "widget": {
+            "name": "feather"
+          },
+          "link": null
+        },
+        {
+          "name": "render_resolution",
+          "type": "INT",
+          "widget": {
+            "name": "render_resolution"
+          },
+          "link": null
+        },
+        {
+          "name": "yaw",
+          "type": "FLOAT",
+          "widget": {
+            "name": "yaw"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "name": "corrected_glb",
+          "type": "FILE_3D",
+          "links": [
+            3,
+            5
+          ]
+        },
+        {
+          "name": "comparison",
+          "type": "IMAGE",
+          "links": [
+            4
+          ]
+        },
+        {
+          "name": "proof_metrics",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "FaceTextureOnly"
+      },
+      "widgets_values": [
+        1,
+        0.18,
+        768,
+        0
+      ],
+      "widgets_values_named": {
+        "strength": 1,
+        "feather": 0.18,
+        "render_resolution": 768,
+        "yaw": 0
+      },
+      "color": "#233",
+      "bgcolor": "#344"
+    },
+    {
+      "id": 4,
+      "type": "Preview3DAdvanced",
+      "pos": [
+        1010,
+        80
+      ],
+      "size": [
+        460,
+        600
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "model_3d",
+          "name": "model_3d",
+          "type": "FILE_3D_GLB,FILE_3D_GLTF,FILE_3D_FBX,FILE_3D_OBJ,FILE_3D_STL,FILE_3D_USDZ,FILE_3D",
+          "link": 3
+        },
+        {
+          "localized_name": "model_3d_info",
+          "name": "model_3d_info",
+          "shape": 7,
+          "type": "LOAD3D_MODEL_INFO",
+          "link": null
+        },
+        {
+          "localized_name": "camera_info",
+          "name": "camera_info",
+          "shape": 7,
+          "type": "LOAD3D_CAMERA",
+          "link": 6
+        },
+        {
+          "localized_name": "viewport_state",
+          "name": "viewport_state",
+          "type": "LOAD_3D",
+          "widget": {
+            "name": "viewport_state"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "width",
+          "name": "width",
+          "type": "INT",
+          "widget": {
+            "name": "width"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "height",
+          "name": "height",
+          "type": "INT",
+          "widget": {
+            "name": "height"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "model_3d",
+          "name": "model_3d",
+          "type": "FILE_3D",
+          "links": null
+        },
+        {
+          "localized_name": "model_3d_info",
+          "name": "model_3d_info",
+          "type": "LOAD3D_MODEL_INFO",
+          "links": null
+        },
+        {
+          "localized_name": "camera_info",
+          "name": "camera_info",
+          "type": "LOAD3D_CAMERA",
+          "links": null
+        },
+        {
+          "localized_name": "width",
+          "name": "width",
+          "type": "INT",
+          "links": null
+        },
+        {
+          "localized_name": "height",
+          "name": "height",
+          "type": "INT",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.37.0",
+        "Node name for S&R": "Preview3DAdvanced"
+      },
+      "widgets_values": [
+        "",
+        1024,
+        1024
+      ],
+      "widgets_values_named": {
+        "viewport_state": "",
+        "width": 1024,
+        "height": 1024
+      },
+      "title": "4 · Corrected GLB — native 3D viewer"
+    },
+    {
+      "id": 5,
+      "type": "PreviewImage",
+      "pos": [
+        530,
+        730
+      ],
+      "size": [
+        620,
+        380
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "images",
+          "name": "images",
+          "type": "IMAGE",
+          "link": 4
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "images",
+          "name": "images",
+          "type": "IMAGE",
+          "links": null
+        }
+      ],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.37.0",
+        "Node name for S&R": "PreviewImage"
+      },
+      "title": "5 · Real reference / before / after comparison"
+    },
+    {
+      "id": 6,
+      "type": "SaveGLB",
+      "pos": [
+        1530,
+        80
+      ],
+      "size": [
+        440,
+        600
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "mesh",
+          "name": "mesh",
+          "type": "MESH,FILE_3D_GLB,FILE_3D_GLTF,FILE_3D_OBJ,FILE_3D_FBX,FILE_3D_STL,FILE_3D_USDZ,FILE_3D_PLY,FILE_3D_SPLAT,FILE_3D_SPZ,FILE_3D_KSPLAT,FILE_3D_SPLAT_ANY,FILE_3D_POINT_CLOUD_ANY,FILE_3D",
+          "link": 5
+        },
+        {
+          "localized_name": "filename_prefix",
+          "name": "filename_prefix",
+          "type": "STRING",
+          "widget": {
+            "name": "filename_prefix"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "image",
+          "name": "image",
+          "type": "PREVIEW_3D",
+          "widget": {
+            "name": "image"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "cnr_id": "comfy-core",
+        "ver": "0.37.0",
+        "Node name for S&R": "SaveGLB"
+      },
+      "widgets_values": [
+        "3d/FaceTextureOnly",
+        ""
+      ],
+      "widgets_values_named": {
+        "filename_prefix": "3d/FaceTextureOnly",
+        "image": ""
+      },
+      "title": "6 · Save FaceTextureOnly.glb — copies bytes"
+    },
+    {
+      "id": 7,
+      "type": "Note",
+      "pos": [
+        540,
+        505
+      ],
+      "size": [
+        370,
+        190
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "Upload the ORIGINAL static textured Trellis GLB and its matching RGB photo.\n\nThe face is detected / registered anew. Only face texture is projected; vertices, geometry and original assets are preserved. No Anima, regeneration, fitting or added geometry.\n\nYaw (degrees) adjusts the source registration view when needed. Queue the graph, inspect comparison and corrected viewer. SaveGLB writes 3d/FaceTextureOnly_*.glb."
+      ],
+      "widgets_values_named": {
+        "text": "Upload the ORIGINAL static textured Trellis GLB and its matching RGB photo.\n\nThe face is detected / registered anew. Only face texture is projected; vertices, geometry and original assets are preserved. No Anima, regeneration, fitting or added geometry.\n\nYaw (degrees) adjusts the source registration view when needed. Queue the graph, inspect comparison and corrected viewer. SaveGLB writes 3d/FaceTextureOnly_*.glb."
+      },
+      "color": "#432",
+      "bgcolor": "#653",
+      "title": "READ ME · Texture projection, not geometry repair"
+    }
+  ],
+  "links": [
+    [
+      1,
+      1,
+      0,
+      3,
+      0,
+      "FILE_3D"
+    ],
+    [
+      2,
+      2,
+      0,
+      3,
+      1,
+      "IMAGE"
+    ],
+    [
+      3,
+      3,
+      0,
+      4,
+      0,
+      "FILE_3D"
+    ],
+    [
+      4,
+      3,
+      1,
+      5,
+      0,
+      "IMAGE"
+    ],
+    [
+      5,
+      3,
+      0,
+      6,
+      0,
+      "FILE_3D"
+    ],
+    [
+      6,
+      1,
+      2,
+      4,
+      2,
+      "LOAD3D_CAMERA"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.67,
+      "offset": [
+        35,
+        30
+      ]
+    }
+  },
+  "version": 0.4
+}

@@ -1,0 +1,52 @@
+{
+  "1": {
+    "class_type": "UniMateModelLoader",
+    "inputs": {"run": "unimate_uniml3d_f60_v3", "checkpoint": "latest", "run_path": ""},
+    "_meta": {"title": "UniMate v3 — 60 frames"}
+  },
+  "2": {
+    "class_type": "PrimitiveString",
+    "inputs": {"value": ""},
+    "_meta": {"title": "input_mesh_path"}
+  },
+  "3": {
+    "class_type": "UniMateMeshPreparation",
+    "inputs": {"rigged_mesh": ["2", 0], "model": ["1", 0], "name": "mesh", "face_right": "", "face_left": "", "force_rebuild": false},
+    "_meta": {"title": "Prepare and cache rigged mesh"}
+  },
+  "4": {
+    "class_type": "PrimitiveStringMultiline",
+    "inputs": {"value": "An object walks forward."},
+    "_meta": {"title": "input_prompt_positiv"}
+  },
+  "5": {
+    "class_type": "PrimitiveFloat",
+    "inputs": {"value": 3.0},
+    "_meta": {"title": "input_cfg_scale"}
+  },
+  "6": {
+    "class_type": "PrimitiveInt",
+    "inputs": {"value": 42},
+    "_meta": {"title": "input_seed"}
+  },
+  "7": {
+    "class_type": "PrimitiveInt",
+    "inputs": {"value": 1},
+    "_meta": {"title": "input_num_repetitions"}
+  },
+  "8": {
+    "class_type": "PrimitiveInt",
+    "inputs": {"value": 10},
+    "_meta": {"title": "input_chain_overlap"}
+  },
+  "9": {
+    "class_type": "UniMateMeshSampler",
+    "inputs": {"model": ["1", 0], "asset": ["3", 0], "prompt": ["4", 0], "cfg_scale": ["5", 0], "seed": ["6", 0], "num_repetitions": ["7", 0], "chain_overlap": ["8", 0]},
+    "_meta": {"title": "Generate text-conditioned motion"}
+  },
+  "10": {
+    "class_type": "UniMateMeshExport",
+    "inputs": {"asset": ["3", 0], "motion": ["9", 0], "filename_prefix": "3D/UniMate", "fps": 30.0},
+    "_meta": {"title": "Output"}
+  }
+}

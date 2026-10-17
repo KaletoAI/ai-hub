@@ -363,7 +363,7 @@ sources, in this order:
    ```yaml
    model_context: |
      glm-*=32768
-     qwen3.8-flash-next-ple4=131072
+     qwen3.8-flash-next-nvfp4-ple4=131072
    ```
 2. **Discovery** — read from the listing where it carries the value: OpenRouter /
    Together `context_length`, vLLM `max_model_len`, llama-server `meta.n_ctx`. A
