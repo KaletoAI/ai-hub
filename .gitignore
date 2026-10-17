@@ -52,3 +52,6 @@ sample_comfyui_workflows/*.heic*
 
 # graphify knowledge-graph output (generated)
 graphify-out/
+
+# runtime/build artifacts
+*.pid
