@@ -460,8 +460,10 @@ or a `503` (with `Retry-After`) if the wait runs out.
 
 - **Park time is per-alias** (`park_s` in the chat-alias editor, or config
   `alias_park`): blank = the global default (`park_timeout_s`, **60 s**, Server
-  tab), `0` = parking off for that alias (immediate `503` when busy). `max_parked`
-  caps the queue. Async generation jobs have their own cap, `max_queued_gen`
+  tab), `0` = parking off for that alias (immediate `503` when busy). Generation
+  jobs and Responses background workers use the same global `park_timeout_s`
+  (no chat-alias override); there is no separate async timeout. `max_parked`
+  caps the call queue. Async generation jobs have their own cap, `max_queued_gen`
   (Server → Runtime, default **200** queued or running; `0` = none): beyond it a new
   `mode: async` job gets `503` + `Retry-After`. A client's job `ttl_s` is capped at
   `jobs.max_ttl_s` (config, default 7 days).
@@ -2474,7 +2476,7 @@ supported (chat SSE → Responses SSE events). **`background: true`** runs the
 request asynchronously per the official OpenAI pattern: it returns immediately
 with a `queued` response object; poll `GET /v1/responses/{id}` until a terminal
 state and cancel via `POST /v1/responses/{id}/cancel`. The background worker
-parks in the shared queue (longer async window) — so long-running or busy
+parks in the shared queue using the Server tab's default park time — so long-running or busy
 requests never time out the client connection. Thinking-model output arrives as
 Responses-API **reasoning items/events** (see [Reasoning control](#reasoning-control)).
 

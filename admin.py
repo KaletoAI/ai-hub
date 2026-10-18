@@ -10532,7 +10532,7 @@ async def users_del(request: Request):
 _SRV_RUNTIME = [
     ("health_check_interval", "int", "health check interval", "seconds"),
     ("max_concurrent", "int", "default max_concurrent", "blank = unlimited"),
-    ("park_timeout_s", "int", "default park time", "seconds a call waits for a free backend when all are busy (blank = 60; per-alias override in Aliases; 0 = off)"),
+    ("park_timeout_s", "int", "default park time", "seconds calls, generation jobs and background responses wait for a free backend (blank = 60; chat per-alias override in Aliases; 0 = off)"),
     ("max_parked", "int", "max parked calls", "queue cap — beyond this a busy call gets 503 (blank = 100)"),
     ("max_queued_gen", "int", "max queued media jobs",
      "async generation jobs queued or running at once — beyond this a new async job gets 503 "

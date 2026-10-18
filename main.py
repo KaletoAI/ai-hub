@@ -548,7 +548,6 @@ def _active_done(token) -> None:
 # before its first await), the rest re-check and wait again. Park time is per-alias
 # (`alias_park_s`), else the global default below; 0 disables parking for an alias.
 park_timeout_s: float = 60.0            # global default park time (Server tab); per-alias overrides in alias_park_s
-async_park_timeout_s: float = 600.0
 # How long a parked generation job rides out a poll that finds ZERO candidates before
 # giving up. A job only parks because it HAD candidates (all busy), so an empty poll is
 # a transient health flap — a busy ComfyUI routinely drops its /object_info discovery
@@ -2460,8 +2459,8 @@ rebuild_route_index()                      # initial index (config backends; mod
 async def _dispatch_or_park(alias, path, body, request, stats_endpoint=None, deadline=None):
     """Forward to a ready backend; if all mapping backends are busy, hold the call in
     the park queue until one frees (then dispatch) or 503. Park window = the alias's
-    park time, or an explicit `deadline` (background responses use the longer async
-    window). Shared by chat routing, the Responses bridge, and background responses."""
+    park time, or an explicit `deadline` (background responses use the global default).
+    Shared by chat routing, the Responses bridge, and background responses."""
     # Stash what a refusal needs to be logged with (see _record_rejected): the alias
     # and body only exist here, but the rejection is rendered by the error handler.
     request.state.gw_alias = alias
@@ -2971,12 +2970,12 @@ def _dispatch_json(resp) -> dict:
 
 
 async def _run_bg_response(job_id, rid, alias, chat_body, request, created):
-    """Worker for a background response: dispatch (parking in the shared queue up to the
-    async window), translate the chat completion → Responses object, store it on the job."""
+    """Worker for a background response: dispatch (parking up to the global default),
+    translate the chat completion → Responses object, store it on the job."""
     try:
         resp = await _dispatch_or_park(alias, "/v1/chat/completions", chat_body, request,
                                        stats_endpoint="/v1/responses",
-                                       deadline=time.monotonic() + async_park_timeout_s)
+                                       deadline=time.monotonic() + park_timeout_s)
         chat_json = _dispatch_json(resp)
         if getattr(resp, "status_code", 200) >= 400:
             await asyncio.to_thread(jobs.fail, job_id,
@@ -4382,7 +4381,8 @@ async def _run_gen_parked(job_id, alias, force, build_req, eligible: Optional[se
     faster job between the designation and the claim (_run_job then returns False), and
     the job simply keeps parking — the backends it already ran on stay tried."""
     run_state = run_state if run_state is not None else {}
-    deadline = time.monotonic() + async_park_timeout_s
+    park_s = park_timeout_s
+    deadline = time.monotonic() + park_s
     unhealthy_since = None                       # when the candidate set first went empty (flap timer)
     # In the media queue for the whole wait, so a backend that frees can be handed to
     # THIS job when the scheduler designates it (same alias / overdue) — see
@@ -4425,9 +4425,9 @@ async def _run_gen_parked(job_id, alias, force, build_req, eligible: Optional[se
                                             f"no healthy backend for '{alias}' (all candidates down for "
                                             f">{park_health_grace_s:.0f}s)" + (f" on '{force}'" if force else ""))
                     return
-            if now > deadline:
+            if now >= deadline:
                 await asyncio.to_thread(jobs.fail, job_id,
-                                        f"park timeout: backend busy for >{async_park_timeout_s:.0f}s")
+                                        f"park timeout: backend busy for >{park_s:.0f}s")
                 return
             await asyncio.sleep(2.0)
     finally:
@@ -8629,7 +8629,7 @@ def apply_server_settings() -> None:
     next restart (the stats server is built once at startup). The gateway listening
     port is set by the launch command, so it is informational here."""
     global api_key, log_per_call, model_prefix, max_concurrent_default, health_check_interval
-    global park_timeout_s, async_park_timeout_s, park_health_grace_s, max_parked, max_queued_gen
+    global park_timeout_s, park_health_grace_s, max_parked, max_queued_gen
     global fast_probe_interval_s, affinity_max_wait_s
     s = store.get_settings() if store.is_active() else {}
     if "api_key" in s:
@@ -8648,11 +8648,6 @@ def apply_server_settings() -> None:
     if "park_timeout_s" in s:
         try:
             park_timeout_s = float(s["park_timeout_s"])
-        except (TypeError, ValueError):
-            pass
-    if "async_park_timeout_s" in s:
-        try:
-            async_park_timeout_s = float(s["async_park_timeout_s"])
         except (TypeError, ValueError):
             pass
     if "park_health_grace_s" in s:

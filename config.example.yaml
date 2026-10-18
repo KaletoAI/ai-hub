@@ -42,7 +42,7 @@ model_prefix: true
 # field is needed — a standard request just waits, then gets a 200 (or a 503 +
 # Retry-After if the wait runs out).
 # NOT config keys — these live in the /ui Server tab only (stored in store.db):
-#   park time         default 60 s   how long a call waits for a free backend (0 = off)
+#   park time         default 60 s   calls, generation jobs and background responses wait for a free backend (0 = off)
 #   max parked        default 100    queue cap; a busy call beyond this gets 503
 #   affinity max wait default 120 s  see "Scheduling" below
 # Per-alias override (blank/absent = the global default park time; 0 = parking off for
@@ -54,9 +54,8 @@ model_prefix: true
 # Async LLM requests use the official OpenAI Responses background mode (no custom
 # field): POST /v1/responses {background:true} -> queued id -> poll GET
 # /v1/responses/{id} -> cancel POST /v1/responses/{id}/cancel. The background
-# worker parks in the same queue, for up to 600 s (`async_park_timeout_s`, a default
-# in main.py — neither a config key nor a Server-tab field; `apply_server_settings`
-# would honour a stored settings row of that name, but no form writes one).
+# worker parks in the same queue, using the Server tab's default park time
+# (`park_timeout_s`, default 60 s), as do generation jobs.
 # A parked generation job whose backends briefly ALL go unhealthy (e.g. a busy
 # ComfyUI dropping its discovery poll mid-render) rides out the flap for 90 s before
 # it's declared "no healthy backend"; a genuinely-offline alias still fails after it

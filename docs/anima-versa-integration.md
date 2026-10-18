@@ -219,9 +219,10 @@ Artefakt `kind` (`image`/`video`/`audio`) + `mime` + `url`. Consumer sollten am
 
 Die Endpoints sind **synchron**: der HTTP-Request blockiert, bis das Bild fertig ist
 (typisch ~30–90 s pro Bild). Ist das Backend belegt, kommt die **Parkzeit** obendrauf:
-bis `async_park_timeout_s` (Default **600 s**) wartet der Job auf einen freien Slot,
-erst danach failt er (502). Worst case also Parkzeit + Generierungszeit —
-**Client-Timeout ≥ 660 s setzen** (oder den nativen Async-Pfad aus §7 nehmen).
+bis `park_timeout_s` (Server → Runtime → „default park time“, Standard **60 s**)
+wartet der Job auf einen freien Slot, erst danach failt er (502).
+**Client-Timeout größer als konfigurierte Parkzeit + Generierungszeit setzen**
+(oder den nativen Async-Pfad aus §7 nehmen).
 
 | Code | Bedeutung | anima-versa |
 |---|---|---|
@@ -241,7 +242,7 @@ bleibt sie leer.
 
 **Busy ≠ Fehler:** Wenn das ComfyUI-Backend gerade ausgelastet ist (Concurrency-Cap),
 **queued das Gateway den Job intern und blockiert den Request, bis ein Slot frei wird**
-(bis `async_park_timeout_s`, Default 600 s, dann 502). anima-versa braucht **keine eigene
+(bis `park_timeout_s` aus dem Server-Tab, Standard 60 s, dann 502). anima-versa braucht **keine eigene
 Concurrency-Drosselung** — nur ein großzügiges Timeout. Mehrere parallele Requests
 reihen sich auf dem Backend sauber ein.
 

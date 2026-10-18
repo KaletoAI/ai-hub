@@ -2516,6 +2516,11 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   `run_generation` refuses a new ASYNC job with 503 once `_gen_tasks` holds that many
   (sync jobs hold a connection and cap themselves), and `_clamp_ttl` caps a client's
   `ttl_s` at `jobs.max_ttl_s` (default 7 days) — `test_gen_limits.py`.
+  Generation parking and Responses background workers also use the global
+  `park_timeout_s` from Server → Runtime, without chat-alias overrides. The old hidden
+  600 s async limit is removed: it silently expired jobs despite a 3600 s UI setting.
+  Each queued job snapshots its wait limit for a consistent deadline and error.
+  `test_gen_park_time.py` guards dispatch after 600 s, configured expiry and zero wait.
   **Async chat has no OpenAI spec** — async lives on the Responses
   background mode: `POST /v1/responses {background:true}` → `resp_<jobid>` queued →
   `GET /v1/responses/{id}` poll → `POST …/cancel`; the worker (`_run_bg_response`)
