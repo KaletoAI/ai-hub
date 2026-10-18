@@ -222,7 +222,7 @@ the key only sees what it's allowed. This is how you point an image client at th
 gateway and have it see just the image aliases instead of the whole 400-model
 catalog: give it a key whose allow-list is the image alias(es) (or the ComfyUI
 backend), and `GET /v1/models` returns only those. `?type=chat`, `image`, `video`,
-`3d`, `tts`, `embedding`, `rerank`, `audio` and `asr` narrow the catalog.
+`3d`, `tts`, `embedding`, `rerank`, `audio`, `asr` and `decision` narrow the catalog.
 `?type=media` selects the union of image, video, 3D, TTS, audio and transcription
 models. Without `type`, the endpoint remains the complete permitted catalog.
 NanoGPT and Venice expose typed inventories; `audio` and `asr` include Venice
@@ -347,6 +347,7 @@ Blank group = the existing independent per-backend limits. Editable in Backends.
 | `models_allow` | keep only models matching one of these globs (comma-separated, or a YAML list): `models_allow: "gpt-*, claude-*"`. Empty/unset = no filter. |
 | `models_deny` | drop every model matching one of these globs, **after** `models_allow` — so deny wins, and `gpt-*` allow + `gpt-*-embed` deny is "all the GPTs except the embedders". Empty/unset = no filter. |
 | `models_extra` | **exact** ids (no globs) this backend serves but does not list, added to the discovered set: `models_extra: "Whisper-V3-Turbo-NPU2"`. Applied last, so a narrow `models_allow` can't take them back out. Empty/unset = nothing added. |
+| `decision_models` | globs naming this backend's **decision models** — they serve `POST /v1/systemone` and nothing else (see [Decision models](#decision-models-system-one-v1systemone)). OpenAI-type backends. Empty/unset = none. |
 
 `models_allow`/`models_deny` are glob-matched case-sensitively (an exact id is just a
 pattern without wildcards) and, unlike the two flags above, apply to **every** backend
@@ -374,6 +375,52 @@ transcription. They are added only once discovery has SUCCEEDED, so an unreachab
 backend never advertises a model. `/health` reports them as `models_added: [ids]` and
 the Backends tab badges `+2 listed manually` — a typo'd id is otherwise silent: it
 routes, and the backend rejects the call.
+
+### Decision models (System One, `/v1/systemone`)
+
+A decision model writes no text. It gets a `state` and typed `questions`
+(`choice` / `noul` / `score`) and answers each with a probability distribution over the
+options it was given — so it is no chat model and `/v1/chat/completions` cannot carry
+it. The hub serves them on their own endpoint, with the normal hub key:
+
+```bash
+curl -s localhost:4000/v1/systemone -H "Authorization: Bearer $KEY" \
+  -H 'Content-Type: application/json' -d '{
+    "model": "typesafe/jev-1.14",
+    "state": {"text": "smiles and waves at a friend"},
+    "questions": {"entry": {"type": "choice",
+      "instructions": "Which facial expression fits the text best?",
+      "criteria": {"neutral": "no particular emotion", "positive": "happy, warm",
+                   "sad": "unhappy", "none": "none of these fits"}}}}'
+# → {"answers": {"entry": {"type": "choice", "choice": "positive",
+#                          "probabilities": {"neutral": 0.03, "positive": 0.95, …}}}, "usage": {…}}
+```
+
+A backend names its decision models in **`decision_models`** (globs, Backends tab →
+Models). They join the discovered set like any model — the allow-list, aliases, quotas,
+failover and LLM Calls (with OpenRouter's `usage.cost`) all work as for chat — but they
+answer **`/v1/systemone` only**, and only they answer it: a decision model asked on a chat
+path, or a chat model on `/v1/systemone`, is `404` with the endpoint to use instead.
+`/v1/models?type=decision` lists them (and aliases that map one); `?type=chat` leaves
+them out.
+
+- **OpenRouter** leaves decision models out of its normal `/v1/models`; with
+  `decision_models` set the hub also reads `?output_modalities=decisions` (cloud
+  backends only) and keeps the matching ids whose listing names the `decisions`
+  modality — so `decision_models: "*"` takes its whole decision catalog without turning
+  a chat model into one. Calls go to its **Decisions API** (`/api/alpha/decisions`, full
+  id). Pin the version (`typesafe/jev-1.14`, not `~typesafe/jev-latest`): thresholds on
+  the caller's side hold for one build only.
+- **llama-swap** lists them with the rest (`decision_models: "laya, openjev-4b"`); calls go
+  to `/upstream/<model>/v1/systemone`. Any other LAN server gets `/v1/systemone` itself.
+
+The body is forwarded as sent — no sampling defaults, no reasoning, no `stream` — and the
+answer comes back verbatim. The read timeout is 30 s (not chat's 300), and a call parks
+at most **2 s** (or the alias's shorter park time) when every candidate is busy: the
+caller falls back without a model after a few seconds, so a clear `503` beats a late
+answer. A `max_concurrent` on the OpenRouter backend also caps decision calls; give them
+their own budget with a second backend entry (same URL and key, `decision_models` set,
+`models_allow` narrowed to them).
 
 ### Context windows (`context_length` in `/v1/models`)
 
@@ -1005,6 +1052,7 @@ runs every 600 s.
 |---|---|---|
 | Text, including streaming | `/v1/chat/completions` | `?type=chat` |
 | Embeddings | `/v1/embeddings` | `?type=embedding` |
+| Decisions (System One) | `/v1/systemone` | `?type=decision` |
 | TTS | `/v1/audio/speech` | `?type=tts` |
 | Images | `/v1/images/generations`, `/v1/generations` | `?type=image` |
 | Video | `/v1/generations` | `?type=video` |
@@ -2663,11 +2711,12 @@ stats:
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/v1/models` | catalog filtered by the caller's allow-list; `?type=chat\|image`; auth via Bearer, `x-api-key`, or separate `x-ai-hub-key: Bearer` |
+| `GET` | `/v1/models` | catalog filtered by the caller's allow-list; `?type=chat\|decision\|image`; auth via Bearer, `x-api-key`, or separate `x-ai-hub-key: Bearer` |
 | `GET` | `/v1/models/{id}` | single-model lookup; same authentication and allow-list |
 | `POST` | `/v1/chat/completions` | chat; scheduled dispatch + failover; streaming; parking; `reasoning: off\|on\|auto` |
 | `POST` | `/v1/completions` | completions; same routing |
 | `POST` | `/v1/embeddings` | embeddings; same routing |
+| `POST` | `/v1/systemone` | [decision models](#decision-models-system-one-v1systemone) (System One); same routing, decision models only; body forwarded verbatim; no stream; parks ≤ 2 s |
 | `POST` | `/v1/audio/speech` | Native TTS binary passthrough; configured ComfyUI `tts`/`text2audio` aliases run synchronously through the generation queue and return audio |
 | `POST` | `/v1/responses` | Responses API ↔ chat bridge; streaming; parking; `background:true` (async) |
 | `GET` | `/v1/responses/{id}` | poll a background response (queued→…→completed/failed/cancelled) |

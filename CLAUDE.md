@@ -99,7 +99,7 @@ hot-reload-safe. Modules marked *pure* do no I/O and import neither `main` nor
 | `modelsync.py` | *Pure*: which model files a ComfyUI alias needs, where they come from (LAN share, catalog URL, derived HF URL). |
 | `loratags.py` | *Pure* half of LoRA trigger words (stored and delivered, never put into a prompt); metadata keyed on the share file's sha256, Civitai by hash. |
 
-Requests: chat/completions/embeddings/speech and `/v1/messages` all funnel through
+Requests: chat/completions/embeddings/speech, `/v1/systemone` and `/v1/messages` all funnel through
 `_dispatch_or_park()` (resolve → ready/busy split → dispatch with failover → park FIFO
 when all busy). Generation (`/v1/generations` + OpenAI image shims) runs as a job via
 `get_gen_routes` → `_run_job`. Each job runs one alias. Details: `docs/architecture.md`.
@@ -123,6 +123,8 @@ Each of these once failed without an error; the full story is in `docs/architect
 - Sampling precedence is client > alias > backend; backend defaults and reasoning are
   derived per backend inside the adapter so a failover re-derives them.
 - `<backend>/current` never loads a model.
+- A decision model (`decision_models`) serves `POST /v1/systemone` only, and only decision
+  models serve it (`serves_model`); its body goes out verbatim (no sampling/reasoning).
 
 **Anthropic / protocols**
 - An `anthropic` backend serves `/v1/messages` ONLY (licence boundary, `serves_path`)

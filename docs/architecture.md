@@ -2550,6 +2550,22 @@ the optional worker's scientific dependencies are absent from the gateway venv.
   an Anthropic backend is invisible everywhere else and an alias served only by
   such backends answers `404 … reachable through POST /v1/messages only` instead of
   a misleading 503.
+- **Decisions** (`POST /v1/systemone`, System One — `{model, state, questions}` in, a
+  probability per option out): `main.systemone` authenticates through `gate_request`
+  (allow-list + quota, like chat), drops `stream` and hands over to the SAME
+  `_dispatch_or_park()` with a park deadline of at most `_DECISION_PARK_S` (2 s, or the
+  alias's shorter `park_s`; parking off → the usual immediate 503): the caller
+  (Anima-Versa) waits 2-6 s and then falls back without a model, so parking it behind a
+  long chat job only produces an answer nobody reads. No `_apply_alias_sampling()`, no
+  `_normalize_reasoning()`, and `OpenAIAdapter._payload` returns the body bare for this
+  path — the state is user content that must reach the model unchanged.
+  `OpenAIAdapter.dispatch` re-targets `call.url` through `adapters.decision_url`
+  (llama-swap → `/upstream/<model>/v1/systemone`, a cloud backend → OpenRouter's
+  Decisions API `/alpha/decisions` — the path Anima measured with 1,284 calls without an
+  error, 2026-10-18; its `/v1/systemone` is untested — any other LAN server →
+  `/v1/systemone`) and runs `_dispatch_once` with `_DECISION_TIMEOUT` (read 30 s): a
+  decision answers in ~0.3 s. Stats/cost are the plain path's (`usage.cost` via
+  `reported_cost`), recorded under `/v1/systemone` (an `llm` row in LLM Calls).
 - **Generation** (`POST /v1/generations`, and the OpenAI shims
   `/v1/images/generations` + `/v1/images/edits`): `get_gen_routes(alias)` resolves
   an alias via the **separate** generation store (`image_models`/store), or a direct
@@ -2794,9 +2810,32 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   badge needs the measurement only when there is one). A typo'd id fails the other way
   round from a filter typo — it routes, looks healthy, and dies at the backend.
   `test_model_filter.py`.
+- **Decision models** (`decision_models`, globs; `main.serves_model`): a decision model
+  answers `adapters.DECISION_PATH` (`/v1/systemone`) ONLY, and only a decision model
+  answers it — a chat body at a decision model, or a decision body at a chat model, is an
+  upstream 400 at best and on OpenRouter a billed one. Checked per candidate in
+  `resolve_routes` (both the pinned and the index branch) next to `serves_path`, so one
+  alias may map both kinds and each endpoint finds its own. Membership is DISCOVERY state
+  (`backend_decisions[bid]`, `Capabilities.decisions` ∩ the filtered `caps.models`, kept
+  while the backend is down like `backend_models`), not a live glob match: OpenRouter
+  lists decision models only under `/v1/models?output_modalities=decisions`
+  (`OpenAIAdapter._decision_listing`, asked only when `decision_models` is set and the
+  backend is not LAN — a LAN llama-swap lists them with the rest and polls every few
+  seconds), and an entry whose listing names output modalities must name `decisions`
+  (`is_decision_entry`) — otherwise `decision_models: "*"` would turn every OpenRouter
+  chat model into a decision model. The decision listing is merged into models, pricing
+  and context; a failed fetch keeps the last good one (`_decision_cache`) rather than
+  dropping the models until the next 10-minute catalog poll. A refusal names the other
+  endpoint (`decision_refusal`, via the same `_name_candidates` that
+  `anthropic_only_candidates` uses, `current` excluded — its kind changes with every
+  swap); down/busy stays 503. The kind is `decision` in `main._backend_model_types`
+  (checked before catalogs and provider metadata, so nothing calls it `chat`): that one
+  place makes `/v1/models?type=decision` list decision models and the aliases mapping one,
+  keeps them out of `?type=chat`, and gives the console's alias picker its `decision`
+  bucket. A decision call also drops the legacy `park` field, like `route`. `test_decision_models.py`.
 - **Allow-list filtering**: `/v1/models` authenticates the caller and filters by
   their allow-list (entries may be aliases, model ids, or **backend names** =
-  all that backend's models); image aliases are included; `?type=chat|image`.
+  all that backend's models); image aliases are included; `?type=chat|decision|image`.
   The user editor's "all chat / all image / all backend" boxes store GROUP TOKENS
   (`main.GRANT_ALL_CHAT` `@chat`, `@image`, `@backends` = `admin._GRANT_TOKENS`),
   resolved per request by `_expand_grants`/`_model_allowed` — ticking "all" used to
@@ -3182,6 +3221,15 @@ retrying a 503 forever: measured 2026-09-12 on prod, 3195 of them in three hours
 one agent. It pins both spellings, the messages path where the same empty set really
 does mean DOWN, and — the guard on the fix itself — that the boundary stays CLOSED:
 only the message changed, `serves_path` still makes that backend no candidate at all).
+`test_decision_models.py` (System One on `/v1/systemone`: its caller treats every
+failure as "no model" and silently falls back, so a broken route reads as a model that is
+never sure. It pins the second OpenRouter listing — decision models are missing from the
+normal one —, the `decisions`-modality rule that keeps `*` off chat models, the kept
+listing on a failed poll, the whitelist winning over a decision model, `serves_model` in
+both directions with the refusal naming the other endpoint, the verbatim body (no
+sampling, no reasoning, backend key not hub key), the Decisions-API / llama-swap
+`/upstream` URLs, the short timeout, the booked `usage.cost`, the allow-list, and the
+`?type=decision|chat` split of `/v1/models`).
 And one guards the project's own NAME (`test_project_name.py`): a stale mention of the
 pre-rename name left in `deploy.sh` points a deploy at a path that no longer exists, in
 `ai-hub.service` at a `WorkingDirectory` that is gone, in the README at a clone URL that

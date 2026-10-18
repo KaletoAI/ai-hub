@@ -8,7 +8,9 @@ from __future__ import annotations
 import re
 
 MEDIA_TYPES = frozenset({"image", "video", "3d", "tts", "audio", "asr"})
-MODEL_TYPES = MEDIA_TYPES | {"chat", "embedding", "rerank"}
+# "decision": System One models (POST /v1/systemone only) — set by the backend's
+# `decision_models`, never derived from a name or provider label here.
+MODEL_TYPES = MEDIA_TYPES | {"chat", "embedding", "rerank", "decision"}
 
 _LABELS = {
     "chat": "chat", "text": "chat", "llm": "chat", "vision": "chat",
