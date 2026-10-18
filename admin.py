@@ -2067,6 +2067,17 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
               "and the whitelist cannot bring it back, because it only ever subtracts. Added after "
               "the filter, and only once discovery has succeeded. A typo here is silent: the id "
               "routes, and the backend rejects it.</p>"
+            + _field("decision models", _inp("decision_models", g("decision_models"),
+                     placeholder="typesafe/jev-1.14, laya"))
+            + "<p class='hint'><b>decision models</b>: comma-separated globs naming the models that "
+              "answer <code>POST /v1/systemone</code> (System One: a state and typed questions in, "
+              "a probability per option out) — and nothing else; every other model stays off that "
+              "endpoint. OpenAI-type backends only. A cloud backend's decision catalog is asked for "
+              "separately (OpenRouter <code>?output_modalities=decisions</code>) and called through "
+              "its Decisions API; a listing that names output modalities must name "
+              "<code>decisions</code>, so <code>*</code> never turns its chat models into decision "
+              "models. On llama-swap the calls go to <code>/upstream/&lt;model&gt;/v1/systemone</code>. "
+              "Blank = none.</p>"
             + f'<div id="llmopts" style="{"" if cur_type in ("openai", "nanogpt") else "display:none"}">'
             + '<div class="grouphdr">LLM</div>'
             + _field("discovery filters",
@@ -3124,7 +3135,7 @@ async def backend_save(request: Request):
     # add), all applied to the discovered model set of EVERY backend type (a ComfyUI
     # checkpoint list included) — deliberately read here and not in the cloud branch
     # below, which strips the ComfyUI-only keys.
-    for mk in ("models_allow", "models_deny", "models_extra"):
+    for mk in ("models_allow", "models_deny", "models_extra", "decision_models"):
         mv = (f.get(mk, "") or "").strip()
         if mv:
             b[mk] = mv

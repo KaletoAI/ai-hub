@@ -62,6 +62,10 @@ logger = logging.getLogger(__name__)
 # hold the failover for five minutes before the next candidate got a chance. Connect
 # (incl. the TLS handshake) and waiting for a pooled connection stay short.
 _CHAT_TIMEOUT = httpx.Timeout(300.0, connect=10.0, pool=30.0)
+# A decision answers in ~0.3 s (OpenRouter p90 0.35 s, measured by Anima-Versa
+# 2026-10-18) and its caller gives up after 2-6 s. 30 s still covers a llama-swap
+# model swap; past that a hung upstream only holds the slot for nobody.
+_DECISION_TIMEOUT = httpx.Timeout(30.0, connect=5.0, pool=10.0)
 _DISCOVERY_TIMEOUT = 5.0
 _COMFY_DISCOVERY_TIMEOUT = 8.0
 # NanoGPT's direct API host (the one its docs recommend for API keys) answered the six
@@ -380,6 +384,54 @@ def extract_models(payload, backend: dict) -> set[str]:
     return {m["id"] for m in data if "id" in m}
 
 
+# ── Decision models (System One: `POST /v1/systemone`) ────────────────────────
+# A decision model writes no text: it gets a `state` and typed `questions` and answers
+# each with a probability distribution over the given options. It is no chat model, so
+# routing keeps it on DECISION_PATH and keeps every chat model off it (main.serves_model).
+DECISION_PATH = "/v1/systemone"
+DECISION_MODALITY = "decisions"
+
+
+def is_decision_entry(m: dict, patterns: list) -> bool:
+    """Is this `/v1/models` entry a decision model on a backend whose `decision_models`
+    globs are `patterns`? The glob must match the id, AND a listing that names its
+    output modalities must name `decisions` among them — so `*` on OpenRouter takes its
+    decision catalog without turning every chat model into one. A listing that names no
+    modalities (llama-swap, vLLM) leaves it to the globs alone."""
+    mid = m.get("id") if isinstance(m, dict) else None
+    if not isinstance(mid, str) or not any(fnmatch.fnmatchcase(mid, p) for p in patterns):
+        return False
+    om = (m.get("architecture") or {}).get("output_modalities")
+    return om is None or DECISION_MODALITY in om
+
+
+def extract_decisions(payload, backend: dict) -> set[str]:
+    """Ids in a `/v1/models` payload that are decision models (is_decision_entry)."""
+    patterns = parse_model_filter(backend.get("decision_models"))
+    if not patterns:
+        return set()
+    data = payload["data"] if isinstance(payload, dict) else payload
+    return {m["id"] for m in data or [] if is_decision_entry(m, patterns)}
+
+
+def decision_url(backend: dict, model: str, llamaswap: bool) -> str:
+    """Where a decision call for `model` goes on this backend.
+
+    - llama-swap (`/running` answered): `/upstream/<model>/v1/systemone` — its proxy
+      routes only the OpenAI paths by the body's `model`; anything else needs the
+      upstream prefix (what Anima-Versa called directly before the hub served it);
+    - a cloud backend: OpenRouter's Decisions API `/alpha/decisions`, which takes the
+      full id (`typesafe/jev-1.14`) and the same body. Chosen over its `/v1/systemone`
+      because it is the one measured: 1,284 calls without an error (2026-10-18);
+    - any other LAN server: `/v1/systemone` itself."""
+    url = backend["url"]
+    if llamaswap:
+        return f"{url}/upstream/{quote(model, safe='/')}{DECISION_PATH}"
+    if not is_lan_url(url):
+        return f"{url}/alpha/decisions"
+    return f"{url}{DECISION_PATH}"
+
+
 # ── Adapter contracts ─────────────────────────────────────────────────────────
 
 @dataclass
@@ -390,6 +442,7 @@ class Capabilities:
     pricing: dict[str, dict[str, float]]
     loras: set = field(default_factory=set)         # ComfyUI: installed LoRA filenames
     context: dict = field(default_factory=dict)     # model → context window (tokens), where the listing says
+    decisions: set = field(default_factory=set)     # the decision models among `models` (DECISION_PATH only)
     # llama-swap `/running` as parse_running() reads it; None = the backend has no such
     # endpoint (vLLM, OpenRouter, LocalAI), which is what makes `current` unroutable there.
     running: Optional[list] = None
@@ -620,6 +673,9 @@ class AdapterContext:
     runpod_probe_save: Callable[[str, dict], None] = lambda name, rec: None
     # Live account key fallback so backends without their own key survive hot reload.
     runpod_account_key: Callable[[], str] = lambda: ""
+    # Does this backend (bid) answer llama-swap's `/running`? Picks the decision URL
+    # (decision_url). Default False keeps non-main constructions valid.
+    is_llamaswap: Callable[[str], bool] = lambda bid: False
 
 
 @asynccontextmanager
@@ -1116,10 +1172,46 @@ class OpenAIAdapter(BackendAdapter):
         resp.raise_for_status()
         payload = resp.json()
         context = extract_context(payload)
+        pricing = extract_pricing(payload)
+        decisions = extract_decisions(payload, b)
+        extra = await self._decision_listing(client)
+        if extra:
+            decisions |= {m["id"] for m in extra}
+            pricing.update(extract_pricing(extra))
+            context.update(extract_context(extra))
         running = await self.fetch_running(client)
         context.update(await self._llamaswap_context(client, b, running or []))
-        return Capabilities(models=extract_models(payload, b),
-                            pricing=extract_pricing(payload), context=context, running=running)
+        # `| decisions`: `chat_only` must not drop a decision model the listing carried.
+        return Capabilities(models=extract_models(payload, b) | decisions, pricing=pricing,
+                            context=context, running=running, decisions=decisions)
+
+    _decision_cache: Optional[list] = None      # last good decision listing (per instance once set)
+
+    async def _decision_listing(self, client: httpx.AsyncClient) -> list:
+        """A cloud catalog's decision models, which its normal `/v1/models` leaves out
+        (OpenRouter lists them under `?output_modalities=decisions` only). Asked only
+        when the backend names `decision_models` and is no LAN server — a LAN server
+        lists its decision models with the rest, and polls far more often.
+
+        A failed fetch keeps the last good listing: dropping the models on one bad poll
+        would 503 every decision call until the next one, ten minutes later."""
+        b = self.backend
+        patterns = parse_model_filter(b.get("decision_models"))
+        if not patterns or is_lan_url(b.get("url")):
+            return []
+        try:
+            r = await client.get(f"{b['url']}/v1/models",
+                                 params={"output_modalities": DECISION_MODALITY},
+                                 headers=self.ctx.auth_headers(b), timeout=_DISCOVERY_TIMEOUT)
+            r.raise_for_status()
+            payload = r.json()
+            data = payload["data"] if isinstance(payload, dict) else payload
+            self._decision_cache = [m for m in data or []
+                                    if isinstance(m, dict) and is_decision_entry(m, patterns)]
+        except Exception as e:
+            logger.warning(f"[{self.name}] decision model listing failed: "
+                           f"{type(e).__name__}: {e} — keeping the last one")
+        return self._decision_cache or []
 
     async def fetch_running(self, client: httpx.AsyncClient,
                             timeout: float = _DISCOVERY_TIMEOUT) -> Optional[list]:
@@ -1170,6 +1262,10 @@ class OpenAIAdapter(BackendAdapter):
         if req.path.startswith("/v1/messages"):
             return await self._dispatch_messages(req)
         call = self._prepare(req)                 # claims the in-flight slot
+        if req.path == DECISION_PATH:
+            call.url = decision_url(self.backend, call.real_model or "",
+                                    self.ctx.is_llamaswap(self.bid))
+            return await self._dispatch_once(req, call, timeout=_DECISION_TIMEOUT)
         if req.body.get("stream"):
             return await self._dispatch_stream(req, call)
         return await self._dispatch_once(req, call)
@@ -1284,9 +1380,14 @@ class OpenAIAdapter(BackendAdapter):
         it from the backend actually serving the call. Text endpoints only:
         embeddings have no sampling and /v1/audio is a binary passthrough.
 
-        Overridden by adapters that must forward the client's body verbatim."""
+        Overridden by adapters that must forward the client's body verbatim.
+
+        A decision call goes out as the client sent it (bar the `_` keys): no sampling,
+        no reasoning — the state it carries must reach the model unchanged."""
         b = self.backend
         fwd = {k: v for k, v in req.body.items() if not k.startswith("_")}
+        if req.path == DECISION_PATH:
+            return fwd, None
         sd = b.get("sampling_defaults")
         if sd and not (req.path.startswith("/v1/embeddings") or req.path.startswith("/v1/audio/")):
             if isinstance(sd, dict):
@@ -1435,12 +1536,13 @@ class OpenAIAdapter(BackendAdapter):
         return StreamingResponse(_StreamBody(generate(), end), media_type="text/event-stream",
                                  headers=call.rheaders)
 
-    async def _dispatch_once(self, req: NormalizedRequest, call: _Call) -> Response:
+    async def _dispatch_once(self, req: NormalizedRequest, call: _Call,
+                             timeout: httpx.Timeout = _CHAT_TIMEOUT) -> Response:
         try:
             payload = self._encode(call, call.fwd)
             async with _pooled_client(self.ctx) as client:
                 resp = await client.post(call.url, content=payload,
-                                         headers=call.headers, timeout=_CHAT_TIMEOUT)
+                                         headers=call.headers, timeout=timeout)
         finally:
             self._finish(call)
         # Parse ONCE (usage → tokens/cost); the body itself passes through as the

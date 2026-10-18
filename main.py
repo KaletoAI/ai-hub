@@ -292,6 +292,9 @@ backend_healthy: dict[str, bool] = {}                          # name → bool
 backend_error: dict[str, dict] = {}                            # bid → why discovery failed (see _classify_error)
 backend_pricing: dict[str, dict[str, dict[str, float]]] = {}   # name → {model_id → {input, output[, cache_read, cache_write]}}
 backend_loras: dict[str, set[str]] = {}                        # id → {lora filename, ...} (ComfyUI)
+# id → the decision models among backend_models (adapters.extract_decisions) — they serve
+# POST /v1/systemone only (serves_model). Kept, like backend_models, while a backend is down.
+backend_decisions: dict[str, set[str]] = {}
 # bid → (kept, total) of the last discovery poll, when the backend carries an
 # allow/deny model filter. A whitelist typo would otherwise leave the backend healthy
 # and serving 0 models with nothing anywhere saying why — so the counts are reported.
@@ -878,6 +881,8 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
         backend_models[bid] = caps.models
         backend_pricing[bid] = caps.pricing
         backend_loras[bid] = getattr(caps, "loras", set()) or set()
+        # After filter/extras: a decision model the whitelist dropped is not served at all.
+        backend_decisions[bid] = (getattr(caps, "decisions", set()) or set()) & caps.models
         learned = merge_learned_context(backend_context.get(bid), getattr(caps, "context", None))
         if learned != backend_context.get(bid, {}):
             backend_context[bid] = learned
@@ -1071,6 +1076,7 @@ def reload_config() -> None:
         backend_models.pop(stale, None)
         backend_pricing.pop(stale, None)
         backend_loras.pop(stale, None)
+        backend_decisions.pop(stale, None)
         backend_model_counts.pop(stale, None)
         backend_inflight.pop(stale, None)
         logger.info(f"  removed backend [{stale}] — state cleared")
@@ -1806,6 +1812,52 @@ def serves_path(backend: dict, path: str) -> bool:
     return True
 
 
+def is_decision_model(backend: dict, real: Optional[str]) -> bool:
+    return real in backend_decisions.get(backend_id(backend), ())
+
+
+def serves_model(backend: dict, real: Optional[str], path: str) -> bool:
+    """May `real` on this backend serve `path`? A decision model answers POST
+    /v1/systemone only, and only a decision model answers it: a chat body sent to a
+    decision model (or a decision body to a chat model) is an upstream 400 at best —
+    on OpenRouter a paid one. Checked per candidate next to serves_path, so an alias
+    mixing both kinds routes each endpoint to its own kind."""
+    return is_decision_model(backend, real) == (path == adapters.DECISION_PATH)
+
+
+def _name_candidates(alias: str) -> list:
+    """Every (backend, real_model) that OWNS the name `alias`, health and busy state
+    left out — for explaining a refusal, never for routing. A '<backend>/<model>' pin
+    is resolved the way `resolve_routes` resolves it, against `_llm_backends`: the
+    index holds aliases and BARE model ids only (`rebuild_route_index`)."""
+    bname, bare = split_backend_prefix(alias)
+    if bname is not None:
+        b = next((b for b in _llm_backends if b["name"] == bname), None)
+        if b is None:
+            return []
+        real = resolve_for_backend(bare, bname)
+        # A model that backend never listed is not an endpoint mistake — leave it 503.
+        return [(b, real)] if real is not None and real in _llm_models(b) else []
+    return list(_route_index.get(alias) or ())
+
+
+def decision_refusal(alias: str, path: str) -> Optional[HTTPException]:
+    """The 404 for a name that exists, but only as the other kind (see serves_model):
+    "no healthy backend" would send the caller hunting an outage that is not there.
+    None when some owner of the name is the right kind (then it is down or busy)."""
+    cands = _name_candidates(alias)
+    if not cands or any(_is_current(b, real) for b, real in cands):
+        return None                    # `current`: its kind changes with every swap
+    on_decision = path == adapters.DECISION_PATH
+    if any(is_decision_model(b, real) == on_decision for b, real in cands):
+        return None
+    if on_decision:
+        return HTTPException(404, f"model '{alias}' is not a decision model — "
+                                  f"POST {adapters.DECISION_PATH} serves decision models only")
+    return HTTPException(404, f"model '{alias}' is a decision model — "
+                              f"reachable through POST {adapters.DECISION_PATH} only")
+
+
 def anthropic_only_candidates(alias: str) -> bool:
     """Is every backend that could serve `alias` an Anthropic one?
 
@@ -1815,22 +1867,12 @@ def anthropic_only_candidates(alias: str) -> bool:
     backend". Health and busy state are deliberately not consulted — the answer is
     about who OWNS the name, not who is up.
 
-    A '<backend>/<model>' pin is resolved the same way `resolve_routes` resolves it,
-    against `_llm_backends` — reading `_route_index` cannot work here: the index holds
+    A '<backend>/<model>' pin is resolved the same way `resolve_routes` resolves it
+    (`_name_candidates`) — reading `_route_index` alone cannot work here: the index holds
     aliases and BARE model ids only (`rebuild_route_index`), so every pinned name came
     back with no candidates and fell through to the generic 503.
     """
-    bname, bare = split_backend_prefix(alias)
-    if bname is not None:
-        b = next((b for b in _llm_backends if b["name"] == bname), None)
-        if b is None:
-            return False
-        real = resolve_for_backend(bare, bname)
-        # A model that backend never listed is not an endpoint mistake — leave it 503.
-        if real is None or real not in _llm_models(b):
-            return False
-        return b.get("type") == "anthropic"
-    cands = _route_index.get(alias) or []
+    cands = _name_candidates(alias)
     return bool(cands) and all(b.get("type") == "anthropic" for b, _ in cands)
 
 
@@ -1858,7 +1900,7 @@ def resolve_routes(alias: str, path: str = "/v1/chat/completions") -> tuple[list
         real = resolve_for_backend(bare, bname)
         if _is_current(b, real):
             real = _current_model(b, path)
-        if real is None or real not in _llm_models(b):
+        if real is None or real not in _llm_models(b) or not serves_model(b, real, path):
             return [], []
         return ([], [(b, real)]) if backend_busy(b) else ([(b, real)], [])
 
@@ -1872,6 +1914,8 @@ def resolve_routes(alias: str, path: str = "/v1/chat/completions") -> tuple[list
             real = _current_model(b, path)
             if real is None:              # nothing suitable loaded → not a candidate (never load one)
                 continue
+        if not serves_model(b, real, path):
+            continue
         (busy if backend_busy(b) else ready).append((b, real))
     if len(ready) > 1:
         # Unified scheduling (spec 2026-09-01): unpaid before paid, then fastest
@@ -2422,6 +2466,7 @@ adapter_ctx = AdapterContext(
         if store.is_active() else None,
     runpod_probe_save=_runpod_probe_save,
     runpod_account_key=lambda: provider_token("runpod"),
+    is_llamaswap=lambda bid: bid in backend_running,
 )
 
 
@@ -2484,7 +2529,7 @@ async def _dispatch_or_park(alias, path, body, request, stats_endpoint=None, dea
         if not path.startswith("/v1/messages") and anthropic_only_candidates(alias):
             raise HTTPException(404, f"model '{alias}' is served by an Anthropic backend — "
                                      "reachable through POST /v1/messages only")
-        raise _nothing_loaded_error(alias, path) or HTTPException(503, f"No healthy backend for model '{alias}'")
+        raise decision_refusal(alias, path) or _nothing_loaded_error(alias, path) or HTTPException(503, f"No healthy backend for model '{alias}'")
     if deadline is None:
         ptime = _park_time_for(alias)
         if ptime <= 0:                                 # parking disabled for this alias → 503 now
@@ -2823,7 +2868,7 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
 
     # CHAT/LLM catalog = LLM backends only (ComfyUI "models" are checkpoints, not
     # chat-callable). Names are unique within the LLM type, so the prefix is unambiguous.
-    if typ in ("", "chat", "tts", "embedding"):
+    if typ in ("", "chat", "tts", "embedding", "decision"):
         offered = [b for b in enabled_backends()
                    if _is_llm(b) and not is_draining(b) and backend_healthy.get(backend_id(b))]
         for backend in offered:                   # comfy / draining / down → not offered
@@ -2831,7 +2876,11 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
             expose_bare = backend.get("local", False)
             catalogs = getattr(backend_adapters.get(backend_id(backend)), "model_catalogs", {})
             for mid in sorted(_llm_models(backend)):
-                if typ:
+                # Decision models answer /v1/systemone only (serves_model): never "chat".
+                dec = is_decision_model(backend, mid)
+                if (typ == "decision" and not dec) or (typ == "chat" and dec):
+                    continue
+                if typ and typ != "decision":
                     if backend.get("type") == "nanogpt":
                         key = {"chat": "text", "tts": "tts", "embedding": "embedding"}[typ]
                         known = any(mid in catalog for catalog in catalogs.values())
@@ -2862,8 +2911,12 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
             if typ in ("", "chat") and _is_current(backend, adapters.CURRENT_MODEL) and cur not in seen and visible({cur, bname}):
                 seen.add(cur)
                 data.append({"id": cur, "object": "model", "created": now, "owned_by": bname})
-        # Virtual chat aliases are cross-backend → always listed bare (no prefix).
-        for alias in virtual_models if typ in ("", "chat") else ():
+        # Virtual chat aliases are cross-backend → always listed bare (no prefix). One
+        # that maps a decision model is listed as that kind (its /v1/systemone route).
+        for alias in virtual_models if typ in ("", "chat", "decision") else ():
+            if typ and (typ == "decision") != any(is_decision_model(b, real)
+                                                  for b, real in _route_index.get(alias, ())):
+                continue
             if alias not in seen and visible({alias}):
                 seen.add(alias)
                 data.append(_with_context(
@@ -3233,6 +3286,32 @@ async def audio_speech(request: Request, authorization: Optional[str] = Header(N
     # blobs for non-text responses. Extra fields (`voice`, `params.ref_text`, …)
     # are forwarded verbatim; a per-alias voice default may fill them in.
     return await route("/v1/audio/speech", request, authorization)
+
+
+# A decision call parks at most this long: its caller (Anima-Versa) waits 2-6 s and
+# falls back without a model, so a clear 503 beats an answer that arrives after it left.
+_DECISION_PARK_S = 2.0
+
+
+@app.post(adapters.DECISION_PATH)
+async def systemone(request: Request, authorization: Optional[str] = Header(None)):
+    """Decision models (System One): `{model, state, questions}` → per question a
+    probability distribution over its options. Routed like chat by body["model"] —
+    allow-list, quota, failover and the call log with OpenRouter's `usage.cost` — but
+    only to decision models (serves_model), and forwarded as sent: no alias sampling,
+    no reasoning, no stream."""
+    try:
+        body = await request.json()
+    except ValueError:
+        raise HTTPException(400, "request body is not valid JSON")
+    if not isinstance(body, dict) or not isinstance(body.get("model"), str) or not body["model"]:
+        raise HTTPException(400, "a JSON object with a 'model' string is required")
+    alias = body["model"]
+    await gate_request(authorization, request, alias)
+    body.pop("stream", None)
+    ptime = _park_time_for(alias)
+    deadline = time.monotonic() + min(ptime, _DECISION_PARK_S) if ptime > 0 else None
+    return await _dispatch_or_park(alias, adapters.DECISION_PATH, body, request, deadline=deadline)
 
 
 # ── Generation (image / video / TTS) ───────────────────────────────────────────
@@ -5741,6 +5820,7 @@ def gateway_info() -> dict:
             "models_allow": ", ".join(adapters.parse_model_filter(b.get("models_allow"))),
             "models_deny": ", ".join(adapters.parse_model_filter(b.get("models_deny"))),
             "models_extra": ", ".join(adapters.parse_model_filter(b.get("models_extra"))),
+            "decision_models": ", ".join(adapters.parse_model_filter(b.get("decision_models"))),
             "host": backend_hosts.get(backend_id(b), ""),
             "host_explicit": bool((b.get("host") or "").strip()),
             "source": "config" if backend_id(b) in config_ids else "ui",
@@ -5748,7 +5828,7 @@ def gateway_info() -> dict:
         } for b in backends],
         "virtual_models": list(virtual_models.keys()),
         "endpoints": ["/v1/chat/completions", "/v1/completions", "/v1/embeddings",
-                      "/v1/responses", "/v1/models", "/v1/generations", "/v1/jobs/{id}"],
+                      "/v1/responses", adapters.DECISION_PATH, "/v1/models", "/v1/generations", "/v1/jobs/{id}"],
     }
 
 

@@ -166,6 +166,10 @@ backends:
   #   chat_only: true                   # drop image/audio-output-only models
   #   serverless_only: false            # keep :free models; true = paid-only
   #                                     # (paid models need account credits, else HTTP 402)
+  #   decision_models: "typesafe/jev-1.14"  # decision models (POST /v1/systemone only),
+  #                                     # globs; OpenRouter lists them separately and is
+  #                                     # called through its Decisions API. On a llama-swap
+  #                                     # backend: e.g. "laya, openjev-4b".
 
   # ArliAI Core: two protocols, one conservative shared account slot.
   # Same provider API key on both; subscription pricing is not per-token billing.
