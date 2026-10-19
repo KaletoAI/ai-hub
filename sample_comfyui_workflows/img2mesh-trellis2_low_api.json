@@ -10,20 +10,11 @@
   },
   "58": {
     "inputs": {
-      "image": "0 (1).png"
+      "image": "0.png"
     },
     "class_type": "Trellis2LoadImageWithTransparency",
     "_meta": {
       "title": "input_image"
-    }
-  },
-  "61": {
-    "inputs": {
-      "value": false
-    },
-    "class_type": "PrimitiveBoolean",
-    "_meta": {
-      "title": "input_remove_background"
     }
   },
   "62": {
@@ -276,14 +267,11 @@
   "83": {
     "inputs": {
       "padding": 25,
-      "remove_background": [
-        "61",
-        0
-      ],
+      "remove_background": false,
       "max_size": 2048,
       "image": [
-        "58",
-        2
+        "109",
+        0
       ]
     },
     "class_type": "Trellis2PreProcessImage",
@@ -449,6 +437,24 @@
     "class_type": "DownloadAndLoadStableXModel",
     "_meta": {
       "title": "(Down)load StableX Model"
+    }
+  },
+  "109": {
+    "inputs": {
+      "rem_mode": "BEN2",
+      "image_output": "Preview",
+      "save_prefix": "ComfyUI",
+      "torchscript_jit": false,
+      "add_background": "none",
+      "refine_foreground": false,
+      "images": [
+        "58",
+        2
+      ]
+    },
+    "class_type": "easy imageRemBg",
+    "_meta": {
+      "title": "Image Remove Bg"
     }
   }
 }
