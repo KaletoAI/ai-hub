@@ -408,5 +408,21 @@ class VeniceSchemaTests(unittest.TestCase):
                 venice.build_request(cand, {"prompt": "hello"}, {})
 
 
+class VeniceMalformedMetadataTests(unittest.TestCase):
+    """Vendor metadata that breaks a constraint read must be a VeniceInput (400 before
+    the paid POST), never a TypeError/ZeroDivisionError the preflight lets through (500)."""
+
+    def test_broken_constraints_refuse_as_input_errors(self):
+        for constraints in ({"steps": ["not", "a", "dict"]}, {"maxInputImages": "many"},
+                            {"widthHeightDivisor": None}, {"widthHeightDivisor": 0}):
+            with self.subTest(constraints=constraints):
+                cand = candidate("images", {"constraints": constraints})
+                try:
+                    venice.validate_request(cand, {"prompt": "a tree", "width": 512, "height": 512},
+                                            [], [])
+                except venice.VeniceInput:
+                    pass
+
+
 if __name__ == "__main__":
     unittest.main()

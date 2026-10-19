@@ -44,7 +44,7 @@ from urllib.parse import quote, urljoin, urlsplit
 import httpx
 
 import scheduler
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 import anthropic_bridge
@@ -4864,6 +4864,18 @@ class NanoGPTAdapter(BackendAdapter):
 
 # ── Venice composite text / media account ────────────────────────────────────
 
+_VENICE_HICCUP_S = 1.0     # least pause after a failed (free) retrieve before the next one
+# Download labels that say nothing about the bytes (S3's default is binary/octet-stream).
+_GENERIC_MIMES = frozenset(("", "application/octet-stream", "binary/octet-stream",
+                            "application/binary", "application/download"))
+_AUDIO_EXT_MIME = {"wav": "audio/wav", "flac": "audio/flac", "ogg": "audio/ogg",
+                   "opus": "audio/opus", "aac": "audio/aac", "mp3": "audio/mpeg",
+                   "pcm": "audio/pcm"}
+
+
+class _VeniceVerdict(RuntimeError):
+    """A retrieve answer that is a verdict about the queue item — never re-fetched."""
+
 class VeniceMediaAdapter(CloudTaskAdapter):
     """Venice's paid media seam. A submitted request is NEVER failover-class.
 
@@ -4930,8 +4942,26 @@ class VeniceMediaAdapter(CloudTaskAdapter):
         return url
 
     async def _asset(self, client, url: str):
-        """No account auth/cookies on ANY asset hop, including injected clients."""
+        """No account auth/cookies on ANY asset hop, including injected clients.
+
+        The GET of a finished, paid result is free and idempotent: a dropped transfer
+        or a 5xx is retried like CloudTaskAdapter._download (CDNs cut bodies, measured
+        2026-10-15); a 4xx or an unsafe redirect is final at once."""
         url = self._download_url(url)
+        for attempt in range(_CLOUD_DOWNLOAD_ATTEMPTS):
+            last = attempt == _CLOUD_DOWNLOAD_ATTEMPTS - 1
+            try:
+                response = await self._asset_once(client, url)
+            except httpx.TransportError:
+                if last:
+                    raise
+            else:
+                if response.status_code < 500 or last:
+                    self._check_response(response, "artifact download")
+                    return response
+            await asyncio.sleep(_CLOUD_DOWNLOAD_BACKOFF_S * 2 ** attempt)
+
+    async def _asset_once(self, client, url: str):
         for _ in range(6):
             request = client.build_request("GET", url, timeout=_CLOUD_DOWNLOAD_TIMEOUT)
             for key in ("authorization", "x-api-key", "cookie", "proxy-authorization"):
@@ -4943,7 +4973,6 @@ class VeniceMediaAdapter(CloudTaskAdapter):
                     raise RuntimeError("Venice artifact redirect has no location")
                 url = self._download_url(urljoin(url, location))
                 continue
-            self._check_response(response, "artifact download")
             return response
         raise RuntimeError("Venice artifact download redirected too many times")
 
@@ -5004,55 +5033,70 @@ class VeniceMediaAdapter(CloudTaskAdapter):
         if endpoint in VeniceMediaAdapter._IMAGE_ENDPOINTS:
             blob = NanoGPTMediaAdapter._image_blob(data, 1)
             return blob
+        # The CONTENT decides, the declared type only refuses: CDNs label the same file
+        # `binary/octet-stream`, nothing at all, or a sibling type (video/quicktime,
+        # audio/x-flac), and a correct, paid file must not fail on its label. A declared
+        # type of the wrong family (text/html error page, application/pdf) still refuses.
+        generic = mime in _GENERIC_MIMES
         if endpoint == "video":
-            if (mime not in ("video/mp4", "application/octet-stream")
+            if ((not generic and not mime.startswith("video/"))
                     or VeniceMediaAdapter._iso_kind(data) != "video"):
                 raise RuntimeError("Venice returned an invalid MP4 video artifact")
+            if mime == "video/quicktime":
+                return GenBlob(data=data, mime=mime, kind="video", name="video.mov")
             return GenBlob(data=data, mime="video/mp4", kind="video", name="video.mp4")
-        if mime in ("audio/mp4", "audio/x-m4a", "audio/m4a") or (
-                mime == "application/octet-stream" and data[4:8] == b"ftyp"):
+        if not generic and not mime.startswith("audio/"):
+            raise RuntimeError("Venice returned an invalid audio artifact")
+        if data[4:8] == b"ftyp":
             if VeniceMediaAdapter._iso_kind(data) != "audio":
                 raise RuntimeError("Venice returned video for an audio job")
-            return GenBlob(data=data, mime=("audio/mp4" if mime == "application/octet-stream" else mime),
-                           kind="audio", name="audio.m4a")
-        if mime == "application/octet-stream":
-            # A generic download type still needs a recognizable audio signature.
-            if data[:4] == b"RIFF" and data[8:12] == b"WAVE":
-                mime = "audio/wav"
-            elif data.startswith(b"fLaC"):
-                mime = "audio/flac"
-            elif data.startswith(b"OggS"):
-                mime = "audio/ogg"
-            elif len(data) > 1 and data[0] == 255 and data[1] & 0xF6 == 0xF0:
-                mime = "audio/aac"
-            elif data.startswith(b"ID3") or (len(data) > 1 and data[0] == 255 and data[1] & 224 == 224):
-                mime = "audio/mpeg"
-        formats = {
-            "audio/mpeg": ("mp3", data.startswith(b"ID3") or
-                           (len(data) > 1 and data[0] == 255 and data[1] & 224 == 224)),
-            "audio/mp3": ("mp3", data.startswith(b"ID3") or
-                          (len(data) > 1 and data[0] == 255 and data[1] & 224 == 224)),
-            "audio/wav": ("wav", data[:4] == b"RIFF" and data[8:12] == b"WAVE"),
-            "audio/x-wav": ("wav", data[:4] == b"RIFF" and data[8:12] == b"WAVE"),
-            "audio/flac": ("flac", data.startswith(b"fLaC")),
-            "audio/ogg": ("ogg", data.startswith(b"OggS")),
-            "audio/opus": ("opus", data.startswith(b"OggS")),
-            "audio/aac": ("aac", len(data) > 1 and data[0] == 255 and data[1] & 240 == 240),
-            "audio/pcm": ("pcm", requested_format == "pcm" and len(data) % 2 == 0),
-        }
-        ext, valid = formats.get(mime, ("", False))
-        if not valid:
+            return GenBlob(data=data, mime=(mime if mime in ("audio/mp4", "audio/x-m4a", "audio/m4a")
+                                            else "audio/mp4"), kind="audio", name="audio.m4a")
+        if requested_format == "pcm" and (generic or mime in ("audio/pcm", "audio/l16")):
+            # Raw PCM has no signature (its first bytes can even look like an MP3 sync).
+            ext = "pcm" if data and len(data) % 2 == 0 else None
+        else:
+            ext = VeniceMediaAdapter._sniff_audio(data, requested_format)
+        if ext is None:
             raise RuntimeError("Venice returned an invalid audio artifact")
-        if ext == "wav":
-            import wave
-            from io import BytesIO
-            with wave.open(BytesIO(data), "rb") as audio:
-                frames = audio.getnframes()
-                if (not frames or len(audio.readframes(frames)) !=
-                        frames * audio.getnchannels() * audio.getsampwidth()):
-                    raise RuntimeError("Venice returned a truncated WAV artifact")
-        return GenBlob(data=data, mime=("audio/mpeg" if ext == "mp3" else mime),
-                       kind="audio", name=f"audio.{ext}")
+        if ext == "wav" and not VeniceMediaAdapter._wav_complete(data):
+            raise RuntimeError("Venice returned a truncated WAV artifact")
+        return GenBlob(data=data, mime=_AUDIO_EXT_MIME[ext], kind="audio", name=f"audio.{ext}")
+
+    @staticmethod
+    def _sniff_audio(data: bytes, requested_format: Optional[str] = None) -> Optional[str]:
+        if data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+            return "wav"
+        if data.startswith(b"fLaC"):
+            return "flac"
+        if data.startswith(b"OggS"):
+            return "opus" if requested_format == "opus" else "ogg"
+        if len(data) > 1 and data[0] == 255 and data[1] & 0xF6 == 0xF0:
+            return "aac"                                   # ADTS: sync + layer bits 00
+        if data.startswith(b"ID3") or (len(data) > 1 and data[0] == 255 and data[1] & 224 == 224):
+            return "mp3"
+        return None
+
+    @staticmethod
+    def _wav_complete(data: bytes) -> bool:
+        """A `fmt ` chunk and a `data` chunk the file actually holds. Any codec (float
+        WAV too); a streaming writer's placeholder size (0 / 0xFFFFFFFF / 0x7FFFFFFF) is
+        accepted when bytes follow — only a REAL declared size larger than the file is
+        a cut-off body."""
+        offset, fmt = 12, False
+        while offset + 8 <= len(data):
+            kind = data[offset:offset + 4]
+            size = int.from_bytes(data[offset + 4:offset + 8], "little")
+            body = offset + 8
+            if kind == b"data":
+                remaining = len(data) - body
+                if not fmt or remaining <= 0:
+                    return False
+                return size in (0, 0xFFFFFFFF, 0x7FFFFFFF) or 0 < size <= remaining
+            if kind == b"fmt ":
+                fmt = size >= 16 and body + size <= len(data)
+            offset = body + size + (size & 1)
+        return False
 
     async def _sync_blobs(self, response, endpoint: str, body: dict) -> list[GenBlob]:
         mime = response.headers.get("content-type", "").split(";", 1)[0].lower()
@@ -5087,40 +5131,96 @@ class VeniceMediaAdapter(CloudTaskAdapter):
 
     async def _retrieve(self, client, req: NormalizedRequest, endpoint: str,
                         queued: dict, max_wait: float, interval: float) -> list[GenBlob]:
+        # The job is paid; retrieve and the artifact GET are free and repeatable until
+        # `/complete`. So a 429/5xx/transport hiccup, a malformed body, a JSON COMPLETED
+        # that carries no URL yet, or an artifact that fails validation (cut-off body) is
+        # polled again until max_wait — one hiccup in a 30-minute video must not discard
+        # it. Only three 4xx / error bodies in a row are a verdict about the queue item
+        # (same rule as CloudTaskAdapter._poll), and a failed/unknown status is final.
         prefix = self._ASYNC_PATHS[endpoint]
         identity = {"model": queued["model"], "queue_id": queued["queue_id"]}
         deadline = time.monotonic() + max_wait
+        verdicts = bad_artifacts = 0
+        last = "no answer"
+
+        async def pause(seconds: float) -> None:
+            await asyncio.sleep(max(0.0, min(seconds, deadline - time.monotonic())))
+
         while time.monotonic() < deadline:
-            response = await self._post(client, prefix + "/retrieve", identity,
-                                        max(0.1, deadline - time.monotonic()))
-            self._check_response(response, "retrieve")
+            try:
+                response = await self._post(client, prefix + "/retrieve", identity,
+                                            max(0.1, deadline - time.monotonic()))
+            except httpx.HTTPError as error:
+                last = type(error).__name__
+                await pause(max(interval, _VENICE_HICCUP_S))
+                continue
+            if 400 <= response.status_code < 500 and response.status_code != 429:
+                verdicts += 1
+                if verdicts >= 3:
+                    self._check_response(response, "retrieve")
+                last = f"HTTP {response.status_code}"
+                await pause(max(interval, _VENICE_HICCUP_S))
+                continue
+            if not 200 <= response.status_code < 300:
+                last = f"HTTP {response.status_code}"
+                await pause(max(interval, _VENICE_HICCUP_S))
+                continue
             mime = response.headers.get("content-type", "").split(";", 1)[0].lower()
-            if mime != "application/json":
-                blobs = [await asyncio.to_thread(self._binary_blob, response.content, mime, endpoint)]
-                break
-            status = await asyncio.to_thread(response.json)
-            if not isinstance(status, dict) or status.get("error"):
-                raise RuntimeError("Venice queue retrieval failed")
-            state = str(status.get("status") or "").upper()
-            if state == "COMPLETED":
-                url = queued.get("download_url") or status.get("download_url") or status.get("url")
-                if not url:
-                    raise RuntimeError("Venice completed queue has no download URL")
-                if req.cloud_trace.get("download_url") != url:
-                    req.cloud_trace["download_url"] = url
-                    self._persist(req)
-                asset = await self._asset(client, url)
-                blobs = [await asyncio.to_thread(self._binary_blob, asset.content,
-                    asset.headers.get("content-type", ""), endpoint)]
-                break
-            if state not in ("PROCESSING", "QUEUED", "PENDING"):
-                raise RuntimeError("Venice returned an unknown or failed queue status")
+            try:
+                if mime != "application/json":
+                    blobs = [await asyncio.to_thread(self._binary_blob, response.content, mime, endpoint)]
+                    break
+                try:
+                    status = await asyncio.to_thread(response.json)
+                except ValueError:
+                    status = None
+                if not isinstance(status, dict):
+                    last = "malformed retrieve body"
+                    await pause(max(interval, _VENICE_HICCUP_S))
+                    continue
+                if status.get("error"):
+                    verdicts += 1
+                    if verdicts >= 3:
+                        raise _VeniceVerdict("Venice queue retrieval failed")
+                    last = "error body"
+                    await pause(max(interval, _VENICE_HICCUP_S))
+                    continue
+                verdicts = 0
+                state = str(status.get("status") or "").upper()
+                if state == "COMPLETED":
+                    url = queued.get("download_url") or status.get("download_url") or status.get("url")
+                    if not url:
+                        # Public models deliver the bytes on a later retrieve, not a URL.
+                        last = "completed without a download URL yet"
+                        await pause(interval)
+                        continue
+                    if req.cloud_trace.get("download_url") != url:
+                        req.cloud_trace["download_url"] = url
+                        self._persist(req)
+                    asset = await self._asset(client, url)
+                    blobs = [await asyncio.to_thread(self._binary_blob, asset.content,
+                        asset.headers.get("content-type", ""), endpoint)]
+                    break
+                if state not in ("PROCESSING", "QUEUED", "PENDING"):
+                    raise _VeniceVerdict("Venice returned an unknown or failed queue status")
+            except _VeniceVerdict:
+                raise
+            except (RuntimeError, httpx.TransportError) as error:
+                # An artifact that failed validation or a download that broke after its
+                # retries: the queue still holds it — fetch it again, a bounded number of times.
+                bad_artifacts += 1
+                if bad_artifacts >= _CLOUD_DOWNLOAD_ATTEMPTS:
+                    raise
+                last = str(error) or type(error).__name__
+                await pause(max(interval, _VENICE_HICCUP_S))
+                continue
             if req.job_id:
                 self.ctx.note_progress(req.job_id, {"basis": "live", "backend": self.name,
                                                    "status": state.lower()})
-            await asyncio.sleep(interval)
+            await pause(interval)
         else:
-            raise RuntimeError("Venice queue did not finish within max_wait; it may still be running")
+            raise RuntimeError(f"Venice queue did not finish within max_wait (last: {last}); "
+                               "it may still be running")
         # This is deletion, NOT cancellation. Failed/cancelled/download-lost jobs
         # retain their queue and URL so the paid result can still be recovered.
         try:
@@ -5178,8 +5278,16 @@ class VeniceMediaAdapter(CloudTaskAdapter):
         try:
             async with _pooled_client(self.ctx) as client:
                 if endpoint == "speech" and audio is not None:
-                    response = await self._post(client, "/v1/audio/voices",
-                                                {"model": req.real_model}, max_wait, audio)
+                    try:
+                        response = await self._post(client, "/v1/audio/voices",
+                                                    {"model": req.real_model}, max_wait, audio)
+                    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
+                        raise                    # nothing was sent: failover is safe
+                    except (httpx.HTTPError, ConnectionError, TimeoutError) as error:
+                        # Sent, answer lost: the voice may exist (and be billed) — a
+                        # retry/failover would upload it again. Final, like an uncertain submit.
+                        raise RuntimeError("Venice voice upload outcome is uncertain; "
+                                           "generation will not be retried") from error
                     self._check_response(response, "voice upload")
                     voice = await asyncio.to_thread(response.json)
                     if (not isinstance(voice, dict) or not isinstance(voice.get("id"), str)
@@ -5427,7 +5535,9 @@ class VeniceAdapter(OpenAIAdapter):
                 "embedding" if req.path.startswith("/v1/embeddings") else "text")
         if (req.real_model not in self.model_catalogs.get(kind, {})
                 and req.real_model not in parse_model_filter(self.backend.get("models_extra"))):
-            raise venice.INPUT_ERROR(f"Venice model is unavailable for {kind}")
+            # The client's mistake (a TTS id on chat, a text id on embeddings, …), not a
+            # backend failure: a deliberate 400, never a 502 + fault row against Venice.
+            raise HTTPException(400, f"Venice model '{req.real_model}' is not a {kind} model")
         return await super().dispatch(req)
 
     async def generate(self, req: NormalizedRequest) -> GenOutput:

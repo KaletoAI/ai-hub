@@ -12,6 +12,7 @@ import wave
 from unittest.mock import AsyncMock
 
 import httpx
+from fastapi import HTTPException
 from PIL import Image
 from starlette.requests import Request
 
@@ -96,6 +97,12 @@ class VeniceAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.binary_image = False
         self.transcript_text = False
         self.cancel_poll = False
+        self.asset_failures = 0
+        self.voice_error = None
+        for name, value in (("_CLOUD_DOWNLOAD_BACKOFF_S", 0), ("_VENICE_HICCUP_S", 0.001)):
+            saved = getattr(adapters, name)
+            setattr(adapters, name, value)
+            self.addCleanup(setattr, adapters, name, saved)
         self.client = httpx.AsyncClient(transport=httpx.MockTransport(self.handle))
         self.ctx = adapters.AdapterContext(
             auth_headers=lambda b: {"Authorization": "Bearer " + b["api_key"]},
@@ -123,6 +130,9 @@ class VeniceAdapterTests(unittest.IsolatedAsyncioTestCase):
         if request.url.host == "assets.test":
             if self.asset_redirect and path.endswith("/redirect"):
                 return httpx.Response(302, headers={"Location": self.asset_redirect})
+            if self.asset_failures:
+                self.asset_failures -= 1
+                return httpx.Response(503)
             return httpx.Response(503 if self.asset_fail else 200, content=self.asset_data,
                                   headers={"Content-Type": self.asset_mime})
         if path.endswith("/api_keys/rate_limits"):
@@ -152,12 +162,16 @@ class VeniceAdapterTests(unittest.IsolatedAsyncioTestCase):
             retrieve = self.retrieve.pop(0) if isinstance(self.retrieve, list) else self.retrieve
             if isinstance(retrieve, Exception):
                 raise retrieve
+            if isinstance(retrieve, httpx.Response):
+                return retrieve
             if retrieve is not None:
                 return httpx.Response(200, json=retrieve)
             if self.inline_video:
                 return httpx.Response(200, content=self.mp4, headers={"Content-Type": "video/mp4"})
             return httpx.Response(200, content=self.audio_data, headers={"Content-Type": self.audio_mime})
         if path.endswith("/voices"):
+            if self.voice_error:
+                raise self.voice_error
             return httpx.Response(200, json={"id": "vv_voice_test", "model": "clone"})
         if self.submit_error:
             raise self.submit_error
@@ -341,8 +355,9 @@ class VeniceAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.requests[-1].url.path, "/api" + path)
         for path, model in (("/v1/chat/completions", "image"),
                             ("/v1/embeddings", "speech"), ("/v1/audio/speech", "chat")):
-            with self.assertRaises(venice.INPUT_ERROR):
+            with self.assertRaises(HTTPException) as refused:
                 await self.ad.dispatch(adapters.NormalizedRequest(path=path, real_model=model))
+            self.assertEqual(refused.exception.status_code, 400)
         self.assertTrue(all(bid == "venice:account" for _, bid in self.slots))
 
     async def test_sync_images_and_binary_operations_deliver_valid_images(self):
@@ -636,6 +651,85 @@ class VeniceAdapterTests(unittest.IsolatedAsyncioTestCase):
         req.upload_images["input_image"] = image.getvalue()
         result = await self.ad.generate(req)
         self.assertEqual(result.blobs[0].data, self.mp4)
+
+    async def test_retrieve_hiccups_and_late_bytes_never_discard_a_paid_queue(self):
+        """One 429/503/dropped poll, a malformed body or a JSON COMPLETED before the bytes
+        used to fail a billed video/music job; retrieve is free, so it is polled again."""
+        self.queue = {"model": "music", "queue_id": "queue-1"}
+        self.retrieve = [httpx.Response(503), httpx.Response(429), httpx.ReadError("dropped"),
+                         httpx.Response(200, text="<html>"), {"status": "COMPLETED"}, None]
+        result = await self.ad.generate(self.req("music", "music"))
+        self.assertEqual(result.blobs[0].data, self.wav)
+        self.assertEqual(len([r for r in self.requests if r.url.path.endswith("/queue")]), 1)
+        self.assertEqual(len([r for r in self.requests if r.url.path.endswith("/retrieve")]), 6)
+        self.assertTrue(self.requests[-1].url.path.endswith("/audio/complete"))
+
+    async def test_three_client_errors_in_a_row_are_a_final_verdict(self):
+        self.queue = {"model": "music", "queue_id": "queue-1"}
+        self.retrieve = [httpx.Response(404), httpx.Response(404), httpx.Response(404), None]
+        with self.assertRaises(RuntimeError):
+            await self.ad.generate(self.req("music", "music"))
+        self.assertEqual(len([r for r in self.requests if r.url.path.endswith("/retrieve")]), 3)
+        self.assertFalse(any(r.url.path.endswith("/complete") for r in self.requests))
+
+    async def test_cut_off_artifact_and_cdn_5xx_are_fetched_again(self):
+        """A CDN 5xx is retried like CloudTaskAdapter._download; bytes that fail validation
+        are fetched again from the queue, and only then is the vendor copy deleted."""
+        self.asset_data, self.asset_mime = self.mp4, "video/mp4"
+        self.asset_failures = 2
+        self.queue["download_url"] = "https://assets.test/private.mp4"
+        self.retrieve = {"status": "COMPLETED"}
+        result = await self.ad.generate(self.req("video", "video", params={"duration": "5s"}))
+        self.assertEqual(result.blobs[0].data, self.mp4)
+        self.assertEqual(len([r for r in self.requests if r.url.host == "assets.test"]), 3)
+        self.requests.clear()
+        self.inline_video = True
+        self.retrieve = [httpx.Response(200, content=self.mp4[:len(self.mp4) // 2],
+                                        headers={"Content-Type": "video/mp4"}), None]
+        result = await self.ad.generate(self.req("video", "video", params={"duration": "5s"}))
+        self.assertEqual(result.blobs[0].data, self.mp4)
+        self.assertTrue(self.requests[-1].url.path.endswith("/video/complete"))
+
+    async def test_content_decides_type_but_foreign_families_still_refuse(self):
+        blob = adapters.VeniceMediaAdapter._binary_blob
+        for mime in ("binary/octet-stream", "", "video/quicktime"):
+            with self.subTest(mime=mime):
+                self.assertEqual(blob(self.mp4, mime, "video").kind, "video")
+        self.assertEqual(blob(self.mp4, "video/quicktime", "video").name, "video.mov")
+        for mime in ("binary/octet-stream", "", "audio/x-wav", "audio/mpeg"):
+            with self.subTest(mime=mime):
+                self.assertEqual((blob(self.wav, mime, "music").mime,
+                                  blob(self.wav, mime, "music").name), ("audio/wav", "audio.wav"))
+        for data, mime, endpoint in ((self.wav, "text/html", "music"),
+                                     (self.mp4, "text/html", "video")):
+            with self.assertRaises(RuntimeError):
+                blob(data, mime, endpoint)
+
+    async def test_streaming_and_float_wav_pass_but_a_cut_wav_does_not(self):
+        blob = adapters.VeniceMediaAdapter._binary_blob
+        fmt_float = (b"fmt " + (16).to_bytes(4, "little") + (3).to_bytes(2, "little")
+                     + (1).to_bytes(2, "little") + (8000).to_bytes(4, "little")
+                     + (32000).to_bytes(4, "little") + (4).to_bytes(2, "little")
+                     + (32).to_bytes(2, "little"))
+        samples = b"\0" * 400
+        streaming = (b"RIFF" + b"\xff" * 4 + b"WAVE" + fmt_float + b"data" + b"\xff" * 4 + samples)
+        self.assertEqual(blob(streaming, "audio/wav", "speech").name, "audio.wav")
+        cut = self.wav[:len(self.wav) // 2]
+        with self.assertRaises(RuntimeError):
+            blob(cut, "audio/wav", "speech")
+
+    async def test_lost_voice_upload_answer_is_final_not_failover(self):
+        """A voice upload that was sent but whose answer was lost may exist (and be
+        billed): a failover-class error here would upload it again on the next attempt."""
+        self.voice_error = httpx.ReadTimeout("lost")
+        req = self.req("speech", "clone", inputs={"prompt": "Hello"},
+                       upload_files={"input_audio": ("reference.wav", self.wav)})
+        with self.assertRaises(RuntimeError) as failed:
+            await self.ad.generate(req)
+        self.assertNotIsInstance(failed.exception, httpx.HTTPError)
+        self.voice_error = httpx.ConnectError("refused")
+        with self.assertRaises(httpx.ConnectError):
+            await self.ad.generate(req)
 
 
 if __name__ == "__main__":

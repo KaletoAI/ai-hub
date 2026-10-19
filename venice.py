@@ -7,6 +7,7 @@ Multipart audio bytes remain in the adapter's upload_files, never in JSON.
 from __future__ import annotations
 
 import base64
+import functools
 import json
 import math
 import mimetypes
@@ -98,6 +99,23 @@ class VeniceInput(RuntimeError):
 
 
 INPUT_ERROR = VeniceInput
+
+
+def _metadata_guard(fn):
+    """The live /models metadata is vendor data: a malformed constraint (a None or 0
+    divisor, a list where a dict belongs, a non-numeric limit) must surface as
+    VeniceInput — a 400 before any paid POST — never as a TypeError the preflight
+    does not catch (a 500)."""
+    @functools.wraps(fn)
+    def guarded(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except VeniceInput:
+            raise
+        except (TypeError, ValueError, ArithmeticError, AttributeError, KeyError, IndexError) as error:
+            raise VeniceInput(f"Venice model metadata or input is malformed "
+                              f"({type(error).__name__}: {error})") from error
+    return guarded
 
 
 def endpoint_of(cand):
@@ -569,7 +587,9 @@ def _values(cand, values):
         body.setdefault("variants", 1)
         if body.get("return_binary") and body["variants"] != 1:
             raise VeniceInput("Venice binary image output supports one variant only")
-        divisor = _constraints(cand).get("widthHeightDivisor", 1)
+        divisor = _constraints(cand).get("widthHeightDivisor")
+        if isinstance(divisor, bool) or not isinstance(divisor, int) or divisor < 1:
+            divisor = 1
         if any(body.get(key, divisor) % divisor for key in ("width", "height")):
             raise VeniceInput("Venice image dimensions must match the model divisor")
     if body.get("transparent_background") and body.get("format" if ep == "images" else "output_format") not in (None, "png", "webp"):
@@ -677,6 +697,7 @@ def _image_reference(value):
         raise VeniceInput("Venice image reference must be base64 or an HTTP(S)/data URL") from exc
 
 
+@_metadata_guard
 def validate_request(cand, values, image_keys, file_keys, model_meta=None):
     if model_meta is not None:
         cand = {**cand, "model_metadata": model_meta}
@@ -764,6 +785,7 @@ def image_constraints(cand):
     return {key: constraints[key] for key in _IMAGE_CONSTRAINTS if constraints.get(key) is not None}
 
 
+@_metadata_guard
 def validate_image_dimensions(cand, dimensions):
     """Validate dimensions supplied by a trusted decoder, never by client controls."""
     limits = image_constraints(cand)
@@ -783,6 +805,7 @@ def validate_image_dimensions(cand, dimensions):
         raise VeniceInput("Venice reference image is outside the model's aspect-ratio bounds")
 
 
+@_metadata_guard
 def build_request(cand, values, images, files=None, image_dimensions=None):
     files = files or {}
     body = validate_request(cand, values, images.keys(), files.keys())

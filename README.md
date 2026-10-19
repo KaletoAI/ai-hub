@@ -203,6 +203,11 @@ A user's allow-list can contain any mix of:
 | **backend name** (`together`) | **all** of that backend's models |
 | model id (`together/llama-3…` or bare) | that specific model |
 | `<backend>/current` | whatever that llama-swap backend has loaded (a backend-name grant covers it too) |
+| `@chat` / `@image` / `@backends` | every chat alias / generation alias / LLM backend, incl. ones added later |
+
+A NanoGPT or Venice account named one by one grants the whole account, paid media
+included. `@backends` covers only its text, TTS and embedding models; paid media
+need `@image`, an alias or the exact id.
 
 An **empty** allow-list = everything allowed (the default). A non-empty list both
 **restricts usage** (a disallowed model → `403`) **and filters `/v1/models`** so

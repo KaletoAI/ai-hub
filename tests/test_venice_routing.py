@@ -88,6 +88,31 @@ class VeniceRouting(_Fixture):
         self.assertEqual(main.resolve_routes("existing-chat")[0][0][1], "chat-model")
         self.assertEqual(store.list_aliases(), {})
 
+    def test_image_shim_count_follows_native_variants(self):
+        """Venice builds the request with `variants` over `n`: every image it bills
+        must reach the caller, whatever `n` the OpenAI shim passed along."""
+        submitted = []
+        def provider(request):
+            body = json.loads(request.content)
+            submitted.append(body)
+            return httpx.Response(200, json={"images": [
+                base64.b64encode(_png()).decode()] * body["variants"]})
+        with self.vendor(provider):
+            response = self.c.post("/v1/images/generations", json={
+                "model": "venice/image-model", "prompt": "blue lamp", "n": 1, "variants": 2,
+                "response_format": "b64_json"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(submitted[0]["variants"], 2)
+        self.assertEqual(len(response.json()["data"]), 2)
+
+    def test_workflow_audio_tasks_share_venice_type_families(self):
+        """`?type=asr|audio` must find a ComfyUI transcription / voice-conversion alias
+        like Venice's — every task containing "audio" used to be `tts`."""
+        for task, kind in (("audio2text", "asr"), ("audio2audio", "audio"),
+                           ("text2audio", "tts"), ("text2img", "image")):
+            with self.subTest(task=task):
+                self.assertEqual(main._generation_type({"backend": "gpu", "task": task}), kind)
+
     def test_openai_image_shim_delivers_bytes_without_invented_workflow_size(self):
         submitted = []
         def provider(request):
@@ -130,6 +155,37 @@ class VeniceRouting(_Fixture):
                 headers={"Authorization": "Bearer image-key"}, json={
                     "model": "image-model", "messages": [{"role": "user", "content": "hello"}]})
         self.assertEqual(response.status_code, 403, response.text)
+
+    def test_all_backends_grant_covers_account_text_but_never_paid_media(self):
+        """`@backends` means all LLM backends: it used to open a composite account's
+        billed video/music too (prefixed id, bare id, /v1/models). Only the account
+        named one by one, `@image`, an alias or the exact id may."""
+        llm_only = {"name": "llm", "role": "user", "models": [main.GRANT_ALL_BACKENDS]}
+        self.assertTrue(main._model_allowed(llm_only, "venice/chat-model", media=False))
+        self.assertTrue(main._model_allowed(llm_only, "chat-model", media=False))
+        for model in ("venice/video-model", "video-model", "venice/chat-model"):
+            with self.subTest(model=model):
+                self.assertFalse(main._model_allowed(llm_only, model, media=True))
+        self.assertFalse(main._model_allowed(llm_only, "venice/music-model"))
+        account = {"name": "acct", "role": "user", "models": ["venice"]}
+        self.assertTrue(main._model_allowed(account, "venice/video-model", media=True))
+        with patch.object(main, "users", [llm_only]), \
+                patch.object(main, "_users_by_key", {"llm-key": llm_only}):
+            listed = {m["id"] for m in self.c.get(
+                "/v1/models", headers={"Authorization": "Bearer llm-key"}).json()["data"]}
+        self.assertIn("venice/chat-model", listed)
+        self.assertNotIn("venice/video-model", listed)
+
+    def test_alias_before_first_catalog_is_retryable_not_a_client_error(self):
+        """A key/URL change starts a fresh adapter with no snapshot: an alias call used
+        to get a 400 "model is unavailable" — blaming the client for gateway state."""
+        import venice
+        store.upsert("clips", [venice.candidate_for("venice", "video-model", "video")])
+        self.ad._publish_catalogs({})
+        response = self.c.post("/v1/generations", json={
+            "model": "clips", "prompt": "moving clouds", "output": {"mode": "sync"}})
+        self.assertEqual(response.status_code, 503, response.text)
+        self.assertIn("retry-after", response.headers)
 
     def test_failed_refresh_keeps_console_inventory_but_no_callable_media(self):
         self.ad._publish_catalogs({})

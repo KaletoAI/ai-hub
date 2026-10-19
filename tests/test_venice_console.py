@@ -3,6 +3,7 @@ paid requests with lost false values, missing uploads or stale catalog availabil
 """
 from html.parser import HTMLParser
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -13,6 +14,7 @@ import httpx
 from tests.test_ui_form_validation import _Fixture
 import admin
 import adapters
+import jobs
 import store
 import venice
 
@@ -92,6 +94,10 @@ class VeniceMedia(_Fixture):
             p = patch.object(admin, name, callback)
             p.start()
             self.addCleanup(p.stop)
+        # The playground reads recent artifacts: never a jobs DB an earlier test deleted.
+        saved_jobs = {key: getattr(jobs, key) for key in ("_DB_PATH", "_BLOB_DIR", "_DEFAULT_TTL", "_active")}
+        self.addCleanup(lambda: [setattr(jobs, key, value) for key, value in saved_jobs.items()])
+        jobs.init(os.path.join(self.tmp.name, "jobs.db"), os.path.join(self.tmp.name, "blobs"))
         old = dict(admin._pg_images)
         admin._pg_images.clear()
         self.addCleanup(lambda: (admin._pg_images.clear(), admin._pg_images.update(old)))
@@ -324,6 +330,30 @@ console.log(JSON.stringify(result));
         self.assertIn("[?]", filtered[2]["context"])
         self.assertIn("[mixed]", filtered[3]["context"])
 
+    def test_unlisted_model_makes_no_billing_claim_and_same_names_both_count(self):
+        """A typed local alias read "[?] API billing unknown" (even on a gateway without
+        Venice), and an openai + venice backend sharing a name overwrote each other."""
+        page = self.c.get("/ui/playground?sub=chat&model=local-only-alias")
+        self.assertEqual(BillingHTML(page.text).context.get("cpbilling", ""), "")
+        page = self.c.get("/ui/playground?sub=chat&backend=unknown&model=local-only-alias")
+        self.assertIn("[?]", BillingHTML(page.text).context["cpbilling"])
+        self.llm.append({"name": "charged", "type": "openai", "models": ["credit-only"]})
+        markup = admin._chatplay_form({"backend": "charged", "model": "credit-only"})
+        self.assertIn("[mixed]", BillingHTML(markup).context["cpbilling"])
+        self.assertIn("[mixed]", BillingHTML(markup).options["credit-only"])
+
+    def test_account_grant_is_listed_and_survives_the_all_backends_token(self):
+        """A composite account is granted by name (text + paid media); `@backends` covers
+        only its text, so saving with that token ticked must not absorb the name."""
+        groups = admin._grant_groups()
+        self.assertEqual(groups["account"], ["charged", "included", "unknown"])
+        self.assertNotIn("charged", groups["backend"])
+        self.assertEqual(admin._normalize_grants(["@backends", "charged", "other"], groups),
+                         ["@backends", "charged"])
+        page = self.c.get("/ui/users?new=1")
+        self.assertIn("cloud accounts", page.text)
+        self.assertIn('value="charged" data-grp="account"', page.text)
+
     def test_media_labels_preserve_direct_and_alias_ids(self):
         rows = [{"id": "included/native-image", "name": "Native image", "backend": "included",
                  "endpoint": "images", "billing": {"state": "included"},
@@ -395,3 +425,55 @@ console.log(JSON.stringify(result));
         self.assertNotIn("cash USD 0", text)
 
 
+
+
+class VeniceRegister(_Fixture):
+    """Registering a Venice alias: an audio task used to fall through to `images` (a
+    silent image alias) and a mesh task raised VeniceInput unhandled (a 500)."""
+
+    def setUp(self):
+        super().setUp()
+        backend = {"name": "venice", "type": venice.KIND, "url": venice.URL}
+        p = patch.object(admin, "_gen_backends", lambda: [backend])
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_audio_tasks_pick_their_endpoint_and_mesh_is_refused(self):
+        for task, endpoint in (("text2img", "images"), ("img2vid", "video"),
+                               ("text2audio", "music"), ("audio2audio", "voice-changer"),
+                               ("audio2text", "transcription")):
+            with self.subTest(task=task):
+                response = self.post("/ui/mapping/register",
+                                     {"alias": "v-" + task, "backend": "venice", "task": task})
+                self.assertEqual(response.status_code, 303, response.text)
+                saved = store.get("v-" + task)[0]
+                self.assertEqual((saved[venice.KIND]["endpoint"], saved["task"]), (endpoint, task))
+        response = self.post("/ui/mapping/register",
+                             {"alias": "v-mesh", "backend": "venice", "task": "img2mesh"})
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIsNone(store.get("v-mesh"))
+
+
+class RoutingModelTabs(_Fixture):
+    """routing_snapshot carries only LLM catalogs, but a composite account's type
+    (venice, nanogpt) is also a GEN type: classifying by host type silently moved its
+    chat models from Routing → LLM models to Image models."""
+
+    def test_composite_text_models_stay_llm_and_image_catalog_is_listed(self):
+        snap = {"aliases": [], "conflicts": [], "models": [
+            {"model": kind + "-chat", "shadowed_by_alias": False,
+             "hosts": [{"backend": kind, "type": kind, "healthy": True}]}
+            for kind in ("venice", "nanogpt")]}
+        rows = [{"id": "venice/venice-img", "backend": "venice", "endpoint": "images",
+                 "candidate": venice.candidate_for("venice", "venice-img", "images")},
+                {"id": "venice/venice-vid", "backend": "venice", "endpoint": "video",
+                 "candidate": venice.candidate_for("venice", "venice-vid", "video")}]
+        with patch.object(admin, "_routing_snapshot", lambda: snap), \
+                patch.object(admin, "_generation_models", lambda: rows):
+            llm = self.c.get("/ui/routing?sub=llm").text
+            image = self.c.get("/ui/routing?sub=image").text
+        for kind in ("venice", "nanogpt"):
+            self.assertIn(f"<code>{kind}-chat</code>", llm)
+            self.assertNotIn(f"{kind}-chat", image)
+        self.assertIn("<code>venice-img</code>", image)
+        self.assertNotIn("venice-vid", image)

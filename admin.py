@@ -5368,10 +5368,12 @@ async def routing_page(request: Request):
     info = _gateway_info()
     bmeta = {b["name"]: b for b in info.get("backends", []) if b.get("type") in adapters.GEN_TYPES}
     refresh = None
+    # routing_snapshot lists LLM catalogs only (`_llm_models`). A composite account
+    # (NanoGPT, Venice) is a GEN type too, but its snapshot ids are its text/TTS/
+    # embedding models — classifying by host type put them under Image models.
     if sub == "llm":
         snap = _routing_snapshot()
-        on_llm = [m for m in snap.get("models", [])
-                  if any(h.get("type") not in adapters.GEN_TYPES for h in m["hosts"])]
+        on_llm = snap.get("models", [])
         title, body = "LLM models", (
             "<h2>LLM models → backends</h2>"
             "<p class='hint'>A bare model id goes to the fastest free <b>unpaid</b> backend of "
@@ -5382,16 +5384,14 @@ async def routing_page(request: Request):
                             sk="routing-llm-models"))
     elif sub == "image":
         snap = _routing_snapshot()
-        img_models = [m for m in snap.get("models", [])
-                      if any(h.get("type") in adapters.GEN_TYPES for h in m["hosts"])]
-        img_on_llm = [m for m in snap.get("models", [])
-                      if any(h.get("type") not in adapters.GEN_TYPES for h in m["hosts"])
-                      and _is_image_model(m["model"])]
+        img_on_llm = [m for m in snap.get("models", []) if _is_image_model(m["model"])]
         title, body = "Image models", (
             "<h2>Image models → backends</h2>"
-            "<p class='hint'>ComfyUI checkpoints/models, plus image models served by LLM "
-            "backends (e.g. flux.* on localai — matched by name, no type metadata).</p>"
-            + _models_table(img_models + img_on_llm))
+            "<p class='hint'>Image catalogs of cloud accounts (NanoGPT, Venice — callable "
+            "as <code>backend/model</code> or bare), plus image models served by LLM "
+            "backends (e.g. flux.* on localai — matched by name, no type metadata). "
+            "ComfyUI checkpoints are reached through media aliases.</p>"
+            + _models_table(_catalog_image_models() + img_on_llm))
     elif sub == "loras":
         v = _lora_meta_view()
         title = "LoRAs"
@@ -5852,15 +5852,20 @@ def _chat_billing_markers(llm: list, models: list) -> dict:
     aliases = dict(_config_chat_aliases())
     if store.is_active():
         aliases.update(store.list_chat_aliases())
-    by_name = {b["name"]: b for b in llm if b.get("type") != "anthropic"}
+    # Names are unique per TYPE only: an openai and a venice backend may share one, and
+    # an alias entry for that name may land on either — keep every same-named backend.
+    by_name: dict = {}
+    for b in llm:
+        if b.get("type") != "anthropic":
+            by_name.setdefault(b["name"], []).append(b)
     markers = {}
     for model in models:
         alias = aliases.get(model)
         if isinstance(alias, dict):
-            accounts = [_backend_billing(by_name.get(name, {})) for name in alias]
+            accounts = [_backend_billing(b) for name in alias for b in by_name.get(name, [{}])]
         else:
             target = alias if isinstance(alias, str) else model
-            accounts = [_backend_billing(b) for b in by_name.values()
+            accounts = [_backend_billing(b) for same in by_name.values() for b in same
                         if target in b.get("models", [])
                         or (alias is None and target.startswith(b["name"] + "/")
                             and target[len(b["name"]) + 1:] in b.get("models", []))]
@@ -5899,25 +5904,36 @@ def _chatplay_form(vals: dict) -> str:
     llm = _llm_backends()
     bk_models = {b["name"]: sorted(b.get("models", [])) for b in llm}   # bare model ids per backend
     all_models = _chat_models()                                         # aliases + bare + backend/model
-    bk_markers = {b["name"]: {m: _billing_marker([_backend_billing(b)])
-                            for m in b.get("models", [])} for b in llm}
+    bk_markers: dict = {}                     # per picker NAME: every same-named backend counts
+    for b in llm:
+        marks = bk_markers.setdefault(b["name"], {})
+        for m in b.get("models", []):
+            accounts = [_backend_billing(x) for x in llm
+                        if x["name"] == b["name"] and m in x.get("models", [])]
+            marks[m] = _billing_marker(accounts)
     all_markers = _chat_billing_markers(llm, all_models)
     cur_bk = v("backend")
     init_models = bk_models[cur_bk] if (cur_bk in bk_models) else all_models   # pre-filter if a backend is picked
     init_markers = bk_markers[cur_bk] if cur_bk in bk_markers else all_markers
-    selected_billing = _billing_description(init_markers.get(v("model"), "[?]")) if v("model") else ""
+    # A model outside the map makes no claim (local aliases, gateways without Venice) —
+    # unless a backend is picked: then that account's own sign applies.
+    bk_default = {n: _billing_marker([_backend_billing(b) for b in llm if b["name"] == n])
+                  for n in bk_models}
+    selected_billing = (_billing_description(init_markers.get(v("model"), bk_default.get(cur_bk, "")))
+                        if v("model") else "")
     # Backend picker (manual, so it can filter the model datalist on change without a reload).
     opts = f'<option value=""{"" if cur_bk else " selected"}>— all backends (scheduler picks) —</option>'
     for n in bk_models:
         opts += f'<option{" selected" if n == cur_bk else ""}>{_esc(n)}</option>'
     bk_select = f'<select name="backend" onchange="cpFilterModels(this.value)">{opts}</select>'
-    filt_js = ("<script>var CP_BK=%s,CP_ALL=%s,CP_BILL_BK=%s,CP_BILL_ALL=%s,CP_BILL_TEXT=%s;"
+    filt_js = ("<script>var CP_BK=%s,CP_ALL=%s,CP_BILL_BK=%s,CP_BILL_ALL=%s,CP_BILL_TEXT=%s,"
+               "CP_BILL_DEF=%s;"
                "function cpUpdateBilling(){"
                "var model=document.querySelector('form[action=\"/ui/chatplay/send\"] [name=\"model\"]'),"
                "backend=document.querySelector('form[action=\"/ui/chatplay/send\"] [name=\"backend\"]'),"
                "out=document.getElementById('cpbilling');if(!model||!backend||!out)return;"
                "var marks=backend.value&&CP_BILL_BK[backend.value]?CP_BILL_BK[backend.value]:CP_BILL_ALL;"
-               "var mark=Object.prototype.hasOwnProperty.call(marks,model.value)?marks[model.value]:'[?]';"
+               "var mark=Object.prototype.hasOwnProperty.call(marks,model.value)?marks[model.value]:(backend.value&&CP_BILL_DEF[backend.value])||'';"
                "out.textContent=model.value?(CP_BILL_TEXT[mark]||''):'';}"
                "function cpFilterModels(bk){"
                "var dl=document.getElementById('cpmodels');if(!dl)return;"
@@ -5927,7 +5943,8 @@ def _chatplay_form(vals: dict) -> str:
                "o.label=m+(marks[m]?' '+marks[m]:'');dl.appendChild(o);});cpUpdateBilling();}"
                "</script>") % (
                    _js_json(bk_models), _js_json(all_models), _js_json(bk_markers), _js_json(all_markers),
-                   _js_json({m: _billing_description(m) for m in ("[C]", "[I]", "[?]", "[mixed]")}))
+                   _js_json({m: _billing_description(m) for m in ("[C]", "[I]", "[?]", "[mixed]")}),
+                   _js_json(bk_default))
     return ('<form action="/ui/chatplay/send" method="post" onsubmit="return cpSending(this)">'
             f'<div class="formbar"><h2>Chat Playground</h2>{_btn("Send", submit=True)}</div>'
             + _field("backend", bk_select, short=True)
@@ -6207,6 +6224,11 @@ async def _mapping_view(qp, detail: Optional[str] = None, err: str = "",
                         status_code=status)
 
 
+# Registering a catalog-cloud alias: audio tasks → the catalog endpoint they name.
+_AUDIO_TASK_ENDPOINTS = {"text2audio": "music", "audio2audio": "voice-changer",
+                         "audio2text": "transcription"}
+
+
 async def register_post(request: Request):
     f = await _multipart(request)
     alias = str(f.get("alias", "")).strip()
@@ -6239,9 +6261,18 @@ async def register_post(request: Request):
         mod = adapters.cloud_module(bt)
         cand = mod.default_candidate(backend)
         if getattr(mod, "task_for", None):
-            endpoint = ("video" if "vid" in task else "3d" if "mesh" in task else "images")
+            # The picked task names the catalog endpoint. One the vendor lacks (a mesh on
+            # Venice, audio on NanoGPT) is a refused form, not a 500 — and an audio task
+            # used to fall through to `images` and silently become an image alias.
+            endpoint = ("video" if "vid" in task else "3d" if "mesh" in task else
+                        _AUDIO_TASK_ENDPOINTS.get(task, "images"))
+            if endpoint not in mod.ENDPOINTS:
+                return await err(f"{mod.VENDOR} has no {task} endpoint — pick one of its tasks")
+            try:
+                cand["task"] = mod.task_for(endpoint, task)
+            except mod.INPUT_ERROR as e:
+                return await err(str(e))
             cand[mod.KIND]["endpoint"] = endpoint
-            cand["task"] = mod.task_for(endpoint, task)
         # Mesh vendors keep img2mesh when the form's text2img default was untouched.
         # ArliAI retains its fixed text2img task and checkpoint contract.
         elif bt != "arliai" and picked_task and picked_task != "text2img":
@@ -7787,6 +7818,28 @@ def _alias_defaults(cand: dict) -> dict:
     return out
 
 
+def _catalog_modality(row: dict) -> str:
+    """A direct catalog row's media type (`images`/`image`, `video`, `3d`, `audio`, …)."""
+    cand = row.get("candidate") or {}
+    kind = adapters.cloud_kind(cand)
+    mod = adapters.cloud_module(kind) if kind else None
+    endpoint = row.get("endpoint", "")
+    return mod.generation_type(endpoint) if getattr(mod, "generation_type", None) else endpoint
+
+
+def _catalog_image_models() -> list:
+    """Composite accounts' (NanoGPT, Venice) image catalogs as `_models_table` rows:
+    bare model id → the accounts that list it (a bare id resolves across all of them)."""
+    hosts: dict[str, list] = {}
+    for row in _generation_models():
+        if _catalog_modality(row) not in ("images", "image"):
+            continue
+        cand = row.get("candidate") or {}
+        hosts.setdefault(cand.get("model") or row["id"], []).append(
+            {"backend": row.get("backend", ""), "healthy": not cand.get("unavailable")})
+    return [{"model": m, "hosts": h} for m, h in sorted(hosts.items(), key=lambda kv: kv[0].lower())]
+
+
 def _media_models() -> list:
     """Stored aliases win collisions with healthy, directly callable catalog IDs."""
     backend_meta = {(b["name"], adapters.backend_kind(b)): b
@@ -7801,14 +7854,7 @@ def _media_models() -> list:
     seen = {row["id"] for row in rows}
     modalities = {"images": "Images", "image": "Images", "video": "Video", "3d": "3D",
                   "audio": "Audio", "tts": "Speech", "asr": "Transcription"}
-
-    def modality(row):
-        cand = row.get("candidate") or {}
-        kind = adapters.cloud_kind(cand)
-        mod = adapters.cloud_module(kind) if kind else None
-        endpoint = row.get("endpoint", "")
-        return mod.generation_type(endpoint) if getattr(mod, "generation_type", None) else endpoint
-
+    modality = _catalog_modality
     order = {"images": 0, "image": 0, "video": 1, "3d": 2, "audio": 3, "tts": 4, "asr": 5}
     for row in sorted(_generation_models(), key=lambda r: (
             str(r.get("backend", "")).lower(), order.get(modality(r), 6),
@@ -10385,10 +10431,16 @@ def _grant_groups() -> dict:
     # Backend grants apply to LLM backends only (generation backends aren't in
     # /v1/models; image access is granted via image aliases). Filtering them out also
     # removes the confusing duplicate when an LLM and a media backend share a name.
+    # A composite account (NanoGPT, Venice) is its own kind WITHOUT a group token: ticked
+    # by name it grants the whole account incl. paid media, while `@backends` covers only
+    # its text side (main._model_allowed) — so the token must never absorb its name.
+    backends = info.get("backends", [])
     return {"chat": sorted(set(info.get("virtual_models", []))),
             "image": sorted(store.list_aliases().keys()) if store.is_active() else [],
-            "backend": sorted({b["name"] for b in info.get("backends", [])
-                               if b.get("name") and b.get("type", "openai") not in adapters.GEN_TYPES})}
+            "backend": sorted({b["name"] for b in backends
+                               if b.get("name") and b.get("type", "openai") not in adapters.GEN_TYPES}),
+            "account": sorted({b["name"] for b in backends
+                               if b.get("name") and b.get("type") in adapters.DYNAMIC_CATALOG_TYPES})}
 
 
 def _normalize_grants(models: list, groups: dict) -> list:
@@ -10424,22 +10476,29 @@ def _user_form(u: Optional[dict], orig: Optional[str] = None, err: str = "") -> 
     allowed = set((u or {}).get("models") or [])
     groups = _grant_groups()
     chat_al, img_al, bk_al = groups["chat"], groups["image"], groups["backend"]
+    acct_al = groups.get("account") or []
     # chat/image aliases granted by name; a backend grants ALL of its models (and filters
     # what this user's key sees in /v1/models). Each kind gets a "select all" header row.
     rows = ""
-    for kind, items in (("chat", chat_al), ("image", img_al), ("backend", bk_al)):
+    for kind, items in (("chat", chat_al), ("image", img_al), ("backend", bk_al),
+                        ("account", acct_al)):
         if not items:
             continue
-        # The group box is a real grant: it submits the kind's TOKEN, which the gateway
-        # resolves per request — so "all chat" also covers aliases added later.
-        tok = _GRANT_TOKENS[kind]
-        grp = tok in allowed
-        all_ck = " checked" if grp else ""
-        rows += (f'<tr class="grp"><td><input type="checkbox" name="model" value="{tok}"{all_ck} '
-                 f'data-grp-all="{kind}" onclick="gwTogAll(this,\'{kind}\')" '
-                 f'title="every {kind} entry, including ones added later"></td>'
-                 f'<td colspan="2"><b>all {kind}</b> <span class="muted">({len(items)} now, '
-                 f'incl. future ones)</span></td></tr>')
+        tok = _GRANT_TOKENS.get(kind)
+        grp = tok in allowed if tok else False
+        if tok is None:                          # accounts: granted one by one only
+            rows += ('<tr class="grp"><td></td><td colspan="2"><b>cloud accounts</b> '
+                     '<span class="muted">(whole account: text + paid media; <b>all backend</b> '
+                     'covers only their text models)</span></td></tr>')
+        else:
+            # The group box is a real grant: it submits the kind's TOKEN, which the gateway
+            # resolves per request — so "all chat" also covers aliases added later.
+            all_ck = " checked" if grp else ""
+            rows += (f'<tr class="grp"><td><input type="checkbox" name="model" value="{tok}"{all_ck} '
+                     f'data-grp-all="{kind}" onclick="gwTogAll(this,\'{kind}\')" '
+                     f'title="every {kind} entry, including ones added later"></td>'
+                     f'<td colspan="2"><b>all {kind}</b> <span class="muted">({len(items)} now, '
+                     f'incl. future ones)</span></td></tr>')
         for a in items:
             ck = " checked" if (grp or a in allowed) else ""
             rows += (f'<tr><td><input type="checkbox" name="model" value="{_esc(a)}" data-grp="{kind}"{ck}></td>'

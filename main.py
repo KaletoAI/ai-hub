@@ -1535,6 +1535,19 @@ def _expand_grants(allow) -> set:
     return out
 
 
+def _composite_media(bname: str, bare: str, media: Optional[bool]) -> bool:
+    """True when `bname/bare` is a composite account's (NanoGPT, Venice) paid MEDIA id,
+    or the request is a media one on such an account — the part a `@backends` grant
+    (all LLM backends) must not open. A chat request (media False) never is."""
+    if media is False:
+        return False
+    for b in backends:
+        if b.get("name") == bname and b.get("type") in adapters.DYNAMIC_CATALOG_TYPES:
+            if media or bare not in _llm_models(b):
+                return True
+    return False
+
+
 def _model_allowed(user: dict, model: Optional[str], *, media: Optional[bool] = None) -> bool:
     raw = user.get("models") or []
     if not raw or not model:
@@ -1549,8 +1562,11 @@ def _model_allowed(user: dict, model: Optional[str], *, media: Optional[bool] = 
     if media is not False and GRANT_ALL_IMAGE in allow and (_gen_alias_exists(model) or _catalog_direct_candidates(model)):
         return True
     bname, bare = split_backend_prefix(model)    # backend/model
-    if bname and bname in allow:                 # whole-backend grant (prefixed request)
-        return True
+    # A composite account named ONE BY ONE is the whole account (text + media); via
+    # `@backends` ("all LLM backends") it is its LLM side only — paid media take
+    # `@image`, an alias or the exact id (review 2026-10-19).
+    if bname and bname in allow and (bname in raw or not _composite_media(bname, bare, media)):
+        return True                              # whole-backend grant (prefixed request)
     if bname and bare == adapters.CURRENT_MODEL and model not in virtual_models:
         # `<backend>/current` may land on ANY model that backend has loaded, so only a
         # grant covering all of them (the backend, or this exact entry — both checked
@@ -1567,6 +1583,10 @@ def _model_allowed(user: dict, model: Optional[str], *, media: Optional[bool] = 
         if not _is_llm(b) or b.get("name") not in allow:
             continue
         served = backend_models.get(backend_id(b), set())
+        if b.get("type") in adapters.DYNAMIC_CATALOG_TYPES and b["name"] not in raw:
+            if media:
+                continue                         # `@backends` never opens account media
+            served = _llm_models(b)
         if bare in served:                                       # real model on a granted backend
             return True
         if is_alias:                                             # alias → granted backend's model
@@ -2812,7 +2832,8 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
     user = authenticate(authorization)
     # Per-user allow-list FILTERS the catalog (empty = all). Entries may be a model id,
     # a chat/image alias, or a backend name (grants all of that backend's models).
-    allow = _expand_grants((user.get("models") if user else None) or [])
+    raw_allow = set((user.get("models") if user else None) or [])
+    allow = _expand_grants(raw_allow)
     typ = (request.query_params.get("type") or "").lower()
     now = int(time.time())
     seen: set[str] = set()
@@ -2888,7 +2909,9 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
             disp = row["id"] if model_prefix else mid
             if row["id"] in img_aliases or disp in img_aliases or (typ and typ != kind):
                 continue
-            if disp not in seen and visible({disp, mid, row["backend"], GRANT_ALL_IMAGE}):
+            # Account media: a backend named one by one, not `@backends` (_model_allowed).
+            account = {row["backend"]} if row["backend"] in raw_allow else set()
+            if disp not in seen and visible({disp, mid, GRANT_ALL_IMAGE} | account):
                 seen.add(disp)
                 data.append({"id": disp, "object": "model", "created": now,
                              "owned_by": row["backend"]})
@@ -3269,6 +3292,12 @@ def _generation_type(cand: dict) -> str:
         return "video"
     if "3d" in task or adapters.cand_kind(cand) in ("meshy", "tripo"):
         return "3d"
+    # Same families as Venice's catalog (venice.generation_type): transcription is
+    # `asr`, audio→audio `audio`. text2audio stays `tts` — existing ComfyUI speech aliases.
+    if task == "audio2text":
+        return "asr"
+    if task == "audio2audio":
+        return "audio"
     return "tts" if "tts" in task or "audio" in task else "image"
 
 
@@ -4654,7 +4683,12 @@ async def run_generation(body: dict, request: Request,
             adapter = backend_adapters.get(backend_id(backend))
             catalog = getattr(adapter, "model_catalogs", {})
             endpoint = mod.endpoint_of(c0)
-            if (catalog or kind == "venice") and c0.get("model") not in catalog.get(endpoint, {}):
+            if kind == "venice" and not catalog:
+                # No snapshot YET (a key/URL change starts a fresh adapter; a failed
+                # refresh clears it) — the gateway's state, not the client's input.
+                raise HTTPException(503, f"{mod.VENDOR} catalog is not discovered yet — retry shortly",
+                                    headers={"Retry-After": "30"})
+            if catalog and c0.get("model") not in catalog.get(endpoint, {}):
                 raise mod.INPUT_ERROR(f"{mod.VENDOR} model is unavailable for {endpoint}")
             await asyncio.to_thread(mod.validate_request, c0, {**inputs, **params},
                 (upload_images or {}).keys(), (upload_files or {}).keys(),

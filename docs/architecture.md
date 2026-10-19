@@ -396,7 +396,12 @@ health/drain/sync/busy/quarantine ordering. No alias rows are generated.
 fresh alias metadata into the console. `/v1/models` exposes typed views, including
 Venice `audio` and `asr`; `@image` covers direct media IDs without granting chat.
 `@chat` expands chat aliases only for LLM request gates, not for media requests
-sharing their names. Inventory checks consider both namespaces.
+sharing their names. Inventory checks consider both namespaces. `@backends` (all
+LLM backends) covers a composite account's TEXT side only (`_composite_media`):
+it used to open billed video/music via the prefixed id, the bare id and
+`/v1/models`. Paid account media take `@image`, an alias/exact id, or the account
+named one by one (the Users table lists composites as "cloud accounts", a kind
+without a group token, so `_normalize_grants` never absorbs the name).
 The generation request gate explicitly enables media grants; chat dispatch cannot
 borrow `@image` through a colliding catalog ID/chat alias. Successful NanoGPT
 discovery rebuilds the route index even when cached IDs are unchanged: typed
@@ -428,7 +433,14 @@ filters. Text discovery accepts Venice's `type: text`, not Together's `chat`;
 legacy chat/serverless flags affect only text. USD token pricing comes from
 `model_spec.pricing`, including `cache_input`; TTS character rates stay unknown
 to the token-cost calculator. Dispatch validates the selected protocol's catalog,
-so an image/music/ASR ID cannot become a chat request.
+so an image/music/ASR ID cannot become a chat request — refused as a deliberate
+`HTTPException(400)`, not a `VeniceInput` that `_dispatch_over` turned into a 502 plus
+an "error" fault row against Venice for the client's mistake. A job on an alias
+before the first snapshot (a key/URL change starts a fresh adapter) is a 503 with
+`Retry-After`, not a 400 "model is unavailable". `venice.validate_request`,
+`build_request` and `validate_image_dimensions` run under `_metadata_guard`: a
+malformed catalog constraint (None/0 divisor, list for dict) is a `VeniceInput`
+(400 before the paid POST), not a TypeError the preflight let through (500).
 
 An optional tenth GET, `/v1/api_keys/rate_limits`, publishes sanitized
 `account_info` alongside discovery. `venice.normalize_account_info` trusts exact
@@ -452,7 +464,19 @@ Private/URL results download without bearer/cookies, including redirects.
 `complete` is deletion, NEVER cancellation, and runs only after valid local bytes
 exist. Only connect/pool failures before submit permit failover; HTTP errors,
 uncertain submissions, malformed results and post-submit poll/download failures
-are final. Cancellation preserves the paid trace and releases local slots without
+are final. Final is not fragile: retrieve and the artifact GET are free and
+repeatable until `complete`, so `_retrieve` polls on through 429/5xx/transport
+hiccups, malformed bodies, a JSON COMPLETED that carries no URL yet (public models
+send the bytes on a later retrieve) and artifacts that fail validation (up to
+`_CLOUD_DOWNLOAD_ATTEMPTS`), until `max_wait`; three 4xx/error bodies in a row and
+a failed/unknown status are the verdicts. `_asset` retries transport errors and
+5xx like `CloudTaskAdapter._download`. One hiccup used to fail a billed 30-minute
+video. `_binary_blob` lets the CONTENT decide (ISO tracks, audio signatures, a WAV
+whose `data` chunk the file holds — float WAV and streaming placeholder sizes
+pass): a CDN's `binary/octet-stream`, no type or `video/quicktime` used to refuse a
+valid paid file; a foreign family (text/html, application/pdf) still refuses. A
+voice upload sent but unanswered is final (it may exist) — it used to escape as a
+failover-class error and upload again. Cancellation preserves the paid trace and releases local slots without
 claiming the vendor stopped. No balance or currency conversion is inferred from
 generation results; account balances come only from the separate billing snapshot.
 Speech jobs optionally upload a supported reference to `/audio/voices` before
@@ -1108,7 +1132,11 @@ locked. Tabs in `TABS`; a top tab can group child views via `SUBTABS` +
 parent route, first child = default —
 Playground: Chat | Media | Voice, Jobs & Calls: LLM | Media | Voice,
 Aliases: Chat | Media, Input & Routing: Input | LLM models | Image models | LoRAs,
-Server: Runtime | Restart | API Keys | Models; `_subnav(parent, sub, marks)` appends raw HTML
+Server: Runtime | Restart | API Keys | Models. Routing → LLM/Image models never classify a
+`routing_snapshot` model by its host's type: the snapshot holds LLM catalogs only, and a
+composite account (NanoGPT, Venice) is a GEN type whose snapshot ids are its TEXT models
+(that put them under Image models). Image models = name-matched LLM-hosted ids + the
+composite accounts' image catalogs (`_catalog_image_models`); `_subnav(parent, sub, marks)` appends raw HTML
 to a sub-tab's label — Server badges *Restart* `↻ restart` from every sub-tab while a
 restart-only value differs from what runs, so a pending restart is never hidden).
 **Server** (`_server_view`, one renderer for the page and every refused Save):
@@ -2895,18 +2923,26 @@ Every test file also says this in its own docstring; this is the overview.
 - `test_concurrency_group.py`: an account cap shared by chat and images, releases,
   independent groups, cap reloads, disabled/draining members and streams held to EOF.
 - `test_venice.py`: native parameter precedence, model pins, metadata bounds,
-  required/reference uploads, structured video inputs, secret/data redaction and
-  exact account-charge flags with finite, separately denominated balances.
-- `test_venice_adapter.py`: atomic typed catalogs, purpose gates, token prices,
-  synchronous/async/binary/private delivery, multipart audio, no rebilling after
-  uncertain submit, credential-free asset redirects, post-download cleanup,
+  malformed metadata as input errors, required/reference uploads, structured video
+  inputs, secret/data redaction and exact account-charge flags with finite,
+  separately denominated balances.
+- `test_venice_adapter.py`: atomic typed catalogs, purpose gates (400, not 502),
+  token prices, synchronous/async/binary/private delivery, multipart audio, no
+  rebilling after uncertain submit or voice upload, credential-free asset
+  redirects, post-download cleanup, retrieve/download hiccups and cut-off
+  artifacts that never discard a paid queue, content-decided artifact types,
   optional balance-query failures and account-identity-safe state adoption.
 - `test_venice_routing.py`: alias-free media delivery, retained chat aliases,
-  modality grants, failed-refresh availability and native video durations.
+  modality grants, `@backends` never opening account media, a 503 before the first
+  catalog, workflow audio tasks in Venice's type families, every billed variant
+  delivered, failed-refresh availability and native video durations.
 - `test_venice_console.py`: shared account controls, metadata-native forms,
   optional false values, typed speech inputs, JSON/text result downloads, billing
-  signs with preserved model IDs, dynamic filtering, mixed-account assurances
-  and correctly denominated balances.
+  signs with preserved model IDs, dynamic filtering, mixed-account assurances,
+  correctly denominated balances, no billing claim for unlisted models, same-named
+  backends both counted, cloud-account grants, audio-task registration (no silent
+  image alias, no 500 on mesh), and composite text models staying under Routing →
+  LLM models (not Image models).
 - `test_nanogpt.py`: pinned models, current metadata-driven schemas and input limits,
   default/client/native precedence, explicit auto, finite JSON, video seconds,
   redacted media metadata and terminal result parsing.
