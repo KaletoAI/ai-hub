@@ -53,6 +53,7 @@ import cloudtask
 import meshy
 import nanogpt
 import tripo
+import venice
 
 logger = logging.getLogger(__name__)
 
@@ -523,7 +524,10 @@ class NormalizedRequest:
 
 # ── cloud task kinds (Meshy, Tripo): the one seam main/admin ask "which kind?" ──
 CLOUD_MODULES: dict = {meshy.KIND: meshy, tripo.KIND: tripo, arliai.KIND: arliai,
-                       nanogpt.KIND: nanogpt}  # kind → pure module
+                       nanogpt.KIND: nanogpt, venice.KIND: venice}  # kind → pure module
+
+# Composite accounts expose purpose-separated live catalogs to routing and admin.
+DYNAMIC_CATALOG_TYPES: frozenset = frozenset((nanogpt.KIND, venice.KIND))
 
 
 def cloud_kind(cand: dict) -> Optional[str]:
@@ -4858,6 +4862,578 @@ class NanoGPTAdapter(BackendAdapter):
         return await self._media.generate(req)
 
 
+# ── Venice composite text / media account ────────────────────────────────────
+
+class VeniceMediaAdapter(CloudTaskAdapter):
+    """Venice's paid media seam. A submitted request is NEVER failover-class.
+
+    Retrieve/complete are not generation calls: retrieve reads the existing queue;
+    complete deletes its media and is called only after validated bytes are local.
+    """
+
+    mod = venice
+    type = mod.KIND
+    _ASYNC_PATHS = {"video": "/v1/video", "music": "/v1/audio",
+                    "voice-changer": "/v1/audio/voice-changer"}
+    _IMAGE_ENDPOINTS = frozenset(("images", "edit", "upscale", "background-remove"))
+
+    def __init__(self, backend: dict, ctx: AdapterContext):
+        super().__init__(backend, ctx)
+        self.model_catalogs: dict[str, dict[str, dict]] = {}
+
+    def _api(self, path: str) -> str:
+        return (self.backend.get("url") or venice.URL).rstrip("/") + path
+
+    def _redact(self, text: str) -> str:
+        key = (self.backend.get("api_key") or "").strip()
+        return text.replace(key, "[redacted]") if key else text
+
+    async def discover(self, client: httpx.AsyncClient) -> Capabilities:
+        # Only the registered composite publishes a complete catalog snapshot.
+        raise NotImplementedError("Venice discovery belongs to the composite account")
+
+    def _persist(self, req: NormalizedRequest) -> None:
+        if req.job_id:
+            self.ctx.note_job_meta(req.job_id, copy.deepcopy(req.cloud_trace))
+
+    async def _post(self, client, path: str, body: dict, max_wait: float,
+                    upload: Optional[tuple] = None):
+        if upload is not None:
+            # Native multipart endpoints use a file field, never a base64 JSON field.
+            name, data = upload
+            mime, _ = _mime_and_kind(name)
+            fields = {key: (json.dumps(value) if not isinstance(value, str) else value)
+                      for key, value in body.items()}
+            return await client.post(self._api(path), headers=self._headers(),
+                data=fields, files={"file": (name, data, mime)}, follow_redirects=False,
+                timeout=httpx.Timeout(max_wait, connect=30.0, pool=30.0))
+        raw = await asyncio.to_thread(lambda: json.dumps(body).encode())
+        return await client.post(self._api(path), content=raw,
+            headers={**self._headers(), "Content-Type": "application/json"},
+            follow_redirects=False,
+            timeout=httpx.Timeout(max_wait, connect=30.0, pool=30.0,
+                                  write=max(60.0, len(raw) / (1024 * 1024) * 4)))
+
+    @staticmethod
+    def _check_response(response, purpose: str) -> None:
+        if not 200 <= response.status_code < 300:
+            # Do not expose vendor response bodies: they can echo credentials,
+            # signed links and large uploaded base64 input.
+            raise RuntimeError(f"Venice {purpose} HTTP {response.status_code}")
+
+    @staticmethod
+    def _download_url(url: str) -> str:
+        parsed = urlsplit(url)
+        if (parsed.scheme != "https" or not parsed.hostname or parsed.username
+                or parsed.password or is_lan_url(url)):
+            raise RuntimeError("Venice returned an unsafe artifact URL")
+        return url
+
+    async def _asset(self, client, url: str):
+        """No account auth/cookies on ANY asset hop, including injected clients."""
+        url = self._download_url(url)
+        for _ in range(6):
+            request = client.build_request("GET", url, timeout=_CLOUD_DOWNLOAD_TIMEOUT)
+            for key in ("authorization", "x-api-key", "cookie", "proxy-authorization"):
+                request.headers.pop(key, None)
+            response = await client.send(request, auth=None, follow_redirects=False)
+            if response.is_redirect:
+                location = response.headers.get("location")
+                if not location:
+                    raise RuntimeError("Venice artifact redirect has no location")
+                url = self._download_url(urljoin(url, location))
+                continue
+            self._check_response(response, "artifact download")
+            return response
+        raise RuntimeError("Venice artifact download redirected too many times")
+
+    @staticmethod
+    def _iso_kind(data: bytes) -> str:
+        """Validate ISO-BMFF box boundaries and read actual audio/video track types.
+
+        M4A and MP4 share ftyp/moov/mdat, so file signatures alone cannot keep an
+        audio job from accepting video (or discard a paid M4A as an unknown format).
+        Fragmented containers are valid too: their sample bytes live in root mdat.
+        """
+        if len(data) < 16 or data[4:8] != b"ftyp":
+            raise RuntimeError("Venice returned an invalid MP4/M4A container")
+        handlers, movie, media = set(), False, False
+
+        def boxes(start: int, end: int, depth: int) -> None:
+            nonlocal movie, media
+            if depth > 8:
+                raise RuntimeError("Venice returned an invalid MP4/M4A container")
+            offset = start
+            while offset < end:
+                if end - offset < 8:
+                    raise RuntimeError("Venice returned a truncated MP4/M4A container")
+                size, kind = struct.unpack_from(">I4s", data, offset)
+                header = 8
+                if size == 1:
+                    if end - offset < 16:
+                        raise RuntimeError("Venice returned a truncated MP4/M4A container")
+                    size, header = struct.unpack_from(">Q", data, offset + 8)[0], 16
+                elif size == 0:
+                    size = end - offset
+                if size < header or size > end - offset:
+                    raise RuntimeError("Venice returned a truncated MP4/M4A container")
+                payload, stop = offset + header, offset + size
+                if kind in (b"moov", b"trak", b"mdia"):
+                    movie = movie or kind == b"moov" and depth == 0
+                    boxes(payload, stop, depth + 1)
+                elif kind == b"hdlr" and depth == 3:
+                    if stop - payload < 12:
+                        raise RuntimeError("Venice returned an invalid media track")
+                    handlers.add(data[payload + 8:payload + 12])
+                elif kind == b"mdat" and depth == 0 and stop > payload:
+                    media = True
+                offset = stop
+
+        boxes(0, len(data), 0)
+        if not movie or not media or not handlers.intersection((b"vide", b"soun")):
+            raise RuntimeError("Venice returned no playable MP4/M4A media track")
+        return "video" if b"vide" in handlers else "audio"
+
+    @staticmethod
+    def _binary_blob(data: bytes, mime: str, endpoint: str,
+                     requested_format: Optional[str] = None) -> GenBlob:
+        """Check format signatures before deleting the vendor's only stored copy."""
+        mime = mime.split(";", 1)[0].strip().lower()
+        if not data:
+            raise RuntimeError("Venice returned an empty artifact")
+        if endpoint in VeniceMediaAdapter._IMAGE_ENDPOINTS:
+            blob = NanoGPTMediaAdapter._image_blob(data, 1)
+            return blob
+        if endpoint == "video":
+            if (mime not in ("video/mp4", "application/octet-stream")
+                    or VeniceMediaAdapter._iso_kind(data) != "video"):
+                raise RuntimeError("Venice returned an invalid MP4 video artifact")
+            return GenBlob(data=data, mime="video/mp4", kind="video", name="video.mp4")
+        if mime in ("audio/mp4", "audio/x-m4a", "audio/m4a") or (
+                mime == "application/octet-stream" and data[4:8] == b"ftyp"):
+            if VeniceMediaAdapter._iso_kind(data) != "audio":
+                raise RuntimeError("Venice returned video for an audio job")
+            return GenBlob(data=data, mime=("audio/mp4" if mime == "application/octet-stream" else mime),
+                           kind="audio", name="audio.m4a")
+        if mime == "application/octet-stream":
+            # A generic download type still needs a recognizable audio signature.
+            if data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+                mime = "audio/wav"
+            elif data.startswith(b"fLaC"):
+                mime = "audio/flac"
+            elif data.startswith(b"OggS"):
+                mime = "audio/ogg"
+            elif len(data) > 1 and data[0] == 255 and data[1] & 0xF6 == 0xF0:
+                mime = "audio/aac"
+            elif data.startswith(b"ID3") or (len(data) > 1 and data[0] == 255 and data[1] & 224 == 224):
+                mime = "audio/mpeg"
+        formats = {
+            "audio/mpeg": ("mp3", data.startswith(b"ID3") or
+                           (len(data) > 1 and data[0] == 255 and data[1] & 224 == 224)),
+            "audio/mp3": ("mp3", data.startswith(b"ID3") or
+                          (len(data) > 1 and data[0] == 255 and data[1] & 224 == 224)),
+            "audio/wav": ("wav", data[:4] == b"RIFF" and data[8:12] == b"WAVE"),
+            "audio/x-wav": ("wav", data[:4] == b"RIFF" and data[8:12] == b"WAVE"),
+            "audio/flac": ("flac", data.startswith(b"fLaC")),
+            "audio/ogg": ("ogg", data.startswith(b"OggS")),
+            "audio/opus": ("opus", data.startswith(b"OggS")),
+            "audio/aac": ("aac", len(data) > 1 and data[0] == 255 and data[1] & 240 == 240),
+            "audio/pcm": ("pcm", requested_format == "pcm" and len(data) % 2 == 0),
+        }
+        ext, valid = formats.get(mime, ("", False))
+        if not valid:
+            raise RuntimeError("Venice returned an invalid audio artifact")
+        if ext == "wav":
+            import wave
+            from io import BytesIO
+            with wave.open(BytesIO(data), "rb") as audio:
+                frames = audio.getnframes()
+                if (not frames or len(audio.readframes(frames)) !=
+                        frames * audio.getnchannels() * audio.getsampwidth()):
+                    raise RuntimeError("Venice returned a truncated WAV artifact")
+        return GenBlob(data=data, mime=("audio/mpeg" if ext == "mp3" else mime),
+                       kind="audio", name=f"audio.{ext}")
+
+    async def _sync_blobs(self, response, endpoint: str, body: dict) -> list[GenBlob]:
+        mime = response.headers.get("content-type", "").split(";", 1)[0].lower()
+        if endpoint == "transcription":
+            if mime == "application/json":
+                payload = await asyncio.to_thread(response.json)
+                if not isinstance(payload, dict) or not isinstance(payload.get("text"), str):
+                    raise RuntimeError("Venice returned no transcription text")
+                data = await asyncio.to_thread(lambda: json.dumps(payload, ensure_ascii=False).encode())
+                return [GenBlob(data=data, mime="application/json", kind="file",
+                                name="transcript.json")]
+            if mime == "text/plain":
+                return [GenBlob(data=response.content, mime="text/plain", kind="file",
+                                name="transcript.txt")]
+            raise RuntimeError("Venice returned an invalid transcription format")
+        if endpoint == "images" and mime == "application/json":
+            payload = await asyncio.to_thread(response.json)
+            images = payload.get("images") if isinstance(payload, dict) else None
+            if not isinstance(images, list) or len(images) != int(body.get("variants", 1)):
+                raise RuntimeError("Venice returned a different image count than requested")
+            blobs = []
+            for index, encoded in enumerate(images, 1):
+                if not isinstance(encoded, str):
+                    raise RuntimeError("Venice returned an invalid base64 image")
+                data = await asyncio.to_thread(base64.b64decode, encoded, validate=True)
+                blob = await asyncio.to_thread(self._binary_blob, data, "image/png", endpoint)
+                blob.name = f"image-{index}" + os.path.splitext(blob.name)[1]
+                blobs.append(blob)
+            return blobs
+        return [await asyncio.to_thread(self._binary_blob, response.content, mime,
+                                        endpoint, body.get("response_format"))]
+
+    async def _retrieve(self, client, req: NormalizedRequest, endpoint: str,
+                        queued: dict, max_wait: float, interval: float) -> list[GenBlob]:
+        prefix = self._ASYNC_PATHS[endpoint]
+        identity = {"model": queued["model"], "queue_id": queued["queue_id"]}
+        deadline = time.monotonic() + max_wait
+        while time.monotonic() < deadline:
+            response = await self._post(client, prefix + "/retrieve", identity,
+                                        max(0.1, deadline - time.monotonic()))
+            self._check_response(response, "retrieve")
+            mime = response.headers.get("content-type", "").split(";", 1)[0].lower()
+            if mime != "application/json":
+                blobs = [await asyncio.to_thread(self._binary_blob, response.content, mime, endpoint)]
+                break
+            status = await asyncio.to_thread(response.json)
+            if not isinstance(status, dict) or status.get("error"):
+                raise RuntimeError("Venice queue retrieval failed")
+            state = str(status.get("status") or "").upper()
+            if state == "COMPLETED":
+                url = queued.get("download_url") or status.get("download_url") or status.get("url")
+                if not url:
+                    raise RuntimeError("Venice completed queue has no download URL")
+                if req.cloud_trace.get("download_url") != url:
+                    req.cloud_trace["download_url"] = url
+                    self._persist(req)
+                asset = await self._asset(client, url)
+                blobs = [await asyncio.to_thread(self._binary_blob, asset.content,
+                    asset.headers.get("content-type", ""), endpoint)]
+                break
+            if state not in ("PROCESSING", "QUEUED", "PENDING"):
+                raise RuntimeError("Venice returned an unknown or failed queue status")
+            if req.job_id:
+                self.ctx.note_progress(req.job_id, {"basis": "live", "backend": self.name,
+                                                   "status": state.lower()})
+            await asyncio.sleep(interval)
+        else:
+            raise RuntimeError("Venice queue did not finish within max_wait; it may still be running")
+        # This is deletion, NOT cancellation. Failed/cancelled/download-lost jobs
+        # retain their queue and URL so the paid result can still be recovered.
+        try:
+            cleanup = await self._post(client, prefix + "/complete", identity, _CLOUD_HTTP_TIMEOUT)
+            self._check_response(cleanup, "cleanup")
+        except Exception:
+            # Bytes are already validated locally; cleanup failure cannot discard them.
+            req.cloud_trace["cleanup_failed"] = True
+            self._persist(req)
+        return blobs
+
+    @staticmethod
+    def _build_body(cand: dict, values: dict, images: dict, files: dict) -> dict:
+        """Runs wholly in a worker: decoded image bounds precede the paid POST."""
+        dimensions = {}
+        if images and venice.image_constraints(cand):
+            from io import BytesIO
+            from PIL import Image
+            try:
+                for name, data in images.items():
+                    with Image.open(BytesIO(data)) as image:
+                        image.load()
+                        dimensions[name] = image.size
+            except Exception as error:
+                raise venice.INPUT_ERROR("Venice reference image cannot be decoded") from error
+        return venice.build_request(cand, values, images, files, image_dimensions=dimensions)
+
+    async def generate(self, req: NormalizedRequest) -> GenOutput:
+        cand = {"model": req.real_model, venice.KIND: req.cloud or {}}
+        endpoint = venice.endpoint_of(cand)
+        metadata = self.model_catalogs.get(endpoint, {}).get(req.real_model)
+        if metadata is None:
+            raise venice.INPUT_ERROR(f"Venice model is unavailable for {endpoint}")
+        # Snapshot before the first await: a failed refresh must never erase the
+        # metadata preflight is about to use for this request.
+        cand["model_metadata"] = metadata
+        values = {**(req.inputs or {}), **(req.params or {})}
+        await asyncio.to_thread(venice.validate_request, cand, values,
+            (req.upload_images or {}).keys(), (req.upload_files or {}).keys(),
+            model_meta=metadata)
+        body = await asyncio.to_thread(self._build_body, cand, values,
+                                       req.upload_images or {}, req.upload_files or {})
+        max_wait = float(self.backend.get("max_wait", venice.MAX_WAIT_DEFAULT))
+        interval = float(self.backend.get("poll_interval", venice.POLL_INTERVAL_DEFAULT))
+        audio = (req.upload_files or {}).get("input_audio")
+        if audio is not None:
+            original_name, audio_data = audio
+            prefix = req.upload_prefix or "gw_" + (req.job_id or uuid.uuid4().hex)
+            prefix = re.sub(r"[^A-Za-z0-9_-]", "_", prefix)
+            audio = (prefix + "_input_audio" + os.path.splitext(original_name)[1].lower(),
+                     audio_data)
+        started = time.monotonic()
+        if not req.slot_held:
+            self.ctx.inflight_inc(self.bid)
+        try:
+            async with _pooled_client(self.ctx) as client:
+                if endpoint == "speech" and audio is not None:
+                    response = await self._post(client, "/v1/audio/voices",
+                                                {"model": req.real_model}, max_wait, audio)
+                    self._check_response(response, "voice upload")
+                    voice = await asyncio.to_thread(response.json)
+                    if (not isinstance(voice, dict) or not isinstance(voice.get("id"), str)
+                            or not voice["id"].startswith("vv_")
+                            or voice.get("model") != req.real_model):
+                        raise RuntimeError("Venice returned an invalid cloned voice handle")
+                    body["voice"] = voice["id"]
+                    req.cloud_trace["voice_id"] = voice["id"]
+                    self._persist(req)
+                req.cloud_trace.update(backend=self.name, cloud=venice.KIND,
+                    endpoint=endpoint, model=req.real_model, create_unconfirmed=True,
+                    request=venice.request_summary(body))
+                try:
+                    response = await self._post(client, venice.submit_path(endpoint, body), body,
+                        max_wait, audio if endpoint in ("transcription", "voice-changer") else None)
+                except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
+                    req.cloud_trace.pop("create_unconfirmed", None)
+                    raise
+                except asyncio.CancelledError:
+                    self._persist(req)
+                    raise
+                except (httpx.HTTPError, ConnectionError, TimeoutError) as error:
+                    self._persist(req)
+                    raise RuntimeError("Venice submit outcome is uncertain; generation will not be retried") from error
+                if not 200 <= response.status_code < 300:
+                    self._persist(req)
+                    self._check_response(response, "generation")
+                try:
+                    if endpoint in self._ASYNC_PATHS:
+                        queued = await asyncio.to_thread(response.json)
+                        if not isinstance(queued, dict) or not isinstance(queued.get("queue_id"), str) or not queued["queue_id"]:
+                            raise RuntimeError("Venice returned no queue id")
+                        # Persist the ID even when the rest of the queue envelope is
+                        # malformed: it is the only handle for recovering a paid job.
+                        self._note_task(req, queued["queue_id"], endpoint, body)
+                        req.cloud_trace["queue_id"] = queued["queue_id"]
+                        req.cloud_trace.pop("create_unconfirmed", None)
+                        req.cloud_trace["model"] = queued.get("model") or req.real_model
+                        if queued.get("download_url") is not None:
+                            req.cloud_trace["download_url"] = queued["download_url"]
+                        self._persist(req)
+                        if queued.get("model") != req.real_model:
+                            raise RuntimeError("Venice returned a different queue model")
+                        blobs = await self._retrieve(client, req, endpoint, queued,
+                            max_wait - (time.monotonic() - started), interval)
+                    else:
+                        blobs = await self._sync_blobs(response, endpoint, body)
+                        req.cloud_trace.pop("create_unconfirmed", None)
+                except Exception as error:
+                    self._persist(req)
+                    # No transport exception after submit may escape to failover.
+                    raise RuntimeError(f"Venice {endpoint} result failed after paid submit: "
+                                       f"{self._redact(str(error))}") from error
+        finally:
+            if not req.slot_held:
+                self.ctx.inflight_dec(self.bid)
+            if req.job_id:
+                self.ctx.note_progress(req.job_id, None)
+        meta = {**req.cloud_trace, "ai_model": req.real_model,
+                "elapsed_ms": int((time.monotonic() - started) * 1000)}
+        return GenOutput(blobs=blobs, meta=meta)
+
+
+class VeniceAdapter(OpenAIAdapter):
+    """One account and concurrency identity for text, speech, embeddings and media."""
+
+    type = venice.KIND
+    serves_generation = True
+    cloud = True
+    bills = True
+    _CATALOG_TYPES = ("text", "tts", "embedding", "image", "inpaint", "upscale",
+                      "video", "music", "asr")
+    _MEDIA_CATALOGS = {"image": "images", "inpaint": "edit", "upscale": "upscale",
+                       "video": "video", "asr": "transcription"}
+
+    def __init__(self, backend: dict, ctx: AdapterContext):
+        super().__init__(backend, ctx)
+        self._media = VeniceMediaAdapter(backend, ctx)
+        self.model_catalogs: dict[str, dict[str, dict]] = {}
+        self.display_media_catalogs: dict[str, dict[str, dict]] = {}
+        self.account_info = venice.normalize_account_info(None)
+
+    def discovery_interval_default(self) -> Optional[float]:
+        return CLOUD_CATALOG_INTERVAL_S
+
+    @staticmethod
+    def _pricing(model: dict, kind: str) -> Optional[dict]:
+        if kind not in ("text", "embedding"):
+            return None
+        spec = model.get("model_spec") or {}
+        pricing = spec.get("pricing") or {}
+        if not isinstance(pricing, dict):
+            return None
+
+        def usd(key):
+            value = pricing.get(key)
+            value = value.get("usd") if isinstance(value, dict) else None
+            if isinstance(value, bool) or value is None:
+                return None
+            try:
+                number = float(value)
+            except (ValueError, TypeError):
+                return None
+            return number if math.isfinite(number) and number >= 0 else None
+
+        inp, out = usd("input"), usd("output")
+        if inp is None or (kind == "text" and out is None):
+            return None
+        result = {"input": inp, "output": out if kind == "text" else 0.0}
+        cache = usd("cache_input")
+        if cache is not None:
+            result["cache_read"] = cache
+        return result
+
+    def _filtered(self, kind: str, metadata: dict) -> dict:
+        kept = filter_models(set(metadata), self.backend)
+        if kind == "text":
+            kept = {mid for mid in kept if metadata[mid].get("type", "text") == "text"}
+            if self.backend.get("serverless_only"):
+                kept = {mid for mid in kept if (price := self._pricing(metadata[mid], kind))
+                        and (price["input"] or price["output"])}
+        return {mid: metadata[mid] for mid in kept}
+
+    def _publish_catalogs(self, catalogs: dict) -> None:
+        self.model_catalogs = catalogs
+        media = {endpoint: catalogs[endpoint] for endpoint in venice.ENDPOINTS if endpoint in catalogs}
+        self._media.model_catalogs = media
+        if catalogs:
+            self.display_media_catalogs = media
+
+    def _parse_snapshot(self, responses: list) -> tuple[Capabilities, dict]:
+        catalogs, pricing, context = {}, {}, {}
+        for kind, response in zip(self._CATALOG_TYPES, responses):
+            payload = response.json()
+            rows = payload.get("data") if isinstance(payload, dict) else payload
+            if not isinstance(rows, list):
+                raise ValueError(f"Venice {kind} catalog has no model list")
+            metadata = {}
+            for row in rows:
+                if (not isinstance(row, dict) or not isinstance(row.get("id"), str)
+                        or not row["id"].strip()
+                        or not isinstance(row.get("model_spec", {}), dict)):
+                    raise ValueError(f"Venice {kind} catalog has an invalid model entry")
+                if row.get("type", kind) != kind:
+                    continue
+                metadata[row["id"]] = row
+            metadata = self._filtered(kind, metadata)
+            if kind in ("text", "tts", "embedding"):
+                catalogs[kind] = metadata
+                for mid, row in metadata.items():
+                    price = self._pricing(row, kind)
+                    if price is not None:
+                        pricing[mid] = price
+                    spec = row.get("model_spec") or {}
+                    size = (row.get("context_length") or spec.get("availableContextTokens")
+                            if kind == "text" else spec.get("maxInputTokens")
+                            if kind == "embedding" else None)
+                    if isinstance(size, (int, float)) and not isinstance(size, bool) and size > 0:
+                        context[mid] = int(size)
+                if kind == "tts":
+                    catalogs["speech"] = metadata
+            elif kind == "music":
+                catalogs["music"] = {mid: row for mid, row in metadata.items()
+                                     if not (row.get("model_spec") or {}).get("voice_changer")}
+                catalogs["voice-changer"] = {mid: row for mid, row in metadata.items()
+                                             if (row.get("model_spec") or {}).get("voice_changer")}
+            else:
+                catalogs[self._MEDIA_CATALOGS[kind]] = metadata
+        operation = {"background-remove": {
+            "id": "background-remove", "type": "operation",
+            "model_spec": {"name": "Background removal (fixed operation)"}}}
+        catalogs["background-remove"] = self._filtered("background-remove", operation)
+        models = set().union(*(set(metadata) for metadata in catalogs.values()))
+        return Capabilities(models=models, pricing=pricing, context=context), catalogs
+
+    @staticmethod
+    def _parse_account_info(response) -> dict:
+        checked_at = time.time()
+        try:
+            response.raise_for_status()
+            return venice.normalize_account_info(response.json(), checked_at)
+        except httpx.HTTPStatusError:
+            error = f"HTTP {response.status_code}"
+        except Exception:
+            error = "unavailable"
+        return {**venice.normalize_account_info(None, checked_at), "error": error}
+
+    async def _discover_account_info(self, client: httpx.AsyncClient, base: str) -> dict:
+        try:
+            response = await client.get(base + "/v1/api_keys/rate_limits",
+                headers=self.ctx.auth_headers(self.backend), timeout=_NANOGPT_DISCOVERY_TIMEOUT)
+        except Exception:
+            # Optional account metadata must never make healthy model discovery fail.
+            return {**venice.normalize_account_info(None, time.time()), "error": "unavailable"}
+        info = await asyncio.to_thread(self._parse_account_info, response)
+        key = (self.backend.get("api_key") or "").strip()
+        if key and key in info.get("api_tier", ""):
+            info.pop("api_tier", None)
+        return info
+
+    async def discover(self, client: httpx.AsyncClient) -> Capabilities:
+        try:
+            base = (self.backend.get("url") or venice.URL).rstrip("/")
+            responses = await asyncio.gather(*(
+                client.get(base + "/v1/models", params={"type": kind},
+                    headers=self.ctx.auth_headers(self.backend), timeout=_NANOGPT_DISCOVERY_TIMEOUT)
+                for kind in self._CATALOG_TYPES),
+                self._discover_account_info(client, base), return_exceptions=True)
+            account_info = responses.pop()
+            if isinstance(account_info, BaseException):
+                raise account_info
+            # Publish only a settled account result, including when catalogs fail.
+            # A failure replaces prior inclusion/balances, never stale assurance.
+            self.account_info = account_info
+            for response in responses:
+                if isinstance(response, BaseException):
+                    raise response
+                response.raise_for_status()
+            caps, catalogs = await asyncio.to_thread(self._parse_snapshot, responses)
+        except BaseException:
+            self._publish_catalogs({})
+            raise
+        self._publish_catalogs(catalogs)
+        return caps
+
+    def adopt_state(self, old: BackendAdapter) -> None:
+        if (not isinstance(old, VeniceAdapter)
+                or old.backend.get("url") != self.backend.get("url")
+                or old.backend.get("api_key") != self.backend.get("api_key")):
+            return
+        self.account_info = copy.deepcopy(old.account_info)
+        for source, display_only in ((old.model_catalogs, False), (old.display_media_catalogs, True)):
+            catalogs = {kind: self._filtered(kind, metadata)
+                        for kind, metadata in copy.deepcopy(source).items()}
+            if display_only:
+                self.display_media_catalogs = catalogs
+            else:
+                self._publish_catalogs(catalogs)
+
+    def adopt_discovery(self, old: BackendAdapter) -> None:
+        self.adopt_state(old)
+
+    async def dispatch(self, req: NormalizedRequest):
+        kind = ("tts" if req.path.startswith("/v1/audio/speech") else
+                "embedding" if req.path.startswith("/v1/embeddings") else "text")
+        if (req.real_model not in self.model_catalogs.get(kind, {})
+                and req.real_model not in parse_model_filter(self.backend.get("models_extra"))):
+            raise venice.INPUT_ERROR(f"Venice model is unavailable for {kind}")
+        return await super().dispatch(req)
+
+    async def generate(self, req: NormalizedRequest) -> GenOutput:
+        return await self._media.generate(req)
+
+
 # ── Meshy.ai (cloud image → 3D) ───────────────────────────────────────────────
 
 _MESHY_API = "/openapi/v1"
@@ -5724,6 +6300,7 @@ class RunpodAdapter(ComfyUIAdapter):
 ADAPTERS: dict[str, type[BackendAdapter]] = {
     "openai": OpenAIAdapter,
     "nanogpt": NanoGPTAdapter,
+    "venice": VeniceAdapter,
     "anthropic": AnthropicAdapter,
     "comfyui": ComfyUIAdapter,
     "meshy": MeshyAdapter,

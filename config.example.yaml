@@ -198,6 +198,17 @@ backends:
   #   max_wait: 1800
   #   poll_interval: 5
 
+  # Venice: keep an existing chat backend's name/key and change type to venice.
+  # Discovers text, TTS, embeddings, images/edits/upscale, video, music and ASR.
+  # Media models are directly callable in Playground; no workflow/alias required.
+  # - name: venice
+  #   type: venice
+  #   url: https://api.venice.ai/api
+  #   api_key: "<Venice API key>"
+  #   max_concurrent: 2                # one account cap for chat and media; always paid
+  #   max_wait: 1800
+  #   poll_interval: 5
+
   # - name: anthropic-sub               # Claude Code frontdoor — see README
   #   type: anthropic                   # reachable through /v1/messages ONLY
   #   url: https://api.anthropic.com

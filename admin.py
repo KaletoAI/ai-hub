@@ -1097,7 +1097,7 @@ def _select(name: str, options: list, selected=None) -> str:
 
 
 _TASK_OPTIONS = ("text2img", "img2img", "text2vid", "img2vid", "text2mesh", "img2mesh",
-                 "mesh2mesh", "mesh2rig", "text2audio")
+                 "mesh2mesh", "mesh2rig", "text2audio", "audio2audio", "audio2text")
 # JS that shows the Video section (fps/frames) only for a video task, driven by the
 # task dropdown; matched loosely so img2vid / img2video / text2video all count.
 _TASK_VIDEO_JS = ("var v=document.getElementById('gw-video');"
@@ -1266,7 +1266,7 @@ def _media_tag(src: str, mime: str = "", kind: str = "", cls: str = "",
         return (head + f'<model-viewer{c} style="{box}" src="{src}" camera-controls auto-rotate '
                 f'shadow-intensity="1" interaction-prompt="none" '
                 f'ar-status="not-presenting"></model-viewer>')
-    if k == "file":                                   # non-previewable artifact (fbx/obj/…) → download
+    if k == "file" or m.startswith("text/") or m == "application/json":
         return _dl_card(src, cls=cls)
     return f'<img{c}{s} src="{src}">'
 
@@ -1349,6 +1349,8 @@ def _type_badge(t: str) -> str:
         return _badge(t, "img", "ArliAI SDNext image generation (subscription)")
     if t == "nanogpt":
         return _badge("NanoGPT", "llm", "NanoGPT text, speech, embeddings, images, video and 3D (paid)")
+    if t == "venice":
+        return _badge("Venice", "llm", "Venice text, embeddings, images, video and audio (API account billing)")
     if t in adapters.CLOUD_TYPES:
         mod = adapters.cloud_module(t)
         return _badge(f"☁ {t}", "img", f"{mod.VENDOR} cloud mesh generation (paid, per task)")
@@ -1823,6 +1825,8 @@ def _type_tab_label(t: str) -> str:
         return "ArliAI Images"
     if t == "nanogpt":
         return "NanoGPT"
+    if t == "venice":
+        return "Venice"
     if t in adapters.CLOUD_TYPES:
         return "Cloud task API"
     if t == "anthropic":
@@ -1992,6 +1996,8 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
               "<b>paid</b>. <b>arliai</b> = ArliAI SDNext image generation; its LLM API uses "
               "<b>openai</b>. <b>nanogpt</b> = NanoGPT text, TTS, embeddings, images, video "
               "and 3D with one API key (always <b>paid</b>). "
+              "<b>venice</b> = Venice text, embeddings, images, video and audio with one "
+              "API key (API account billing; web Pro inclusion does not imply free API usage). "
               "<b>anthropic</b> = api.anthropic.com for Claude Code, reachable through "
               "<code>/v1/messages</code> only.</p>"
             # A managed host's backend has a DERIVED url (its tunnel port) — readonly,
@@ -2067,7 +2073,7 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
               "and the whitelist cannot bring it back, because it only ever subtracts. Added after "
               "the filter, and only once discovery has succeeded. A typo here is silent: the id "
               "routes, and the backend rejects it.</p>"
-            + f'<div id="llmopts" style="{"" if cur_type in ("openai", "nanogpt") else "display:none"}">'
+            + f'<div id="llmopts" style="{"" if cur_type == "openai" or cur_type in adapters.DYNAMIC_CATALOG_TYPES else "display:none"}">'
             + '<div class="grouphdr">LLM</div>'
             + _field("discovery filters",
                      _checkbox("chat_only", gb("chat_only"), "chat_only",
@@ -2110,7 +2116,7 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
 
             # ── Behavior ──────────────────────────────────────────────────────────
             + pane("behavior")
-            + _btype_block("openai nanogpt", cur_type,
+            + _btype_block("openai " + " ".join(sorted(adapters.DYNAMIC_CATALOG_TYPES)), cur_type,
                            _field("prompt cache passthrough",
                                   _checkbox("prompt_cache", gb("prompt_cache"), "prompt_cache"))
                            + "<p class='hint'><b>prompt_cache</b>: keep Claude Code's cache breakpoints "
@@ -2196,7 +2202,7 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
             + '<div class="grouphdr">Cloud task API</div>'
             + _field("max wait s", _inp("cloud_max_wait", g("max_wait"), typ="number",
                      placeholder=num(cmod.MAX_WAIT_DEFAULT) if cmod else "900"))
-            + _btype_block("meshy tripo nanogpt", cur_type,
+            + _btype_block("meshy tripo " + " ".join(sorted(adapters.DYNAMIC_CATALOG_TYPES)), cur_type,
                            _field("poll interval s", _inp("cloud_poll_interval", g("poll_interval"),
                                   typ="number", step="0.5",
                                   placeholder=num(cmod.POLL_INTERVAL_DEFAULT) if cmod else "5")))
@@ -2289,12 +2295,13 @@ def _type_select(current: str) -> str:
     urls = _esc(_js_json(_provider_urls()))
     cloud = _esc(_js_json(sorted(adapters.CLOUD_TYPES)))
     bill = _esc(_js_json(sorted(adapters.BILLING_TYPES)))
+    text_types = _esc(_js_json(["openai"] + sorted(adapters.DYNAMIC_CATALOG_TYPES)))
     return ('<select name="type" onchange="var t=this.value,providerUrls=' + urls
-            + ",cloud=" + cloud + ",bill=" + bill + ","
+            + ",cloud=" + cloud + ",bill=" + bill + ",textTypes=" + text_types + ","
             "l=document.getElementById('llmopts'),c=document.getElementById('comfyopts'),"
             "m=document.getElementById('cloudopts'),a=document.getElementById('anthopts'),"
             "u=document.querySelector('input[name=url]'),p=document.querySelector('input[name=paid]');"
-            "if(l)l.style.display=(t==='openai'||t==='nanogpt')?'':'none';"
+            "if(l)l.style.display=textTypes.indexOf(t)>=0?'':'none';"
             "if(c)c.style.display=t==='comfyui'?'':'none';"
             "if(m)m.style.display=cloud.indexOf(t)>=0?'':'none';"
             "if(a)a.style.display=t==='anthropic'?'':'none';"
@@ -2527,6 +2534,8 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
             cr = f" · credits {b['credits']}"
             if b.get("credits_at"):
                 cr += f" ({_age(b['credits_at'])} ago)"
+        if b.get("type") == "venice" or b.get("billing") is not None:
+            cr += " · " + _billing_summary(_backend_billing(b))
         # llama-swap: what is loaded right now — the model a `<backend>/current` call gets
         ld = (f" · loaded {_loaded_text(b['loaded'], html=False)}"
               if isinstance(b.get("loaded"), list) else "")
@@ -2588,7 +2597,9 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
                  f'{_btn("Scan network", kind="secondary", submit=True)}</form></div>'
                  + msg_html
                  + f"<p class='hint'>Edit a backend to manage it here (editing a config one creates an "
-                 f"editable copy that overrides it).</p>{items}"
+                 f"editable copy that overrides it).</p>"
+                 + (_BILLING_LEGEND if any(_backend_billing(b) is not None for b in binfo) else "")
+                 + items
                  + _managed_hosts_section(tviews)
                  + _runpod_volumes_section(vviews)
                  + _hosts_panel(binfo, "" if qp.get("new") else qp.get("host", ""), tviews)
@@ -5457,6 +5468,64 @@ def _chat_summary(value) -> str:
     return "—"
 
 
+def _backend_billing(backend: dict) -> Optional[dict]:
+    billing = backend.get("billing")
+    return billing if isinstance(billing, dict) else (
+        {"state": "unknown"} if backend.get("type") == "venice" else None)
+
+
+def _billing_marker(accounts: list) -> str:
+    """A sign is definitive only when every possible account confirms the same state."""
+    if not any(isinstance(account, dict) for account in accounts):
+        return ""
+    states = {account.get("state", "unknown") if isinstance(account, dict) else "other"
+              for account in accounts}
+    if len(states) != 1:
+        return "[mixed]"
+    return {"credits": "[C]", "included": "[I]"}.get(next(iter(states)), "[?]")
+
+
+def _billing_description(marker: str) -> str:
+    return {"[C]": "[C] API credits / account funds consumed",
+            "[I]": "[I] API included (confirmed no-charge account)",
+            "[?]": "[?] API billing unknown",
+            "[mixed]": "[mixed] billing depends on the selected backend / account"}.get(marker, "")
+
+
+_BILLING_LEGEND = (
+    "<p class='hint'>Venice API: <b>[C]</b> credits / account funds consumed; "
+    "<b>[I]</b> included only when the API account confirms no charge; "
+    "<b>[?]</b> billing unknown. <b>[mixed]</b> depends on the backend / account; "
+    "no free-usage assurance. Pro web included use does not imply free API usage. "
+    "Signs describe API account billing, not model prices or web Pro eligibility.</p>")
+
+
+def _billing_summary(billing: Optional[dict]) -> str:
+    billing = billing or {"state": "unknown"}
+    text = _billing_description(_billing_marker([billing]))
+    balances = billing.get("balances") or {}
+    for key, label, multiplier in (("BUNDLED_CREDITS", "bundled credits", 100),
+                                    ("USD", "cash USD", 1), ("DIEM", "DIEM", 1)):
+        value = balances.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
+            amount = format(value * multiplier, ".8g")
+            text += " · available " + (
+                amount + " credits (bundled)" if key == "BUNDLED_CREDITS" else label + " " + amount)
+        else:
+            text += " · " + label + " unavailable"
+    if billing.get("checked_at"):
+        text += " (" + _age(billing["checked_at"]) + " ago)"
+    return text
+
+
+def _model_datalist(dlid: str, models: list, markers: dict) -> str:
+    options = []
+    for model in models:
+        label = model + (" " + markers[model] if markers.get(model) else "")
+        options.append(f'<option value="{_esc(model)}" label="{_esc(label)}"></option>')
+    return f'<datalist id="{_esc(dlid)}">' + "".join(options) + "</datalist>"
+
+
 def _datalist(dlid: str, models: list) -> str:
     return f'<datalist id="{_esc(dlid)}">' + "".join(f'<option value="{_esc(m)}">' for m in models) + "</datalist>"
 
@@ -5778,6 +5847,27 @@ def _chat_models() -> list:
     return out
 
 
+def _chat_billing_markers(llm: list, models: list) -> dict:
+    """Resolve all alias routes, never borrow only an alias's first account."""
+    aliases = dict(_config_chat_aliases())
+    if store.is_active():
+        aliases.update(store.list_chat_aliases())
+    by_name = {b["name"]: b for b in llm if b.get("type") != "anthropic"}
+    markers = {}
+    for model in models:
+        alias = aliases.get(model)
+        if isinstance(alias, dict):
+            accounts = [_backend_billing(by_name.get(name, {})) for name in alias]
+        else:
+            target = alias if isinstance(alias, str) else model
+            accounts = [_backend_billing(b) for b in by_name.values()
+                        if target in b.get("models", [])
+                        or (alias is None and target.startswith(b["name"] + "/")
+                            and target[len(b["name"]) + 1:] in b.get("models", []))]
+        markers[model] = _billing_marker(accounts)
+    return markers
+
+
 async def _self_api(request: Request, method: str, path: str, **kw) -> httpx.Response:
     """Call the gateway's OWN API as a real client — the playground contract: they
     exist to TEST the API, so they go through it (auth, routing, parking, reasoning,
@@ -5809,22 +5899,42 @@ def _chatplay_form(vals: dict) -> str:
     llm = _llm_backends()
     bk_models = {b["name"]: sorted(b.get("models", [])) for b in llm}   # bare model ids per backend
     all_models = _chat_models()                                         # aliases + bare + backend/model
+    bk_markers = {b["name"]: {m: _billing_marker([_backend_billing(b)])
+                            for m in b.get("models", [])} for b in llm}
+    all_markers = _chat_billing_markers(llm, all_models)
     cur_bk = v("backend")
     init_models = bk_models[cur_bk] if (cur_bk in bk_models) else all_models   # pre-filter if a backend is picked
+    init_markers = bk_markers[cur_bk] if cur_bk in bk_markers else all_markers
+    selected_billing = _billing_description(init_markers.get(v("model"), "[?]")) if v("model") else ""
     # Backend picker (manual, so it can filter the model datalist on change without a reload).
     opts = f'<option value=""{"" if cur_bk else " selected"}>— all backends (scheduler picks) —</option>'
     for n in bk_models:
         opts += f'<option{" selected" if n == cur_bk else ""}>{_esc(n)}</option>'
     bk_select = f'<select name="backend" onchange="cpFilterModels(this.value)">{opts}</select>'
-    filt_js = ("<script>var CP_BK=%s,CP_ALL=%s;function cpFilterModels(bk){"
+    filt_js = ("<script>var CP_BK=%s,CP_ALL=%s,CP_BILL_BK=%s,CP_BILL_ALL=%s,CP_BILL_TEXT=%s;"
+               "function cpUpdateBilling(){"
+               "var model=document.querySelector('form[action=\"/ui/chatplay/send\"] [name=\"model\"]'),"
+               "backend=document.querySelector('form[action=\"/ui/chatplay/send\"] [name=\"backend\"]'),"
+               "out=document.getElementById('cpbilling');if(!model||!backend||!out)return;"
+               "var marks=backend.value&&CP_BILL_BK[backend.value]?CP_BILL_BK[backend.value]:CP_BILL_ALL;"
+               "var mark=Object.prototype.hasOwnProperty.call(marks,model.value)?marks[model.value]:'[?]';"
+               "out.textContent=model.value?(CP_BILL_TEXT[mark]||''):'';}"
+               "function cpFilterModels(bk){"
                "var dl=document.getElementById('cpmodels');if(!dl)return;"
-               "var ms=(bk&&CP_BK[bk])?CP_BK[bk]:CP_ALL;"
-               "dl.innerHTML=ms.map(function(m){var o=document.createElement('option');o.value=m;"
-               "return o.outerHTML;}).join('');}</script>") % (_js_json(bk_models), _js_json(all_models))
+               "var ms=(bk&&CP_BK[bk])?CP_BK[bk]:CP_ALL,"
+               "marks=(bk&&CP_BILL_BK[bk])?CP_BILL_BK[bk]:CP_BILL_ALL;"
+               "dl.innerHTML='';ms.forEach(function(m){var o=document.createElement('option');o.value=m;"
+               "o.label=m+(marks[m]?' '+marks[m]:'');dl.appendChild(o);});cpUpdateBilling();}"
+               "</script>") % (
+                   _js_json(bk_models), _js_json(all_models), _js_json(bk_markers), _js_json(all_markers),
+                   _js_json({m: _billing_description(m) for m in ("[C]", "[I]", "[?]", "[mixed]")}))
     return ('<form action="/ui/chatplay/send" method="post" onsubmit="return cpSending(this)">'
             f'<div class="formbar"><h2>Chat Playground</h2>{_btn("Send", submit=True)}</div>'
             + _field("backend", bk_select, short=True)
-            + _field("model", _dl_input("model", v("model"), "cpmodels", "alias or model id"), short=True)
+            + _field("model", _dl_input("model", v("model"), "cpmodels", "alias or model id").replace(
+                '<input ', '<input oninput="cpUpdateBilling()" onchange="cpUpdateBilling()" ', 1), short=True)
+            + f'<p class="hint"><span id="cpbilling">{_esc(selected_billing)}</span></p>'
+            + (_BILLING_LEGEND if any(_backend_billing(b) is not None for b in llm) else "")
             + _field("system", _textarea("system", v("system"), 2, "optional system prompt"))
             + _field("message", _textarea("user", v("user"), 6, "your message"))
             + _field("max tokens", _inp("max_tokens", v("max_tokens"), typ="number"), short=True)
@@ -5837,7 +5947,7 @@ def _chatplay_form(vals: dict) -> str:
               "<b>reasoning</b> sends the API's thinking switch (applied via the "
               "<a href='/ui/reasoning'>Reasoning</a> rules; auto = model default — an alias's own "
               "default applies only when calling the alias, not a backend/model form).</p>"
-            + "</form>" + _datalist("cpmodels", init_models) + filt_js + _CHATPLAY_JS)
+            + "</form>" + _model_datalist("cpmodels", init_models, init_markers) + filt_js + _CHATPLAY_JS)
 
 
 def _chatplay_body(vals: dict, result_html: str) -> str:
@@ -5943,7 +6053,7 @@ def _register_form(vals: Optional[dict] = None, err: str = "") -> str:
                 "file field.</p>") if err else "")
             + "<p class='hint'>The gateway <b>owns</b> the API JSON once registered — independent of "
             "later ComfyUI-GUI edits. You'll map fields after registering. For a <b>cloud</b> backend "
-            "(meshy, tripo, arliai, nanogpt) no JSON is needed — the alias is created with that vendor's defaults and "
+            "(meshy, tripo, arliai, nanogpt, venice) no JSON is needed — the alias is created with that vendor's defaults and "
             "edited next.</p>"
             + _field("alias", _inp("alias", v.get("alias", ""), placeholder="flux"))
             + _field("backend", _select("backend", backend_opts, v.get("backend")))
@@ -6907,10 +7017,10 @@ def _cloud_editor(kind: str, alias: str, cands: list, saved: bool = False, taken
         model = raw.get("cloud_model", "")
     model_control = _inp("cloud_model", model, placeholder="exact provider model id")
     schema_cand = cand
-    if kind == "nanogpt":
+    if kind in adapters.DYNAMIC_CATALOG_TYPES:
         backend_names = {c.get("backend") for c in cands}
         catalog = [row for row in _generation_models() if row.get("backend") in backend_names]
-        dlid = "nano-alias-models"
+        dlid = "nano-alias-models" if kind == "nanogpt" else kind + "-alias-models"
         suggestions = ""
         for row in catalog:
             discovered = row.get("candidate") or {}
@@ -6974,7 +7084,8 @@ def _cloud_editor(kind: str, alias: str, cands: list, saved: bool = False, taken
                       hint="Choose an exact discovered ID from this backend's catalog, or keep a stored ID. "
                            "The alias pins this model; client parameters cannot override it.")
                if dynamic_models else _field("ai model", _select("cloud_model", list(mod.AI_MODELS), model)))
-            + _option_rows(mod, opts, ep, {p["name"]: p for p in params} if kind == "nanogpt" else None)
+            + _option_rows(mod, opts, ep, {p["name"]: p for p in params}
+                           if kind in adapters.DYNAMIC_CATALOG_TYPES else None)
             + (_field("deliver formats", fmts) if fmts else "")
             + _field("retries", _inp("retries", str(retries), placeholder="blank = try all backends",
                                      typ="number"), short=True)
@@ -7608,6 +7719,7 @@ _PG_FILE_MIME = {"glb": "model/gltf-binary", "gltf": "model/gltf+json", "obj": "
                  "stl": "model/stl", "ply": "model/ply", "fbx": "model/fbx",
                  "mp4": "video/mp4", "webm": "video/webm", "mov": "video/quicktime",
                  "mp3": "audio/mpeg", "wav": "audio/wav", "ogg": "audio/ogg",
+                 "wave": "audio/wav", "oga": "audio/ogg",
                  "flac": "audio/flac", "m4a": "audio/mp4", "aac": "audio/aac"}
 
 
@@ -7677,16 +7789,33 @@ def _alias_defaults(cand: dict) -> dict:
 
 def _media_models() -> list:
     """Stored aliases win collisions with healthy, directly callable catalog IDs."""
-    rows = [{"id": name, "name": name, "group": "Aliases"}
-            for name in store.list_aliases()]
+    backend_meta = {(b["name"], adapters.backend_kind(b)): b
+                    for b in _gateway_info().get("backends", [])
+                    if b.get("type") in adapters.GEN_TYPES}
+    rows = [{"id": name, "name": name, "group": "Aliases",
+             "billing_marker": _billing_marker([
+                 _backend_billing(backend_meta.get((c.get("backend"), adapters.cand_kind(c)), {}))
+                 or ({"state": "unknown"} if adapters.cloud_kind(c) == "venice" else None)
+                 for c in candidates])}
+            for name, candidates in store.list_aliases().items()]
     seen = {row["id"] for row in rows}
-    modalities = {"images": "Images", "video": "Video", "3d": "3D"}
+    modalities = {"images": "Images", "image": "Images", "video": "Video", "3d": "3D",
+                  "audio": "Audio", "tts": "Speech", "asr": "Transcription"}
+
+    def modality(row):
+        cand = row.get("candidate") or {}
+        kind = adapters.cloud_kind(cand)
+        mod = adapters.cloud_module(kind) if kind else None
+        endpoint = row.get("endpoint", "")
+        return mod.generation_type(endpoint) if getattr(mod, "generation_type", None) else endpoint
+
+    order = {"images": 0, "image": 0, "video": 1, "3d": 2, "audio": 3, "tts": 4, "asr": 5}
     for row in sorted(_generation_models(), key=lambda r: (
-            str(r.get("backend", "")).lower(), {"images": 0, "video": 1, "3d": 2}.get(r.get("endpoint"), 3),
-            str(r.get("name", r.get("id", ""))).lower())):
+            str(r.get("backend", "")).lower(), order.get(modality(r), 6),
+            str(r.get("endpoint", "")), str(r.get("name", r.get("id", ""))).lower())):
         if row.get("id") and row["id"] not in seen:
             rows.append({**row, "group": str(row.get("backend", "")) + " · "
-                         + modalities.get(row.get("endpoint"), str(row.get("endpoint", "")))})
+                         + modalities.get(modality(row), str(row.get("endpoint", "")))})
             seen.add(row["id"])
     return rows
 
@@ -7737,6 +7866,11 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
             model_id, label = row["id"], row.get("name") or row["id"]
             if row.get("candidate") and row["candidate"].get("model") != label:
                 label += " (" + str(row["candidate"].get("model", model_id)) + ")"
+            marker = row.get("billing_marker") or _billing_marker([row.get("billing")])
+            if not marker and adapters.cloud_kind(row.get("candidate") or {}) == "venice":
+                marker = "[?]"
+            if marker:
+                label += " " + marker
             opts += (f'<option value="{_esc(model_id)}"'
                      f'{" selected" if model_id == vals.get("model") else ""}>{_esc(label)}</option>')
         opts += "</optgroup>"
@@ -7761,7 +7895,8 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
             # Same row as a ComfyUI mesh param (upload or an earlier job's artifact) —
             # WITHOUT the "path on the backend" field: Meshy/Tripo read the bytes out of
             # the request, there is no backend disk a path could point into.
-            acc = ",".join("." + a for a in (x.get("accept") or [])) or _PG_FILE_ACCEPT
+            acc = ",".join(a if "/" in a or a.startswith(".") else "." + a
+                           for a in (x.get("accept") or [])) or _PG_FILE_ACCEPT
             extra = (kept_badge(x["name"], show_name=True) if kept and x["name"] in kept else
                      ' <span class="muted">required</span>' if x.get("required") else "")
             rows += _field(x["name"], f'<input type="file" name="file__{_esc(x["name"])}" '
@@ -7784,7 +7919,7 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
                     choices.insert(0, (cur, cur or "model default"))
                 rows += _field(p["name"], _select(f"p__{p['name']}", choices, cur))
             elif p["type"] == "bool":
-                if adapters.cloud_kind(cand) == "nanogpt":
+                if adapters.cloud_kind(cand) in adapters.DYNAMIC_CATALOG_TYPES:
                     rows += _field(p["name"], _select(f"p__{p['name']}",
                                    [("", "model default"), ("true", "true"), ("false", "false")], cur.lower()))
                 else:
@@ -7865,6 +8000,10 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
     return ('<form action="/ui/playground/generate" method="post" enctype="multipart/form-data">'
             f'<div class="formbar"><h2>Media Playground</h2>{generate}</div>'
             + _field("model", alias_select)
+            + (_BILLING_LEGEND if any(
+                row.get("billing_marker") or row.get("billing") is not None
+                or adapters.cloud_kind(row.get("candidate") or {}) == "venice"
+                for row in aliases if isinstance(row, dict)) else "")
             + backend_field
             + notice
             + rows
@@ -7972,7 +8111,7 @@ async def playground_page(request: Request):
     for p in pnames:
         q = qp.get(f"p__{p}", "")
         vals[p] = q if q != "" else ("" if defaults.get(p) is None else str(defaults[p]))
-    if cand and adapters.cloud_kind(cand) == "nanogpt":
+    if cand and adapters.cloud_kind(cand) in adapters.DYNAMIC_CATALOG_TYPES:
         # Model changes carry compatible controls only. Refused POSTs bypass this
         # GET normalization and still re-render exactly as typed.
         for field in _pf:
@@ -8016,13 +8155,13 @@ async def generate(request: Request):
     model = str(f.get("model", ""))
     force_bk = str(f.get("backend", "")).strip()       # pin to one backend (testing per-backend)
     cand = _media_candidate(model)
-    bool_fields = set()
-    if cand and adapters.cloud_kind(cand) == "nanogpt":
+    schema_types = {}
+    if cand and adapters.cloud_kind(cand) in adapters.DYNAMIC_CATALOG_TYPES:
         params, _, _ = adapters.public_fields(cand)
-        bool_fields = {p["name"] for p in params if p.get("type") == "bool"}
+        schema_types = {p["name"]: p.get("type") for p in params}
     # dynamic request fields arrive as p__<param>. prompt/negative_prompt feed the
-    # request's inputs; everything else goes into params (numeric-coerced when it
-    # parses). The mapping in the alias decides which node each lands on.
+    # request's inputs; schema strings stay strings, even when they look numeric.
+    # Workflow fields without a typed catalog retain their existing numeric coercion.
     submitted = {k[len("p__"):]: str(f.get(k, "")) for k in f if k.startswith("p__")}
     body = {"model": model, "mode": "async", "params": {}}     # async → instant job id
     if force_bk:
@@ -8032,8 +8171,10 @@ async def generate(request: Request):
             continue
         if p in ("prompt", "negative_prompt"):
             body[p] = raw
-        elif p in bool_fields and raw.lower() in ("true", "false", "1", "0", "on", "off"):
+        elif schema_types.get(p) == "bool" and raw.lower() in ("true", "false", "1", "0", "on", "off"):
             body["params"][p] = raw.lower() in ("true", "1", "on")
+        elif schema_types.get(p) in ("string", "bool"):
+            body["params"][p] = raw
         else:
             body["params"][p] = _num(raw)
     # per-field uploads: images (img__<param>, empty → the 8×8 placeholder downstream,
@@ -8808,7 +8949,7 @@ def _job_thumbs(jid: str, kind: str, entries: list) -> str:
             cells += (f'<div><div class="fbxview" data-live-skip data-src="{_esc(src)}"{tex_attr} '
                       f'style="{box3d};background:#0c0e12;border:1px solid #313a46;border-radius:10px"></div>'
                       f"<div>{_dl_card(src, label, dl=dl, compact=True)}</div></div>")
-        elif mk == "file":                                # other file artifacts → download card
+        elif mk == "file" or m.startswith("text/") or m == "application/json":
             cells += _dl_card(src, label, dl=dl, mime=(r.get("mime") or "file"))
         else:
             cells += (f"<a href='{src}' target='_blank'><img src='{src}' style='{style}'></a>")

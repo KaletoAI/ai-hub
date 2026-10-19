@@ -386,15 +386,15 @@ Main preflights model/count/input errors before creating a job and leaves NanoGP
 video seconds intact. The OpenAI image shim does not invent workflow dimensions
 for this kind, and retains native quality/format controls and strict counts.
 
-`main._is_llm` and `_is_gen` overlap for NanoGPT. `_llm_models` positively selects
-the current text/TTS/embedding inventory (plus explicit extras), so clearing
+`main._is_llm` and `_is_gen` overlap for catalog providers (`DYNAMIC_CATALOG_TYPES`).
+`_llm_models` positively selects the current text/TTS/embedding inventory (plus explicit extras), so clearing
 catalog metadata during refresh cannot turn cached image IDs into chat models.
-Generation aliases still win; otherwise `_nano_direct_candidates` builds
+Generation aliases still win; otherwise `_catalog_direct_candidates` builds
 ephemeral candidates from current media metadata and runs them through the same
 health/drain/sync/busy/quarantine ordering. No alias rows are generated.
 `generation_models_info` and `generation_candidate` inject that inventory and
-fresh alias metadata into the console. `/v1/models` exposes six typed views;
-`@image` covers real direct media IDs without granting chat.
+fresh alias metadata into the console. `/v1/models` exposes typed views, including
+Venice `audio` and `asr`; `@image` covers direct media IDs without granting chat.
 `@chat` expands chat aliases only for LLM request gates, not for media requests
 sharing their names. Inventory checks consider both namespaces.
 The generation request gate explicitly enables media grants; chat dispatch cannot
@@ -416,6 +416,51 @@ collision with a saved migration target is refused instead of reassigning it.
 Generation backends activate jobs without aliases, including through console
 saves and YAML hot reload. `_activate_generation_jobs` retains the startup-only
 job DB/blob paths even when initialization was deferred on a text-only gateway.
+
+
+`VeniceAdapter` (`type: venice`) inherits OpenAI dispatch and composes an internal
+`VeniceMediaAdapter`, sharing `venice:<name>` slots with chat, TTS and embeddings.
+Nine unique `/v1/models?type=...` GETs publish one atomic catalog snapshot; speech
+and transcription job inventories reuse the TTS/ASR responses. Pending refreshes
+retain the last complete snapshot; failures clear callable metadata but keep the
+display-only media snapshot. Adoption requires the same URL/key and reapplies
+filters. Text discovery accepts Venice's `type: text`, not Together's `chat`;
+legacy chat/serverless flags affect only text. USD token pricing comes from
+`model_spec.pricing`, including `cache_input`; TTS character rates stay unknown
+to the token-cost calculator. Dispatch validates the selected protocol's catalog,
+so an image/music/ASR ID cannot become a chat request.
+
+An optional tenth GET, `/v1/api_keys/rate_limits`, publishes sanitized
+`account_info` alongside discovery. `venice.normalize_account_info` trusts exact
+`apiTier.isCharged` booleans, not model price, tier names or Pro web entitlement.
+Explicit charged=true yields `credits`; confirmed charged=false plus permitted
+access yields `included`; malformed/absent/failed information yields `unknown`.
+Balance failures are isolated from catalog health, and clear old billing assurance.
+Pending refresh keeps the prior snapshot; adoption deep-copies account state only
+for the same URL/key. Bundled-credit amounts are USD-denominated and displayed
+as credits at the documented 100:1 rate; cash and DIEM retain their own units.
+`_billing_info` injects this account state into backend and model views. Console
+markers `[C]`/`[I]`/`[?]` change labels, never routing values, including ES5 dynamic
+chat filtering. Mixed-provider/account aliases cannot inherit one included route's
+no-charge assurance. Scheduler paid tiers and quota behavior are unchanged.
+
+Venice synchronous native image endpoints return base64 JSON or verified binary
+images; multi-reference edits select `/image/multi-edit` with `modelId`.
+Music/video/voice-changer queue once, persist `queue_id`, model and any private
+download URL immediately, then POST retrieve until binary media or terminal JSON.
+Private/URL results download without bearer/cookies, including redirects.
+`complete` is deletion, NEVER cancellation, and runs only after valid local bytes
+exist. Only connect/pool failures before submit permit failover; HTTP errors,
+uncertain submissions, malformed results and post-submit poll/download failures
+are final. Cancellation preserves the paid trace and releases local slots without
+claiming the vendor stopped. No balance or currency conversion is inferred from
+generation results; account balances come only from the separate billing snapshot.
+Speech jobs optionally upload a supported reference to `/audio/voices` before
+speech generation; ASR uses multipart `/audio/transcriptions` and returns JSON/text
+artifacts. Cloud audio uploads are job-namespaced and MIME aliases round-trip to
+audio extensions explicitly instead of falling back to the mesh `.glb` suffix.
+Console numeric-looking schema strings remain strings; JSON/text artifacts are
+downloads, not image previews.
 
 
 **The build/execute/deliver seam** (`ComfyUIAdapter.generate`). What used to be one
@@ -751,6 +796,19 @@ overwriting the short-name control the user changed. Alias form numbers are fini
 and whole where required; invalid saves re-render as typed without changing the store.
 `test_arliai.py` and `test_arliai_console.py` guard pins, pixel boundaries,
 image decoding, uncertain submits, form persistence and unsupported input refusal.
+
+### `venice.py`
+
+Pure native Venice schemas/request helpers; no HTTP, main or adapters imports.
+It uses the same dynamic candidate/public-fields/options seam as NanoGPT, with
+endpoints for images, edits, upscale, background removal, video, music,
+voice conversion, speech and transcription. Background removal is a documented
+fixed operation with its own explicit operation ID and no upstream model field.
+Music entries advertised as voice-changer are separated from ordinary music.
+Catalog choices, bounds and required references drive preflight and the console;
+native seconds, format/variant controls, structured references and model pins are
+preserved. Unsupported masks, controls, credential/queue overrides, non-finite
+values and invalid input combinations are refused before billing.
 
 ### `nanogpt.py`
 
@@ -2385,7 +2443,7 @@ the optional worker's scientific dependencies are absent from the gateway venv.
 - **Generation** (`POST /v1/generations`, and the OpenAI shims
   `/v1/images/generations` + `/v1/images/edits`): `get_gen_routes(alias)` resolves
   an alias via the **separate** generation store (`image_models`/store), or a direct
-  NanoGPT media catalog ID when no alias exists, filtered to enabled+healthy backends
+  NanoGPT/Venice media catalog ID when no alias exists, filtered to enabled+healthy backends
   (`adapters.cand_kind` == `adapters.backend_kind`); LoRA-aware preference +
   busy→park. Everything the ROUTER reads off a candidate's workflow (image slots for the
   `images` filter and the shims, the params refusal, the schema) goes
@@ -2836,6 +2894,19 @@ Every test file also says this in its own docstring; this is the overview.
   both stored and typed values, and generation input refusals before a job exists.
 - `test_concurrency_group.py`: an account cap shared by chat and images, releases,
   independent groups, cap reloads, disabled/draining members and streams held to EOF.
+- `test_venice.py`: native parameter precedence, model pins, metadata bounds,
+  required/reference uploads, structured video inputs, secret/data redaction and
+  exact account-charge flags with finite, separately denominated balances.
+- `test_venice_adapter.py`: atomic typed catalogs, purpose gates, token prices,
+  synchronous/async/binary/private delivery, multipart audio, no rebilling after
+  uncertain submit, credential-free asset redirects, post-download cleanup,
+  optional balance-query failures and account-identity-safe state adoption.
+- `test_venice_routing.py`: alias-free media delivery, retained chat aliases,
+  modality grants, failed-refresh availability and native video durations.
+- `test_venice_console.py`: shared account controls, metadata-native forms,
+  optional false values, typed speech inputs, JSON/text result downloads, billing
+  signs with preserved model IDs, dynamic filtering, mixed-account assurances
+  and correctly denominated balances.
 - `test_nanogpt.py`: pinned models, current metadata-driven schemas and input limits,
   default/client/native precedence, explicit auto, finite JSON, video seconds,
   redacted media metadata and terminal result parsing.

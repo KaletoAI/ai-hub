@@ -32,7 +32,6 @@ import admin
 import anthropic_bridge
 import arliai
 import faults
-import nanogpt
 import jobs
 import reasoning
 import scheduler
@@ -406,17 +405,17 @@ def backend_id(backend: dict) -> str:
 
 
 def _is_gen(b: dict) -> bool:
-    """Supports generation; NanoGPT also supports the LLM protocol family."""
+    """Supports generation; catalog providers also support the LLM protocol family."""
     return b.get("type") in adapters.GEN_TYPES
 
 
 def _is_llm(b: dict) -> bool:
-    return b.get("type") == "nanogpt" or not _is_gen(b)
+    return b.get("type") in adapters.DYNAMIC_CATALOG_TYPES or not _is_gen(b)
 
 
 def _llm_models(b: dict) -> set:
     models = backend_models.get(backend_id(b), set())
-    if b.get("type") != "nanogpt":
+    if b.get("type") not in adapters.DYNAMIC_CATALOG_TYPES:
         return models
     catalogs = getattr(backend_adapters.get(backend_id(b)), "model_catalogs", {})
     text = set().union(*(set(catalogs.get(k, {})) for k in ("text", "tts", "embedding")))
@@ -888,8 +887,9 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
             backend_running.pop(bid, None)
         else:
             backend_running[bid] = running
-        if changed or backend.get("type") == "nanogpt" or had_running != (running is not None):
-            # NanoGPT's typed catalogs can repopulate with unchanged cached IDs after
+        if (changed or backend.get("type") in adapters.DYNAMIC_CATALOG_TYPES
+                or had_running != (running is not None)):
+            # Typed catalogs can repopulate with unchanged cached IDs after
             # restart, or after an index rebuild during discovery. Restore those routes too.
             rebuild_route_index()
         was_healthy = backend_healthy.get(bid, False)
@@ -1546,7 +1546,7 @@ def _model_allowed(user: dict, model: Optional[str], *, media: Optional[bool] = 
                            and (media is not False or grant != GRANT_ALL_IMAGE))
     if model in allow:                           # exact id / chat alias / image alias
         return True
-    if media is not False and GRANT_ALL_IMAGE in allow and (_gen_alias_exists(model) or _nano_direct_candidates(model)):
+    if media is not False and GRANT_ALL_IMAGE in allow and (_gen_alias_exists(model) or _catalog_direct_candidates(model)):
         return True
     bname, bare = split_backend_prefix(model)    # backend/model
     if bname and bname in allow:                 # whole-backend grant (prefixed request)
@@ -2832,7 +2832,7 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
             catalogs = getattr(backend_adapters.get(backend_id(backend)), "model_catalogs", {})
             for mid in sorted(_llm_models(backend)):
                 if typ:
-                    if backend.get("type") == "nanogpt":
+                    if backend.get("type") in adapters.DYNAMIC_CATALOG_TYPES:
                         key = {"chat": "text", "tts": "tts", "embedding": "embedding"}[typ]
                         known = any(mid in catalog for catalog in catalogs.values())
                         if mid not in catalogs.get(key, {}) and not (typ == "chat" and not known):
@@ -2871,7 +2871,7 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
                     _alias_context(alias, offered)))
 
     # Optional aliases retain precedence over directly discovered media IDs.
-    if typ in ("", "image", "video", "3d", "tts"):
+    if typ in ("", "image", "video", "3d", "tts", "audio", "asr"):
         img_aliases = (await asyncio.to_thread(store.list_aliases)
                        if store.is_active() else image_models)
         for alias, cands in img_aliases.items():
@@ -2883,7 +2883,7 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
                 data.append({"id": alias, "object": "model", "created": now,
                              "owned_by": f"ai-hub ({kind})"})
         for row in generation_models_info():
-            kind = "image" if row["endpoint"] == "images" else row["endpoint"]
+            kind = _generation_type(row["candidate"])
             mid = row["candidate"]["model"]
             disp = row["id"] if model_prefix else mid
             if row["id"] in img_aliases or disp in img_aliases or (typ and typ != kind):
@@ -3257,8 +3257,12 @@ def _gen_backend_for(name: str, cand: Optional[dict],
 
 
 def _generation_type(cand: dict) -> str:
-    if adapters.cand_kind(cand) == nanogpt.KIND:
-        endpoint = nanogpt.endpoint_of(cand)
+    kind = adapters.cand_kind(cand)
+    if kind in adapters.DYNAMIC_CATALOG_TYPES:
+        mod = adapters.cloud_module(kind)
+        endpoint = mod.endpoint_of(cand)
+        if hasattr(mod, "generation_type"):
+            return mod.generation_type(endpoint)
         return "image" if endpoint == "images" else endpoint
     task = str(cand.get("task") or "")
     if "vid" in task:
@@ -3268,17 +3272,18 @@ def _generation_type(cand: dict) -> str:
     return "tts" if "tts" in task or "audio" in task else "image"
 
 
-def _nano_direct_candidates(model: str, pool=None) -> list[dict]:
+def _catalog_direct_candidates(model: str, pool=None) -> list[dict]:
     """Resolve catalog IDs without writing aliases; explicit aliases win upstream."""
     bname, bare = split_backend_prefix(model)
     out = []
     for b in _gen_backends if pool is None else pool:
-        if b.get("type") != "nanogpt" or (bname is not None and b["name"] != bname):
+        if b.get("type") not in adapters.DYNAMIC_CATALOG_TYPES or (bname is not None and b["name"] != bname):
             continue
+        mod = adapters.cloud_module(b["type"])
         catalogs = getattr(backend_adapters.get(backend_id(b)), "model_catalogs", {})
-        for endpoint in ("images", "video", "3d"):
+        for endpoint in mod.ENDPOINTS:
             if bare in catalogs.get(endpoint, {}):
-                out.append(nanogpt.candidate_for(b["name"], bare, endpoint, catalogs[endpoint][bare]))
+                out.append(mod.candidate_for(b["name"], bare, endpoint, catalogs[endpoint][bare]))
     return out
 
 
@@ -3286,7 +3291,7 @@ def generation_models_info(*, console: bool = False) -> list[dict]:
     """Callable inventory; the console also shows the last successful snapshot."""
     out = []
     for b in _gen_backends:
-        if b.get("type") != "nanogpt" or is_draining(b):
+        if b.get("type") not in adapters.DYNAMIC_CATALOG_TYPES or is_draining(b):
             continue
         ad = backend_adapters.get(backend_id(b))
         current = getattr(ad, "model_catalogs", {})
@@ -3294,13 +3299,16 @@ def generation_models_info(*, console: bool = False) -> list[dict]:
         if not console and not available:
             continue
         catalogs = current if available else getattr(ad, "display_media_catalogs", {})
-        for endpoint in ("images", "video", "3d"):
+        mod = adapters.cloud_module(b["type"])
+        for endpoint in mod.ENDPOINTS:
             for model, meta in sorted(catalogs.get(endpoint, {}).items()):
-                candidate = nanogpt.candidate_for(b["name"], model, endpoint, meta)
+                candidate = mod.candidate_for(b["name"], model, endpoint, meta)
                 if not available:
                     candidate["unavailable"] = True
-                out.append({"id": f"{b['name']}/{model}", "name": meta.get("name") or model,
-                            "backend": b["name"], "endpoint": endpoint, "candidate": candidate})
+                out.append({"id": f"{b['name']}/{model}",
+                            "name": meta.get("name") or (meta.get("model_spec") or {}).get("name") or model,
+                            "backend": b["name"], "endpoint": endpoint, "candidate": candidate,
+                            "billing": _billing_info(b)})
     return out
 
 
@@ -3334,7 +3342,7 @@ def _gen_routes(alias: str, gated: Optional[list] = None) -> tuple[list, list]:
     if candidates is None:
         candidates = image_models.get(alias)
     if candidates is None:
-        candidates = _nano_direct_candidates(alias)
+        candidates = _catalog_direct_candidates(alias)
     # generation routes only to generation backends (ComfyUI, Meshy, Tripo), so a name
     # shared with an LLM backend resolves to the right one — and, since backends are keyed
     # (name, type), the candidate's own KIND picks between a same-named ComfyUI and
@@ -3345,8 +3353,8 @@ def _gen_routes(alias: str, gated: Optional[list] = None) -> tuple[list, list]:
         b = _gen_backend_for(cand.get("backend"), cand, gen)
         if b is None or not backend_healthy.get(backend_id(b)):
             continue
-        if b.get("type") == "nanogpt":
-            endpoint = nanogpt.endpoint_of(cand)
+        if b.get("type") in adapters.DYNAMIC_CATALOG_TYPES:
+            endpoint = adapters.cloud_module(b["type"]).endpoint_of(cand)
             meta = getattr(backend_adapters.get(backend_id(b)), "model_catalogs", {}).get(
                 endpoint, {}).get(cand.get("model"))
             if meta is not None:
@@ -4333,11 +4341,12 @@ async def cancel_generation(job_id: str) -> bool:
     cand = next((c for c in cands if c.get("backend") == job.get("backend")), None)
     pool = [x for x in backends if _is_gen(x)]       # incl. disabled: cancel must still reach it
     if cand is None:
-        cand = next((c for c in _nano_direct_candidates(job_alias, pool)
+        cand = next((c for c in _catalog_direct_candidates(job_alias, pool)
                      if c.get("backend") == job.get("backend")), None)
-    if cand is None and (job.get("meta") or {}).get("cloud") == nanogpt.KIND:
+    cloud = (job.get("meta") or {}).get("cloud")
+    if cand is None and cloud in adapters.DYNAMIC_CATALOG_TYPES:
         # A running paid task keeps its kind even when discovery goes down.
-        cand = {nanogpt.KIND: {}}
+        cand = {cloud: {}}
     b = (_gen_backend_for(job.get("backend"), cand, pool) if cand is not None
          else next((x for x in pool if x.get("name") == job.get("backend")), None))
     adapter = backend_adapters.get(backend_id(b)) if b else None
@@ -4632,23 +4641,25 @@ async def run_generation(body: dict, request: Request,
     routes, parked, eligible = await _gen_pick(alias, force, body)
     inputs, params = _gen_inputs_params(body)
     c0 = routes[0][1]
-    nano_media = adapters.cloud_kind(c0) == nanogpt.KIND
-    if not nano_media:
+    kind = adapters.cloud_kind(c0)
+    catalog_media = kind in adapters.DYNAMIC_CATALOG_TYPES
+    if not catalog_media:
         _apply_seconds(params, c0)              # workflow seconds → frames
-    if nano_media:
+    if catalog_media:
         if "n" in output:
             params["n"] = output["n"]
         try:
+            mod = adapters.cloud_module(kind)
             backend = routes[0][0]
             adapter = backend_adapters.get(backend_id(backend))
             catalog = getattr(adapter, "model_catalogs", {})
-            endpoint = nanogpt.endpoint_of(c0)
-            if catalog and c0.get("model") not in catalog.get(endpoint, {}):
-                raise nanogpt.NanoGPTInput(f"NanoGPT model is unavailable for {endpoint}")
-            await asyncio.to_thread(nanogpt.validate_request, c0, {**inputs, **params},
+            endpoint = mod.endpoint_of(c0)
+            if (catalog or kind == "venice") and c0.get("model") not in catalog.get(endpoint, {}):
+                raise mod.INPUT_ERROR(f"{mod.VENDOR} model is unavailable for {endpoint}")
+            await asyncio.to_thread(mod.validate_request, c0, {**inputs, **params},
                 (upload_images or {}).keys(), (upload_files or {}).keys(),
                 model_meta=catalog.get(endpoint, {}).get(c0.get("model")))
-        except nanogpt.NanoGPTInput as e:
+        except mod.INPUT_ERROR as e:
             raise HTTPException(400, str(e)) from e
     if adapters.cloud_kind(c0) == "arliai":
         if output.get("n", 1) != 1:
@@ -5088,6 +5099,12 @@ _EXT_BY_MIME = {                            # what a data-URI MIME means as a fi
     "model/gltf+json": "gltf",
     "model/obj": "obj", "model/stl": "stl", "model/ply": "ply",
     "model/fbx": "fbx", "application/x-fbx": "fbx",
+    "audio/wav": "wav", "audio/x-wav": "wav", "audio/wave": "wav",
+    "audio/vnd.wave": "wav", "audio/mpeg": "mp3", "audio/mp3": "mp3",
+    "audio/mp4": "m4a", "audio/x-m4a": "m4a", "audio/m4a": "m4a", "audio/aac": "aac",
+    "audio/ogg": "ogg", "audio/flac": "flac", "audio/x-flac": "flac",
+    "audio/webm": "webm", "video/webm": "webm", "video/mp4": "mp4",
+    "video/quicktime": "mov",
 }
 
 
@@ -5219,21 +5236,28 @@ async def _decode_ref_image(ref) -> Optional[bytes]:
 
 
 def _image_shim_settings(alias: str, size, params: dict, n):
-    """Preserve NanoGPT model-native controls; workflow backends retain size defaults."""
+    """Preserve catalog model-native controls; workflows retain size defaults."""
     routes = get_gen_routes(alias)
-    nano = bool(routes and adapters.cloud_kind(routes[0][1]) == nanogpt.KIND)
+    kind = adapters.cloud_kind(routes[0][1]) if routes else None
+    catalog_media = kind in adapters.DYNAMIC_CATALOG_TYPES
     params = dict(params)
-    if nano:
-        if nanogpt.endpoint_of(routes[0][1]) != "images":
-            raise HTTPException(400, "OpenAI Images requires a NanoGPT images alias")
+    if catalog_media:
+        mod = adapters.cloud_module(kind)
+        if _generation_type(routes[0][1]) != "image":
+            raise HTTPException(400, f"OpenAI Images requires a {mod.VENDOR} image model")
         if size not in (None, ""):
             params["size"] = size
         if n is None:
             n = params.get("n")
+        if n in (None, "") and kind == "venice":
+            n = params.get("variants")
         if n in (None, "") and isinstance(params.get("extra"), dict):
             n = params["extra"].get("n")
+            if n in (None, "") and kind == "venice":
+                n = params["extra"].get("variants")
         if n in (None, ""):
-            n = nanogpt.options_of(routes[0][1]).get("n")
+            opts = mod.options_of(routes[0][1])
+            n = opts.get("n") if opts.get("n") is not None else opts.get("variants")
         return params, n if n is not None else 1, True
     w, h = parse_size(size)
     return {"width": w, "height": h, **params}, int(n or 1), False
@@ -5254,12 +5278,12 @@ async def images_generations(request: Request, authorization: Optional[str] = He
     slots = await asyncio.to_thread(_gen_image_slots, alias)   # ONE lookup — uploads + log
     if refs and not slots:
         raise HTTPException(400, f"'{alias}' has no reference-image inputs")
-    params, count, nano = await asyncio.to_thread(_image_shim_settings, alias, body.get("size"),
+    params, count, catalog_media = await asyncio.to_thread(_image_shim_settings, alias, body.get("size"),
         {**(body.get("params") or {}), **{k: v for k, v in body.items() if k not in OAI_IMG_KEYS}},
         body.get("n"))
-    if nano:
+    if catalog_media:
         if len(refs) > len(slots):
-            raise HTTPException(400, f"NanoGPT accepts at most {len(slots)} reference images")
+            raise HTTPException(400, f"model accepts at most {len(slots)} reference images")
         params.update({k: body[k] for k in ("quality", "style", "background", "output_format") if k in body})
     # images_uploads keeps one image per slot; fetching the rest would only download
     # (and, for URLs, reach out for) bytes that are thrown away.
@@ -5297,11 +5321,14 @@ async def images_edits(request: Request, authorization: Optional[str] = Header(N
     if not slots:
         raise HTTPException(400, f"'{alias}' does not support image edits")
     routes = await asyncio.to_thread(get_gen_routes, alias)
-    nano = bool(routes and adapters.cloud_kind(routes[0][1]) == nanogpt.KIND)
-    if nano and masks:
-        raise HTTPException(400, "NanoGPT mask edits require params.maskDataUrl on /v1/generations")
-    if nano and len(images) > len(slots):
-        raise HTTPException(400, f"NanoGPT accepts at most {len(slots)} reference images")
+    kind = adapters.cloud_kind(routes[0][1]) if routes else None
+    catalog_media = kind in adapters.DYNAMIC_CATALOG_TYPES
+    if catalog_media and masks:
+        detail = ("NanoGPT mask edits require params.maskDataUrl on /v1/generations"
+                  if kind == "nanogpt" else "Venice image editing does not support a mask channel")
+        raise HTTPException(400, detail)
+    if catalog_media and len(images) > len(slots):
+        raise HTTPException(400, f"model accepts at most {len(slots)} reference images")
     logger.info(f"images/edits '{alias}': image_files={len(images)} mask_files={len(masks)} "  # where they land
                 f"slots={slots} "
                 f"scalar_keys={sorted(k for k, vs in f.items() if not isinstance((vs or [None])[0], (bytes, bytearray)))}")
@@ -5557,6 +5584,14 @@ def _loaded_info(b: dict) -> dict:
     return {"loaded": [dict(e) for e in backend_running[bid]]}
 
 
+def _billing_info(b: dict) -> Optional[dict]:
+    """Account-confirmed API billing, never inferred from Pro web access or prices."""
+    if b.get("type") != "venice":
+        return None
+    ad = backend_adapters.get(backend_id(b))
+    return dict(getattr(ad, "account_info", None) or {"state": "unknown"})
+
+
 def _cloud_info(b: dict) -> dict:
     """Credit balance seen at the last discovery of a cloud backend (Meshy, Tripo), plus
     the same rolling fail-rate the comfy backends carry (merged into /health + the UI
@@ -5565,6 +5600,8 @@ def _cloud_info(b: dict) -> dict:
     if b.get("type") not in adapters.CLOUD_TYPES:
         return {}
     info: dict = {}
+    if b.get("type") == "venice":
+        info["billing"] = _billing_info(b)
     fs = _gen_fail_stats(backend_id(b))      # same rolling fail-rate as comfy backends
     if fs:
         info.update(fs)
@@ -8743,6 +8780,7 @@ def llm_backends_info() -> list[dict]:
     return [{"name": b["name"], "type": b.get("type", "openai"),
              "enabled": is_enabled(b),
              "models": sorted(_llm_models(b)),
+             "billing": _billing_info(b),
              # `/running` answers → the alias editor also offers `current` here
              "current": _is_current(b, adapters.CURRENT_MODEL)}
             for b in backends if _is_llm(b)]

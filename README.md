@@ -210,7 +210,9 @@ the key only sees what it's allowed. This is how you point an image client at th
 gateway and have it see just the image aliases instead of the whole 400-model
 catalog: give it a key whose allow-list is the image alias(es) (or the ComfyUI
 backend), and `GET /v1/models` returns only those. `?type=image`, `chat`, `video`,
-`3d`, `tts` and `embedding` narrow the catalog; NanoGPT exposes each modality separately.
+`3d`, `tts`, `embedding`, `audio` and `asr` narrow the catalog. NanoGPT and Venice
+expose typed inventories; `audio` and `asr` include Venice music/voice conversion
+and transcription respectively.
 
 ### Quotas
 
@@ -490,7 +492,7 @@ or a `503` (with `Retry-After`) if the wait runs out.
 never delays a LAN poll. A healthy backend is polled every `discovery_interval_s`
 (per backend, Backends tab; blank = type default): LAN backends and ComfyUI/RunPod
 follow `health_check_interval` (30 s), cloud catalogs (OpenAI-compatible vendors,
-Anthropic, NanoGPT, ArliAI) 600 s, Meshy/Tripo credit balance 300 s. A saved change
+Anthropic, NanoGPT, Venice, ArliAI) 600 s, Meshy/Tripo credit balance 300 s. A saved change
 to a backend polls that backend at once; a DOWN backend is retried at least every
 `health_check_interval`. A fault row names the request that failed
 (`ReadTimeout (GET /api/v1/models)`).
@@ -737,13 +739,14 @@ respect.
 
 ## Media generation
 
-Generation runs on six backend types: **`type: comfyui`** — a ComfyUI server on
+Generation runs on seven backend types: **`type: comfyui`** — a ComfyUI server on
 your own GPU, or on a GPU rented on demand as a
 [managed host](#managed-hosts-thunder-compute-runpod-later) —, **`type: runpod`** (the
 same workflows on a [RunPod Serverless](#runpod-serverless-comfyui-workflows-pay-per-second)
 endpoint), the two cloud mesh APIs **`type: meshy`** (Meshy.ai) and **`type: tripo`**
-(Tripo3D), **`type: arliai`** (SDNext text-to-image), and **`type: nanogpt`**
-(NanoGPT: the same backend also serves text, TTS and embeddings). A ComfyUI
+(Tripo3D), **`type: arliai`** (SDNext text-to-image), **`type: nanogpt`**
+(NanoGPT: text, TTS, embeddings and media), and **`type: venice`**
+(Venice: text, embeddings, image/video/audio generation and transcription). A ComfyUI
 backend speaks a different protocol, so it declares `type: comfyui`.
 Discovery is via `/object_info` (checkpoints/UNETs/VAEs **and** installed LoRAs);
 dispatch submits a parametrised workflow, polls `/history`, and fetches whatever
@@ -997,6 +1000,98 @@ Provider contracts: [Images](https://docs.nano-gpt.com/api-reference/endpoint/im
 [video submit](https://docs.nano-gpt.com/api-reference/endpoint/video-generation),
 [unified status](https://docs.nano-gpt.com/api-reference/endpoint/video-status-unified)
 and [3D model reference](https://nano-gpt.com/models/3d/wavespeed-ai/hunyuan-3d-v3.1-rapid).
+
+
+### Venice (images, video, music, speech, transcription, embeddings)
+
+Use one **`type: venice`** backend for the account. Chat keeps using the existing
+OpenAI dispatch; typed discovery adds media and speech without aliases or workflows.
+For an existing console-managed Venice chat backend, edit its type to `venice`,
+keeping its name, URL and key. For a YAML-managed backend, change the existing
+row's `type` instead of adding a duplicate account. Chat aliases retain their
+backend-name references. Unrelated `openai` backends are not changed automatically.
+
+```yaml
+backends:
+  - name: venice
+    type: venice
+    url: https://api.venice.ai/api     # NOT /api/v1; gateway adds /v1 paths
+    api_key: "<Venice API key>"
+    max_concurrent: 2                # shared by chat and media; always paid
+    max_wait: 1800
+    poll_interval: 5
+```
+
+Open **Playground → Media** and select a discovered model. Form choices, bounds,
+reference slots and required inputs come from Venice's model metadata. Models
+remain visible but disabled during a failed discovery refresh.
+
+| Capability | Gateway API | Venice alias endpoint |
+|---|---|---|
+| Text | `/v1/chat/completions` and existing protocol bridges | chat alias |
+| Embeddings | `/v1/embeddings` | chat-family routing |
+| Image generation | `/v1/images/generations`, `/v1/generations` | `images` |
+| Image edit, multiple references | `/v1/images/edits`, `/v1/generations` | `edit` |
+| Image upscale / background removal | `/v1/generations` | `upscale` / `background-remove` |
+| Video, including supported reference/upgrade operations | `/v1/generations` | `video` |
+| Music / sound effects | `/v1/generations` | `music` |
+| Speech-to-speech conversion | `/v1/generations` | `voice-changer` |
+| TTS / reference-voice speech | `/v1/audio/speech`, `/v1/generations` | `speech` |
+| Transcription | `/v1/generations` | `transcription` |
+
+The rightmost values are for optional stored candidates:
+`venice: {endpoint: video, options: {...}}`. Their `model` pins an exact discovered
+ID. The direct form is `<backend>/<model ID>`; background removal instead uses the
+explicit operation ID `<backend>/background-remove`, not a fabricated vendor model.
+Voice-changer models appear only when the music catalog advertises
+`model_spec.voice_changer`; other music models never route to that API.
+
+Native requests use `params` for controls, `images` for named image-reference
+uploads and `files.input_audio` / `files.input_video` for audio/video data URIs or
+URLs. Inspect `GET /v1/generations/<backend>/<model ID>/schema` for that model's
+exact fields. Video durations remain native seconds, not workflow frame counts.
+The image shims translate `n`, `size` and output-format controls; Venice image
+editing has **no mask channel**. Transcription produces a downloadable JSON/text
+artifact, not an image preview. There is no separate public transcription route.
+
+For a TTS model advertising `voice_cloning`, its media form accepts an optional
+`input_audio` reference file. The gateway uploads it to `/audio/voices`, then uses
+the returned handle for `/audio/speech`; a cloned reference and an explicit voice
+handle are mutually exclusive. Venice currently expires these handles after seven
+days. This cloud flow does not scp references to the provider.
+
+Nine catalog GETs publish one complete snapshot. Legacy chat-only/serverless filters
+apply to text, not to the dedicated media catalogs. Text and embedding USD token
+prices are normalized from `model_spec.pricing`; character/second/image prices are
+not misreported as token rates.
+
+The console reads `/api_keys/rate_limits` to label Venice models without changing
+their IDs: **`[C]`** uses API credits/account funds, **`[I]`** is included only when
+the API account explicitly confirms no charge, **`[?]`** means billing is unknown,
+and **`[mixed]`** depends on the selected backend/account. Chat suggestions retain
+these signs when filtering by backend; media labels carry the same information.
+These are **API account** indicators, not a list of models included in Pro web use.
+Pro access in the Venice app must never be treated as unlimited free API usage.
+
+Backends shows available bundled credits, USD cash and DIEM separately.
+`BUNDLED_CREDITS` is returned in USD and displayed at Venice's published
+**100 credits = 1 USD** rate; no initial/monthly allocation is assumed.
+The balance query is optional: an unavailable or refused query changes the
+indicator to unknown without taking otherwise healthy catalogs/chat offline.
+See [API account balances](https://docs.venice.ai/api-reference/endpoint/api_keys/rate_limits).
+
+Generation submits are never blindly retried. Queue IDs and private download URLs
+are saved before polling; download requests carry no account credentials.
+`/video/complete` and `/audio/complete` delete stored media and are called only
+after validated bytes have been downloaded. Cancelling a gateway job stops local
+waiting, **not the vendor job or its billing**.
+
+Provider contracts: [model catalogs](https://docs.venice.ai/api-reference/endpoint/models/list),
+[images](https://docs.venice.ai/guides/media/image-generation),
+[video](https://docs.venice.ai/guides/media/video-generation),
+[music](https://docs.venice.ai/guides/media/music-and-sound-effects),
+[voice cloning](https://docs.venice.ai/guides/media/voice-cloning),
+[transcription](https://docs.venice.ai/guides/media/speech-to-text).
 
 
 ### Meshy.ai (cloud mesh generation)
