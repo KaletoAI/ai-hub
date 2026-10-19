@@ -2376,7 +2376,7 @@ def public_fields(cand: dict) -> tuple[list, list, list]:
         # stable label. Set a label on every param for a fully node-id-free schema.
         if cur is not None:
             entry["default"] = cur
-        if name == "seed" or (p == "seed" and name == p):
+        if name == "seed" or (p == "seed" and name == p) or m.get("random"):
             entry["auto"] = "random unless sent"
         params.append(entry)
     return params, images, files
@@ -2585,15 +2585,31 @@ def _coerce(value, current):
     return value
 
 
+# One draw range for every value the gateway rolls itself (the auto-seed, a 🎲 pin, a 🎲
+# request field): 0..2**31-1 is inside every common seed widget — KSampler takes 2**64-1,
+# but the Trellis2 nodes declare max 0x7fffffff and refuse anything above, and numpy
+# seeds stop at 2**32-1.
+RANDOM_SEED_MAX = 0x7fffffff
+
+
+def random_seed() -> int:
+    return random.randint(0, RANDOM_SEED_MAX)
+
+
 def _apply_fixed(wf: dict, fixed: list) -> dict:
     """Apply admin-pinned constant bindings: each `{node, field, value}` sets
     `workflow[node].inputs[field] = value` (type-coerced to the field's current
     type). This is the general mechanism for pre-setting nodes the admin chose —
     model/clip/vae loader slots, a Switch's boolean, a reference image, etc. — so
-    a registered workflow runs without the gateway guessing."""
+    a registered workflow runs without the gateway guessing.
+
+    A pin flagged `random: true` (🎲 in the editor) is drawn fresh per job instead of
+    taking its stored value — a seed the admin wants varied, but not client-settable."""
     applied = {}
     for b in fixed or []:
         node, fieldn, value = b.get("node"), b.get("field"), b.get("value")
+        if b.get("random"):
+            value = random_seed()
         if node in wf and fieldn and value is not None and value != "":
             inputs = wf[node].setdefault("inputs", {})
             inputs[fieldn] = _coerce(value, inputs.get(fieldn))
@@ -3491,7 +3507,18 @@ class ComfyUIAdapter(BackendAdapter):
                            if p == "seed" or ((m or {}).get("label") or "").strip().lower() == "seed"),
                           None)
         if seed_param and values.get(seed_param) in (None, ""):
-            values[seed_param] = random.randint(0, 2**63 - 1)
+            values[seed_param] = random_seed()
+        # 🎲 request fields: drawn the same way unless the request sends a value. A pin
+        # on the same node/field wins (protected) — its own draw is what runs.
+        rolled = [p for p, m in mapping.items()
+                  if (m or {}).get("random") and values.get(p) in (None, "")]
+        for p in rolled:
+            values[p] = random_seed()
+        # every drawn value by node.field, for the job summary — the only place a good
+        # random result can be reproduced from
+        drawn = {f"{b['node']}.{b['field']}": fixed_applied[f"{b['node']}.{b['field']}"]
+                 for b in fixed if b.get("random")
+                 and f"{b.get('node')}.{b.get('field')}" in fixed_applied}
         # image request-fields are filled per-field (upload or 8×8 placeholder), not
         # via the scalar mapping — keep them out of _apply_mapping.
         img_params = image_params(wf, mapping)
@@ -3513,6 +3540,10 @@ class ComfyUIAdapter(BackendAdapter):
         lora_placed = _apply_lora_list(wf, mapping, req.loras or [], self.ctx.loras_of(self.bid))
         lora_placed += _apply_lora_cascade(wf, values)    # client loras → next free stack slots
         applied = _apply_mapping(wf, mapping, values, protected)
+        for p in rolled:
+            m = mapping[p]
+            if p in applied:                 # not shadowed by a pin on the same node/field
+                drawn[f"{m.get('node')}.{m.get('field')}"] = applied[p]
         # An `on_empty: disable` slot left empty prunes a whole dead branch, which needs
         # each candidate class's required-input set. Loaded ONLY when such a slot is
         # actually empty; after discovery the cache already holds every class, so this
@@ -3554,6 +3585,7 @@ class ComfyUIAdapter(BackendAdapter):
         summary = {"applied": sorted(applied.keys()),
                    "seed": values.get(seed_param) if seed_param else None,
                    "fixed": sorted(fixed_applied.keys()),
+                   **({"random": drawn} if drawn else {}),
                    "loras": [f"{n}.{f}={v}" for n, f, v in lora_placed],
                    "images": sorted(img_applied), "autofilled_images": autofilled,
                    **({"disabled_nodes": pruned} if pruned else {}),

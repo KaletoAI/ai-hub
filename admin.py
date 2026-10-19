@@ -1812,6 +1812,18 @@ def _value_control(name: str, node: str, field: str, value, wf: dict, oi: dict) 
     return _inp(name, "" if cur is None else cur)
 
 
+def _is_int_field(wf: dict, node: str, field: str) -> bool:
+    v = (wf.get(node, {}).get("inputs") or {}).get(field)
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _dice_box(name: str, on: bool, title: str) -> str:
+    """🎲 checkbox of an int pin / request field (adapters.random_seed draws per job).
+    Rendered on every int row, so a Save reads "absent" as "off"."""
+    return (f' <label class="rnd" title="{_esc(title)}"><input type="checkbox" class="rnd" '
+            f'name="{_esc(name)}"{" checked" if on else ""}> 🎲 random</label>')
+
+
 # ── Tab: Backends ───────────────────────────────────────────────────────────────
 
 def _type_tab_label(t: str) -> str:
@@ -6659,6 +6671,7 @@ _PIN_CSS_JS = ("<style>.ptabs{display:flex;gap:4px;margin:10px 0 0;flex-wrap:wra
                ".ppanel{border:1px solid #242a33;border-radius:0 8px 8px 8px;padding:10px 12px}"
                ".ovrow{margin:9px 0}.ovrow label{display:block;font-size:12px;color:#8b97a4;margin-bottom:3px}"
                ".ovrow input,.ovrow select{width:100%;max-width:560px;box-sizing:border-box}"
+               ".ovrow input.rnd{width:auto}label.rnd{white-space:nowrap}"
                ".ovrow.inherited{opacity:.5}.ovrow.inherited:focus-within{opacity:1}"
                ".ovact{float:right}.ovtag{font-size:10px;padding:1px 6px;border-radius:6px;margin-left:6px}"
                ".ovtag.inh{background:#1a1f27;color:#7e8b99}.ovtag.set{background:#15301f;color:#7fd6a0}"
@@ -6727,6 +6740,10 @@ def _req_fields_rows(alias: str, wf: dict, mapping: dict, oi: dict) -> str:
             cur_cell = "(linked)"                        # wired to another node — not editable
         elif node and fld and node in wf:
             cur_cell = _value_control("default__" + p, node, fld, None, wf, oi)
+            if _is_int_field(wf, node, fld):
+                cur_cell += _dice_box("random__" + p, bool(m.get("random")),
+                                      "a request without this field gets a fresh random "
+                                      "value (0..2³¹-1) instead of this default")
         else:
             cur_cell = ""                                # stale/incomplete binding — nothing to edit
         if not is_img and (adapters.is_file_param(p, m) or m.get("client_path")):
@@ -6794,6 +6811,12 @@ def _pin_tab_rows(alias: str, c: dict, is_primary: bool, fixed: list, wf: dict, 
                     f"data-src=\"{_esc(f'fixed__{nid}__{fld}')}\" data-dst=\"{_esc(name)}\" "
                     f"title=\"Use the primary backend's value\" onclick='pinDef(this)'>default</button></span>")
         ctl = _value_control(name, nid, fld, cur, wf, oi_bn)
+        if is_primary and _is_int_field(wf, nid, fld):
+            ctl += _dice_box(f"fixedrnd__{nid}__{fld}", bool(b.get("random")),
+                             "drawn fresh per job (0..2³¹-1) on every backend; the value "
+                             "beside it is ignored while this is on. Requests cannot override a pin.")
+        elif b.get("random"):
+            ctl += " <span class='muted'>🎲 random (set on the primary tab)</span>"
         tag = "" if is_primary else (" <span class='ovtag inh'>inherited</span>" if inherited
                                      else " <span class='ovtag set'>override</span>")
         title = wf.get(nid, {}).get("_meta", {}).get("title", "")
@@ -7514,6 +7537,8 @@ def _apply_update_form(cands: list, f: dict) -> str:
                     entry["client_path"] = True
                 if f.get(f"required__{p}"):           # same row, same "absent = off" rule
                     entry["required"] = True
+                if f.get(f"random__{p}"):             # 🎲: drawn unless the request sends it
+                    entry["random"] = True
                 mapping[p] = entry
     # Editable workflow defaults (the "=" column): default__<param> writes the
     # value a request-without-this-field runs with into the workflow JSON at the
@@ -7548,7 +7573,10 @@ def _apply_update_form(cands: list, f: dict) -> str:
             _, nid, fld = key.split("__", 2)
             old = ((cands[0].get("workflow_json") or {}).get(nid, {}).get("inputs") or {}).get(fld)
             val = adapters._coerce(val, old)
-            fixed.append({"node": nid, "field": fld, "value": val})
+            pin = {"node": nid, "field": fld, "value": val}
+            if f.get(f"fixedrnd__{nid}__{fld}"):     # 🎲: drawn per job, value ignored
+                pin["random"] = True
+            fixed.append(pin)
     # per-backend overrides of pinned values: ovr__<backend>__<node>__<field>
     ovr = {}
     for key, val in f.items():
@@ -7568,7 +7596,8 @@ def _apply_update_form(cands: list, f: dict) -> str:
         c["fixed"] = [{"node": b["node"], "field": b["field"],
                        "value": adapters._coerce(
                            ovr.get((bn, b["node"], b["field"]), b["value"]),
-                           (wf.get(b["node"], {}).get("inputs") or {}).get(b["field"]))}
+                           (wf.get(b["node"], {}).get("inputs") or {}).get(b["field"])),
+                       **({"random": True} if b.get("random") else {})}
                       for b in fixed]
     # per-backend node bypass: a byp__<backend>__<node> checkbox grid. The hidden
     # bypass_nodes (union managed set) is authoritative — an unchecked (=absent) box clears.

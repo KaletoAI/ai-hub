@@ -1493,6 +1493,14 @@ Key mapping concepts:
   on save, including zero. Unlisted saved choices stay selected and marked stale,
   never silently replaced. A backend that cannot answer borrows the available
   candidate's definitions, as with model dropdowns.
+- **🎲 random values.** Every integer pin and integer request field has a
+  `🎲 random` box (`random: true` on the `fixed` / `mapping` entry). A random pin is
+  drawn fresh per job on every backend (its stored value is ignored, requests still
+  cannot override it); a random request field is drawn unless the request sends a
+  value. A field named or labelled `seed` is drawn that way without the box. All
+  draws use `0..2³¹-1`, the range every common seed widget accepts (Trellis2 nodes
+  refuse more than `0x7fffffff`), and the job summary lists each drawn value under
+  `random` (`{"34.seed": 1234}`) so a good result can be reproduced.
 - **Image input slots** (a `LoadImage` / `LoadImageMask` node) become file-upload
   request fields. The Aliases media editor picks one of three behaviours per slot for a
   request that sends no image:
