@@ -35,6 +35,7 @@ modelsrc.key.pub
 modelsrc-known_hosts
 # Sample workflows: ship the curated ones directly; keep raw originals out of git
 sample_comfyui_workflows/org/
+/sample_comfyui_workflows/video_fastvideo_fasth3_i2v*.json
 # Agent/tool state and session artefacts
 .claude/
 .agents/

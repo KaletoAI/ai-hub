@@ -42,7 +42,7 @@
         0
       ],
       "start_image": [
-        "168",
+        "173",
         0
       ]
     },
@@ -305,7 +305,7 @@
   "169": {
     "inputs": {
       "image": [
-        "168",
+        "173",
         0
       ]
     },
@@ -369,6 +369,21 @@
     "class_type": "Lora Loader Stack (rgthree)",
     "_meta": {
       "title": "input_lora_low"
+    }
+  },
+  "173": {
+    "inputs": {
+      "image": [
+        "168",
+        0
+      ],
+      "upscale_method": "lanczos",
+      "megapixels": 0.4,
+      "resolution_steps": 32
+    },
+    "class_type": "ImageScaleToTotalPixels",
+    "_meta": {
+      "title": "Video resolution (0.4 MP, 32px)"
     }
   }
 }

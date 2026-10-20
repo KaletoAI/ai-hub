@@ -170,6 +170,89 @@ Keine Geometrie- oder Facecount-Generierung.
 Konkreter Client-Ablauf und Installation:
 [Anima-Versa Face Retexture](../docs/anima-versa-face-retexture.md).
 
+#### Wan-LowRAM — Bild → Video
+
+`img2video_wan_lowram_api.json`, Task `img2vid`; der produktive Alias
+`Wan-LowRAM` hat die Kandidaten `rtx-3090` und `dx10-02`.
+
+Seit 2026-10-20 skaliert Node `173` das Upload-Bild vor **beiden**
+Verwendungen (Startbild und `GetImageSize`) mit Lanczos auf **0,4 MP**
+und ein **32-Pixel-Raster**. Das Seitenverhältnis bleibt bis auf die
+Rasterrundung erhalten: quadratisch 640×640, 16:9 864×480.
+Die Auflösung folgt nicht mehr unbeschränkt dem Upload; zuvor wurden
+1024×1024 bei 81 Frames auf der 3090 mit erheblichem Offloading verarbeitet.
+Kleine Vorlagen werden ebenfalls auf das Ziel-Pixelbudget skaliert.
+
+Unverändert: Wan 2.2 I2V A14B High-/Low-Noise Q5_K_M, die FP16-I2V-Lightning-LoRAs,
+4 Schritte (2+2), CFG 1, Shift 5, Euler/simple, Wan-2.1-VAE,
+16 fps und standardmäßig 81 Frames (5,0625 s). Die
+[Lightning-Referenz](https://huggingface.co/lightx2v/Wan2.2-Lightning)
+führt I2V V1; neuere **T2V**-LoRAs sind kein Ersatz für diese I2V-Gewichte.
+Die Beispiel-JSON verwendet den offiziellen UMT5-Encoder; der bestehende
+produktive Pin `wan_nsfw_umt5-xxl_fp8_scaled.safetensors` bleibt erhalten.
+
+Eingaben bleiben `images.image`, `prompt`, `negative_prompt`,
+`params.frames` beziehungsweise `params.seconds` sowie die gemappten
+High-/Low-LoRA-Slots. Ausgabe: MP4 von Node `108`, ohne generierte Tonspur.
+Der Graph im Store wird separat aktualisiert; eine geänderte Beispieldatei
+allein ändert den Alias nicht.
+
+Abnahme auf `rtx-3090`: echter AI-Hub-Job
+`69324057c08747f0b9d6429668209776`, Upload 1024×1024 →
+H.264-MP4 640×640, 81 Frames bei 16 fps, Laufzeit 168,566 s;
+Download und Decodierung von Anfang/Mitte/Ende geprüft.
+Auf DX10-02 wurde der Skalierungsnode für quadratische, Quer- und Hochformatbilder
+im CPU-Modus geprüft. Kein vollständiger GPU-Lauf dort: der ComfyUI-Dienst
+war regulär gestoppt; er wurde bei dieser Prüfung nicht gestartet.
+
+#### FastH3-I2V — Bild → Video mit generiertem Stereo-Ton
+
+Produktiver Alias `FastH3-I2V`, Task `img2vid`, seit 2026-10-20.
+Der API-Graph `video_fastvideo_fasth3_i2v_api.json` liegt lokal und auf dem Hub,
+ist aber ausdrücklich **gitignored**. Der Store enthält denselben gemeinsamen
+Graphen mit pro Backend gepinnten Modell-/VAE-Dateien; keine neue Adapterlogik.
+
+Gewählt wurde [FastH3 Trim](https://huggingface.co/FastVideo/FastVideo-FastH3-Trim-Comfy):
+42 statt 50 Transformer-Blöcke, 8 Schritte, `res_multistep`/`simple`,
+Video-/Audio-Shift 10/3 und VSA mit 20 % beibehaltenen Video-Tiles.
+Text-/Audio-Konditionierung bleibt exakt. Dense Attention nutzt PyTorch,
+nicht die mit INT8-ConvRot problematische Comfy-Kitchen-Attention.
+
+| Backend | Diffusionsmodell | Video-VAE | gemessener Hub-Lauf |
+|---|---|---|---|
+| `dx10-02`, GB10 | Trim NVFP4 | originaler H3 INT8-ConvRot | 82,195 s |
+| `rtx-3090`, Ampere | Trim INT8-ConvRot | LynnReal Light INT8-ConvRot | 88,745 s |
+
+Gemeinsam: H3-spezifischer Qwen3-VL-32B NVFP4-AWQ-Encoder und H3-Audio-VAE FP32.
+NVFP4 des Textencoders spart auf Ampere Speicher, ist dort keine native
+FP4-Rechenbeschleunigung. Der Light-VAE wird nur auf der 3090 verwendet:
+deren ComfyUI 0.42 erkennt seine Decoder-Tiefe; DX10s 0.37 nicht.
+Keine Core-/Paketänderungen und keine Dienstneustarts für die Einrichtung.
+
+Eingaben: `images.image` (Pflicht), `prompt`, `params.frames` (124),
+`params.seed` (ohne Angabe zufällig), `params.megapixels` (0,4).
+Bildskalierung mit Lanczos, 32-Pixel-Raster und erhaltenem Seitenverhältnis;
+das skalierte Bild liefert sowohl die Abmessungen als auch das Startbild.
+H3 rundet die Framezahl auf `17k+5`; nicht das Wan-Raster `4k+1` erzwingen.
+Ausgabe: Node `92`, H.264-MP4 bei 24 fps mit AAC-Stereo-Ton.
+
+Abnahme: identisches Referenzbild, Prompt und Seed 42; beide Jobs lieferten
+864×480, 124 Frames, 5,167 s Video plus Stereo-Audio mit 32 kHz.
+Jobs: DX `17e761d3006841ceac0d993d4ff7033d`,
+3090 `4c710e0f4dc94544b9d57a934867f065`.
+Heruntergeladen, Anfang/Mitte/Ende decodiert und visuell geprüft;
+bewegte Frames und nicht stumme Audiospur nachgewiesen.
+Alle acht installierten Backend-Dateien stimmen mit den veröffentlichten
+SHA256-Werten überein. Zeiten sind einzelne echte Hub-Läufe, kein
+kontrollierter Benchmark sämtlicher Modellvarianten.
+
+**Grenzen:** Trim ist experimentell, kann feine Details verlieren und wurde
+vom Hersteller vor allem für T2V vermessen. Native I2V-Konditionierung ist
+hier praktisch geprüft, aber keine Garantie für Identitätstreue bei jedem Motiv.
+Die [Herstellerbenchmarks](https://haoailab.com/blogs/fasth3-rtx/) verwenden
+die separate FastVideo-Runtime; ihre Zeiten sind nicht ComfyUI-Messungen.
+Die Modellgewichte behalten die MiniMax-H3-Lizenzbedingungen.
+
 #### mesh-reg-unirig / mesh-reg-mia / mesh-make-it-animatable
 
 | Workflow | `input_mesh_path` | `input_name` | `input_face_num` | `input_no_fingers` |

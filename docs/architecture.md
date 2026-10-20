@@ -85,6 +85,33 @@ but `_fault_label`/`_gen_exhausted_msg` keep it NAMED apart from a real connecti
 fault and from an httpx transport timeout — reporting a `max_wait` expiry as
 "unreachable (connection)" sends you diagnosing the network instead of the
 workflow, and the cap is spent PER CANDIDATE.) `AdapterContext` injects app services.
+
+The `Wan-LowRAM` example and stored alias bound image size before sampling:
+`ImageScaleToTotalPixels` node 173 feeds both `WanImageToVideo.start_image`
+and `GetImageSize`, targeting 0.4 MP on a 32-pixel grid. Capping only the
+dimensions would leave image conditioning inconsistent with the latent canvas.
+Previously an unscaled 1024-square upload with 81 frames took about ten minutes
+before being interrupted on the RTX 3090; no missing weights or Wan OOM was
+observed. The existing Q5_K_M experts and 4-step I2V Lightning LoRAs stay in
+place. A real Hub job with the updated workflow delivered an 81-frame
+640-square H.264 MP4 in 168.566 s, including download and decoded-frame checks.
+This is alias configuration using an existing core node, not a new adapter
+mechanism. Inputs, precision choices and verification limits are recorded in
+`sample_comfyui_workflows/README.md`, section `Wan-LowRAM`.
+
+`FastH3-I2V` is likewise configuration, not a new adapter: one gitignored
+native H3 workflow, per-backend model/VAE pins, and the existing job delivery
+path including generated audio. Trim uses NVFP4 on GB10 and INT8 ConvRot on
+Ampere; its 8-step VSA schedule keeps 20% of video tiles and exact conditioning
+rows. The INT8 model must not use Comfy Kitchen dense attention. The light
+video VAE is pinned only on ComfyUI 0.42 (RTX 3090); the 0.37 DX installation
+does not infer its decoder depth, so it keeps the full INT8 video VAE.
+H3 itself aligns frames to `17k+5`; the alias deliberately does not set
+Wan's `4k+1` raster. Identical real Hub I2V jobs with downloaded, decoded
+video and non-silent stereo audio verified both backends. Precision choices,
+job IDs, timings and Trim's experimental I2V quality limits are recorded in
+`sample_comfyui_workflows/README.md`, section `FastH3-I2V`.
+
 `AnthropicAdapter` (`type: anthropic`, subclasses `OpenAIAdapter`) serves
 **`/v1/messages` only** — a licence boundary enforced in routing
 (`main.serves_path`), not just documented: a Claude subscription token covers
