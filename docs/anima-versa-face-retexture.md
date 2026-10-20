@@ -8,7 +8,7 @@ Auf **dx10-02 und k12** sind Node **v1.0.2** und sichtbarer Workflow installiert
 
 ## Eingangsbedingungen
 
-- Originales, statisches GLB: **ein Mesh, ein indiziertes Dreiecks-Primitive**, eingebettete unkomprimierte opake Textur. Keine externen Assets, Skinning/Rigs, Animation oder Morph-Targets. Ein beliebiges img2mesh-Ergebnis erfüllt diese Bedingungen nicht automatisch; ungeeignete Assets klar ablehnen, nicht still konvertieren.
+- Originales, statisches GLB: **ein Mesh, ein indiziertes Dreiecks-Primitive**, opakes Material mit eingebetteten PNG-/JPEG- oder WebP-Texturen (ab Node **v1.4.0** auch `EXT_texture_webp` als erforderliche Erweiterung, z. B. UniForge3D-Exporte; je Bild höchstens 8192 px pro Seite, ein Frame). Das korrigierte GLB behält die Original-WebP-Bilder und die Erweiterung, der neue Gesichtsatlas ist PNG. Keine externen Assets, Skinning/Rigs, Animation oder Morph-Targets. Ein beliebiges img2mesh-Ergebnis erfüllt diese Bedingungen nicht automatisch; ungeeignete Assets klar ablehnen, nicht still konvertieren.
 - **Y-up, +Z nach vorne**. `yaw` wählt die Registrierungsansicht in Grad (−180 bis 180), ohne die Geometrie zu drehen/deformieren. Mit 0 beginnen; nur bei abweichender Frontausrichtung anpassen. Ein erkennbares Gesicht muss im Mesh-Render und im Foto sichtbar sein.
 - Genau ein passendes frontales **Original-RGB-Foto**, nicht StableX-Normalmap, Tiefenbild, Maske oder diagnostischer Render. Das Foto aus dem Anima-Versa-Asset behalten und erneut hochladen.
 - Jede Korrektur beginnt erneut am **Original-GLB**. Das korrigierte GLB enthält getrennte Körper-/Gesichts-Primitives und ist kein unterstützter Eingang für einen weiteren Projektionslauf.
