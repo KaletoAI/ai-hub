@@ -233,6 +233,55 @@ class GenerateBody(unittest.TestCase):
                         .startswith("data:model/gltf-binary;base64,"))
 
 
+# ── Send to Playground carries the seed the job actually ran with ──────────────
+# The seed a job ran with is usually DRAWN by the gateway (auto-seed, 🎲 field), so it
+# is not in inputs.params. Before the fix the playground got a blank seed, the rerun
+# drew a new one, and the image picked in the job log could not be reproduced.
+
+SEED_ALIAS = [{"backend": "comfy-a", "task": "text2img",
+               "workflow_json": {"3": {"class_type": "KSampler", "inputs": {"seed": 0}},
+                                 "7": {"class_type": "PrimitiveInt", "inputs": {"value": 0}},
+                                 "8": {"class_type": "PrimitiveInt", "inputs": {"value": 0}}},
+               "mapping": {"prompt": {"node": "6", "field": "text"},
+                           "value_7": {"node": "7", "field": "value", "label": "Seed"},
+                           "value_8": {"node": "8", "field": "value", "random": True}}}]
+
+
+class SendToPlaygroundSeed(unittest.TestCase):
+    def setUp(self):
+        import store
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        saved_jobs = {k: getattr(jobs, k) for k in ("_DB_PATH", "_BLOB_DIR", "_DEFAULT_TTL", "_active")}
+        saved_store = {k: getattr(store, k) for k in ("_DB_PATH", "_active")}
+        self.addCleanup(lambda: [setattr(jobs, k, v) for k, v in saved_jobs.items()])
+        self.addCleanup(lambda: [setattr(store, k, v) for k, v in saved_store.items()])
+        store.init(os.path.join(self.tmp.name, "store.db"))
+        jobs.init(os.path.join(self.tmp.name, "jobs.db"),
+                  os.path.join(self.tmp.name, "blobs"), 3600)
+        store.upsert("seeded", SEED_ALIAS)
+        self.addCleanup(admin._pg_images.clear)
+
+    def _send(self, params, meta):
+        from urllib.parse import parse_qs, urlsplit
+        jid = jobs.create("text2img", "seeded", "comfy-a")
+        jobs.merge_meta(jid, {"inputs": {"prompt": "a cat", "params": params}})
+        jobs.complete(jid, [Blob(b"\x89PNG\r\n\x1a\n", "image/png", "image")], meta)
+        resp = asyncio.run(admin.job_to_playground(jid, FakeGenRequest([])))
+        return {k: v[0] for k, v in parse_qs(urlsplit(resp.headers["location"]).query).items()}
+
+    def test_drawn_seed_and_dice_field_land(self):
+        q = self._send({}, {"seed": 1234567, "random": {"8.value": 42}})
+        self.assertEqual(q["p__value_7"], "1234567")   # auto-seed on the param labelled Seed
+        self.assertEqual(q["p__value_8"], "42")        # 🎲 request field by node.field
+        self.assertEqual(q["p__prompt"], "a cat")
+
+    def test_client_seed_still_lands(self):
+        q = self._send({"Seed": 77}, {"seed": 77})
+        self.assertEqual(q["p__value_7"], "77")
+        self.assertNotIn("p__value_8", q)
+
+
 class MultipartFilename(unittest.TestCase):
     def test_file_part_carries_its_name(self):
         b = "----gwtest"

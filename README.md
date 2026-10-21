@@ -1501,6 +1501,9 @@ Key mapping concepts:
   draws use `0..2³¹-1`, the range every common seed widget accepts (Trellis2 nodes
   refuse more than `0x7fffffff`), and the job summary lists each drawn value under
   `random` (`{"34.seed": 1234}`) so a good result can be reproduced.
+  **→ Send to Playground** on a job fills in those drawn values (the seed included)
+  next to the sent params, so the next Generate runs with the same seed (a 🎲 pin is
+  still drawn fresh — requests cannot override it).
 - **Image input slots** (a `LoadImage` / `LoadImageMask` node) become file-upload
   request fields. The Aliases media editor picks one of three behaviours per slot for a
   request that sends no image:

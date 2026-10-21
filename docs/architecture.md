@@ -181,6 +181,11 @@ built on a file the client never sent); a mapping
 `label` is the param's public
 API name — incoming values are accepted under label OR param, and the
 auto-random seed keys on that effective name (`''` counts as unset);
+Send to Playground (`admin.job_to_playground`) also carries the values the gateway DREW
+— `meta.seed` and the 🎲 `meta.random` (node.field) mapped back to their params by
+`_job_drawn_values` — because `inputs.params` holds only what the client sent: without
+them the rerun drew a new seed and the picked result could not be reproduced
+(`test_playground_files.SendToPlaygroundSeed`);
 `_apply_lora_cascade` drops client LoRAs into free stack slots (so with a pinned
 `lora_01` the client's `lora_01` runs in `lora_02`; the job view tags each client
 `lora_N`/`strength_N` row with its landing slot from `meta.loras` via

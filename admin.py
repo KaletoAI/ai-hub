@@ -9370,6 +9370,28 @@ async def job_input(job_id: str, n: int):
     return FileResponse(path, media_type=mime)
 
 
+def _job_drawn_values(mapping: dict, meta: dict) -> dict:
+    """{param: value} of the values the GATEWAY drew for a job (auto-seed, 🎲 request
+    fields) — they never reach `inputs.params`, which holds only what the client sent,
+    so Send to Playground would leave the seed blank and the rerun draws a new one: the
+    image you picked cannot be reproduced. Sources are the build summary in the job
+    meta: `seed` (the seed param, found as adapters._build_prompt finds it) and `random`
+    keyed by node.field. A random PIN is not a request field and is drawn again anyway."""
+    out = {}
+    drawn = meta.get("random") or {}
+    for p, m in mapping.items():
+        val = drawn.get(f"{(m or {}).get('node')}.{(m or {}).get('field')}")
+        if val is not None:
+            out[p] = str(val)
+    if meta.get("seed") is not None:
+        seed_param = next((p for p, m in mapping.items()
+                           if p == "seed" or ((m or {}).get("label") or "").strip().lower() == "seed"),
+                          None)
+        if seed_param:
+            out[seed_param] = str(meta["seed"])
+    return out
+
+
 async def job_to_playground(job_id: str, request: Request):
     """Load a job's stored inputs into the Media Playground and jump there: scalar
     params ride the URL (`p__<param>`, so same-named fields land), reference images go
@@ -9402,6 +9424,8 @@ async def job_to_playground(job_id: str, request: Request):
     for k, val in (inp.get("params") or {}).items():
         if val is not None and str(val) != "":
             q[f"p__{ext2param.get(k, k)}"] = str(val)
+    for p, val in _job_drawn_values(mapping, meta).items():
+        q[f"p__{p}"] = val
     user = _session_user(request) or "default"
     stash = _pg_images.setdefault(user, {})
     for r in meta.get("input_images", []):
