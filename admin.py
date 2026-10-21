@@ -361,6 +361,13 @@ p.hint{color:var(--dim);margin:0 0 14px;max-width:62ch;line-height:1.5}
 .control.short input,.control.short select{max-width:150px}
 input,select,textarea{width:100%;background:var(--input);color:var(--text-hi);border:1px solid var(--line-2);border-radius:7px;padding:0 10px;height:36px;font:inherit;outline:none}
 input:focus,select:focus,textarea:focus{border-color:var(--accent)}
+.pg-model{position:relative;width:100%}
+.pg-model input{padding-right:30px}
+.pg-model::after{content:"▾";position:absolute;right:11px;top:6px;pointer-events:none;color:var(--dim)}
+.pg-model-list{position:absolute;top:100%;left:0;right:0;z-index:20;max-height:min(320px,40vh);overflow:auto;background:var(--panel);border:1px solid var(--line-2);border-radius:7px;box-shadow:0 8px 20px #0005}
+.pg-model-list [role=option]{padding:6px 10px;cursor:pointer;overflow-wrap:anywhere}
+.pg-model-list [role=option]:hover,.pg-model-list [aria-selected=true]{background:var(--sel);color:var(--text-hi)}
+.pg-model-group,.pg-model-empty{padding:6px 10px;color:var(--dim);font-size:12px}
 textarea{height:auto;min-height:60px;padding:8px 10px;font-family:ui-monospace,monospace;font-size:12px;line-height:1.5}
 input[type=file]{padding:7px 10px;height:auto}
 input[type=checkbox]{width:auto;height:auto;margin:0 6px 0 0;vertical-align:middle;accent-color:var(--btn)}
@@ -7908,6 +7915,82 @@ def _media_candidate(model: str, models: Optional[list] = None) -> Optional[dict
                  if row.get("id") == model), None)
 
 
+_PG_MODEL_JS = """<script>(function(){
+var select=document.querySelector('[data-pg-model] select');
+if(!select||select.hidden)return;
+var root=select.parentNode,input=document.createElement('input'),list=document.createElement('div');
+input.type='text';input.id='pg-model-input';input.autocomplete='off';
+input.setAttribute('role','combobox');input.setAttribute('aria-label','Model');
+input.setAttribute('aria-autocomplete','list');input.setAttribute('aria-expanded','false');
+input.setAttribute('aria-controls','pg-model-options');
+input.placeholder='Search models…';
+list.id='pg-model-options';list.className='pg-model-list';list.hidden=true;
+list.setAttribute('role','listbox');list.setAttribute('aria-label','Models');
+root.appendChild(input);root.appendChild(list);select.hidden=true;
+var active=-1,visible=[];
+function restore(){
+ input.value=select.selectedIndex<0?'':select.options[select.selectedIndex].text;
+}
+function close(){
+ list.hidden=true;input.setAttribute('aria-expanded','false');
+ input.removeAttribute('aria-activedescendant');restore();
+}
+function highlight(index){
+ active=index;
+ var rows=list.querySelectorAll('[role=option]');
+ for(var i=0;i<rows.length;i++)rows[i].setAttribute('aria-selected',i===active?'true':'false');
+ if(rows[active]){
+  input.setAttribute('aria-activedescendant',rows[active].id);
+  rows[active].scrollIntoView({block:'nearest'});
+ }else input.removeAttribute('aria-activedescendant');
+}
+function show(query){
+ list.replaceChildren();visible=[];active=-1;
+ var needle=query.toLowerCase(),lastGroup=null;
+ for(var i=0;i<select.options.length;i++){
+  var option=select.options[i],group=option.parentNode.label||'';
+  if(option.disabled||(option.text+' '+option.value+' '+group).toLowerCase().indexOf(needle)<0)continue;
+  if(group!==lastGroup){
+   var heading=document.createElement('div');heading.className='pg-model-group';
+   heading.setAttribute('role','presentation');heading.textContent=group;list.appendChild(heading);
+   lastGroup=group;
+  }
+  var row=document.createElement('div');row.id='pg-model-option-'+i;
+  row.setAttribute('role','option');row.setAttribute('data-index',visible.length);
+  row.setAttribute('aria-selected','false');row.textContent=option.text;
+  visible.push(option);list.appendChild(row);
+ }
+ if(!visible.length){
+  var empty=document.createElement('div');empty.className='pg-model-empty';
+  empty.setAttribute('role','status');empty.textContent='No matching models';list.appendChild(empty);
+ }
+ list.hidden=false;input.setAttribute('aria-expanded','true');highlight(-1);
+}
+function choose(index){
+ var option=visible[index];if(!option)return;
+ var changed=select.value!==option.value;select.value=option.value;close();
+ if(changed)select.dispatchEvent(new Event('change',{bubbles:true}));
+}
+input.addEventListener('focus',function(){show('');input.select();});
+input.addEventListener('click',function(){if(list.hidden){show('');input.select();}});
+input.addEventListener('input',function(){show(input.value);});
+input.addEventListener('blur',close);
+input.addEventListener('keydown',function(e){
+ if(e.key==='Escape'){e.preventDefault();close();return;}
+ if(e.key==='Tab'){close();return;}
+ if(e.key==='Enter'){e.preventDefault();if(!list.hidden)choose(active);return;}
+ if(e.key!=='ArrowDown'&&e.key!=='ArrowUp')return;
+ e.preventDefault();if(list.hidden)show('');
+ if(visible.length)highlight((active+(e.key==='ArrowDown'?1:active<0?0:-1)+visible.length)%visible.length);
+});
+list.addEventListener('mousedown',function(e){e.preventDefault();});
+list.addEventListener('click',function(e){
+ var row=e.target.closest('[data-index]');if(row)choose(Number(row.getAttribute('data-index')));
+});
+restore();
+})();</script>"""
+
+
 def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Optional[dict] = None,
                      kept: Optional[dict] = None) -> str:
     """`kept` is the user's upload stash ({param: (filename, bytes)}) — membership drives
@@ -7929,7 +8012,7 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
                 + (f' <span class="muted">{_esc(name)}</span>' if show_name and name else "")
                 + ' <label class="muted" style="font-weight:normal">'
                   f'<input type="checkbox" name="clear__{_esc(param)}"> clear</label>')
-    # A native grouped select keeps keyboard navigation and needs no widget script.
+    # Keep the grouped select as the form value; enhance it with an inline search picker.
     groups = {}
     for row in aliases:
         row = row if isinstance(row, dict) else {"id": row, "name": row, "group": "Aliases"}
@@ -7950,7 +8033,8 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
                      f'{" selected" if model_id == vals.get("model") else ""}>{_esc(label)}</option>')
         opts += "</optgroup>"
     # Switching models carries same-named scalar controls, like prompt, across.
-    alias_select = f'<select name="model" onchange="pgSwitch(this)">{opts}</select>'
+    alias_select = (f'<div class="pg-model" data-pg-model data-live-skip>'
+                    f'<select name="model" onchange="pgSwitch(this)">{opts}</select></div>')
     # one input per MAPPED param of the selected alias (dynamic — mirrors the request
     # fields configured in Mapping, in drag-set order). Image-loader fields render as
     # file uploads (img__<param>, empty → 8×8 placeholder); scalars as p__<param>
@@ -8084,7 +8168,7 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
             + rows
             + '<p class="hint">Uses <code>POST /v1/generations</code>; results update here. '
               'Catalog models need no alias. Reference uploads are kept for the next generation.</p></form>'
-            + pg_switch_js)
+            + pg_switch_js + _PG_MODEL_JS)
 
 
 def _playground_body(aliases: list, vals: dict, cand: Optional[dict], result_html: str,

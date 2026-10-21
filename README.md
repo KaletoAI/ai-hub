@@ -2388,6 +2388,12 @@ Media Jobs list is always live (every 15 s when idle, so a job started from anot
 client shows up without F5), sortable like the other lists, and pages back through
 older jobs 100 at a time (`older →`).
 
+**Searchable media model picker:** click the Model field in the Media Playground
+to see the grouped model list, or type in that same field to narrow it by name,
+model ID or group (case-insensitive). Select with a click or Arrow Up/Down + Enter;
+Escape or leaving the field restores the current model without switching.
+Only listed models can be selected, and switching keeps same-named prompt fields.
+
 **Animated GLB previews** in Media Playground and Media Job detail play the file's
 own animation, with a play/pause checkbox and clip selection when the file contains
 multiple animations. The camera stays still while motion plays; you can orbit it
