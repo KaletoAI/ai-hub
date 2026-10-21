@@ -282,6 +282,28 @@ class SendToPlaygroundSeed(unittest.TestCase):
         self.assertNotIn("p__value_8", q)
 
 
+class DrawnFieldsStayBlank(unittest.TestCase):
+    """The playground SENDS every filled field. A drawn field prefilled with the
+    workflow's value (seed 123456) therefore ran every playground job with that one
+    seed, while the API drew a fresh one — a 🎲 field that never rolled."""
+
+    def _input(self, html, name):
+        import re
+        return re.search(r'<input[^>]*name="%s"[^>]*>' % name, html).group(0)
+
+    def test_no_default_for_drawn_params(self):
+        self.assertEqual(admin._alias_defaults(SEED_ALIAS[0]), {})   # value_7 = Seed, value_8 = 🎲
+
+    def test_blank_with_placeholder_until_a_value_is_sent(self):
+        cand = SEED_ALIAS[0]
+        html = admin._playground_form([{"id": "seeded", "name": "seeded", "group": "Aliases"}],
+                                      {"model": "seeded", "value_7": "", "value_8": "42"}, cand)
+        seed = self._input(html, "p__value_7")
+        self.assertIn('value=""', seed)
+        self.assertIn("🎲 random", seed)
+        self.assertIn('value="42"', self._input(html, "p__value_8"))   # Send to Playground value
+
+
 class MultipartFilename(unittest.TestCase):
     def test_file_part_carries_its_name(self):
         b = "----gwtest"

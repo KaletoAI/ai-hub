@@ -185,7 +185,10 @@ Send to Playground (`admin.job_to_playground`) also carries the values the gatew
 — `meta.seed` and the 🎲 `meta.random` (node.field) mapped back to their params by
 `_job_drawn_values` — because `inputs.params` holds only what the client sent: without
 them the rerun drew a new seed and the picked result could not be reproduced
-(`test_playground_files.SendToPlaygroundSeed`);
+(`test_playground_files.SendToPlaygroundSeed`). The playground renders such a drawn
+param (`admin._drawn_param`) BLANK — `_alias_defaults` skips it — because it sends
+every filled field: prefilled with the workflow's value, every playground run used
+that one seed while the API drew a fresh one (`DrawnFieldsStayBlank`);
 `_apply_lora_cascade` drops client LoRAs into free stack slots (so with a pinned
 `lora_01` the client's `lora_01` runs in `lora_02`; the job view tags each client
 `lora_N`/`strength_N` row with its landing slot from `meta.loras` via

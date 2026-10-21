@@ -1503,7 +1503,9 @@ Key mapping concepts:
   `random` (`{"34.seed": 1234}`) so a good result can be reproduced.
   **→ Send to Playground** on a job fills in those drawn values (the seed included)
   next to the sent params, so the next Generate runs with the same seed (a 🎲 pin is
-  still drawn fresh — requests cannot override it).
+  still drawn fresh — requests cannot override it). In the Media Playground a
+  drawn field (🎲 or the seed) starts blank with a `🎲 random` placeholder instead
+  of the workflow's value: blank is drawn per job, a typed value is sent as is.
 - **Image input slots** (a `LoadImage` / `LoadImageMask` node) become file-upload
   request fields. The Aliases media editor picks one of three behaviours per slot for a
   request that sends no image:

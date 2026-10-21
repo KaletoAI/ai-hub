@@ -7843,11 +7843,23 @@ def _pg_history_blob(ref: str):
     return name, data
 
 
+def _drawn_param(param: str, m: Optional[dict]) -> bool:
+    """A request field the gateway DRAWS when the request leaves it blank: 🎲, or the
+    auto-seed param (named or labelled `seed`, as adapters._build_prompt finds it)."""
+    m = m or {}
+    return (bool(m.get("random")) or param == "seed"
+            or (m.get("label") or "").strip().lower() == "seed")
+
+
 def _alias_defaults(cand: dict) -> dict:
-    """Default value per request param, read from the workflow at the mapped node."""
+    """Default value per request param, read from the workflow at the mapped node.
+    A drawn param has none: the playground would prefill the workflow's value and SEND
+    it, so every playground run used that one seed while the API drew a fresh one."""
     wf = cand.get("workflow_json") or {}
     out = {}
     for param, m in (cand.get("mapping") or {}).items():
+        if _drawn_param(param, m):
+            continue
         v = (wf.get(m.get("node"), {}).get("inputs") or {}).get(m.get("field"))
         if v is not None and not isinstance(v, list):
             out[param] = v
@@ -8128,6 +8140,9 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
                 if cur and cur not in o:
                     o = [cur] + o
                 rows += _field(label, _select(f"p__{p}", o, cur))
+            elif _drawn_param(p, m):                     # blank = drawn per job; a value reruns it
+                rows += _field(label, _inp(f"p__{p}", v(p), placeholder="🎲 random", typ="number",
+                                           step="1"))
             elif isinstance(opts, dict) and opts.get("_num"):    # FLOAT/INT → bounded number input
                 cur = v(p) or (str(dv) if dv is not None else "")
                 rows += _field(label, _num_input(f"p__{p}", cur, opts))
