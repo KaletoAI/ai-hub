@@ -42,12 +42,14 @@ class VoicePlayground(_Fixture):
                                         "nanogpt": {"endpoint": "tts"}}])
         # No healthy catalog row: stored aliases must still be selectable in a queue.
         with patch.object(admin, "_generation_models", lambda: []), \
-                patch.object(admin, "_chat_models", lambda: ["native-tts", "workflow-speech"]):
+                patch.object(admin, "_llm_backends", lambda: [{
+                    "name": "native", "models": ["native-tts"],
+                    "model_types": {"native-tts": ["tts"]}}]):
             response = self.c.get("/ui/playground?sub=voice")
         self.assertEqual(response.status_code, 200)
         controls = _VoiceControls(response.text)
         self.assertEqual(set(controls.models), {
-            "native-tts", "workflow-speech", "workflow-text2audio"})
+            "native-tts", "native/native-tts", "workflow-speech", "workflow-text2audio"})
         self.assertEqual(controls.models.count("workflow-speech"), 1)
         for name in ("model", "input", "voice_sel", "voice", "ref_text", "language"):
             self.assertIn(name, controls.fields)

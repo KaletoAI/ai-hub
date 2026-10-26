@@ -214,10 +214,21 @@ An **empty** allow-list = everything allowed (the default). A non-empty list bot
 the key only sees what it's allowed. This is how you point an image client at the
 gateway and have it see just the image aliases instead of the whole 400-model
 catalog: give it a key whose allow-list is the image alias(es) (or the ComfyUI
-backend), and `GET /v1/models` returns only those. `?type=image`, `chat`, `video`,
-`3d`, `tts`, `embedding`, `audio` and `asr` narrow the catalog. NanoGPT and Venice
-expose typed inventories; `audio` and `asr` include Venice music/voice conversion
-and transcription respectively.
+backend), and `GET /v1/models` returns only those. `?type=chat`, `image`, `video`,
+`3d`, `tts`, `embedding`, `rerank`, `audio` and `asr` narrow the catalog.
+`?type=media` selects the union of image, video, 3D, TTS, audio and transcription
+models. Without `type`, the endpoint remains the complete permitted catalog.
+NanoGPT and Venice expose typed inventories; `audio` and `asr` include Venice
+music/voice conversion and transcription respectively.
+
+Task-specific console model choices use the same type classification: Chat and
+reasoning tests suggest chat models, Voice suggests TTS models, and Media can be
+narrowed by category as well as backend. Backend-specific suggestions respect the
+selected type. Alias types follow their actual targets, not their display names;
+models with multiple supported capabilities can appear in multiple categories.
+Explicit provider task/capability metadata takes precedence over conservative legacy
+model-name inference. Generic text-only output metadata is not proof of chat support.
+Model access permissions and dispatch rules are unchanged by catalog filtering.
 
 ### Quotas
 

@@ -381,6 +381,13 @@ def extract_models(payload, backend: dict) -> set[str]:
     return {m["id"] for m in data if "id" in m}
 
 
+def extract_model_metadata(payload) -> dict[str, dict]:
+    """Keep provider capability declarations instead of flattening discovery to IDs."""
+    data = payload.get("data", []) if isinstance(payload, dict) else payload
+    return {row["id"]: row for row in data or []
+            if isinstance(row, dict) and isinstance(row.get("id"), str)}
+
+
 # ── Adapter contracts ─────────────────────────────────────────────────────────
 
 @dataclass
@@ -394,6 +401,7 @@ class Capabilities:
     # llama-swap `/running` as parse_running() reads it; None = the backend has no such
     # endpoint (vLLM, OpenRouter, LocalAI), which is what makes `current` unroutable there.
     running: Optional[list] = None
+    metadata: dict[str, dict] = field(default_factory=dict)  # original provider rows, for catalog capabilities
 
 
 # ── `current`: whatever model a llama-swap backend has loaded right now ────────
@@ -1123,7 +1131,8 @@ class OpenAIAdapter(BackendAdapter):
         running = await self.fetch_running(client)
         context.update(await self._llamaswap_context(client, b, running or []))
         return Capabilities(models=extract_models(payload, b),
-                            pricing=extract_pricing(payload), context=context, running=running)
+                            pricing=extract_pricing(payload), context=context, running=running,
+                            metadata=extract_model_metadata(payload))
 
     async def fetch_running(self, client: httpx.AsyncClient,
                             timeout: float = _DISCOVERY_TIMEOUT) -> Optional[list]:
@@ -1682,8 +1691,9 @@ class AnthropicAdapter(OpenAIAdapter):
             resp = await client.get(f"{b['url']}/v1/models", headers=headers,
                                     timeout=_DISCOVERY_TIMEOUT)
             resp.raise_for_status()
-            models = extract_models(resp.json(), b) | set(configured)
-            return Capabilities(models=models, pricing={})
+            payload = resp.json()
+            models = extract_models(payload, b) | set(configured)
+            return Capabilities(models=models, pricing={}, metadata=extract_model_metadata(payload))
         except Exception as e:
             if configured:
                 logger.info(f"[{self.name}] /v1/models unavailable ({type(e).__name__}) — "

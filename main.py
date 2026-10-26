@@ -42,6 +42,7 @@ import stats
 import store
 import modelsync
 import loratags
+from model_kinds import MEDIA_TYPES, generation_types, model_types
 import hostapi
 import hostctl
 import rpvolume
@@ -287,6 +288,7 @@ def rebuild_virtual_models() -> None:
 # ── State ─────────────────────────────────────────────────────────────────────
 
 backend_models: dict[str, set[str]] = {}                       # name → {model_id, ...}
+backend_model_metadata: dict[str, dict[str, dict]] = {}         # bid → original provider model rows
 backend_healthy: dict[str, bool] = {}                          # name → bool
 backend_error: dict[str, dict] = {}                            # bid → why discovery failed (see _classify_error)
 backend_pricing: dict[str, dict[str, dict[str, float]]] = {}   # name → {model_id → {input, output[, cache_read, cache_write]}}
@@ -420,6 +422,63 @@ def _llm_models(b: dict) -> set:
     catalogs = getattr(backend_adapters.get(backend_id(b)), "model_catalogs", {})
     text = set().union(*(set(catalogs.get(k, {})) for k in ("text", "tts", "embedding")))
     return models & adapters.add_model_extras(text, b)
+
+
+def _backend_model_types(backend: dict, model: str) -> set[str]:
+    """Catalog membership and provider metadata, shared by API and console views."""
+    bid = backend_id(backend)
+    if _is_current(backend, model):
+        return {"chat"}
+    catalogs = getattr(backend_adapters.get(bid), "model_catalogs", {})
+    kinds = set()
+    for endpoint, rows in catalogs.items():
+        if model in rows:
+            kinds.update(model_types(model, {**rows[model], "catalog_type": endpoint}))
+    return kinds or model_types(model, backend_model_metadata.get(bid, {}).get(model))
+
+
+def _callable_model_types(backend: dict, model: str) -> set[str]:
+    """Capabilities of a backend/model pin after the generic alias resolution."""
+    # Prefix dispatch selects the first enabled LLM backend with this name.
+    name = backend["name"]
+    backend = next((b for b in backends if b["name"] == name and is_enabled(b) and _is_llm(b)), None)
+    if backend is None:
+        return set()
+    target, _ = alias_entry(model, backend["name"])
+    if target is None or (target not in _llm_models(backend) and not _is_current(backend, target)):
+        return set()
+    return _backend_model_types(backend, target)
+
+
+def _chat_alias_types(alias: str) -> set[str]:
+    """Union actual backend targets, never the public alias's potentially opaque name."""
+    mapping = virtual_models.get(alias)
+    kinds, covered = set(), set()
+    for backend in backends:
+        if not _is_llm(backend):
+            continue
+        real, _ = alias_entry(alias, backend["name"])
+        if not real:
+            continue
+        if real in _llm_models(backend) or _is_current(backend, real):
+            kinds.update(_backend_model_types(backend, real))
+            covered.add(backend["name"])
+    # A global mapping does not acquire chat from every backend lacking its model.
+    if isinstance(mapping, str):
+        return kinds or model_types(mapping)
+    # An offline/not-yet-added candidate still contributes its actual target's kind.
+    if isinstance(mapping, dict):
+        for name, entry in mapping.items():
+            real = entry.get("model") if isinstance(entry, dict) else entry
+            if name not in covered and real:
+                kinds.update(model_types(real))
+    return kinds
+
+
+def _matches_model_type(kinds: set[str], requested: str) -> bool:
+    if requested == "media":
+        return bool(kinds & MEDIA_TYPES)
+    return not requested or requested in kinds
 
 
 def enabled_backends() -> list[dict]:
@@ -842,6 +901,7 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
     if bid in _probing:
         return                             # a poll of this backend is already in flight
     _probing.add(bid)
+    discovery_account = (backend.get("url"), backend.get("api_key"))
     try:
         try:
             caps = await adapter.discover(client)
@@ -875,6 +935,13 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
         if changed:
             await _persist_discovery(label, store.save_backend_models, bid, caps.models)
         backend_models[bid] = caps.models
+        current_adapter = backend_adapters.get(bid)
+        current_backend = getattr(current_adapter, "backend", backend)
+        if current_adapter is not None and discovery_account == (
+                current_backend.get("url"), current_backend.get("api_key")):
+            backend_model_metadata[bid] = {
+                mid: meta for mid, meta in (getattr(caps, "metadata", None) or {}).items()
+                if mid in caps.models}
         backend_pricing[bid] = caps.pricing
         backend_loras[bid] = getattr(caps, "loras", set()) or set()
         learned = merge_learned_context(backend_context.get(bid), getattr(caps, "context", None))
@@ -1069,6 +1136,7 @@ def reload_config() -> None:
         backend_healthy.pop(stale, None)
         backend_error.pop(stale, None)
         backend_models.pop(stale, None)
+        backend_model_metadata.pop(stale, None)
         backend_pricing.pop(stale, None)
         backend_loras.pop(stale, None)
         backend_model_counts.pop(stale, None)
@@ -2459,6 +2527,8 @@ def build_backend_adapters() -> None:
     `adopt_state`s what still applies (see the adapters)."""
     old = dict(backend_adapters)
     backend_adapters.clear()
+    for stale in set(backend_model_metadata) - {backend_id(b) for b in backends}:
+        backend_model_metadata.pop(stale, None)
     for b in backends:
         bid = backend_id(b)
         prev = old.get(bid)
@@ -2467,6 +2537,9 @@ def build_backend_adapters() -> None:
             backend_adapters[bid] = prev
             continue
         ad = make_adapter(b, adapter_ctx)
+        if (prev is None or prev.backend.get("url") != b.get("url")
+                or prev.backend.get("api_key") != b.get("api_key")):
+            backend_model_metadata.pop(bid, None)
         if prev is not None:
             ad.adopt_state(prev)
         backend_adapters[bid] = ad
@@ -2842,79 +2915,71 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
     def visible(keys: set) -> bool:                           # any grant-key in the allow-list?
         return (not allow) or any(k in allow for k in keys)
 
-    # CHAT/LLM catalog = LLM backends only (ComfyUI "models" are checkpoints, not
-    # chat-callable). Names are unique within the LLM type, so the prefix is unambiguous.
-    if typ in ("", "chat", "tts", "embedding"):
-        offered = [b for b in enabled_backends()
-                   if _is_llm(b) and not is_draining(b) and backend_healthy.get(backend_id(b))]
-        for backend in offered:                   # comfy / draining / down → not offered
-            bname = backend["name"]
-            expose_bare = backend.get("local", False)
-            catalogs = getattr(backend_adapters.get(backend_id(backend)), "model_catalogs", {})
-            for mid in sorted(_llm_models(backend)):
-                if typ:
-                    if backend.get("type") in adapters.DYNAMIC_CATALOG_TYPES:
-                        key = {"chat": "text", "tts": "tts", "embedding": "embedding"}[typ]
-                        known = any(mid in catalog for catalog in catalogs.values())
-                        if mid not in catalogs.get(key, {}) and not (typ == "chat" and not known):
-                            continue
-                    elif typ != "chat":
-                        continue
-                # model_prefix on → '<backend>/<model>' (provider visible, distinct across
-                # backends). off → legacy bare ids deduplicated across backends.
-                disp = f"{bname}/{mid}" if model_prefix else mid
-                if disp not in seen and visible({disp, mid, bname}):
-                    seen.add(disp)
-                    data.append(_with_context(
-                        {"id": disp, "object": "model", "created": now, "owned_by": bname},
-                        model_context(backend, mid)))
-                # `local: true` backends ALSO list the bare id; a bare request routes
-                # across every backend that exposes it (like a virtual alias) — so its
-                # context_length is the SMALLEST of theirs.
-                if expose_bare and mid not in seen and visible({mid, bname}):
-                    seen.add(mid)
-                    data.append(_with_context(
-                        {"id": mid, "object": "model", "created": now, "owned_by": bname},
-                        _context_min((b2, mid) for b2 in offered
-                                     if mid in _llm_models(b2))))
-            # `<backend>/current` (llama-swap only) — always prefixed, a bare `current`
-            # would be ambiguous. No context_length: it changes with every swap.
-            cur = f"{bname}/{adapters.CURRENT_MODEL}"
-            if typ in ("", "chat") and _is_current(backend, adapters.CURRENT_MODEL) and cur not in seen and visible({cur, bname}):
-                seen.add(cur)
-                data.append({"id": cur, "object": "model", "created": now, "owned_by": bname})
-        # Virtual chat aliases are cross-backend → always listed bare (no prefix).
-        for alias in virtual_models if typ in ("", "chat") else ():
-            if alias not in seen and visible({alias}):
-                seen.add(alias)
-                data.append(_with_context(
-                    {"id": alias, "object": "model", "created": now, "owned_by": "ai-hub (virtual)"},
-                    _alias_context(alias, offered)))
-
-    # Optional aliases retain precedence over directly discovered media IDs.
-    if typ in ("", "image", "video", "3d", "tts", "audio", "asr"):
-        img_aliases = (await asyncio.to_thread(store.list_aliases)
-                       if store.is_active() else image_models)
-        for alias, cands in img_aliases.items():
-            kind = _generation_type(cands[0]) if cands else "image"
-            if typ and kind != typ:
-                continue
-            if alias not in seen and visible({alias, GRANT_ALL_IMAGE}):
-                seen.add(alias)
-                data.append({"id": alias, "object": "model", "created": now,
-                             "owned_by": f"ai-hub ({kind})"})
-        for row in generation_models_info():
-            kind = _generation_type(row["candidate"])
-            mid = row["candidate"]["model"]
-            disp = row["id"] if model_prefix else mid
-            if row["id"] in img_aliases or disp in img_aliases or (typ and typ != kind):
-                continue
-            # Account media: a backend named one by one, not `@backends` (_model_allowed).
-            account = {row["backend"]} if row["backend"] in raw_allow else set()
-            if disp not in seen and visible({disp, mid, GRANT_ALL_IMAGE} | account):
+    img_aliases = (await asyncio.to_thread(store.list_aliases)
+                   if store.is_active() else image_models)
+    chat_aliases = set(virtual_models)
+    # The LLM protocol catalog can also contain embeddings, speech and multimodal
+    # outputs. Classification narrows only this view, never dispatch's model set.
+    offered = [b for b in enabled_backends()
+               if _is_llm(b) and not is_draining(b) and backend_healthy.get(backend_id(b))]
+    for backend in offered:
+        bname = backend["name"]
+        expose_bare = backend.get("local", False)
+        for mid in sorted(_llm_models(backend)):
+            kinds = (_callable_model_types(backend, mid) if model_prefix
+                     else _backend_model_types(backend, mid))
+            disp = f"{bname}/{mid}" if model_prefix else mid
+            if (_matches_model_type(kinds, typ) and disp not in seen
+                    and disp not in chat_aliases and visible({disp, mid, bname})):
                 seen.add(disp)
-                data.append({"id": disp, "object": "model", "created": now,
-                             "owned_by": row["backend"]})
+                data.append(_with_context(
+                    {"id": disp, "object": "model", "created": now, "owned_by": bname},
+                    model_context(backend, (resolve_for_backend(mid, bname) or mid) if model_prefix else mid)))
+            # A bare local ID still carries the smallest context across its hosts.
+            if (expose_bare and mid not in seen and mid not in chat_aliases
+                    and _matches_model_type(_backend_model_types(backend, mid), typ)
+                    and visible({mid, bname})):
+                seen.add(mid)
+                data.append(_with_context(
+                    {"id": mid, "object": "model", "created": now, "owned_by": bname},
+                    _context_min((b2, mid) for b2 in offered if mid in _llm_models(b2))))
+        cur = f"{bname}/{adapters.CURRENT_MODEL}"
+        if (_matches_model_type(_callable_model_types(backend, adapters.CURRENT_MODEL), typ)
+                and _is_current(backend, adapters.CURRENT_MODEL)
+                and cur not in seen and cur not in chat_aliases and visible({cur, bname})):
+            seen.add(cur)
+            data.append({"id": cur, "object": "model", "created": now, "owned_by": bname})
+    # Virtual aliases keep their grants and context calculation; their type is the
+    # union of actual backend targets, not the alias name or merely its first target.
+    for alias in virtual_models:
+        if (_matches_model_type(_chat_alias_types(alias), typ)
+                and alias not in seen and visible({alias})):
+            seen.add(alias)
+            data.append(_with_context(
+                {"id": alias, "object": "model", "created": now, "owned_by": "ai-hub (virtual)"},
+                _alias_context(alias, offered)))
+    for alias, cands in img_aliases.items():
+        kinds = set().union(*(generation_types(cand) for cand in cands)) if cands else {"image"}
+        if not _matches_model_type(kinds, typ):
+            continue
+        if alias not in seen and visible({alias, GRANT_ALL_IMAGE}):
+            seen.add(alias)
+            # Preserve the existing owner label for single-kind aliases.
+            kind = _generation_type(cands[0]) if cands else "image"
+            data.append({"id": alias, "object": "model", "created": now,
+                         "owned_by": f"ai-hub ({kind})"})
+    for row in generation_models_info():
+        kinds = generation_types(row["candidate"])
+        mid = row["candidate"]["model"]
+        disp = row["id"] if model_prefix else mid
+        if row["id"] in img_aliases or disp in img_aliases or not _matches_model_type(kinds, typ):
+            continue
+        # Account media: a backend named one by one, not `@backends` (_model_allowed).
+        account = {row["backend"]} if row["backend"] in raw_allow else set()
+        if disp not in seen and visible({disp, mid, GRANT_ALL_IMAGE} | account):
+            seen.add(disp)
+            data.append({"id": disp, "object": "model", "created": now,
+                         "owned_by": row["backend"]})
 
     return {"object": "list", "data": data}
 
@@ -3375,23 +3440,8 @@ def _gen_backend_for(name: str, cand: Optional[dict],
 def _generation_type(cand: dict) -> str:
     kind = adapters.cand_kind(cand)
     if kind in adapters.DYNAMIC_CATALOG_TYPES:
-        mod = adapters.cloud_module(kind)
-        endpoint = mod.endpoint_of(cand)
-        if hasattr(mod, "generation_type"):
-            return mod.generation_type(endpoint)
-        return "image" if endpoint == "images" else endpoint
-    task = str(cand.get("task") or "")
-    if "vid" in task:
-        return "video"
-    if "3d" in task or adapters.cand_kind(cand) in ("meshy", "tripo"):
-        return "3d"
-    # Same families as Venice's catalog (venice.generation_type): transcription is
-    # `asr`, audio→audio `audio`. text2audio stays `tts` — existing ComfyUI speech aliases.
-    if task == "audio2text":
-        return "asr"
-    if task == "audio2audio":
-        return "audio"
-    return "tts" if "tts" in task or "audio" in task else "image"
+        adapters.cloud_module(kind).endpoint_of(cand)  # preserve the dispatch-time endpoint validation
+    return next(iter(generation_types(cand)))
 
 
 def _catalog_direct_candidates(model: str, pool=None) -> list[dict]:
@@ -5911,6 +5961,7 @@ def gateway_info() -> dict:
             **_comfy_watch_info(b), **_cloud_info(b), **_runpod_info(b), **_model_filter_info(b), **_loaded_info(b),
         } for b in backends],
         "virtual_models": list(virtual_models.keys()),
+        "alias_types": {alias: sorted(_chat_alias_types(alias)) for alias in virtual_models},
         "endpoints": ["/v1/chat/completions", "/v1/completions", "/v1/embeddings",
                       "/v1/responses", "/v1/models", "/v1/generations", "/v1/jobs/{id}"],
     }
@@ -8907,6 +8958,12 @@ def llm_backends_info() -> list[dict]:
     return [{"name": b["name"], "type": b.get("type", "openai"),
              "enabled": is_enabled(b),
              "models": sorted(_llm_models(b)),
+             "model_types": {mid: sorted(_backend_model_types(b, mid))
+                             for mid in sorted(_llm_models(b) | (
+                                 {adapters.CURRENT_MODEL} if _is_current(b, adapters.CURRENT_MODEL) else set()))},
+             "callable_model_types": {mid: sorted(_callable_model_types(b, mid))
+                                     for mid in sorted(_llm_models(b) | (
+                                         {adapters.CURRENT_MODEL} if _is_current(b, adapters.CURRENT_MODEL) else set()))},
              "billing": _billing_info(b),
              # `/running` answers → the alias editor also offers `current` here
              "current": _is_current(b, adapters.CURRENT_MODEL)}

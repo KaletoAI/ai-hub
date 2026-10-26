@@ -311,6 +311,7 @@ var document={
 """ + scripts + """
 var result=[];
 ['included','charged','unknown',''].forEach(function(bk){
+ model.value=bk==='unknown'?'unknown-only':'shared';
  backend.value=bk;cpFilterModels(bk);
  result.push({options:dl.children,context:context.textContent,model:model.value});
 });
@@ -324,7 +325,7 @@ console.log(JSON.stringify(result));
             expected = ("included-only", "credit-only", "unknown-only")[i]
             option = next(o for o in options if o["value"] == expected)
             self.assertIn(marker, option["label"])
-            self.assertEqual(filtered[i]["model"], "shared")
+            self.assertEqual(filtered[i]["model"], "unknown-only" if i == 2 else "shared")
         self.assertIn("[I]", filtered[0]["context"])
         self.assertIn("[C]", filtered[1]["context"])
         self.assertIn("[?]", filtered[2]["context"])

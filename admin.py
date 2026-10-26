@@ -35,6 +35,7 @@ import arliai
 import cloudtask
 import hostapi
 import jobs
+import model_kinds
 import scheduler
 import reasoning
 import rpvolume
@@ -5578,26 +5579,127 @@ def _chat_value_for(alias: str) -> dict:
         return {b["name"]: v for b in _llm_backends() if v in b.get("models", [])}
     return {}
 
+def _backend_model_types(backend: dict, model: str) -> set:
+    kinds = backend.get("model_types") or {}
+    return set(kinds[model]) if model in kinds else model_kinds.model_types(model)
+
+
+def _callable_model_types(backend: dict, model: str) -> set:
+    """A backend/model pin resolves a generic alias before selecting its target."""
+    kinds = backend.get("callable_model_types") or {}
+    if model in kinds:
+        return set(kinds[model])
+    aliases = dict(_config_chat_aliases())
+    if store.is_active():
+        aliases.update(store.list_chat_aliases())
+    value = aliases.get(model, model)
+    target = value.get(backend["name"]) if isinstance(value, dict) else value
+    target = target.get("model") if isinstance(target, dict) else target
+    if target == adapters.CURRENT_MODEL and backend.get("current"):
+        return {"chat"}
+    if target and target in backend.get("models", []):
+        return _backend_model_types(backend, target)
+    return set()
+
+
+def _backend_models(backend: dict, kind: str, *, callable_models: bool = False) -> list:
+    classify = _callable_model_types if callable_models else _backend_model_types
+    return sorted(m for m in backend.get("models", [])
+                  if kind == "all" or kind in classify(backend, m))
+
+
+def _backend_picker_models(kind: str, *, current: bool = False,
+                           anthropic: bool = False, literal: bool = False) -> dict:
+    models: dict = {}
+    for b in _llm_backends():
+        if b.get("type") == "anthropic" and not anthropic:
+            continue
+        target = models.setdefault(b["name"], set())
+        target.update(_backend_models(b, kind, callable_models=not literal))
+        if current and b.get("current") and kind in ("chat", "all"):
+            target.add(adapters.CURRENT_MODEL)
+    return {name: sorted(values) for name, values in models.items()}
+
+
+def _alias_model_types(alias: str, info: Optional[dict] = None) -> set:
+    info = _gateway_info() if info is None else info
+    kinds = info.get("alias_types") or {}
+    if alias in kinds:
+        return set(kinds[alias])
+    aliases = dict(_config_chat_aliases())
+    if store.is_active():
+        aliases.update(store.list_chat_aliases())
+    value = aliases.get(alias)
+    if value is None:
+        return model_kinds.model_types(alias)
+    kinds = set()
+    for b in _llm_backends():
+        target = value.get(b["name"]) if isinstance(value, dict) else value
+        target = target.get("model") if isinstance(target, dict) else target
+        if target == adapters.CURRENT_MODEL and b.get("current"):
+            kinds.add("chat")
+        elif target and target in b.get("models", []):
+            kinds.update(_backend_model_types(b, target))
+    return kinds
+
+
+_ALIAS_MODEL_KINDS = ("chat", "image", "video", "3d", "audio", "tts", "asr", "embedding", "rerank")
+
+
+def _alias_kind_control(kind: str) -> str:
+    return _field("model type", _select("type", [(k, k) for k in _ALIAS_MODEL_KINDS]
+                  + [("all", "all types")], kind).replace(
+                      "<select ", '<select onchange="amFilter(this.form)" ', 1), short=True)
+
+
+def _alias_picker_script(datalists: dict) -> str:
+    # Generic aliases also serve speech/embedding endpoints. Narrow suggestions,
+    # never erase existing mappings when the management filter changes.
+    catalogs: dict = {}
+    for backend in _llm_backends():
+        buckets = catalogs.setdefault(backend["name"], {k: set() for k in (*_ALIAS_MODEL_KINDS, "all")})
+        for model in backend.get("models", []):
+            buckets["all"].add(model)
+            for kind in _backend_model_types(backend, model):
+                if kind in buckets:
+                    buckets[kind].add(model)
+        if backend.get("current"):
+            buckets["chat"].add(adapters.CURRENT_MODEL)
+            buckets["all"].add(adapters.CURRENT_MODEL)
+    kinds = {name: {kind: sorted(models) for kind, models in buckets.items()}
+             for name, buckets in catalogs.items()}
+    return ("<script>var AM_BK=%s,AM_DLS=%s;function amFilter(f){"
+            "var kind=f.elements.type.value;"
+            "Object.keys(AM_DLS).forEach(function(id){"
+            "var bk=f.elements.backend?f.elements.backend.value:AM_DLS[id],"
+            "ms=(AM_BK[bk]||{})[kind]||[],dl=document.getElementById(id);if(!dl)return;"
+            "dl.innerHTML='';ms.forEach(function(m){var o=document.createElement('option');"
+            "o.value=m;dl.appendChild(o);});});}</script>") % (_js_json(kinds), _js_json(datalists))
+
+
 
 def _chat_new_form(vals: Optional[dict] = None, err: str = "") -> str:
     """Minimal create form — like registering a generation alias. More backends are
     assigned in the editor afterwards. `vals`/`err`: a refused create, shown again."""
     v = vals or {}
     llm = _llm_backends()
-    all_models = sorted({m for b in llm for m in b.get("models", [])})
-    if any(b.get("current") for b in llm):            # llama-swap: "whatever is loaded"
-        all_models.insert(0, adapters.CURRENT_MODEL)
+    kind = v.get("type") if v.get("type") in (*_ALIAS_MODEL_KINDS, "all") else "chat"
+    bk_models = _backend_picker_models(kind, current=True, anthropic=True, literal=True)
+    backend = v.get("backend") or next(iter(bk_models), "")
+    all_models = bk_models.get(backend, [])
     bopts = [b["name"] for b in llm] or [("", "(no LLM backends)")]
     return ('<form action="/ui/chat/create" method="post" data-guard>'
             f'<div class="formbar"><h2>New Chat Alias</h2>{_btn("Create", submit=True)}'
             f'{_btn("Cancel", "/ui/aliases", "secondary")}</div>'
             + _form_err(err)
             + _field("alias name", _inp("alias", v.get("alias", ""), placeholder="fast"), short=True)
-            + _field("backend", _select("backend", bopts, v.get("backend")), short=True)
+            + _alias_kind_control(kind)
+            + _field("backend", _select("backend", bopts, backend).replace(
+                "<select ", '<select onchange="amFilter(this.form)" ', 1), short=True)
             + _field("model", _dl_input("model", v.get("model", ""), "cm_all"), short=True)
             + "<p class='hint'>Pick a first backend + model. Assign more backends after "
               "creating.</p>"
-            + "</form>" + _datalist("cm_all", all_models))
+            + "</form>" + _datalist("cm_all", all_models) + _alias_picker_script({"cm_all": ""}))
 
 
 def _chat_editor(alias: str, raw: Optional[dict] = None, err: str = "") -> str:
@@ -5614,6 +5716,11 @@ def _chat_editor(alias: str, raw: Optional[dict] = None, err: str = "") -> str:
                     if k.startswith("model__")}
     else:
         assigned = _chat_value_for(alias)
+    alias_types = _alias_model_types(alias)
+    kind = (r.get("type") if r.get("type") in (*_ALIAS_MODEL_KINDS, "all")
+            else next(iter(alias_types)) if len(alias_types) == 1 else "all" if alias_types else "chat")
+    picker_models = _backend_picker_models(kind, current=True, anthropic=True, literal=True)
+    datalists = {}
     rows, dls = "", ""
     for i, (bn, entry) in enumerate(assigned.items()):
         model = entry.get("model", "") if isinstance(entry, dict) else entry
@@ -5625,8 +5732,8 @@ def _chat_editor(alias: str, raw: Optional[dict] = None, err: str = "") -> str:
               if len(assigned) > 1 else "<span class='muted' title='alias needs ≥1 backend'>—</span>")
         rows += (f"<tr><td>{head}</td><td>{_dl_input('model__' + bn, model, dlid)}</td>"
                  f"<td class='acts'>{rm}</td></tr>")
-        dls += _datalist(dlid, ([adapters.CURRENT_MODEL] if b.get("current") else [])
-                         + list(b.get("models", [])))
+        dls += _datalist(dlid, picker_models.get(bn, []))
+        datalists[dlid] = bn
     rows = rows or "<tr><td colspan=3 class='muted'>no backends — add one below</td></tr>"
     add_opts = [b["name"] for b in llm if b["name"] not in assigned]
     add_sel = ""
@@ -5692,11 +5799,12 @@ def _chat_editor(alias: str, raw: Optional[dict] = None, err: str = "") -> str:
                                         placeholder="fast"), short=True)
             + park_field + rsn_field + voice_field + smp_field
             + "<h2>Backends</h2>"
+            + _alias_kind_control(kind)
             + "<p class='hint'>Assign backends to this alias and pick the model on each. A call "
               "takes the fastest free unpaid one of them, with failover.</p>"
             + f"<table class='pins'><tr><th>backend</th><th>model</th><th></th></tr>{rows}</table>"
             + add_sel
-            + "</form>" + dls)
+            + "</form>" + dls + _alias_picker_script(datalists))
 
 
 async def chat_create(request: Request):
@@ -5707,7 +5815,7 @@ async def chat_create(request: Request):
 
     async def err(msg):
         return await _mapping_view({"sub": "chat", "cnew": "1"}, status=400, detail=_chat_new_form(
-            {"alias": alias, "backend": backend, "model": model}, msg))
+            {"alias": alias, "backend": backend, "model": model, "type": f.get("type", "")}, msg))
     if not alias or not backend:
         return await err("alias name and backend are required")
     if _chat_alias_taken(alias):
@@ -5809,16 +5917,8 @@ async def chat_del(request: Request):
 
 # ── Tab: Chat Playground ────────────────────────────────────────────────────────
 
-# Heuristic to spot image-generation models served by an OpenAI-compatible backend
-# (e.g. localai exposes flux.* with no `type` field). Name-based, since these backends
-# carry no metadata to classify by — extend the hint list as needed.
-_IMG_MODEL_HINTS = ("flux", "stable-diffusion", "sdxl", "sd3", "sd-", "dall-e", "dalle",
-                    "pixart", "kandinsky", "playground-v", "kolors", "wan2", "hidream")
-
-
 def _is_image_model(mid: str) -> bool:
-    m = (mid or "").lower()
-    return any(h in m for h in _IMG_MODEL_HINTS)
+    return "image" in model_kinds.model_types(mid)
 
 
 def _anthropic_backends() -> set:
@@ -5835,9 +5935,9 @@ def _anthropic_only(alias: str, anthro: set) -> bool:
     alias applies to every backend but is only served where the model exists."""
     if not anthro:
         return False
-    v = _config_chat_aliases().get(alias)
-    if v is None and store.is_active():
-        v = store.get_chat_alias(alias)
+    v = store.get_chat_alias(alias) if store.is_active() else None
+    if v is None:
+        v = _config_chat_aliases().get(alias)
     if isinstance(v, dict):
         return bool(v) and set(v.keys()) <= anthro
     if isinstance(v, str) and v:
@@ -5846,24 +5946,24 @@ def _anthropic_only(alias: str, anthro: set) -> bool:
     return False
 
 
-def _chat_models() -> list:
-    """Everything callable as a chat `model`: aliases first, then bare model ids
-    (scheduler-routed) and backend/model forms — feeds the model datalist. Anthropic
-    backends and their alias-only entries are left out: they answer /v1/messages
-    only, so offering them here would just produce a 503 (and inviting a
-    subscription backend into a chat console is exactly what it is not for)."""
+def _typed_models(kind: str) -> list:
+    """Callable aliases first, then bare and backend/model IDs of the requested type."""
+    info = _gateway_info()
     anthro = _anthropic_backends()
-    aliases = [a for a in _gateway_info().get("virtual_models", [])
-               if not _anthropic_only(a, anthro)]
+    alias_names = info.get("virtual_models", [])
+    aliases = [a for a in alias_names
+               if kind in _alias_model_types(a, info) and not _anthropic_only(a, anthro)]
     llm = [b for b in _llm_backends() if b.get("type") != "anthropic"]
-    bare = sorted({m for b in llm for m in b.get("models", [])})
-    prefixed = sorted(f"{b['name']}/{m}" for b in llm for m in b.get("models", []))
-    out, seen = [], set()
-    for x in aliases + bare + prefixed:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
+    # An alias shadows a bare ID, even when its target belongs to another task.
+    bare = sorted({m for b in llm for m in _backend_models(b, kind) if m not in alias_names})
+    prefixed = sorted({f"{b['name']}/{m}" for b in llm
+                       for m in _backend_models(b, kind, callable_models=True)
+                       if f"{b['name']}/{m}" not in alias_names})
+    return list(dict.fromkeys(aliases + bare + prefixed))
+
+
+def _chat_models() -> list:
+    return _typed_models("chat")
 
 
 def _chat_billing_markers(llm: list, models: list) -> dict:
@@ -5920,8 +6020,8 @@ _CHATPLAY_JS = ("<script>function cpSending(f){"
 
 def _chatplay_form(vals: dict) -> str:
     v = lambda k: vals.get(k, "")
-    llm = _llm_backends()
-    bk_models = {b["name"]: sorted(b.get("models", [])) for b in llm}   # bare model ids per backend
+    llm = [b for b in _llm_backends() if b.get("type") != "anthropic"]
+    bk_models = _backend_picker_models("chat")
     all_models = _chat_models()                                         # aliases + bare + backend/model
     bk_markers: dict = {}                     # per picker NAME: every same-named backend counts
     for b in llm:
@@ -5958,6 +6058,8 @@ def _chatplay_form(vals: dict) -> str:
                "var dl=document.getElementById('cpmodels');if(!dl)return;"
                "var ms=(bk&&CP_BK[bk])?CP_BK[bk]:CP_ALL,"
                "marks=(bk&&CP_BILL_BK[bk])?CP_BILL_BK[bk]:CP_BILL_ALL;"
+               "var input=document.querySelector('form[action=\"/ui/chatplay/send\"] [name=\"model\"]');"
+               "if(input&&ms.indexOf(input.value)<0)input.value='';"
                "dl.innerHTML='';ms.forEach(function(m){var o=document.createElement('option');o.value=m;"
                "o.label=m+(marks[m]?' '+marks[m]:'');dl.appendChild(o);});cpUpdateBilling();}"
                "</script>") % (
@@ -7078,20 +7180,35 @@ def _cloud_editor(kind: str, alias: str, cands: list, saved: bool = False, taken
         model = raw.get("cloud_model", "")
     model_control = _inp("cloud_model", model, placeholder="exact provider model id")
     schema_cand = cand
+    picker_js = ""
+    endpoint_control = _select("cloud_endpoint", list(mod.ENDPOINTS), ep)
     if kind in adapters.DYNAMIC_CATALOG_TYPES:
         backend_names = {c.get("backend") for c in cands}
         catalog = [row for row in _generation_models() if row.get("backend") in backend_names]
         dlid = "nano-alias-models" if kind == "nanogpt" else kind + "-alias-models"
         suggestions = ""
+        by_endpoint: dict = {}
         for row in catalog:
             discovered = row.get("candidate") or {}
             if not discovered.get("model"):
                 continue
             label = (str(row.get("backend", "")) + " · " + str(row.get("endpoint", ""))
                      + " · " + str(row.get("name") or discovered["model"]))
-            suggestions += f'<option value="{_esc(discovered["model"])}" label="{_esc(label)}">'
+            endpoint = row.get("endpoint") or mod.endpoint_of(discovered)
+            by_endpoint.setdefault(endpoint, []).append({"model": discovered["model"], "label": label})
+            if endpoint == ep:
+                suggestions += f'<option value="{_esc(discovered["model"])}" label="{_esc(label)}">'
         model_control = (_dl_input("cloud_model", model, dlid, "exact discovered model id")
                          + f'<datalist id="{dlid}">{suggestions}</datalist>')
+        endpoint_control = endpoint_control.replace(
+            "<select ", '<select onchange="caFilter(this.form)" ', 1)
+        picker_js = ("<script>var CA_MODELS=%s;function caFilter(f){"
+                     "var rows=CA_MODELS[f.elements.cloud_endpoint.value]||[],"
+                     "input=f.elements.cloud_model,dl=document.getElementById(%s);if(!dl)return;"
+                     "dl.innerHTML='';rows.forEach(function(r){var o=document.createElement('option');"
+                     "o.value=r.model;o.label=r.label;dl.appendChild(o);});"
+                     "if(!rows.some(function(r){return r.model===input.value;}))input.value='';}"
+                     "</script>") % (_js_json(by_endpoint), _js_json(dlid))
         schema_endpoint = ep if ep in mod.ENDPOINTS else mod.endpoint_of(cand)
         metadata = next(((row.get("candidate") or {}).get("model_metadata") for row in catalog
                          if row.get("backend") == cand.get("backend") and row.get("endpoint") == schema_endpoint
@@ -7135,7 +7252,7 @@ def _cloud_editor(kind: str, alias: str, cands: list, saved: bool = False, taken
             + (_field("task", "text2img") + '<input type="hidden" name="task" value="text2img">'
                if image_api else _field("task", _task_select(cur_task), short=True))
             + f'<h2 style="margin-top:18px">{_esc(vendor)}</h2>'
-            + _field("endpoint", _select("cloud_endpoint", list(mod.ENDPOINTS), ep))
+            + _field("endpoint", endpoint_control)
             + f"<p class='hint' style='margin:-4px 0 10px'>{mod.ENDPOINT_HINT}</p>"
             + (_field("checkpoint", _inp("cloud_model", model, placeholder="exact ArliAI checkpoint title"),
                       hint="Use an exact checkpoint from Routing → Image models. "
@@ -7154,7 +7271,7 @@ def _cloud_editor(kind: str, alias: str, cands: list, saved: bool = False, taken
             + f"<p class='hint'>Request fields for {_esc(vendor)} — what "
               f"<code>GET /v1/generations/{{alias}}/schema</code> advertises.{ign_hint}</p>"
             + f"<table class='pins'><tr><th>name</th><th>type</th></tr>{fields}</table>"
-            + "</form>"
+            + "</form>" + picker_js
             + '<h2 style="margin-top:18px">Backends</h2>'
             + "<p class='hint'>Allowed backends for this alias — a job takes the fastest free one. "
               f"Only {_esc(vendor)} backends can be added. A submitted request with an uncertain "
@@ -7888,18 +8005,20 @@ def _catalog_image_models() -> list:
     return [{"model": m, "hosts": h} for m, h in sorted(hosts.items(), key=lambda kv: kv[0].lower())]
 
 
-def _media_models() -> list:
+def _media_models(kind: str = "media") -> list:
     """Stored aliases win collisions with healthy, directly callable catalog IDs."""
     backend_meta = {(b["name"], adapters.backend_kind(b)): b
                     for b in _gateway_info().get("backends", [])
                     if b.get("type") in adapters.GEN_TYPES}
     rows = [{"id": name, "name": name, "group": "Aliases",
+             "model_types": sorted(set().union(*(model_kinds.generation_types(c) for c in candidates))),
              "billing_marker": _billing_marker([
                  _backend_billing(backend_meta.get((c.get("backend"), adapters.cand_kind(c)), {}))
                  or ({"state": "unknown"} if adapters.cloud_kind(c) == "venice" else None)
                  for c in candidates])}
             for name, candidates in store.list_aliases().items()]
     seen = {row["id"] for row in rows}
+    direct = {}
     modalities = {"images": "Images", "image": "Images", "video": "Video", "3d": "3D",
                   "audio": "Audio", "tts": "Speech", "asr": "Transcription"}
     modality = _catalog_modality
@@ -7907,11 +8026,27 @@ def _media_models() -> list:
     for row in sorted(_generation_models(), key=lambda r: (
             str(r.get("backend", "")).lower(), order.get(modality(r), 6),
             str(r.get("endpoint", "")), str(r.get("name", r.get("id", ""))).lower())):
+        kinds = model_kinds.generation_types(row.get("candidate") or row)
+        if row.get("id") in direct:
+            existing = direct[row["id"]]
+            existing["model_types"] = sorted(set(existing["model_types"]) | kinds)
+            continue
         if row.get("id") and row["id"] not in seen:
-            rows.append({**row, "group": str(row.get("backend", "")) + " · "
+            rows.append({**row, "model_types": sorted(kinds),
+                         "group": str(row.get("backend", "")) + " · "
                          + modalities.get(modality(row), str(row.get("endpoint", "")))})
-            seen.add(row["id"])
-    return rows
+            direct[row["id"]] = rows[-1]
+    wanted = model_kinds.MEDIA_TYPES if kind == "media" else {kind}
+    return [row for row in rows if wanted.intersection(row["model_types"])]
+
+_MEDIA_KIND_OPTIONS = [("media", "All media"), ("image", "Images"), ("video", "Video"),
+                       ("3d", "3D"), ("audio", "Audio"), ("tts", "Speech"),
+                       ("asr", "Transcription")]
+
+
+def _media_kind(value) -> str:
+    return value if value in dict(_MEDIA_KIND_OPTIONS) else "media"
+
 
 
 def _media_candidate(model: str, models: Optional[list] = None) -> Optional[dict]:
@@ -8161,18 +8296,26 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
                          for b in bk_list))
     backend_field = _field("backend", f'<select name="backend">{bk_opts}</select>') if bk_list else ""
     pg_switch_js = ("<script>function pgSwitch(sel){var f=sel.form,"
-                    "q='sub=media&model='+encodeURIComponent(sel.value);"
+                    "q='sub=media&type='+encodeURIComponent(f.elements.type.value);"
+                    "if(sel.name!=='type')q+='&model='+encodeURIComponent(f.elements.model.value);"
                     "f.querySelectorAll('[name^=\"p__\"]').forEach(function(el){"
                     "if(el.value!=='')q+='&'+encodeURIComponent(el.name)+'='+encodeURIComponent(el.value);});"
                     "location.href='/ui/playground?'+q;}</script>")
     unavailable = bool(cand and cand.get("unavailable"))
-    generate = ('<button type="submit" disabled>Generate</button>' if unavailable
+    generate = ('<button type="submit" disabled>Generate</button>' if unavailable or not aliases
                 else _btn("Generate", submit=True))
     notice = ("<p class='hint'>This backend is temporarily unavailable or refreshing its catalog. "
               "The last successful model list remains visible; generation is disabled "
               "until discovery succeeds. Reload this page to check availability.</p>" if unavailable else "")
+    if not aliases:
+        notice = ("<p class='hint'>No media models are available for this category. "
+                  "Choose another type, enable a media backend in <a href='/ui/backends'>Backends</a>, "
+                  "or register a workflow in <a href='/ui/aliases?sub=media'>Aliases</a>.</p>")
+    category = _select("type", _MEDIA_KIND_OPTIONS, _media_kind(vals.get("type"))).replace(
+        "<select ", '<select onchange="pgSwitch(this)" ', 1)
     return ('<form action="/ui/playground/generate" method="post" enctype="multipart/form-data">'
             f'<div class="formbar"><h2>Media Playground</h2>{generate}</div>'
+            + _field("model type", category, short=True)
             + _field("model", alias_select)
             + (_BILLING_LEGEND if any(
                 row.get("billing_marker") or row.get("billing") is not None
@@ -8261,18 +8404,14 @@ async def playground_page(request: Request):
                                   refresh=vu_refresh, subnav=_subnav("playground", "voice")))
     if not store.is_active():
         return _inactive()
-    aliases = _media_models()
-    if not aliases:
-        return HTMLResponse(_page("Media Playground",
-            "<h2>Media Playground</h2><p class='hint'>No media models are available. "
-            "Enable a healthy media backend in <a href='/ui/backends'>Backends</a>, or "
-            "register a workflow in <a href='/ui/aliases?sub=media'>Aliases</a>.</p>", "playground",
-            subnav=_subnav("playground", "media")))
-    model = qp.get("model", "") or aliases[0]["id"]
-    cand = _media_candidate(model, aliases)
+    kind = _media_kind(qp.get("type"))
+    aliases = _media_models(kind)
+    selected = qp.get("model", "")
+    model = selected if any(row["id"] == selected for row in aliases) else (aliases[0]["id"] if aliases else "")
+    cand = _media_candidate(model, aliases) if model else None
     # values per request param, keyed by param name; query (p__<param>) overrides the
     # alias's workflow default. Params are dynamic — whatever Mapping configured.
-    vals = {"model": model, "backend": qp.get("backend", "")}
+    vals = {"model": model, "backend": qp.get("backend", ""), "type": kind}
     defaults = _alias_defaults(cand) if cand else {}
     # the alias's public param names: a mapping for a ComfyUI alias, the fixed label
     # table for a cloud one (Meshy, Tripo) — without this a p__<field> from the URL
@@ -8361,10 +8500,11 @@ async def generate(request: Request):
     stash = _pg_images.setdefault(user, {})
     wf_i = (cand.get("workflow_json") if cand else {}) or {}
     map_i = (cand.get("mapping") if cand else {}) or {}
-    vals = {"model": model, "backend": force_bk, **submitted}
+    kind = _media_kind(str(f.get("type", "")))
+    vals = {"model": model, "backend": force_bk, "type": kind, **submitted}
 
     def _err(msg: str, status: int = 404):
-        aliases = _media_models()
+        aliases = _media_models(kind)
         result_html = f'<h2>Result</h2><p class="bad">Error {status}: {_esc(msg)}</p>'
         return HTMLResponse(_page("Media Playground",
                                   _playground_body(aliases, vals, cand, result_html, kept=dict(stash)),
@@ -8441,7 +8581,7 @@ async def generate(request: Request):
     except HTTPException as e:
         return _err(str(e.detail), e.status_code)
     # Redirect to the GET view (form re-populated + live-updating) — instant feedback.
-    q = urlencode({"sub": "media", "model": model, "backend": force_bk, "job": view.get("job_id", ""),
+    q = urlencode({"sub": "media", "type": kind, "model": model, "backend": force_bk, "job": view.get("job_id", ""),
                    **{f"p__{p}": v for p, v in submitted.items() if v}})
     return RedirectResponse(f"/ui/playground?{q}", status_code=303)
 
@@ -8501,12 +8641,33 @@ _VOICEPLAY_JS = ("<script>function vpSending(f){"
 def _voice_models() -> list:
     # Stored workflow aliases remain callable (queued) while a backend is busy;
     # the healthy direct media catalog is not the source for configured aliases.
-    models = _chat_models()
-    seen = set(models)
+    models = _typed_models("tts")
     aliases = store.list_aliases() if store.is_active() else {}
-    for name, candidates in aliases.items():
-        if name not in seen and any(c.get("task") in ("tts", "text2audio")
-                                    and not adapters.cloud_kind(c) for c in candidates):
+    # /v1/audio/speech handles stored ComfyUI speech aliases only, not cloud
+    # generation aliases. Their TTS entries remain available in Media instead.
+    supported = {name for name, candidates in aliases.items() if candidates and all(
+        c.get("task") in ("tts", "text2audio") and not adapters.cloud_kind(c) for c in candidates)}
+    models = [m for m in models if m not in aliases or m in supported]
+    seen = set(models)
+    for name in aliases:
+        if name in supported and name not in seen:
+            models.append(name)
+            seen.add(name)
+    info = _gateway_info()
+    generic_aliases = set(info.get("virtual_models", []))
+    native_backends = _llm_backends()
+    for row in _generation_models():
+        name = row.get("id")
+        candidate = row.get("candidate") or row
+        if candidate.get("unavailable"):
+            continue
+        native = [b for b in native_backends if b["name"] == candidate.get("backend")]
+        if native and not any("tts" in _callable_model_types(b, candidate.get("model", "")) for b in native):
+            continue
+        if name in generic_aliases and "tts" not in _alias_model_types(name, info):
+            continue
+        if (name and name not in aliases and name not in seen
+                and "tts" in model_kinds.generation_types(row.get("candidate") or row)):
             models.append(name)
             seen.add(name)
     return models
@@ -10353,11 +10514,13 @@ def _reasoning_form(rule: Optional[dict], idx, test: Optional[dict] = None,
                     for x in ("off", "on"))
     # Picking a backend filters the model datalist to THAT backend's models (like the
     # Chat Playground) — a rule is per (model×backend), so the model list should follow.
-    rt_bk = {b["name"]: sorted(b.get("models", [])) for b in _llm_backends()}
+    rt_bk = _backend_picker_models("chat")
     rt_all = _chat_models()
     rt_js = ("<script>var RT_BK=%s,RT_ALL=%s;function rtFilter(bk){"
              "var dl=document.getElementById('rtmodels');if(!dl)return;"
              "var ms=(bk&&RT_BK[bk])?RT_BK[bk]:RT_ALL;"
+             "var input=document.querySelector('[name=\"test_model\"]');"
+             "if(input&&ms.indexOf(input.value)<0)input.value='';"
              "dl.innerHTML=ms.map(function(m){var o=document.createElement('option');"
              "o.value=m;return o.outerHTML;}).join('');}</script>") % (_js_json(rt_bk), _js_json(rt_all))
     test_panel = (
@@ -10374,7 +10537,7 @@ def _reasoning_form(rule: Optional[dict], idx, test: Optional[dict] = None,
         + '<button type="submit" class="btn secondary" formaction="/ui/reasoning/test" '
           'formnovalidate onclick="return rTest(this.form)">▶ Run test</button>'
         + f"<div id='rtresult'>{_reason_test_result(test) if test else ''}</div>"
-        + "</div>" + _datalist("rtmodels", rt_bk.get(tb_pre) or rt_all))
+        + "</div>" + _datalist("rtmodels", rt_bk[tb_pre] if tb_pre in rt_bk else rt_all))
     return ('<form action="/ui/reasoning/save" method="post" data-guard>' + hidden +
             f'<div class="formbar"><h2>{"Edit rule" if rule else "New rule"}</h2>'
             f'{_btn("Save", submit=True)}{_btn("Cancel", "/ui/reasoning", "secondary")}</div>'
