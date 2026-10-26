@@ -2901,8 +2901,10 @@ async def route(path: str, request: Request, authorization: Optional[str]) -> JS
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/v1/models")
-async def list_models(request: Request, authorization: Optional[str] = Header(None)):
-    user = authenticate(authorization)
+async def list_models(request: Request, authorization: Optional[str] = Header(None),
+                      x_api_key: Optional[str] = Header(None),
+                      x_ai_hub_key: Optional[str] = Header(None)):
+    user = authenticate(_client_credential(authorization, x_api_key, x_ai_hub_key))
     # Per-user allow-list FILTERS the catalog (empty = all). Entries may be a model id,
     # a chat/image alias, or a backend name (grants all of that backend's models).
     raw_allow = set((user.get("models") if user else None) or [])
@@ -2985,8 +2987,10 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
 
 
 @app.get("/v1/models/{model_id:path}")
-async def get_model(model_id: str, authorization: Optional[str] = Header(None)):
-    user = authenticate(authorization)
+async def get_model(model_id: str, authorization: Optional[str] = Header(None),
+                    x_api_key: Optional[str] = Header(None),
+                    x_ai_hub_key: Optional[str] = Header(None)):
+    user = authenticate(_client_credential(authorization, x_api_key, x_ai_hub_key))
     # The same grant the request path enforces; outside it the answer is the unknown-model
     # 404, so a restricted key cannot probe what exists beyond its allow-list.
     if user is not None and not _model_allowed(user, model_id):
@@ -3221,12 +3225,15 @@ async def cancel_response(response_id: str, request: Request, authorization: Opt
 # models through any chat backend (translated by anthropic_bridge) — with the same
 # routing, parking, failover, quotas and stats as every other endpoint.
 #
-# Claude Code authenticates with `x-api-key`; ANTHROPIC_AUTH_TOKEN sends
-# `Authorization: Bearer` instead. Both carry a GATEWAY key here (never an
-# Anthropic credential — that one lives on the backend).
+# Gateway credentials normally arrive in Authorization or x-api-key. A seat login
+# instead keeps OAuth in Authorization and sends the gateway key separately.
 
-def _client_credential(authorization: Optional[str], x_api_key: Optional[str]) -> Optional[str]:
-    """The caller's gateway credential from either header, in Bearer form."""
+def _client_credential(authorization: Optional[str], x_api_key: Optional[str],
+                       x_ai_hub_key: Optional[str] = None) -> Optional[str]:
+    """Separate gateway auth wins, including an empty/invalid value: never fall back
+    to another identity when the caller explicitly selected a gateway key."""
+    if x_ai_hub_key is not None:
+        return x_ai_hub_key
     if authorization:
         return authorization
     return f"Bearer {x_api_key}" if x_api_key else None
@@ -3259,7 +3266,11 @@ async def _messages_route(path: str, request: Request, credential: Optional[str]
     if not isinstance(body, dict):
         raise HTTPException(400, "request body must be a JSON object")
     alias = body.get("model", "")
-    await gate_request(credential, request, alias)          # auth + allow-list + quota
+    user = await gate_request(credential, request, alias)   # auth + allow-list + quota
+    # Only an authenticated separate gateway key authorizes client OAuth forwarding.
+    # Bootstrap-open and legacy gateway credentials must never become provider auth.
+    request.state.gw_oauth_passthrough = (
+        user is not None and request.headers.get("x-ai-hub-key") is not None)
     thinking = body.get("thinking")
     if isinstance(thinking, dict) and thinking.get("type") in ("enabled", "disabled"):
         # An explicit client control always wins over the per-alias default — same
@@ -3281,20 +3292,22 @@ async def _messages_route(path: str, request: Request, credential: Optional[str]
 
 @app.post("/v1/messages")
 async def messages(request: Request, authorization: Optional[str] = Header(None),
-                   x_api_key: Optional[str] = Header(None)):
+                   x_api_key: Optional[str] = Header(None),
+                   x_ai_hub_key: Optional[str] = Header(None)):
     """Anthropic Messages API — Claude Code's endpoint. Errors are shaped by the
     app-wide HTTPException handler (which also logs the refusal)."""
     return await _messages_route("/v1/messages", request,
-                                 _client_credential(authorization, x_api_key))
+                                 _client_credential(authorization, x_api_key, x_ai_hub_key))
 
 
 @app.post("/v1/messages/count_tokens")
 async def messages_count_tokens(request: Request, authorization: Optional[str] = Header(None),
-                                x_api_key: Optional[str] = Header(None)):
+                                x_api_key: Optional[str] = Header(None),
+                                x_ai_hub_key: Optional[str] = Header(None)):
     """Token count for a Messages body: passed through to an Anthropic backend,
     estimated by the bridge for a chat backend (which has no such endpoint)."""
     return await _messages_route("/v1/messages/count_tokens", request,
-                                 _client_credential(authorization, x_api_key))
+                                 _client_credential(authorization, x_api_key, x_ai_hub_key))
 
 
 @app.post("/v1/completions")
@@ -5945,6 +5958,9 @@ def gateway_info() -> dict:
             "chat_only": bool(b.get("chat_only")), "serverless_only": bool(b.get("serverless_only")),
             "local": bool(b.get("local")), "paid": bool(b.get("paid")),
             "api_key_set": bool(b.get("api_key")),      # the key itself never leaves main
+            **({"auth_mode": b.get("auth_mode") or "subscription",
+                "configured_models": b.get("models") or []}
+               if b.get("type") == "anthropic" else {}),
             "sampling_defaults": b.get("sampling_defaults") or None,
             # The filter globs themselves, not just the resulting counts: the backend
             # editor falls back to THIS summary for a config-defined backend (nothing in

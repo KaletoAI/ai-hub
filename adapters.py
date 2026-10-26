@@ -1071,9 +1071,9 @@ def _error_text(resp) -> str:
 # sends (`anthropic-*`, `x-stainless-*`, `x-app`, its user-agent — the subscription path
 # checks them), OpenRouter reads `HTTP-Referer`/`X-Title` for attribution, and a list
 # of what backends may see would silently strip the next such header. What is dropped:
-# - gateway credentials: `authorization` AND `x-api-key` (Claude Code authenticates
-#   with the latter) — forwarding either hands the caller's gateway key to OpenRouter,
-#   Anthropic or whoever serves the call; the adapter adds the backend's own afterwards;
+# - gateway credentials: `authorization`, `x-api-key` and `x-ai-hub-key` — forwarding
+#   them hands the caller's credential to whoever serves the call. Only the
+#   Anthropic passthrough mode may restore an authenticated client's OAuth bearer;
 # - what describes THIS hop: `host`, `content-length`, RFC 7230 hop-by-hop
 #   (`connection` + every header it names, `keep-alive`, `te`, `trailer`,
 #   `transfer-encoding`, `upgrade`, `proxy-*`) and `expect`. A client's
@@ -1087,7 +1087,7 @@ def _error_text(resp) -> str:
 #   `via`/`cf-connecting-ip`/`true-client-ip`, the browser's `origin`/`referer`/`sec-*`
 #   metadata, and the gateway's own `x-source` attribution and `x-park-mode`.
 _HOP_BY_HOP = frozenset((
-    "host", "content-length", "authorization", "x-api-key", "x-park-mode", "x-source",
+    "host", "content-length", "authorization", "x-api-key", "x-ai-hub-key", "x-park-mode", "x-source",
     "connection", "keep-alive", "te", "trailer", "transfer-encoding", "upgrade", "expect",
     "accept-encoding", "cookie", "forwarded", "x-real-ip", "via", "cf-connecting-ip",
     "true-client-ip", "origin", "referer",
@@ -1643,7 +1643,13 @@ class AnthropicAdapter(OpenAIAdapter):
         """A subscription (OAuth setup-token) credential rather than an API key."""
         return (self.backend.get("auth_mode") or "subscription") == "subscription"
 
+    def _passthrough(self) -> bool:
+        """OAuth belongs to this request's authenticated client, never the backend."""
+        return self.backend.get("auth_mode") == "passthrough"
+
     def _backend_auth(self) -> dict:
+        if self._passthrough():
+            return {}
         key = self.backend.get("api_key") or ""
         if not key:
             return {}
@@ -1676,14 +1682,18 @@ class AnthropicAdapter(OpenAIAdapter):
                 int(u.get("cache_creation_input_tokens") or 0))
 
     async def discover(self, client: httpx.AsyncClient) -> Capabilities:
-        """Anthropic's GET /v1/models, falling back to the backend's configured
-        `models` list — a subscription token is not guaranteed to be allowed on the
-        models endpoint, and a 401 there must not take the backend down when the
-        admin has said which models to offer."""
+        """Client OAuth discovery is configured-only: there is no client token here.
+        Other modes GET /v1/models with configured-model fallback, since stored
+        subscription tokens are not guaranteed access to the models endpoint."""
         b = self.backend
         configured = b.get("models") or []
         if isinstance(configured, str):
             configured = [m.strip() for m in configured.split(",") if m.strip()]
+        if self._passthrough():
+            models = {m.strip() for m in configured if isinstance(m, str) and m.strip()}
+            if not models:
+                raise ValueError("Anthropic passthrough discovery requires configured models")
+            return Capabilities(models=models, pricing={})
         headers = {"anthropic-version": _ANTHROPIC_VERSION, **self._backend_auth()}
         if self._subscription():
             headers["anthropic-beta"] = _OAUTH_BETA
@@ -1707,11 +1717,27 @@ class AnthropicAdapter(OpenAIAdapter):
             # for every other path); explicit so a future caller can't slip past it.
             return _anthropic_error(404, "not_found_error",
                                     f"backend '{self.name}' serves /v1/messages only")
+        authorization = ""
+        if self._passthrough():
+            raw = req.raw
+            authorization = raw.headers.get("authorization", "") if raw is not None else ""
+            token = authorization[len("Bearer "):]
+            if (not getattr(getattr(raw, "state", None), "gw_oauth_passthrough", False)
+                    or not authorization.startswith("Bearer sk-ant-oat")
+                    or len(token) <= len("sk-ant-oat")
+                    or any(c.isspace() for c in token)):
+                return _anthropic_error(
+                    401, "authentication_error",
+                    "Anthropic passthrough requires client OAuth (Bearer sk-ant-oat...) "
+                    "and separate authenticated x-ai-hub-key")
         call = self._prepare(req)                  # claims the in-flight slot
-        # The client's anthropic-beta list must survive, and subscription auth needs
-        # its own beta appended to it.
-        if self._subscription():
-            betas = [b for b in (call.headers.get("anthropic-beta") or "").split(",") if b.strip()]
+        if authorization:
+            call.headers["authorization"] = authorization
+        # Preserve the client's betas; OAuth needs its own beta exactly once even
+        # when the caller surrounds its existing entry with whitespace.
+        if self._subscription() or self._passthrough():
+            betas = [b.strip() for b in (call.headers.get("anthropic-beta") or "").split(",")
+                     if b.strip()]
             if _OAUTH_BETA not in betas:
                 betas.append(_OAUTH_BETA)
             call.headers["anthropic-beta"] = ",".join(betas)

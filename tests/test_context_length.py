@@ -234,7 +234,7 @@ class Catalog(unittest.TestCase):
         main.rebuild_route_index()
 
     def _list(self):
-        data = asyncio.run(main.list_models(_Req(), None))["data"]
+        data = asyncio.run(main.list_models(_Req(), None, None, None))["data"]
         return {m["id"]: m for m in data}
 
     def test_prefixed_entry_carries_its_backend_value(self):
@@ -254,11 +254,11 @@ class Catalog(unittest.TestCase):
         self.assertNotIn("context_length", cat["none"])
 
     def test_get_model_matches_the_listing(self):
-        one = asyncio.run(main.get_model("b/glm", None))
+        one = asyncio.run(main.get_model("b/glm", None, None, None))
         self.assertEqual(one["context_length"], 32768)
-        alias = asyncio.run(main.get_model("chat", None))
+        alias = asyncio.run(main.get_model("chat", None, None, None))
         self.assertEqual(alias["context_length"], 32768)
-        bare = asyncio.run(main.get_model("glm", None))
+        bare = asyncio.run(main.get_model("glm", None, None, None))
         self.assertEqual(bare["context_length"], 32768)
 
     def test_merge_keeps_what_this_poll_did_not_see(self):

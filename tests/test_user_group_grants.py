@@ -84,7 +84,7 @@ class Catalog(_State):
              mock.patch.object(main.store, "is_active", return_value=False):
             req = mock.MagicMock()
             req.query_params = {}
-            ids = [m["id"] for m in asyncio.run(main.list_models(req, None))["data"]]
+            ids = [m["id"] for m in asyncio.run(main.list_models(req, None, None, None))["data"]]
         self.assertIn("later", ids)
         self.assertNotIn("model-a", ids)
 

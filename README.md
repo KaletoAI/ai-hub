@@ -162,6 +162,13 @@ Two layers, both optional:
   `show_user_keys` in Server → Runtime and only a key generated right there in the
   form is ever shown, as before.
 
+For Claude Code's **own subscription login**, keep OAuth in `Authorization` and
+send the AI-Hub key separately as `x-ai-hub-key: Bearer <key>`. This is supported
+on the Messages/count_tokens and model-catalog endpoints; other APIs keep their
+normal Bearer authentication. The separate key is checked first, with no fallback
+if it is empty or invalid. See [client OAuth setup](#keep-the-claude-code-subscription-login-client-oauth)
+for `auth_mode: passthrough`, login settings and picker limitations.
+
 **Bootstrap-open → locked.** With no users *and* no master key, the gateway and
 console are fully open. Add an admin user (or set a master key — Server → API Keys)
 to lock it down:
@@ -577,6 +584,9 @@ The gateway speaks Anthropic's Messages protocol as a **frontdoor**, so
 models with open-weight models behind gateway aliases, while keeping routing,
 parking, failover, quotas and stats:
 
+For a gateway-managed backend credential (the client does **not** use its saved
+subscription login):
+
 ```bash
 export ANTHROPIC_BASE_URL=http://gateway:4000
 export ANTHROPIC_AUTH_TOKEN=<your gateway key>   # or ANTHROPIC_API_KEY (sent as x-api-key)
@@ -596,6 +606,98 @@ the reasoning rewrite and `sampling_defaults` are all skipped there. On the
 translated path they apply as usual, and Claude Code's `thinking: {type:
 enabled}` maps onto the gateway's [reasoning control](#reasoning-control) so an
 open-weight model thinks when asked to.
+
+### Keep the Claude Code subscription login (client OAuth)
+
+Use this mode to keep Claude Code signed in with **Claude account with
+subscription** and switch between Claude and foreign models through AI-Hub.
+Claude Code owns login and token refresh; AI-Hub neither stores nor refreshes
+the client's OAuth token. This differs from the stored `claude setup-token`
+configuration below.
+
+Configure an Anthropic backend with **client OAuth** in the console's Anthropic
+tab, and enter its exact model ids in the Models tab. The YAML equivalent:
+
+```yaml
+backends:
+  - name: claude-seat
+    type: anthropic
+    url: https://api.anthropic.com
+    auth_mode: passthrough
+    models: [claude-sonnet-5]       # required; use ids available to your account
+    # No backend api_key: only the requesting client's OAuth token is used.
+
+  - name: foreign
+    type: openai
+    url: https://your-provider.example
+    api_key: <provider API key>
+
+virtual_models:
+  kimi-claude-compatible:
+    foreign: <exact model id discovered from your provider>
+  glm-claude-compatible:
+    foreign: <another model id discovered from your provider>
+```
+
+Use separate aliases for Claude and foreign models; do not put a foreign
+fallback behind a Claude alias if you want an explicit provider choice.
+Passthrough discovery uses only `models:`: it makes no unauthenticated provider
+request and does not take the backend down because one client's token expired.
+An upstream 401 is returned to that client, not retried on another backend.
+
+Create an AI-Hub user key with the desired model grants (or use the master
+key); **bootstrap-open mode cannot forward OAuth**. In
+`~/.claude/settings.json`, merge:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://localhost:4000",
+    "ANTHROPIC_CUSTOM_HEADERS": "x-ai-hub-key: Bearer <AI-Hub key>",
+    "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION": "kimi-claude-compatible",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": "Kimi"
+  }
+}
+```
+
+Do **not** set `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, or `apiKeyHelper`
+for this mode: those override the saved subscription login. Remove conflicting
+values from both shell and applicable settings files. Choose **Claude account
+with subscription** at login and check `/status` for your account and gateway
+base URL. Do not append `/v1` to `ANTHROPIC_BASE_URL`.
+
+AI-Hub authenticates the separate `x-ai-hub-key` on `/v1/messages`,
+`/v1/messages/count_tokens` and both `/v1/models` endpoints. This header takes
+precedence even when invalid or empty: it never falls back to another identity.
+Normal model grants, quotas and call attribution apply to that gateway key.
+Only `auth_mode: passthrough` may forward `Authorization: Bearer sk-ant-oat…`;
+stored-key Anthropic backends use their configured key and foreign backends
+receive only their own provider credential. Neither gateway credential header
+is forwarded.
+
+**Picker limitation:** the current
+[Claude Code discovery protocol](https://code.claude.com/docs/en/llm-gateway-protocol#model-discovery)
+says discovery is skipped unless Claude Code resolves an API key, auth token
+or helper credential; `ANTHROPIC_CUSTOM_HEADERS` alone does not enable it.
+Do not add one of those credentials just to enable discovery in subscription
+mode. The manual `ANTHROPIC_CUSTOM_MODEL_OPTION` above is the reliable fallback;
+switch to it and back to Claude with `/model` without restarting the session.
+Other aliases can be selected by their exact id with `/model <alias>`.
+
+If your Claude Code version does perform discovery with your login, AI-Hub's
+catalog already supports `GET /v1/models?limit=1000` with the separate gateway
+header and user-specific filtering. Claude Code filters on the **id**, not the
+display name: include `claude` or `anthropic` in foreign alias ids. Before
+v2.1.223 the id must **start** with one of those strings; use
+`claude-compatible-kimi` on those versions. A `display_name` cannot bypass the
+filter. Automatic “From gateway” entries with a subscription-only login are
+client-version-dependent, not guaranteed by AI-Hub.
+
+For a transport/auth smoke without a real subscription token, configure a
+test upstream. A real Claude Code session is required to verify subscription
+entitlement, token refresh and picker behavior against Anthropic.
+
 
 ### Prompt caching and cost
 
@@ -693,9 +795,10 @@ The token belongs to the *account*, not the machine — minting it on your lapto
 and pasting it into the console works exactly as well. Either way it goes into the
 backend's **api key** field (stored encrypted in `store.db`).
 
-Do **not** use the `accessToken` out of `~/.claude/.credentials.json`: that one is
-the short-lived session token Claude Code refreshes for itself (hours), and the
-gateway has no refresh mechanism — the backend would go DOWN when it expires.
+For a **stored backend key**, do **not** copy `accessToken` out of
+`~/.claude/.credentials.json`: that short-lived token is refreshed by Claude Code,
+not AI-Hub. To use that login, choose `auth_mode: passthrough` above instead of
+storing the token in a backend.
 
 ### Backend setup
 
@@ -2526,8 +2629,8 @@ stats:
 
 | Method | Path | Notes |
 |---|---|---|
-| `GET` | `/v1/models` | catalog filtered by the caller's allow-list; `?type=chat\|image` |
-| `GET` | `/v1/models/{id}` | single-model lookup |
+| `GET` | `/v1/models` | catalog filtered by the caller's allow-list; `?type=chat\|image`; auth via Bearer, `x-api-key`, or separate `x-ai-hub-key: Bearer` |
+| `GET` | `/v1/models/{id}` | single-model lookup; same authentication and allow-list |
 | `POST` | `/v1/chat/completions` | chat; scheduled dispatch + failover; streaming; parking; `reasoning: off\|on\|auto` |
 | `POST` | `/v1/completions` | completions; same routing |
 | `POST` | `/v1/embeddings` | embeddings; same routing |
@@ -2542,8 +2645,8 @@ stats:
 
 | Method | Path | Notes |
 |---|---|---|
-| `POST` | `/v1/messages` | [Claude Code frontdoor](#claude-code--anthropic-messages); verbatim on `anthropic` backends, translated on chat backends; streaming; parking; auth via `x-api-key` **or** `Authorization: Bearer` |
-| `POST` | `/v1/messages/count_tokens` | native upstream count, estimated for chat backends |
+| `POST` | `/v1/messages` | [Claude Code frontdoor](#claude-code--anthropic-messages); verbatim on `anthropic` backends, translated on chat backends; streaming; parking; gateway auth via `x-api-key`, `Authorization: Bearer`, or separate `x-ai-hub-key: Bearer` |
+| `POST` | `/v1/messages/count_tokens` | native upstream count, estimated for chat backends; same gateway authentication |
 
 ### Voice cloning & the reference library
 

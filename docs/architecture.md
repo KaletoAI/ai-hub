@@ -127,9 +127,32 @@ incl. cache reads, else every subscription call books 0 tokens). The same
 `OpenAIAdapter` also serves `/v1/messages` for chat backends by calling
 `anthropic_bridge` in both directions, which is what lets ONE alias hold an
 Anthropic backend AND an OpenRouter model with normal failover between them.
-`_HOP_BY_HOP` drops `x-api-key` alongside `authorization` — both are GATEWAY
-credentials (Claude Code sends the former), and forwarding either would hand the
-caller's key to the backend. `_forward_headers` applies it (the one site that copies
+`_client_credential` separates gateway auth from a Claude Code seat login:
+`x-ai-hub-key: Bearer <gateway key>` wins over Authorization/x-api-key, including
+an empty/invalid separate header (never fall back to a different identity).
+Messages, count_tokens, model listing and model lookup share this resolution.
+After the Messages gate authenticates a real user/master key, it marks
+`request.state.gw_oauth_passthrough` only when the separate header was used;
+bootstrap-open access cannot authorize provider OAuth. Normal allow-lists, quotas
+and attribution still belong to the gateway user.
+`AnthropicAdapter` with explicit `auth_mode: passthrough` consumes that mark and
+accepts only the request's `Bearer sk-ant-oat…` credential. It restores that
+credential solely to this dispatch's headers, never adapter/shared state, and
+never falls back to a configured key. Configured `models` are required and form
+the entire discovery result: no provider request without a client token, so an
+expired token cannot turn a shared backend DOWN. Upstream auth failures return
+to that client without failover. Claude Code owns token refresh. Existing
+`subscription`/`api_key` modes continue using only stored credentials; the
+Messages-only licence boundary is unchanged. Security boundaries, token isolation
+and configured discovery are guarded by `test_anthropic_passthrough.py` and
+`test_gateway_credentials.py`.
+The config-backend editor receives `auth_mode` and `configured_models` separately
+from the summary's numeric `models` count. Without these fields an Edit/Save
+silently replaced client OAuth with stored-token auth and the exact ids with a
+count; the rendered-form regression in `test_gateway_credentials.py` pins this.
+`_HOP_BY_HOP` drops `x-ai-hub-key` alongside `x-api-key` and `authorization`;
+outside the explicit Anthropic client-OAuth path no caller credential may reach
+any backend. `_forward_headers` applies it (the one site that copies
 client headers) and also drops RFC 7230 hop-by-hop headers (plus whatever
 `connection` names), `expect`, `accept-encoding` (httpx negotiates what it can
 decode — a browser's `br` came back as a body the gateway could not read), and what

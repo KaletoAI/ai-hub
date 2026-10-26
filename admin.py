@@ -2127,11 +2127,12 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
                                                    if isinstance((b or {}).get("models"), list)
                                                    else g("models"),
                                                    placeholder="claude-sonnet-5, claude-opus-5"))
-                           + "<p class='hint' style='margin:-4px 0 10px'>Comma-separated fallback model "
-                             "list. Discovery asks <code>GET /v1/models</code> first; a subscription token "
-                             "is not guaranteed to be allowed there, and this list keeps the backend usable "
-                             "when it isn't. Point a chat alias at one of these ids, then run Claude Code "
-                             "with <code>ANTHROPIC_BASE_URL=&lt;gateway&gt;</code>.</p>")
+                           + "<p class='hint' style='margin:-4px 0 10px'>Comma-separated exact model ids. "
+                             "Required for <b>client OAuth</b>: there is no provider discovery without a "
+                             "client token. Other auth modes try <code>GET /v1/models</code> first and "
+                             "use this list as fallback if discovery is denied. Point a chat alias at "
+                             "one of these ids, then run Claude Code with "
+                             "<code>ANTHROPIC_BASE_URL=&lt;gateway&gt;</code>.</p>")
             + "</div>"
 
             # ── Behavior ──────────────────────────────────────────────────────────
@@ -2274,12 +2275,18 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
               "Claude into the OpenAI endpoints.</p>"
             + _field("auth mode", _select("auth_mode", [
                 ("subscription", "subscription — claude setup-token (OAuth)"),
-                ("api_key", "api key — console.anthropic.com")],
+                ("api_key", "api key — console.anthropic.com"),
+                ("passthrough", "client OAuth — Claude Code login")],
                 g("auth_mode", "subscription")))
             + "<p class='hint' style='margin:-4px 0 10px'>Determines how the credential in <b>api key</b> "
               "(General tab) is sent: <b>subscription</b> → <code>Authorization: Bearer</code> plus the "
-              "OAuth beta header; <b>api key</b> → <code>x-api-key</code>. The model list this backend "
-              "falls back to lives in the <b>Models</b> tab.</p>"
+              "OAuth beta header; <b>api key</b> → <code>x-api-key</code>. "
+              "<b>client OAuth</b> needs no backend api key: Claude Code retains and refreshes its "
+              "subscription login, and the gateway forwards the client's OAuth token only to this "
+              "Anthropic backend. Send the separate gateway credential with "
+              "<code>ANTHROPIC_CUSTOM_HEADERS='x-ai-hub-key: Bearer &lt;AI-Hub key&gt;'</code>. "
+              "Configure model ids in the <b>Models</b> tab: client OAuth has no provider discovery "
+              "without a client token.</p>"
             + "</div>"
             + "</div></form>")
 
@@ -2480,8 +2487,12 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
     editing = None
     if edit_id:
         en, et = _parse_bid(edit_id)
-        editing = (store.get_backend(en, et)
-                   or next((b for b in binfo if _bid(b) == edit_id), None))
+        editing = store.get_backend(en, et)
+        if editing is None:
+            editing = next((b for b in binfo if _bid(b) == edit_id), None)
+            if editing is not None and et == "anthropic":
+                # The summary's `models` is a count, not the configured input list.
+                editing = {**editing, "models": editing.get("configured_models") or []}
     def render(b):
         bid = _bid(b)
         draining, inflight = b.get("draining"), b.get("inflight", 0)
@@ -3254,15 +3265,18 @@ async def backend_save(request: Request):
         b.pop("volume", None)
         b.pop("queue_max_s", None)
         b.pop("cost_per_hour", None)
-    # Anthropic: how the credential is sent, plus the fallback model list used when
-    # a subscription token isn't allowed on GET /v1/models.
+    # Anthropic: stored credential or client OAuth, plus the configured model list.
+    # Client OAuth cannot discover models without a request's token.
     if new_type == "anthropic":
-        b["auth_mode"] = "api_key" if (f.get("auth_mode") or "") == "api_key" else "subscription"
+        auth_mode = f.get("auth_mode") or "subscription"
+        b["auth_mode"] = auth_mode if auth_mode in ("api_key", "passthrough") else "subscription"
         models = [m.strip() for m in (f.get("models", "") or "").split(",") if m.strip()]
         if models:
             b["models"] = models
         else:
             b.pop("models", None)
+            if b["auth_mode"] == "passthrough":
+                problems.append("models: client OAuth requires at least one configured model id")
     else:
         b.pop("auth_mode", None)
         b.pop("models", None)

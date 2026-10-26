@@ -217,13 +217,31 @@ backends:
   #                                     # NOT the accessToken from
   #                                     # ~/.claude/.credentials.json, that expires
   #                                     # within hours)
-  #   auth_mode: subscription           # subscription (OAuth setup-token) | api_key
+  #   auth_mode: subscription           # stored setup-token; api_key for a paid API key
   #   models: [claude-sonnet-5]         # fallback list if GET /v1/models is denied
   #   paid: true                        # subscription/API cost → unpaid backends first
   #   # LICENCE: a Claude subscription covers YOUR use of Claude Code — not
   #   # re-serving Claude as an API to other clients or people. The gateway
   #   # enforces that: this backend never appears on /v1/chat/completions,
   #   # /v1/responses or in the Playground. Please keep it that way.
+
+  # Client OAuth alternative: Claude Code keeps/refreshes its own subscription login.
+  # No backend api_key is needed or used; no client token is stored by the gateway.
+  # - name: anthropic-login
+  #   type: anthropic                   # reachable through /v1/messages ONLY
+  #   url: https://api.anthropic.com
+  #   auth_mode: passthrough
+  #   models: [claude-sonnet-5]         # REQUIRED: no discovery without a client token
+  #   paid: true
+  # Keep Claude Code logged in; set ANTHROPIC_BASE_URL to the gateway base URL and:
+  #   ANTHROPIC_CUSTOM_HEADERS='x-ai-hub-key: Bearer <AI-Hub key>'
+  # The separate header authenticates to AI-Hub; Authorization carries client OAuth.
+  # Use a real AI-Hub user key (bootstrap-open access cannot forward client OAuth).
+  # Do NOT set ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY / apiKeyHelper in Claude Code:
+  # they override the subscription login. No /v1 suffix on ANTHROPIC_BASE_URL.
+  # For /model, use ANTHROPIC_CUSTOM_MODEL_OPTION or /model <alias>; custom-header-only
+  # model discovery is not guaranteed by Claude Code. See README's client OAuth section.
+  # The subscription licence boundary above also applies to client OAuth.
 
 # Virtual models — pseudo model names that map to real model IDs on backends.
 #   string  → same model on every backend

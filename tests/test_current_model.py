@@ -327,7 +327,7 @@ class AllowList(_MainCase):
 
 class Catalog(_MainCase):
     def test_listed_only_where_running_exists(self):
-        data = asyncio.run(main.list_models(_Req(), None))["data"]
+        data = asyncio.run(main.list_models(_Req(), None, None, None))["data"]
         ids = {m["id"]: m for m in data}
         self.assertIn("a/current", ids)
         self.assertIn("b/current", ids)                    # up, just nothing chat-loaded right now
@@ -335,9 +335,9 @@ class Catalog(_MainCase):
         self.assertNotIn("context_length", ids["a/current"])
 
     def test_get_model(self):
-        self.assertEqual(asyncio.run(main.get_model("a/current", None))["id"], "a/current")
+        self.assertEqual(asyncio.run(main.get_model("a/current", None, None, None))["id"], "a/current")
         with self.assertRaises(HTTPException):
-            asyncio.run(main.get_model("c/current", None))
+            asyncio.run(main.get_model("c/current", None, None, None))
 
     def test_routing_snapshot_counts_current_as_present(self):
         routes = {r["backend"]: r for a in main.routing_snapshot()["aliases"]
