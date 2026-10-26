@@ -1059,6 +1059,12 @@ The image shims translate `n`, `size` and output-format controls; Venice image
 editing has **no mask channel**. Transcription produces a downloadable JSON/text
 artifact, not an image preview. There is no separate public transcription route.
 
+AI-Hub defaults Venice image generation and editing to `safe_mode: false`, including
+direct model calls through `/v1/generations` and the OpenAI image shims. This overrides
+Venice's native adult-blur default. An explicit alias option or request value wins;
+use `params.safe_mode: true` on `/v1/generations` (or `safe_mode: true` in an image-shim
+request) to enable blur. This does not disable model/provider content-policy rejections.
+
 For a TTS model advertising `voice_cloning`, its media form accepts an optional
 `input_audio` reference file. The gateway uploads it to `/audio/voices`, then uses
 the returned handle for `/audio/speech`; a cloned reference and an explicit voice

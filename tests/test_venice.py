@@ -114,6 +114,17 @@ class VeniceSchemaTests(unittest.TestCase):
             with self.subTest(values=values), self.assertRaises(venice.INPUT_ERROR):
                 venice.validate_request(cand, values, [], [])
 
+    def test_image_safe_mode_defaults_off_but_explicit_choices_win(self):
+        for endpoint in ("images", "edit"):
+            images = {"input_image": PNG} if endpoint == "edit" else {}
+            cand = candidate(endpoint)
+            with self.subTest(endpoint=endpoint):
+                self.assertIs(venice.build_request(cand, {"prompt": "hello"}, images)["safe_mode"], False)
+                cand["venice"]["options"]["safe_mode"] = True
+                self.assertIs(venice.build_request(cand, {"prompt": "hello"}, images)["safe_mode"], True)
+                self.assertIs(venice.build_request(cand, {"prompt": "hello", "safe_mode": False}, images)["safe_mode"], False)
+                self.assertIs(venice.build_request(candidate(endpoint), {"prompt": "hello", "safe_mode": True}, images)["safe_mode"], True)
+
     def test_client_alias_provider_precedence_and_count_translation(self):
         cand = candidate("images", {"constraints": {"steps": {"default": 15, "max": 30}}})
         cand["venice"]["options"].update(steps=20, options_json='{"variants":2,"safe_mode":true}')

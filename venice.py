@@ -263,7 +263,7 @@ def _parameter_specs(cand):
 
     if ep in {"images", "edit"}:
         add("prompt", required=True, min_length=1, max_length=c.get("promptCharacterLimit", 7500 if ep == "images" else 32768))
-        add("safe_mode", "bool")
+        add("safe_mode", "bool", default=False)
         add("enhance_prompt", "bool")
         add("anon_user_id", min_length=1, max_length=128)
         choices("aspect_ratio", c.get("aspectRatios"), c.get("defaultAspectRatio"))
