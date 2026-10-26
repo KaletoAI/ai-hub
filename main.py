@@ -3249,13 +3249,106 @@ async def embeddings(request: Request, authorization: Optional[str] = Header(Non
 
 @app.post("/v1/audio/speech")
 async def audio_speech(request: Request, authorization: Optional[str] = Header(None)):
-    # OpenAI-shaped TTS / voice cloning: routed like chat by body["model"] (bare id
-    # or alias) through the same dispatch/parking/failover machinery. The backend's
-    # binary audio (audio/wav etc.) passes through untouched — route() strips any
-    # `stream` flag (audio is never SSE) and the adapter skips body parsing/stats
-    # blobs for non-text responses. Extra fields (`voice`, `params.ref_text`, …)
-    # are forwarded verbatim; a per-alias voice default may fill them in.
-    return await route("/v1/audio/speech", request, authorization)
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "speech body must be an object")
+    alias = body.get("model")
+    if not isinstance(alias, str):
+        raise HTTPException(400, "`model` must be a string")
+    cands = ((await asyncio.to_thread(store.get, alias)) if store.is_active()
+             else image_models.get(alias))
+    if not cands:
+        return await route("/v1/audio/speech", request, authorization)
+    await gate_request(authorization, request, alias, media=True)
+    if any(adapters.cloud_kind(c) or c.get("task") not in ("tts", "text2audio")
+           for c in cands):
+        raise HTTPException(400, "speech requires a ComfyUI tts/text2audio alias")
+    text = body.get("input")
+    if not isinstance(text, str) or not text.strip():
+        raise HTTPException(400, "`input` must be a non-empty string")
+    if not isinstance(body.get("params", {}), dict):
+        raise HTTPException(400, "`params` must be an object")
+    params = dict(body.get("params") or {})
+    params["text"] = text
+    defaults = alias_voice.get(alias) or {}
+    reference = body.get("input_audio")
+    voice = body.get("voice")
+    if voice is not None and not isinstance(voice, str):
+        raise HTTPException(400, "`voice` must be a string")
+    if reference is None and not voice:
+        voice = defaults.get("voice")
+    if voice is not None and not isinstance(voice, str):
+        raise HTTPException(400, "`voice` must be a string")
+    transcript = params.get("reference_text") or params.get("ref_text")
+    mapping = cands[0].get("mapping") or {}
+    wf = await asyncio.to_thread(adapters.cand_workflow, cands[0]) or {}
+    files = adapters.file_params(wf, mapping)
+    ref_param = next((p for name in ("reference_audio", "voice")
+                      if (p := _mapping_param(mapping, name)) in files), None)
+    uploads = None
+    if reference is not None or (voice and voice.startswith("lib:")):
+        for cand in cands[1:]:
+            other_mapping = cand.get("mapping") or {}
+            other_wf = await asyncio.to_thread(adapters.cand_workflow, cand) or {}
+            other_files = adapters.file_params(other_wf, other_mapping)
+            other_ref = next((p for name in ("reference_audio", "voice")
+                              if (p := _mapping_param(other_mapping, name)) in other_files), None)
+            if other_ref != ref_param:
+                raise HTTPException(400, "speech candidates must share the reference-file mapping key")
+    if reference is not None and voice:
+        raise HTTPException(400, "use either `voice` or `input_audio`, not both")
+    if voice and voice.startswith("lib:"):
+        entry = voice_library.get(voice[4:])
+        if not entry:
+            raise HTTPException(400, "unknown voice library entry")
+        if not ref_param:
+            raise HTTPException(400, "alias needs a mapped reference_audio/voice file field")
+        path = Path(entry.get("file") or "")
+        try:
+            data = await asyncio.to_thread(path.read_bytes)
+        except OSError as e:
+            raise HTTPException(409, "voice library recording is unavailable") from e
+        if not data or len(data) > _UPLOAD_MAX_BYTES:
+            raise HTTPException(413, "voice reference is empty or exceeds the upload limit")
+        uploads = {ref_param: (path.name, data)}
+        transcript = transcript or entry.get("ref_text")
+    elif reference is not None:
+        if not ref_param:
+            raise HTTPException(400, "alias needs a mapped reference_audio/voice file field")
+        uploads = {ref_param: await _decode_one_file("input_audio", ref_param, reference)}
+    elif voice:
+        if not _mapping_param(mapping, "voice") and not ref_param:
+            raise HTTPException(400, "alias has no mapped voice/reference_audio field")
+        params["voice" if _mapping_param(mapping, "voice") else ref_param] = voice
+    if transcript is None and reference is None and voice == defaults.get("voice"):
+        transcript = defaults.get("ref_text")
+    if transcript is not None:
+        params["ref_text"] = params["reference_text"] = transcript
+    requested_format = body.get("response_format")
+    if requested_format is not None and requested_format not in ("wav", "mp3", "flac", "opus", "aac"):
+        raise HTTPException(400, "unsupported speech response_format")
+    view = await run_generation({"model": alias, "prompt": text, "params": params,
+                                 "output": {"mode": "sync"}}, request, upload_files=uploads)
+    if view.get("status") != "done":
+        raise HTTPException(502, f"speech generation {view.get('status')}: {view.get('error')}")
+    result = next((r for r in view.get("results", [])
+                   if str(r.get("mime", "")).startswith("audio/")), None)
+    if result is None:
+        raise HTTPException(502, "speech workflow returned no audio artifact")
+    rp = await asyncio.to_thread(jobs.result_path, view["job_id"], result["n"])
+    if rp is None:
+        raise HTTPException(502, "speech audio artifact is unavailable")
+    path, mime, name = rp
+    formats = {"audio/wav": "wav", "audio/x-wav": "wav", "audio/mpeg": "mp3",
+               "audio/flac": "flac", "audio/x-flac": "flac", "audio/opus": "opus",
+               "audio/aac": "aac"}
+    if requested_format and formats.get(mime) != requested_format:
+        raise HTTPException(400, f"workflow produced {mime}, not requested {requested_format}; "
+                                 f"audio remains in job {view['job_id']}")
+    return FileResponse(path, media_type=mime, headers={
+        "x-gateway-backend": view.get("backend") or "",
+        "x-gateway-job-id": view["job_id"],
+        **({"Content-Disposition": jobs.content_disposition(name)} if name else {})})
 
 
 # ── Generation (image / video / TTS) ───────────────────────────────────────────

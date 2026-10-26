@@ -8487,7 +8487,7 @@ async def result(job_id: str, n: int, anim: str = ""):
 # plays the returned WAV. The result bytes live in a per-user stash (like the
 # media playground's reference images) served by /ui/playground/voice-audio.
 
-_VOICEPLAY_KEYS = ("model", "input", "voice", "ref_text")
+_VOICEPLAY_KEYS = ("model", "input", "voice", "ref_text", "language")
 _voice_out: dict = {}          # user → (bytes, mime) — last synthesis result
 
 _VOICEPLAY_JS = ("<script>function vpSending(f){"
@@ -8496,6 +8496,20 @@ _VOICEPLAY_JS = ("<script>function vpSending(f){"
                  "routing + waiting for the backend (model load can take a while)</p>\";"
                  "var b=f.querySelector('button[type=submit]');if(b){b.disabled=true;b.textContent='Synthesizing\\u2026';}"
                  "return true;}</script>")
+
+
+def _voice_models() -> list:
+    # Stored workflow aliases remain callable (queued) while a backend is busy;
+    # the healthy direct media catalog is not the source for configured aliases.
+    models = _chat_models()
+    seen = set(models)
+    aliases = store.list_aliases() if store.is_active() else {}
+    for name, candidates in aliases.items():
+        if name not in seen and any(c.get("task") in ("tts", "text2audio")
+                                    and not adapters.cloud_kind(c) for c in candidates):
+            models.append(name)
+            seen.add(name)
+    return models
 
 
 def _voiceplay_form(vals: dict) -> str:
@@ -8510,14 +8524,19 @@ def _voiceplay_form(vals: dict) -> str:
             + _field("model", _dl_input("model", v("model"), "vpmodels", "TTS model id or alias"))
             + _field("text", _textarea("input", v("input"), 5, "the text to speak"))
             + _field("voice (library)", f'<select name="voice_sel">{vopts}</select>')
-            + _field("…or path", _inp("voice", "" if v("voice").startswith("lib:") else v("voice"),
-                                      placeholder="raw backend-side path, e.g. /opt/voices/kai.wav"))
+            + _field("…or voice / path", _inp("voice", "" if v("voice").startswith("lib:") else v("voice"),
+                                      placeholder="voice ID or backend-side path, e.g. /opt/voices/kai.wav"))
             + _field("ref text", _textarea("ref_text", v("ref_text"), 2,
                                            "transcript override (library entries carry their own)"))
-            + "<p class='hint'>Synchronous <code>POST /v1/audio/speech</code> — routed like chat. "
-              "Pick a <b>library voice</b> (its reference + transcript are applied by the gateway) "
-              "or give a raw path; empty = the model's default voice.</p>"
-            + "</form>" + _datalist("vpmodels", _chat_models()) + _VOICEPLAY_JS)
+            + _field("language", _inp("language", v("language"),
+                                      placeholder="optional model-supported language, e.g. de"))
+            + "<p class='hint'>Synchronous <code>POST /v1/audio/speech</code> — native TTS uses chat "
+              "routing; ComfyUI speech aliases use the generation queue. Library audio is uploaded "
+              "to ComfyUI workflows; native file-based backends use the shipped reference path. "
+              "The library transcript is used unless overridden above. A raw voice ID or backend "
+              "path is forwarded to the model; workflow file paths still require admin access or "
+              "an explicitly permitted mapping. Empty voice = the model's default.</p>"
+            + "</form>" + _datalist("vpmodels", _voice_models()) + _VOICEPLAY_JS)
 
 
 def _voice_lib_panel(status_html: str = "", target: Optional[dict] = None) -> str:
@@ -8553,10 +8572,11 @@ def _voice_lib_panel(status_html: str = "", target: Optional[dict] = None) -> st
     return (
         "<div style='margin-top:18px;padding-top:12px;border-top:1px solid #272b33'>"
         "<h2>Voice library</h2>"
-        "<p class='hint'>Uploaded references are stored on the gateway (master copy) and <b>shipped via "
-        "scp to every TTS host</b> — LocalAI has no upload API; the model reads <code>voice</code> only "
-        "as a local file, and failover may route to any host serving the model. Empty <b>ref text</b> is "
-        "auto-transcribed by the gateway's local faster-whisper (CPU).</p>"
+        "<p class='hint'>Uploaded references are stored on the gateway (master copy). ComfyUI speech "
+        "workflows receive an upload from that copy, with no scp required. For native file-based "
+        "TTS (such as LocalAI), references are <b>shipped via scp to every configured TTS host</b>; "
+        "the model reads <code>voice</code> as a local path, including after failover. Empty "
+        "<b>ref text</b> is auto-transcribed by the gateway's local faster-whisper (CPU).</p>"
         + status_html
         + f"<table><tr><th>voice</th><th>state</th><th>ref text</th><th></th></tr>{rows}</table>"
         + '<form action="/ui/playground/voice-upload" method="post" enctype="multipart/form-data" '
@@ -8612,8 +8632,9 @@ async def voiceplay_send(request: Request):
     body = {"model": model, "input": text}
     if vals["voice"].strip():
         body["voice"] = vals["voice"].strip()
-    if vals["ref_text"].strip():
-        body["params"] = {"ref_text": vals["ref_text"].strip()}
+    params = {k: vals[k].strip() for k in ("ref_text", "language") if vals[k].strip()}
+    if params:
+        body["params"] = params
     try:
         r = await _self_api(request, "POST", "/v1/audio/speech", json=body)
         ct = r.headers.get("content-type", "")

@@ -2930,6 +2930,38 @@ a bridge stopped on it and closed the source; the Responses bridge fails on any 
 
 ## Voice cloning (`/v1/audio/speech`)
 
+Configured non-cloud `tts`/`text2audio` generation aliases are intercepted by
+`audio_speech` before native `route()`. Classification reads stored candidates
+independent of backend health, so an offline workflow never falls through to chat.
+The bridge uses `gate_request(media=True)` and synchronous `run_generation`, retaining
+job ownership, queueing, failover, pinned inputs and backend-path permissions.
+`input` becomes prompt/text; mapped controls remain in `params`. Library voices use
+gateway master bytes uploaded through the existing job-unique file path, not the
+native scp path. File classification includes `audio` / `reference_audio`; the backend
+therefore needs `comfy_input_dir`. Public reference labels are `reference_audio` (or
+a file-valued `voice`) and `reference_text`; explicit transcript beats library default.
+Alias transcript defaults are used only for their own selected default voice,
+after explicit/library transcript resolution; they cannot leak onto another recording.
+`input_audio` uses the existing bounded, URL-policy-aware file decoder and overrides
+an alias voice default. Explicit voice IDs target a scalar voice mapping before
+falling back to a reference-file mapping. Reference uploads require an identical
+internal reference key across all candidates; a misconfigured alias fails before
+dispatch rather than dropping a reference on initial selection or failover.
+
+The first actual audio artifact is returned as a FileResponse with job/backend
+headers. Explicit response formats must match its MIME; mismatches return 400 without
+discarding the completed job. There is no transcoding. A failed job or absent audio
+returns 502. Workflow speech belongs to Media Jobs, not a second native Voice Call.
+The Voice form retains native model choices and adds stored workflow speech aliases,
+with optional language merged into params.
+
+Regression boundaries: `test_comfy_speech.py` guards offline dispatch, invalid text,
+non-speech workflows, missing/inconsistent reference mappings and explicit audio
+overriding alias voice defaults; `test_voice_playground.py`
+guards selection of busy configured workflow aliases without listing music/cloud
+generation entries. HTTP/browser smoke uses a protocol fixture, not model inference.
+
+
 The local voice-cloning TTS backends read `voice` strictly as a
 file on THEIR host (no base64/URL/upload API — measured). Cloud TTS such as NanoGPT
 instead receives the model-supported voice ID; it does not use reference scp.

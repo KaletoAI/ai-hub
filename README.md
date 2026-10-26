@@ -2514,7 +2514,7 @@ stats:
 | `POST` | `/v1/chat/completions` | chat; scheduled dispatch + failover; streaming; parking; `reasoning: off\|on\|auto` |
 | `POST` | `/v1/completions` | completions; same routing |
 | `POST` | `/v1/embeddings` | embeddings; same routing |
-| `POST` | `/v1/audio/speech` | TTS / voice cloning; same routing; binary audio passthrough (WAV …); `voice` + `params.ref_text` forward verbatim, per-alias voice defaults fill them in |
+| `POST` | `/v1/audio/speech` | Native TTS binary passthrough; configured ComfyUI `tts`/`text2audio` aliases run synchronously through the generation queue and return audio |
 | `POST` | `/v1/responses` | Responses API ↔ chat bridge; streaming; parking; `background:true` (async) |
 | `GET` | `/v1/responses/{id}` | poll a background response (queued→…→completed/failed/cancelled) |
 | `POST` | `/v1/responses/{id}/cancel` | cancel a background response |
@@ -2529,6 +2529,41 @@ stats:
 | `POST` | `/v1/messages/count_tokens` | native upstream count, estimated for chat backends |
 
 ### Voice cloning & the reference library
+
+**ComfyUI speech:** configure a generation alias with `task: tts` or `text2audio`,
+an audio-saving output node and public mapping names `text` (or `prompt`),
+`reference_audio` (a file input), `reference_text` and optionally `language`.
+All candidates must share the reference-file mapping key, as well as the alias's
+shared workflow/mapping contract. Inconsistent reference keys are refused before
+dispatch. The backend needs `comfy_input_dir` for reference-file uploads. The Voice playground
+lists these aliases even when their backend is busy/offline and offers an optional
+model-specific language value (for example `German`, if that model expects it).
+
+```json
+{"model":"ming-speech","input":"Guten Morgen.","voice":"lib:kai","params":{"language":"German","ref_text":"Transkript der Referenzaufnahme"}}
+```
+
+`input` supplies the workflow text; `params` supplies mapped controls.
+`voice: "lib:<name>"` uploads the gateway's master recording to the selected
+backend under a job-unique name, without requiring prior scp shipping. The explicit
+`params.reference_text` / `params.ref_text` wins over the library transcript.
+An alias transcript default is only a fallback for its own selected default voice;
+it is never paired with a different library voice or an explicit audio upload.
+Alternatively, `input_audio` accepts a base64 recording, data URI or permitted HTTP(S)
+URL; it cannot be combined with an explicit `voice` and overrides an alias's voice
+default. A raw `voice` maps to the workflow's
+`voice` field, or to its reference-file field when no voice field exists; backend
+paths retain the normal admin/`client_path` restrictions.
+
+The response contains the first audio artifact, with its actual Content-Type and
+`x-gateway-backend` / `x-gateway-job-id` headers. No format conversion is performed:
+omitting `response_format` returns the workflow's format; explicit `wav`, `mp3`,
+`flac`, `opus` or `aac` must match the generated artifact or the call returns 400
+after generation (the audio remains in the job). Unsupported formats are refused
+before generation. Workflow failures or missing audio return 502. Jobs remain
+inspectable through `/v1/jobs`; `/v1/generations` is unchanged.
+
+The following scp requirements apply to **native file-based TTS**, not ComfyUI:
 
 **Backend constraint (measured, not assumed):** LocalAI has **no upload API**, and
 cloning-capable TTS models (e.g. `qwen3-tts-cpp-customvoice`) read `voice` strictly

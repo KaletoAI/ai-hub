@@ -2283,7 +2283,8 @@ def image_params(wf: dict, mapping: dict) -> list:
 # Workflow fields that take a path to a client file. A mapped node is a plain
 # Primitive/string node either way, so the workflow itself never says "this is a
 # file" — the NAME is the only signal there is.
-_FILE_FIELDS = ("file_path", "mesh_path", "path", "filename", "file")
+_FILE_FIELDS = ("file_path", "mesh_path", "path", "filename", "file", "audio",
+                "reference_audio")
 
 
 def is_file_param(param: str, m: Optional[dict]) -> bool:
