@@ -130,6 +130,27 @@ def _tool_use_block(tc: dict) -> dict:
             "input": args if isinstance(args, dict) else {}}
 
 
+def _messages_usage(usage: dict, fallback_input: int = 0) -> dict:
+    """Split OpenAI total input into Anthropic fresh input and cache shares.
+
+    Apply the existing missing/zero-total estimate before subtraction: a fully
+    cached real prompt legitimately leaves zero fresh tokens.
+    """
+    total = max(0, int(usage.get("prompt_tokens") or fallback_input))
+    out = {"input_tokens": total,
+           "output_tokens": int(usage.get("completion_tokens") or 0)}
+    details = usage.get("prompt_tokens_details") or {}
+    if ("cached_tokens" in details or "cache_write_tokens" in details
+            or "cached_tokens" in usage or "cache_creation_input_tokens" in usage):
+        read = min(total, max(0, int(details.get("cached_tokens")
+                                     or usage.get("cached_tokens") or 0)))
+        write = min(total - read, max(0, int(details.get("cache_write_tokens")
+                                             or usage.get("cache_creation_input_tokens") or 0)))
+        out.update(input_tokens=total - read - write,
+                   cache_read_input_tokens=read, cache_creation_input_tokens=write)
+    return out
+
+
 def chat_to_messages(chat_resp: dict, model: Optional[str]) -> dict:
     """Translate a Chat Completions response body into a Messages object. `model`
     is the alias the client asked for — Claude Code matches it against what it
@@ -153,16 +174,15 @@ def chat_to_messages(chat_resp: dict, model: Optional[str]) -> dict:
     return message_shell(
         _mid(), model, content=content,
         stop_reason=_stop_reason(choice.get("finish_reason"), bool(message.get("tool_calls"))),
-        usage={"input_tokens": int(usage_in.get("prompt_tokens") or 0),
-               "output_tokens": int(usage_in.get("completion_tokens") or 0)},
+        usage=_messages_usage(usage_in),
     )
 
 
 def estimate_input_tokens(body: dict) -> int:
     """Rough prompt-token count (~chars/4) over a Messages body — what
     `/v1/messages/count_tokens` answers for a backend that has no such endpoint,
-    and the input figure `message_start` carries before the backend reports real
-    usage. Never 0 for a non-empty request: a 0 reads as "nothing sent"."""
+    and the final usage fallback when no usable total arrives. Never 0 for a
+    non-empty request: a 0 reads as "nothing sent"."""
     chars = len(_blocks_text(body.get("system") or ""))
     for m in body.get("messages") or []:
         content = m.get("content")
@@ -225,8 +245,10 @@ async def messages_stream(chat_resp, model: Optional[str], input_tokens: int = 0
         state["kind"] = kind
         return ev("content_block_start", {"index": state["index"], "content_block": block})
 
+    # Fresh input is unknown until final usage. Claude retains a nonzero start
+    # count when final fresh input is zero, so never announce the estimate here.
     yield ev("message_start", {"message": message_shell(
-        mid, model, usage={"input_tokens": input_tokens, "output_tokens": 0})})
+        mid, model, usage={"input_tokens": 0, "output_tokens": 0})})
 
     # Hold the iterator in a local so it can be closed explicitly: when the CLIENT
     # disconnects, GeneratorExit lands in THIS generator, and the inner adapter
@@ -331,8 +353,7 @@ async def messages_stream(chat_resp, model: Optional[str], input_tokens: int = 0
             yield ev("content_block_delta", {"index": state["index"],
                      "delta": {"type": "input_json_delta", "partial_json": t["args"]}})
         yield close_open()
-    final_usage = {"input_tokens": int((usage or {}).get("prompt_tokens") or input_tokens),
-                   "output_tokens": int((usage or {}).get("completion_tokens") or 0)}
+    final_usage = _messages_usage(usage or {}, input_tokens)
     yield ev("message_delta", {"delta": {"stop_reason": _stop_reason(stop_reason, bool(tools)),
                                          "stop_sequence": None}, "usage": final_usage})
     yield ev("message_stop", {})

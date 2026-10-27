@@ -1458,6 +1458,15 @@ long Claude Code session started paying full price again. New columns are added
 by the same `ALTER TABLE` migration list as the earlier ones (an existing prod
 stats.db migrates in place; pre-existing rows read 0, never NULL).
 
+Together's `pricing.cached_input` is already USD/million and is normalized to
+`cache_read`; missing/null/empty rates remain absent, while an explicit zero is
+free. The unchanged `_cost_usd` prices each input share independently. This fixes
+78 measured Kimi K3 calls booked at $9.030153 rather than $2.1969498 despite 90.3%
+cache hits. `test_call_cost.py` covers the measured total, unknown/free cache rates
+and the existing priority of backend-reported costs. Historical rows require an
+explicit, backed-up repair; restarting afterward reseeds the in-memory monthly
+quota and clears aggregate memoization.
+
 ### `responses_bridge.py`
 
 Pure Responses↔Chat translation functions (no
@@ -1494,6 +1503,17 @@ vLLM/LocalAI builds do) — `end_turn` there ends Claude Code's turn instead of
 running the tool. Covered by
 `test_anthropic_bridge.py` (stdlib `unittest` — a streaming tool-call bridge fails
 silently rather than crashing).
+The shared pure `_messages_usage` converts OpenAI total input to Anthropic fresh
+input plus cache-read/write counters, clamping shares to conserve total input.
+`_StreamNormalizer` keeps known cache details in public OpenAI usage but still
+removes private cost metadata. JSON and terminal SSE use the same conversion;
+native Anthropic passthroughs never enter it. A translated `message_start` reports
+zero unknown input, not a preliminary estimate: the installed Claude Code client
+retained that estimate when terminal fresh input was zero. Final usage supplies
+the actual split, or the existing estimate fallback if upstream usage is unusable.
+`test_anthropic_bridge.py` covers both paths, complete cache hits, invalid shares
+and the zero-start contract; a real Claude Code smoke also confirmed fresh 0,
+cache-read 100 and output 5 without retaining the initial prompt estimate.
 
 ### `openai_image_bridge.py`
 

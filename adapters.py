@@ -172,12 +172,16 @@ def normalize_pricing(m: dict) -> Optional[dict[str, float]]:
     → `cache_read`/`cache_write`, set only when listed: absent means "billed as
     input", never 0 — a read is often 1/50 of the input price, and pricing it as
     fresh input booked an agent session at 5× its bill (2026-09-23, MiMo).
+    Together's `cached_input` likewise sets `cache_read`, already per-million.
     """
     p = m.get("pricing")
     if not isinstance(p, dict):
         return None
     if "input" in p or "output" in p:            # Together-style (per-million)
-        return {"input": _to_float(p.get("input")), "output": _to_float(p.get("output"))}
+        out = {"input": _to_float(p.get("input")), "output": _to_float(p.get("output"))}
+        if p.get("cached_input") not in (None, ""):
+            out["cache_read"] = _to_float(p.get("cached_input"))
+        return out
     if "prompt" in p or "completion" in p:        # OpenRouter-style (per-token)
         out = {"input": _to_float(p.get("prompt")) * 1_000_000,
                "output": _to_float(p.get("completion")) * 1_000_000}
@@ -768,7 +772,8 @@ class _StreamNormalizer:
         self.reasoning_as_content = reasoning_as_content
         self.buf = b""
         self.in_tok = self.out_tok = 0      # best backend-reported usage so far
-        self.cache_read = self.cache_write = 0   # prompt-cache share of in_tok (stats only)
+        self.cache_read = self.cache_write = 0   # prompt-cache shares of in_tok
+        self.cache_reported = False         # preserve explicit zero, not empty details
         self.cost: Optional[float] = None   # what the backend says it charged (stats only)
         self.pieces = 0                     # content-bearing deltas ≈ completion tokens
         self.meta: dict = {}                # id/model/created of the last chunk seen
@@ -797,10 +802,14 @@ class _StreamNormalizer:
 
     def _usage_json(self) -> str:
         it, ot = self.tokens()
+        usage = {"prompt_tokens": it, "completion_tokens": ot, "total_tokens": it + ot}
+        if self.cache_reported:
+            details = {"cached_tokens": self.cache_read}
+            if self.cache_write:
+                details["cache_write_tokens"] = self.cache_write
+            usage["prompt_tokens_details"] = details
         return json.dumps({**self.meta, "object": "chat.completion.chunk",
-                           "choices": [],
-                           "usage": {"prompt_tokens": it, "completion_tokens": ot,
-                                     "total_tokens": it + ot}},
+                           "choices": [], "usage": usage},
                           ensure_ascii=False, separators=(",", ":"))
 
     def _line(self, line: str) -> str:
@@ -828,9 +837,12 @@ class _StreamNormalizer:
         if isinstance(u, dict):
             self.in_tok = max(self.in_tok, int(u.get("prompt_tokens") or 0))
             self.out_tok = max(self.out_tok, int(u.get("completion_tokens") or 0))
-            # Prompt-cache share, for stats only — never forwarded, the client's
-            # usage chunk keeps the strict OpenAI shape.
+            # Keep only known cache shares for stats and the public usage chunk;
+            # provider cost fields remain private.
             det = u.get("prompt_tokens_details") or {}
+            self.cache_reported = self.cache_reported or (
+                "cached_tokens" in det or "cache_write_tokens" in det
+                or "cached_tokens" in u or "cache_creation_input_tokens" in u)
             self.cache_read = max(self.cache_read,
                                   int(det.get("cached_tokens") or u.get("cached_tokens") or 0))
             self.cache_write = max(self.cache_write,

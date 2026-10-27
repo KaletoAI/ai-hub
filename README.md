@@ -2583,9 +2583,17 @@ stats:
   body_max_kb: 256      # per side; larger bodies keep their first and last 128 KB
 ```
 
-- **Cost** comes from each backend's pricing (cached at discovery, normalised to
-  USD/million tokens — Together's per-million and OpenRouter's per-token schemas).
-  Local backends → 0.
+- **Cost** uses backend-reported call costs when available, otherwise the backend's
+  discovery pricing, normalised to USD/million tokens. Together's `cached_input`
+  and OpenRouter's cache rates price cached input separately; an absent cache rate
+  falls back to the fresh-input rate, not free input. Local unpriced backends → 0.
+  Statistics keep total input, while translated `/v1/messages` usage separates
+  fresh `input_tokens`, `cache_read_input_tokens` and `cache_creation_input_tokens`.
+  The stream starts with zero unknown input and reports the real split at the end,
+  avoiding clients retaining a preliminary estimate when fresh input is actually zero.
+  Claude Code computes its own cost estimate using its configured model rates;
+  correct token accounting does not install Together's rates in the client.
+  Historical stored costs are not rewritten automatically by this correction.
 - **Source** is the authenticated user, else the `X-Source` header, else client IP
   (IP aliases give those friendly names; the Users page offers reverse-DNS names and
   stores them on *Save resolved names*).

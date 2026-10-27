@@ -93,6 +93,33 @@ class CostUsd(unittest.TestCase):
         self.assertAlmostEqual(cost, want, places=12)
         self.assertLess(cost, 0.0005)             # booked 0.0121 before the fix
 
+    def test_measured_together_kimi_session(self):
+        """Dropping Together's cached_input silently overbills 78 real Kimi calls."""
+        catalog = {"data": [{"id": "moonshotai/Kimi-K3",
+                             "pricing": {"input": 3, "output": 15, "cached_input": 0.3}}]}
+        main.backend_pricing["openai:tg"] = adapters.extract_pricing(catalog)
+        cost = main._cost_usd("openai:tg", "moonshotai/Kimi-K3",
+                              2802306, 41549, 2530816, 0)
+        self.assertAlmostEqual(cost, 2.1969498, places=12)
+
+    def test_together_unlisted_cache_price_uses_input_rate(self):
+        """Missing, null and empty cache rates are unknown, not free cached input."""
+        for cache_price in ({}, {"cached_input": None}, {"cached_input": ""}):
+            with self.subTest(cache_price=cache_price):
+                catalog = {"data": [{"id": "m", "pricing": {
+                    "input": 3, "output": 15, **cache_price}}]}
+                main.backend_pricing["openai:tg"] = adapters.extract_pricing(catalog)
+                cost = main._cost_usd("openai:tg", "m", 1000, 100, 800, 0)
+                self.assertAlmostEqual(cost, 0.0045, places=12)
+
+    def test_together_explicit_zero_cache_price_is_free(self):
+        """An explicitly free cache must not fall back to the fresh-input rate."""
+        catalog = {"data": [{"id": "m",
+                             "pricing": {"input": 3, "output": 15, "cached_input": 0}}]}
+        main.backend_pricing["openai:tg"] = adapters.extract_pricing(catalog)
+        cost = main._cost_usd("openai:tg", "m", 1000, 100, 800, 0)
+        self.assertAlmostEqual(cost, 0.0021, places=12)
+
     def test_cache_write_priced_at_write_rate(self):
         cost = main._cost_usd("openai:or", "anthropic/claude-sonnet-5", 10000, 100, 6000, 3000)
         want = (1000 * 2.0 + 6000 * 0.2 + 3000 * 2.5 + 100 * 10.0) / 1e6
@@ -277,8 +304,8 @@ class ReportedCostBooked(unittest.TestCase):
                         self._stream(usage))
         self.assertEqual(row["cost_usd"], 0.777)
 
-    def test_reported_cost_never_reaches_a_strict_client(self):
-        # the client's usage chunk keeps the strict OpenAI shape
+    def test_stream_exposes_cache_usage_but_not_private_cost(self):
+        """Lost cache usage makes clients price cached context as fresh input."""
         rows, out = [], []
         a, client = _adapter(self._stream(OR_USAGE), rows)
 
@@ -291,6 +318,12 @@ class ReportedCostBooked(unittest.TestCase):
             await client.aclose()
         asyncio.run(go())
         self.assertNotIn(b'"cost"', b"".join(out))
+        chunks = [json.loads(line[5:].strip()) for line in b"".join(out).decode().splitlines()
+                  if line.startswith("data:") and line[5:].strip() != "[DONE]"]
+        usage = next(chunk["usage"] for chunk in chunks if chunk.get("usage"))
+        self.assertEqual(usage["prompt_tokens"], 13907)
+        self.assertEqual(usage["prompt_tokens_details"]["cached_tokens"], 13888)
+        self.assertNotIn("cost_details", usage)
 
 
 if __name__ == "__main__":

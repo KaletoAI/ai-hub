@@ -242,7 +242,7 @@ class ChatToMessages(unittest.TestCase):
         msg = ab.chat_to_messages(self.chat({"content": "x"}), "alias-x")
         self.assertEqual(msg["model"], "alias-x")
 
-    def test_usage_is_renamed_to_anthropic_fields(self):
+    def test_uncached_usage_keeps_the_two_field_contract(self):
         msg = ab.chat_to_messages(self.chat({"content": "x"}), "m")
         self.assertEqual(msg["usage"], {"input_tokens": 11, "output_tokens": 3})
 
@@ -337,6 +337,92 @@ def collect(gen):
     return asyncio.run(run())
 
 
+class CacheUsage(unittest.TestCase):
+    """Cache shares must reach JSON/SSE clients without inflating fresh input."""
+
+    def test_input_shares_are_conserved_in_plain_and_terminal_stream_usage(self):
+        """Losing cache details or subtracting them twice misreports Claude usage."""
+        cases = [
+            ({}, {"input_tokens": 100, "output_tokens": 5}),
+            ({"prompt_tokens_details": {}}, {"input_tokens": 100, "output_tokens": 5}),
+            ({"prompt_tokens_details": {"cached_tokens": 60, "cache_write_tokens": 30}},
+             {"input_tokens": 10, "output_tokens": 5,
+              "cache_read_input_tokens": 60, "cache_creation_input_tokens": 30}),
+            ({"cached_tokens": 60, "cache_creation_input_tokens": 30},
+             {"input_tokens": 10, "output_tokens": 5,
+              "cache_read_input_tokens": 60, "cache_creation_input_tokens": 30}),
+            ({"prompt_tokens_details": {"cached_tokens": 60, "cache_write_tokens": 30},
+              "cached_tokens": 90, "cache_creation_input_tokens": 10},
+             {"input_tokens": 10, "output_tokens": 5,
+              "cache_read_input_tokens": 60, "cache_creation_input_tokens": 30}),
+            ({"prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+              "cached_tokens": 60, "cache_creation_input_tokens": 30},
+             {"input_tokens": 10, "output_tokens": 5,
+              "cache_read_input_tokens": 60, "cache_creation_input_tokens": 30}),
+            ({"cached_tokens": 60, "cache_creation_input_tokens": 90},
+             {"input_tokens": 0, "output_tokens": 5,
+              "cache_read_input_tokens": 60, "cache_creation_input_tokens": 40}),
+            ({"cached_tokens": 100},
+             {"input_tokens": 0, "output_tokens": 5,
+              "cache_read_input_tokens": 100, "cache_creation_input_tokens": 0}),
+            ({"cached_tokens": 150, "cache_creation_input_tokens": 30},
+             {"input_tokens": 0, "output_tokens": 5,
+              "cache_read_input_tokens": 100, "cache_creation_input_tokens": 0}),
+            ({"cache_creation_input_tokens": 30},
+             {"input_tokens": 70, "output_tokens": 5,
+              "cache_read_input_tokens": 0, "cache_creation_input_tokens": 30}),
+            ({"cached_tokens": 0},
+             {"input_tokens": 100, "output_tokens": 5,
+              "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}),
+            ({"cached_tokens": -10, "cache_creation_input_tokens": -20},
+             {"input_tokens": 100, "output_tokens": 5,
+              "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}),
+        ]
+        for cache, expected in cases:
+            usage = {"prompt_tokens": 100, "completion_tokens": 5, **cache}
+            with self.subTest(cache=cache):
+                response = {"choices": [{"message": {"content": "answer"},
+                                         "finish_reason": "stop"}], "usage": usage}
+                plain = ab.chat_to_messages(response, "alias")["usage"]
+                stream = FakeStream([
+                    delta_chunk(content="answer"),
+                    sse({"choices": [], "usage": usage}), "data: [DONE]\n\n"])
+                events = collect(ab.messages_stream(stream, "alias", input_tokens=17))
+                self.assertEqual(events[0]["message"]["usage"]["input_tokens"], 0)
+                final = [e["usage"] for e in events if e["type"] == "message_delta"]
+                self.assertEqual(plain, expected)
+                self.assertEqual(final, [expected])
+                self.assertEqual(sum(expected.get(k, 0) for k in (
+                    "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")), 100)
+
+    def test_fully_cached_stream_never_announces_estimated_fresh_input(self):
+        """Claude retains a nonzero start count when the final fresh count is zero."""
+        stream = FakeStream([
+            delta_chunk(content="cached answer"),
+            sse({"choices": [], "usage": {"prompt_tokens": 100, "completion_tokens": 5,
+                                         "prompt_tokens_details": {"cached_tokens": 100}}}),
+            "data: [DONE]\n\n"])
+        events = collect(ab.messages_stream(stream, "alias", input_tokens=1599))
+        self.assertEqual(events[0]["message"]["usage"],
+                         {"input_tokens": 0, "output_tokens": 0})
+        final = [e["usage"] for e in events if e["type"] == "message_delta"]
+        self.assertEqual(final, [{"input_tokens": 0, "output_tokens": 5,
+                                 "cache_read_input_tokens": 100,
+                                 "cache_creation_input_tokens": 0}])
+
+    def test_unusable_stream_usage_still_uses_the_prompt_estimate(self):
+        """A zero total before cache splitting retains the old estimate fallback."""
+        for usage in (None, {}, {"prompt_tokens": 0, "completion_tokens": 0}):
+            with self.subTest(usage=usage):
+                chunks = [delta_chunk(content="answer")]
+                if usage is not None:
+                    chunks.append(sse({"choices": [], "usage": usage}))
+                chunks.append("data: [DONE]\n\n")
+                events = collect(ab.messages_stream(FakeStream(chunks), "alias", input_tokens=17))
+                final = [e["usage"] for e in events if e["type"] == "message_delta"]
+                self.assertEqual(final, [{"input_tokens": 17, "output_tokens": 0}])
+
+
 class MessagesStream(unittest.TestCase):
     """Chat SSE → Anthropic SSE. Claude Code drives entirely off these events."""
 
@@ -370,11 +456,10 @@ class MessagesStream(unittest.TestCase):
         self.assertEqual(events[0]["message"]["role"], "assistant")
 
     def test_usage_lands_where_anthropic_puts_it(self):
-        """A chat backend reports usage only in its LAST chunk, but message_start
-        goes out first — so it carries the caller's estimate and message_delta
-        carries the real numbers once they arrive."""
+        """Usage is unknown at message_start; only message_delta announces counts,
+        so clients retaining a start count on final zero cannot keep an estimate."""
         events = collect(ab.messages_stream(self.text_stream(), "alias-x", input_tokens=5))
-        self.assertEqual(events[0]["message"]["usage"]["input_tokens"], 5)
+        self.assertEqual(events[0]["message"]["usage"]["input_tokens"], 0)
         delta = [e for e in events if e["type"] == "message_delta"][0]
         self.assertEqual(delta["usage"], {"input_tokens": 7, "output_tokens": 2})
         self.assertEqual(delta["delta"]["stop_reason"], "end_turn")
