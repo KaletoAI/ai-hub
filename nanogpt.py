@@ -35,7 +35,14 @@ OPTION_FIELDS = [{"key": k, "label": k.replace("_", " "), "type": "int" if k in 
                  for k in OPTION_DEFAULTS]
 OPTION_FIELDS[-1].update(label="Model-specific defaults (JSON)", textarea=True,
                         hint="A JSON object of model-supported controls; no model, credentials or endpoint overrides.")
-_RESERVED = {"model", "endpoint", "provider", "api_key", "authorization", "x-api-key", "headers", "options_json"}
+OPTION_DEFAULTS["mesh_views"] = ""
+OPTION_FIELDS.append({"key": "mesh_views", "label": "3D image views", "type": "select",
+                      "choices": [("", "Catalog default"), ("front", "Single view (front)"),
+                                  ("front,back,left,right", "Multiview (front, back, left, right)")],
+                      "hint": "3D aliases only. Explicit camera slots for a model whose documented image "
+                              "limit is absent from its catalog. Never overrides a published image limit."})
+_RESERVED = {"model", "endpoint", "provider", "api_key", "authorization", "x-api-key", "headers",
+             "options_json", "mesh_views"}
 _IMAGE_SLOTS = ["input_image"] + [f"input_image_{i}" for i in range(2, 17)]
 
 
@@ -110,6 +117,8 @@ def options_of(cand):
     stored = (cand.get(KIND) or {}).get("options") or {}
     result = {k: stored.get(k, value) for k, value in OPTION_DEFAULTS.items()}
     _advanced(result["options_json"])
+    if result["mesh_views"] not in (None, "", "front", "front,back,left,right"):
+        raise NanoGPTInput("3D image views must be catalog default, front or front,back,left,right")
     for key in _INT_FIELDS | {"cfg"}:
         if result.get(key) not in (None, ""):
             result[key] = _number(key, result[key], key in _INT_FIELDS)
@@ -219,6 +228,15 @@ def _parameter_specs(cand):
 def slot_names(cand):
     if not _input_supported(cand, "image"):
         return []
+    views = options_of(cand)["mesh_views"] if endpoint_of(cand) == "3d" else ""
+    if views:
+        names = [f"input_image_{view}" for view in views.split(",")]
+        supported = (_metadata(cand) or {}).get("supported_parameters") or {}
+        limit = supported.get("max_input_images",
+                              (supported.get("input_image_constraints") or {}).get("max_items"))
+        if isinstance(limit, int) and len(names) > limit:
+            raise NanoGPTInput(f"3D image views exceed the catalog limit of {limit}")
+        return names
     if _metadata(cand) is None:
         return _IMAGE_SLOTS.copy() if endpoint_of(cand) == "images" else ["input_image"]
     supported = _metadata(cand).get("supported_parameters") or {}
@@ -262,7 +280,9 @@ def public_fields(cand):
             if default not in (None, ""):
                 field["default"] = default
             params.append(field)
-    images = [{"name": name, "required": False, "on_empty": "none"} for name in slot_names(cand)]
+    images = [{"name": name, "required": name == "input_image_front",
+               "on_empty": "required" if name == "input_image_front" else "none"}
+              for name in slot_names(cand)]
     return params, images, _file_fields(cand)
 
 
@@ -272,6 +292,7 @@ def _values(cand, values):
     if not isinstance(model, str) or not model.strip():
         raise NanoGPTInput("an exact NanoGPT model ID is required")
     opts = options_of(cand)
+    opts.pop("mesh_views")
     body = _advanced(opts.pop("options_json"))
     body.update({k: v for k, v in opts.items() if v not in (None, "")})
     extra = values.get("extra") or {}
@@ -422,10 +443,18 @@ def build_request(cand, values, images, files=None):
     image_values = [_data_url(images[name], _image_mime(images[name]))
                     for name in slot_names(cand) if images.get(name)]
     if image_values:
-        key = "imageDataUrls" if len(image_values) > 1 else "imageDataUrl"
+        key = "images" if ep == "3d" and len(image_values) > 1 else (
+            "imageDataUrls" if len(image_values) > 1 else "imageDataUrl")
         if key in body or "imageUrl" in body or "imageDataUrl" in body or "imageDataUrls" in body:
             raise NanoGPTInput("choose uploaded images or URL/data-URL parameters, not both")
-        body[key] = image_values if len(image_values) > 1 else image_values[0]
+        if ep == "3d":
+            # NanoGPT's 3D transport requires the primary even with multiple views;
+            # its published studio client sends the complete view set as `images`.
+            body["imageDataUrl"] = image_values[0]
+            if len(image_values) > 1:
+                body["images"] = image_values
+        else:
+            body[key] = image_values if len(image_values) > 1 else image_values[0]
     for name, (filename, data) in files.items():
         key = {"input_video": "videoDataUrl", "input_audio": "audioDataUrl"}[name]
         if key in body or key.replace("DataUrl", "Url") in body:

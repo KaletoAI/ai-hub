@@ -1107,6 +1107,32 @@ counts, excess references and discovered count
 limits are refused rather than silently changed. Multipart image references work
 through `/v1/images/edits`; masks use native `params.maskDataUrl` instead.
 
+For 3D models whose catalog omits the reference count, an alias's **3D image views**
+control explicitly selects `front` or `front,back,left,right` (`mesh_views` in its
+`nanogpt.options`). This publishes `input_image_front` and, for multiview,
+`input_image_back`, `input_image_left`, `input_image_right`. The front is required;
+missing other views are skipped. Uploads are sent in that camera order, regardless
+of request-key order. An explicit catalog image limit is never overridden. Leave
+the control blank to retain the catalog's numbered slots. This setting stays on
+the gateway and is not sent as a NanoGPT generation parameter.
+The 3D transport always sends the primary as `imageDataUrl`; multiple 3D views
+add the complete ordered set as `images` (not the Image API's `imageDataUrls`).
+See the [NanoGPT multiview studio](https://nano-gpt.com/studio/3d?model=meshy%2Fv7.1%2Fmulti-image-to-3d).
+
+For Anima Verse, use separate `img2mesh` aliases for
+`meshy/v7.1/image-to-3d` (single view) and `meshy/v7.1/multi-image-to-3d`
+(multiview), with the corresponding view control. Pin native defaults through
+**Model-specific defaults (JSON)**, for example:
+`{"should_texture":true,"topology":"triangle","target_polycount":150000,"geometry_resolution":"standard","enable_rigging":false,"enable_animation":false}`.
+These produce unrigged meshes; Anima performs local rigging in its separate step.
+Native `params` can override generation defaults, not the alias's camera layout.
+
+NanoGPT supports prepaid API usage without a subscription:
+[pricing and balance top-ups](https://nano-gpt.com/pricing).
+Mesh generation needs a positive balance sufficient for the selected variant.
+The Meshy 7.1 catalog currently lists a textured, standard-detail, static result
+at USD 1.44 for either image-input model; consult the live catalog before submitting.
+
 Video and 3D share NanoGPT's submit/status transport; real task IDs and progress
 are saved on the gateway job. GLB and additional delivered mesh/texture assets
 become downloadable job artifacts, with the existing 3D viewer. CDN downloads

@@ -58,6 +58,32 @@ class MediaRequests(unittest.TestCase):
         self.assertIn("imageDataUrl", image)
         self.assertNotIn("imageDataUrls", image)
 
+    def test_mesh_views_keep_distinct_cameras_in_declared_order(self):
+        cand = self.candidate("3d", mesh_views="front,back,left,right")
+        cand["model_metadata"] = {"capabilities": {"image_to_3d": True},
+                                  "supported_parameters": {}}
+        # Distinct PNG inputs, deliberately inserted in reverse camera order.
+        images = {"input_image_right": _png() + b"right",
+                  "input_image_left": _png() + b"left",
+                  "input_image_back": _png() + b"back",
+                  "input_image_front": _png() + b"front"}
+        body = nanogpt.build_request(cand, {}, images)
+        decoded = [base64.b64decode(value.split(",", 1)[1]) for value in body["images"]]
+        self.assertEqual(decoded, [_png() + b"front", _png() + b"back",
+                                   _png() + b"left", _png() + b"right"])
+        self.assertEqual(base64.b64decode(body["imageDataUrl"].split(",", 1)[1]), _png() + b"front")
+        self.assertNotIn("imageDataUrls", body)
+        self.assertNotIn("mesh_views", body)
+
+    def test_mesh_views_refuse_unknown_cameras_and_explicit_catalog_limits(self):
+        cand = self.candidate("3d", mesh_views="front,back,left,right")
+        cand["model_metadata"] = {"capabilities": {"image_to_3d": True},
+                                  "supported_parameters": {"max_input_images": 1}}
+        with self.assertRaises(nanogpt.NanoGPTInput):
+            nanogpt.build_request(cand, {}, {"input_image_front": _png()})
+        with self.assertRaises(nanogpt.NanoGPTInput):
+            nanogpt.build_request(self.candidate("3d", mesh_views="face"), {}, {})
+
     def test_bad_options_and_counts_refuse_instead_of_silently_normalizing(self):
         for options in ({"options_json": "[]"}, {"options_json": '{"api_key":"secret"}'},
                         {"options_json": '{"model":"replacement"}'}, {"options_json": '{"cfg":NaN}'},
