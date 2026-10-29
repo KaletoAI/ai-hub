@@ -12,7 +12,9 @@ import subprocess
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OLD = re.compile(r"llm[-_ ]gateway", re.I)
+# `llm-gateway-protocol` is Anthropic's Claude Code doc page (code.claude.com/docs/en/…),
+# a live link in the README — not our old name; renaming it would break the link.
+OLD = re.compile(r"llm[-_ ]gateway(?!-protocol)", re.I)
 # Historical records keep their name; the migration note in the README/CLAUDE.md and
 # the README's upgrade paragraph may name it, because an operator coming from the old
 # install has to be told which unit to stop and which directory to move.
