@@ -705,6 +705,29 @@ class VeniceAdapterTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(RuntimeError):
                 blob(data, mime, endpoint)
 
+    async def test_id3_tag_is_skipped_before_the_container_is_named(self):
+        """Venice's ACE-Step FLAC arrives behind an ID3v2 tag (a C2PA GEOB frame). Reading
+        the tag as "MP3" stored a playable FLAC as audio.mp3 / audio/mpeg — a player then
+        decodes FLAC frames with the MP3 decoder and the paid track is crackling noise."""
+        blob = adapters.VeniceMediaAdapter._binary_blob
+
+        def id3(body, footer=False):
+            size = 40
+            tag = (b"ID3\x04\x00" + bytes([0x10 if footer else 0])
+                   + bytes([0, 0, 0, size]) + b"GEOB" + b"\0" * (size - 4))
+            return tag + (b"3DI\x04\x00\x10" + bytes([0, 0, 0, size]) if footer else b"") + body
+
+        flac = b"fLaC" + b"\0" * 64
+        for data in (id3(flac), id3(flac, footer=True), id3(id3(flac))):
+            with self.subTest(data=data[:12]):
+                got = blob(data, "audio/mpeg", "music")
+                self.assertEqual((got.mime, got.name, got.data), ("audio/flac", "audio.flac", data))
+        got = blob(id3(self.wav), "application/octet-stream", "music")
+        self.assertEqual((got.mime, got.name), ("audio/wav", "audio.wav"))
+        for body in (b"\xff\xfb\x90\x00" + b"\0" * 64, b"\0" * 64):  # MPEG frame / tag padding
+            with self.subTest(body=body[:4]):
+                self.assertEqual(blob(id3(body), "audio/mpeg", "music").name, "audio.mp3")
+
     async def test_streaming_and_float_wav_pass_but_a_cut_wav_does_not(self):
         blob = adapters.VeniceMediaAdapter._binary_blob
         fmt_float = (b"fmt " + (16).to_bytes(4, "little") + (3).to_bytes(2, "little")

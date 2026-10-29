@@ -5148,16 +5148,35 @@ class VeniceMediaAdapter(CloudTaskAdapter):
                 raise RuntimeError("Venice returned video for an audio job")
             return GenBlob(data=data, mime=(mime if mime in ("audio/mp4", "audio/x-m4a", "audio/m4a")
                                             else "audio/mp4"), kind="audio", name="audio.m4a")
+        # An ID3v2 tag (Venice puts its C2PA manifest there) can front ANY container:
+        # name the codec after the tag, else a FLAC is served as MP3 and plays as noise.
+        # The stored bytes keep the tag.
+        tagged = VeniceMediaAdapter._id3_length(data)
+        body = data[tagged:]
         if requested_format == "pcm" and (generic or mime in ("audio/pcm", "audio/l16")):
             # Raw PCM has no signature (its first bytes can even look like an MP3 sync).
             ext = "pcm" if data and len(data) % 2 == 0 else None
         else:
-            ext = VeniceMediaAdapter._sniff_audio(data, requested_format)
+            ext = VeniceMediaAdapter._sniff_audio(body, requested_format)
+            if ext is None and tagged and body:
+                ext = "mp3"                                # tag + padding before the frames
         if ext is None:
             raise RuntimeError("Venice returned an invalid audio artifact")
-        if ext == "wav" and not VeniceMediaAdapter._wav_complete(data):
+        if ext == "wav" and not VeniceMediaAdapter._wav_complete(body):
             raise RuntimeError("Venice returned a truncated WAV artifact")
         return GenBlob(data=data, mime=_AUDIO_EXT_MIME[ext], kind="audio", name=f"audio.{ext}")
+
+    @staticmethod
+    def _id3_length(data: bytes) -> int:
+        """Bytes taken by leading (possibly stacked) ID3v2 tags: 10-byte header, synchsafe
+        size, a 10-byte footer when flagged. 0 when there is no tag."""
+        offset = 0
+        while (data[offset:offset + 3] == b"ID3" and len(data) >= offset + 10
+               and all(b < 0x80 for b in data[offset + 6:offset + 10])):
+            b = data[offset + 6:offset + 10]
+            size = b[0] << 21 | b[1] << 14 | b[2] << 7 | b[3]
+            offset += 10 + size + (10 if data[offset + 5] & 0x10 else 0)
+        return min(offset, len(data))
 
     @staticmethod
     def _sniff_audio(data: bytes, requested_format: Optional[str] = None) -> Optional[str]:

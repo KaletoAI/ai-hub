@@ -532,7 +532,11 @@ a failed/unknown status are the verdicts. `_asset` retries transport errors and
 video. `_binary_blob` lets the CONTENT decide (ISO tracks, audio signatures, a WAV
 whose `data` chunk the file holds — float WAV and streaming placeholder sizes
 pass): a CDN's `binary/octet-stream`, no type or `video/quicktime` used to refuse a
-valid paid file; a foreign family (text/html, application/pdf) still refuses. A
+valid paid file; a foreign family (text/html, application/pdf) still refuses.
+Leading ID3v2 tags are skipped (`_id3_length`) before the signature is read — Venice
+puts a C2PA manifest in one in front of ACE-Step's FLAC, and "starts with ID3 = MP3"
+stored it as `audio.mp3`/`audio/mpeg`, which players decoded as crackling noise
+(job ce2235a2, 2026-10-30); the stored bytes keep the tag. A
 voice upload sent but unanswered is final (it may exist) — it used to escape as a
 failover-class error and upload again. Cancellation preserves the paid trace and releases local slots without
 claiming the vendor stopped. No balance or currency conversion is inferred from
