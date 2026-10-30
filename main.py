@@ -4670,6 +4670,31 @@ def _lora_eligible_names(all_cands: list, body: dict) -> Optional[set]:
     return {r[0].get("name") for r in elig}
 
 
+def _gen_no_route_error(alias: str, gated: list, force: str = "") -> HTTPException:
+    """The 503 for a generation alias with no routable candidate right now. A backend
+    that is up but has not synced this alias's models is the reason worth naming —
+    "no healthy backend" would send the caller looking at a box that is fine. A force
+    pin filters these too: a pin elsewhere is not about the Thunder box."""
+    why = [w for name, w in gated if not force or name == force]
+    return HTTPException(503, "; ".join(why) if why else
+                         f"No healthy backend for generation model '{alias}'"
+                         + (f" on backend '{force}'" if force else ""))
+
+
+def _gen_slotless_error(alias: str, detail: str) -> HTTPException:
+    """Why an image-slot lookup came back empty. The slots are read from the alias's
+    routable candidates, so an alias with NONE right now (every GPU box down) has no
+    workflow to read them from: that is the job path's outage 503, never the 400
+    `detail` — a 400 told the client the alias can never take a reference image, and it
+    did not fall back. Asks the same lookup the slots came from (`get_gen_routes`).
+    Blocking (store read) — call via asyncio.to_thread."""
+    if get_gen_routes(alias):
+        return HTTPException(400, detail)
+    gated: list = []
+    _gen_routes(alias, gated)                    # only for the sync reason worth naming
+    return _gen_no_route_error(alias, gated)
+
+
 async def _gen_pick(alias: str, force: str, body: dict) -> tuple[list, bool, Optional[set]]:
     """Resolve a generation request's candidates ONCE (a single store read):
     force-pin filter, LoRA eligibility, ready/busy split. Returns
@@ -4678,13 +4703,7 @@ async def _gen_pick(alias: str, force: str, body: dict) -> tuple[list, bool, Opt
     ready, allc = await asyncio.to_thread(_gen_routes, alias, gated)
     ready, allc = _force_filter(ready, force), _force_filter(allc, force)
     if not allc:
-        # A backend that is up but has not synced this alias's models is the reason worth
-        # naming — "no healthy backend" would send the caller looking at a box that is fine.
-        # A force pin filters these too: a pin elsewhere is not about the Thunder box.
-        why = [w for name, w in gated if not force or name == force]
-        raise HTTPException(503, "; ".join(why) if why else
-                            f"No healthy backend for generation model '{alias}'"
-                            + (f" on backend '{force}'" if force else ""))
+        raise _gen_no_route_error(alias, gated, force)
     eligible = None if force else _lora_eligible_names(allc, body)   # a pin is never overridden
     if eligible is not None:
         ready = [r for r in ready if r[0].get("name") in eligible]
@@ -5467,7 +5486,8 @@ async def images_generations(request: Request, authorization: Optional[str] = He
         raise HTTPException(400, "`ref_images` must be a list")
     slots = await asyncio.to_thread(_gen_image_slots, alias)   # ONE lookup — uploads + log
     if refs and not slots:
-        raise HTTPException(400, f"'{alias}' has no reference-image inputs")
+        raise await asyncio.to_thread(_gen_slotless_error, alias,
+                                      f"'{alias}' has no reference-image inputs")
     params, count, catalog_media = await asyncio.to_thread(_image_shim_settings, alias, body.get("size"),
         {**(body.get("params") or {}), **{k: v for k, v in body.items() if k not in OAI_IMG_KEYS}},
         body.get("n"))
@@ -5509,7 +5529,8 @@ async def images_edits(request: Request, authorization: Optional[str] = Header(N
     masks = [v for v in (f.get("mask") or []) if isinstance(v, (bytes, bytearray))]
     slots = await asyncio.to_thread(_gen_image_slots, alias)   # ONE lookup — uploads + log
     if not slots:
-        raise HTTPException(400, f"'{alias}' does not support image edits")
+        raise await asyncio.to_thread(_gen_slotless_error, alias,
+                                      f"'{alias}' does not support image edits")
     routes = await asyncio.to_thread(get_gen_routes, alias)
     kind = adapters.cloud_kind(routes[0][1]) if routes else None
     catalog_media = kind in adapters.DYNAMIC_CATALOG_TYPES

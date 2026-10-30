@@ -2909,6 +2909,13 @@ ranges), the request goes to the CHECKED IP with the original Host header and
 `_REF_FETCH_MAX_BYTES`. `/v1/generations` fetches only `images` keys in
 `_gen_image_slot_names` (param or label), the image shim only as many `ref_images` as
 the alias has slots (`test_ref_url_fetch.py`, `test_body_limit.py`).
+The slots are read from the alias's ROUTABLE candidates, so an empty list does not
+mean "no slots" when nothing is routable right now: the shims ask `_gen_slotless_error`,
+which answers the job path's outage 503 (`_gen_no_route_error`, naming a model-sync
+gate when there is one) and keeps the 400 ("has no reference-image inputs" / "does not
+support image edits") for an alias that is routable and really has no slot. With every
+GPU box of an alias off, the 400 told the client the alias can never take a reference
+image, so it never fell back (`test_gen_inputs.py` `NoRouteIsNotNoSlot`).
 
 ## Stats recording
 

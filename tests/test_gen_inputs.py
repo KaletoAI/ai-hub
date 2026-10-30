@@ -133,5 +133,63 @@ class PathWorkflowSlots(unittest.TestCase):
         self.assertEqual(self.handed, {"input_image": b"img"})
 
 
+class NoRouteIsNotNoSlot(unittest.TestCase):
+    """The OpenAI image shims read an alias's image slots from its ROUTABLE candidates.
+    With none routable right now (every GPU box off) the slot list came back empty and
+    the shim answered 400 "has no reference-image inputs" — a permanent client error
+    for an alias that does have slots, so the client never fell back elsewhere. Without
+    a route it is the job path's outage 503; a 400 only when a route exists."""
+
+    def setUp(self):
+        names = ("_gen_routes", "_decode_ref_image", "run_generation",
+                 "api_key", "users", "_users_by_key")
+        self._saved = {n: getattr(main, n) for n in names}
+        main.api_key, main.users, main._users_by_key = "", [], {}
+        self.routes, self.gated = [], []
+
+        def routes(alias, gated=None):
+            if gated is not None:
+                gated.extend(self.gated)
+            return list(self.routes), list(self.routes)
+
+        async def run(body, request, upload_images=None, upload_files=None):
+            raise HTTPException(418, "stop")
+        main._gen_routes = routes
+        main.run_generation = run
+
+    def tearDown(self):
+        for n, v in self._saved.items():
+            setattr(main, n, v)
+
+    def _post(self, path, **kw):
+        from fastapi.testclient import TestClient
+        return TestClient(main.app).post(path, **kw)
+
+    def test_generations_without_a_route_is_the_outage_503(self):
+        r = self._post("/v1/images/generations", json={"model": "a", "prompt": "p", "ref_images": ["u1"]})
+        self.assertEqual(r.status_code, 503)
+        self.assertIn("No healthy backend", r.json()["detail"])
+
+    def test_a_sync_gate_is_named(self):
+        self.gated = [("vm", "models syncing 3/5")]
+        r = self._post("/v1/images/generations", json={"model": "a", "prompt": "p", "ref_images": ["u1"]})
+        self.assertEqual((r.status_code, r.json()["detail"]), (503, "models syncing 3/5"))
+
+    def test_edits_without_a_route_is_the_outage_503(self):
+        r = self._post("/v1/images/edits", data={"model": "a", "prompt": "p"},
+                       files={"image": ("i.png", PNG, "image/png")})
+        self.assertEqual(r.status_code, 503)
+
+    def test_a_routable_alias_without_slots_stays_a_400(self):
+        self.routes = [({"name": "b"}, {"backend": "b", "workflow_json": WF, "mapping": {
+            "prompt": {"node": "2", "field": "text"}}})]
+        r = self._post("/v1/images/generations", json={"model": "a", "prompt": "p", "ref_images": ["u1"]})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("has no reference-image inputs", r.json()["detail"])
+        r = self._post("/v1/images/edits", data={"model": "a", "prompt": "p"},
+                       files={"image": ("i.png", PNG, "image/png")})
+        self.assertEqual((r.status_code, r.json()["detail"]), (400, "'a' does not support image edits"))
+
+
 if __name__ == "__main__":
     unittest.main()
