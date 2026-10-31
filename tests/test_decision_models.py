@@ -311,6 +311,16 @@ class Dispatch(unittest.TestCase):
         _, sent, _ = self._run(LS, llamaswap=True, real="laya")
         self.assertEqual(str(sent[0].url), "http://192.168.8.31:8080/upstream/laya/v1/systemone")
 
+    def test_a_lan_cold_start_fits_the_read_budget(self):
+        """A llama-swap cold start is no fault: measured 2026-10-31, laya loaded in 28.8 s
+        and openjev-4b took over 30 s — with the old 30 s budget every cold openjev-4b call
+        was a 503 plus a `timeout` fault row. A cloud backend keeps the short budget: there
+        a hung call would hold a slot the chat traffic shares (OpenRouter max_concurrent 2)."""
+        _, sent, _ = self._run(LS, llamaswap=True, real="laya")
+        self.assertEqual(sent[0].extensions["timeout"]["read"], 90.0)
+        _, sent, _ = self._run(OR)
+        self.assertEqual(sent[0].extensions["timeout"]["read"], 30.0)
+
 
 class Endpoint(_Routing):
     def setUp(self):

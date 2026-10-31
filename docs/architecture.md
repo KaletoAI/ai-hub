@@ -2563,8 +2563,11 @@ the optional worker's scientific dependencies are absent from the gateway venv.
   (llama-swap → `/upstream/<model>/v1/systemone`, a cloud backend → OpenRouter's
   Decisions API `/alpha/decisions` — the path Anima measured with 1,284 calls without an
   error, 2026-10-18; its `/v1/systemone` is untested — any other LAN server →
-  `/v1/systemone`) and runs `_dispatch_once` with `_DECISION_TIMEOUT` (read 30 s): a
-  decision answers in ~0.3 s. Stats/cost are the plain path's (`usage.cost` via
+  `/v1/systemone`) and runs `_dispatch_once` with `_DECISION_TIMEOUT` (read 30 s) on a
+  cloud backend — a decision answers in ~0.3 s, and a hung call would hold a slot chat
+  shares — and `_DECISION_TIMEOUT_LAN` (read 90 s) on a LAN server, whose first call
+  loads the model (2026-10-31: laya 28.8 s, openjev-4b > 30 s; with 30 s every cold
+  start was a 503 plus a `timeout` fault row). Stats/cost are the plain path's (`usage.cost` via
   `reported_cost`), recorded under `/v1/systemone` (an `llm` row in LLM Calls). Tokens:
   OpenRouter's Decisions API names them `input_tokens`/`output_tokens`, so
   `OpenAIAdapter._usage_of` falls back to those when `prompt_tokens`/`completion_tokens`

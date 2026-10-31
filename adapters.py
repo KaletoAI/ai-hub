@@ -64,9 +64,13 @@ logger = logging.getLogger(__name__)
 # (incl. the TLS handshake) and waiting for a pooled connection stay short.
 _CHAT_TIMEOUT = httpx.Timeout(300.0, connect=10.0, pool=30.0)
 # A decision answers in ~0.3 s (OpenRouter p90 0.35 s, measured by Anima-Versa
-# 2026-10-18) and its caller gives up after 2-6 s. 30 s still covers a llama-swap
-# model swap; past that a hung upstream only holds the slot for nobody.
+# 2026-10-18) and its caller gives up after 2-6 s. On a cloud backend 30 s is plenty;
+# past that a hung upstream only holds a slot the chat traffic shares. A LAN server
+# (llama-swap) loads the model on the first call: measured 2026-10-31, laya 28.8 s and
+# openjev-4b over 30 s — so the LAN budget is 90 s, or every cold start is a 503 plus a
+# fault row. The load finishes either way; the budget only decides whether it counts.
 _DECISION_TIMEOUT = httpx.Timeout(30.0, connect=5.0, pool=10.0)
+_DECISION_TIMEOUT_LAN = httpx.Timeout(90.0, connect=5.0, pool=10.0)
 _DISCOVERY_TIMEOUT = 5.0
 _COMFY_DISCOVERY_TIMEOUT = 8.0
 # NanoGPT's direct API host (the one its docs recommend for API keys) answered the six
@@ -1290,7 +1294,9 @@ class OpenAIAdapter(BackendAdapter):
         if req.path == DECISION_PATH:
             call.url = decision_url(self.backend, call.real_model or "",
                                     self.ctx.is_llamaswap(self.bid))
-            return await self._dispatch_once(req, call, timeout=_DECISION_TIMEOUT)
+            timeout = (_DECISION_TIMEOUT_LAN if is_lan_url(self.backend.get("url"))
+                       else _DECISION_TIMEOUT)
+            return await self._dispatch_once(req, call, timeout=timeout)
         if req.body.get("stream"):
             return await self._dispatch_stream(req, call)
         return await self._dispatch_once(req, call)
