@@ -4,3 +4,7 @@ httpx
 pyyaml
 faster-whisper
 pillow>=13.0.0
+# Security floors for transitive deps (httpx → certifi, faster-whisper → huggingface_hub
+# → filelock): deploy.sh installs without --upgrade, so an old copy would otherwise stay.
+certifi>=2026.10.18
+filelock>=4.2.1
