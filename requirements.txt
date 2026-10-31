@@ -3,4 +3,4 @@ uvicorn[standard]
 httpx
 pyyaml
 faster-whisper
-pillow
+pillow>=13.0.0
