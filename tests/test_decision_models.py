@@ -80,7 +80,9 @@ QUESTION = {"model": JEV, "state": {"text": "smiles and waves at a friend"},
 ANSWER = {"answers": {"entry": {"type": "choice", "choice": "positive",
                                 "probabilities": {"neutral": 0.03, "positive": 0.95,
                                                   "sad": 0.0, "none": 0.02}}},
-          "usage": {"prompt_tokens": 120, "completion_tokens": 0, "cost": 0.00004}}
+          # The usage shape OpenRouter's Decisions API returned live (2026-10-31):
+          # Anthropic-style token names, not prompt_/completion_tokens.
+          "usage": {"input_tokens": 366, "output_tokens": 45, "cost": 0.00004}}
 
 
 class PureRules(unittest.TestCase):
@@ -302,6 +304,8 @@ class Dispatch(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["endpoint"], DP)
         self.assertEqual(rows[0]["cost_usd"], 0.00004)
+        # Counted, not 0: the call log showed decision calls with cost but no tokens.
+        self.assertEqual((rows[0]["input_tokens"], rows[0]["output_tokens"]), (366, 45))
 
     def test_llamaswap_goes_through_upstream(self):
         _, sent, _ = self._run(LS, llamaswap=True, real="laya")

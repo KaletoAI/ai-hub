@@ -2565,7 +2565,10 @@ the optional worker's scientific dependencies are absent from the gateway venv.
   error, 2026-10-18; its `/v1/systemone` is untested — any other LAN server →
   `/v1/systemone`) and runs `_dispatch_once` with `_DECISION_TIMEOUT` (read 30 s): a
   decision answers in ~0.3 s. Stats/cost are the plain path's (`usage.cost` via
-  `reported_cost`), recorded under `/v1/systemone` (an `llm` row in LLM Calls).
+  `reported_cost`), recorded under `/v1/systemone` (an `llm` row in LLM Calls). Tokens:
+  OpenRouter's Decisions API names them `input_tokens`/`output_tokens`, so
+  `OpenAIAdapter._usage_of` falls back to those when `prompt_tokens`/`completion_tokens`
+  are absent (live 2026-10-31: cost booked, tokens 0 before the fallback).
 - **Generation** (`POST /v1/generations`, and the OpenAI shims
   `/v1/images/generations` + `/v1/images/edits`): `get_gen_routes(alias)` resolves
   an alias via the **separate** generation store (`image_models`/store), or a direct

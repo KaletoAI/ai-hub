@@ -1425,9 +1425,14 @@ class OpenAIAdapter(BackendAdapter):
 
     def _usage_of(self, resp_json: dict) -> tuple[int, int]:
         """(input, output) tokens out of a non-streamed response body. Overridden
-        where the protocol names them differently (Anthropic)."""
+        where the protocol names them differently (Anthropic).
+
+        `input_tokens`/`output_tokens` are the fallback: OpenRouter's Decisions API
+        (/v1/systemone) reports them that way, and the call log showed those calls
+        with their cost but 0 tokens."""
         usage = (resp_json.get("usage") or {}) if isinstance(resp_json, dict) else {}
-        return int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0)
+        return (int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0),
+                int(usage.get("completion_tokens") or usage.get("output_tokens") or 0))
 
     def _cache_of(self, resp_json: dict) -> tuple[int, int]:
         """(cache_read, cache_write) — how much of the input came out of the
