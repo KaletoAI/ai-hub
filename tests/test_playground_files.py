@@ -232,6 +232,26 @@ class GenerateBody(unittest.TestCase):
         self.assertTrue(self.sent["files"]["input_mesh_path"]
                         .startswith("data:model/gltf-binary;base64,"))
 
+    def test_comfy_booleans_can_flip_both_defaults_without_coercing_strings(self):
+        import store
+        store.upsert("comfy-flags", [{
+            "backend": "comfy-a", "task": "text2img",
+            "workflow_json": {"1": {"class_type": "Options", "inputs": {
+                "remove_background": True, "force_cuda_rast": False, "literal": "false",
+            }}},
+            "mapping": {
+                "value_1": {"node": "1", "field": "remove_background", "label": "input_remove_background"},
+                "value_2": {"node": "1", "field": "force_cuda_rast", "label": "input_force_cuda_rast"},
+                "literal": {"node": "1", "field": "literal"},
+            },
+        }])
+        self._post([("model", "comfy-flags"), ("p__value_1", "false"),
+                    ("p__value_2", "true"), ("p__literal", "false")])
+        self.assertIs(self.sent["params"]["value_1"], False)
+        self.assertIs(self.sent["params"]["value_2"], True)
+        self.assertEqual(self.sent["params"]["literal"], "false")
+
+
 
 # ── Send to Playground carries the seed the job actually ran with ──────────────
 # The seed a job ran with is usually DRAWN by the gateway (auto-seed, 🎲 field), so it

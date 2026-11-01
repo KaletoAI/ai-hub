@@ -8295,7 +8295,12 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
             dv = defaults.get(p)
             node, field = (m or {}).get("node"), (m or {}).get("field")
             opts = (oi or {}).get((wf.get(node) or {}).get("class_type", ""), {}).get(field)
-            if isinstance(opts, list) and opts:          # ANY combo (model, skeleton_template, …) → dropdown
+            if isinstance(dv, bool):
+                cur = v(p) or str(dv)
+                rows += _field(label, _select(f"p__{p}",
+                               [("true", "true"), ("false", "false")],
+                               "true" if cur.lower() in ("true", "1", "on") else "false"))
+            elif isinstance(opts, list) and opts:       # ANY combo (model, skeleton_template, …) → dropdown
                 cur = v(p) or (str(dv) if dv is not None else "")
                 o = list(opts)
                 if cur and cur not in o:
@@ -8498,6 +8503,9 @@ async def generate(request: Request):
     if cand and adapters.cloud_kind(cand) in adapters.DYNAMIC_CATALOG_TYPES:
         params, _, _ = adapters.public_fields(cand)
         schema_types = {p["name"]: p.get("type") for p in params}
+    elif cand and not adapters.cloud_kind(cand):
+        schema_types = {p: "bool" for p, value in _alias_defaults(cand).items()
+                        if isinstance(value, bool)}
     # dynamic request fields arrive as p__<param>. prompt/negative_prompt feed the
     # request's inputs; schema strings stay strings, even when they look numeric.
     # Workflow fields without a typed catalog retain their existing numeric coercion.

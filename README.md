@@ -1687,6 +1687,10 @@ Key mapping concepts:
   on save, including zero. Unlisted saved choices stay selected and marked stale,
   never silently replaced. A backend that cannot answer borrows the available
   candidate's definitions, as with model dropdowns.
+- **Boolean workflow controls.** The Media Playground renders mapped boolean
+  defaults as explicit `true`/`false` choices and submits real JSON booleans.
+  A disabled option stays `false`, not the truthy string `"False"`. String-valued
+  workflow fields keep their text, even when it happens to be `"false"`.
 - **🎲 random values.** Every integer pin and integer request field has a
   `🎲 random` box (`random: true` on the `fixed` / `mapping` entry). A random pin is
   drawn fresh per job on every backend (its stored value is ignored, requests still
