@@ -1325,9 +1325,11 @@ where the script must act on nodes arriving later, register the action in
 `window.gwLiveHooks` (`gwFbxScan`, which also initialises `.bvhview`: a BVH motion
 clip as an animated `SkeletonHelper` — the `AnimationMixer` must sit on the bone
 GROUP, not the helper, or r160 binds no track and the figure stands still with only
-console warnings). The job gallery keys the BVH viewer on the file EXTENSION and
-never draws a non-image mime as `<img>`, so rows stored with the old fallback label
-still render. `test_admin_live.py` pins this, plus `data-live`
+console warnings). Both the job page and the Media Playground's result column show
+it (`_is_bvh`/`_bvh_cell`), so `_playground_body` hoists `_FBX_VIEWER_JS` too —
+import map before the model-viewer module, same reason as `job_detail_page`. Both key
+the BVH viewer on the file EXTENSION and never draw a non-image mime as `<img>`, so
+rows stored with the old fallback label still render. `test_admin_live.py` pins this, plus `data-live`
 on `<main>` and that every JS constant parses — all three fail silently. "ES5" here
 is a SYNTAX rule (no arrow functions, let/const, template strings, classes); later
 DOM APIs (fetch, URL, `closest`, `Array.from`, `replaceChildren`) are used freely.

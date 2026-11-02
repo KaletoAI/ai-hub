@@ -1220,7 +1220,7 @@ def _dl_card(src: str, label: str = "download", *, dl: str = " download",
 
 def _media_tag(src: str, mime: str = "", kind: str = "", cls: str = "",
                style: str = "", autoplay: bool = False,
-               glb_stats: Optional[dict] = None) -> str:
+               glb_stats: Optional[dict] = None, name: str = "") -> str:
     """Right media element for a generation artifact: <video> for video, <audio>
     for audio, <model-viewer> for glTF/GLB, else <img>. The serving route sets the
     real content-type; mime/kind here only pick the tag (unknown → <img>). `src`
@@ -1275,7 +1275,9 @@ def _media_tag(src: str, mime: str = "", kind: str = "", cls: str = "",
                 f'shadow-intensity="1" interaction-prompt="none" '
                 f'ar-status="not-presenting"></model-viewer>')
     if k == "file" or m.startswith("text/") or m == "application/json" or (m and not m.startswith("image/")):
-        return _dl_card(src, cls=cls)   # a non-image mime is never an <img> (old ("octet-stream", "image") rows)
+        # a non-image mime is never an <img> (old ("octet-stream", "image") rows);
+        # `name` labels the card, so two variants' sidecars are told apart
+        return _dl_card(src, name or "download", dl=f' download="{_esc(name)}"' if name else " download", cls=cls)
     return f'<img{c}{s} src="{src}">'
 
 
@@ -8364,8 +8366,10 @@ def _playground_body(aliases: list, vals: dict, cand: Optional[dict], result_htm
                      oi: Optional[dict] = None, kept: Optional[dict] = None) -> str:
     # model-viewer loads with the page and stays loaded: _LIVE_JS never re-inserts a
     # <script>, so a viewer arriving through a live update upgrades against the
-    # definition that is already there.
-    return (f'<script type="module" src="{_MODELVIEWER_SRC}"></script>'
+    # definition that is already there. The three.js module (BVH viewer) is hoisted
+    # for the same reason, and its import map goes FIRST — see job_detail_page: a map
+    # after a module script's load started is rejected and the viewer stays black.
+    return (f'{_FBX_VIEWER_JS}<script type="module" src="{_MODELVIEWER_SRC}"></script>'
             f'<div class="cols"><div class="col">{_playground_form(aliases, vals, cand, oi, kept)}</div>'
             f'<div class="col"><div id="resultcol">{result_html}</div></div></div>')
 
@@ -8384,12 +8388,18 @@ def _job_result_html(job_id: str, job: Optional[dict]):
     cells = []
     for r in job.get("results", []):
         src = f"/ui/playground/result/{_esc(job_id)}/{r['n']}"
+        if _is_bvh(r):
+            name = r.get("name") or ""
+            cells.append(_bvh_cell(src, name or f"artifact {r['n']}",
+                                   f' download="{_esc(name)}"' if name else " download",
+                                   "width:720px;max-width:100%;height:520px"))
+            continue
         st = None
         if (r.get("mime") or "").lower() == "model/gltf-binary":
             rp = jobs.result_path(job_id, r["n"])
             st = _glb_stats(rp[0]) if rp else None
         extra = _glb_stats_html(st)
-        cells.append(f"<div>{_media_tag(src, r.get('mime'), r.get('kind'), cls='result', autoplay=True, glb_stats=st)}{extra}</div>")
+        cells.append(f"<div>{_media_tag(src, r.get('mime'), r.get('kind'), cls='result', autoplay=True, glb_stats=st, name=r.get('name') or '')}{extra}</div>")
     imgs = "".join(cells)
     meta = job.get("meta") or {}
     tags = ""
@@ -9321,6 +9331,22 @@ _FBX_VIEWER_JS = (
     '</script>')
 
 
+def _is_bvh(r: dict) -> bool:
+    """A result entry is a BVH motion clip. Keyed on the file EXTENSION, not mime/kind:
+    rows stored before .bvh had a label carry ("application/octet-stream", "image")
+    and must still get the viewer."""
+    return os.path.splitext(r.get("name") or r.get("filename") or "")[1].lower() == ".bvh"
+
+
+def _bvh_cell(src: str, label: str, dl: str, box: str) -> str:
+    """BVH viewer + download card. The div is rendered EMPTY and filled client-side by
+    gwFbxScan's .bvhview half (_FBX_VIEWER_JS), so the page showing it must hoist that
+    module; data-live-skip keeps a morph from stripping the canvas back out."""
+    return (f'<div><div class="bvhview" data-live-skip data-src="{src}" '
+            f'style="{box};background:#0c0e12;border:1px solid #313a46;border-radius:10px"></div>'
+            f"<div>{_dl_card(src, label, dl=dl, compact=True)}</div></div>")
+
+
 def _job_thumbs(jid: str, kind: str, entries: list) -> str:
     """Gallery of artifact thumbnails (kind = 'input'|'result'). Images link to the
     full file; video/audio play inline; GLB → <model-viewer>; FBX → a three.js 3D
@@ -9372,13 +9398,8 @@ def _job_thumbs(jid: str, kind: str, entries: list) -> str:
             cells += (f'<div><div class="fbxview" data-live-skip data-src="{_esc(src)}"{tex_attr} '
                       f'style="{box3d};background:#0c0e12;border:1px solid #313a46;border-radius:10px"></div>'
                       f"<div>{_dl_card(src, label, dl=dl, compact=True)}</div></div>")
-        elif os.path.splitext(name or r.get("filename") or "")[1].lower() == ".bvh":
-            # BVH → animated skeleton (gwFbxScan's .bvhview half) + download. Keyed on
-            # the extension, not mime/kind: rows stored before .bvh had a mapping carry
-            # ("application/octet-stream", "image") and must still get the viewer.
-            cells += (f'<div><div class="bvhview" data-live-skip data-src="{_esc(src)}" '
-                      f'style="{box3d};background:#0c0e12;border:1px solid #313a46;border-radius:10px"></div>'
-                      f"<div>{_dl_card(src, label, dl=dl, compact=True)}</div></div>")
+        elif _is_bvh(r):                                  # BVH → animated skeleton + download
+            cells += _bvh_cell(src, label, dl, box3d)
         elif (mk == "file" or m.startswith("text/") or m == "application/json"
               or (m and not m.startswith("image/"))):
             # Last clause: a non-image mime is never an <img> — the old fallback label

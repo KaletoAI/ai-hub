@@ -434,12 +434,33 @@ class PlaygroundScriptInvariant(unittest.TestCase):
         body = admin._playground_body([], {"model": ""}, None, "<p>x</p>")
         self.assertIn(f'<script type="module" src="{admin._MODELVIEWER_SRC}"></script>', body)
 
-    def test_playground_never_renders_an_fbx_viewer(self):
-        # Why it needs no gwFbxScan: the playground's result column goes through
-        # _media_tag, which has no .fbxview branch — an FBX there is a download card.
-        # Written as an assertion so the day that changes, this says what to add.
-        self.assertNotIn("fbxview", admin._media_tag("/x.fbx", "application/octet-stream", "file"))
-        self.assertNotIn("fbxview", admin._playground_body([], {"model": ""}, None, "<p>x</p>"))
+    def test_playground_hoists_the_three_viewer_with_its_import_map_first(self):
+        # The result column grows a .bvhview through a live morph, which drops every
+        # <script> it inserts — so the module (and its gwLiveHooks scan) must already be
+        # on the page, and its import map must precede the model-viewer module script,
+        # or 'three' fails to resolve and the viewer stays a black box, silently.
+        body = admin._playground_body([], {"model": ""}, None, "<p>x</p>")
+        self.assertIn(admin._FBX_VIEWER_JS, body)
+        imap = body.find('<script type="importmap"')
+        mod = body.find(f'<script type="module" src="{admin._MODELVIEWER_SRC}"')
+        self.assertNotEqual(imap, -1)
+        self.assertLess(imap, mod, "the import map must precede every external module script")
+
+    def test_playground_result_renders_the_bvh_viewer(self):
+        # Legacy label on purpose: the old ("application/octet-stream", "image") rows
+        # went through _media_tag and came out as a broken <img>.
+        html, _ = admin._job_result_html("abc", _DONE_JOB)
+        self.assertEqual(html.count('class="bvhview" data-live-skip'), 1)
+        self.assertIn("transition_0.bvh", html)
+        self.assertNotIn("<img", html)
+        self.assertIn("⬇ transition_0.json", html)   # sidecar card named, not "download"
+
+    def test_playground_result_adds_no_script(self):
+        # The column IS the morphed subtree; a viewer script appearing here instead of
+        # in the hoisted head would never run.
+        html, _ = admin._job_result_html("abc", _DONE_JOB)
+        self.assertNotIn('<script type="importmap"', html)
+        self.assertNotIn("gwFbxScan", html)
 
 
 class VoiceUploadProgressIsConsumed(unittest.TestCase):
