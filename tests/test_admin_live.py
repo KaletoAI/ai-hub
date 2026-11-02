@@ -374,6 +374,13 @@ class LiveScriptInvariant(unittest.TestCase):
         # still not an artifact (that set is _MIME_BY_EXT, mirrored by the RunPod worker).
         self.assertIsNone(adapters._view_params("/x/ComfyUI/output/meta.json"))
 
+    def test_both_viewers_advance_their_mixer_every_frame(self):
+        # A mixer that is created but never update()d binds its clip and then holds
+        # frame 0 forever: a rigged FBX or a BVH that just stands there, no error
+        # anywhere. Both render loops (FBX, BVH) must tick theirs.
+        self.assertEqual(admin._FBX_VIEWER_JS.count("mixer.update(clock.getDelta())"), 2)
+        self.assertIn("new THREE.AnimationMixer(o)", admin._FBX_VIEWER_JS)
+
     def test_fbx_scan_is_a_named_post_morph_hook(self):
         # Hoisting alone is not enough: the module body runs at load, when a running
         # job's page has no .fbxview at all. The hook is what initialises the one the

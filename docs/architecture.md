@@ -1328,7 +1328,8 @@ GROUP, not the helper, or r160 binds no track and the figure stands still with o
 console warnings). Both the job page and the Media Playground's result column show
 it and the FBX viewer (`_is_bvh`/`_bvh_cell`, `_is_fbx`/`_fbx_cell`, texture from
 `_fbx_tex_url`: the *basecolor* image result, else the first image — the generic
-FBX's own texture path is dead), so `_playground_body` hoists `_FBX_VIEWER_JS` too —
+FBX's own texture path is dead; embedded clips with a duration > 0 play on loop with
+a pause button and, for several, a picker — an FBX without one stays static), so `_playground_body` hoists `_FBX_VIEWER_JS` too —
 import map before the model-viewer module, same reason as `job_detail_page`. Both key
 the BVH viewer on the file EXTENSION and never draw a non-image mime as `<img>`, so
 rows stored with the old fallback label still render. `test_admin_live.py` pins this, plus `data-live`
