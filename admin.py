@@ -8386,13 +8386,17 @@ def _job_result_html(job_id: str, job: Optional[dict]):
         return (f"<h2>Result</h2><p class='bad'>✗ failed · job {_esc(job_id)}</p>"
                 f"<pre class='err'>{_esc(job.get('error'))}</pre>"), None
     cells = []
+    base = f"/ui/playground/result/{_esc(job_id)}/"
+    tex_url = _fbx_tex_url(job.get("results", []), base)
     for r in job.get("results", []):
-        src = f"/ui/playground/result/{_esc(job_id)}/{r['n']}"
-        if _is_bvh(r):
+        src = f"{base}{r['n']}"
+        if _is_bvh(r) or _is_fbx(r):                  # three.js viewers (hoisted module)
             name = r.get("name") or ""
-            cells.append(_bvh_cell(src, name or f"artifact {r['n']}",
-                                   f' download="{_esc(name)}"' if name else " download",
-                                   "width:720px;max-width:100%;height:520px"))
+            label = name or f"artifact {r['n']}"
+            dl = f' download="{_esc(name)}"' if name else " download"
+            box = "width:720px;max-width:100%;height:520px"
+            cells.append(_bvh_cell(src, label, dl, box) if _is_bvh(r)
+                         else _fbx_cell(src, tex_url, label, dl, box))
             continue
         st = None
         if (r.get("mime") or "").lower() == "model/gltf-binary":
@@ -9338,6 +9342,38 @@ def _is_bvh(r: dict) -> bool:
     return os.path.splitext(r.get("name") or r.get("filename") or "")[1].lower() == ".bvh"
 
 
+def _is_fbx(r: dict) -> bool:
+    """A result entry is an FBX (by extension: .fbx is labelled application/octet-stream,
+    so the mime cannot tell it from any other binary)."""
+    return os.path.splitext(r.get("name") or r.get("filename") or "")[1].lower() == ".fbx"
+
+
+def _fbx_tex_url(entries: list, base: str) -> Optional[str]:
+    """The texture for an FBX viewer: the generic (UniRig) FBX carries only a dead
+    temp-path reference, so a sibling image result is applied as the material map —
+    one named *basecolor* if there is one, else the first image."""
+    tex_url = None
+    for r in entries:
+        if (r.get("mime") or "").startswith("image/"):
+            u = f"{base}{r['n']}"
+            if "basecolor" in (r.get("name") or "").lower():
+                return u
+            tex_url = tex_url or u
+    return tex_url
+
+
+def _fbx_cell(src: str, tex_url: Optional[str], label: str, dl: str, box: str) -> str:
+    """FBX viewer + download card. data-live-skip: the server renders this div EMPTY
+    and gwFbxScan fills it client-side (data-init + a three.js canvas). A morph would
+    strip both back out — the attribute is not in the server's markup and the canvas
+    is not in its children — and the viewer would go black with nothing in any log.
+    The page showing it must hoist _FBX_VIEWER_JS."""
+    tex_attr = f' data-tex="{_esc(tex_url)}"' if tex_url else ""
+    return (f'<div><div class="fbxview" data-live-skip data-src="{src}"{tex_attr} '
+            f'style="{box};background:#0c0e12;border:1px solid #313a46;border-radius:10px"></div>'
+            f"<div>{_dl_card(src, label, dl=dl, compact=True)}</div></div>")
+
+
 def _bvh_cell(src: str, label: str, dl: str, box: str) -> str:
     """BVH viewer + download card. The div is rendered EMPTY and filled client-side by
     gwFbxScan's .bvhview half (_FBX_VIEWER_JS), so the page showing it must hoist that
@@ -9363,15 +9399,7 @@ def _job_thumbs(jid: str, kind: str, entries: list) -> str:
     base = f"/ui/job/{_esc(jid)}/input/" if kind == "input" else f"/ui/playground/result/{_esc(jid)}/"
     style = "max-width:260px;max-height:260px;border:1px solid #313a46;border-radius:8px"
     box3d = "width:720px;max-width:100%;height:640px"
-    # a basecolor/texture PNG to feed the FBX viewer (prefer one named *basecolor*)
-    tex_url = None
-    for r in entries:
-        if (r.get("mime") or "").startswith("image/"):
-            u = f"{base}{r['n']}"
-            if "basecolor" in (r.get("name") or "").lower():
-                tex_url = u
-                break
-            tex_url = tex_url or u
+    tex_url = _fbx_tex_url(entries, base)
     cells = ""
     for r in entries:
         src = f"{base}{r['n']}"
@@ -9389,15 +9417,8 @@ def _job_thumbs(jid: str, kind: str, entries: list) -> str:
             stats = _glb_stats_html(st) if kind == "result" else ""
             cells += (f"<div>{_media_tag(src, r.get('mime'), 'file', style=box3d, glb_stats=st)}{stats}"
                       f"<div>{_dl_card(src, label, dl=dl, compact=True)}</div></div>")
-        elif name.lower().endswith(".fbx"):               # FBX → three.js viewer + download
-            tex_attr = f' data-tex="{_esc(tex_url)}"' if tex_url else ""
-            # data-live-skip: the server renders this div EMPTY and gwFbxScan fills it
-            # client-side (data-init + a three.js canvas). A morph would strip both back
-            # out — the attribute is not in the server's markup and the canvas is not in
-            # its children — and the viewer would go black with nothing in any log.
-            cells += (f'<div><div class="fbxview" data-live-skip data-src="{_esc(src)}"{tex_attr} '
-                      f'style="{box3d};background:#0c0e12;border:1px solid #313a46;border-radius:10px"></div>'
-                      f"<div>{_dl_card(src, label, dl=dl, compact=True)}</div></div>")
+        elif _is_fbx(r):                                  # FBX → three.js viewer + download
+            cells += _fbx_cell(src, tex_url, label, dl, box3d)
         elif _is_bvh(r):                                  # BVH → animated skeleton + download
             cells += _bvh_cell(src, label, dl, box3d)
         elif (mk == "file" or m.startswith("text/") or m == "application/json"

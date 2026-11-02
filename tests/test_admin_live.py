@@ -451,9 +451,24 @@ class PlaygroundScriptInvariant(unittest.TestCase):
         # went through _media_tag and came out as a broken <img>.
         html, _ = admin._job_result_html("abc", _DONE_JOB)
         self.assertEqual(html.count('class="bvhview" data-live-skip'), 1)
+        self.assertEqual(html.count('class="fbxview" data-live-skip'), 1)   # rigged.fbx
         self.assertIn("transition_0.bvh", html)
         self.assertNotIn("<img", html)
         self.assertIn("⬇ transition_0.json", html)   # sidecar card named, not "download"
+
+    def test_playground_result_renders_the_fbx_viewer_with_its_texture(self):
+        # Before, an FBX in the playground was a bare download card. The generic (UniRig)
+        # FBX references a dead temp path for its texture, so without data-tex the
+        # viewer shows a grey mesh — the sibling basecolor PNG must be wired in.
+        job = dict(_DONE_JOB, results=[
+            {"n": 0, "mime": "application/octet-stream", "kind": "file", "name": "x_mia.fbx"},
+            {"n": 1, "mime": "image/png", "kind": "image", "name": "x_preview.png"},
+            {"n": 2, "mime": "image/png", "kind": "image", "name": "x_basecolor_0.png"},
+        ])
+        html, _ = admin._job_result_html("abc", job)
+        self.assertEqual(html.count('class="fbxview" data-live-skip'), 1)
+        self.assertIn('data-tex="/ui/playground/result/abc/2"', html)
+        self.assertIn("⬇ x_mia.fbx", html)
 
     def test_playground_result_adds_no_script(self):
         # The column IS the morphed subtree; a viewer script appearing here instead of
