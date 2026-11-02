@@ -276,7 +276,14 @@ glob on the result; plain `output_globs` may accompany cases OR an
 `output_node` as unconditional extras (the node's result stays authoritative:
 an empty node still errors, never an extras-only delivery; globs WITHOUT a
 node are the whole delivery). A relative `/view` path keeps its dirs as the
-subfolder (`_view_params`).
+subfolder (`_view_params`). Two extension tables, on purpose: `_MIME_BY_EXT` is
+both a label AND the set of bare string paths `_view_params` fetches (mirrored by
+the RunPod worker's `ARTIFACT_EXTS`, pinned equal), while `_LABEL_ONLY_EXT`
+(`.bvh`, `.json`) only labels files that already arrive by dict item or glob —
+putting `.json` in the first would start delivering every JSON path a custom node
+reports. An unlabelled extension falls back to `("application/octet-stream",
+"image")`, which is how MotionBricks' `.bvh` + `.json` got drawn as broken `<img>`s
+(`test_admin_live.LiveScriptInvariant.test_motion_extensions_are_files_not_images`).
 The separate sample `mesh-face-retexture_api.json` uses the public
 `GLBFaceRetexture` custom node, not the legacy standalone face workflow:
 `files.input_mesh_path` maps to native `Load3DAdvanced.model_file` (node 1),
@@ -1303,8 +1310,8 @@ POSITIONALLY and a list that gains one row rewrites EVERY row, which is the one
 thing the mechanism exists to avoid. `data-sk` counts as a key for the same reason
 one level up — the dashboard renders three of its four tables conditionally, and an
 unkeyed table node would be reused for a DIFFERENT logical table when a panel comes
-or goes. Never touched: `<script>`, `[data-live-skip]` subtrees (the `.fbxview`
-container, which the server renders EMPTY and the client fills), focused/dirty form
+or goes. Never touched: `<script>`, `[data-live-skip]` subtrees (the `.fbxview` /
+`.bvhview` containers, which the server renders EMPTY and the client fills), focused/dirty form
 controls, media with an unchanged `src`, and `<details open>`.
 **The `<script>` rule cuts both ways, and the second way is the trap**: `adopt()`
 drops a script it would otherwise INSERT, not just leave existing ones alone. So
@@ -1315,7 +1322,12 @@ response, so the poller stops and it cannot self-heal (measured: a finishing job
 invariant every live page owes: **it must already contain every `<script>` any later
 state of it can render** — hoist them (`job_detail_page`, `_playground_body`) and,
 where the script must act on nodes arriving later, register the action in
-`window.gwLiveHooks` (`gwFbxScan`). `test_admin_live.py` pins this, plus `data-live`
+`window.gwLiveHooks` (`gwFbxScan`, which also initialises `.bvhview`: a BVH motion
+clip as an animated `SkeletonHelper` — the `AnimationMixer` must sit on the bone
+GROUP, not the helper, or r160 binds no track and the figure stands still with only
+console warnings). The job gallery keys the BVH viewer on the file EXTENSION and
+never draws a non-image mime as `<img>`, so rows stored with the old fallback label
+still render. `test_admin_live.py` pins this, plus `data-live`
 on `<main>` and that every JS constant parses — all three fail silently. "ES5" here
 is a SYNTAX rule (no arrow functions, let/const, template strings, classes); later
 DOM APIs (fetch, URL, `closest`, `Array.from`, `replaceChildren`) are used freely.

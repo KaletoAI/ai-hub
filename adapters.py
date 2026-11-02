@@ -1989,11 +1989,19 @@ _MIME_BY_EXT = {
     # stored/rendered as an IMAGE.
     ".usdz": ("model/vnd.usdz+zip", "file"), ".3mf": ("model/3mf", "file"),
 }
+# Labels ONLY — deliberately not in _MIME_BY_EXT, which is also the set of bare string
+# paths _view_params fetches (and the RunPod worker's ARTIFACT_EXTS): adding `.json`
+# there would start delivering every JSON path a custom node reports. These files
+# already arrive by dict item or output glob (MotionBricks: a .bvh clip + .json sidecar
+# per variant); without a label they were stored as IMAGES and /ui drew broken <img>s.
+_LABEL_ONLY_EXT = {
+    ".bvh": ("application/octet-stream", "file"), ".json": ("application/json", "file"),
+}
 
 
 def _mime_and_kind(filename: str) -> tuple[str, str]:
-    return _MIME_BY_EXT.get(os.path.splitext(filename)[1].lower(),
-                            ("application/octet-stream", "image"))
+    ext = os.path.splitext(filename)[1].lower()
+    return _MIME_BY_EXT.get(ext) or _LABEL_ONLY_EXT.get(ext, ("application/octet-stream", "image"))
 
 
 def _image_dims(b: bytes) -> Optional[tuple]:

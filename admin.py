@@ -1274,8 +1274,8 @@ def _media_tag(src: str, mime: str = "", kind: str = "", cls: str = "",
         return (head + f'<model-viewer{c} style="{box}" src="{src}" camera-controls auto-rotate '
                 f'shadow-intensity="1" interaction-prompt="none" '
                 f'ar-status="not-presenting"></model-viewer>')
-    if k == "file" or m.startswith("text/") or m == "application/json":
-        return _dl_card(src, cls=cls)
+    if k == "file" or m.startswith("text/") or m == "application/json" or (m and not m.startswith("image/")):
+        return _dl_card(src, cls=cls)   # a non-image mime is never an <img> (old ("octet-stream", "image") rows)
     return f'<img{c}{s} src="{src}">'
 
 
@@ -9253,12 +9253,14 @@ async def jobs_page(request: Request):
 # The scan is a named global and a post-morph hook, because hoisting alone only gets
 # the code onto the page: the module body runs once at load, when a still-running job
 # has no `.fbxview` at all. Each morph that brings one in re-runs gwFbxScan, which
-# picks up exactly the ones not yet initialised.
+# picks up exactly the ones not yet initialised. The same module and scan also drive
+# the `.bvhview` motion preview (MotionBricks clips) — one import map, one hook.
 _FBX_VIEWER_JS = (
     '<script type="importmap">{"imports":{"three":"/ui/static/three/three.module.min.js"}}</script>'
     '<script type="module">'
     "import * as THREE from 'three';"
     "import { FBXLoader } from '/ui/static/three/jsm/loaders/FBXLoader.js';"
+    "import { BVHLoader } from '/ui/static/three/jsm/loaders/BVHLoader.js';"
     "import { OrbitControls } from '/ui/static/three/jsm/controls/OrbitControls.js';"
     "window.gwFbxScan = function(){"
     "document.querySelectorAll('.fbxview:not([data-init])').forEach(function(el){"
@@ -9282,6 +9284,36 @@ _FBX_VIEWER_JS = (
     " },undefined,function(e){ el.innerHTML='<p style=\"padding:14px;color:#e89\">FBX-Vorschau fehlgeschlagen</p>'; });"
     " (function loop(){ requestAnimationFrame(loop); ct.update(); rn.render(sc,cam); })();"
     "});"
+    # BVH (motion clip, no mesh): the skeleton as a SkeletonHelper stick figure playing
+    # its clip on loop over a floor grid, framed on frame 0. Same stage as the FBX one.
+    "document.querySelectorAll('.bvhview:not([data-init])').forEach(function(el){"
+    " el.dataset.init='1';"
+    " var W=el.clientWidth||480,H=el.clientHeight||420;"
+    " var sc=new THREE.Scene(); sc.background=new THREE.Color(0x0c0e12);"
+    " var cam=new THREE.PerspectiveCamera(45,W/H,0.1,1e5);"
+    " var rn=new THREE.WebGLRenderer({antialias:true}); rn.setPixelRatio(devicePixelRatio); rn.setSize(W,H);"
+    " el.appendChild(rn.domElement);"
+    " var ct=new OrbitControls(cam,rn.domElement); ct.enableDamping=true;"
+    " var mixer=null,clock=new THREE.Clock();"
+    " new BVHLoader().load(el.dataset.src,function(r){"
+    "  var root=r.skeleton.bones[0],grp=new THREE.Group(); grp.add(root);"
+    "  var sh=new THREE.SkeletonHelper(root); sc.add(sh); sc.add(grp);"
+    "  mixer=new THREE.AnimationMixer(grp); mixer.clipAction(r.clip).play(); mixer.update(0);"
+    "  grp.updateMatrixWorld(true);"
+    "  var b=new THREE.Box3();"
+    "  r.skeleton.bones.forEach(function(bn){ b.expandByPoint(bn.getWorldPosition(new THREE.Vector3())); });"
+    "  var s=b.getSize(new THREE.Vector3()),ce=b.getCenter(new THREE.Vector3());"
+    "  var md=Math.max(s.x,s.y,s.z)||1;"
+    "  var g=new THREE.GridHelper(md*6,24,0x3a4554,0x232a35); g.position.set(ce.x,b.min.y,ce.z); sc.add(g);"
+    "  cam.position.set(ce.x+md*0.9,ce.y+md*0.35,ce.z+md*1.9); cam.near=md/200; cam.far=md*200; cam.updateProjectionMatrix();"
+    "  ct.target.copy(ce); ct.update();"
+    "  var cap=document.createElement('div');"
+    "  cap.textContent=r.clip.duration.toFixed(2)+' s \\u00b7 '+r.skeleton.bones.length+' bones';"
+    "  cap.style.cssText='position:absolute;left:10px;bottom:8px;font-size:12px;color:#8a96a8';"
+    "  el.style.position='relative'; el.appendChild(cap);"
+    " },undefined,function(e){ el.innerHTML='<p style=\"padding:14px;color:#e89\">BVH-Vorschau fehlgeschlagen</p>'; });"
+    " (function loop(){ requestAnimationFrame(loop); if(mixer){mixer.update(clock.getDelta());} ct.update(); rn.render(sc,cam); })();"
+    "});"
     "};"
     "window.gwFbxScan();"
     "window.gwLiveHooks = window.gwLiveHooks || [];"
@@ -9292,7 +9324,8 @@ _FBX_VIEWER_JS = (
 def _job_thumbs(jid: str, kind: str, entries: list) -> str:
     """Gallery of artifact thumbnails (kind = 'input'|'result'). Images link to the
     full file; video/audio play inline; GLB → <model-viewer>; FBX → a three.js 3D
-    viewer textured with the sibling basecolor PNG; other files → a download card.
+    viewer textured with the sibling basecolor PNG; BVH → an animated three.js
+    skeleton; other files (any non-image mime) → a download card.
 
     Emits no import map and no viewer INIT of its own: the three.js module and its
     import map (_FBX_VIEWER_JS) and the model-viewer module are hoisted by the calling
@@ -9339,7 +9372,18 @@ def _job_thumbs(jid: str, kind: str, entries: list) -> str:
             cells += (f'<div><div class="fbxview" data-live-skip data-src="{_esc(src)}"{tex_attr} '
                       f'style="{box3d};background:#0c0e12;border:1px solid #313a46;border-radius:10px"></div>'
                       f"<div>{_dl_card(src, label, dl=dl, compact=True)}</div></div>")
-        elif mk == "file" or m.startswith("text/") or m == "application/json":
+        elif os.path.splitext(name or r.get("filename") or "")[1].lower() == ".bvh":
+            # BVH → animated skeleton (gwFbxScan's .bvhview half) + download. Keyed on
+            # the extension, not mime/kind: rows stored before .bvh had a mapping carry
+            # ("application/octet-stream", "image") and must still get the viewer.
+            cells += (f'<div><div class="bvhview" data-live-skip data-src="{_esc(src)}" '
+                      f'style="{box3d};background:#0c0e12;border:1px solid #313a46;border-radius:10px"></div>'
+                      f"<div>{_dl_card(src, label, dl=dl, compact=True)}</div></div>")
+        elif (mk == "file" or m.startswith("text/") or m == "application/json"
+              or (m and not m.startswith("image/"))):
+            # Last clause: a non-image mime is never an <img> — the old fallback label
+            # ("application/octet-stream", "image") is how a .json sidecar got drawn
+            # as a broken image.
             cells += _dl_card(src, label, dl=dl, mime=(r.get("mime") or "file"))
         else:
             cells += (f"<a href='{src}' target='_blank'><img src='{src}' style='{style}'></a>")

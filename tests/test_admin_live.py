@@ -243,6 +243,12 @@ _RUNNING_JOB = {
 _DONE_JOB = dict(_RUNNING_JOB, status="done", results=[
     {"n": 0, "mime": "model/gltf-binary", "kind": "file", "name": "mesh.glb"},
     {"n": 1, "mime": "application/octet-stream", "kind": "file", "name": "rigged.fbx"},
+    # A MotionBricks pair as rows stored before .bvh/.json had a mime mapping: the
+    # ("application/octet-stream", "image") fallback label that drew broken <img>s.
+    {"n": 2, "mime": "application/octet-stream", "kind": "image", "filename": "2.bvh",
+     "name": "transition_0.bvh"},
+    {"n": 3, "mime": "application/octet-stream", "kind": "image", "filename": "3.json",
+     "name": "transition_0.json"},
 ])
 
 
@@ -347,6 +353,26 @@ class LiveScriptInvariant(unittest.TestCase):
         html = self._render(_DONE_JOB)
         self.assertIn("<model-viewer", html)
         self.assertIn('class="fbxview"', html)
+        self.assertIn('class="bvhview"', html)
+
+    def test_mislabelled_motion_artifacts_are_not_images(self):
+        # A .bvh/.json stored with the old ("application/octet-stream", "image") label
+        # rendered as a broken <img> — no error anywhere, just an empty icon. The BVH
+        # must get the viewer and the JSON a download card, keyed on the file name.
+        gal = admin._job_thumbs("abc", "result", _DONE_JOB["results"])
+        self.assertNotIn("<img", gal)
+        self.assertIn('class="bvhview" data-live-skip', gal)
+        self.assertIn("transition_0.json", gal)
+
+    def test_motion_extensions_are_files_not_images(self):
+        # The source of the mislabel: an unmapped extension falls back to kind "image".
+        import adapters
+        self.assertEqual(adapters._mime_and_kind("transition_0.bvh")[1], "file")
+        self.assertEqual(adapters._mime_and_kind("transition_0.json"),
+                         ("application/json", "file"))
+        # …without widening what gets FETCHED: a bare string path ending in .json is
+        # still not an artifact (that set is _MIME_BY_EXT, mirrored by the RunPod worker).
+        self.assertIsNone(adapters._view_params("/x/ComfyUI/output/meta.json"))
 
     def test_fbx_scan_is_a_named_post_morph_hook(self):
         # Hoisting alone is not enough: the module body runs at load, when a running
