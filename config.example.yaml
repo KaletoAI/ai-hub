@@ -152,6 +152,9 @@ backends:
   #   api_key: "tgp_v1_…"               # https://api.together.xyz/settings/api-keys
   #   chat_only: true                   # skip image/video/embedding models
   #   serverless_only: true             # skip dedicated-endpoint-only models
+  #   model_pricing: |                  # USD per 1M tokens: glob=input/output[/cache_read
+  #     gpt-5.5=1.25/10                 # [/cache_write]] — beats the listing's prices;
+  #                                     # shown before sending and in /v1/models `pricing`
   #   models_allow: "meta-llama/*, Qwen/*"   # keep only these (globs, comma-separated
   #                                     # or a YAML list); empty/unset = no filter
   #   models_deny: "*-Embed*, *-Vision" # dropped AFTER models_allow — deny wins, so

@@ -158,6 +158,9 @@ _runpod_object_info: Callable[[str], Optional[dict]] = lambda name: None
 _set_backend_enabled = None
 _apply_backends: Callable[[], None] = lambda: None
 _llm_backends: Callable[[], list] = lambda: []
+# Price summary of a catalog id (main.price_info: per field [lo, hi] USD per 1M tokens +
+# `unknown`), None when no enabled backend serves it.
+_price_info: Callable[[str], Optional[dict]] = lambda model: None
 _config_chat_aliases: Callable[[], dict] = lambda: {}
 _apply_chat_aliases: Callable[[], None] = lambda: None
 _playground_key: Callable[[str], Optional[str]] = lambda name: None
@@ -2133,6 +2136,18 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
               "llama-server <code>n_ctx</code> — read through llama-swap for <b>loaded</b> models "
               "only, and remembered). Write a rule for a llama-swap model that is rarely loaded, or "
               "when the server's value is not what clients should use.</p>"
+            + _field("prices per 1M tokens",
+                     _textarea("model_pricing", g("model_pricing"), rows=3,
+                               placeholder="gpt-5.5=1.25/10\nclaude-sonnet-*=3/15/0.30/3.75"))
+            + "<p class='hint'><b>prices per 1M tokens</b>: one "
+              "<code>model-glob=input/output[/cache read[/cache write]]</code> per line, USD per "
+              "million tokens. Shown in the Playground and the alias editor before a request is "
+              "sent, published as <code>pricing</code> in <code>/v1/models</code> (OpenRouter's "
+              "per-token schema) and used for the LLM Calls cost. A rule beats the price list "
+              "discovery reads (OpenRouter, Together, NanoGPT, Venice); write one for a vendor whose "
+              "listing names no prices (OpenAI, Anthropic). Without either, an <b>unpaid</b> backend "
+              "counts as free and a <b>paid</b> one as unknown — never as 0. A cache rate left out "
+              "bills as input.</p>"
             + "</div>"
             + _btype_block("anthropic", cur_type,
                            '<div class="grouphdr">Anthropic</div>'
@@ -3066,6 +3081,12 @@ async def backend_save(request: Request):
             url = ""
     # Every refusal is collected and answered BEFORE the store is touched, with the form
     # shown again as typed (400) — see _refuse_backend below.
+    # A price rule that does not parse would be dropped at read time (a paid model then
+    # shows "unknown") — refused here instead, so a typo never goes unnoticed.
+    for line in str(f.get("model_pricing", "") or "").splitlines():
+        if line.strip() and not line.strip().startswith("#") and not adapters.parse_model_pricing(line):
+            problems.append(f"price rule '{line.strip()}' is not model-glob=input/output"
+                            "[/cache read[/cache write]] (USD per 1M tokens, non-negative)")
     if not name or not (url or mhost):
         problems.insert(0, "name and url are required"
                         + (" — the tunnel URL goes with the managed host; type the backend's "
@@ -3175,6 +3196,11 @@ async def backend_save(request: Request):
         b["model_context"] = mctx               # `glob=tokens` lines; parsed on every read
     else:
         b.pop("model_context", None)
+    mprc = (f.get("model_pricing", "") or "").strip()
+    if mprc:
+        b["model_pricing"] = mprc               # `glob=in/out[/cr[/cw]]` lines; parsed on every read
+    else:
+        b.pop("model_pricing", None)
     # Model whitelist / blacklist (globs, subtract) and the extra-model list (exact ids,
     # add), all applied to the discovered model set of EVERY backend type (a ComfyUI
     # checkpoint list included) — deliberately read here and not in the cloud branch
@@ -5565,10 +5591,87 @@ def _billing_summary(billing: Optional[dict]) -> str:
     return text
 
 
-def _model_datalist(dlid: str, models: list, markers: dict) -> str:
+def _usd_rate(x: float) -> str:
+    """A per-million rate for people: 15.00, 0.60, 0.075 — never an exponent."""
+    if x >= 1:
+        return f"{x:.2f}"
+    if x == 0:
+        return "0"
+    if x < 0.0001:
+        return "<0.0001"
+    whole, frac = f"{x:.4f}".rstrip("0").split(".")
+    return f"{whole}.{frac.ljust(2, '0')}"
+
+
+def _rate_span(span, open_hi: bool = False) -> str:
+    """`$lo` / `$lo–hi`; `open_hi` (a candidate without a price) → `$lo–?`: the call may
+    cost more than any known rate, so no upper bound is claimed."""
+    lo, hi = span
+    if open_hi:
+        return f"${_usd_rate(lo)}–?"
+    return f"${_usd_rate(lo)}" if lo == hi else f"${_usd_rate(lo)}–{_usd_rate(hi)}"
+
+
+def _price_summary(p: Optional[dict]) -> Optional[dict]:
+    """One backend's exact price (or None = unknown) as a one-candidate summary, so the
+    console formats exact prices and alias ranges the same way."""
+    return adapters.summarize_prices([p])
+
+
+def _price_short(summary: Optional[dict]) -> str:
+    """Compact price for a model picker label: `$0.15/$0.60` (input/output per 1M),
+    `free`, ranges for several backends, `price ?` when nothing is known."""
+    if not summary:
+        return ""
+    if "input" not in summary:
+        return "price ?"
+    unk = bool(summary.get("unknown"))
+    if summary["input"][1] == 0 and summary.get("output", [0, 0])[1] == 0 and not unk:
+        return "free"
+    return (f"{_rate_span(summary['input'], unk)}/"
+            f"{_rate_span(summary.get('output', [0.0, 0.0]), unk)}")
+
+
+def _price_long(summary: Optional[dict]) -> str:
+    """The price hint under a model field: every known rate, and who has none."""
+    if not summary:
+        return ""
+    unk = summary.get("unknown") or 0
+    if "input" not in summary:
+        return ("Price unknown — this paid backend lists no prices; add a rule under "
+                "Backends → Models → prices per 1M tokens.")
+    if summary["input"][1] == 0 and summary.get("output", [0, 0])[1] == 0 and not unk:
+        return "Free — unpaid backend(s): no per-token cost."
+    parts = [f"input {_rate_span(summary['input'], bool(unk))}",
+             f"output {_rate_span(summary.get('output', [0.0, 0.0]), bool(unk))}"]
+    for k, lbl in (("cache_read", "cache read"), ("cache_write", "cache write")):
+        if k in summary:
+            parts.append(f"{lbl} {_rate_span(summary[k], bool(unk))}")
+    txt = "Price per 1M tokens: " + " · ".join(parts)
+    if unk:
+        txt += (f" — {unk} backend{'s' if unk > 1 else ''} without a price: "
+                "the call may cost more")
+    return txt
+
+
+def _price_js(summary: Optional[dict]) -> Optional[dict]:
+    """What the page's estimator needs per model: rate spans + the two texts."""
+    if not summary:
+        return None
+    out = {"s": _price_short(summary), "l": _price_long(summary), "u": summary.get("unknown") or 0}
+    for k, short in (("input", "i"), ("output", "o")):
+        if k in summary:
+            out[short] = summary[k]
+    return out
+
+
+def _model_datalist(dlid: str, models: list, markers: dict, prices: Optional[dict] = None) -> str:
     options = []
     for model in models:
         label = model + (" " + markers[model] if markers.get(model) else "")
+        pr = ((prices or {}).get(model) or {}).get("s")
+        if pr:
+            label += " · " + pr
         options.append(f'<option value="{_esc(model)}" label="{_esc(label)}"></option>')
     return f'<datalist id="{_esc(dlid)}">' + "".join(options) + "</datalist>"
 
@@ -5680,6 +5783,31 @@ def _alias_kind_control(kind: str) -> str:
                       "<select ", '<select onchange="amFilter(this.form)" ', 1), short=True)
 
 
+def _backend_prices() -> dict:
+    """{backend name: {model: price js}} — the exact price of each model ON that backend
+    (no alias range: the alias editor picks the model per backend). Same-named backends
+    of different types merge; their model ids differ."""
+    out: dict = {}
+    for b in _llm_backends():
+        dst = out.setdefault(b["name"], {})
+        for m, p in (b.get("prices") or {}).items():
+            pj = _price_js(_price_summary(p))
+            if pj and m not in dst:
+                dst[m] = pj
+    return out
+
+
+def _priced_datalist(dlid: str, models: list, prices: dict) -> str:
+    """A model datalist whose options carry the model's price on that backend."""
+    return _model_datalist(dlid, models, {}, prices)
+
+
+def _price_cell(model: str, prices: dict, cell_id: str) -> str:
+    pj = prices.get(model) or {}
+    return (f"<td class='muted' id='{_esc(cell_id)}' title='{_esc(pj.get('l', ''))}'>"
+            f"{_esc(pj.get('s', ''))}</td>")
+
+
 def _alias_picker_script(datalists: dict) -> str:
     # Generic aliases also serve speech/embedding endpoints. Narrow suggestions,
     # never erase existing mappings when the management filter changes.
@@ -5696,13 +5824,25 @@ def _alias_picker_script(datalists: dict) -> str:
             buckets["all"].add(adapters.CURRENT_MODEL)
     kinds = {name: {kind: sorted(models) for kind, models in buckets.items()}
              for name, buckets in catalogs.items()}
-    return ("<script>var AM_BK=%s,AM_DLS=%s;function amFilter(f){"
+    # AM_PR: per backend the model's price (short label + full text) — on the picker's
+    # options and in the row's price cell, refreshed as a model is typed or picked.
+    return ("<script>var AM_BK=%s,AM_DLS=%s,AM_PR=%s;function amFilter(f){"
             "var kind=f.elements.type.value;"
             "Object.keys(AM_DLS).forEach(function(id){"
             "var bk=f.elements.backend?f.elements.backend.value:AM_DLS[id],"
-            "ms=(AM_BK[bk]||{})[kind]||[],dl=document.getElementById(id);if(!dl)return;"
+            "ms=(AM_BK[bk]||{})[kind]||[],pr=AM_PR[bk]||{},dl=document.getElementById(id);if(!dl)return;"
             "dl.innerHTML='';ms.forEach(function(m){var o=document.createElement('option');"
-            "o.value=m;dl.appendChild(o);});});}</script>") % (_js_json(kinds), _js_json(datalists))
+            "o.value=m;o.label=m+(pr[m]?' \\u00b7 '+pr[m].s:'');dl.appendChild(o);});});"
+            "amPriceAll(f);}"
+            "function amPrice(inp,bk,cell){var c=document.getElementById(cell);if(!c)return;"
+            "var p=(AM_PR[bk]||{})[inp.value];"
+            "c.textContent=p?(c.hasAttribute('data-long')?p.l:p.s):'';c.title=p?p.l:'';}"
+            "function amPriceAll(f){if(!f||!f.querySelectorAll)return;"
+            "var els=f.querySelectorAll('[data-am-cell]');"
+            "for(var i=0;i<els.length;i++){var e=els[i],bk=e.getAttribute('data-am-bk')"
+            "||(f.elements.backend?f.elements.backend.value:'');"
+            "amPrice(e,bk,e.getAttribute('data-am-cell'));}}"
+            "</script>") % (_js_json(kinds), _js_json(datalists), _js_json(_backend_prices()))
 
 
 
@@ -5716,6 +5856,11 @@ def _chat_new_form(vals: Optional[dict] = None, err: str = "") -> str:
     backend = v.get("backend") or next(iter(bk_models), "")
     all_models = bk_models.get(backend, [])
     bopts = [b["name"] for b in llm] or [("", "(no LLM backends)")]
+    prices = _backend_prices().get(backend, {})
+    pj = prices.get(v.get("model", "")) or {}
+    model_inp = _dl_input("model", v.get("model", ""), "cm_all").replace(
+        "<input ", '<input data-am-cell="cm_price" oninput="amPriceAll(this.form)" '
+                   'onchange="amPriceAll(this.form)" ', 1)
     return ('<form action="/ui/chat/create" method="post" data-guard>'
             f'<div class="formbar"><h2>New Chat Alias</h2>{_btn("Create", submit=True)}'
             f'{_btn("Cancel", "/ui/aliases", "secondary")}</div>'
@@ -5724,10 +5869,11 @@ def _chat_new_form(vals: Optional[dict] = None, err: str = "") -> str:
             + _alias_kind_control(kind)
             + _field("backend", _select("backend", bopts, backend).replace(
                 "<select ", '<select onchange="amFilter(this.form)" ', 1), short=True)
-            + _field("model", _dl_input("model", v.get("model", ""), "cm_all"), short=True)
+            + _field("model", model_inp, short=True)
+            + f"<p class='hint' id='cm_price' data-long>{_esc(pj.get('l', ''))}</p>"
             + "<p class='hint'>Pick a first backend + model. Assign more backends after "
               "creating.</p>"
-            + "</form>" + _datalist("cm_all", all_models) + _alias_picker_script({"cm_all": ""}))
+            + "</form>" + _priced_datalist("cm_all", all_models, prices) + _alias_picker_script({"cm_all": ""}))
 
 
 def _chat_editor(alias: str, raw: Optional[dict] = None, err: str = "") -> str:
@@ -5748,6 +5894,7 @@ def _chat_editor(alias: str, raw: Optional[dict] = None, err: str = "") -> str:
     kind = (r.get("type") if r.get("type") in (*_ALIAS_MODEL_KINDS, "all")
             else next(iter(alias_types)) if len(alias_types) == 1 else "all" if alias_types else "chat")
     picker_models = _backend_picker_models(kind, current=True, anthropic=True, literal=True)
+    all_prices = _backend_prices()
     datalists = {}
     rows, dls = "", ""
     for i, (bn, entry) in enumerate(assigned.items()):
@@ -5758,11 +5905,15 @@ def _chat_editor(alias: str, raw: Optional[dict] = None, err: str = "") -> str:
         rm = (_btn("✕", f"/ui/chat/bdel?alias={_q(alias)}&backend={_q(bn)}", "danger",
                    sm=True, icon=True, title="Remove this backend")
               if len(assigned) > 1 else "<span class='muted' title='alias needs ≥1 backend'>—</span>")
-        rows += (f"<tr><td>{head}</td><td>{_dl_input('model__' + bn, model, dlid)}</td>"
-                 f"<td class='acts'>{rm}</td></tr>")
-        dls += _datalist(dlid, picker_models.get(bn, []))
+        inp = _dl_input('model__' + bn, model, dlid).replace(
+            "<input ", f'<input data-am-cell="{dlid}_p" data-am-bk="{_esc(bn)}" '
+                       'oninput="amPriceAll(this.form)" onchange="amPriceAll(this.form)" ', 1)
+        rows += (f"<tr><td>{head}</td><td>{inp}</td>"
+                 + _price_cell(model, all_prices.get(bn, {}), f"{dlid}_p")
+                 + f"<td class='acts'>{rm}</td></tr>")
+        dls += _priced_datalist(dlid, picker_models.get(bn, []), all_prices.get(bn, {}))
         datalists[dlid] = bn
-    rows = rows or "<tr><td colspan=3 class='muted'>no backends — add one below</td></tr>"
+    rows = rows or "<tr><td colspan=4 class='muted'>no backends — add one below</td></tr>"
     add_opts = [b["name"] for b in llm if b["name"] not in assigned]
     add_sel = ""
     if add_opts:
@@ -5830,7 +5981,9 @@ def _chat_editor(alias: str, raw: Optional[dict] = None, err: str = "") -> str:
             + _alias_kind_control(kind)
             + "<p class='hint'>Assign backends to this alias and pick the model on each. A call "
               "takes the fastest free unpaid one of them, with failover.</p>"
-            + f"<table class='pins'><tr><th>backend</th><th>model</th><th></th></tr>{rows}</table>"
+            + f"<table class='pins'><tr><th>backend</th><th>model</th>"
+              f"<th title='USD per 1M tokens, input/output, on that backend'>price /1M</th>"
+              f"<th></th></tr>{rows}</table>"
             + add_sel
             + "</form>" + dls + _alias_picker_script(datalists))
 
@@ -6046,6 +6199,30 @@ _CHATPLAY_JS = ("<script>function cpSending(f){"
                 "return true;}</script>")
 
 
+# The price hint under the model field + a per-request estimate before Send: prompt
+# tokens ≈ characters / 4 (a rough rule — the backend's tokenizer decides the bill; the
+# text says "≈"), output priced up to `max tokens` when set, else quoted per 1M. A
+# range when the call can land on backends with different prices (an alias). ES5.
+_CP_PRICE_JS = (
+    "function cpUsd(x){return x===0?'0':x<0.0001?'<0.0001':x<1?String(+x.toPrecision(2)):x.toFixed(2);}"
+    "function cpSpan(a,n){var lo=a[0]*n/1e6,hi=a[1]*n/1e6;"
+    "return '$'+(lo===hi?cpUsd(lo):cpUsd(lo)+'\u2013'+cpUsd(hi));}"
+    "function cpUpdatePrice(){var f=document.querySelector('form[action=\"/ui/chatplay/send\"]'),"
+    "out=document.getElementById('cpprice'),e=f&&f.elements;"
+    "if(!out||!e||!e.model||!e.backend)return;"
+    "function val(n){return (e[n]&&e[n].value)||'';}"
+    "var bk=e.backend.value,prs=(bk&&CP_PR_BK[bk])?CP_PR_BK[bk]:CP_PR_ALL,"
+    "p=prs[e.model.value];if(!e.model.value||!p){out.textContent='';return;}"
+    "var chars=val('system').length+val('user').length,"
+    "tin=Math.ceil(chars/4),mt=parseInt(val('max_tokens'),10);"
+    "var txt=p.l;if(tin>0&&p.i&&p.o&&!(p.i[1]===0&&p.o[1]===0)){"
+    "txt+=' \u2014 this request \u2248 '+cpSpan(p.i,tin)+' input (\u2248'+tin+' tokens)';"
+    "txt+=mt>0?' + up to '+cpSpan(p.o,mt)+' output ('+mt+' max tokens)'"
+    ":' + output at '+cpSpan(p.o,1e6)+' per 1M (set max tokens for a cap)';"
+    "if(p.u)txt+=' \u2014 not counting the backend(s) without a price';}"
+    "out.textContent=txt;}")
+
+
 def _chatplay_form(vals: dict) -> str:
     v = lambda k: vals.get(k, "")
     llm = [b for b in _llm_backends() if b.get("type") != "anthropic"]
@@ -6068,20 +6245,28 @@ def _chatplay_form(vals: dict) -> str:
                   for n in bk_models}
     selected_billing = (_billing_description(init_markers.get(v("model"), bk_default.get(cur_bk, "")))
                         if v("model") else "")
+    # Prices per picker entry: with a backend picked the call goes to `<backend>/<model>`
+    # (chatplay_send), so that is the id priced; otherwise the id as typed, over every
+    # backend it can run on (an alias → a range).
+    all_prices = {m: pj for m in all_models if (pj := _price_js(_price_info(m)))}
+    bk_prices = {bk: {m: pj for m in ms if (pj := _price_js(_price_info(f"{bk}/{m}")))}
+                 for bk, ms in bk_models.items()}
+    init_prices = bk_prices[cur_bk] if cur_bk in bk_prices else all_prices
+    sel_price = init_prices.get(v("model")) if v("model") else None
     # Backend picker (manual, so it can filter the model datalist on change without a reload).
     opts = f'<option value=""{"" if cur_bk else " selected"}>— all backends (scheduler picks) —</option>'
     for n in bk_models:
         opts += f'<option{" selected" if n == cur_bk else ""}>{_esc(n)}</option>'
     bk_select = f'<select name="backend" onchange="cpFilterModels(this.value)">{opts}</select>'
     filt_js = ("<script>var CP_BK=%s,CP_ALL=%s,CP_BILL_BK=%s,CP_BILL_ALL=%s,CP_BILL_TEXT=%s,"
-               "CP_BILL_DEF=%s;"
+               "CP_BILL_DEF=%s,CP_PR_BK=%s,CP_PR_ALL=%s;" + _CP_PRICE_JS +
                "function cpUpdateBilling(){"
                "var model=document.querySelector('form[action=\"/ui/chatplay/send\"] [name=\"model\"]'),"
                "backend=document.querySelector('form[action=\"/ui/chatplay/send\"] [name=\"backend\"]'),"
                "out=document.getElementById('cpbilling');if(!model||!backend||!out)return;"
                "var marks=backend.value&&CP_BILL_BK[backend.value]?CP_BILL_BK[backend.value]:CP_BILL_ALL;"
                "var mark=Object.prototype.hasOwnProperty.call(marks,model.value)?marks[model.value]:(backend.value&&CP_BILL_DEF[backend.value])||'';"
-               "out.textContent=model.value?(CP_BILL_TEXT[mark]||''):'';}"
+               "out.textContent=model.value?(CP_BILL_TEXT[mark]||''):'';cpUpdatePrice();}"
                "function cpFilterModels(bk){"
                "var dl=document.getElementById('cpmodels');if(!dl)return;"
                "var ms=(bk&&CP_BK[bk])?CP_BK[bk]:CP_ALL,"
@@ -6089,21 +6274,27 @@ def _chatplay_form(vals: dict) -> str:
                "var input=document.querySelector('form[action=\"/ui/chatplay/send\"] [name=\"model\"]');"
                "if(input&&ms.indexOf(input.value)<0)input.value='';"
                "dl.innerHTML='';ms.forEach(function(m){var o=document.createElement('option');o.value=m;"
-               "o.label=m+(marks[m]?' '+marks[m]:'');dl.appendChild(o);});cpUpdateBilling();}"
+               "var prs=(bk&&CP_PR_BK[bk])?CP_PR_BK[bk]:CP_PR_ALL;"
+               "o.label=m+(marks[m]?' '+marks[m]:'')+(prs[m]?' \\u00b7 '+prs[m].s:'');dl.appendChild(o);});"
+               "cpUpdateBilling();}cpUpdatePrice();"
                "</script>") % (
                    _js_json(bk_models), _js_json(all_models), _js_json(bk_markers), _js_json(all_markers),
                    _js_json({m: _billing_description(m) for m in ("[C]", "[I]", "[?]", "[mixed]")}),
-                   _js_json(bk_default))
+                   _js_json(bk_default), _js_json(bk_prices), _js_json(all_prices))
     return ('<form action="/ui/chatplay/send" method="post" onsubmit="return cpSending(this)">'
             f'<div class="formbar"><h2>Chat Playground</h2>{_btn("Send", submit=True)}</div>'
             + _field("backend", bk_select, short=True)
             + _field("model", _dl_input("model", v("model"), "cpmodels", "alias or model id").replace(
                 '<input ', '<input oninput="cpUpdateBilling()" onchange="cpUpdateBilling()" ', 1), short=True)
             + f'<p class="hint"><span id="cpbilling">{_esc(selected_billing)}</span></p>'
+            + f'<p class="hint" id="cpprice">{_esc((sel_price or {}).get("l", ""))}</p>'
             + (_BILLING_LEGEND if any(_backend_billing(b) is not None for b in llm) else "")
-            + _field("system", _textarea("system", v("system"), 2, "optional system prompt"))
-            + _field("message", _textarea("user", v("user"), 6, "your message"))
-            + _field("max tokens", _inp("max_tokens", v("max_tokens"), typ="number"), short=True)
+            + _field("system", _textarea("system", v("system"), 2, "optional system prompt").replace(
+                "<textarea ", '<textarea oninput="cpUpdatePrice()" ', 1))
+            + _field("message", _textarea("user", v("user"), 6, "your message").replace(
+                "<textarea ", '<textarea oninput="cpUpdatePrice()" ', 1))
+            + _field("max tokens", _inp("max_tokens", v("max_tokens"), typ="number").replace(
+                "<input ", '<input oninput="cpUpdatePrice()" ', 1), short=True)
             + _field("temperature", _inp("temperature", v("temperature"), typ="number"), short=True)
             + _field("reasoning", "<select name='reasoning'>" + "".join(
                 f'<option value="{x}"{" selected" if (v("reasoning") or "auto") == x else ""}>{x}</option>'
@@ -6113,7 +6304,8 @@ def _chatplay_form(vals: dict) -> str:
               "<b>reasoning</b> sends the API's thinking switch (applied via the "
               "<a href='/ui/reasoning'>Reasoning</a> rules; auto = model default — an alias's own "
               "default applies only when calling the alias, not a backend/model form).</p>"
-            + "</form>" + _model_datalist("cpmodels", init_models, init_markers) + filt_js + _CHATPLAY_JS)
+            + "</form>" + _model_datalist("cpmodels", init_models, init_markers, init_prices)
+            + filt_js + _CHATPLAY_JS)
 
 
 def _chatplay_body(vals: dict, result_html: str) -> str:

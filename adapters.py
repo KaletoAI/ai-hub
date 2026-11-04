@@ -291,6 +291,98 @@ def model_context_for(backend: dict, model: str, learned: dict) -> Optional[int]
     return int(v) if isinstance(v, (int, float)) and v > 0 else None
 
 
+PRICE_FIELDS = ("input", "output", "cache_read", "cache_write")
+
+
+def parse_model_pricing(text) -> list[tuple[str, dict[str, float]]]:
+    """The backend's `model_pricing` rules: one `glob=input/output[/cache_read[/cache_write]]`
+    per line, USD per MILLION tokens (blank lines and `#` comments skipped). A line that
+    does not parse is DROPPED, not fatal — a typo must not take the backend's other
+    rules with it, and must never become a 0 that reads as "free". An omitted cache
+    rate stays absent ("billed as input", see normalize_pricing), never 0. Order is
+    kept: the first matching rule wins in model_price_for()."""
+    rules: list[tuple[str, dict[str, float]]] = []
+    for line in str(text or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        pat, _, rest = line.partition("=")
+        pat, parts = pat.strip(), [p.strip() for p in rest.split("/")]
+        if not pat or not 2 <= len(parts) <= 4:
+            continue
+        try:
+            nums = [float(p) for p in parts]
+        except ValueError:
+            continue
+        if not all(math.isfinite(n) and n >= 0 for n in nums):
+            continue
+        rules.append((pat, dict(zip(PRICE_FIELDS, nums))))
+    return rules
+
+
+def model_price_for(backend: dict, model: str, learned: dict) -> Optional[dict[str, float]]:
+    """USD per million tokens for `model` on `backend`, or None = unknown.
+
+    The admin's `model_pricing` rule (first glob match) beats the discovered price list —
+    the rule exists for the vendor whose /v1/models names no prices (OpenAI, Anthropic)
+    and for the operator who knows better than a listing. An UNPAID backend without
+    either is free: local hardware or a flat subscription bills nothing per call. A
+    PAID backend without a price is unknown — never shown or published as 0, since a
+    client that budgets by it would read "free" for a call that bills."""
+    for pat, price in parse_model_pricing(backend.get("model_pricing")):
+        if fnmatch.fnmatchcase(model, pat):
+            return dict(price)
+    p = (learned or {}).get(model)
+    if isinstance(p, dict) and ("input" in p or "output" in p):
+        return {k: float(p[k]) for k in PRICE_FIELDS if isinstance(p.get(k), (int, float))}
+    if not backend.get("paid"):
+        return {"input": 0.0, "output": 0.0}
+    return None
+
+
+def summarize_prices(prices) -> Optional[dict]:
+    """One figure for a catalog entry SEVERAL backends may serve (an alias, a bare local
+    id): per field the cheapest and the dearest known rate, `[lo, hi]`, plus `unknown` =
+    how many candidates have no price. None when there are no candidates at all. A cache
+    rate a candidate does not list counts at that candidate's input rate (how it bills)."""
+    prices = list(prices)
+    if not prices:
+        return None
+    known = [p for p in prices if p is not None]
+    out: dict = {"unknown": len(prices) - len(known)}
+    for k in PRICE_FIELDS:
+        vals = [p.get(k, p.get("input", 0.0)) if k.startswith("cache") else p.get(k, 0.0)
+                for p in known]
+        if vals and (not k.startswith("cache") or any(k in p for p in known)):
+            out[k] = [min(vals), max(vals)]
+    return out
+
+
+def _per_token(usd_per_million: float) -> str:
+    """A per-token USD string the way OpenRouter writes it ("0.00000015", never
+    "1.5e-07" — some parsers are naive about exponents)."""
+    s = f"{usd_per_million / 1_000_000:.12f}".rstrip("0").rstrip(".")
+    return s or "0"
+
+
+def openrouter_pricing(summary: Optional[dict]) -> Optional[dict[str, str]]:
+    """The `/v1/models` `pricing` object in OpenRouter's schema (per-token strings:
+    prompt / completion / input_cache_read / input_cache_write) — the shape clients
+    already read from OpenRouter's catalog (Oh My Pi, LiteLLM, OpenCode), and the one
+    normalize_pricing reads back, so a gateway chained behind this one learns the same
+    numbers. From a summarize_prices() summary it publishes the DEAREST rate: the client
+    cannot pick the backend. None (omit the field) when any candidate is unknown — a
+    lower bound published as the price is the error that costs money."""
+    if not summary or summary.get("unknown") or "input" not in summary:
+        return None
+    out = {"prompt": _per_token(summary["input"][1]),
+           "completion": _per_token(summary.get("output", [0.0, 0.0])[1])}
+    for key, src in (("input_cache_read", "cache_read"), ("input_cache_write", "cache_write")):
+        if src in summary:
+            out[key] = _per_token(summary[src][1])
+    return out
+
+
 def parse_model_filter(value) -> list[str]:
     """The backend's `models_allow` / `models_deny` patterns: a comma-separated string
     OR an already-parsed list (config.yaml may write either). Entries are trimmed and

@@ -2795,6 +2795,21 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   `backend_models`). A bare id or alias publishes the MINIMUM over its backends.
   Unknown = absent, never 0. Clients that find none assume a default (Oh My Pi 128k)
   and their over-long prompts 400 at the backend — `test_context_length.py`.
+- **Prices before a request** (`main.model_price` → `adapters.model_price_for`): the
+  backend's `model_pricing` `glob=in/out[/cache_read[/cache_write]]` rules (USD per 1M)
+  first, then the discovered `backend_pricing`, then 0 on an UNPAID backend; a paid
+  backend without either is None = unknown, never 0 (a client budgeting by "free" is the
+  silent failure). `main.price_info` resolves a catalog id to its (backend, real model)
+  pairs like the context figure does and summarizes them (`adapters.summarize_prices`:
+  per field `[lo, hi]` + `unknown`). `/v1/models` publishes `pricing` in OpenRouter's
+  per-token string schema (`adapters.openrouter_pricing`, no exponents — normalize_pricing
+  reads it back) at the DEAREST candidate, and omits it when any candidate is unknown.
+  `_cost_usd` books through `model_price` too, so a rule prices LLM Calls as well. The
+  console shows `llm_backends_info()["prices"]` per backend (alias editor) and
+  `price_info` per picker id (Chat Playground, plus a chars/4 request estimate in JS);
+  an unknown candidate renders the upper bound open (`$0–?`). A rule line that does not
+  parse is refused on backend save (it would otherwise silently drop to "unknown") —
+  `test_model_pricing.py`.
 - **Per-backend model allow/deny** (`models_allow` / `models_deny`, comma-separated
   globs): `adapters.filter_models` narrows what discovery found — allow first (empty =
   keep all), then deny removes from the rest, so DENY WINS and "`gpt-*` except
@@ -3208,6 +3223,11 @@ client that finds none does not error, it ASSUMES one — Oh My Pi 128k — and 
 the llama-swap enrichment asking `/upstream/<model>/v1/models` for LOADED models only —
 asking an unloaded one would load it — the merge that keeps what this poll did not see,
 and the MINIMUM a bare id or alias publishes over its backends).
+`test_model_pricing.py` (prices before a request: a price is plausible either way, so
+the precedence rule > discovery > unpaid 0 > unknown, the alias publishing its DEAREST
+backend, `pricing` absent when any candidate is unknown, the per-token strings without
+exponents that normalize_pricing reads back, LLM Calls booking through the rule, and the
+console labels — an unpriced candidate leaves the upper bound open, never "free").
 `test_netscan.py` (the LAN scan: a wrong range silently scans nothing or a whole
 site, a misclassified server pre-fills a backend the gateway cannot discover, a
 "known" match that misses re-offers every backend already there, and a scan that

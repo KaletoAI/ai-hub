@@ -881,6 +881,45 @@ def _with_context(entry: dict, ctx: Optional[int]) -> dict:
     return entry
 
 
+def model_price(backend: dict, model: str) -> Optional[dict]:
+    """USD per million tokens of `model` on `backend` — admin rule first, discovered price
+    list second, 0 on an unpaid backend, None = unknown (see adapters.model_price_for)."""
+    return adapters.model_price_for(backend, model, backend_pricing.get(backend_id(backend), {}))
+
+
+def _price_pairs(model_id: str, pool: list) -> list:
+    """The (backend, real model) pairs a catalog id can run on — the same resolution the
+    catalog's context figure uses: an alias over every backend it maps to, a
+    `backend/model` id on that backend (an alias pinned there resolves first), a bare id
+    on every backend that lists it."""
+    bname, bare = split_backend_prefix(model_id)
+    if bname is not None:
+        pool = [b for b in pool if b["name"] == bname]
+        model_id = bare
+    pairs = []
+    for b in pool:
+        real = resolve_for_backend(model_id, b["name"]) if model_id in virtual_models else model_id
+        if real is not None and (real in _llm_models(b) or _is_current(b, real)):
+            pairs.append((b, real))
+    return pairs
+
+
+def price_info(model_id: str) -> Optional[dict]:
+    """Price summary (adapters.summarize_prices: per field `[lo, hi]` USD per million
+    tokens + `unknown`) for a catalog id over the enabled LLM backends that can serve it
+    now; None when none can. Feeds `/v1/models` and the console's price hints."""
+    pool = [b for b in enabled_backends() if _is_llm(b) and not is_draining(b)]
+    return adapters.summarize_prices(model_price(b, m) for b, m in _price_pairs(model_id, pool))
+
+
+def _with_pricing(entry: dict, model_id: str) -> dict:
+    """Attach OpenRouter-style `pricing` only when every candidate's price is known."""
+    pr = adapters.openrouter_pricing(price_info(model_id))
+    if pr:
+        entry["pricing"] = pr
+    return entry
+
+
 async def _persist_discovery(label: str, save, *args) -> None:
     """Store what a poll learned (models, context windows) — bookkeeping that must never
     fail the POLL: inside refresh_backend's try, a locked store.db marked a backend that
@@ -2497,15 +2536,20 @@ def delete_voice_ref(name: str) -> None:
 
 def _cost_usd(bid: str, model_id: Optional[str], in_tok: int, out_tok: int,
               cache_read: int = 0, cache_write: int = 0) -> float:
-    """USD cost for a call from cached pricing (Together-style /v1/models), keyed by
-    the backend id (`type:name`, same as `backend_pricing`). 0 if unknown.
+    """USD cost for a call from the backend's price (`model_price`: a `model_pricing`
+    rule, else the discovered list), keyed by the backend id (`type:name`, same as
+    `backend_pricing`). 0 if unknown.
 
     `cache_read`/`cache_write` are SUBSETS of `in_tok`; each is priced at its own
     rate where the backend lists one, else as input. Clamped so a backend reporting
     more cached than prompt tokens never books a credit."""
     if not model_id:
         return 0.0
-    p = backend_pricing.get(bid, {}).get(model_id, {})
+    # The same price the catalog and the console show — an admin `model_pricing` rule
+    # included — so what a client budgets by is what LLM Calls books.
+    b = next((x for x in backends if backend_id(x) == bid), None)
+    p = (model_price(b, model_id) if b is not None
+         else backend_pricing.get(bid, {}).get(model_id)) or {}
     inp = p.get("input", 0.0)
     total = max(in_tok or 0, 0)
     read = min(max(cache_read or 0, 0), total)
@@ -2985,32 +3029,33 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
             if (_matches_model_type(kinds, typ) and disp not in seen
                     and disp not in chat_aliases and visible({disp, mid, bname})):
                 seen.add(disp)
-                data.append(_with_context(
+                data.append(_with_pricing(_with_context(
                     {"id": disp, "object": "model", "created": now, "owned_by": bname},
-                    model_context(backend, (resolve_for_backend(mid, bname) or mid) if model_prefix else mid)))
+                    model_context(backend, (resolve_for_backend(mid, bname) or mid) if model_prefix else mid)),
+                    disp))
             # A bare local ID still carries the smallest context across its hosts.
             if (expose_bare and mid not in seen and mid not in chat_aliases
                     and _matches_model_type(_backend_model_types(backend, mid), typ)
                     and visible({mid, bname})):
                 seen.add(mid)
-                data.append(_with_context(
+                data.append(_with_pricing(_with_context(
                     {"id": mid, "object": "model", "created": now, "owned_by": bname},
-                    _context_min((b2, mid) for b2 in offered if mid in _llm_models(b2))))
+                    _context_min((b2, mid) for b2 in offered if mid in _llm_models(b2))), mid))
         cur = f"{bname}/{adapters.CURRENT_MODEL}"
         if (_matches_model_type(_callable_model_types(backend, adapters.CURRENT_MODEL), typ)
                 and _is_current(backend, adapters.CURRENT_MODEL)
                 and cur not in seen and cur not in chat_aliases and visible({cur, bname})):
             seen.add(cur)
-            data.append({"id": cur, "object": "model", "created": now, "owned_by": bname})
+            data.append(_with_pricing({"id": cur, "object": "model", "created": now, "owned_by": bname}, cur))
     # Virtual aliases keep their grants and context calculation; their type is the
     # union of actual backend targets, not the alias name or merely its first target.
     for alias in virtual_models:
         if (_matches_model_type(_chat_alias_types(alias), typ)
                 and alias not in seen and visible({alias})):
             seen.add(alias)
-            data.append(_with_context(
+            data.append(_with_pricing(_with_context(
                 {"id": alias, "object": "model", "created": now, "owned_by": "ai-hub (virtual)"},
-                _alias_context(alias, offered)))
+                _alias_context(alias, offered)), alias))
     for alias, cands in img_aliases.items():
         kinds = set().union(*(generation_types(cand) for cand in cands)) if cands else {"image"}
         if not _matches_model_type(kinds, typ):
@@ -3049,23 +3094,25 @@ async def get_model(model_id: str, authorization: Optional[str] = Header(None),
     now = int(time.time())
     llm = [b for b in enabled_backends() if _is_llm(b)]
     if model_id in virtual_models:
-        return _with_context(
+        return _with_pricing(_with_context(
             {"id": model_id, "object": "model", "created": now, "owned_by": "ai-hub (virtual)"},
-            _alias_context(model_id, llm))
+            _alias_context(model_id, llm)), model_id)
     bname, bare = split_backend_prefix(model_id)
     if bname is not None:
         b = next((b for b in llm if b["name"] == bname), None)
         if b is not None and bare in _llm_models(b):
-            return _with_context({"id": model_id, "object": "model", "created": now, "owned_by": bname},
-                                 model_context(b, bare))
+            return _with_pricing(_with_context(
+                {"id": model_id, "object": "model", "created": now, "owned_by": bname},
+                model_context(b, bare)), model_id)
         if b is not None and _is_current(b, bare):
-            return {"id": model_id, "object": "model", "created": now, "owned_by": bname}
+            return _with_pricing({"id": model_id, "object": "model", "created": now, "owned_by": bname},
+                                 model_id)
     else:
         hosts = [b for b in llm if model_id in _llm_models(b)]
         if hosts:      # a bare id routes across every host → the smallest window, as in the listing
-            return _with_context(
+            return _with_pricing(_with_context(
                 {"id": model_id, "object": "model", "created": now, "owned_by": hosts[0]["name"]},
-                _context_min((b, model_id) for b in hosts))
+                _context_min((b, model_id) for b in hosts)), model_id)
     routes = await asyncio.to_thread(get_gen_routes, model_id)
     if routes:
         return {"id": model_id, "object": "model", "created": now, "owned_by": routes[0][0]["name"]}
@@ -6054,6 +6101,7 @@ def gateway_info() -> dict:
             "concurrency_group": b.get("concurrency_group"),
             "max_image_pixels": b.get("max_image_pixels"),
             "model_context": b.get("model_context"),
+            "model_pricing": b.get("model_pricing"),
             "chat_only": bool(b.get("chat_only")), "serverless_only": bool(b.get("serverless_only")),
             "local": bool(b.get("local")), "paid": bool(b.get("paid")),
             "api_key_set": bool(b.get("api_key")),      # the key itself never leaves main
@@ -9081,6 +9129,9 @@ def llm_backends_info() -> list[dict]:
                                      for mid in sorted(_llm_models(b) | (
                                          {adapters.CURRENT_MODEL} if _is_current(b, adapters.CURRENT_MODEL) else set()))},
              "billing": _billing_info(b),
+             "paid": bool(b.get("paid")),
+             # USD per million tokens per model; None = unknown (paid, no list, no rule)
+             "prices": {mid: model_price(b, mid) for mid in sorted(_llm_models(b))},
              # `/running` answers → the alias editor also offers `current` here
              "current": _is_current(b, adapters.CURRENT_MODEL)}
             for b in backends if _is_llm(b)]
@@ -9099,6 +9150,7 @@ admin.bind(runpod_probe=runpod_probe, runpod_object_info=runpod_object_info,
            job_progress=lambda job_id: gen_progress.get(job_id),
            apply_backends=apply_backend_change,
            llm_backends=llm_backends_info,
+           price_info=price_info,
            config_chat_aliases=lambda: dict(config_virtual_models),
            apply_chat_aliases=apply_chat_aliases,
            playground_key=_playground_key,

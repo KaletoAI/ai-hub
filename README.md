@@ -448,6 +448,46 @@ window among them — the client cannot pick the backend. Unknown stays absent,
 never `0`. The **Input & Routing → LLM models** tab shows the value on each
 backend chip (`ctx 32k`), so "why does my client think 128k?" is answerable there.
 
+### Prices before you send (`pricing` in `/v1/models`)
+
+Every LLM model has a price per million tokens the gateway knows before a request is
+sent, from three sources in this order:
+
+1. **`model_pricing`** on the backend (Backends tab → *Models* → *prices per 1M tokens*,
+   or config): one `model-glob=input/output[/cache read[/cache write]]` per line, USD
+   per million tokens, first match wins. Use it for a vendor whose listing names no
+   prices (OpenAI, Anthropic) or to correct a listing. A cache rate left out bills as
+   input. A line that does not parse is refused on save.
+   ```yaml
+   model_pricing: |
+     gpt-5.5=1.25/10
+     claude-sonnet-*=3/15/0.30/3.75
+   ```
+2. **Discovery** — the listing's own prices: OpenRouter, Together, NanoGPT, Venice.
+3. **Unpaid backend** (no `paid`) — free: local hardware or a flat subscription bills
+   nothing per call. A **paid** backend without a price is *unknown*, never `0`.
+
+Where it shows:
+
+- **`/v1/models`** and `GET /v1/models/{id}`: `pricing` in OpenRouter's schema —
+  per-token USD strings `prompt` / `completion` / `input_cache_read` /
+  `input_cache_write`, the shape clients already read from OpenRouter's catalog (Oh My
+  Pi, LiteLLM, OpenCode). A chat alias or a bare id several backends serve publishes
+  its **dearest** backend's rate (the client cannot pick the backend); when any of them
+  is unknown the field is **absent**.
+- **Chat Playground**: the model picker lists each model's price (`$in/$out` per 1M,
+  `free`, a range for an alias, `$0–?` when a backend has no price), and the hint under
+  the model shows every rate plus an estimate for the request as typed — prompt
+  tokens ≈ characters ÷ 4, output up to *max tokens* (rough: the backend's tokenizer
+  decides the bill).
+- **Aliases → chat alias editor / new alias**: the model picker of each backend lists
+  that backend's price, and a *price /1M* column shows the picked model's.
+- **LLM Calls** costs use the same price (a backend-reported cost such as OpenRouter's
+  `usage.cost` still wins), so what a client budgets by is what gets booked.
+
+Media generation (ComfyUI, cloud 3D, image/video catalogs) is not token-priced and is
+not covered here.
+
 ### Scan network (find backends on the LAN)
 
 Backends tab → **Scan network** sweeps this host's own subnet(s) for servers the
@@ -2662,7 +2702,8 @@ stats:
 ```
 
 - **Cost** uses backend-reported call costs when available, otherwise the backend's
-  discovery pricing, normalised to USD/million tokens. Together's `cached_input`
+  `model_pricing` rule or its discovery pricing (see [Prices before you
+  send](#prices-before-you-send-pricing-in-v1models)), normalised to USD/million tokens. Together's `cached_input`
   and OpenRouter's cache rates price cached input separately; an absent cache rate
   falls back to the fresh-input rate, not free input. Local unpriced backends → 0.
   Statistics keep total input, while translated `/v1/messages` usage separates
