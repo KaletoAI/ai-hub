@@ -2797,7 +2797,8 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   and their over-long prompts 400 at the backend — `test_context_length.py`.
 - **Prices before a request** (`main.model_price` → `adapters.model_price_for`): the
   backend's `model_pricing` `glob=in/out[/cache_read[/cache_write]]` rules (USD per 1M)
-  first, then the discovered `backend_pricing`, then 0 on an UNPAID backend; a paid
+  first, then the discovered `backend_pricing` (a negative listed rate — OpenRouter's
+  `-1` for router models like `openrouter/auto` — is unknown), then 0 on an UNPAID backend; a paid
   backend without either is None = unknown, never 0 (a client budgeting by "free" is the
   silent failure). `main.price_info` resolves a catalog id to its (backend, real model)
   pairs like the context figure does and summarizes them (`adapters.summarize_prices`:

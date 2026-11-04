@@ -334,7 +334,11 @@ def model_price_for(backend: dict, model: str, learned: dict) -> Optional[dict[s
             return dict(price)
     p = (learned or {}).get(model)
     if isinstance(p, dict) and ("input" in p or "output" in p):
-        return {k: float(p[k]) for k in PRICE_FIELDS if isinstance(p.get(k), (int, float))}
+        rates = {k: float(p[k]) for k in PRICE_FIELDS if isinstance(p.get(k), (int, float))}
+        # OpenRouter lists a ROUTER model (openrouter/auto, …/jev-router) at -1: the
+        # price is whatever model it routes to. That is "unknown", never a rate — it
+        # was published as `"prompt": "-1"` (prod, 2026-11-04).
+        return None if any(v < 0 for v in rates.values()) else rates
     if not backend.get("paid"):
         return {"input": 0.0, "output": 0.0}
     return None

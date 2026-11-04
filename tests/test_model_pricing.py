@@ -61,6 +61,13 @@ class PricingRules(unittest.TestCase):
         self.assertEqual(adapters.model_price_for(b, "m", {"m": {"input": 1.0, "output": 2.0}}),
                          {"input": 1.0, "output": 2.0})
 
+    def test_router_model_minus_one_is_unknown(self):
+        # OpenRouter prices its routers (openrouter/auto, jev-router) at -1 = variable.
+        listed = adapters.normalize_pricing({"pricing": {"prompt": "-1", "completion": "-1"}})
+        for paid in (True, False):
+            self.assertIsNone(adapters.model_price_for({"name": "or", "paid": paid}, "auto",
+                                                       {"auto": listed}))
+
     def test_unpaid_without_price_is_free_paid_is_unknown(self):
         self.assertEqual(adapters.model_price_for({"name": "l"}, "m", {}),
                          {"input": 0.0, "output": 0.0})
