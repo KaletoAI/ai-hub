@@ -3229,6 +3229,10 @@ the precedence rule > discovery > unpaid 0 > unknown, the alias publishing its D
 backend, `pricing` absent when any candidate is unknown, the per-token strings without
 exponents that normalize_pricing reads back, LLM Calls booking through the rule, and the
 console labels — an unpriced candidate leaves the upper bound open, never "free").
+`test_media_provider_filter.py` (the Media Playground's provider filter: an alias is
+offered under EVERY backend it can run on, a stale `provider=` filters nothing instead
+of emptying the picker, and Generate's redirect keeps the filter — each wrong variant
+still renders a valid picker, so the next run silently goes elsewhere).
 `test_netscan.py` (the LAN scan: a wrong range silently scans nothing or a whole
 site, a misclassified server pre-fills a backend the gateway cannot discover, a
 "known" match that misses re-offers every backend already there, and a scan that

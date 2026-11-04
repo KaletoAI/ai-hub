@@ -2636,6 +2636,9 @@ to see the grouped model list, or type in that same field to narrow it by name,
 model ID or group (case-insensitive). Select with a click or Arrow Up/Down + Enter;
 Escape or leaving the field restores the current model without switching.
 Only listed models can be selected, and switching keeps same-named prompt fields.
+A **provider** select above it (shown when two or more backends offer models of the
+chosen type) narrows the list to one backend — its catalog models plus every alias that
+can run there; the choice survives Generate.
 
 **Animated GLB previews** in Media Playground and Media Job detail play the file's
 own animation, with a play/pause checkbox and clip selection when the file contains

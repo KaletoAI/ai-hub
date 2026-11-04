@@ -8257,6 +8257,7 @@ def _media_models(kind: str = "media") -> list:
                     for b in _gateway_info().get("backends", [])
                     if b.get("type") in adapters.GEN_TYPES}
     rows = [{"id": name, "name": name, "group": "Aliases",
+             "providers": sorted({str(c.get("backend")) for c in candidates if c.get("backend")}),
              "model_types": sorted(set().union(*(model_kinds.generation_types(c) for c in candidates))),
              "billing_marker": _billing_marker([
                  _backend_billing(backend_meta.get((c.get("backend"), adapters.cand_kind(c)), {}))
@@ -8279,6 +8280,7 @@ def _media_models(kind: str = "media") -> list:
             continue
         if row.get("id") and row["id"] not in seen:
             rows.append({**row, "model_types": sorted(kinds),
+                         "providers": [str(row["backend"])] if row.get("backend") else [],
                          "group": str(row.get("backend", "")) + " · "
                          + modalities.get(modality(row), str(row.get("endpoint", "")))})
             direct[row["id"]] = rows[-1]
@@ -8292,6 +8294,25 @@ _MEDIA_KIND_OPTIONS = [("media", "All media"), ("image", "Images"), ("video", "V
 
 def _media_kind(value) -> str:
     return value if value in dict(_MEDIA_KIND_OPTIONS) else "media"
+
+
+def _media_providers(rows: list) -> list:
+    """(provider, model count) over a model list — the Media Playground's provider
+    filter. A provider is a backend; an alias counts under every backend it can run on."""
+    counts: dict = {}
+    for row in rows:
+        for p in row.get("providers") or ():
+            counts[p] = counts.get(p, 0) + 1
+    return sorted(counts.items(), key=lambda kv: kv[0].lower())
+
+
+def _media_by_provider(rows: list, provider: str) -> tuple[list, str]:
+    """(rows on `provider`, the provider actually applied). An unknown provider — gone
+    since the link was made, or not offering this model type — filters nothing rather
+    than leaving an empty picker."""
+    if provider and any(provider == p for p, _n in _media_providers(rows)):
+        return [r for r in rows if provider in (r.get("providers") or ())], provider
+    return rows, ""
 
 
 
@@ -8385,9 +8406,11 @@ restore();
 
 
 def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Optional[dict] = None,
-                     kept: Optional[dict] = None) -> str:
+                     kept: Optional[dict] = None, providers: Optional[list] = None) -> str:
     """`kept` is the user's upload stash ({param: (filename, bytes)}) — membership drives
-    the '✓ kept' badge, the name is shown for mesh uploads (which one is loaded?)."""
+    the '✓ kept' badge, the name is shown for mesh uploads (which one is loaded?).
+    `providers` = (backend, model count) over the UNFILTERED list of this model type —
+    the provider filter above the model picker (`aliases` is already filtered)."""
     v = lambda k: str(vals.get(k) if vals.get(k) is not None else "")
     # Job-artifact picker options, loaded AT MOST ONCE per render (one SELECT) and only
     # when a row actually needs them — a text-only alias must not pay for the query.
@@ -8548,6 +8571,7 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
     backend_field = _field("backend", f'<select name="backend">{bk_opts}</select>') if bk_list else ""
     pg_switch_js = ("<script>function pgSwitch(sel){var f=sel.form,"
                     "q='sub=media&type='+encodeURIComponent(f.elements.type.value);"
+                    "if(f.elements.provider)q+='&provider='+encodeURIComponent(f.elements.provider.value);"
                     "if(sel.name!=='type')q+='&model='+encodeURIComponent(f.elements.model.value);"
                     "f.querySelectorAll('[name^=\"p__\"]').forEach(function(el){"
                     "if(el.value!=='')q+='&'+encodeURIComponent(el.name)+'='+encodeURIComponent(el.value);});"
@@ -8564,9 +8588,17 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
                   "or register a workflow in <a href='/ui/aliases?sub=media'>Aliases</a>.</p>")
     category = _select("type", _MEDIA_KIND_OPTIONS, _media_kind(vals.get("type"))).replace(
         "<select ", '<select onchange="pgSwitch(this)" ', 1)
+    # Provider filter: only when there is a choice (two or more backends offer models).
+    provider_field = ""
+    if providers and len(providers) > 1:
+        popts = [("", "all providers")] + [
+            (p, f"{p} ({n})") for p, n in providers]
+        provider_field = _field("provider", _select("provider", popts, vals.get("provider", "")).replace(
+            "<select ", '<select onchange="pgSwitch(this)" ', 1), short=True)
     return ('<form action="/ui/playground/generate" method="post" enctype="multipart/form-data">'
             f'<div class="formbar"><h2>Media Playground</h2>{generate}</div>'
             + _field("model type", category, short=True)
+            + provider_field
             + _field("model", alias_select)
             + (_BILLING_LEGEND if any(
                 row.get("billing_marker") or row.get("billing") is not None
@@ -8581,14 +8613,15 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
 
 
 def _playground_body(aliases: list, vals: dict, cand: Optional[dict], result_html: str,
-                     oi: Optional[dict] = None, kept: Optional[dict] = None) -> str:
+                     oi: Optional[dict] = None, kept: Optional[dict] = None,
+                     providers: Optional[list] = None) -> str:
     # model-viewer loads with the page and stays loaded: _LIVE_JS never re-inserts a
     # <script>, so a viewer arriving through a live update upgrades against the
     # definition that is already there. The three.js module (BVH viewer) is hoisted
     # for the same reason, and its import map goes FIRST — see job_detail_page: a map
     # after a module script's load started is rejected and the viewer stays black.
     return (f'{_FBX_VIEWER_JS}<script type="module" src="{_MODELVIEWER_SRC}"></script>'
-            f'<div class="cols"><div class="col">{_playground_form(aliases, vals, cand, oi, kept)}</div>'
+            f'<div class="cols"><div class="col">{_playground_form(aliases, vals, cand, oi, kept, providers)}</div>'
             f'<div class="col"><div id="resultcol">{result_html}</div></div></div>')
 
 
@@ -8668,13 +8701,14 @@ async def playground_page(request: Request):
     if not store.is_active():
         return _inactive()
     kind = _media_kind(qp.get("type"))
-    aliases = _media_models(kind)
+    all_rows = _media_models(kind)
+    aliases, provider = _media_by_provider(all_rows, qp.get("provider", ""))
     selected = qp.get("model", "")
     model = selected if any(row["id"] == selected for row in aliases) else (aliases[0]["id"] if aliases else "")
     cand = _media_candidate(model, aliases) if model else None
     # values per request param, keyed by param name; query (p__<param>) overrides the
     # alias's workflow default. Params are dynamic — whatever Mapping configured.
-    vals = {"model": model, "backend": qp.get("backend", ""), "type": kind}
+    vals = {"model": model, "backend": qp.get("backend", ""), "type": kind, "provider": provider}
     defaults = _alias_defaults(cand) if cand else {}
     # the alias's public param names: a mapping for a ComfyUI alias, the fixed label
     # table for a cloud one (Meshy, Tripo) — without this a p__<field> from the URL
@@ -8721,7 +8755,8 @@ async def playground_page(request: Request):
     oi = await _object_info(cand.get("backend", ""), wf, cand.get("mapping")) if cand else {}
     kept = dict(_pg_images.get(_session_user(request) or "default", {}))
     return HTMLResponse(_page("Media Playground",
-                              _playground_body(aliases, vals, cand, result_html, oi, kept),
+                              _playground_body(aliases, vals, cand, result_html, oi, kept,
+                                               providers=_media_providers(all_rows)),
                               "playground", refresh=refresh,
                               subnav=_subnav("playground", "media")))
 
@@ -8770,10 +8805,12 @@ async def generate(request: Request):
     vals = {"model": model, "backend": force_bk, "type": kind, **submitted}
 
     def _err(msg: str, status: int = 404):
-        aliases = _media_models(kind)
+        all_rows = _media_models(kind)
+        aliases, vals["provider"] = _media_by_provider(all_rows, str(f.get("provider", "") or ""))
         result_html = f'<h2>Result</h2><p class="bad">Error {status}: {_esc(msg)}</p>'
         return HTMLResponse(_page("Media Playground",
-                                  _playground_body(aliases, vals, cand, result_html, kept=dict(stash)),
+                                  _playground_body(aliases, vals, cand, result_html, kept=dict(stash),
+                                                   providers=_media_providers(all_rows)),
                                   "playground", subnav=_subnav("playground", "media")))
 
     # One pass PER PARAM, so the three ways an input arrives have a defined precedence:
@@ -8847,7 +8884,8 @@ async def generate(request: Request):
     except HTTPException as e:
         return _err(str(e.detail), e.status_code)
     # Redirect to the GET view (form re-populated + live-updating) — instant feedback.
-    q = urlencode({"sub": "media", "type": kind, "model": model, "backend": force_bk, "job": view.get("job_id", ""),
+    q = urlencode({"sub": "media", "type": kind, "provider": str(f.get("provider", "") or ""),
+                   "model": model, "backend": force_bk, "job": view.get("job_id", ""),
                    **{f"p__{p}": v for p, v in submitted.items() if v}})
     return RedirectResponse(f"/ui/playground?{q}", status_code=303)
 
