@@ -6,6 +6,7 @@ picker — an alias that also runs on the chosen provider simply is not offered,
 forgets the filter lands the user back on the unfiltered list with another model
 pre-selected. Nothing errors; the next generation just runs somewhere else.
 """
+import re
 from unittest.mock import patch
 
 import httpx
@@ -63,6 +64,21 @@ class Page(_Fixture):
         self.assertEqual(sorted(models), ["nano/flux", "venice/sd35"])
         _c, models = self._models("/ui/playground?sub=media&provider=venice")
         self.assertEqual(models, ["venice/sd35"])
+
+    def test_disabled_backend_is_no_provider(self):
+        """An alias naming a switched-off backend must not put it in the filter."""
+        store.upsert("Mix", [{"backend": "gpu-on", "workflow_json": {}, "mapping": {}},
+                             {"backend": "gpu-off", "workflow_json": {}, "mapping": {}}])
+        self.config_backends[:] = [
+            {"name": "gpu-on", "type": "comfyui", "enabled": True, "healthy": False},
+            {"name": "gpu-off", "type": "comfyui", "enabled": False, "healthy": True}]
+        page = self.c.get("/ui/playground?sub=media").text
+        sel = re.search(r'<select[^>]*name="provider".*?</select>', page, re.S).group(0)
+        provs = re.findall(r'<option value="([^"]+)"', sel)
+        self.assertIn("gpu-on", provs)                # down-but-enabled stays
+        self.assertNotIn("gpu-off", provs)            # disabled goes
+        _c, models = self._models("/ui/playground?sub=media&provider=gpu-off")
+        self.assertIn("nano/flux", models)            # a now-unknown provider filters nothing
 
     def test_stale_provider_shows_everything(self):
         _c, models = self._models("/ui/playground?sub=media&provider=gone")

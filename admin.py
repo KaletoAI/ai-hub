@@ -8308,7 +8308,12 @@ def _media_models(kind: str = "media") -> list:
                     if b.get("type") in adapters.GEN_TYPES}
     stored = store.list_aliases()           # read ONCE: also feeds every row's price below
     rows = [{"id": name, "name": name, "group": "Aliases",
-             "providers": sorted({str(c.get("backend")) for c in candidates if c.get("backend")}),
+             # Provider filter: only backends that are switched ON — a disabled one would
+             # offer aliases that cannot run there (a down-but-enabled one stays: outages
+             # are temporary, the list must not jump with every health poll).
+             "providers": sorted({str(c.get("backend")) for c in candidates
+                                  if (backend_meta.get((c.get("backend"), adapters.cand_kind(c))) or {})
+                                  .get("enabled", False)}),
              "model_types": sorted(set().union(*(model_kinds.generation_types(c) for c in candidates))),
              "billing_marker": _billing_marker([
                  _backend_billing(backend_meta.get((c.get("backend"), adapters.cand_kind(c)), {}))
