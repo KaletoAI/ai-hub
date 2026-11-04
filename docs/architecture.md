@@ -2811,6 +2811,18 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   an unknown candidate renders the upper bound open (`$0–?`). A rule line that does not
   parse is refused on backend save (it would otherwise silently drop to "unknown") —
   `test_model_pricing.py`.
+- **Media from-prices** (`mediaprice.py`, pure): `from_price(kind, cand, backend)`
+  reads the cheapest request off the provider's catalog — NanoGPT `pricing` (field
+  groups per image incl. TURBO speeds, per run incl. variants, per generation, per
+  video, per second; a long-tail fallback over `per_video`/`base_price*`/`…per_second…`
+  keys that SKIPS surcharge and setting keys — a reference-video rate is not the base,
+  and `default_frames_per_second: 24` once read as "$24/s"), Venice
+  `model_spec.pricing` (upscale ignored), Tripo/Meshy credit tables, RunPod
+  `cost_per_hour`; unpaid → free, otherwise None = unknown. `main.media_price_info`
+  resolves a media id like `_gen_routes` but without health filters and takes
+  `cheapest` over the candidates; `/v1/models` publishes `pricing.request` (the
+  cheapest per-request floor, one worker thread for the whole listing) only when every
+  candidate has a floor — `test_media_pricing.py`.
 - **Per-backend model allow/deny** (`models_allow` / `models_deny`, comma-separated
   globs): `adapters.filter_models` narrows what discovery found — allow first (empty =
   keep all), then deny removes from the rest, so DENY WINS and "`gpt-*` except
@@ -3229,6 +3241,10 @@ the precedence rule > discovery > unpaid 0 > unknown, the alias publishing its D
 backend, `pricing` absent when any candidate is unknown, the per-token strings without
 exponents that normalize_pricing reads back, LLM Calls booking through the rule, and the
 console labels — an unpriced candidate leaves the upper bound open, never "free").
+`test_media_pricing.py` (media from-prices: every catalog shape seen on 2026-11-04 with
+the value it must give — the cheapest size/speed/variant, surcharges and settings never
+read as the base price, an unpriced or foreign-currency model unknown instead of free,
+the alias floor omitted when one backend has none).
 `test_media_provider_filter.py` (the Media Playground's provider filter: an alias is
 offered under EVERY backend it can run on, a stale `provider=` filters nothing instead
 of emptying the picker, and Generate's redirect keeps the filter — each wrong variant

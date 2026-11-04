@@ -485,8 +485,24 @@ Where it shows:
 - **LLM Calls** costs use the same price (a backend-reported cost such as OpenRouter's
   `usage.cost` still wins), so what a client budgets by is what gets booked.
 
-Media generation (ComfyUI, cloud 3D, image/video catalogs) is not token-priced and is
-not covered here.
+**Media models** (image, video, 3D, audio) carry a **from price** — what the cheapest
+request costs at least; size, duration, resolution, quality, references and options
+can cost more:
+
+| Provider | Source | Shown as |
+|---|---|---|
+| NanoGPT | the catalog's `pricing` (per image by size, per run/variant, per video, per second, per 1k chars, minimum) | `from $0.008/image`, `from $0.07/s` |
+| Venice | `model_spec.pricing` (flat, by resolution/quality, by duration, per second, per characters); Venice video lists none | `from $0.01/image` |
+| Tripo | credit table (20 per generation without texture, 25 per rig; 1 credit = $0.01) | `from $0.20/run` |
+| Meshy | credit table (20 per task, 5 per rig) — USD per credit depends on the plan | `from 20 credits` |
+| RunPod | the backend's `cost_per_hour` | `from $1.75/h GPU` |
+| ComfyUI / unpaid | — | `free` |
+
+It shows in the Media Playground's model picker (plus a hint under the model), in a
+cloud alias editor's model suggestions and under its model id, and in `/v1/models` as
+`pricing: {"request": "<usd>"}` — the cheapest per-request floor, published only when
+every backend of the entry has one (a per-second rate counts when the shortest
+billable duration is known).
 
 ### Scan network (find backends on the LAN)
 

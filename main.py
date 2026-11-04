@@ -33,6 +33,7 @@ import anthropic_bridge
 import arliai
 import faults
 import jobs
+import mediaprice
 import reasoning
 import scheduler
 import netscan
@@ -3056,6 +3057,7 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
             data.append(_with_pricing(_with_context(
                 {"id": alias, "object": "model", "created": now, "owned_by": "ai-hub (virtual)"},
                 _alias_context(alias, offered)), alias))
+    media_ids: list = []
     for alias, cands in img_aliases.items():
         kinds = set().union(*(generation_types(cand) for cand in cands)) if cands else {"image"}
         if not _matches_model_type(kinds, typ):
@@ -3066,6 +3068,7 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
             kind = _generation_type(cands[0]) if cands else "image"
             data.append({"id": alias, "object": "model", "created": now,
                          "owned_by": f"ai-hub ({kind})"})
+            media_ids.append(alias)
     for row in generation_models_info():
         kinds = generation_types(row["candidate"])
         mid = row["candidate"]["model"]
@@ -3078,7 +3081,12 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
             seen.add(disp)
             data.append({"id": disp, "object": "model", "created": now,
                          "owned_by": row["backend"]})
-
+            media_ids.append(disp)
+    # Media from-prices: one worker thread for all of them (store reads), never per entry.
+    prices = await asyncio.to_thread(lambda: {m: _media_request_pricing(m) for m in media_ids})
+    for entry in data:
+        if prices.get(entry["id"]):
+            entry["pricing"] = prices[entry["id"]]
     return {"object": "list", "data": data}
 
 
@@ -3115,7 +3123,11 @@ async def get_model(model_id: str, authorization: Optional[str] = Header(None),
                 _context_min((b, model_id) for b in hosts)), model_id)
     routes = await asyncio.to_thread(get_gen_routes, model_id)
     if routes:
-        return {"id": model_id, "object": "model", "created": now, "owned_by": routes[0][0]["name"]}
+        entry = {"id": model_id, "object": "model", "created": now, "owned_by": routes[0][0]["name"]}
+        pricing = await asyncio.to_thread(_media_request_pricing, model_id)
+        if pricing:
+            entry["pricing"] = pricing
+        return entry
     raise HTTPException(404, f"Model '{model_id}' not found")
 
 
@@ -3620,6 +3632,52 @@ def generation_models_info(*, console: bool = False) -> list[dict]:
                             "backend": b["name"], "endpoint": endpoint, "candidate": candidate,
                             "billing": _billing_info(b)})
     return out
+
+
+def _media_price_pairs(model_id: str) -> list:
+    """(backend, candidate) pairs a media id may run on — the resolution _gen_routes
+    uses (store alias, config alias, catalog id) WITHOUT its health/busy/sync filters: a
+    price does not flicker with a poll. Catalog metadata is attached as there. Blocking
+    (store read)."""
+    cands = store.get(model_id) if store.is_active() else None
+    if cands is None:
+        cands = image_models.get(model_id)
+    if cands is None:
+        cands = _catalog_direct_candidates(model_id)
+    gen = [b for b in _gen_backends if not is_draining(b)]
+    out = []
+    for cand in cands or []:
+        b = _gen_backend_for(cand.get("backend"), cand, gen)
+        if b is None:
+            continue
+        if b.get("type") in adapters.DYNAMIC_CATALOG_TYPES and not cand.get("model_metadata"):
+            endpoint = adapters.cloud_module(b["type"]).endpoint_of(cand)
+            meta = getattr(backend_adapters.get(backend_id(b)), "model_catalogs", {}).get(
+                endpoint, {}).get(cand.get("model"))
+            if meta is not None:
+                cand = {**cand, "model_metadata": meta}
+        out.append((b, cand))
+    return out
+
+
+def media_price_info(model_id: str) -> Optional[dict]:
+    """The from-price of a media id (mediaprice.cheapest over its candidates: the
+    cheapest known one + `unknown`), None when no backend can serve it. Blocking."""
+    return mediaprice.cheapest(
+        mediaprice.from_price(adapters.cloud_kind(c) or b.get("type", ""), c, b)
+        for b, c in _media_price_pairs(model_id))
+
+
+def _media_request_pricing(model_id: str) -> Optional[dict]:
+    """`/v1/models` `pricing` for a media id: OpenRouter's per-request field, the
+    cheapest request's floor — only when EVERY candidate has one (a rate without a known
+    minimum, credits without a USD rate or no price at all omit the field)."""
+    pairs = _media_price_pairs(model_id)
+    floors = [mediaprice.request_usd(mediaprice.from_price(adapters.cloud_kind(c) or b.get("type", ""), c, b))
+              for b, c in pairs]
+    if not floors or any(f is None for f in floors):
+        return None
+    return {"request": mediaprice.usd_str(min(floors))}
 
 
 def generation_candidate(model: str) -> Optional[dict]:
@@ -9151,6 +9209,7 @@ admin.bind(runpod_probe=runpod_probe, runpod_object_info=runpod_object_info,
            apply_backends=apply_backend_change,
            llm_backends=llm_backends_info,
            price_info=price_info,
+           media_price=media_price_info,
            config_chat_aliases=lambda: dict(config_virtual_models),
            apply_chat_aliases=apply_chat_aliases,
            playground_key=_playground_key,

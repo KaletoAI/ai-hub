@@ -161,6 +161,8 @@ _llm_backends: Callable[[], list] = lambda: []
 # Price summary of a catalog id (main.price_info: per field [lo, hi] USD per 1M tokens +
 # `unknown`), None when no enabled backend serves it.
 _price_info: Callable[[str], Optional[dict]] = lambda model: None
+# From-price of a media id (main.media_price_info → mediaprice.cheapest), None = no backend.
+_media_price: Callable[[str], Optional[dict]] = lambda model: None
 _config_chat_aliases: Callable[[], dict] = lambda: {}
 _apply_chat_aliases: Callable[[], None] = lambda: None
 _playground_key: Callable[[str], Optional[str]] = lambda name: None
@@ -5665,6 +5667,49 @@ def _price_js(summary: Optional[dict]) -> Optional[dict]:
     return out
 
 
+_MEDIA_UNITS = {"image": "image", "video": "video", "run": "run", "second": "s",
+                "1k chars": "1k chars", "1M chars": "1M chars", "hour": "h GPU"}
+
+
+def _media_price_short(p: Optional[dict]) -> str:
+    """Picker label for a media from-price: `from $0.008/image`, `from 20 credits`,
+    `free`, `price ?`; `+?` when another backend of an alias has no price."""
+    if not p:
+        return ""
+    unk = " +?" if p.get("unknown") else ""
+    if p.get("free"):
+        return "free" + unk
+    if "credits" in p:
+        return f"from {p['credits']:g} credits" + unk
+    if "usd" not in p:
+        return "price ?"
+    return f"from ${_usd_rate(p['usd'])}/{_MEDIA_UNITS.get(p.get('unit'), p.get('unit', ''))}" + unk
+
+
+def _media_price_long(p: Optional[dict]) -> str:
+    """The hint under the media model field."""
+    if not p:
+        return ""
+    unk = (f" {p['unknown']} other backend{'s' if p['unknown'] > 1 else ''} of this alias "
+           "list no price." if p.get("unknown") else "")
+    if p.get("free"):
+        return "Free — local or unpaid backend: no per-run cost." + unk
+    if "credits" in p:
+        return (f"From {p['credits']:g} credits per task (the USD value of a credit depends on the "
+                "account's plan); options such as texture add credits." + unk)
+    if "usd" not in p:
+        return "Price unknown — the provider lists no price for this model."
+    usd, unit = _usd_rate(p["usd"]), p.get("unit")
+    if unit == "hour":
+        return f"RunPod GPU at ${usd}/h — the run time decides the bill." + unk
+    per = {"second": "per second of output", "1k chars": "per 1,000 characters",
+           "1M chars": "per 1M characters"}.get(unit, f"per {unit}")
+    floor = (f" (≥ ${_usd_rate(p['usd'] * p['min_s'])} at the shortest {p['min_s']:g} s)"
+             if unit == "second" and p.get("min_s") else "")
+    return (f"From ${usd} {per}{floor} — the provider's cheapest option; size, duration, "
+            "resolution, quality and references can cost more." + unk)
+
+
 def _intern_prices(maps: dict, table: Optional[list] = None) -> tuple[list, dict]:
     """Price maps for a page's JS, each distinct price shipped ONCE: `{key: {model: price
     js}}` → (table, `{key: {model: index}}`). Thousands of catalog models share a few
@@ -7440,6 +7485,9 @@ def _cloud_editor(kind: str, alias: str, cands: list, saved: bool = False, taken
                 continue
             label = (str(row.get("backend", "")) + " · " + str(row.get("endpoint", ""))
                      + " · " + str(row.get("name") or discovered["model"]))
+            plabel = _media_price_short(_media_price(row["id"])) if row.get("id") else ""
+            if plabel:
+                label += " · " + plabel
             endpoint = row.get("endpoint") or mod.endpoint_of(discovered)
             by_endpoint.setdefault(endpoint, []).append({"model": discovered["model"], "label": label})
             if endpoint == ep:
@@ -7465,6 +7513,7 @@ def _cloud_editor(kind: str, alias: str, cands: list, saved: bool = False, taken
             schema_cand.pop("model_metadata", None)
         if metadata is not None:
             schema_cand["model_metadata"] = metadata
+    alias_price = _media_price_long(_media_price(alias))
     retries = next((c.get("retries") for c in cands if c.get("retries") not in (None, "")), "")
     if raw is not None:
         retries = raw.get("retries", "")
@@ -7508,6 +7557,7 @@ def _cloud_editor(kind: str, alias: str, cands: list, saved: bool = False, taken
                       hint="Choose an exact discovered ID from this backend's catalog, or keep a stored ID. "
                            "The alias pins this model; client parameters cannot override it.")
                if dynamic_models else _field("ai model", _select("cloud_model", list(mod.AI_MODELS), model)))
+            + (f"<p class='hint' style='margin:-4px 0 10px'>{_esc(alias_price)}</p>" if alias_price else "")
             + _option_rows(mod, opts, ep, {p["name"]: p for p in params}
                            if kind in adapters.DYNAMIC_CATALOG_TYPES else None)
             + (_field("deliver formats", fmts) if fmts else "")
@@ -8285,7 +8335,11 @@ def _media_models(kind: str = "media") -> list:
                          + modalities.get(modality(row), str(row.get("endpoint", "")))})
             direct[row["id"]] = rows[-1]
     wanted = model_kinds.MEDIA_TYPES if kind == "media" else {kind}
-    return [row for row in rows if wanted.intersection(row["model_types"])]
+    out = [row for row in rows if wanted.intersection(row["model_types"])]
+    for row in out:
+        row["price"] = _media_price(row["id"])
+        row["price_label"] = _media_price_short(row["price"])
+    return out
 
 _MEDIA_KIND_OPTIONS = [("media", "All media"), ("image", "Images"), ("video", "Video"),
                        ("3d", "3D"), ("audio", "Audio"), ("tts", "Speech"),
@@ -8445,6 +8499,8 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
                 marker = "[?]"
             if marker:
                 label += " " + marker
+            if row.get("price_label"):
+                label += " · " + row["price_label"]
             opts += (f'<option value="{_esc(model_id)}"'
                      f'{" selected" if model_id == vals.get("model") else ""}>{_esc(label)}</option>')
         opts += "</optgroup>"
@@ -8588,6 +8644,8 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
                   "or register a workflow in <a href='/ui/aliases?sub=media'>Aliases</a>.</p>")
     category = _select("type", _MEDIA_KIND_OPTIONS, _media_kind(vals.get("type"))).replace(
         "<select ", '<select onchange="pgSwitch(this)" ', 1)
+    sel_row = next((r for r in aliases if isinstance(r, dict) and r.get("id") == vals.get("model")), None)
+    sel_price = _media_price_long((sel_row or {}).get("price")) if sel_row else ""
     # Provider filter: only when there is a choice (two or more backends offer models).
     provider_field = ""
     if providers and len(providers) > 1:
@@ -8600,6 +8658,7 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
             + _field("model type", category, short=True)
             + provider_field
             + _field("model", alias_select)
+            + (f"<p class='hint' id='pgprice'>{_esc(sel_price)}</p>" if sel_price else "")
             + (_BILLING_LEGEND if any(
                 row.get("billing_marker") or row.get("billing") is not None
                 or adapters.cloud_kind(row.get("candidate") or {}) == "venice"
