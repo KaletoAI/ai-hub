@@ -182,6 +182,16 @@ class Console(unittest.TestCase):
         free_or_unknown = adapters.summarize_prices([{"input": 0.0, "output": 0.0}, None])
         self.assertEqual(admin._price_short(free_or_unknown), "$0–?/$0–?")
 
+    def test_page_ships_each_price_once(self):
+        # Inlined per model, prices doubled the Chat Playground (1.24 MB on prod).
+        a, b = {"s": "$1/$2"}, {"s": "free"}
+        table, idx = admin._intern_prices({"x": {"m1": a, "m2": dict(a)}, "y": {"m3": b}})
+        self.assertEqual(table, [a, b])
+        self.assertEqual(idx, {"x": {"m1": 0, "m2": 0}, "y": {"m3": 1}})
+        table2, idx2 = admin._intern_prices({"": {"m4": dict(b)}}, table)
+        self.assertIs(table2, table)
+        self.assertEqual((len(table), idx2[""]["m4"]), (2, 1))
+
     def test_backend_form_renders_the_rules(self):
         html = admin._backend_form({"name": "oa", "type": "openai", "url": "http://x",
                                     "model_pricing": "gpt-*=1.25/10"}, [])

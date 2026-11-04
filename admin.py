@@ -5665,6 +5665,26 @@ def _price_js(summary: Optional[dict]) -> Optional[dict]:
     return out
 
 
+def _intern_prices(maps: dict, table: Optional[list] = None) -> tuple[list, dict]:
+    """Price maps for a page's JS, each distinct price shipped ONCE: `{key: {model: price
+    js}}` → (table, `{key: {model: index}}`). Thousands of catalog models share a few
+    hundred prices; inlined per model the maps more than doubled the Chat Playground
+    (1.24 MB on prod, 2026-11-04, ~690 KB of it prices). `table` extends an existing
+    table, so two maps of one page share it."""
+    table = [] if table is None else table
+    seen = {json.dumps(pj, sort_keys=True): i for i, pj in enumerate(table)}
+    out: dict = {}
+    for key, per_model in maps.items():
+        dst = out.setdefault(key, {})
+        for model, pj in per_model.items():
+            sig = json.dumps(pj, sort_keys=True)
+            if sig not in seen:
+                seen[sig] = len(table)
+                table.append(pj)
+            dst[model] = seen[sig]
+    return table, out
+
+
 def _model_datalist(dlid: str, models: list, markers: dict, prices: Optional[dict] = None) -> str:
     options = []
     for model in models:
@@ -5826,23 +5846,26 @@ def _alias_picker_script(datalists: dict) -> str:
              for name, buckets in catalogs.items()}
     # AM_PR: per backend the model's price (short label + full text) — on the picker's
     # options and in the row's price cell, refreshed as a model is typed or picked.
-    return ("<script>var AM_BK=%s,AM_DLS=%s,AM_PR=%s;function amFilter(f){"
+    pr_table, pr_idx = _intern_prices(_backend_prices())
+    return ("<script>var AM_BK=%s,AM_DLS=%s,AM_PRT=%s,AM_PR=%s;"
+            "function amP(bk,m){var i=(AM_PR[bk]||{})[m];return i===undefined?null:AM_PRT[i];}"
+            "function amFilter(f){"
             "var kind=f.elements.type.value;"
             "Object.keys(AM_DLS).forEach(function(id){"
             "var bk=f.elements.backend?f.elements.backend.value:AM_DLS[id],"
-            "ms=(AM_BK[bk]||{})[kind]||[],pr=AM_PR[bk]||{},dl=document.getElementById(id);if(!dl)return;"
-            "dl.innerHTML='';ms.forEach(function(m){var o=document.createElement('option');"
-            "o.value=m;o.label=m+(pr[m]?' \\u00b7 '+pr[m].s:'');dl.appendChild(o);});});"
+            "ms=(AM_BK[bk]||{})[kind]||[],dl=document.getElementById(id);if(!dl)return;"
+            "dl.innerHTML='';ms.forEach(function(m){var o=document.createElement('option'),p=amP(bk,m);"
+            "o.value=m;o.label=m+(p?' \\u00b7 '+p.s:'');dl.appendChild(o);});});"
             "amPriceAll(f);}"
             "function amPrice(inp,bk,cell){var c=document.getElementById(cell);if(!c)return;"
-            "var p=(AM_PR[bk]||{})[inp.value];"
+            "var p=amP(bk,inp.value);"
             "c.textContent=p?(c.hasAttribute('data-long')?p.l:p.s):'';c.title=p?p.l:'';}"
             "function amPriceAll(f){if(!f||!f.querySelectorAll)return;"
             "var els=f.querySelectorAll('[data-am-cell]');"
             "for(var i=0;i<els.length;i++){var e=els[i],bk=e.getAttribute('data-am-bk')"
             "||(f.elements.backend?f.elements.backend.value:'');"
             "amPrice(e,bk,e.getAttribute('data-am-cell'));}}"
-            "</script>") % (_js_json(kinds), _js_json(datalists), _js_json(_backend_prices()))
+            "</script>") % (_js_json(kinds), _js_json(datalists), _js_json(pr_table), _js_json(pr_idx))
 
 
 
@@ -6204,6 +6227,7 @@ _CHATPLAY_JS = ("<script>function cpSending(f){"
 # text says "≈"), output priced up to `max tokens` when set, else quoted per 1M. A
 # range when the call can land on backends with different prices (an alias). ES5.
 _CP_PRICE_JS = (
+    "function cpP(prs,m){var i=prs[m];return i===undefined?null:CP_PRT[i];}"
     "function cpUsd(x){return x===0?'0':x<0.0001?'<0.0001':x<1?String(+x.toPrecision(2)):x.toFixed(2);}"
     "function cpSpan(a,n){var lo=a[0]*n/1e6,hi=a[1]*n/1e6;"
     "return '$'+(lo===hi?cpUsd(lo):cpUsd(lo)+'\u2013'+cpUsd(hi));}"
@@ -6212,7 +6236,7 @@ _CP_PRICE_JS = (
     "if(!out||!e||!e.model||!e.backend)return;"
     "function val(n){return (e[n]&&e[n].value)||'';}"
     "var bk=e.backend.value,prs=(bk&&CP_PR_BK[bk])?CP_PR_BK[bk]:CP_PR_ALL,"
-    "p=prs[e.model.value];if(!e.model.value||!p){out.textContent='';return;}"
+    "p=cpP(prs,e.model.value);if(!e.model.value||!p){out.textContent='';return;}"
     "var chars=val('system').length+val('user').length,"
     "tin=Math.ceil(chars/4),mt=parseInt(val('max_tokens'),10);"
     "var txt=p.l;if(tin>0&&p.i&&p.o&&!(p.i[1]===0&&p.o[1]===0)){"
@@ -6253,13 +6277,15 @@ def _chatplay_form(vals: dict) -> str:
                  for bk, ms in bk_models.items()}
     init_prices = bk_prices[cur_bk] if cur_bk in bk_prices else all_prices
     sel_price = init_prices.get(v("model")) if v("model") else None
+    pr_table, pr_bk = _intern_prices(bk_prices)
+    pr_all = _intern_prices({"": all_prices}, pr_table)[1].get("", {})
     # Backend picker (manual, so it can filter the model datalist on change without a reload).
     opts = f'<option value=""{"" if cur_bk else " selected"}>— all backends (scheduler picks) —</option>'
     for n in bk_models:
         opts += f'<option{" selected" if n == cur_bk else ""}>{_esc(n)}</option>'
     bk_select = f'<select name="backend" onchange="cpFilterModels(this.value)">{opts}</select>'
     filt_js = ("<script>var CP_BK=%s,CP_ALL=%s,CP_BILL_BK=%s,CP_BILL_ALL=%s,CP_BILL_TEXT=%s,"
-               "CP_BILL_DEF=%s,CP_PR_BK=%s,CP_PR_ALL=%s;" + _CP_PRICE_JS +
+               "CP_BILL_DEF=%s,CP_PRT=%s,CP_PR_BK=%s,CP_PR_ALL=%s;" + _CP_PRICE_JS +
                "function cpUpdateBilling(){"
                "var model=document.querySelector('form[action=\"/ui/chatplay/send\"] [name=\"model\"]'),"
                "backend=document.querySelector('form[action=\"/ui/chatplay/send\"] [name=\"backend\"]'),"
@@ -6275,12 +6301,12 @@ def _chatplay_form(vals: dict) -> str:
                "if(input&&ms.indexOf(input.value)<0)input.value='';"
                "dl.innerHTML='';ms.forEach(function(m){var o=document.createElement('option');o.value=m;"
                "var prs=(bk&&CP_PR_BK[bk])?CP_PR_BK[bk]:CP_PR_ALL;"
-               "o.label=m+(marks[m]?' '+marks[m]:'')+(prs[m]?' \\u00b7 '+prs[m].s:'');dl.appendChild(o);});"
+               "var p=cpP(prs,m);o.label=m+(marks[m]?' '+marks[m]:'')+(p?' \\u00b7 '+p.s:'');dl.appendChild(o);});"
                "cpUpdateBilling();}cpUpdatePrice();"
                "</script>") % (
                    _js_json(bk_models), _js_json(all_models), _js_json(bk_markers), _js_json(all_markers),
                    _js_json({m: _billing_description(m) for m in ("[C]", "[I]", "[?]", "[mixed]")}),
-                   _js_json(bk_default), _js_json(bk_prices), _js_json(all_prices))
+                   _js_json(bk_default), _js_json(pr_table), _js_json(pr_bk), _js_json(pr_all))
     return ('<form action="/ui/chatplay/send" method="post" onsubmit="return cpSending(this)">'
             f'<div class="formbar"><h2>Chat Playground</h2>{_btn("Send", submit=True)}</div>'
             + _field("backend", bk_select, short=True)
