@@ -103,6 +103,11 @@ class Venice(unittest.TestCase):
         p = venice({"resolutions": {"1K": {"usd": 0.07}}, "quality": {"1K": {"low": {"usd": 0.05}}}})
         self.assertEqual(p, {"usd": 0.05, "unit": "image"})
 
+    def test_edit_models_price_under_inpaint(self):
+        self.assertEqual(venice({"inpaint": {"usd": 0.04}}), {"usd": 0.04, "unit": "image"})
+        p = venice({"inpaint": {"usd": 0.12}, "inputImages": {"included": 1, "additional": {"usd": 0.0345}}})
+        self.assertEqual(p["usd"], 0.12)            # the extra-image surcharge is not the base
+
     def test_audio_and_unpriced_video(self):
         self.assertEqual(venice({"input": {"usd": 3.5}}), {"usd": 3.5, "unit": "1M chars"})
         self.assertEqual(venice({"durations": {"60": {"usd": 0.03}, "90": {"usd": 0.04}}})["usd"], 0.03)

@@ -113,11 +113,13 @@ def nanogpt_from(pricing) -> Optional[dict]:
 
 def venice_from(pricing) -> Optional[dict]:
     """Venice `model_spec.pricing` (values `{"usd": …}`): generation (flat), resolutions /
-    quality (images), durations (music), per_second, per_thousand_characters, input
+    quality / inpaint (images, edits), durations (music), per_second, per_thousand_characters, input
     (TTS, per 1M characters). Upscale prices are an extra, never the base."""
     if not isinstance(pricing, dict):
         return None
-    for keys, unit in ((("generation",), "run"), (("resolutions", "quality"), "image"),
+    # Edit models (catalog type `inpaint`) price under `inpaint`; `inputImages.additional`
+    # is a per-extra-image surcharge, never the base.
+    for keys, unit in ((("generation",), "run"), (("resolutions", "quality", "inpaint"), "image"),
                        (("durations",), "run")):
         lo = _min_of([pricing.get(k) for k in keys])
         if lo is not None:
