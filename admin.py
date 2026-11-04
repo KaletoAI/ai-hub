@@ -162,7 +162,7 @@ _llm_backends: Callable[[], list] = lambda: []
 # `unknown`), None when no enabled backend serves it.
 _price_info: Callable[[str], Optional[dict]] = lambda model: None
 # From-price of a media id (main.media_price_info → mediaprice.cheapest), None = no backend.
-_media_price: Callable[[str], Optional[dict]] = lambda model: None
+_media_price: Callable[..., Optional[dict]] = lambda model, aliases=None: None
 _config_chat_aliases: Callable[[], dict] = lambda: {}
 _apply_chat_aliases: Callable[[], None] = lambda: None
 _playground_key: Callable[[str], Optional[str]] = lambda name: None
@@ -8306,6 +8306,7 @@ def _media_models(kind: str = "media") -> list:
     backend_meta = {(b["name"], adapters.backend_kind(b)): b
                     for b in _gateway_info().get("backends", [])
                     if b.get("type") in adapters.GEN_TYPES}
+    stored = store.list_aliases()           # read ONCE: also feeds every row's price below
     rows = [{"id": name, "name": name, "group": "Aliases",
              "providers": sorted({str(c.get("backend")) for c in candidates if c.get("backend")}),
              "model_types": sorted(set().union(*(model_kinds.generation_types(c) for c in candidates))),
@@ -8313,7 +8314,7 @@ def _media_models(kind: str = "media") -> list:
                  _backend_billing(backend_meta.get((c.get("backend"), adapters.cand_kind(c)), {}))
                  or ({"state": "unknown"} if adapters.cloud_kind(c) == "venice" else None)
                  for c in candidates])}
-            for name, candidates in store.list_aliases().items()]
+            for name, candidates in stored.items()]
     seen = {row["id"] for row in rows}
     direct = {}
     modalities = {"images": "Images", "image": "Images", "video": "Video", "3d": "3D",
@@ -8337,7 +8338,7 @@ def _media_models(kind: str = "media") -> list:
     wanted = model_kinds.MEDIA_TYPES if kind == "media" else {kind}
     out = [row for row in rows if wanted.intersection(row["model_types"])]
     for row in out:
-        row["price"] = _media_price(row["id"])
+        row["price"] = _media_price(row["id"], stored)
         row["price_label"] = _media_price_short(row["price"])
     return out
 

@@ -3083,7 +3083,9 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
                          "owned_by": row["backend"]})
             media_ids.append(disp)
     # Media from-prices: one worker thread for all of them (store reads), never per entry.
-    prices = await asyncio.to_thread(lambda: {m: _media_request_pricing(m) for m in media_ids})
+    store_aliases = img_aliases if store.is_active() else None
+    prices = await asyncio.to_thread(
+        lambda: {m: _media_request_pricing(m, store_aliases) for m in media_ids})
     for entry in data:
         if prices.get(entry["id"]):
             entry["pricing"] = prices[entry["id"]]
@@ -3634,12 +3636,16 @@ def generation_models_info(*, console: bool = False) -> list[dict]:
     return out
 
 
-def _media_price_pairs(model_id: str) -> list:
+def _media_price_pairs(model_id: str, aliases: Optional[dict] = None) -> list:
     """(backend, candidate) pairs a media id may run on — the resolution _gen_routes
     uses (store alias, config alias, catalog id) WITHOUT its health/busy/sync filters: a
     price does not flicker with a poll. Catalog metadata is attached as there. Blocking
-    (store read)."""
-    cands = store.get(model_id) if store.is_active() else None
+    (store read). `aliases`: the store's aliases already read — the catalog prices a
+    thousand ids per listing and must not query the store once per id."""
+    if aliases is not None:
+        cands = aliases.get(model_id)
+    else:
+        cands = store.get(model_id) if store.is_active() else None
     if cands is None:
         cands = image_models.get(model_id)
     if cands is None:
@@ -3660,19 +3666,20 @@ def _media_price_pairs(model_id: str) -> list:
     return out
 
 
-def media_price_info(model_id: str) -> Optional[dict]:
+def media_price_info(model_id: str, aliases: Optional[dict] = None) -> Optional[dict]:
     """The from-price of a media id (mediaprice.cheapest over its candidates: the
-    cheapest known one + `unknown`), None when no backend can serve it. Blocking."""
+    cheapest known one + `unknown`), None when no backend can serve it. Blocking;
+    `aliases` as in _media_price_pairs."""
     return mediaprice.cheapest(
         mediaprice.from_price(adapters.cloud_kind(c) or b.get("type", ""), c, b)
-        for b, c in _media_price_pairs(model_id))
+        for b, c in _media_price_pairs(model_id, aliases))
 
 
-def _media_request_pricing(model_id: str) -> Optional[dict]:
+def _media_request_pricing(model_id: str, aliases: Optional[dict] = None) -> Optional[dict]:
     """`/v1/models` `pricing` for a media id: OpenRouter's per-request field, the
     cheapest request's floor — only when EVERY candidate has one (a rate without a known
     minimum, credits without a USD rate or no price at all omit the field)."""
-    pairs = _media_price_pairs(model_id)
+    pairs = _media_price_pairs(model_id, aliases)
     floors = [mediaprice.request_usd(mediaprice.from_price(adapters.cloud_kind(c) or b.get("type", ""), c, b))
               for b, c in pairs]
     if not floors or any(f is None for f in floors):

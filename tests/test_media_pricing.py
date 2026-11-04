@@ -140,16 +140,26 @@ class Catalog(unittest.TestCase):
                   "model_metadata": {"pricing": p}}) for i, p in enumerate(prices)]
 
     def test_request_price_is_the_cheapest_floor(self):
-        with patch.object(main, "_media_price_pairs", lambda m: self._pairs(
+        with patch.object(main, "_media_price_pairs", lambda m, a=None: self._pairs(
                 {"per_image": {"a": 0.04}}, {"per_image": {"a": 0.009}})):
             self.assertEqual(main._media_request_pricing("x"), {"request": "0.009"})
 
     def test_any_candidate_without_a_floor_omits_it(self):
-        with patch.object(main, "_media_price_pairs", lambda m: self._pairs(
+        with patch.object(main, "_media_price_pairs", lambda m, a=None: self._pairs(
                 {"per_image": {"a": 0.04}}, {"per_second_by_resolution": {"720p": 0.1}})):
             self.assertIsNone(main._media_request_pricing("x"))
-        with patch.object(main, "_media_price_pairs", lambda m: []):
+        with patch.object(main, "_media_price_pairs", lambda m, a=None: []):
             self.assertIsNone(main._media_request_pricing("x"))
+
+
+    def test_given_aliases_are_used_instead_of_the_store(self):
+        # The catalog prices ~1000 media ids per listing: one store read, not one per id.
+        cand = {"backend": "gpu", "model": "m"}
+        with patch.object(main.store, "get", side_effect=AssertionError("store queried per id")), \
+             patch.object(main, "_gen_backends", [{"name": "gpu", "type": "comfyui"}]), \
+             patch.object(main, "_gen_backend_for", lambda name, c, gen: gen[0]):
+            pairs = main._media_price_pairs("A", {"A": [cand]})
+        self.assertEqual([c for _b, c in pairs], [cand])
 
 
 class Console(unittest.TestCase):
