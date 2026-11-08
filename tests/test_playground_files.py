@@ -120,6 +120,24 @@ class RecentArtifacts(unittest.TestCase):
         jobs.create("response", "gpt-alias", "openai")
         self.assertEqual(jobs.recent_artifacts(), [])
 
+    def test_picker_options_carry_job_id_and_thumbnail(self):
+        """The "(from a job…)" picker searches the option text AND value, and shows the
+        picked image from the option's thumb url. A label without the short job id, or a
+        thumb url that is not the route serving that artifact, fails only in the browser
+        (no match / broken thumbnail); a mesh result must carry no thumb at all."""
+        jid = jobs.create("img2mesh", "mesh-mia", "comfy-a")
+        jobs.set_inputs(jid, {"params": {}}, [("input_image", PNG)])
+        jobs.complete(jid, [Blob(PNG, "image/png", "image"),
+                            Blob(b"glTF-ish", "model/gltf-binary", "file", "hero.glb")], None)
+        opts = admin._pg_history_opts()
+        by_val = {v: (lbl, src) for v, lbl, src in opts["image"]}
+        lbl, src = by_val[f"{jid}:r:0"]
+        self.assertIn(jid[:8], lbl)
+        self.assertEqual(src, f"/ui/playground/result/{jid}/0")
+        self.assertEqual(by_val[f"{jid}:i:0"][1], f"/ui/job/{jid}/input/0")
+        (val, _lbl, src), = opts["file"]
+        self.assertEqual((val, src), (f"{jid}:r:1", ""))
+
 
 # ── admin._multipart keeps the upload filename ──────────────────────────────────
 

@@ -212,6 +212,14 @@ them the rerun drew a new seed and the picked result could not be reproduced
 param (`admin._drawn_param`) BLANK — `_alias_defaults` skips it — because it sends
 every filled field: prefilled with the workflow's value, every playground run used
 that one seed while the API drew a fresh one (`DrawnFieldsStayBlank`);
+the playground's "(from a job…)" pickers (`admin._pg_history_opts`, the last
+`_PG_HISTORY_JOBS` media jobs) keep a hidden `<select name="hist__<param>">` as the
+form value and `_PG_HIST_JS` turns it into a search box — matching option text AND
+value, so a pasted full job id finds its artifacts (the label carries the 8-char
+id) — plus a thumbnail of a picked image from the option's `data-src` (result →
+`/ui/playground/result/<id>/<n>`, stored input → `/ui/job/<id>/input/<n>`; mesh
+results carry none); the wrapper is `data-live-skip` like the model picker, since a
+morph would strip the enhancement (`RecentArtifacts.test_picker_options_carry_job_id_and_thumbnail`);
 `_apply_lora_cascade` drops client LoRAs into free stack slots (so with a pinned
 `lora_01` the client's `lora_01` runs in `lora_02`; the job view tags each client
 `lora_N`/`strength_N` row with its landing slot from `meta.loras` via

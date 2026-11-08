@@ -374,6 +374,10 @@ input:focus,select:focus,textarea:focus{border-color:var(--accent)}
 .pg-model-list [role=option]{padding:6px 10px;cursor:pointer;overflow-wrap:anywhere}
 .pg-model-list [role=option]:hover,.pg-model-list [aria-selected=true]{background:var(--sel);color:var(--text-hi)}
 .pg-model-group,.pg-model-empty{padding:6px 10px;color:var(--dim);font-size:12px}
+.pg-hist{margin-top:4px}
+.pg-hist-thumb{display:inline-block;margin-top:6px}
+.pg-hist-thumb[hidden]{display:none}
+.pg-hist-thumb img{display:block;max-width:160px;max-height:120px;border:1px solid var(--line-2);border-radius:6px;background:var(--input)}
 textarea{height:auto;min-height:60px;padding:8px 10px;font-family:ui-monospace,monospace;font-size:12px;line-height:1.5}
 input[type=file]{padding:7px 10px;height:auto}
 input[type=checkbox]{width:auto;height:auto;margin:0 6px 0 0;vertical-align:middle;accent-color:var(--btn)}
@@ -8211,26 +8215,33 @@ def _pg_file_mime(name: str) -> str:
                              "application/octet-stream")
 
 
+_PG_HISTORY_JOBS = 200     # jobs offered by the playground's "from a job…" pickers
+
+
 def _pg_history_opts() -> dict:
-    """{"image": [(value, label)…], "file": […]} — every artifact of the recent jobs,
-    newest first, as picker options. `value` is "<job>:r:<n>" (a result) or
+    """{"image": [(value, label, thumb url)…], "file": […]} — every artifact of the
+    recent jobs, newest first, as picker options (thumb url only for images, else ""). `value` is "<job>:r:<n>" (a result) or
     "<job>:i:<n>" (a stored input image); generate() resolves it back to bytes.
 
     An image slot may take any earlier image — a result OR another job's reference
     input (re-running the same picture against a second alias is the common case);
     a mesh param takes result FILES (glb/fbx/…), which is what a mesh stage produces."""
     out = {"image": [], "file": []}
-    for j in jobs.recent_artifacts(limit=60):
-        when = time.strftime("%H:%M", time.localtime(int(j.get("created") or 0)))
-        head = f"{when} {j.get('alias') or '?'}"
+    for j in jobs.recent_artifacts(limit=_PG_HISTORY_JOBS):
+        when = time.strftime("%m-%d %H:%M", time.localtime(int(j.get("created") or 0)))
+        # the short job id is in the label so it can be READ next to the Jobs tab; the
+        # search box matches the full id too (it is the option value's prefix)
+        head = f"{when} {str(j['id'])[:8]} {j.get('alias') or '?'}"
         for r in j["results"]:
             kind = r.get("kind")
             if kind in out or kind in ("video", "audio"):
                 out[kind if kind in out else "file"].append(
-                    (f"{j['id']}:r:{r['n']}", f"{head} · #{r['n']} {r.get('name') or ''}"))
+                    (f"{j['id']}:r:{r['n']}", f"{head} · #{r['n']} {r.get('name') or ''}",
+                     f"/ui/playground/result/{j['id']}/{r['n']}" if kind == "image" else ""))
         for i in j["inputs"]:
             out["image"].append((f"{j['id']}:i:{i['n']}",
-                                 f"{head} · in#{i['n']} {i.get('slot') or i.get('filename') or ''}"))
+                                 f"{head} · in#{i['n']} {i.get('slot') or i.get('filename') or ''}",
+                                 f"/ui/job/{j['id']}/input/{i['n']}"))
     return out
 
 
@@ -8465,6 +8476,93 @@ restore();
 })();</script>"""
 
 
+# The "(from a job…)" pickers of the Media Playground: the same search-box pattern as
+# the model picker (the hidden <select> stays the form value), matching the option
+# text AND value — the value starts with the full job id, so a pasted id finds it.
+# An image pick shows a small thumbnail (option data-src) that links to full size.
+_PG_HIST_JS = """<script>(function(){
+var boxes=document.querySelectorAll('[data-pg-hist]');
+for(var b=0;b<boxes.length;b++)enhance(boxes[b],b);
+function enhance(root,k){
+var select=root.querySelector('select');
+if(!select||select.hidden)return;
+var input=document.createElement('input'),list=document.createElement('div'),
+ link=document.createElement('a'),img=document.createElement('img');
+input.type='text';input.autocomplete='off';input.id='pg-hist-input-'+k;
+input.setAttribute('role','combobox');input.setAttribute('aria-label','From a job');
+input.setAttribute('aria-autocomplete','list');input.setAttribute('aria-expanded','false');
+input.setAttribute('aria-controls','pg-hist-options-'+k);
+input.placeholder='(from a job…) search job id, alias, name';
+list.id='pg-hist-options-'+k;list.className='pg-model-list';list.hidden=true;
+list.setAttribute('role','listbox');list.setAttribute('aria-label','Job artifacts');
+link.className='pg-hist-thumb';link.target='_blank';link.rel='noopener';link.hidden=true;
+img.alt='picked image';img.loading='lazy';link.appendChild(img);
+root.appendChild(input);root.appendChild(list);root.appendChild(link);select.hidden=true;
+var active=-1,visible=[];
+function restore(){
+ var o=select.selectedIndex>0?select.options[select.selectedIndex]:null;
+ input.value=o?o.text:'';
+ var src=o?o.getAttribute('data-src'):'';
+ if(src){if(img.getAttribute('src')!==src)img.src=src;link.href=src;link.hidden=false;}
+ else{link.hidden=true;img.removeAttribute('src');}
+}
+function close(){
+ list.hidden=true;input.setAttribute('aria-expanded','false');
+ input.removeAttribute('aria-activedescendant');restore();
+}
+function highlight(index){
+ active=index;
+ var rows=list.querySelectorAll('[role=option]');
+ for(var i=0;i<rows.length;i++)rows[i].setAttribute('aria-selected',i===active?'true':'false');
+ if(rows[active]){
+  input.setAttribute('aria-activedescendant',rows[active].id);
+  rows[active].scrollIntoView({block:'nearest'});
+ }else input.removeAttribute('aria-activedescendant');
+}
+function show(query){
+ list.replaceChildren();visible=[];active=-1;
+ var words=query.toLowerCase().split(/\\s+/).filter(Boolean);
+ for(var i=0;i<select.options.length;i++){
+  var option=select.options[i],hay=(option.text+' '+option.value).toLowerCase(),hit=true;
+  for(var w=0;w<words.length;w++)if(hay.indexOf(words[w])<0){hit=false;break;}
+  if(!hit)continue;
+  var row=document.createElement('div');row.id='pg-hist-'+k+'-option-'+i;
+  row.setAttribute('role','option');row.setAttribute('data-index',visible.length);
+  row.setAttribute('aria-selected','false');row.textContent=option.text;
+  visible.push(option);list.appendChild(row);
+ }
+ if(!visible.length){
+  var empty=document.createElement('div');empty.className='pg-model-empty';
+  empty.setAttribute('role','status');empty.textContent='No matching job artifacts';
+  list.appendChild(empty);
+ }
+ list.hidden=false;input.setAttribute('aria-expanded','true');highlight(-1);
+}
+function choose(index){
+ var option=visible[index];if(!option)return;
+ var changed=select.value!==option.value;select.value=option.value;close();
+ if(changed)select.dispatchEvent(new Event('change',{bubbles:true}));
+}
+input.addEventListener('focus',function(){show('');input.select();});
+input.addEventListener('click',function(){if(list.hidden){show('');input.select();}});
+input.addEventListener('input',function(){show(input.value);});
+input.addEventListener('blur',close);
+input.addEventListener('keydown',function(e){
+ if(e.key==='Escape'){e.preventDefault();close();return;}
+ if(e.key==='Tab'){close();return;}
+ if(e.key==='Enter'){e.preventDefault();if(!list.hidden)choose(active);return;}
+ if(e.key!=='ArrowDown'&&e.key!=='ArrowUp')return;
+ e.preventDefault();if(list.hidden)show('');
+ if(visible.length)highlight((active+(e.key==='ArrowDown'?1:active<0?0:-1)+visible.length)%visible.length);
+});
+list.addEventListener('mousedown',function(e){e.preventDefault();});
+list.addEventListener('click',function(e){
+ var row=e.target.closest('[data-index]');if(row)choose(Number(row.getAttribute('data-index')));
+});
+restore();
+}
+})();</script>"""
+
 def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Optional[dict] = None,
                      kept: Optional[dict] = None, providers: Optional[list] = None) -> str:
     """`kept` is the user's upload stash ({param: (filename, bytes)}) — membership drives
@@ -8479,7 +8577,14 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
     def hist(param: str, kind: str) -> str:
         if not hist_cache:
             hist_cache.append(_pg_history_opts())
-        return _select(f"hist__{param}", [("", "(from a job…)")] + hist_cache[0][kind])
+        # A plain <select> stays the form value (hist__<param>); _PG_HIST_JS turns it
+        # into a search box (job id / alias / name) plus a thumbnail of the picked image.
+        # data-live-skip: a live morph must not strip the enhanced picker back out.
+        opts = '<option value="">(from a job…)</option>' + "".join(
+            f'<option value="{_esc(val)}"' + (f' data-src="{_esc(src)}"' if src else "")
+            + f'>{_esc(lbl)}</option>' for val, lbl, src in hist_cache[0][kind])
+        return (f'<div class="pg-model pg-hist" data-pg-hist data-live-skip>'
+                f'<select name="hist__{_esc(param)}">{opts}</select></div>')
 
     def kept_badge(param: str, show_name: bool = False) -> str:
         name = (kept or {}).get(param)
@@ -8674,7 +8779,7 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
             + rows
             + '<p class="hint">Uses <code>POST /v1/generations</code>; results update here. '
               'Catalog models need no alias. Reference uploads are kept for the next generation.</p></form>'
-            + pg_switch_js + _PG_MODEL_JS)
+            + pg_switch_js + _PG_MODEL_JS + _PG_HIST_JS)
 
 
 def _playground_body(aliases: list, vals: dict, cand: Optional[dict], result_html: str,
