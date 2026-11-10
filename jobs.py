@@ -381,6 +381,30 @@ def _is_live(job_id: str) -> bool:
     return row is not None
 
 
+def hand_over(job_id: str, owner: str) -> bool:
+    """Give a FINISHED media job to another owner (the /ui "Hand over" action) — the
+    recipient then fetches it via /v1/jobs/<id> under their own key. Only a `done`
+    media job moves: a live one belongs to the client that is still waiting for it, a
+    failed one has nothing to hand over, and a chat/response row is not a media job.
+
+    Two columns stay untouched on purpose: `updated` is the run's END time (RUN_S =
+    updated − started feeds the median/ETA and the speed stats — stamping it here would
+    make a 10 s render look like a day), and `created` orders the lists. The expiry is
+    only ever EXTENDED, to at least the default TTL from now: a job handed over an hour
+    before its TTL would otherwise be pruned before the recipient got to it."""
+    owner = (owner or "").strip()
+    if not owner or not _active:
+        return False
+    now = int(time.time())
+    with _conn() as c:
+        cur = c.execute(
+            f"UPDATE jobs SET owner=?, ttl_s=MAX(ttl_s, ? - created + ?) "
+            f"WHERE id=? AND status='done' AND task NOT IN "
+            f"({','.join('?' * len(_NON_MEDIA_TASKS))})",
+            (owner, now, _DEFAULT_TTL, job_id, *_NON_MEDIA_TASKS))
+        return cur.rowcount > 0
+
+
 def merge_meta(job_id: str, meta: dict) -> None:
     """Merge keys into a job's meta WITHOUT touching its status — for facts that must
     reach the row whatever state it is in (a cancelled job's already-billed cloud task:

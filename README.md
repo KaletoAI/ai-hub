@@ -1892,7 +1892,10 @@ retrievable by id until its TTL (default 24 h), then pruned. The job also keeps
 its **inputs** (prompt, params, reference images) so it stays inspectable in the
 **Media Jobs** tab. A running job can be cancelled (`POST /v1/jobs/{id}/cancel` or the ✕ button),
 which interrupts the ComfyUI prompt to free the GPU. On a restart, any job left
-`running`/`queued` is reconciled to `failed`.
+`running`/`queued` is reconciled to `failed`. An admin can **hand over** a finished
+media job to a user (job page → *Hand over to* → user): the job's owner becomes that
+user, who fetches it via `GET /v1/jobs/{id}` with their own key; its expiry is extended
+to at least the default TTL from the handover.
 
 ### Hosts & VRAM policy
 

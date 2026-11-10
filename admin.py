@@ -1036,7 +1036,7 @@ _POST_ACTIONS = frozenset((
     "/ui/mapping/delete",
     "/ui/reasoning/toggle", "/ui/reasoning/delete",
     "/ui/playground/voice-ship", "/ui/playground/voice-del",
-    "/ui/job/{job_id}/cancel",
+    "/ui/job/{job_id}/cancel", "/ui/job/{job_id}/handover",
     "/ui/users/delete", "/ui/ipalias/delete", "/ui/ipalias/save-resolved",
     # Server → API Keys: each secret its own small form
     "/ui/server/api-key", "/ui/server/provider-token", "/ui/server/hf-token",
@@ -10094,6 +10094,9 @@ async def job_detail_page(job_id: str, request: Request):
                   title="Copy this job's prompt, params and reference images into the Media Playground")
              if store.is_active() and job.get("task") != "response" else "")
     # prev/next in the Media Jobs list (newest first); hidden at the ends.
+    handover = await _job_handover_html(job_id, job)
+    msg = ((getattr(request, "query_params", None) or {}).get("msg", "") or "")[:600]
+    msg_html = f"<p class='hint' role='status' data-k='job-msg'><b>{_esc(msg)}</b></p>" if msg else ""
     newer, older = await asyncio.to_thread(jobs.neighbors, job_id)
     nav = ((_btn("‹ Prev", f"/ui/job/{_q(newer)}", "secondary", title="Newer job") if newer else "")
            + (_btn("Next ›", f"/ui/job/{_q(older)}", "secondary", title="Older job") if older else ""))
@@ -10119,7 +10122,7 @@ async def job_detail_page(job_id: str, request: Request):
             f"<button type='button' class='btn secondary sm' data-copy=\"{_esc(job_id)}\" "
             f"title='copy the full job id'>📋 Copy ID</button> "
             f"<span class='badge {_JOB_SCLS.get(st, 'muted')}'>{_esc(_job_status_text(job))}</span></h2>"
-            f"<div style='display:flex;gap:8px'>{cancel_btn}{to_pg}{nav}{back}</div></div>{info}"
+            f"<div style='display:flex;gap:8px'>{cancel_btn}{to_pg}{nav}{back}</div></div>{msg_html}{info}{handover}"
             f"<div style='display:flex;gap:28px;flex-wrap:wrap;align-items:flex-start'>"
             f"<div style='flex:1;min-width:320px'><h2>Input</h2>{inbox}</div>"
             f"<div style='flex:1;min-width:320px'><h2>Output</h2>{outbox}</div></div>"
@@ -10204,6 +10207,45 @@ async def job_to_playground(job_id: str, request: Request):
             except OSError:
                 pass
     return RedirectResponse(f"/ui/playground?{urlencode(q)}", status_code=303)
+
+
+async def _job_handover_html(job_id: str, job: dict) -> str:
+    """The "Hand over to <user>" row under a FINISHED media job's info line — empty for a
+    live/failed job, a chat/response row, or when there are no users to give it to.
+    The fields travel in their own form (`form=` on the button), outside the page's
+    empty action form; the current owner is preselected so a stray click changes nothing."""
+    if job.get("status") != "done" or job.get("task") in jobs._NON_MEDIA_TASKS or not store.is_active():
+        return ""
+    names = sorted({u["name"] for u in await asyncio.to_thread(store.list_users) if u.get("name")})
+    if not names:
+        return ""
+    cur = job.get("owner")
+    opts = "".join(f"<option value=\"{_esc(n)}\"{' selected' if n == cur else ''}>{_esc(n)}</option>"
+                   for n in names)
+    return ("<form id='gw-handover' data-k='job-handover' "
+            "style='display:flex;gap:8px;align-items:center;margin:4px 0 12px'>"
+            "<label class='muted' for='gw-handover-user' style='white-space:nowrap'>Hand over to</label>"
+            f"<select id='gw-handover-user' name='user' style='width:auto;min-width:160px'>{opts}</select>"
+            + _btn("→ Hand over", f"/ui/job/{_q(job_id)}/handover", "secondary", sm=True,
+                   form="gw-handover",
+                   confirm="Hand this job over? The new owner can fetch it with their own key; "
+                           "the current owner loses access.",
+                   title="Make the selected user this job's owner (fetch via /v1/jobs/<id>)")
+            + "</form>")
+
+
+async def job_handover(job_id: str, request: Request):
+    """POST: give a finished media job to an existing user (jobs.hand_over). Refusals
+    come back to the job page as `?msg=` — the job page is where the admin looks."""
+    user = ((await _form(request)).get("user") or "").strip()
+    names = {u.get("name") for u in await asyncio.to_thread(store.list_users)} if store.is_active() else set()
+    if user not in names:
+        msg = f"✗ unknown user {user!r} — nothing changed"
+    elif await asyncio.to_thread(jobs.hand_over, job_id, user):
+        msg = f"✓ handed over to {user} — fetch via /v1/jobs/{job_id} with their key"
+    else:
+        msg = "✗ only a finished (done) media job can be handed over — nothing changed"
+    return RedirectResponse(f"/ui/job/{_q(job_id)}?msg={_q(msg)}", status_code=303)
 
 
 async def job_cancel(job_id: str):
@@ -12591,6 +12633,7 @@ def register(app) -> None:
     app.add_api_route("/ui/job/{job_id}/input/{n}", job_input, methods=["GET"])
     app.add_api_route("/ui/job/{job_id}/to-playground", job_to_playground, methods=["GET"])
     app.add_api_route("/ui/job/{job_id}/cancel", job_cancel, methods=["POST"])
+    app.add_api_route("/ui/job/{job_id}/handover", job_handover, methods=["POST"])
     app.add_api_route("/ui/dashboard", dashboard_page, methods=["GET"])
     app.add_api_route("/ui/llmcalls", llmcalls_page, methods=["GET"])
     app.add_api_route("/ui/statistic", statistic_page, methods=["GET"])

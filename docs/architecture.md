@@ -1170,6 +1170,18 @@ the short form with the full id as `title` and a `data-copy` button (`_COPY_JS`,
 `_CONFIRM_JS`: delegated, so it survives the live morph; `navigator.clipboard` only in a
 secure context, else a textarea + `execCommand('copy')` — the console is plain http on
 the LAN; "Copied" only when the copy really happened).
+**Hand over** (`jobs.hand_over`, `admin.job_handover`, POST `/ui/job/{id}/handover`): the
+admin gives a FINISHED media job to an existing user, who then fetches it via
+`/v1/jobs/<id>` under their own key (the previous owner gets the 403 of any foreign job).
+Only `done` + media task moves — a live job belongs to the client still polling it, a
+failed one has nothing to give, chat/response rows are not media. The UPDATE never
+touches `updated` (it is the run's END time: RUN_S feeds median/ETA and the speed stats)
+or `created` (list order), and only EXTENDS the expiry to at least the default TTL from
+now, so a job handed over shortly before its TTL is not pruned under the recipient. The
+call log keeps the original caller (cost stays with whoever generated). The picker
+(`_job_handover_html`) preselects the current owner and sends its field via its own
+form (`form=` on the button); refusals come back as `?msg=` on the job page
+(`test_job_handover`).
 `test_jobs_lifecycle.py`. Carries `owner`. Reused for
 **background Responses** jobs (task type `response`, result via `complete_json`).
 A job's DURATION is its run time, `jobs.RUN_S` = updated − COALESCE(`started`,
@@ -3426,6 +3438,12 @@ job as delivered; and `prune_once` deleted a job still RUNNING under a short cli
 `ttl_s`, after which `complete()` wrote artifacts into a directory no row points to.
 Pins first-terminal-write-wins on every status writer, `merge_meta` reaching a terminal
 row, and prune touching finished jobs only).
+`test_job_handover.py` (handing a finished media job to a user: stamping `updated` on the
+owner change would turn the run time into hours and skew median/ETA and speed stats;
+moving a live job takes it from the client still polling it; a job handed over shortly
+before its TTL was pruned before the recipient fetched it. Pins done+media only, the
+untouched run-time columns, the extend-only expiry, the unknown-user refusal and the
+recipient/old-owner access).
 `test_gen_cancel.py` (stopping exactly one job's work: ComfyUI's bare `/interrupt`
 stops whatever executes, so cancelling a queued job or a `max_wait` on a waiting prompt
 killed a stranger's run, which then failed over or was charged an execution fault — and
