@@ -365,7 +365,8 @@ class VendorDefaults(unittest.TestCase):
         """Guards _vendor_default: wiro's catalog spells some control defaults outside
         their own option list ('English' vs 'en', ['vocal'], checkbox '--use_pe') —
         validating them would refuse every run of those models, so they are sent
-        verbatim; a numeric `text` default (seed '0') is a value and goes out too,
+        verbatim; a numeric `text` default of a REQUIRED item (seed '0') goes out too
+        (an optional one would pin every result to one seed),
         while a prose `text` default (a sample prompt) never does."""
         row = {"parameters": [{"items": [
             {"id": "prompt", "type": "textarea", "required": True, "defaultvalue": "sample"},
@@ -378,6 +379,7 @@ class VendorDefaults(unittest.TestCase):
              "options": [{"id": "Pop", "name": "Pop"}, {"id": "rock", "name": "rock"}]},
             {"id": "seed", "type": "text", "required": True, "defaultvalue": "0"},
             {"id": "style", "type": "text", "defaultvalue": "cinematic sample"},
+            {"id": "seed2", "type": "text", "defaultvalue": "0"},          # optional: never sent
         ]}]}
         cand = wiro.candidate_for("w", "o/p", "audio", row)
         body, parts = wiro.build_request(cand, {"prompt": "x"}, {}, {})

@@ -509,7 +509,8 @@ def _vendor_default(item):
     is not re-validated: a default outside its own options or a checkbox default like
     '--use_pe' is how wiro's catalog spells them). None = do not send. Never for file
     inputs (sample URLs) or prose (sample prompts); a `text` default only when it is a
-    number (seed '0', '-1' — a value, not a sample)."""
+    number AND the item is required (seed '0' — a value, not a sample; optional seeds
+    stay unset so results vary)."""
     typ = str(item.get("type") or "").lower()
     default = item.get("defaultvalue")
     if default in (None, "", []):
@@ -521,7 +522,10 @@ def _vendor_default(item):
             return default
     if typ in _DEFAULTABLE or typ == "multiselect":
         return default
-    if typ == "text" and isinstance(default, (str, int, float)) and not isinstance(default, bool):
+    # A numeric `text` default only for a REQUIRED item: an optional seed "0" sent on
+    # every run would pin every result to one seed (the vendor picks when it is absent).
+    if typ == "text" and item.get("required") is True and isinstance(default, (str, int, float)) \
+            and not isinstance(default, bool):
         try:
             float(str(default))
             return str(default)

@@ -963,7 +963,8 @@ spaces). Parameter items drive `public_fields` (file items whose id names an ima
 are image slots, expanded `id, id_2 … id_N` by `maxinputlenght`; other file items
 are uploads) and `build_request`: client > alias `options_json` > `_vendor_default`.
 **Vendor defaults are sent only for controls** (select, number, float, checkbox,
-multiselect, and a `text` whose default is a number like seed `"0"`) and verbatim —
+multiselect, and a REQUIRED `text` whose default is a number like seed `"0"` — an
+optional seed sent on every run pinned every result to it) and verbatim —
 wiro's catalog spells some outside their own options (`"English"` vs `en`, `["vocal"]`,
 checkbox `"--use_pe"`), and validating them refused every run of those models.
 **File defaults are wiro SAMPLE URLs and prose defaults sample prompts**: sending
