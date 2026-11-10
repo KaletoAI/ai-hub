@@ -117,7 +117,12 @@ def generation_types(candidate: dict) -> set[str]:
     for vendor in ("meshy", "tripo"):
         if vendor in candidate:
             return {"3d"}
-    for vendor in ("nanogpt", "venice"):
+    if "lulabs" in candidate:
+        # LU endpoints are `<kind>[-<op>]` (image-edit, video-animate) plus tts / music.
+        endpoint = str((candidate.get("lulabs") or {}).get("endpoint") or "image")
+        return {"tts": {"tts"}, "music": {"audio"}}.get(endpoint) or (
+            {"video"} if endpoint.startswith("video") else {"image"})
+    for vendor in ("nanogpt", "venice", "wiro"):
         if vendor in candidate:
             endpoint = (candidate.get(vendor) or {}).get("endpoint") or "images"
             return _labels(endpoint) or {"image"}

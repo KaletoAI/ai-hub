@@ -496,6 +496,35 @@ saves and YAML hot reload. `_activate_generation_jobs` retains the startup-only
 job DB/blob paths even when initialization was deferred on a text-only gateway.
 
 
+`WiroAdapter` (`type: wiro`) and `LuLabsAdapter` (`type: lulabs`) are composite
+accounts on the NanoGPT pattern: an internal `OpenAIAdapter` subclass for chat and a
+`CloudTaskAdapter` subclass for media share one bid/in-flight pool and publish one
+snapshot (`text` + the media endpoints); a failed refresh clears callable catalogs
+and keeps the display copy. Dispatch of a non-chat id is a 400. wiro discovery pages
+`Tool/List` (public — no account headers) until a short page and asks the LLM
+endpoint `/v1/models?limit=1000` (its default page is small). wiro chat sends
+`api_key` verbatim (`KEY:SECRET` works there; the HMAC headers do not), the task API
+signs. `WiroMediaAdapter._run`: the model's catalog metadata is attached before the
+body is built (without it every value read as unknown); code 96 (HTTP 200) →
+`CloudTaskRetryable`, 97 → `CloudNoCredits`, a lost answer after the POST went out
+→ final `RuntimeError` with `create_unconfirmed`; the task is polled by its
+socketaccesstoken; `totalcost` (USD) becomes `cost_usd`, never `consumed_credits`.
+A cancelled job sends `Task/Kill` (shielded, 15 s) and records `stop_requested`.
+`LuLabsTextAdapter` adds `stream: false` to a chat body without `stream` — LU
+streams by default and the SSE body would have been parsed as JSON.
+`LuLabsMediaAdapter._run`: uploads (`/files`, role per slot) → free quote → booking
+with `max_credits` = quote and one `client_request_id`. **The only sanctioned re-POST
+of a paid submit in this repo**: a transport error or 5xx on `POST /jobs` is re-sent
+with the SAME body and id (LU returns the job already booked), up to
+`SUBMIT_ATTEMPTS`; then final with `create_unconfirmed`. Only the FIRST answer's
+refusals map to failover classes (402/`credits_exhausted` → no credits, 429 → busy,
+503 → retryable); a refusal after an uncertain attempt is final. The result is
+fetched in `_run` (`/content` with the key, not followed; the redirect target without
+it; job-JSON URLs as fallback), sniffed, and handed to the base run as an in-memory
+`lulabs-mem://` download — a per-instance download hook would mix concurrent jobs'
+files. A lost result after the paid job is `CloudArtifactLost` (never failover-class).
+Poll bodies are redacted before parsing (the job error lands on the job row).
+
 `VeniceAdapter` (`type: venice`) inherits OpenAI dispatch and composes an internal
 `VeniceMediaAdapter`, sharing `venice:<name>` slots with chat, TTS and embeddings.
 Nine unique `/v1/models?type=...` GETs publish one atomic catalog snapshot; speech
@@ -910,6 +939,45 @@ Catalog choices, bounds and required references drive preflight and the console;
 native seconds, format/variant controls, structured references and model pins are
 preserved. Unsupported masks, controls, credential/queue overrides, non-finite
 values and invalid input combinations are refused before billing.
+
+### `wiro.py`
+
+Pure wiro.ai helpers; no HTTP, main or adapters imports. `tool_metadata` turns one
+`Tool/List` row into `(owner/project, endpoint, metadata)` by its categories (first
+match: realtime → skip, speech-to-text → asr, text-to-speech → tts, music/voice →
+audio, any video → video, any image → image, everything else — llm, chat,
+captioning — skipped). Ids come from the CLEAN slugs (`slugproject` may contain
+spaces). Parameter items drive `public_fields` (file items whose id names an image
+are image slots, expanded `id, id_2 … id_N` by `maxinputlenght`; other file items
+are uploads) and `build_request`: client > alias `options_json` > `_vendor_default`.
+**Vendor defaults are sent only for controls** (select, number, float, checkbox,
+multiselect, and a `text` whose default is a number like seed `"0"`) and verbatim —
+wiro's catalog spells some outside their own options (`"English"` vs `en`, `["vocal"]`,
+checkbox `"--use_pe"`), and validating them refused every run of those models.
+**File defaults are wiro SAMPLE URLs and prose defaults sample prompts**: sending
+either generated from the vendor's samples instead of the request, so they never go
+out and a required one is a 400. Blank client values are "not set" (main always
+passes `prompt`/`negative_prompt`); `negative_prompt` maps onto `negativePrompt`.
+Files go multipart: `fileinput` = file in `{id}` plus an empty `{id}Url`,
+combine/multi = the `{id}` field repeated in slot order. `signature_headers`: HMAC
+key = KEY, message = SECRET + nonce, hex; the nonce is an integer (seconds×1000 +
+a counter) so two calls in one second differ. `parse_task`: only
+`task_postprocess_end` / `task_cancel` are terminal (`task_end` comes before
+post-processing, `task_error*` are transient); success ⇔ `pexit == "0"`.
+
+### `lulabs.py`
+
+Pure LU Labs helpers. The create catalog's JSON is unpublished, so
+`parse_create_catalog` is defensive: a row needs an id and `kind`, rows of other
+types/kinds and unsupported ops (lora-train, studio) are skipped, a `tools` block
+publishes model-less `removebg`/`upscale`; only a payload with no list at all is an
+error (an empty snapshot would hide every model). `image` and `video` each hold two
+ops — `op_for` picks edit/animate when a `source_image` is sent — so one model has
+one id and the OpenAI edits shim reaches the edit. `validate_request` returns the
+job params (op included) and refuses unknown keys, `n` > 1, unpublished durations,
+a mask without its image and missing inputs before any upload; `options_json`
+cannot set op, model, paths, `max_credits` or `client_request_id`. `sniff` names a
+result by its bytes (LU's `/content` redirect says nothing about the type).
 
 ### `nanogpt.py`
 
@@ -3153,6 +3221,23 @@ Every test file also says this in its own docstring; this is the overview.
   both stored and typed values, and generation input refusals before a job exists.
 - `test_concurrency_group.py`: an account cap shared by chat and images, releases,
   independent groups, cap reloads, disabled/draining members and streams held to EOF.
+- `test_wiro.py`: category mapping (realtime/llm skipped), clean-slug ids, signature
+  and key-only headers, redaction, value precedence, sample defaults never sent,
+  vendor control defaults verbatim, hidden items, slot expansion, task states.
+- `test_wiro_adapter.py`: paginated public `Tool/List`, `limit=1000`, Bearer
+  `KEY:SECRET` on chat, signed runs, `task_end` not terminal, credential-free
+  downloads, multipart repeats, 400 before any POST, failed exit code final, 96/97
+  classes, no re-POST after an uncertain submit, redaction, Kill on cancel.
+- `test_lulabs_adapter.py`: defensive create catalog, op-based generation types,
+  validation before any paid call, reserved alias options, byte sniffing,
+  `stream: false` on chat, quote-capped booking, credential-free redirect target,
+  same-id re-POST only, final after `SUBMIT_ATTEMPTS`, first-answer refusal classes,
+  redacted failures, lost result not failover-class, uploads + cancel.
+- `test_wiro_lulabs_routing.py`: `backend/owner/project` ids, alias-free generation
+  with client values only, 400 before paid calls, `@backends` never opening media,
+  from-prices, the LU edits shim with a mask, 503 before the first catalog.
+- `test_wiro_lulabs_console.py`: account save (vendor URL, forced paid, key never
+  rendered), type select, every endpoint saved as alias, native playground fields.
 - `test_venice.py`: native parameter precedence, model pins, metadata bounds,
   malformed metadata as input errors, required/reference uploads, structured video
   inputs, secret/data redaction and exact account-charge flags with finite,

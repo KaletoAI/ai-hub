@@ -212,8 +212,8 @@ A user's allow-list can contain any mix of:
 | `<backend>/current` | whatever that llama-swap backend has loaded (a backend-name grant covers it too) |
 | `@chat` / `@image` / `@backends` | every chat alias / generation alias / LLM backend, incl. ones added later |
 
-A NanoGPT or Venice account named one by one grants the whole account, paid media
-included. `@backends` covers only its text, TTS and embedding models; paid media
+A NanoGPT, Venice, wiro or LU Labs account named one by one grants the whole
+account, paid media included. `@backends` covers only its text, TTS and embedding models; paid media
 need `@image`, an alias or the exact id.
 
 An **empty** allow-list = everything allowed (the default). A non-empty list both
@@ -225,7 +225,7 @@ backend), and `GET /v1/models` returns only those. `?type=chat`, `image`, `video
 `3d`, `tts`, `embedding`, `rerank`, `audio`, `asr` and `decision` narrow the catalog.
 `?type=media` selects the union of image, video, 3D, TTS, audio and transcription
 models. Without `type`, the endpoint remains the complete permitted catalog.
-NanoGPT and Venice expose typed inventories; `audio` and `asr` include Venice
+NanoGPT, Venice, wiro and LU Labs expose typed inventories; `audio` and `asr` include Venice
 music/voice conversion and transcription respectively.
 
 Task-specific console model choices use the same type classification: Chat and
@@ -493,6 +493,8 @@ can cost more:
 |---|---|---|
 | NanoGPT | the catalog's `pricing` (per image by size, per run/variant, per video, per second, per 1k chars, minimum) | `from $0.008/image`, `from $0.07/s` |
 | Venice | `model_spec.pricing` (flat, by resolution/quality, by duration, per second, per characters); Venice video lists none | `from $0.01/image` |
+| wiro | the catalog's `dynamicprice` (per request / per output, per output-second, per prompt character); output-metered models show none | `from $0.039/image` |
+| LU Labs | the create catalog's `credits` (LU sells credits in EUR plans and packs) | `from 1200 credits` |
 | Tripo | credit table (20 per generation without texture, 25 per rig; 1 credit = $0.01) | `from $0.20/run` |
 | Meshy | credit table (20 per task, 5 per rig) — USD per credit depends on the plan | `from 20 credits` |
 | RunPod | the backend's `cost_per_hour` | `from $1.75/h GPU` |
@@ -618,7 +620,7 @@ or a `503` (with `Retry-After`) if the wait runs out.
 never delays a LAN poll. A healthy backend is polled every `discovery_interval_s`
 (per backend, Backends tab; blank = type default): LAN backends and ComfyUI/RunPod
 follow `health_check_interval` (30 s), cloud catalogs (OpenAI-compatible vendors,
-Anthropic, NanoGPT, Venice, ArliAI) 600 s, Meshy/Tripo credit balance 300 s. A saved change
+Anthropic, NanoGPT, Venice, wiro, LU Labs, ArliAI) 600 s, Meshy/Tripo credit balance 300 s. A saved change
 to a backend polls that backend at once; a DOWN backend is retried at least every
 `health_check_interval`. A fault row names the request that failed
 (`ReadTimeout (GET /api/v1/models)`).
@@ -967,8 +969,10 @@ your own GPU, or on a GPU rented on demand as a
 same workflows on a [RunPod Serverless](#runpod-serverless-comfyui-workflows-pay-per-second)
 endpoint), the two cloud mesh APIs **`type: meshy`** (Meshy.ai) and **`type: tripo`**
 (Tripo3D), **`type: arliai`** (SDNext text-to-image), **`type: nanogpt`**
-(NanoGPT: text, TTS, embeddings and media), and **`type: venice`**
-(Venice: text, embeddings, image/video/audio generation and transcription). A ComfyUI
+(NanoGPT: text, TTS, embeddings and media), **`type: venice`**
+(Venice: text, embeddings, image/video/audio generation and transcription),
+**`type: wiro`** (wiro.ai: chat plus image/video/speech/music/transcription tasks) and
+**`type: lulabs`** (LU Labs / LU Cloud: chat plus image/video/speech/music jobs). A ComfyUI
 backend speaks a different protocol, so it declares `type: comfyui`.
 Discovery is via `/object_info` (checkpoints/UNETs/VAEs **and** installed LoRAs);
 dispatch submits a parametrised workflow, polls `/history`, and fetches whatever
@@ -1347,6 +1351,82 @@ Provider contracts: [model catalogs](https://docs.venice.ai/api-reference/endpoi
 [music](https://docs.venice.ai/guides/media/music-and-sound-effects),
 [voice cloning](https://docs.venice.ai/guides/media/voice-cloning),
 [transcription](https://docs.venice.ai/guides/media/speech-to-text).
+
+
+### wiro.ai (chat + images, video, speech, music, transcription)
+
+One **`type: wiro`** backend is one wiro project. Chat runs through wiro's
+OpenAI-compatible LLM endpoint (`https://llm.wiro.ai/v1`, discovered with
+`?limit=1000`); media runs as tasks on `https://api.wiro.ai/v1` (`Run` →
+`Task/Detail` → output download). The media catalog (`Tool/List`, about 400 media
+models) is read in full at discovery; each model lands on exactly one endpoint by its
+wiro categories — `image`, `video`, `audio` (music, voice conversion), `tts` or `asr`.
+Realtime and LLM rows are not media.
+
+```yaml
+  - name: wiro
+    type: wiro
+    url: https://llm.wiro.ai          # chat base; the task API is api.wiro.ai/v1
+    api_key: "KEY"                    # or "KEY:SECRET" for a signature-auth project
+    max_concurrent: 2                 # one cap for chat and media; always paid
+    max_wait: 1800
+    poll_interval: 3
+```
+
+`api_key` is `KEY` for a key-only project or `KEY:SECRET` for a signature project:
+chat sends it verbatim as `Authorization: Bearer …`, the task API signs every call
+(`x-nonce`, `x-signature` = HMAC-SHA256 of SECRET+NONCE keyed with KEY).
+
+Media ids are `wiro/<owner>/<project>` (`wiro/google/nano-banana`) and are callable
+without an alias. Request parameters are the model's own wiro parameter ids
+(`aspectRatio`, `steps`, …), listed by `GET /v1/generations/schema` and the
+Playground; image inputs are the model's file parameters (`inputImage`,
+`inputImage_2`, …), other files (`inputAudio`, `inputVideo`) are uploads.
+wiro's catalog defaults for **controls** (selects, numbers, checkboxes) are sent
+when the client is silent; its defaults for **files and prose** are vendor samples
+and are never sent — a required prompt or input image without a value is a 400.
+Unknown parameters are a 400 before anything is paid. `negative_prompt` maps onto a
+model's `negativePrompt`.
+
+A submitted task is never re-submitted: a lost answer is final (the job names the
+task). A refusal that created nothing (concurrency limit, code 96) may fail over; no
+balance (code 97) marks the account out of credits. Only `task_postprocess_end` with
+`pexit` `"0"` is success. Cancelling a gateway job sends `Task/Kill` (wiro does not
+bill cancelled tasks). The job meta carries wiro's `totalcost` as `cost_usd`.
+
+### LU Labs (LU Cloud — chat + images, video, speech, music)
+
+One **`type: lulabs`** backend is one LU account (one credit wallet; API keys always
+spend credits, also on the Hosted plan). Chat is OpenAI-compatible; LU streams by
+default, so the gateway always sends `stream` explicitly. Media runs through LU's
+create API: inputs are uploaded (`/v1/files`), the job is **quoted first** (free) and
+booked with that quote as its `max_credits` cap, then polled and fetched from
+`/v1/jobs/{id}/content` (the key is never sent to the redirect target).
+
+```yaml
+  - name: lu
+    type: lulabs
+    url: https://lu-labs.ai/api/inference   # gateway adds /v1 paths
+    api_key: "lu_…"                          # Account → Cloud API keys
+    max_concurrent: 1
+```
+
+| Endpoint | LU op | Inputs |
+|---|---|---|
+| `image` | `generate`, or `edit` when `source_image` is sent (`mask_image` optional) | prompt, `negative_prompt`, `size`, `seed` |
+| `image-removebg` / `image-upscale` | `removebg` / `upscale` | `source_image` (+ `target_resolution` 2k/4k/8k) |
+| `video` | `generate`, or `animate` when `source_image` is sent | prompt, `duration` (the model's published durations), `seed` |
+| `video-lipsync` / `video-motion` | `lipsync` / `motion` | `audio` + `source_image` or `video` / `source_image` + `video` |
+| `tts` / `music` | `tts` (optional `audio` voice clone) / `music` | prompt, `duration` (music) |
+
+Ids are `lu/<model>` (e.g. `lu/flux-dev`); the OpenAI edits shim maps one image and
+its mask onto `source_image` / `mask_image`. One job delivers one result (`n` must be
+1). Every job carries a `client_request_id`: a lost answer to the booking call is
+re-sent **with the same id** (LU answers with the job it already booked) — never a
+new booking and never on another backend. Chat prices are credits, not USD: chat
+cost in the stats stays 0 unless a `model_pricing` rule sets one. Cancelling a
+gateway job asks LU to cancel the job; LU only cancels (and refunds) a job that is
+still queued.
 
 
 ### Meshy.ai (cloud mesh generation)

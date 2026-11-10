@@ -54,6 +54,8 @@ import meshy
 import nanogpt
 import tripo
 import venice
+import wiro
+import lulabs
 
 logger = logging.getLogger(__name__)
 
@@ -689,10 +691,12 @@ class NormalizedRequest:
 
 # ── cloud task kinds (Meshy, Tripo): the one seam main/admin ask "which kind?" ──
 CLOUD_MODULES: dict = {meshy.KIND: meshy, tripo.KIND: tripo, arliai.KIND: arliai,
-                       nanogpt.KIND: nanogpt, venice.KIND: venice}  # kind → pure module
+                       nanogpt.KIND: nanogpt, venice.KIND: venice,
+                       wiro.KIND: wiro, lulabs.KIND: lulabs}  # kind → pure module
 
 # Composite accounts expose purpose-separated live catalogs to routing and admin.
-DYNAMIC_CATALOG_TYPES: frozenset = frozenset((nanogpt.KIND, venice.KIND))
+DYNAMIC_CATALOG_TYPES: frozenset = frozenset((nanogpt.KIND, venice.KIND, wiro.KIND,
+                                                    lulabs.KIND))
 
 
 def cloud_kind(cand: dict) -> Optional[str]:
@@ -5876,6 +5880,721 @@ class VeniceAdapter(OpenAIAdapter):
         return await self._media.generate(req)
 
 
+# ── wiro.ai composite text / media account ────────────────────────────────────
+
+
+class WiroTextAdapter(OpenAIAdapter):
+    """The llm.wiro.ai side: OpenAI dispatch unchanged, one discovery override.
+
+    The wiro LLM endpoint pages its /v1/models catalog (default page size is small), so
+    discovery ALWAYS asks for limit=1000 (W4). Auth is the api_key verbatim — KEY or
+    KEY:SECRET, llm.wiro.ai accepts both; the HMAC headers are NOT accepted there.
+    """
+
+    type = wiro.KIND
+    bills = True
+    serves_generation = False
+
+    async def _fetch_snapshot(self, client: httpx.AsyncClient) -> tuple[Capabilities, dict]:
+        """GET /v1/models?limit=1000 → (caps, {"text": metadata}), publishing nothing."""
+        b = self.backend
+        resp = await client.get(f"{(b.get('url') or wiro.URL).rstrip('/')}/v1/models",
+                                params={"limit": "1000"}, headers=self.ctx.auth_headers(b),
+                                timeout=_NANOGPT_DISCOVERY_TIMEOUT)
+        resp.raise_for_status()
+        payload = await asyncio.to_thread(resp.json)
+        models = filter_models(extract_models(payload, b), b)
+        metadata = extract_model_metadata(payload)
+        caps = Capabilities(models=models, pricing=extract_pricing(payload),  # null = unknown
+                            context=extract_context(payload))
+        return caps, {"text": {mid: metadata.get(mid, {}) for mid in models}}
+
+    async def discover(self, client: httpx.AsyncClient) -> Capabilities:
+        raise NotImplementedError("wiro discovery belongs to the composite account")
+
+
+class WiroMediaAdapter(CloudTaskAdapter):
+    """The api.wiro.ai task side: Tool/List catalog → Run → Task/Detail → outputs.
+
+    A submit that wiro REFUSED provably created nothing (code 96/97) keeps failover
+    semantics; anything after a sent submit whose answer is uncertain is final and
+    never re-POSTed (G3/W7). Poll errors are about the free service, retried until
+    max_wait; only task_postprocess_end/task_cancel are terminal (W8).
+    """
+
+    mod = wiro
+    type = mod.KIND
+
+    def __init__(self, backend: dict, ctx: AdapterContext):
+        super().__init__(backend, ctx)
+        self.model_catalogs: dict[str, dict[str, dict]] = {}
+        self._live_task_ids: dict[str, str] = {}       # gateway job id → wiro task id
+
+    def _api(self, path: str) -> str:
+        return (self.backend.get("media_url") or wiro.MEDIA_URL).rstrip("/") + path
+
+    def _headers(self) -> dict:
+        return wiro.signature_headers(self.backend.get("api_key"))
+
+    def _redact(self, text: str) -> str:
+        return wiro.redact(text, self.backend.get("api_key"))
+
+    def _msg(self, response) -> str:
+        return self._redact(response.text)[:300]
+
+    def adopt_state(self, old: BackendAdapter) -> None:
+        super().adopt_state(old)
+        if (isinstance(old, WiroMediaAdapter)
+                and old.backend.get("url") == self.backend.get("url")
+                and old.backend.get("api_key") == self.backend.get("api_key")
+                and old.backend.get("media_url") == self.backend.get("media_url")):
+            self.model_catalogs = copy.deepcopy(old.model_catalogs)
+
+    async def discover(self, client: httpx.AsyncClient) -> Capabilities:
+        # Only the registered composite publishes a complete catalog snapshot.
+        raise NotImplementedError("wiro discovery belongs to the composite account")
+
+    async def _fetch_snapshot(self, client: httpx.AsyncClient) -> tuple[Capabilities, dict]:
+        """Every Tool/List page → (caps, catalogs), publishing nothing. Tool/List is
+        PUBLIC: no account headers on it, and a refused page (result:false or an
+        unexpected envelope) fails the whole refresh — a partial catalog must never
+        validate a paid submit."""
+        rows, start, limit = [], 0, 100
+        while True:
+            raw = await asyncio.to_thread(
+                lambda: json.dumps({"start": str(start), "limit": str(limit),
+                                    "hideworkflows": True}).encode())
+            response = await client.post(self._api("/Tool/List"), content=raw,
+                headers={"Content-Type": "application/json"},
+                timeout=_NANOGPT_DISCOVERY_TIMEOUT)
+            response.raise_for_status()
+            payload = await asyncio.to_thread(response.json)
+            if not isinstance(payload, dict) or payload.get("result") is not True:
+                raise RuntimeError("wiro Tool/List refused the catalog request")
+            page = payload.get("tool")
+            if not isinstance(page, list):
+                raise RuntimeError("wiro Tool/List returned no tool list")
+            rows.extend(page)
+            if len(page) < limit:
+                break
+            start += limit
+        catalogs = await asyncio.to_thread(self._parse_catalog, rows)
+        return Capabilities(models=set().union(*(set(c) for c in catalogs.values())),
+                            pricing={}, context={}), catalogs
+
+    def _parse_catalog(self, rows) -> dict:
+        catalogs: dict[str, dict[str, dict]] = {endpoint: {} for endpoint in wiro.ENDPOINTS}
+        for row in rows:
+            if not isinstance(row, dict):
+                raise RuntimeError("wiro Tool/List returned an invalid tool entry")
+            entry = wiro.tool_metadata(row)
+            if entry is None:                    # realtime / llm / chat / uncategorized
+                continue
+            model, endpoint, metadata = entry
+            catalogs[endpoint][model] = metadata
+        for endpoint in wiro.ENDPOINTS:
+            kept = filter_models(set(catalogs[endpoint]), self.backend)
+            catalogs[endpoint] = {mid: catalogs[endpoint][mid] for mid in kept}
+        return catalogs
+
+    async def _run(self, client, req: NormalizedRequest, cand: dict, opts: dict,
+                   poll_interval: float, max_wait: float) -> RunResult:
+        endpoint = wiro.endpoint_of(cand)
+        model = cand.get("model") or req.real_model
+        # The run body is built from the model's own parameter list (catalog snapshot);
+        # without it every client value would read as unknown.
+        meta = self.model_catalogs.get(endpoint, {}).get(model)
+        if meta is None:
+            raise wiro.INPUT_ERROR(f"wiro model is unavailable for {endpoint}")
+        cand = {**cand, "model_metadata": meta}
+        body, parts = await asyncio.to_thread(
+            wiro.build_request, cand, {**req.params, **req.inputs},
+            req.upload_images or {}, req.upload_files or {})
+        url = self._api(f"/Run/{model}")
+        started = time.monotonic()
+        # The submit POST carries the inputs and gets its own size-scaled budget; a
+        # connect/pool failure never reached the vendor and may fail over (G3).
+        size = len(json.dumps(body)) + sum(len(data) for _, _, data in (parts or []))
+        timeout = httpx.Timeout(max(120.0, size / (1024 * 1024) * 4), connect=30.0,
+                                write=max(60.0, size / (1024 * 1024) * 4), pool=30.0)
+        if parts:
+            data_fields = {key: (json.dumps(value) if not isinstance(value, str) else value)
+                           for key, value in body.items()}
+            file_fields = [(fid, (filename, data, _mime_and_kind(filename)[0]))
+                           for fid, filename, data in parts]
+            posting = client.post(url, headers=self._headers(), data=data_fields,
+                                  files=file_fields, timeout=timeout)
+        else:
+            raw = await asyncio.to_thread(lambda: json.dumps(body).encode())
+            posting = client.post(url, content=raw,
+                headers={**self._headers(), "Content-Type": "application/json"}, timeout=timeout)
+        try:
+            response = await posting
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
+            raise                        # nothing was sent: failover is safe
+        except (httpx.HTTPError, ConnectionError, TimeoutError) as error:
+            # Sent, answer lost: wiro may have created (and will bill) the task —
+            # never re-POST it (W7), and the trace says why (create_unconfirmed).
+            req.cloud_trace.update(backend=self.name, cloud=wiro.KIND, endpoint=endpoint,
+                create_unconfirmed=True, request=wiro.request_summary(body, parts))
+            raise RuntimeError("wiro submit outcome is uncertain; generation will not be retried"
+                               ) from error
+        if response.status_code in (401, 403):
+            raise RuntimeError(f"wiro authentication failed ({response.status_code}): "
+                               f"{self._msg(response)}")
+        if response.status_code == 429:
+            retry_after = response.headers.get("retry-after")
+            error = CloudBusy(f"wiro rate limited: {self._msg(response)}", vendor=self.vendor)
+            error.retry_after = retry_after
+            raise error
+        if response.status_code >= 500:
+            raise RuntimeError(f"wiro run HTTP {response.status_code}: {self._msg(response)}")
+        payload = await asyncio.to_thread(response.json) if response.content else {}
+        created = wiro.run_created(payload)
+        if created is None:
+            code = wiro.error_code(payload)
+            message = self._redact(wiro.error_message(payload))
+            if code == 96:
+                raise CloudTaskRetryable(f"wiro concurrency limit: {message}", vendor=self.vendor)
+            if code == 97:
+                raise CloudNoCredits(f"wiro: {message}", vendor=self.vendor)
+            if code in (98, 99):
+                raise RuntimeError(f"wiro authentication failed (code {code}): {message}")
+            # 0/1 and anything else: the vendor's verdict on the INPUT or the model —
+            # nothing was created, but it fails the same way on every candidate.
+            raise RuntimeError(f"wiro refused the task (code {code}): {message}")
+        task_id, token = created
+        req.cloud_trace.update(backend=self.name, cloud=wiro.KIND, endpoint=endpoint,
+            cloud_task_id=task_id, request=wiro.request_summary(body, parts))
+        req.cloud_trace.setdefault("tasks", []).append({"role": endpoint, "task_id": task_id})
+        if req.job_id:
+            self._live_task_ids[req.job_id] = task_id
+            self.ctx.note_job_meta(req.job_id, copy.deepcopy(req.cloud_trace))
+        state = await self._poll(client, endpoint, token, [], opts, poll_interval,
+                                 max_wait - (time.monotonic() - started))
+        extra = {}
+        if state.credits is not None:            # wiro's totalcost is USD, not credits
+            extra["cost_usd"], state.credits = state.credits, None
+        return RunResult(task_id, endpoint, body, state, extra)
+
+    async def _task_request(self, client, endpoint: str, task_token: str):
+        # Poll by tasktoken (the socketaccesstoken from Run), never the numeric id.
+        raw = await asyncio.to_thread(lambda: json.dumps({"tasktoken": task_token}).encode())
+        return await client.post(self._api("/Task/Detail"), content=raw,
+            headers={**self._headers(), "Content-Type": "application/json"})
+
+    def _task_body(self, r) -> dict:
+        try:
+            task = wiro.task_of_detail(json.loads(self._redact(r.text) or "{}"))
+        except (wiro.WiroInput, ValueError) as error:
+            raise _TaskVerdict(str(error)) from error
+        return task
+
+    async def cancel(self, job_id: str = "") -> None:
+        """Best-effort vendor stop for the fallback path: Kill covers queued AND
+        running tasks, and cancelled tasks are not billed (G4). The vendor's task id
+        sits in the live in-memory trace of the job (persisted via note_job_meta);
+        without it there is nothing to aim at. Never claims the vendor stopped."""
+        task_id = self._live_task_ids.get(job_id)
+        if not job_id or not task_id:
+            return
+        try:
+            async with httpx.AsyncClient(timeout=_CLOUD_HTTP_TIMEOUT) as client:
+                raw = json.dumps({"taskid": str(task_id)}).encode()
+                await client.post(self._api("/Task/Kill"), content=raw,
+                                  headers={**self._headers(), "Content-Type": "application/json"})
+        except Exception as error:
+            logger.warning(f"[{self.name}] wiro Task/Kill failed: {self._redact(str(error))}")
+
+    def _classify_create(self, r) -> Optional[str]:
+        return None                 # the run answer is classified inside _run (W7)
+
+    def _task_id_of(self, js: dict) -> str:
+        return ""
+
+    async def generate(self, req: NormalizedRequest) -> GenOutput:
+        try:
+            return await super().generate(req)
+        except asyncio.CancelledError:
+            # The gateway job was cancelled while the wiro task runs: Kill it (cancelled
+            # tasks are not billed). Shielded and bounded — the cancellation still wins;
+            # the job meta says a stop was REQUESTED, never that wiro stopped (G4).
+            if req.job_id and req.job_id in self._live_task_ids:
+                req.cloud_trace["stop_requested"] = True
+                self.ctx.note_job_meta(req.job_id, copy.deepcopy(req.cloud_trace))
+                try:
+                    await asyncio.wait_for(asyncio.shield(self.cancel(req.job_id)), 15.0)
+                except BaseException:
+                    pass
+            raise
+        finally:
+            self._live_task_ids.pop(req.job_id, None)
+
+
+class WiroAdapter(BackendAdapter):
+    """One wiro account: the llm.wiro.ai chat catalog and the api.wiro.ai task
+    catalogs share one identity, in-flight pool and discovery snapshot (G2)."""
+
+    type = wiro.KIND
+    serves_generation = True
+    cloud = True
+    bills = True
+
+    def discovery_interval_default(self) -> Optional[float]:
+        return CLOUD_CATALOG_INTERVAL_S
+
+    def __init__(self, backend: dict, ctx: AdapterContext):
+        super().__init__(backend, ctx)
+        self._text = WiroTextAdapter(backend, ctx)
+        self._media = WiroMediaAdapter(backend, ctx)
+        self.model_catalogs: dict[str, dict[str, dict]] = {}
+        self.display_media_catalogs: dict[str, dict[str, dict]] = {}
+
+    def _publish_catalogs(self, catalogs: dict) -> None:
+        self.model_catalogs = catalogs
+        if catalogs:
+            self.display_media_catalogs = {kind: catalogs[kind]
+                                           for kind in wiro.ENDPOINTS if kind in catalogs}
+        self._text.model_catalogs = {"text": catalogs["text"]} if "text" in catalogs else {}
+        self._media.model_catalogs = {kind: catalogs[kind]
+                                      for kind in wiro.ENDPOINTS if kind in catalogs}
+
+    async def discover(self, client: httpx.AsyncClient) -> Capabilities:
+        # NanoGPT rule: while a refresh is pending the last COMPLETE snapshot stays
+        # published; a FAILED refresh clears callable catalogs, so nothing the vendor
+        # did not just confirm validates a paid submit after an error.
+        try:
+            results = await asyncio.gather(self._text._fetch_snapshot(client),
+                                          self._media._fetch_snapshot(client),
+                                          return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+            (text, text_catalogs), (media, media_catalogs) = results
+            catalogs = {**text_catalogs, **media_catalogs}
+        except BaseException:
+            self._publish_catalogs({})
+            raise
+        self._publish_catalogs(catalogs)
+        return Capabilities(models=text.models | media.models, pricing=text.pricing,
+                            context=text.context)
+
+    def adopt_state(self, old: BackendAdapter) -> None:
+        if (not isinstance(old, WiroAdapter)
+                or old.backend.get("url") != self.backend.get("url")
+                or old.backend.get("api_key") != self.backend.get("api_key")
+                or old.backend.get("media_url") != self.backend.get("media_url")):
+            return
+        self._media.adopt_state(old._media)
+        for source, display_only in ((old.model_catalogs, False),
+                                     (old.display_media_catalogs, True)):
+            catalogs = copy.deepcopy(source)
+            for kind, metadata in catalogs.items():
+                kept = filter_models(set(metadata), self.backend)
+                catalogs[kind] = {mid: metadata[mid] for mid in kept}
+            if display_only:
+                self.display_media_catalogs = catalogs
+            else:
+                self._publish_catalogs(catalogs)
+
+    def adopt_discovery(self, old: BackendAdapter) -> None:
+        self.adopt_state(old)
+
+    async def dispatch(self, req: NormalizedRequest):
+        kind = ("tts" if req.path.startswith("/v1/audio/speech") else
+                "embedding" if req.path.startswith("/v1/embeddings") else "text")
+        if (req.real_model not in self.model_catalogs.get(kind, {})
+                and req.real_model not in parse_model_filter(self.backend.get("models_extra"))):
+            # The client's mistake (a media id on chat, …), not a backend failure:
+            # a deliberate 400, never a 502 + fault row against the account.
+            raise HTTPException(400, f"wiro model '{req.real_model}' is not a {kind} model")
+        return await self._text.dispatch(req)
+
+    async def generate(self, req: NormalizedRequest) -> GenOutput:
+        cand = {"model": req.real_model, wiro.KIND: req.cloud or {}}
+        endpoint = wiro.endpoint_of(cand)
+        if req.real_model not in self.model_catalogs.get(endpoint, {}):
+            raise wiro.INPUT_ERROR(f"wiro model is unavailable for {endpoint}")
+        return await self._media.generate(req)
+
+    async def cancel(self, job_id: str = "") -> None:
+        await self._media.cancel(job_id)
+
+
+# ── LU Labs composite text / media account ───────────────────────────────────
+
+_LULABS_MEM = "lulabs-mem://"      # an already-fetched result handed to the base run
+
+
+class LuLabsTextAdapter(OpenAIAdapter):
+    """LU's OpenAI-compatible chat. LU STREAMS BY DEFAULT: a body without `stream`
+    would come back as SSE while the gateway reads JSON — so the flag is always sent.
+    Chat prices are credits, not USD: no token pricing is published (unknown, not 0)."""
+
+    type = lulabs.KIND
+    bills = True
+    serves_generation = False
+
+    async def _fetch_snapshot(self, client: httpx.AsyncClient) -> tuple[Capabilities, dict]:
+        b = self.backend
+        resp = await client.get(f"{(b.get('url') or lulabs.URL).rstrip('/')}/v1/models",
+                                headers=self.ctx.auth_headers(b), timeout=_NANOGPT_DISCOVERY_TIMEOUT)
+        resp.raise_for_status()
+        payload = await asyncio.to_thread(resp.json)
+        models = filter_models(extract_models(payload, b), b)
+        metadata = extract_model_metadata(payload)
+        caps = Capabilities(models=models, pricing={}, context=extract_context(payload))
+        return caps, {"text": {mid: metadata.get(mid, {}) for mid in models}}
+
+    async def discover(self, client: httpx.AsyncClient) -> Capabilities:
+        raise NotImplementedError("LU Labs discovery belongs to the composite account")
+
+    async def dispatch(self, req: NormalizedRequest):
+        if (req.path.startswith("/v1/chat/completions") and isinstance(req.body, dict)
+                and "stream" not in req.body):
+            req = replace(req, body={**req.body, "stream": False})
+        return await super().dispatch(req)
+
+
+class LuLabsMediaAdapter(CloudTaskAdapter):
+    """LU's create API: upload inputs → free quote → ONE booked job (capped at the quote,
+    idempotent by client_request_id) → poll → /content. The one sanctioned re-POST of a
+    paid submit in this repo: the SAME body with the SAME client_request_id, because LU
+    answers it with the job already booked instead of a second one."""
+
+    mod = lulabs
+    type = mod.KIND
+
+    def __init__(self, backend: dict, ctx: AdapterContext):
+        super().__init__(backend, ctx)
+        self.model_catalogs: dict[str, dict[str, dict]] = {}
+        self._live_jobs: dict[str, str] = {}          # gateway job id → LU job id
+        self._fetched: dict[str, bytes] = {}          # in-memory results (see _run)
+
+    def _api(self, path: str) -> str:
+        return (self.backend.get("url") or lulabs.URL).rstrip("/") + "/v1" + path
+
+    def _redact(self, text: str) -> str:
+        key = (self.backend.get("api_key") or "").strip()
+        return text.replace(key, "[redacted]") if key and isinstance(text, str) else text
+
+    def _msg(self, response) -> str:
+        return self._redact(response.text)[:300]
+
+    def adopt_state(self, old: BackendAdapter) -> None:
+        super().adopt_state(old)
+        if (isinstance(old, LuLabsMediaAdapter)
+                and old.backend.get("url") == self.backend.get("url")
+                and old.backend.get("api_key") == self.backend.get("api_key")):
+            self.model_catalogs = copy.deepcopy(old.model_catalogs)
+
+    async def discover(self, client: httpx.AsyncClient) -> Capabilities:
+        raise NotImplementedError("LU Labs discovery belongs to the composite account")
+
+    async def _fetch_snapshot(self, client: httpx.AsyncClient) -> tuple[Capabilities, dict]:
+        resp = await client.get(self._api("/models"), params={"type": "create"},
+                                headers=self._headers(), timeout=_NANOGPT_DISCOVERY_TIMEOUT)
+        resp.raise_for_status()
+        payload = await asyncio.to_thread(resp.json)
+        catalogs = await asyncio.to_thread(lulabs.parse_create_catalog, payload)
+        for endpoint in lulabs.ENDPOINTS:
+            kept = filter_models(set(catalogs[endpoint]), self.backend)
+            catalogs[endpoint] = {mid: catalogs[endpoint][mid] for mid in kept}
+        return Capabilities(models=set().union(*(set(c) for c in catalogs.values())),
+                            pricing={}, context={}), catalogs
+
+    @staticmethod
+    def _payload(response):
+        try:
+            return response.json()
+        except ValueError:
+            return {}
+
+    def _refusal(self, response, what: str):
+        """A non-2xx answer that provably booked nothing → the gateway's error class."""
+        payload = self._payload(response)
+        code = lulabs.error_code(payload)
+        text = self._redact(lulabs.error_text(payload) or response.text[:300])
+        status = response.status_code
+        if status == 402 or code in ("credits_exhausted", "video_budget_exhausted"):
+            return CloudNoCredits(f"LU Labs {what}: {text}", vendor=self.vendor)
+        if status == 429:
+            error = CloudBusy(f"LU Labs {what} rate limited: {text}", vendor=self.vendor)
+            error.retry_after = response.headers.get("retry-after")
+            return error
+        if status == 503:
+            return CloudTaskRetryable(f"LU Labs {what} unavailable ({code or status}): {text}",
+                                      vendor=self.vendor)
+        if status in (401, 403):
+            return RuntimeError(f"LU Labs {what} refused ({status} {code}): {text}")
+        return RuntimeError(f"LU Labs {what} HTTP {status} {code}: {text}")
+
+    async def _upload(self, client, slot: str, filename: str, data: bytes) -> str:
+        role, _param = lulabs.SLOT_ROLES[slot]
+        mime = _mime_and_kind(filename)[0]
+        resp = await client.post(self._api("/files"), headers=self._headers(),
+                                 data={"role": role}, files={"file": (filename, data, mime)},
+                                 timeout=httpx.Timeout(connect=30.0, pool=30.0,
+                                                       read=max(120.0, len(data) / 2 ** 20 * 4),
+                                                       write=max(60.0, len(data) / 2 ** 20 * 4)))
+        if not 200 <= resp.status_code < 300:
+            raise self._refusal(resp, f"upload of {slot}")
+        path = (self._payload(resp) or {}).get("path")
+        if not isinstance(path, str) or not path.strip():
+            raise RuntimeError(f"LU Labs upload of {slot} returned no path")
+        return path
+
+    async def _run(self, client, req: NormalizedRequest, cand: dict, opts: dict,
+                   poll_interval: float, max_wait: float) -> RunResult:
+        endpoint = lulabs.endpoint_of(cand)
+        model = cand.get("model") or req.real_model
+        meta = self.model_catalogs.get(endpoint, {}).get(model)
+        if meta is None:
+            raise lulabs.INPUT_ERROR(f"LU Labs model is unavailable for {endpoint}")
+        cand = {**cand, "model_metadata": meta}
+        values = {**(req.inputs or {}), **(req.params or {})}
+        images, files = req.upload_images or {}, req.upload_files or {}
+        params = await asyncio.to_thread(lulabs.validate_request, cand, values,
+                                         images.keys(), files.keys())
+        started = time.monotonic()
+        # Uploads and the quote book nothing: a connect failure there may fail over.
+        paths = {}
+        for slot, data in images.items():
+            paths[lulabs.SLOT_ROLES[slot][1]] = await self._upload(client, slot, f"{slot}.png"
+                                                                   if not lulabs.sniff(data) else
+                                                                   f"{slot}.{lulabs.sniff(data)[0]}", data)
+        for slot, (filename, data) in files.items():
+            paths[lulabs.SLOT_ROLES[slot][1]] = await self._upload(client, slot, filename or slot, data)
+        crid = str(uuid.uuid4())
+        quote_body = lulabs.build_job(cand, params, values.get("prompt"), paths, crid)
+        raw = await asyncio.to_thread(lambda: json.dumps(quote_body).encode())
+        headers = {**self._headers(), "Content-Type": "application/json"}
+        resp = await client.post(self._api("/jobs/quote"), content=raw, headers=headers)
+        if not 200 <= resp.status_code < 300:
+            raise self._refusal(resp, "quote")
+        quoted = lulabs.quote_credits(self._payload(resp))
+        body = lulabs.build_job(cand, params, values.get("prompt"), paths, crid, quoted)
+        raw = await asyncio.to_thread(lambda: json.dumps(body).encode())
+        summary = lulabs.request_summary(body)
+        job_id, sent = "", False
+        for attempt in range(lulabs.SUBMIT_ATTEMPTS):
+            last = attempt == lulabs.SUBMIT_ATTEMPTS - 1
+            try:
+                resp = await client.post(self._api("/jobs"), content=raw, headers=headers,
+                                         timeout=httpx.Timeout(connect=30.0, read=120.0,
+                                                               write=60.0, pool=30.0))
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
+                if not sent:
+                    raise                     # nothing ever reached LU: failover is safe
+                error = None                  # an earlier attempt may have booked: same id again
+            except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
+                sent, error = True, e
+            else:
+                sent = True
+                if 200 <= resp.status_code < 300:
+                    job_id = lulabs.job_id_of(self._payload(resp))
+                    if not job_id:
+                        req.cloud_trace.update(backend=self.name, cloud=lulabs.KIND,
+                            endpoint=endpoint, create_unconfirmed=True, request=summary)
+                        raise RuntimeError("LU Labs accepted the job but returned no id")
+                    break
+                if attempt == 0 and (resp.status_code < 500 or resp.status_code == 503):
+                    # The first answer, a refusal (4xx; 503 = media_not_live /
+                    # model_unavailable): nothing was booked.
+                    raise self._refusal(resp, "job")
+                if resp.status_code < 500:
+                    req.cloud_trace.update(backend=self.name, cloud=lulabs.KIND,
+                        endpoint=endpoint, create_unconfirmed=True, request=summary)
+                    raise RuntimeError(f"LU Labs job re-submit answered {resp.status_code} "
+                                       f"after an uncertain first attempt: {self._msg(resp)}")
+                error = RuntimeError(f"LU Labs job HTTP {resp.status_code}: {self._msg(resp)}")
+            req.cloud_trace.update(backend=self.name, cloud=lulabs.KIND, endpoint=endpoint,
+                                   create_unconfirmed=True, request=summary)
+            if last:
+                raise RuntimeError("LU Labs submit outcome is uncertain after "
+                                   f"{lulabs.SUBMIT_ATTEMPTS} attempts with one "
+                                   f"client_request_id ({crid}); not re-created") from error
+            await asyncio.sleep(min(2.0 * (attempt + 1), 5.0) if poll_interval else 0)
+        req.cloud_trace.pop("create_unconfirmed", None)
+        self._note_task(req, job_id, endpoint, body)
+        req.cloud_trace["client_request_id"] = crid
+        if req.job_id:
+            self._live_jobs[req.job_id] = job_id
+            self.ctx.note_job_meta(req.job_id, copy.deepcopy(req.cloud_trace))
+        state = await self._poll(client, endpoint, job_id, [], opts, poll_interval,
+                                 max_wait - (time.monotonic() - started))
+        # /content is the documented delivery (a fresh signed link); result URLs in the
+        # job JSON are only the fallback. Fetched HERE — the file's type is known only from
+        # its bytes — and handed to the base run as an in-memory download, so a concurrent
+        # job on this adapter can never pick up another job's file.
+        data, last_error = b"", None
+        for url in [self._api(f"/jobs/{job_id}/content")] + [u for _, u in state.downloads]:
+            try:
+                data = await self._fetch_result(client, url)
+            except (httpx.HTTPError, ConnectionError, TimeoutError, RuntimeError) as e:
+                last_error = e
+                continue
+            if data:
+                break
+        if not data:
+            # Billed and done: never a failover-class error (it would book the job twice).
+            raise CloudArtifactLost(f"LU Labs result download failed after the paid job "
+                                    f"{job_id}: {self._redact(str(last_error))}", vendor=self.vendor)
+        found = lulabs.sniff(data)
+        if found is None:
+            raise RuntimeError(f"LU Labs job {job_id} returned an unrecognised file")
+        token = uuid.uuid4().hex
+        self._fetched[token] = data
+        state.downloads = [(f"result.{found[0]}", _LULABS_MEM + token)]
+        extra = {"quoted_credits": quoted} if quoted is not None else {}
+        return RunResult(job_id, endpoint, body, state, extra)
+
+    async def _task_request(self, client, endpoint: str, task_id: str):
+        return await client.get(self._api(f"/jobs/{task_id}"), headers=self._headers())
+
+    def _task_body(self, r) -> dict:
+        # The job's error text ends up on the job row: never with the key in it.
+        try:
+            return json.loads(self._redact(r.text) or "{}")
+        except ValueError as e:                  # a garbled 200 is counted like a 4xx
+            raise _TaskVerdict("LU Labs job status is not JSON") from e
+
+    async def _download(self, client, url: str) -> bytes:
+        if url.startswith(_LULABS_MEM):
+            return self._fetched.pop(url[len(_LULABS_MEM):])
+        return await CloudTaskAdapter._download(client, url)
+
+    async def _fetch_result(self, client, url: str) -> bytes:
+        """`/jobs/{id}/content` is authenticated and REDIRECTS to the file: fetch it with
+        the key and without following, then the target WITHOUT the key (a CDN must never
+        see it). A result URL from the job JSON is a plain credential-free download."""
+        if not url.startswith(self._api("/jobs/")):
+            return await CloudTaskAdapter._download(client, url)
+        resp = await client.get(url, headers=self._headers(), follow_redirects=False,
+                                timeout=_CLOUD_DOWNLOAD_TIMEOUT)
+        if resp.is_redirect and resp.headers.get("location"):
+            return await CloudTaskAdapter._download(client, urljoin(url, resp.headers["location"]))
+        if resp.status_code == 200:
+            return resp.content
+        raise RuntimeError(f"LU Labs result download failed ({resp.status_code})")
+
+    async def generate(self, req: NormalizedRequest) -> GenOutput:
+        try:
+            return await super().generate(req)
+        except asyncio.CancelledError:
+            job_id = self._live_jobs.get(req.job_id or "")
+            if job_id:
+                req.cloud_trace["stop_requested"] = True
+                self.ctx.note_job_meta(req.job_id, copy.deepcopy(req.cloud_trace))
+                try:
+                    await asyncio.wait_for(asyncio.shield(self.cancel(req.job_id)), 15.0)
+                except BaseException:
+                    pass
+            raise
+        finally:
+            self._live_jobs.pop(req.job_id or "", None)
+
+    async def cancel(self, job_id: str = "") -> None:
+        """Best-effort: LU cancels (and refunds) only a still-QUEUED job; a running one
+        answers 409 and finishes. Never claims the vendor stopped."""
+        lu_job = self._live_jobs.get(job_id)
+        if not job_id or not lu_job:
+            return
+        try:
+            async with httpx.AsyncClient(timeout=_CLOUD_HTTP_TIMEOUT) as client:
+                await client.post(self._api(f"/jobs/{lu_job}/cancel"), headers=self._headers())
+        except Exception as error:
+            logger.warning(f"[{self.name}] LU Labs cancel failed: {self._redact(str(error))}")
+
+    def _classify_create(self, r) -> Optional[str]:
+        return None
+
+    def _task_id_of(self, js: dict) -> str:
+        return ""
+
+
+class LuLabsAdapter(BackendAdapter):
+    """One LU account: chat and the create catalog share one identity, one in-flight
+    pool and one discovery snapshot (NanoGPT/Venice composite rules)."""
+
+    type = lulabs.KIND
+    serves_generation = True
+    cloud = True
+    bills = True
+
+    def discovery_interval_default(self) -> Optional[float]:
+        return CLOUD_CATALOG_INTERVAL_S
+
+    def __init__(self, backend: dict, ctx: AdapterContext):
+        super().__init__(backend, ctx)
+        self._text = LuLabsTextAdapter(backend, ctx)
+        self._media = LuLabsMediaAdapter(backend, ctx)
+        self.model_catalogs: dict[str, dict[str, dict]] = {}
+        self.display_media_catalogs: dict[str, dict[str, dict]] = {}
+
+    def _publish_catalogs(self, catalogs: dict) -> None:
+        self.model_catalogs = catalogs
+        if catalogs:
+            self.display_media_catalogs = {kind: catalogs[kind]
+                                           for kind in lulabs.ENDPOINTS if kind in catalogs}
+        self._text.model_catalogs = {"text": catalogs["text"]} if "text" in catalogs else {}
+        self._media.model_catalogs = {kind: catalogs[kind]
+                                      for kind in lulabs.ENDPOINTS if kind in catalogs}
+
+    async def discover(self, client: httpx.AsyncClient) -> Capabilities:
+        try:
+            results = await asyncio.gather(self._text._fetch_snapshot(client),
+                                          self._media._fetch_snapshot(client),
+                                          return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+            (text, text_catalogs), (media, media_catalogs) = results
+            catalogs = {**text_catalogs, **media_catalogs}
+        except BaseException:
+            self._publish_catalogs({})
+            raise
+        self._publish_catalogs(catalogs)
+        return Capabilities(models=text.models | media.models, pricing=text.pricing,
+                            context=text.context)
+
+    def adopt_state(self, old: BackendAdapter) -> None:
+        if (not isinstance(old, LuLabsAdapter)
+                or old.backend.get("url") != self.backend.get("url")
+                or old.backend.get("api_key") != self.backend.get("api_key")):
+            return
+        self._media.adopt_state(old._media)
+        for source, display_only in ((old.model_catalogs, False),
+                                     (old.display_media_catalogs, True)):
+            catalogs = copy.deepcopy(source)
+            for kind, metadata in catalogs.items():
+                kept = filter_models(set(metadata), self.backend)
+                catalogs[kind] = {mid: metadata[mid] for mid in kept}
+            if display_only:
+                self.display_media_catalogs = catalogs
+            else:
+                self._publish_catalogs(catalogs)
+
+    def adopt_discovery(self, old: BackendAdapter) -> None:
+        self.adopt_state(old)
+
+    async def dispatch(self, req: NormalizedRequest):
+        if (req.real_model not in self.model_catalogs.get("text", {})
+                and req.real_model not in parse_model_filter(self.backend.get("models_extra"))):
+            raise HTTPException(400, f"LU Labs model '{req.real_model}' is not a chat model")
+        return await self._text.dispatch(req)
+
+    async def generate(self, req: NormalizedRequest) -> GenOutput:
+        cand = {"model": req.real_model, lulabs.KIND: req.cloud or {}}
+        endpoint = lulabs.endpoint_of(cand)
+        if req.real_model not in self.model_catalogs.get(endpoint, {}):
+            raise lulabs.INPUT_ERROR(f"LU Labs model is unavailable for {endpoint}")
+        return await self._media.generate(req)
+
+    async def cancel(self, job_id: str = "") -> None:
+        await self._media.cancel(job_id)
+
+
 # ── Meshy.ai (cloud image → 3D) ───────────────────────────────────────────────
 
 _MESHY_API = "/openapi/v1"
@@ -6743,6 +7462,8 @@ ADAPTERS: dict[str, type[BackendAdapter]] = {
     "openai": OpenAIAdapter,
     "nanogpt": NanoGPTAdapter,
     "venice": VeniceAdapter,
+    "wiro": WiroAdapter,
+    "lulabs": LuLabsAdapter,
     "anthropic": AnthropicAdapter,
     "comfyui": ComfyUIAdapter,
     "meshy": MeshyAdapter,

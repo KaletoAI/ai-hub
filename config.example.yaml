@@ -216,6 +216,23 @@ backends:
   #   max_wait: 1800
   #   poll_interval: 5
 
+  # wiro.ai: chat via llm.wiro.ai + image/video/audio/TTS/ASR tasks via api.wiro.ai.
+  # api_key is KEY (key-only project) or KEY:SECRET (signature project). Always paid.
+  # - name: wiro
+  #   type: wiro
+  #   url: https://llm.wiro.ai
+  #   api_key: "<KEY or KEY:SECRET>"
+  #   max_concurrent: 2
+  #   max_wait: 1800
+  #   poll_interval: 3
+
+  # LU Labs (LU Cloud): chat + image/video/speech/music jobs from one credit wallet.
+  # - name: lu
+  #   type: lulabs
+  #   url: https://lu-labs.ai/api/inference
+  #   api_key: "lu_…"
+  #   max_concurrent: 1
+
   # - name: anthropic-sub               # Claude Code frontdoor — see README
   #   type: anthropic                   # reachable through /v1/messages ONLY
   #   url: https://api.anthropic.com

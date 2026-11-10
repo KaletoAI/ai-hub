@@ -5048,7 +5048,7 @@ async def run_generation(body: dict, request: Request,
             adapter = backend_adapters.get(backend_id(backend))
             catalog = getattr(adapter, "model_catalogs", {})
             endpoint = mod.endpoint_of(c0)
-            if kind == "venice" and not catalog:
+            if kind in ("venice", "wiro", "lulabs") and not catalog:
                 # No snapshot YET (a key/URL change starts a fresh adapter; a failed
                 # refresh clears it) — the gateway's state, not the client's input.
                 raise HTTPException(503, f"{mod.VENDOR} catalog is not discovered yet — retry shortly",
@@ -5724,9 +5724,14 @@ async def images_edits(request: Request, authorization: Optional[str] = Header(N
     routes = await asyncio.to_thread(get_gen_routes, alias)
     kind = adapters.cloud_kind(routes[0][1]) if routes else None
     catalog_media = kind in adapters.DYNAMIC_CATALOG_TYPES
-    if catalog_media and masks:
+    # LU Labs edits declare [source_image, mask_image]: one image + its mask land there
+    # positionally. Elsewhere a mask has no fixed slot on a catalog model.
+    if catalog_media and masks and not (kind == "lulabs" and len(images) == 1 and len(masks) == 1):
         detail = ("NanoGPT mask edits require params.maskDataUrl on /v1/generations"
-                  if kind == "nanogpt" else "Venice image editing does not support a mask channel")
+                  if kind == "nanogpt" else
+                  "Venice image editing does not support a mask channel" if kind == "venice" else
+                  f"send the mask to /v1/generations in the model's own mask slot "
+                  f"({', '.join(slots)})")
         raise HTTPException(400, detail)
     if catalog_media and len(images) > len(slots):
         raise HTTPException(400, f"model accepts at most {len(slots)} reference images")

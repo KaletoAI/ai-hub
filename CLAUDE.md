@@ -67,7 +67,7 @@ must be in both AND in `.gitignore`, or `rsync --delete` wipes it on prod: `conf
 
 ## Architecture map
 
-Thirty-one Python files at the top level (`ls *.py` is the count of record), tests in
+Thirty-three Python files at the top level (`ls *.py` is the count of record), tests in
 `tests/`, scripts that run on OTHER boxes in `ops/` (`ops/runpod/` is the RunPod worker's Docker build context). `main.py` owns all app state as
 module globals; **no other module imports `main`** — they get what they need through
 injected callables (`AdapterContext`, `admin.bind(...)`, hostctl `Deps`) and stay
@@ -77,7 +77,8 @@ hot-reload-safe. Modules marked *pure* do no I/O and import neither `main` nor
 | Module | Role |
 |---|---|
 | `main.py` | Config load/hot reload, discovery loop, routing, every HTTP endpoint, auth/quotas, parking, generation orchestration, Responses bridge endpoints. `load_config` → `rebuild_backends` / `rebuild_virtual_models` → `rebuild_route_index`; `refresh_backend` = discovery; `build_backend_adapters` keeps unchanged adapter instances (`adopt_state`). |
-| `adapters.py` | Per-backend protocol seam: `OpenAIAdapter` (chat/completions/embeddings/TTS, stream normalizer), `AnthropicAdapter` (verbatim `/v1/messages` passthrough), `ComfyUIAdapter` (workflow mapping, bypass/prune, watchdog, ws progress, targeted stop), `CloudTaskAdapter` + `MeshyAdapter`/`TripoAdapter`, `RunpodAdapter` (ComfyUI workflows on RunPod Serverless, via the `GenIO` build seam). |
+| `adapters.py` | Per-backend protocol seam: `OpenAIAdapter` (chat/completions/embeddings/TTS, stream normalizer), `AnthropicAdapter` (verbatim `/v1/messages` passthrough), `ComfyUIAdapter` (workflow mapping, bypass/prune, watchdog, ws progress, targeted stop), `CloudTaskAdapter` + `MeshyAdapter`/`TripoAdapter`, `RunpodAdapter` (ComfyUI workflows on RunPod Serverless, via the `GenIO` build seam), `WiroAdapter` / `LuLabsAdapter` (composite chat + media accounts). |
+| `wiro.py`, `lulabs.py` | *Pure* halves of the wiro.ai and LU Labs composite accounts (catalog rows → endpoints, native fields, request bodies, task/job states). |
 | `meshy.py`, `tripo.py` | *Pure* halves of the cloud 3D vendors; same duck-typed module interface (`KIND`, `ENDPOINTS`, `OPTION_FIELDS`, `build_request`, `parse_task`, …). |
 | `cloudtask.py` | *Pure* leaf for both: `TaskState`, the `opt__<key>` option-form reader/writer. |
 | `s3vol.py` | S3 SigV4 client for RunPod volumes. |

@@ -133,6 +133,62 @@ def venice_from(pricing) -> Optional[dict]:
     return None
 
 
+_WIRO_UNITS = {"cpr": (1, "run"), "cpo": (1, "run"), "cp-outputVideoLength": (1, "second"),
+               "cp-audiosecondslength": (1, "second"), "cp-promptlength": (1000, "1k chars")}
+
+
+def wiro_from(dynamicprice, endpoint: str = "") -> Optional[dict]:
+    """wiro `dynamicprice` (a JSON STRING in Tool/List, a list in Tool/Detail):
+    `[{inputs, price, priceMethod}]`. Per request (cpr) / per output (cpo) first, then
+    per-second and per-prompt-character rates. Output-metered prices (cp-readoutput,
+    usually `price: 0` plus a note) and per-pixel/token ones stay unknown — a 0 there
+    would show a paid model as free."""
+    if isinstance(dynamicprice, str):
+        try:
+            import json
+            dynamicprice = json.loads(dynamicprice)
+        except ValueError:
+            return None
+    if not isinstance(dynamicprice, list):
+        return None
+    by_unit: dict = {}
+    for row in dynamicprice:
+        if not isinstance(row, dict) or row.get("priceMethod") not in _WIRO_UNITS:
+            continue
+        factor, unit = _WIRO_UNITS[row["priceMethod"]]
+        x = _num(row.get("price"))
+        if x is None or x <= 0:
+            continue
+        if unit == "run" and endpoint == "image":
+            unit = "image"
+        by_unit[unit] = min(by_unit.get(unit, x * factor), x * factor)
+    for unit in ("image", "run", "second", "1k chars"):
+        if unit in by_unit:
+            return _price(by_unit[unit], unit)
+    return None
+
+
+def lulabs_from(meta) -> Optional[dict]:
+    """LU Labs `credits` (a number, or nested per duration/second/resolution): the
+    smallest figure as credits per run — LU sells credits in EUR packs and plans, so
+    no USD rate is assumed."""
+    found = []
+
+    def walk(v):
+        x = _num(v)
+        if x is not None:
+            if x > 0:
+                found.append(x)
+        elif isinstance(v, dict):
+            for w in v.values():
+                walk(w)
+        elif isinstance(v, (list, tuple)):
+            for w in v:
+                walk(w)
+    walk((meta or {}).get("credits"))
+    return {"credits": min(found), "unit": "run"} if found else None
+
+
 def from_price(kind: str, cand: dict, backend: dict) -> Optional[dict]:
     """The candidate's from-price. `kind` = its cloud kind (nanogpt, venice, tripo, meshy,
     arliai) or the backend type for a workflow backend (comfyui, runpod)."""
@@ -146,6 +202,10 @@ def from_price(kind: str, cand: dict, backend: dict) -> Optional[dict]:
         # A flat `generation` price on an image endpoint is per image (one per request).
         if found and found["unit"] == "run" and (cand.get("venice") or {}).get("endpoint") in ("images", "edit"):
             found["unit"] = "image"
+    elif kind == "wiro":
+        found = wiro_from(meta.get("dynamicprice"), (cand.get("wiro") or {}).get("endpoint") or "")
+    elif kind == "lulabs":
+        found = lulabs_from(meta)
     elif kind == "tripo":
         # tripo.py: 20 credits per generation without texture (30 with), 25 per rig.
         rig = ((cand.get("tripo") or {}).get("endpoint") or "") == "rig"

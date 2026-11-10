@@ -1370,6 +1370,11 @@ def _type_badge(t: str) -> str:
         return _badge("NanoGPT", "llm", "NanoGPT text, speech, embeddings, images, video and 3D (paid)")
     if t == "venice":
         return _badge("Venice", "llm", "Venice text, embeddings, images, video and audio (API account billing)")
+    if t == "wiro":
+        return _badge("wiro", "llm", "wiro.ai chat (llm.wiro.ai) and task-API images, video, speech and "
+                                     "music (paid, USD per run)")
+    if t == "lulabs":
+        return _badge("LU Labs", "llm", "LU Labs chat, images, video, speech and music (one credit wallet)")
     if t in adapters.CLOUD_TYPES:
         mod = adapters.cloud_module(t)
         return _badge(f"☁ {t}", "img", f"{mod.VENDOR} cloud mesh generation (paid, per task)")
@@ -1858,6 +1863,10 @@ def _type_tab_label(t: str) -> str:
         return "NanoGPT"
     if t == "venice":
         return "Venice"
+    if t == "wiro":
+        return "wiro"
+    if t == "lulabs":
+        return "LU Labs"
     if t in adapters.CLOUD_TYPES:
         return "Cloud task API"
     if t == "anthropic":
@@ -2029,6 +2038,10 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
               "and 3D with one API key (always <b>paid</b>). "
               "<b>venice</b> = Venice text, embeddings, images, video and audio with one "
               "API key (API account billing; web Pro inclusion does not imply free API usage). "
+              "<b>wiro</b> = wiro.ai chat plus images, video, speech and music from its task API; "
+              "API key <code>KEY</code> or <code>KEY:SECRET</code> for a signature project (always "
+              "<b>paid</b>). <b>lulabs</b> = LU Labs (LU Cloud) chat plus images, video, speech and "
+              "music from one credit wallet; key <code>lu_…</code> (always <b>paid</b>). "
               "<b>anthropic</b> = api.anthropic.com for Claude Code, reachable through "
               "<code>/v1/messages</code> only.</p>"
             # A managed host's backend has a DERIVED url (its tunnel port) — readonly,
@@ -2150,7 +2163,7 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
               "million tokens. Shown in the Playground and the alias editor before a request is "
               "sent, published as <code>pricing</code> in <code>/v1/models</code> (OpenRouter's "
               "per-token schema) and used for the LLM Calls cost. A rule beats the price list "
-              "discovery reads (OpenRouter, Together, NanoGPT, Venice); write one for a vendor whose "
+              "discovery reads (OpenRouter, Together, NanoGPT, Venice, wiro); write one for a vendor whose "
               "listing names no prices (OpenAI, Anthropic). Without either, an <b>unpaid</b> backend "
               "counts as free and a <b>paid</b> one as unknown — never as 0. A cache rate left out "
               "bills as input.</p>"
@@ -5466,7 +5479,7 @@ async def routing_page(request: Request):
         img_on_llm = [m for m in snap.get("models", []) if _is_image_model(m["model"])]
         title, body = "Image models", (
             "<h2>Image models → backends</h2>"
-            "<p class='hint'>Image catalogs of cloud accounts (NanoGPT, Venice — callable "
+            "<p class='hint'>Image catalogs of cloud accounts (NanoGPT, Venice, wiro, LU Labs — callable "
             "as <code>backend/model</code> or bare), plus image models served by LLM "
             "backends (e.g. flux.* on localai — matched by name, no type metadata). "
             "ComfyUI checkpoints are reached through media aliases.</p>"
@@ -6486,7 +6499,7 @@ def _register_form(vals: Optional[dict] = None, err: str = "") -> str:
                 "file field.</p>") if err else "")
             + "<p class='hint'>The gateway <b>owns</b> the API JSON once registered — independent of "
             "later ComfyUI-GUI edits. You'll map fields after registering. For a <b>cloud</b> backend "
-            "(meshy, tripo, arliai, nanogpt, venice) no JSON is needed — the alias is created with that vendor's defaults and "
+            "(meshy, tripo, arliai, nanogpt, venice, wiro, lulabs) no JSON is needed — the alias is created with that vendor's defaults and "
             "edited next.</p>"
             + _field("alias", _inp("alias", v.get("alias", ""), placeholder="flux"))
             + _field("backend", _select("backend", backend_opts, v.get("backend")))
