@@ -1360,7 +1360,8 @@ OpenAI-compatible LLM endpoint (`https://llm.wiro.ai/v1`, discovered with
 `?limit=1000`); media runs as tasks on `https://api.wiro.ai/v1` (`Run` →
 `Task/Detail` → output download). The media catalog (`Tool/List`, about 400 media
 models) is read in full at discovery; each model lands on exactly one endpoint by its
-wiro categories — `image`, `video`, `audio` (music, voice conversion), `tts` or `asr`.
+wiro categories — `image`, `video`, `audio` (music, voice conversion), `speech` (TTS) or
+`asr` (transcripts arrive as a text file).
 Realtime and LLM rows are not media.
 
 ```yaml
@@ -1386,7 +1387,9 @@ wiro's catalog defaults for **controls** (selects, numbers, checkboxes) are sent
 when the client is silent; its defaults for **files and prose** are vendor samples
 and are never sent — a required prompt or input image without a value is a 400.
 Unknown parameters are a 400 before anything is paid. `negative_prompt` maps onto a
-model's `negativePrompt`.
+model's `negativePrompt`; the OpenAI Images shim's `size` maps onto the model's
+`width`/`height` or a matching `aspectRatio`, its `n` onto `samples`, and its other
+generic keys (`quality`, `style`, …) are dropped when the model has no such control.
 
 A submitted task is never re-submitted: a lost answer is final (the job names the
 task). A refusal that created nothing (concurrency limit, code 96) may fail over; no
@@ -1417,13 +1420,14 @@ booked with that quote as its `max_credits` cap, then polled and fetched from
 | `image-removebg` / `image-upscale` | `removebg` / `upscale` | `source_image` (+ `target_resolution` 2k/4k/8k) |
 | `video` | `generate`, or `animate` when `source_image` is sent | prompt, `duration` (the model's published durations), `seed` |
 | `video-lipsync` / `video-motion` | `lipsync` / `motion` | `audio` + `source_image` or `video` / `source_image` + `video` |
-| `tts` / `music` | `tts` (optional `audio` voice clone) / `music` | prompt, `duration` (music) |
+| `speech` / `music` | `tts` (optional `audio` voice clone) / `music` | prompt, `duration` (music) |
 
 Ids are `lu/<model>` (e.g. `lu/flux-dev`); the OpenAI edits shim maps one image and
 its mask onto `source_image` / `mask_image`. One job delivers one result (`n` must be
 1). Every job carries a `client_request_id`: a lost answer to the booking call is
 re-sent **with the same id** (LU answers with the job it already booked) — never a
-new booking and never on another backend. Chat prices are credits, not USD: chat
+new booking and never on another backend. A quote whose credits cannot be read books
+nothing. The OpenAI shim's `quality`/`style`/`background`/`output_format` are dropped. Chat prices are credits, not USD: chat
 cost in the stats stays 0 unless a `model_pricing` rule sets one. Cancelling a
 gateway job asks LU to cancel the job; LU only cancels (and refunds) a job that is
 still queued.

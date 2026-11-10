@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import math
 
-from cloudtask import TaskState
+from cloudtask import TaskState, sniff as cloudtask_sniff
 
 KIND, VENDOR, URL = "lulabs", "LU Labs", "https://lu-labs.ai/api/inference"
 # endpoint → (job kind, ops in preference order). `image` and `video` hold two ops each:
@@ -26,7 +26,7 @@ OPS = {
     "video": ("video", ("generate", "animate")),
     "video-lipsync": ("video", ("lipsync",)),
     "video-motion": ("video", ("motion",)),
-    "tts": ("audio", ("tts",)),
+    "speech": ("audio", ("tts",)),          # not `tts`: main's text side owns that key
     "music": ("audio", ("music",)),
 }
 ENDPOINTS = tuple(OPS)
@@ -73,13 +73,13 @@ def endpoint_of(cand):
 def generation_type(endpoint):
     if endpoint not in OPS:
         raise LuLabsInput("invalid LU Labs media endpoint")
-    return {"tts": "tts", "music": "audio"}.get(endpoint, OPS[endpoint][0])
+    return {"speech": "tts", "music": "audio"}.get(endpoint, OPS[endpoint][0])
 
 
 def task_for(endpoint, previous_task=""):
     return {"image": "text2img", "image-removebg": "img2img", "image-upscale": "img2img",
             "video": "text2vid", "video-lipsync": "img2vid", "video-motion": "img2vid",
-            "tts": "text2audio", "music": "text2audio"}[endpoint_of({KIND: {"endpoint": endpoint}})]
+            "speech": "text2audio", "music": "text2audio"}[endpoint_of({KIND: {"endpoint": endpoint}})]
 
 
 def candidate_for(backend, model, endpoint, model_meta=None):
@@ -230,6 +230,7 @@ def _durations(meta):
 
 # ── fields / validation ───────────────────────────────────────────────────────
 _PROMPT_OPS = {"generate", "edit", "animate", "tts", "music"}
+_OPENAI_GENERIC = ("quality", "style", "background", "output_format", "response_format", "user")
 
 
 def model_ops(cand):
@@ -321,6 +322,8 @@ def validate_request(cand, values, image_keys, file_keys, model_meta=None):
     params_spec, images_spec, files_spec = public_fields(cand)
     allowed = {field["name"] for field in params_spec} | {"n"}
     values = {k: v for k, v in (values or {}).items() if v not in (None, "")}
+    for key in _OPENAI_GENERIC:          # what the OpenAI Images shims pass for every client
+        values.pop(key, None)
     unknown = set(values) - allowed
     if unknown:
         raise LuLabsInput("unsupported LU Labs parameter: " + sorted(unknown)[0])
@@ -405,11 +408,22 @@ def job_id_of(payload):
 
 
 def quote_credits(payload):
+    """The quoted credit figure (`credits`, also as a numeric string or under `quote`/
+    `data`), or None — the adapter then refuses to book: an uncapped job is exactly
+    what the quote exists to prevent."""
     if isinstance(payload, dict):
-        value = payload.get("credits")
-        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) \
-                and value >= 0:
-            return value
+        for holder in (payload, payload.get("quote"), payload.get("data")):
+            if not isinstance(holder, dict):
+                continue
+            value = holder.get("credits")
+            if isinstance(value, str):
+                try:
+                    value = float(value)
+                except ValueError:
+                    continue
+            if isinstance(value, (int, float)) and not isinstance(value, bool) \
+                    and math.isfinite(value) and value >= 0:
+                return int(value) if float(value).is_integer() else value
     return None
 
 
@@ -480,36 +494,8 @@ def parse_job(job, formats=None, endpoint="image", options=None):
     return state
 
 
-# ── artifact sniffing (names are unknown until the bytes arrive) ──────────────
-def sniff(data):
-    """(extension, mime, kind) from the first bytes, or None."""
-    head = data[:16]
-    if head.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "png", "image/png", "image"
-    if head.startswith(b"\xff\xd8\xff"):
-        return "jpg", "image/jpeg", "image"
-    if head[:4] == b"RIFF" and data[8:12] == b"WEBP":
-        return "webp", "image/webp", "image"
-    if head[:6] in (b"GIF87a", b"GIF89a"):
-        return "gif", "image/gif", "image"
-    if head[:4] == b"RIFF" and data[8:12] == b"WAVE":
-        return "wav", "audio/wav", "audio"
-    if head.startswith(b"fLaC"):
-        return "flac", "audio/flac", "audio"
-    if head.startswith(b"OggS"):
-        return "ogg", "audio/ogg", "audio"
-    if head.startswith(b"ID3") or (len(head) > 1 and head[0] == 0xFF and head[1] & 0xE0 == 0xE0):
-        return "mp3", "audio/mpeg", "audio"
-    if head.startswith(b"\x1a\x45\xdf\xa3"):
-        return "webm", "video/webm", "video"
-    if data[4:8] == b"ftyp":
-        brand = data[8:12]
-        if brand in (b"M4A ", b"M4B "):
-            return "m4a", "audio/mp4", "audio"
-        if brand == b"qt  ":
-            return "mov", "video/quicktime", "video"
-        return "mp4", "video/mp4", "video"
-    return None
+# ── artifact sniffing: cloudtask.sniff (shared with wiro uploads) ──────────────
+sniff = cloudtask_sniff
 
 
 parse_task = parse_job          # the CloudTaskAdapter._poll seam name

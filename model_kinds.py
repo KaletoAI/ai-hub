@@ -118,9 +118,9 @@ def generation_types(candidate: dict) -> set[str]:
         if vendor in candidate:
             return {"3d"}
     if "lulabs" in candidate:
-        # LU endpoints are `<kind>[-<op>]` (image-edit, video-animate) plus tts / music.
+        # LU endpoints are `<kind>[-<op>]` (image-upscale, video-lipsync) plus speech / music.
         endpoint = str((candidate.get("lulabs") or {}).get("endpoint") or "image")
-        return {"tts": {"tts"}, "music": {"audio"}}.get(endpoint) or (
+        return {"speech": {"tts"}, "music": {"audio"}}.get(endpoint) or (
             {"video"} if endpoint.startswith("video") else {"image"})
     for vendor in ("nanogpt", "venice", "wiro"):
         if vendor in candidate:

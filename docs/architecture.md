@@ -500,27 +500,37 @@ job DB/blob paths even when initialization was deferred on a text-only gateway.
 accounts on the NanoGPT pattern: an internal `OpenAIAdapter` subclass for chat and a
 `CloudTaskAdapter` subclass for media share one bid/in-flight pool and publish one
 snapshot (`text` + the media endpoints); a failed refresh clears callable catalogs
-and keeps the display copy. Dispatch of a non-chat id is a 400. wiro discovery pages
+and keeps the display copy. `_composite_chat_dispatch`: chat paths only (speech/embeddings → 400), a non-chat id
+is a 400, no snapshot yet → 503 + Retry-After. wiro discovery pages
 `Tool/List` (public — no account headers) until a short page and asks the LLM
 endpoint `/v1/models?limit=1000` (its default page is small). wiro chat sends
 `api_key` verbatim (`KEY:SECRET` works there; the HMAC headers do not), the task API
 signs. `WiroMediaAdapter._run`: the model's catalog metadata is attached before the
-body is built (without it every value read as unknown); code 96 (HTTP 200) →
+body is built (without it every value read as unknown) from `{**inputs, **params}` — main
+validates in that order and always passes a blank `inputs.prompt`, so the reverse sent
+a paid run WITHOUT a prompt given in params; the empty `{id}Url` of a `fileinput` is
+a plain form field (as a file part it crashed every upload); code 96 (HTTP 200) →
 `CloudTaskRetryable`, 97 → `CloudNoCredits`, a lost answer after the POST went out
 → final `RuntimeError` with `create_unconfirmed`; the task is polled by its
-socketaccesstoken; `totalcost` (USD) becomes `cost_usd`, never `consumed_credits`.
+numeric task id (`{"taskid"}`), so the socket token never lands in an error or job row;
+`Tool/List` pages until `total` (a server capping `limit` answers short pages that are
+not the end; 200 pages at most); `totalcost` (USD) becomes `cost_usd`, never `consumed_credits`.
 A cancelled job sends `Task/Kill` (shielded, 15 s) and records `stop_requested`.
 `LuLabsTextAdapter` adds `stream: false` to a chat body without `stream` — LU
 streams by default and the SSE body would have been parsed as JSON.
 `LuLabsMediaAdapter._run`: uploads (`/files`, role per slot) → free quote → booking
-with `max_credits` = quote and one `client_request_id`. **The only sanctioned re-POST
+with `max_credits` = quote and one `client_request_id`; an unreadable quote books
+nothing. **The only sanctioned re-POST
 of a paid submit in this repo**: a transport error or 5xx on `POST /jobs` is re-sent
 with the SAME body and id (LU returns the job already booked), up to
 `SUBMIT_ATTEMPTS`; then final with `create_unconfirmed`. Only the FIRST answer's
-refusals map to failover classes (402/`credits_exhausted` → no credits, 429 → busy,
-503 → retryable); a refusal after an uncertain attempt is final. The result is
+refusals map to failover classes, and a 429/5xx only when the body names LU's own
+code (`rate_limited`, `credits_exhausted`, `model_unavailable`, …): a bare one may be a
+proxy after LU booked, so it is re-sent with the same id. A refusal after an uncertain
+attempt is final. The result is
 fetched in `_run` (`/content` with the key, not followed; the redirect target without
-it; job-JSON URLs as fallback), sniffed, and handed to the base run as an in-memory
+it; job-JSON URLs as fallback, also when `/content` answers bytes that are no media),
+sniffed, and handed to the base run as an in-memory
 `lulabs-mem://` download — a per-instance download hook would mix concurrent jobs'
 files. A lost result after the paid job is `CloudArtifactLost` (never failover-class).
 Poll bodies are redacted before parsing (the job error lands on the job row).
@@ -944,7 +954,9 @@ values and invalid input combinations are refused before billing.
 
 Pure wiro.ai helpers; no HTTP, main or adapters imports. `tool_metadata` turns one
 `Tool/List` row into `(owner/project, endpoint, metadata)` by its categories (first
-match: realtime → skip, speech-to-text → asr, text-to-speech → tts, music/voice →
+match: realtime → skip, speech-to-text → asr, text-to-speech → `speech` (NOT `tts`:
+main's text side reads the catalog key `tts`, and a paid media catalog there became
+LLM-routable — review 2026-11-10), music/voice →
 audio, any video → video, any image → image, everything else — llm, chat,
 captioning — skipped). Ids come from the CLEAN slugs (`slugproject` may contain
 spaces). Parameter items drive `public_fields` (file items whose id names an image
@@ -958,6 +970,11 @@ checkbox `"--use_pe"`), and validating them refused every run of those models.
 either generated from the vendor's samples instead of the request, so they never go
 out and a required one is a 400. Blank client values are "not set" (main always
 passes `prompt`/`negative_prompt`); `negative_prompt` maps onto `negativePrompt`.
+`_openai_generics`: the OpenAI Images shim passes `size`/`quality`/`style`/… for every
+client — `size` maps onto width/height or a matching aspect ratio, `n` onto `samples`,
+the rest is dropped (refusing them made Open WebUI a 400 on most models). Image uploads
+are named by their bytes (`cloudtask.sniff`), never `.bin`. A `raw` text output (or an
+asr task's `debugoutput`) is `state.texts`, filed as `transcript.txt`.
 Files go multipart: `fileinput` = file in `{id}` plus an empty `{id}Url`,
 combine/multi = the `{id}` field repeated in slot order. `signature_headers`: HMAC
 key = KEY, message = SECRET + nonce, hex; the nonce is an integer (seconds×1000 +

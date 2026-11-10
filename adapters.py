@@ -2096,6 +2096,7 @@ _MIME_BY_EXT = {
 # per variant); without a label they were stored as IMAGES and /ui drew broken <img>s.
 _LABEL_ONLY_EXT = {
     ".bvh": ("application/octet-stream", "file"), ".json": ("application/json", "file"),
+    ".txt": ("text/plain", "file"),
 }
 
 
@@ -5883,6 +5884,24 @@ class VeniceAdapter(OpenAIAdapter):
 # ── wiro.ai composite text / media account ────────────────────────────────────
 
 
+async def _composite_chat_dispatch(account, req: NormalizedRequest, vendor: str):
+    """wiro / LU Labs serve CHAT only on their text side (no speech or embeddings
+    there; their speech models are paid media under `speech`). A non-chat id is the
+    client's mistake: a 400, never a 502 + fault row. Before the first snapshot (or
+    after a failed refresh) it is the gateway's state: 503 + Retry-After."""
+    if not account.model_catalogs:
+        raise HTTPException(503, f"{vendor} catalog is not discovered yet — retry shortly",
+                            headers={"Retry-After": "30"})
+    if not req.path.startswith(("/v1/chat/completions", "/v1/completions", "/v1/messages",
+                                "/v1/responses")):
+        raise HTTPException(400, f"{vendor} serves chat only on this path")
+    if (req.real_model not in account.model_catalogs.get("text", {})
+            and req.real_model not in parse_model_filter(account.backend.get("models_extra"))):
+        raise HTTPException(400, f"{vendor} model '{req.real_model}' is not a chat model")
+    return await account._text.dispatch(req)
+
+
+
 class WiroTextAdapter(OpenAIAdapter):
     """The llm.wiro.ai side: OpenAI dispatch unchanged, one discovery override.
 
@@ -5913,6 +5932,9 @@ class WiroTextAdapter(OpenAIAdapter):
         raise NotImplementedError("wiro discovery belongs to the composite account")
 
 
+_WIRO_MEM = "wiro-mem://"          # a text output handed to the base run as a download
+
+
 class WiroMediaAdapter(CloudTaskAdapter):
     """The api.wiro.ai task side: Tool/List catalog → Run → Task/Detail → outputs.
 
@@ -5929,6 +5951,12 @@ class WiroMediaAdapter(CloudTaskAdapter):
         super().__init__(backend, ctx)
         self.model_catalogs: dict[str, dict[str, dict]] = {}
         self._live_task_ids: dict[str, str] = {}       # gateway job id → wiro task id
+        self._fetched: dict[str, bytes] = {}            # text outputs handed to the base run
+
+    async def _download(self, client, url: str) -> bytes:
+        if url.startswith(_WIRO_MEM):
+            return self._fetched.pop(url[len(_WIRO_MEM):])
+        return await CloudTaskAdapter._download(client, url)
 
     def _api(self, path: str) -> str:
         return (self.backend.get("media_url") or wiro.MEDIA_URL).rstrip("/") + path
@@ -5960,7 +5988,7 @@ class WiroMediaAdapter(CloudTaskAdapter):
         unexpected envelope) fails the whole refresh — a partial catalog must never
         validate a paid submit."""
         rows, start, limit = [], 0, 100
-        while True:
+        for _page in range(200):            # a server that ignores `start` must not loop forever
             raw = await asyncio.to_thread(
                 lambda: json.dumps({"start": str(start), "limit": str(limit),
                                     "hideworkflows": True}).encode())
@@ -5975,9 +6003,18 @@ class WiroMediaAdapter(CloudTaskAdapter):
             if not isinstance(page, list):
                 raise RuntimeError("wiro Tool/List returned no tool list")
             rows.extend(page)
-            if len(page) < limit:
+            try:
+                total = int(payload.get("total"))
+            except (TypeError, ValueError):
+                total = None
+            # `total` decides when the catalog is complete — a server that caps `limit`
+            # below ours returns short pages that are NOT the end.
+            if not page or (total is not None and len(rows) >= total) or (
+                    total is None and len(page) < limit):
                 break
-            start += limit
+            start += len(page)
+        else:
+            raise RuntimeError("wiro Tool/List did not finish paging")
         catalogs = await asyncio.to_thread(self._parse_catalog, rows)
         return Capabilities(models=set().union(*(set(c) for c in catalogs.values())),
                             pricing={}, context={}), catalogs
@@ -6008,7 +6045,7 @@ class WiroMediaAdapter(CloudTaskAdapter):
             raise wiro.INPUT_ERROR(f"wiro model is unavailable for {endpoint}")
         cand = {**cand, "model_metadata": meta}
         body, parts = await asyncio.to_thread(
-            wiro.build_request, cand, {**req.params, **req.inputs},
+            wiro.build_request, cand, {**(req.inputs or {}), **(req.params or {})},
             req.upload_images or {}, req.upload_files or {})
         url = self._api(f"/Run/{model}")
         started = time.monotonic()
@@ -6020,8 +6057,11 @@ class WiroMediaAdapter(CloudTaskAdapter):
         if parts:
             data_fields = {key: (json.dumps(value) if not isinstance(value, str) else value)
                            for key, value in body.items()}
+            for fid, filename, data in parts:
+                if filename is None:                       # fileinput's empty {id}Url field
+                    data_fields[fid] = ""
             file_fields = [(fid, (filename, data, _mime_and_kind(filename)[0]))
-                           for fid, filename, data in parts]
+                           for fid, filename, data in parts if filename is not None]
             posting = client.post(url, headers=self._headers(), data=data_fields,
                                   files=file_fields, timeout=timeout)
         else:
@@ -6070,16 +6110,22 @@ class WiroMediaAdapter(CloudTaskAdapter):
         if req.job_id:
             self._live_task_ids[req.job_id] = task_id
             self.ctx.note_job_meta(req.job_id, copy.deepcopy(req.cloud_trace))
-        state = await self._poll(client, endpoint, token, [], opts, poll_interval,
+        # Polled by the numeric task id: the socket access token never lands in an error
+        # text, a log line or a job row.
+        state = await self._poll(client, endpoint, task_id, [], opts, poll_interval,
                                  max_wait - (time.monotonic() - started))
+        texts = getattr(state, "texts", None) or []
+        if texts:                                    # a transcript arrives as text, not a file
+            token = uuid.uuid4().hex
+            self._fetched[token] = "\n\n".join(texts).encode()
+            state.downloads = list(state.downloads) + [("transcript.txt", _WIRO_MEM + token)]
         extra = {}
         if state.credits is not None:            # wiro's totalcost is USD, not credits
             extra["cost_usd"], state.credits = state.credits, None
         return RunResult(task_id, endpoint, body, state, extra)
 
-    async def _task_request(self, client, endpoint: str, task_token: str):
-        # Poll by tasktoken (the socketaccesstoken from Run), never the numeric id.
-        raw = await asyncio.to_thread(lambda: json.dumps({"tasktoken": task_token}).encode())
+    async def _task_request(self, client, endpoint: str, task_id: str):
+        raw = await asyncio.to_thread(lambda: json.dumps({"taskid": str(task_id)}).encode())
         return await client.post(self._api("/Task/Detail"), content=raw,
             headers={**self._headers(), "Content-Type": "application/json"})
 
@@ -6201,14 +6247,7 @@ class WiroAdapter(BackendAdapter):
         self.adopt_state(old)
 
     async def dispatch(self, req: NormalizedRequest):
-        kind = ("tts" if req.path.startswith("/v1/audio/speech") else
-                "embedding" if req.path.startswith("/v1/embeddings") else "text")
-        if (req.real_model not in self.model_catalogs.get(kind, {})
-                and req.real_model not in parse_model_filter(self.backend.get("models_extra"))):
-            # The client's mistake (a media id on chat, …), not a backend failure:
-            # a deliberate 400, never a 502 + fault row against the account.
-            raise HTTPException(400, f"wiro model '{req.real_model}' is not a {kind} model")
-        return await self._text.dispatch(req)
+        return await _composite_chat_dispatch(self, req, "wiro")
 
     async def generate(self, req: NormalizedRequest) -> GenOutput:
         cand = {"model": req.real_model, wiro.KIND: req.cloud or {}}
@@ -6373,6 +6412,9 @@ class LuLabsMediaAdapter(CloudTaskAdapter):
         if not 200 <= resp.status_code < 300:
             raise self._refusal(resp, "quote")
         quoted = lulabs.quote_credits(self._payload(resp))
+        if quoted is None:
+            # Nothing booked yet; booking without the cap is what the quote prevents.
+            raise RuntimeError(f"LU Labs quote is unreadable ({self._msg(resp)}); job not booked")
         body = lulabs.build_job(cand, params, values.get("prompt"), paths, crid, quoted)
         raw = await asyncio.to_thread(lambda: json.dumps(body).encode())
         summary = lulabs.request_summary(body)
@@ -6398,9 +6440,14 @@ class LuLabsMediaAdapter(CloudTaskAdapter):
                             endpoint=endpoint, create_unconfirmed=True, request=summary)
                         raise RuntimeError("LU Labs accepted the job but returned no id")
                     break
-                if attempt == 0 and (resp.status_code < 500 or resp.status_code == 503):
-                    # The first answer, a refusal (4xx; 503 = media_not_live /
-                    # model_unavailable): nothing was booked.
+                code = lulabs.error_code(self._payload(resp))
+                if attempt == 0 and (
+                        (resp.status_code < 500 and resp.status_code != 429)
+                        or code in ("rate_limited", "credits_exhausted", "video_budget_exhausted",
+                                    "media_not_live", "model_unavailable")):
+                    # The first answer and LU's OWN refusal (a 4xx, or a 429/503 that names
+                    # its LU code): nothing was booked. A bare 429/5xx may come from a proxy
+                    # after LU booked — that is re-sent with the same id below.
                     raise self._refusal(resp, "job")
                 if resp.status_code < 500:
                     req.cloud_trace.update(backend=self.name, cloud=lulabs.KIND,
@@ -6427,22 +6474,21 @@ class LuLabsMediaAdapter(CloudTaskAdapter):
         # job JSON are only the fallback. Fetched HERE — the file's type is known only from
         # its bytes — and handed to the base run as an in-memory download, so a concurrent
         # job on this adapter can never pick up another job's file.
-        data, last_error = b"", None
+        data, found, last_error = b"", None, None
         for url in [self._api(f"/jobs/{job_id}/content")] + [u for _, u in state.downloads]:
             try:
                 data = await self._fetch_result(client, url)
             except (httpx.HTTPError, ConnectionError, TimeoutError, RuntimeError) as e:
                 last_error = e
                 continue
-            if data:
+            found = lulabs.sniff(data) if data else None
+            if found:
                 break
-        if not data:
+            last_error = RuntimeError("not a recognised media file")
+        if not found:
             # Billed and done: never a failover-class error (it would book the job twice).
             raise CloudArtifactLost(f"LU Labs result download failed after the paid job "
                                     f"{job_id}: {self._redact(str(last_error))}", vendor=self.vendor)
-        found = lulabs.sniff(data)
-        if found is None:
-            raise RuntimeError(f"LU Labs job {job_id} returned an unrecognised file")
         token = uuid.uuid4().hex
         self._fetched[token] = data
         state.downloads = [(f"result.{found[0]}", _LULABS_MEM + token)]
@@ -6579,10 +6625,7 @@ class LuLabsAdapter(BackendAdapter):
         self.adopt_state(old)
 
     async def dispatch(self, req: NormalizedRequest):
-        if (req.real_model not in self.model_catalogs.get("text", {})
-                and req.real_model not in parse_model_filter(self.backend.get("models_extra"))):
-            raise HTTPException(400, f"LU Labs model '{req.real_model}' is not a chat model")
-        return await self._text.dispatch(req)
+        return await _composite_chat_dispatch(self, req, "LU Labs")
 
     async def generate(self, req: NormalizedRequest) -> GenOutput:
         cand = {"model": req.real_model, lulabs.KIND: req.cloud or {}}

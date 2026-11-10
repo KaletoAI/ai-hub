@@ -78,7 +78,9 @@ class WiroRouting(_Routing):
                "media_url": "https://api.test/v1", "api_key": "K:S", "max_concurrent": 2,
                "poll_interval": 0}
     CATALOGS = {"text": {"openai/gpt-chat": {}}, "image": {"google/nano-banana": WIRO_IMAGE},
-                "video": {}, "audio": {}, "tts": {}, "asr": {}}
+                "video": {}, "audio": {}, "asr": {},
+                "speech": {"elevenlabs/tts": {"name": "tts", "parameters": [{"items": [
+                    {"id": "prompt", "type": "textarea", "required": True}]}]}}}
 
     def test_owner_project_ids_list_and_route_without_alias(self):
         """`wiro/google/nano-banana` has TWO slashes: the backend prefix splits at the
@@ -117,6 +119,14 @@ class WiroRouting(_Routing):
         self.assertEqual(sent, [{"prompt": "blue lamp", "aspectRatio": "16:9"}])
         self.assertEqual(response.json()["status"], "done", response.text)
 
+    def test_paid_speech_models_never_become_llm_routable(self):
+        """main's text side reads the catalog key `tts`; a media speech catalog under that
+        key made paid task-API models LLM speech models. They are `?type=tts` media only."""
+        self.assertNotIn("elevenlabs/tts", main._llm_models(self.backend))
+        tts = {r["id"] for r in self.c.get("/v1/models?type=tts").json()["data"]}
+        self.assertIn("wiro/elevenlabs/tts", tts)
+        self.assertEqual(main.resolve_routes("wiro/elevenlabs/tts"), ([], []))
+
     def test_bad_values_are_400_before_any_paid_call(self):
         def provider(request):
             self.fail("invalid input must not buy a wiro task")
@@ -145,7 +155,7 @@ class LuLabsRouting(_Routing):
                 "image": {"flux-dev": {"id": "flux-dev", "kind": "image", "credits": 1200,
                                        "_ops": ["generate", "edit"]}},
                 "image-removebg": {}, "image-upscale": {}, "video": {},
-                "video-lipsync": {}, "video-motion": {}, "tts": {}, "music": {}}
+                "video-lipsync": {}, "video-motion": {}, "speech": {}, "music": {}}
 
     def test_openai_edit_with_mask_lands_in_source_and_mask_slots(self):
         """LU edits take [source_image, mask_image]: the OpenAI edits shim maps one image

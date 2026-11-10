@@ -45,7 +45,7 @@ class Pure(unittest.TestCase):
         self.assertEqual(set(cats["image"]), {"flux-dev"})
         self.assertEqual(cats["image"]["flux-dev"]["_ops"], ["generate", "edit"])
         self.assertEqual(cats["video"]["wan-2.2-720p"]["_ops"], ["generate", "animate"])
-        self.assertEqual(set(cats["tts"]), {"voice-1"})
+        self.assertEqual(set(cats["speech"]), {"voice-1"})
         self.assertEqual(set(cats["image-removebg"]), {"removebg"})
         self.assertEqual(set(cats["image-upscale"]), {"upscale"})
         self.assertNotIn("lora", set().union(*map(set, cats.values())))
@@ -55,7 +55,7 @@ class Pure(unittest.TestCase):
     def test_generation_types_follow_the_op(self):
         """`video-lipsync` is a VIDEO, `music` audio, `tts` speech — the generic label
         table knows none of these endpoint names and would call them images."""
-        for endpoint, kind in (("video-lipsync", "video"), ("video", "video"), ("tts", "tts"),
+        for endpoint, kind in (("video-lipsync", "video"), ("video", "video"), ("speech", "tts"),
                                ("music", "audio"), ("image-upscale", "image")):
             self.assertEqual(model_kinds.generation_types({"lulabs": {"endpoint": endpoint}}), {kind})
 
@@ -217,6 +217,35 @@ class LuLabsAdapterTest(unittest.IsolatedAsyncioTestCase):
         posts = self.calls("/v1/jobs")
         self.assertEqual(len(posts), 3)
         self.assertEqual(len({p.content for p in posts}), 1)
+
+    async def test_bare_proxy_errors_on_the_first_answer_are_resent_with_the_same_id(self):
+        """A 503/429 WITHOUT LU's own error code may come from a proxy after LU booked:
+        treating it as "nothing booked" (failover) would book the job again elsewhere.
+        It is re-sent with the same client_request_id instead."""
+        self.job_answers = [httpx.Response(503, text="<html>bad gateway</html>")]
+        out = await self.ad.generate(self.req())
+        posts = self.calls("/v1/jobs")
+        self.assertEqual(len(posts), 2)
+        self.assertEqual(posts[0].content, posts[1].content)
+        self.assertEqual(out.meta["cloud_task_id"], "j1")
+
+    async def test_unreadable_quote_never_books_uncapped(self):
+        """Every job is capped at its quote: a quote whose credits cannot be read must not
+        silently book a job without `max_credits`."""
+        self.quote = httpx.Response(200, json={"object": "job.quote", "price": "?"})
+        with self.assertRaises(RuntimeError):
+            await self.ad.generate(self.req())
+        self.assertEqual(self.calls("/v1/jobs"), [])
+        self.quote = httpx.Response(200, json={"quote": {"credits": "1500"}})
+        await self.ad.generate(self.req())
+        self.assertEqual(json.loads(self.calls("/v1/jobs")[0].content)["params"]["max_credits"], 1500)
+
+    async def test_openai_image_shim_keys_are_dropped_not_refused(self):
+        await self.ad.generate(self.req(params={"size": "1024x1024", "quality": "hd",
+                                                "style": "vivid", "output_format": "png"}))
+        params = json.loads(self.calls("/v1/jobs")[0].content)["params"]
+        self.assertEqual(params["size"], "1024x1024")
+        self.assertNotIn("quality", params)
 
     async def test_uncertain_submit_that_never_resolves_is_final(self):
         """After SUBMIT_ATTEMPTS uncertain answers: a final RuntimeError (not a

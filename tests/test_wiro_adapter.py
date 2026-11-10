@@ -52,6 +52,9 @@ IMAGE = _row("google", "nano-banana", ["tool", "text-to-image", "image-editing"]
 ])
 LLM = _row("openai", "gpt-chat", ["llm", "chat"], [_item("prompt", "textarea", required=True)])
 REALTIME = _row("openai", "gpt-live-1", ["realtime-conversation", "speech-to-speech"], [])
+FILE_ONE = _row("acme", "animate", ["image-to-video"], [
+    _item("inputImage", "fileinput", required=True, defaultvalue=SAMPLE),
+    _item("prompt", "textarea")])
 FILLER = [_row("filler", f"img-{i}", ["text-to-image"], [_item("prompt", "textarea")])
           for i in range(100)]
 
@@ -59,7 +62,8 @@ FILLER = [_row("filler", f"img-{i}", ["text-to-image"], [_item("prompt", "textar
 class WiroAdapterTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.requests, self.meta, self.progress, self.slots = [], [], [], []
-        self.pages = [FILLER, [IMAGE, LLM, REALTIME]]
+        self.pages = [FILLER, [IMAGE, LLM, REALTIME, FILE_ONE]]
+        self.page_cap = None
         self.run_answer = httpx.Response(200, json={"result": True, "errors": [], "taskid": "2221",
                                                     "socketaccesstoken": "tok-2221"})
         self.details = []
@@ -114,9 +118,13 @@ class WiroAdapterTest(unittest.IsolatedAsyncioTestCase):
             "content-type", "").startswith("application/json") else {}
         if path.endswith("/Tool/List"):
             start = int(body["start"])
-            page = self.pages[start // 100] if start // 100 < len(self.pages) else []
-            return httpx.Response(200, json={"result": True, "errors": [], "tool": page,
-                                             "total": sum(map(len, self.pages))})
+            rows = [row for page in self.pages for row in page] if isinstance(self.pages[0], list) \
+                else None
+            if rows is None:
+                return httpx.Response(200, json={"result": True, "tool": self.pages[0]})
+            size = min(int(body["limit"]), self.page_cap or 10 ** 6)
+            return httpx.Response(200, json={"result": True, "errors": [],
+                                             "tool": rows[start:start + size], "total": len(rows)})
         if path.startswith("/v1/Run/"):
             if self.run_error:
                 raise self.run_error
@@ -154,6 +162,7 @@ class WiroAdapterTest(unittest.IsolatedAsyncioTestCase):
         catalogs = self.ad.model_catalogs
         self.assertIn("google/nano-banana", catalogs["image"])
         self.assertEqual(len(catalogs["image"]), 101)
+        self.assertIn("acme/animate", catalogs["video"])
         for endpoint in wiro.ENDPOINTS:
             self.assertNotIn("openai/gpt-chat", catalogs.get(endpoint, {}))
             self.assertNotIn("openai/gpt-live-1", catalogs.get(endpoint, {}))
@@ -163,6 +172,42 @@ class WiroAdapterTest(unittest.IsolatedAsyncioTestCase):
         # the LLM endpoint takes KEY:SECRET verbatim as Bearer; HMAC headers are not accepted there
         self.assertEqual(models[0].headers["authorization"], "Bearer KEY123:SECRET456")
         self.assertNotIn("x-signature", models[0].headers)
+
+    async def test_short_pages_are_not_the_end_while_total_says_more(self):
+        """A server that caps `limit` below 100 answers short pages: `total` decides when
+        the catalog is complete, or it was silently cut to its first page."""
+        self.page_cap = 40
+        await self.ad.discover(self.client)
+        self.assertEqual(len(self.ad.model_catalogs["image"]), 101)
+        self.assertIn("acme/animate", self.ad.model_catalogs["video"])
+
+    async def test_single_file_input_upload_is_sent_with_empty_url_field(self):
+        """A `fileinput` slot sends the file AND an empty `{id}Url` form field — the empty
+        field used to crash the adapter (`_mime_and_kind(None)`) on every upload."""
+        await self.ad.generate(self.req(model="acme/animate", endpoint="video",
+                                        upload_images={"inputImage": self.png}))
+        raw = self.calls("/Run/acme/animate")[0].content
+        self.assertIn(b'name="inputImage"; filename="inputImage.png"', raw)
+        self.assertIn(b'name="inputImageUrl"\r\n\r\n\r\n', raw)
+        self.assertNotIn(SAMPLE.encode(), raw)
+
+    async def test_params_win_over_blank_inputs(self):
+        """main validates {**inputs, **params} and always passes inputs.prompt="" when the
+        client put the prompt in params: built the other way round, the blank won and a
+        paid run went out WITHOUT the prompt."""
+        await self.ad.generate(self.req(inputs={"prompt": "", "negative_prompt": ""},
+                                        params={"prompt": "from params"}))
+        self.assertEqual(json.loads(self.calls("/Run/google/nano-banana")[0].content)["prompt"],
+                         "from params")
+
+    async def test_speech_and_embeddings_are_not_chat(self):
+        """wiro's LLM endpoint has no speech/embeddings; its speech models are paid media.
+        /v1/audio/speech is a 400 here — it used to forward a task-API id to llm.wiro.ai."""
+        for path in ("/v1/audio/speech", "/v1/embeddings"):
+            with self.assertRaises(HTTPException) as caught:
+                await self.ad.dispatch(adapters.NormalizedRequest(path=path, real_model="openai/gpt-chat",
+                                                                  body={}))
+            self.assertEqual(caught.exception.status_code, 400)
 
     async def test_failed_refresh_clears_callable_catalog(self):
         """A failed refresh must not leave stale metadata validating a paid submit."""
@@ -201,7 +246,8 @@ class WiroAdapterTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(run.headers["x-signature"],
                          hmac.new(b"KEY123", ("SECRET456" + nonce).encode(), hashlib.sha256).hexdigest())
         self.assertEqual(len(self.calls("/Task/Detail")), 3)
-        self.assertEqual(json.loads(self.calls("/Task/Detail")[0].content), {"tasktoken": "tok-2221"})
+        # polled by the numeric id: the socket token never reaches an error text or a job row
+        self.assertEqual(json.loads(self.calls("/Task/Detail")[0].content), {"taskid": "2221"})
         asset = [r for r in self.requests if r.url.host == "cdn.test"][0]
         for header in ("x-api-key", "authorization", "x-signature"):
             self.assertNotIn(header, asset.headers)

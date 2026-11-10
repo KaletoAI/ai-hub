@@ -16,12 +16,14 @@ import math
 import re
 from urllib.parse import urlsplit
 
-from cloudtask import TaskState
+from cloudtask import TaskState, sniff
 
 KIND, VENDOR = "wiro", "wiro"
 URL = "https://llm.wiro.ai"                       # LLM endpoint base; the adapter appends /v1/...
 MEDIA_URL = "https://api.wiro.ai/v1"              # task API base (backend key `media_url` overrides)
-ENDPOINTS = ("image", "video", "audio", "tts", "asr")
+# `speech`, not `tts`: main's text side owns the catalog key `tts` (NanoGPT's chat-side
+# speech); a media catalog under that key became LLM-routable (review 2026-11-10).
+ENDPOINTS = ("image", "video", "audio", "speech", "asr")
 AI_MODELS, FORMATS, RIG_FORMATS = (), (), ()
 DYNAMIC_MODELS = True
 RIG_ENDPOINT = None
@@ -58,7 +60,7 @@ _TYPE_MAP = {"number": "int", "float": "float", "checkbox": "bool", "text": "str
 _CATEGORY_SKIP = ("realtime-conversation",)
 _CATEGORY_MAP = (
     (("speech-to-text",), "asr"),
-    (("text-to-speech",), "tts"),
+    (("text-to-speech",), "speech"),
     (("music-generation", "text-to-music", "text-to-song", "image-to-song",
       "speech-to-speech", "voice-clone"), "audio"),
     (("text-to-video", "image-to-video", "video-to-video", "talking-head"), "video"),
@@ -146,12 +148,12 @@ def endpoint_of(cand):
 def generation_type(endpoint):
     if endpoint not in ENDPOINTS:
         raise WiroInput("invalid wiro media endpoint")
-    return endpoint
+    return "tts" if endpoint == "speech" else endpoint
 
 
 def task_for(endpoint, previous_task=""):
     return {"image": "text2img", "video": "text2vid", "audio": "text2audio",
-            "tts": "text2audio", "asr": "audio2text"}[endpoint_of({"wiro": {"endpoint": endpoint}})]
+            "speech": "text2audio", "asr": "audio2text"}[endpoint_of({"wiro": {"endpoint": endpoint}})]
 
 
 def candidate_for(backend, model, endpoint, model_meta=None):
@@ -528,6 +530,48 @@ def _vendor_default(item):
     return None
 
 
+# What the OpenAI Images shims pass for EVERY client (Open WebUI sends size=1024x1024 by
+# default): translated onto the model's own controls where it has them, else dropped —
+# refusing them made every OpenAI-image client a 400 on most wiro models.
+_OPENAI_GENERIC = ("size", "quality", "style", "background", "output_format",
+                   "response_format", "user")
+
+
+def _openai_generics(client, items):
+    size = client.get("size")
+    if "size" not in items and isinstance(size, str) and "x" in size.lower():
+        try:
+            width, height = (int(part) for part in size.lower().split("x", 1))
+        except ValueError:
+            width = height = 0
+        if width > 0 and height > 0:
+            if "width" in items and "height" in items:
+                client.setdefault("width", width)
+                client.setdefault("height", height)
+            else:
+                ratio_id = next((fid for fid in ("aspectRatio", "aspect_ratio", "ratio")
+                                 if fid in items), None)
+                if ratio_id:
+                    import math as _m
+                    g = _m.gcd(width, height)
+                    want = f"{width // g}:{height // g}"
+                    if want in _choices(items[ratio_id]):
+                        client.setdefault(ratio_id, want)
+    for key in _OPENAI_GENERIC:
+        if key not in items:
+            client.pop(key, None)
+    n = client.get("n")
+    if n not in (None, "") and "n" not in items:
+        count_id = next((fid for fid in ("samples", "numberOfImages", "num_images", "numImages")
+                         if fid in items), None)
+        try:
+            count = int(float(n))
+        except (TypeError, ValueError):
+            count = 0
+        if count_id and count > 1:
+            client.setdefault(count_id, count)
+
+
 def _merged_values(cand, values):
     """client value > alias option pin > wiro defaultvalue — but defaults fill ONLY
     controls (_vendor_default): file defaults are wiro SAMPLE URLs and text defaults
@@ -543,6 +587,7 @@ def _merged_values(cand, values):
         native = next((fid for fid in ("negativePrompt", "negative") if fid in items), None)
         if native:
             client.setdefault(native, client.pop("negative_prompt"))
+    _openai_generics(client, items)
     merged = {**_advanced(opts.get("options_json")), **client}
     body = {}
     for fid, item in items.items():
@@ -577,7 +622,8 @@ def validate_request(cand, values, image_keys, file_keys, model_meta=None):
     n = (values or {}).get("n")
     if n not in (None, ""):
         count = _number("n", n, integer=True)
-        if count > 1 and not any(key in items for key in ("samples", "numberOfImages")):
+        if count > 1 and not any(key in items for key in ("samples", "numberOfImages", "num_images",
+                                                              "numImages")):
             raise WiroInput("wiro model has no sample-count parameter for n > 1")
     for item in _param_items(cand):
         if not _is_file(item) or item.get("required") is not True:
@@ -617,7 +663,10 @@ def build_request(cand, values, images, files=None):
         if base not in grouped:
             grouped[base] = []
             order.append(base)
-        grouped[base].append((filename or (base + ".bin"), data))
+        if not filename:
+            found = sniff(data)                 # an image slot carries bytes only
+            filename = f"{base}.{found[0]}" if found else base + ".bin"
+        grouped[base].append((filename, data))
     if not grouped:
         return body, None
     for base in order:
@@ -626,7 +675,7 @@ def build_request(cand, values, images, files=None):
         for filename, data in grouped[base]:
             parts.append((base, filename, data))
         if typ == "fileinput":
-            parts.append((base + "Url", None, b""))
+            parts.append((base + "Url", None, b""))   # filename None = a plain (empty) form field
     return body, parts
 
 
@@ -716,7 +765,7 @@ def parse_task(task, formats=None, endpoint="image", options=None):
         detail = str(task.get("debugerror") or "generation failed")[:300]
         state.error = detail
         return state
-    downloads = []
+    downloads, texts = [], []
     outputs = task.get("outputs")
     if isinstance(outputs, list):
         for index, output in enumerate(outputs, 1):
@@ -724,15 +773,38 @@ def parse_task(task, formats=None, endpoint="image", options=None):
                 continue
             url = output.get("url")
             if not isinstance(url, str) or not url.strip():
+                text = _output_text(output.get("content"))
+                if text:
+                    texts.append(text)
                 continue
             name = str(output.get("name") or "").strip()
             if not name or "/" in name:
                 name = urlsplit(url).path.rsplit("/", 1)[-1] or f"output_{index}"
             downloads.append((name, url.strip()))
-    if not downloads:
+    if not downloads and not texts and endpoint == "asr":
+        debug = str(task.get("debugoutput") or "").strip()
+        if debug:
+            texts.append(debug)
+    if not downloads and not texts:
         state.error = "wiro task finished without outputs"
     state.downloads = downloads
+    state.texts = texts                  # transcripts / raw outputs: the adapter files them
     return state
+
+
+def _output_text(content):
+    """A `raw` output's text (wiro: `{raw, segments[], …}` or a plain string)."""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, dict):
+        for key in ("raw", "text", "answer", "transcript"):
+            if isinstance(content.get(key), str) and content[key].strip():
+                return content[key].strip()
+        segments = content.get("segments")
+        if isinstance(segments, list):
+            return "".join(str(s.get("content") or s.get("text") or "") for s in segments
+                           if isinstance(s, dict) and s.get("type") in (None, "answer")).strip()
+    return ""
 
 
 def task_of_detail(payload):

@@ -94,7 +94,7 @@ class CatalogMapping(unittest.TestCase):
 
     def test_category_first_match_and_uncategorized_skip(self):
         """Guards W3's mapping order and the skip of rows with no media category."""
-        self.assertEqual(wiro.catalog_endpoint(["text-to-speech"]), "tts")
+        self.assertEqual(wiro.catalog_endpoint(["text-to-speech"]), "speech")
         self.assertEqual(wiro.catalog_endpoint(["music-generation"]), "audio")
         self.assertEqual(wiro.catalog_endpoint(["image-to-song"]), "audio")
         self.assertEqual(wiro.catalog_endpoint(["talking-head"]), "video")
@@ -389,3 +389,54 @@ class VendorDefaults(unittest.TestCase):
         with self.assertRaises(wiro.INPUT_ERROR):
             wiro.build_request(cand, {"prompt": "x", "genre": "jazz"}, {}, {})
         wiro.public_fields(cand)                 # odd defaults never break the schema
+
+
+class OpenAIShimKeys(unittest.TestCase):
+    ROW = {"parameters": [{"items": [
+        {"id": "prompt", "type": "textarea", "required": True},
+        {"id": "aspectRatio", "type": "select", "defaultvalue": "1:1",
+         "options": [{"text": "1:1", "value": "1:1"}, {"text": "16:9", "value": "16:9"}]},
+        {"id": "samples", "type": "number", "defaultvalue": "1", "minvalue": "1", "maxvalue": "4"}]}]}
+
+    def test_openai_generic_keys_translate_or_drop_never_400(self):
+        """The OpenAI Images shim passes size/quality/style/… for EVERY client (Open WebUI
+        sends size=1024x1024): refusing them as unknown made those clients a 400 on most
+        wiro models. size → the model's aspect ratio (or width/height), the rest dropped;
+        n → the model's own sample count."""
+        cand = wiro.candidate_for("w", "o/p", "image", self.ROW)
+        body, _ = wiro.build_request(cand, {"prompt": "x", "size": "1920x1080", "quality": "hd",
+                                            "style": "vivid", "n": 3}, {}, {})
+        self.assertEqual(body, {"prompt": "x", "aspectRatio": "16:9", "samples": 3})
+        body, _ = wiro.build_request(cand, {"prompt": "x", "size": "1000x700"}, {}, {})
+        self.assertEqual(body["aspectRatio"], "1:1")          # no matching ratio: model default
+        sized = {"parameters": [{"items": [{"id": "prompt", "type": "textarea"},
+                                           {"id": "width", "type": "number"},
+                                           {"id": "height", "type": "number"}]}]}
+        body, _ = wiro.build_request(wiro.candidate_for("w", "o/p", "image", sized),
+                                     {"prompt": "x", "size": "768x512"}, {}, {})
+        self.assertEqual((body["width"], body["height"]), (768, 512))
+
+    def test_text_outputs_become_a_transcript(self):
+        """wiro speech-to-text answers in the task body, not as a file: a finished asr
+        task with text but no output URL is a success, not "finished without outputs"."""
+        state = wiro.parse_task({"status": "task_postprocess_end", "pexit": "0", "outputs": [
+            {"contenttype": "raw", "content": {"raw": "hello world"}}]}, endpoint="asr")
+        self.assertIsNone(state.error)
+        self.assertEqual(state.texts, ["hello world"])
+        state = wiro.parse_task({"status": "task_postprocess_end", "pexit": "0", "outputs": [],
+                                 "debugoutput": "plain transcript"}, endpoint="asr")
+        self.assertEqual(state.texts, ["plain transcript"])
+
+    def test_image_upload_is_named_by_its_bytes(self):
+        """An image slot carries bytes only; a `.bin` octet-stream upload risks the
+        vendor refusing or misreading the file after the run is billed."""
+        import io
+        from PIL import Image
+        buf = io.BytesIO()
+        Image.new("RGB", (8, 8)).save(buf, "PNG")
+        row = {"parameters": [{"items": [{"id": "prompt", "type": "textarea"},
+                                         {"id": "inputImage", "type": "fileinput", "required": True}]}]}
+        _, parts = wiro.build_request(wiro.candidate_for("w", "o/p", "image", row),
+                                      {"prompt": "x"}, {"inputImage": buf.getvalue()}, {})
+        self.assertEqual(parts[0][:2], ("inputImage", "inputImage.png"))
+        self.assertEqual(parts[1], ("inputImageUrl", None, b""))

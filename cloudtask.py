@@ -80,3 +80,35 @@ def field_value_str(fld: dict, value) -> str:
     if value is None:
         return ""
     return str(value)
+
+
+# ── artifact sniffing (a vendor answer or an upload says nothing about the type) ──
+def sniff(data):
+    """(extension, mime, kind) from the first bytes, or None."""
+    head = data[:16]
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png", "image/png", "image"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "jpg", "image/jpeg", "image"
+    if head[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp", "image/webp", "image"
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif", "image/gif", "image"
+    if head[:4] == b"RIFF" and data[8:12] == b"WAVE":
+        return "wav", "audio/wav", "audio"
+    if head.startswith(b"fLaC"):
+        return "flac", "audio/flac", "audio"
+    if head.startswith(b"OggS"):
+        return "ogg", "audio/ogg", "audio"
+    if head.startswith(b"ID3") or (len(head) > 1 and head[0] == 0xFF and head[1] & 0xE0 == 0xE0):
+        return "mp3", "audio/mpeg", "audio"
+    if head.startswith(b"\x1a\x45\xdf\xa3"):
+        return "webm", "video/webm", "video"
+    if data[4:8] == b"ftyp":
+        brand = data[8:12]
+        if brand in (b"M4A ", b"M4B "):
+            return "m4a", "audio/mp4", "audio"
+        if brand == b"qt  ":
+            return "mov", "video/quicktime", "video"
+        return "mp4", "video/mp4", "video"
+    return None
