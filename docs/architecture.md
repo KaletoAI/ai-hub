@@ -355,6 +355,11 @@ from `_create` and not from each `_run` is what makes it unforgettable — Tripo
 and clips pass through there too; those carry a `role` and join `tasks` WITHOUT claiming
 `cloud_task_id`/`endpoint`, which name the primary task on both paths. No `credits` is
 ever guessed onto a failed row: only a poll knows what was consumed.
+The job view puts the bill next to the Output heading (`admin._job_cost_text`): the
+recorded figure in its OWN unit — wiro `cost_usd` (USD; its `consumed_credits` stays
+None), Meshy/Tripo/LU `consumed_credits`, RunPod `cost_est_usd` marked as an estimate —
+else, for a run that is not failed, the catalog price labelled "price list" (Venice and
+NanoGPT record no per-task cost). `test_job_cost_line.py`.
 `CloudTaskAdapter` (`cloud = True`, `serves_generation = True`) is the vendor-NEUTRAL
 half of every cloud task backend — `MeshyAdapter` and `TripoAdapter` are subclasses,
 and a third vendor is a subclass plus a pure module, not a second copy of the

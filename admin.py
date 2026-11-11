@@ -9979,6 +9979,30 @@ def _lora_landing(params: dict, placed: list) -> dict:
 
 
 
+def _job_cost_text(meta: dict, alias: str, status: str = "done") -> str:
+    """The cost line next to a cloud job's Output heading: what the vendor billed when
+    the run recorded it (wiro `cost_usd`, Meshy/Tripo/LU `consumed_credits`, RunPod's
+    execution-time estimate), else the catalog's price for the model, labelled as such
+    (Venice and NanoGPT report no per-task cost) — never for a failed job, whose bill
+    a list price cannot tell. '' for a local (ComfyUI) job."""
+    if not (meta.get("cloud") or meta.get("cloud_task_id") or meta.get("runpod_job_id")):
+        return ""
+    num = lambda v: v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+    if num(meta.get("cost_usd")) is not None:
+        return f"cost ${_usd_rate(float(meta['cost_usd']))}"
+    if num(meta.get("consumed_credits")) is not None:
+        return f"cost {meta['consumed_credits']:g} credits"
+    if num(meta.get("cost_est_usd")) is not None:
+        return f"cost ≈ ${_usd_rate(float(meta['cost_est_usd']))} (estimate)"
+    if status == "failed":
+        return ""
+    try:
+        listed = _media_price_short(_media_price(alias)) if alias else ""
+    except Exception:                       # a price lookup must never break the job view
+        listed = ""
+    return f"price list {listed}" if listed and listed != "price ?" else "cost unknown"
+
+
 async def job_detail_page(job_id: str, request: Request):
     """Input (prompt/params/reference images) + output artifacts of one job."""
     if not jobs.is_active():
@@ -10098,6 +10122,9 @@ async def job_detail_page(job_id: str, request: Request):
     else:
         outbox = "<p class='muted'>No artifacts.</p>"
     exp = " · <span class='bad'>expired</span>" if job.get("expired") else ""
+    cost = _job_cost_text(meta, job.get("alias") or "", st)
+    cost_html = (f" <span class='muted' style='font-weight:normal;font-size:14px'>· {_esc(cost)}</span>"
+                 if cost else "")
     info = (f"<p class='muted'>task {_esc(job['task'])} · alias {_esc(job['alias'])} · backend "
             f"{_esc(job['backend'])} · owner {_esc(job['owner'])} · {_age(job['created'])}{exp}</p>")
     cancel_btn = (_btn("✕ Cancel", f"/ui/job/{_q(job_id)}/cancel", "danger", confirm="Cancel this job?")
@@ -10138,7 +10165,7 @@ async def job_detail_page(job_id: str, request: Request):
             f"<div style='display:flex;gap:8px'>{cancel_btn}{to_pg}{nav}{back}</div></div>{msg_html}{info}{handover}"
             f"<div style='display:flex;gap:28px;flex-wrap:wrap;align-items:flex-start'>"
             f"<div style='flex:1;min-width:320px'><h2>Input</h2>{inbox}</div>"
-            f"<div style='flex:1;min-width:320px'><h2>Output</h2>{outbox}</div></div>"
+            f"<div style='flex:1;min-width:320px'><h2>Output{cost_html}</h2>{outbox}</div></div>"
             + (_JOB_TICK if st in ("queued", "running") else ""))
     return HTMLResponse(_page("Job", page, "jobs", refresh=(2 if st in ("queued", "running") else None)))
 
