@@ -114,7 +114,7 @@ class WiroRouting(_Routing):
         with self.vendor(provider):
             response = self.c.post("/v1/generations", json={
                 "model": "wiro/google/nano-banana", "prompt": "blue lamp",
-                "params": {"aspectRatio": "16:9"}, "output": {"mode": "sync"}})
+                "params": {"aspect_ratio": "16:9"}, "output": {"mode": "sync"}})
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(sent, [{"prompt": "blue lamp", "aspectRatio": "16:9"}])
         self.assertEqual(response.json()["status"], "done", response.text)
@@ -158,7 +158,7 @@ class LuLabsRouting(_Routing):
                 "video-lipsync": {}, "video-motion": {}, "speech": {}, "music": {}}
 
     def test_openai_edit_with_mask_lands_in_source_and_mask_slots(self):
-        """LU edits take [source_image, mask_image]: the OpenAI edits shim maps one image
+        """LU edits take [input_image, input_image_mask]: the OpenAI edits shim maps one image
         and its mask there (other catalog accounts refuse a mask) — both uploaded with
         their roles and sent as source_path / mask_path."""
         roles, jobs_sent = [], []

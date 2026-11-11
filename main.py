@@ -5724,7 +5724,7 @@ async def images_edits(request: Request, authorization: Optional[str] = Header(N
     routes = await asyncio.to_thread(get_gen_routes, alias)
     kind = adapters.cloud_kind(routes[0][1]) if routes else None
     catalog_media = kind in adapters.DYNAMIC_CATALOG_TYPES
-    # LU Labs edits declare [source_image, mask_image]: one image + its mask land there
+    # LU Labs edits declare [input_image, input_image_mask]: one image + its mask land there
     # positionally. Elsewhere a mask has no fixed slot on a catalog model.
     if catalog_media and masks and not (kind == "lulabs" and len(images) == 1 and len(masks) == 1):
         detail = ("NanoGPT mask edits require params.maskDataUrl on /v1/generations"

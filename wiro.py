@@ -38,7 +38,8 @@ ENDPOINT_HINT = ("Choose an exact discovered owner/project model and its endpoin
 OPTION_DEFAULTS = {"options_json": ""}
 OPTION_FIELDS = [{"key": "options_json", "label": "Model-specific defaults (JSON)", "type": "text",
                   "textarea": True,
-                  "hint": "A JSON object of wiro parameter ids; model and credentials are refused."}]
+                  "hint": "A JSON object of the model's parameters (playground names, or wiro's "
+                          "own ids); model and credentials are refused."}]
 NONCE_COUNTER = 0                                  # same-second nonce uniqueness (module-level, pure)
 
 _RESERVED = {"model", "endpoint", "provider", "api_key", "apikey", "authorization", "x-api-key",
@@ -350,44 +351,102 @@ def _accept(item):
     return []
 
 
-def slot_names(cand):
-    """Image upload slots: file items whose id names an image, multi-entry ones
-    expanded to id, id_2, … id_N (cap 16)."""
-    names = []
-    for item in _param_items(cand):
-        if not _is_file(item) or not _is_image_file(item) or item.get("hidden") is True:
+# Public names follow the gateway's convention (snake_case, `input_image`,
+# `input_image_2`, `input_audio`, …) like Venice / NanoGPT / Meshy, so a value or a kept
+# upload carries across providers; the wire keeps wiro's own ids. `inputImage2` →
+# `input_image_2`, `aspectRatio` → `aspect_ratio`; the few end-frame spellings share
+# one name. Measured on the live Tool/List (577 rows, 2026-11-11): no collisions.
+_NAME_ALIASES = {"lastFrameImage": "input_image_last", "inputImageEnd": "input_image_last",
+                 "inputImageFirst": "input_image"}
+
+
+def _snake(fid):
+    name = re.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", fid)
+    name = re.sub(r"(?<=[A-Za-z])(\d)", r"_\1", name)
+    return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+
+
+def _expand(base, count):
+    return [base] + [f"{base}_{i}" for i in range(2, count + 1)]
+
+
+def _visible(cand):
+    """{wiro id: item} of the settable items, catalog order."""
+    return {str(item["id"]): item for item in _param_items(cand)
+            if item.get("id") not in (None, "") and item.get("hidden") is not True}
+
+
+def _public_names(items):
+    """{wiro id: public base name}. An item whose name (or an expanded slot name)
+    would be taken twice keeps its wiro id, so two ids never share a public name."""
+    def names(fid, base):
+        item = items[fid]
+        return _expand(base, _multi_count(item)) if _is_file(item) else [base]
+    pub = {fid: (_NAME_ALIASES.get(fid) if _is_file(item) else None) or _snake(fid) or fid
+           for fid, item in items.items()}
+    for _round in range(2):
+        seen = {}
+        for fid, base in pub.items():
+            for name in names(fid, base):
+                seen.setdefault(name, set()).add(fid)
+        clash = {fid for owners in seen.values() if len(owners) > 1 for fid in owners}
+        if not clash:
+            return pub
+        pub = {fid: (fid if fid in clash else base) for fid, base in pub.items()}
+    raise WiroInput("wiro model parameter ids collide")
+
+
+def _slots(cand):
+    """Every upload slot in catalog order: {name (public), vendor (wiro slot name),
+    id, image, required, accept}; multi-entry items expand to name, name_2 … (cap 16)."""
+    items = _visible(cand)
+    pub = _public_names(items)
+    slots = []
+    for fid, item in items.items():
+        if not _is_file(item):
             continue
-        base = str(item.get("id"))
-        names.extend([base] if _multi_count(item) == 1 else
-                     [base] + [f"{base}_{i}" for i in range(2, _multi_count(item) + 1)])
-    return names
+        required = item.get("required") is True
+        image = _is_image_file(item)
+        for i, (name, vendor) in enumerate(zip(_expand(pub[fid], _multi_count(item)),
+                                               _expand(fid, _multi_count(item)))):
+            slots.append({"name": name, "vendor": vendor, "id": fid, "image": image,
+                          "required": required and i == 0,
+                          "accept": [] if image else _accept(item)})
+    return slots
+
+
+def _to_vendor(values, pub):
+    """Client / pinned values → wiro ids. Public names win over a wiro id given for the
+    same item; keys naming no item (n, size, …) pass through."""
+    rev = {name: fid for fid, name in pub.items()}
+    out = {}
+    for key in sorted(values, key=lambda k: k not in rev):          # public first
+        out.setdefault(rev.get(key, key), values[key])
+    return out
+
+
+def slot_names(cand):
+    """Image upload slots (public names): `input_image`, `input_image_2`, …"""
+    return [s["name"] for s in _slots(cand) if s["image"]]
 
 
 def _file_fields(cand):
     """Non-image upload slots, expanded the same way; `required` from the item."""
-    fields = []
-    for item in _param_items(cand):
-        if not _is_file(item) or _is_image_file(item) or item.get("hidden") is True:
-            continue
-        base = str(item.get("id"))
-        required = item.get("required") is True
-        for name in ([base] if _multi_count(item) == 1 else
-                     [base] + [f"{base}_{i}" for i in range(2, _multi_count(item) + 1)]):
-            fields.append({"name": name, "required": required and name == base,
-                           "accept": _accept(item)})
-    return fields
+    return [{"name": s["name"], "required": s["required"], "accept": s["accept"]}
+            for s in _slots(cand) if not s["image"]]
 
 
 def public_fields(cand):
-    """(params, images, files): the schema endpoint, playground and upload checks."""
-    params, images = [], []
-    for item in _param_items(cand):
-        fid, typ = str(item.get("id") or ""), str(item.get("type") or "").lower()
-        if not fid or item.get("hidden") is True:
-            continue
+    """(params, images, files): the schema endpoint, playground and upload checks —
+    public names (see _public_names); wiro's own label rides along as `label`."""
+    items = _visible(cand)
+    pub = _public_names(items)
+    params = []
+    for fid, item in items.items():
+        typ = str(item.get("type") or "").lower()
         if _is_file(item):
             continue
-        field = {"name": fid, "type": _TYPE_MAP.get(typ, "string")}
+        field = {"name": pub[fid], "type": _TYPE_MAP.get(typ, "string")}
         if item.get("required") is True:
             field["required"] = True
         default = _vendor_default(item)        # what the run sends when the client is silent
@@ -412,20 +471,15 @@ def public_fields(cand):
                 continue
         field.update(bounds)
         label = str(item.get("label") or "").strip()
-        if label and label.lower() != fid.lower():
+        if label and label.lower() not in (fid.lower(), pub[fid].lower()):
             field["label"] = label
         note = str(item.get("note") or "").strip()
         if note:
             field["hint"] = note
         params.append(field)
-    for item in _param_items(cand):
-        if not _is_file(item) or not _is_image_file(item) or item.get("hidden") is True:
-            continue
-        base = str(item.get("id"))
-        for name in ([base] if _multi_count(item) == 1 else
-                     [base] + [f"{base}_{i}" for i in range(2, _multi_count(item) + 1)]):
-            images.append({"name": name, "required": item.get("required") is True and name == base,
-                           "on_empty": "required" if item.get("required") is True and name == base else "none"})
+    images = [{"name": s["name"], "required": s["required"],
+               "on_empty": "required" if s["required"] else "none"}
+              for s in _slots(cand) if s["image"]]
     return params, images, _file_fields(cand)
 
 
@@ -440,9 +494,9 @@ def _number(key, value, integer=False):
 
 
 # ── request values (W6) ───────────────────────────────────────────────────────
-def _coerce(item, value):
+def _coerce(item, value, name=None):
     typ = str(item.get("type") or "").lower()
-    fid = str(item.get("id") or "")
+    fid = name or str(item.get("id") or "")
     if typ == "checkbox":
         if isinstance(value, bool):
             return value
@@ -580,19 +634,20 @@ def _merged_values(cand, values):
     """client value > alias option pin > wiro defaultvalue — but defaults fill ONLY
     controls (_vendor_default): file defaults are wiro SAMPLE URLs and text defaults
     are sample prompts, and sending either silently generates from the vendor's
-    samples instead of the client's request."""
+    samples instead of the client's request. Keys are public names (a wiro id is
+    accepted too, for clients and pins written against wiro's own spelling)."""
     opts = options_of(cand)
     # The gateway always passes `prompt` / `negative_prompt` (blank when the client
     # sent none): blank is "not set", never an unknown parameter.
-    client = {k: v for k, v in (values or {}).items() if v not in (None, "")}
-    items = {str(item.get("id")): item for item in _param_items(cand)
-             if item.get("id") and item.get("hidden") is not True}
+    items = _visible(cand)
+    pub = _public_names(items)
+    client = _to_vendor({k: v for k, v in (values or {}).items() if v not in (None, "")}, pub)
     if "negative_prompt" in client and "negative_prompt" not in items:
         native = next((fid for fid in ("negativePrompt", "negative") if fid in items), None)
         if native:
             client.setdefault(native, client.pop("negative_prompt"))
     _openai_generics(client, items)
-    merged = {**_advanced(opts.get("options_json")), **client}
+    merged = {**_to_vendor(_advanced(opts.get("options_json")), pub), **client}
     body = {}
     for fid, item in items.items():
         if _is_file(item):
@@ -603,9 +658,9 @@ def _merged_values(cand, values):
             if default is not None:
                 body[fid] = default
             elif item.get("required") is True:
-                raise WiroInput(f"wiro {fid} is required")
+                raise WiroInput(f"wiro {pub[fid]} is required")
             continue
-        body[fid] = _coerce(item, value)
+        body[fid] = _coerce(item, value, pub[fid])
     # Gateway-generic keys that never name a wiro parameter (a model's own "prompt"
     # or "seed" was already consumed from `merged` above; `n` is validated apart).
     unknown = set(merged) - {"n"}
@@ -619,9 +674,10 @@ def validate_request(cand, values, image_keys, file_keys, model_meta=None):
         cand = {**cand, "model_metadata": model_meta}
     endpoint_of(cand)
     body, items = _merged_values(cand, values)
-    slots, files = set(slot_names(cand)), {f["name"] for f in _file_fields(cand)}
+    slots = _slots(cand)
     image_keys, file_keys = set(image_keys), set(file_keys)
-    if image_keys - slots or file_keys - files:
+    if image_keys - {s["name"] for s in slots if s["image"]} or \
+            file_keys - {s["name"] for s in slots if not s["image"]}:
         raise WiroInput("unsupported wiro upload slot")
     n = (values or {}).get("n")
     if n not in (None, ""):
@@ -629,57 +685,42 @@ def validate_request(cand, values, image_keys, file_keys, model_meta=None):
         if count > 1 and not any(key in items for key in ("samples", "numberOfImages", "num_images",
                                                               "numImages")):
             raise WiroInput("wiro model has no sample-count parameter for n > 1")
-    for item in _param_items(cand):
-        if not _is_file(item) or item.get("required") is not True:
-            continue
-        base = str(item.get("id"))
-        supplied = base in (image_keys if _is_image_file(item) else file_keys)
-        if not supplied:
-            raise WiroInput(f"wiro {base} is required")
+    for slot in slots:
+        if slot["required"] and slot["name"] not in (image_keys if slot["image"] else file_keys):
+            raise WiroInput(f"wiro {slot['name']} is required")
     return body
 
 
 def build_request(cand, values, images, files=None):
     """(body, multipart) — None for a JSON run; otherwise (text fields, file parts).
-    File parts are (param id, filename, bytes): fileinput sends the file under its id
-    plus an empty {id}Url; combine/multi repeat the id per file, expanded slots in
-    order. The sample-URL defaults of file inputs are NEVER sent (W6)."""
-    files = files or {}
+    File parts are (wiro param id, filename, bytes): fileinput sends the file under its
+    id plus an empty {id}Url; combine/multi repeat the id per file, expanded slots in
+    order. Uploads arrive under public slot names. The sample-URL defaults of file
+    inputs are NEVER sent (W6)."""
+    images, files = images or {}, files or {}
     body = validate_request(cand, values, images.keys(), files.keys())
-    parts = []
-    by_id = {}
-    for item in _param_items(cand):
-        if _is_file(item):
-            by_id.setdefault(str(item.get("id")), item)
-    slots = slot_names(cand)
-    file_names = [f["name"] for f in _file_fields(cand)]
-    uploads = [(name, images[name]) for name in slots if images.get(name)]
-    uploads += [(name, files[name][1], files[name][0]) for name in file_names if files.get(name)]
+    items = _visible(cand)
+    slots = _slots(cand)
+    uploads = [(s, images[s["name"]], None) for s in slots if s["image"] and images.get(s["name"])]
+    uploads += [(s, files[s["name"]][1], files[s["name"]][0]) for s in slots
+                if not s["image"] and files.get(s["name"])]
     grouped = {}
-    order = []
-    for entry in uploads:
-        name, data = entry[0], entry[1]
-        filename = entry[2] if len(entry) > 2 else None
-        base = re.sub(r"_\d+$", "", name)
-        item = by_id.get(base)
-        if item is None or not data:
-            raise WiroInput(f"wiro upload {name} is empty or unknown")
-        if base not in grouped:
-            grouped[base] = []
-            order.append(base)
+    for slot, data, filename in uploads:
+        fid = slot["id"]
+        if not data:
+            raise WiroInput(f"wiro upload {slot['name']} is empty")
         if not filename:
             found = sniff(data)                 # an image slot carries bytes only
-            filename = f"{base}.{found[0]}" if found else base + ".bin"
-        grouped[base].append((filename, data))
+            filename = f"{fid}.{found[0]}" if found else fid + ".bin"
+        grouped.setdefault(fid, []).append((filename, data))
     if not grouped:
         return body, None
-    for base in order:
-        item = by_id[base]
-        typ = str(item.get("type") or "").lower()
-        for filename, data in grouped[base]:
-            parts.append((base, filename, data))
-        if typ == "fileinput":
-            parts.append((base + "Url", None, b""))   # filename None = a plain (empty) form field
+    parts = []
+    for fid, entries in grouped.items():
+        for filename, data in entries:
+            parts.append((fid, filename, data))
+        if str(items[fid].get("type") or "").lower() == "fileinput":
+            parts.append((fid + "Url", None, b""))   # filename None = a plain (empty) form field
     return body, parts
 
 

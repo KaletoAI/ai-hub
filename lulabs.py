@@ -51,8 +51,11 @@ _RESERVED = {"op", "model", "kind", "max_credits", "client_request_id", "api_key
              "authorization", "options_json", "source_path", "mask_path", "audio_path",
              "video_path", "image_paths", "source_url"}
 # Upload slot → (role on POST /files, job param that receives the returned path)
-SLOT_ROLES = {"source_image": ("source", "source_path"), "mask_image": ("mask", "mask_path"),
-              "audio": ("audio", "audio_path"), "video": ("video", "video_path")}
+# Slot names follow the gateway's convention (`input_image`, `input_audio`, … like
+# Venice / NanoGPT / wiro), so a Playground upload kept under that name carries across
+# providers; LU's own role names live only in the right-hand side.
+SLOT_ROLES = {"input_image": ("source", "source_path"), "input_image_mask": ("mask", "mask_path"),
+              "input_audio": ("audio", "audio_path"), "input_video": ("video", "video_path")}
 _TERMINAL_FAIL = {"failed", "canceled", "cancelled", "error", "expired"}
 
 
@@ -248,7 +251,7 @@ def op_for(cand, image_keys=(), file_keys=()):
     ops = model_ops(cand)
     if len(ops) == 1:
         return ops[0]
-    return ops[1] if "source_image" in set(image_keys or ()) else ops[0]
+    return ops[1] if "input_image" in set(image_keys or ()) else ops[0]
 
 
 def public_fields(cand):
@@ -281,16 +284,16 @@ def public_fields(cand):
     images = []
     if ops & needs_image:
         required = ops <= (needs_image - {"lipsync"})
-        images.append({"name": "source_image", "required": required,
+        images.append({"name": "input_image", "required": required,
                        "on_empty": "required" if required else "none"})
     if "edit" in ops:
-        images.append({"name": "mask_image", "required": False, "on_empty": "none"})
+        images.append({"name": "input_image_mask", "required": False, "on_empty": "none"})
     files = []
     if ops & {"lipsync", "tts"}:
-        files.append({"name": "audio", "required": "lipsync" in ops,
+        files.append({"name": "input_audio", "required": "lipsync" in ops,
                       "accept": ["wav", "mp3", "flac", "ogg", "m4a"]})
     if ops & {"lipsync", "motion"}:
-        files.append({"name": "video", "required": "motion" in ops, "accept": ["mp4", "webm", "mov"]})
+        files.append({"name": "input_video", "required": "motion" in ops, "accept": ["mp4", "webm", "mov"]})
     return params, images, files
 
 
@@ -335,10 +338,10 @@ def validate_request(cand, values, image_keys, file_keys, model_meta=None):
         for slot in spec:
             if slot["required"] and slot["name"] not in keys:
                 raise LuLabsInput(f"LU Labs {endpoint} requires {slot['name']}")
-    if op == "lipsync" and not ({"source_image", "video"} & (image_keys | file_keys)):
-        raise LuLabsInput("LU Labs lipsync needs source_image or video")
-    if "mask_image" in image_keys and op != "edit":
-        raise LuLabsInput("LU Labs mask_image needs a source_image to edit")
+    if op == "lipsync" and not ({"input_image", "input_video"} & (image_keys | file_keys)):
+        raise LuLabsInput("LU Labs lipsync needs input_image or input_video")
+    if "input_image_mask" in image_keys and op != "edit":
+        raise LuLabsInput("LU Labs input_image_mask needs an input_image to edit")
     if op in _PROMPT_OPS and "prompt" not in values:
         raise LuLabsInput(f"LU Labs {endpoint} requires prompt")
     params = {**_advanced(options_of(cand)["options_json"])}

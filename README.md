@@ -1379,16 +1379,20 @@ chat sends it verbatim as `Authorization: Bearer …`, the task API signs every 
 (`x-nonce`, `x-signature` = HMAC-SHA256 of SECRET+NONCE keyed with KEY).
 
 Media ids are `wiro/<owner>/<project>` (`wiro/google/nano-banana`) and are callable
-without an alias. Request parameters are the model's own wiro parameter ids
-(`aspectRatio`, `steps`, …), listed by `GET /v1/generations/schema` and the
-Playground; image inputs are the model's file parameters (`inputImage`,
-`inputImage_2`, …), other files (`inputAudio`, `inputVideo`) are uploads.
+without an alias. Request parameters are the model's own wiro parameters under the
+gateway's snake_case names (`aspectRatio` → `aspect_ratio`, `negativePrompt` →
+`negative_prompt`), listed by `GET /v1/generations/schema` and the Playground; wiro's
+own ids are still accepted as params (and in `options_json`), and go out on the wire.
+Image inputs use the same slot names as Venice/NanoGPT — `input_image`,
+`input_image_2` … (`inputImage2` → `input_image_2`), named extras like
+`input_image_last` / `input_image_mask` / `input_image_reference`; other files are
+`input_audio`, `input_video`, … uploads. Two ids that would share a name keep wiro's ids.
 wiro's catalog defaults for **controls** (selects, numbers, checkboxes) are sent
 when the client is silent; its defaults for **files and prose** are vendor samples
 and are never sent — a required prompt or input image without a value is a 400.
 Unknown parameters are a 400 before anything is paid. `negative_prompt` maps onto a
-model's `negativePrompt`; the OpenAI Images shim's `size` maps onto the model's
-`width`/`height` or a matching `aspectRatio`, its `n` onto `samples`, and its other
+model's `negative` control where it has no `negativePrompt`; the OpenAI Images shim's
+`size` maps onto the model's `width`/`height` or a matching `aspect_ratio`, its `n` onto `samples`, and its other
 generic keys (`quality`, `style`, …) are dropped when the model has no such control.
 
 A submitted task is never re-submitted: a lost answer is final (the job names the
@@ -1416,14 +1420,15 @@ booked with that quote as its `max_credits` cap, then polled and fetched from
 
 | Endpoint | LU op | Inputs |
 |---|---|---|
-| `image` | `generate`, or `edit` when `source_image` is sent (`mask_image` optional) | prompt, `negative_prompt`, `size`, `seed` |
-| `image-removebg` / `image-upscale` | `removebg` / `upscale` | `source_image` (+ `target_resolution` 2k/4k/8k) |
-| `video` | `generate`, or `animate` when `source_image` is sent | prompt, `duration` (the model's published durations), `seed` |
-| `video-lipsync` / `video-motion` | `lipsync` / `motion` | `audio` + `source_image` or `video` / `source_image` + `video` |
-| `speech` / `music` | `tts` (optional `audio` voice clone) / `music` | prompt, `duration` (music) |
+| `image` | `generate`, or `edit` when `input_image` is sent (`input_image_mask` optional) | prompt, `negative_prompt`, `size`, `seed` |
+| `image-removebg` / `image-upscale` | `removebg` / `upscale` | `input_image` (+ `target_resolution` 2k/4k/8k) |
+| `video` | `generate`, or `animate` when `input_image` is sent | prompt, `duration` (the model's published durations), `seed` |
+| `video-lipsync` / `video-motion` | `lipsync` / `motion` | `input_audio` + `input_image` or `input_video` / `input_image` + `input_video` |
+| `speech` / `music` | `tts` (optional `input_audio` voice clone) / `music` | prompt, `duration` (music) |
 
 Ids are `lu/<model>` (e.g. `lu/flux-dev`); the OpenAI edits shim maps one image and
-its mask onto `source_image` / `mask_image`. One job delivers one result (`n` must be
+its mask onto `input_image` / `input_image_mask` (slot names as on every other
+provider, so Playground uploads carry across). One job delivers one result (`n` must be
 1). Every job carries a `client_request_id`: a lost answer to the booking call is
 re-sent **with the same id** (LU answers with the job it already booked) — never a
 new booking and never on another backend. A quote whose credits cannot be read books

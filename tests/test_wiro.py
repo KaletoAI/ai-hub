@@ -241,13 +241,13 @@ class Uploads(unittest.TestCase):
             wiro.build_request(_cand(IMAGE_ROW), {"prompt": "x", "secretKnob": "1"}, {})
 
     def test_image_slots_expand_and_repeat_in_multipart(self):
-        """Guards W5/W6's expansion: maxinputlenght 3 → inputImage, inputImage_2,
-        inputImage_3 slots, all sent as REPEATED inputImage fields in slot order,
+        """Guards W5/W6's expansion: maxinputlenght 3 → input_image, input_image_2,
+        input_image_3 slots, all sent as REPEATED inputImage fields in slot order,
         with no sample default anywhere."""
         cand = _cand(IMAGE_ROW)
-        self.assertEqual(wiro.slot_names(cand), ["inputImage", "inputImage_2", "inputImage_3"])
+        self.assertEqual(wiro.slot_names(cand), ["input_image", "input_image_2", "input_image_3"])
         body, parts = wiro.build_request(cand, {"prompt": "x"},
-            {"inputImage": b"one", "inputImage_2": b"two", "inputImage_3": b"three"})
+            {"input_image": b"one", "input_image_2": b"two", "input_image_3": b"three"})
         self.assertEqual([(fid, data) for fid, _name, data in parts],
                          [("inputImage", b"one"), ("inputImage", b"two"), ("inputImage", b"three")])
         self.assertNotIn("inputImage", body)
@@ -256,7 +256,7 @@ class Uploads(unittest.TestCase):
         """Guards the fileinput wire shape: the file under its id AND an empty
         {id}Url, per the task-API contract."""
         cand = _cand(VIDEO_ROW, endpoint="video")
-        body, parts = wiro.build_request(cand, {"prompt": "x"}, {"lastFrameImage": b"img"})
+        body, parts = wiro.build_request(cand, {"prompt": "x"}, {"input_image_last": b"img"})
         self.assertIn(("lastFrameImage", "lastFrameImage.bin", b"img"), parts)
         self.assertIn(("lastFrameImageUrl", None, b""), parts)
 
@@ -265,17 +265,17 @@ class Uploads(unittest.TestCase):
         lastFrameImage) are IMAGE slots; audio/video/document ids are FILE fields
         with a derived accept list."""
         _params, images, files = wiro.public_fields(_cand(VIDEO_ROW, endpoint="video"))
-        self.assertIn("lastFrameImage", {f["name"] for f in images})
+        self.assertIn("input_image_last", {f["name"] for f in images})
         by_name = {f["name"]: f for f in files}
-        self.assertEqual(by_name["inputVideo"]["accept"], ["mp4", "webm", "mov"])
+        self.assertEqual(by_name["input_video"]["accept"], ["mp4", "webm", "mov"])
         _p, _i, asr_files = wiro.public_fields(_cand(ASR_ROW, endpoint="asr"))
-        self.assertEqual({f["name"] for f in asr_files}, {"inputAudio"})
+        self.assertEqual({f["name"] for f in asr_files}, {"input_audio"})
         self.assertTrue(asr_files[0]["required"])
 
     def test_asr_upload_flow(self):
         """Guards that the required whisper audio arrives as multipart, not JSON."""
         cand = _cand(ASR_ROW, endpoint="asr")
-        body, parts = wiro.build_request(cand, {}, {}, {"inputAudio": ("clip.mp3", b"audio")})
+        body, parts = wiro.build_request(cand, {}, {}, {"input_audio": ("clip.mp3", b"audio")})
         self.assertEqual(body["language"], "en")             # select default fills
         self.assertEqual([(fid, fn, data) for fid, fn, data in parts],
                          [("inputAudio", "clip.mp3", b"audio")])
@@ -283,10 +283,67 @@ class Uploads(unittest.TestCase):
     def test_request_summary_carries_no_file_bytes(self):
         """Guards that the job row's request summary names byte counts, never bytes."""
         body, parts = wiro.build_request(_cand(VIDEO_ROW, endpoint="video"),
-            {"prompt": "x"}, {"lastFrameImage": b"img"})
+            {"prompt": "x"}, {"input_image_last": b"img"})
         summary = wiro.request_summary(body, parts)
         self.assertNotIn("img", json.dumps(summary))
         self.assertIn("<files>", summary)
+
+
+class PublicNames(unittest.TestCase):
+    def test_public_names_follow_the_gateway_convention(self):
+        """Guards the cross-provider naming: wiro's camelCase ids are published as the
+        gateway's snake_case names (`input_image`, `input_image_2`, `aspect_ratio`) —
+        with the vendor ids the Playground's kept uploads and values (keyed by name)
+        were lost on every switch from Venice/NanoGPT to wiro. The wire keeps wiro's ids."""
+        row = dict(VIDEO_ROW, parameters=[{"title": "", "items": [
+            _item("inputImage", "combinefileinput"),
+            _item("inputImage2", "combinefileinput"),
+            _item("inputImageLast", "combinefileinput"),
+            _item("inputAudio", "combinefileinput"),
+            _item("negativePrompt", "text"),
+            _item("aspectRatio", "select", defaultvalue="16:9",
+                  options=[{"text": "16:9", "value": "16:9"}, {"text": "1:1", "value": "1:1"}]),
+            _item("prompt", "text", required=True)]}])
+        cand = _cand(row, endpoint="video")
+        params, images, files = wiro.public_fields(cand)
+        self.assertEqual([i["name"] for i in images], ["input_image", "input_image_2", "input_image_last"])
+        self.assertEqual([f["name"] for f in files], ["input_audio"])
+        self.assertEqual({p["name"] for p in params}, {"negative_prompt", "aspect_ratio", "prompt"})
+        body, parts = wiro.build_request(cand,
+            {"prompt": "x", "negative_prompt": "blur", "aspect_ratio": "1:1"},
+            {"input_image": b"a", "input_image_2": b"b", "input_image_last": b"c"},
+            {"input_audio": ("v.wav", b"w")})
+        self.assertEqual(body, {"prompt": "x", "negativePrompt": "blur", "aspectRatio": "1:1"})
+        self.assertEqual([(fid, data) for fid, _n, data in parts],
+                         [("inputImage", b"a"), ("inputImage2", b"b"), ("inputImageLast", b"c"),
+                          ("inputAudio", b"w")])
+
+    def test_wiro_ids_stay_accepted_and_public_name_wins(self):
+        """Guards compatibility: a client or an options_json pin written against wiro's
+        own ids still works (a pin saved before the rename); given both spellings, the
+        public name decides. Upload slots have ONE spelling — main drops image keys that
+        are not a published slot before the adapter sees them."""
+        cand = _cand(IMAGE_ROW, options={"options_json": '{"aspectRatio": "wide"}'})
+        body, _ = wiro.build_request(cand, {"prompt": "x"}, {})
+        self.assertEqual(body["aspectRatio"], "wide")
+        body, _ = wiro.build_request(cand, {"prompt": "x", "aspectRatio": "wide",
+                                            "aspect_ratio": "square"}, {})
+        self.assertEqual(body["aspectRatio"], "square")
+
+    def test_colliding_names_keep_their_wiro_ids(self):
+        """Guards that two ids never share a public name: when `aspectRatio` and
+        `aspect_ratio` (or a multi slot's `input_image_2` and `inputImage2`) would
+        collide, both keep wiro's id instead of one silently shadowing the other."""
+        row = dict(IMAGE_ROW, parameters=[{"title": "", "items": [
+            _item("aspectRatio", "text"), _item("aspect_ratio", "text"),
+            _item("inputImage", "combinefileinput", maxinputlenght=2),
+            _item("inputImage2", "combinefileinput"), _item("prompt", "text")]}])
+        cand = _cand(row)
+        params, images, _ = wiro.public_fields(cand)
+        self.assertEqual({p["name"] for p in params}, {"aspectRatio", "aspect_ratio", "prompt"})
+        self.assertEqual([i["name"] for i in images], ["inputImage", "inputImage_2", "inputImage2"])
+        body, _ = wiro.build_request(cand, {"prompt": "x", "aspect_ratio": "a", "aspectRatio": "b"}, {})
+        self.assertEqual((body["aspect_ratio"], body["aspectRatio"]), ("a", "b"))
 
 
 class TaskStates(unittest.TestCase):
@@ -439,6 +496,6 @@ class OpenAIShimKeys(unittest.TestCase):
         row = {"parameters": [{"items": [{"id": "prompt", "type": "textarea"},
                                          {"id": "inputImage", "type": "fileinput", "required": True}]}]}
         _, parts = wiro.build_request(wiro.candidate_for("w", "o/p", "image", row),
-                                      {"prompt": "x"}, {"inputImage": buf.getvalue()}, {})
+                                      {"prompt": "x"}, {"input_image": buf.getvalue()}, {})
         self.assertEqual(parts[0][:2], ("inputImage", "inputImage.png"))
         self.assertEqual(parts[1], ("inputImageUrl", None, b""))

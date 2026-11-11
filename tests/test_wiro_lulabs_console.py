@@ -64,12 +64,12 @@ class Aliases(_Fixture):
     def test_playground_renders_native_controls_without_sample_values(self):
         cand = wiro.candidate_for("wiro", "google/nano-banana", "image", WIRO_META)
         params, images, files = adapters.public_fields(cand)
-        self.assertEqual([i["name"] for i in images], ["inputImage", "inputImage_2"])
+        self.assertEqual([i["name"] for i in images], ["input_image", "input_image_2"])
         names = {p["name"]: p for p in params}
-        self.assertEqual(names["aspectRatio"].get("choices"), ["1:1", "16:9"])
+        self.assertEqual(names["aspect_ratio"].get("choices"), ["1:1", "16:9"])
         self.assertNotIn("sample prompt text", str(names["prompt"].get("default", "")))
         lu = lulabs.candidate_for("lulabs", "flux-dev", "image",
                                   {"id": "flux-dev", "kind": "image", "_ops": ["generate", "edit"]})
         _, lu_images, _ = adapters.public_fields(lu)
-        self.assertEqual([i["name"] for i in lu_images], ["source_image", "mask_image"])
+        self.assertEqual([i["name"] for i in lu_images], ["input_image", "input_image_mask"])
         self.assertFalse(lu_images[0]["required"])

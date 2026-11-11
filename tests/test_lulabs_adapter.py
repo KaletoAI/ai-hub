@@ -71,13 +71,13 @@ class Pure(unittest.TestCase):
             with self.assertRaises(lulabs.INPUT_ERROR):
                 lulabs.validate_request(video, bad, (), ())
         # a source image turns the same model id into an animate job
-        self.assertEqual(lulabs.validate_request(video, {"prompt": "x"}, ("source_image",), ())["op"],
+        self.assertEqual(lulabs.validate_request(video, {"prompt": "x"}, ("input_image",), ())["op"],
                          "animate")
         image = lulabs.candidate_for("lu", "flux-dev", "image", cats["image"]["flux-dev"])
-        self.assertEqual(lulabs.validate_request(image, {"prompt": "x"}, ("source_image", "mask_image"),
+        self.assertEqual(lulabs.validate_request(image, {"prompt": "x"}, ("input_image", "input_image_mask"),
                                                  ())["op"], "edit")
         with self.assertRaises(lulabs.INPUT_ERROR):      # a mask without the image it edits
-            lulabs.validate_request(image, {"prompt": "x"}, ("mask_image",), ())
+            lulabs.validate_request(image, {"prompt": "x"}, ("input_image_mask",), ())
 
     def test_alias_options_cannot_override_paths_caps_or_op(self):
         """options_json must never smuggle max_credits, client_request_id, op or a path."""
@@ -291,7 +291,7 @@ class LuLabsAdapterTest(unittest.IsolatedAsyncioTestCase):
         """An edit uploads its image (role=source) and sends the returned path; a
         cancelled gateway job asks LU to cancel ITS job and records stop_requested."""
         self.block_poll = asyncio.Event()
-        req = self.req(endpoint="image", upload_images={"source_image": self.png})
+        req = self.req(endpoint="image", upload_images={"input_image": self.png})
         task = asyncio.create_task(self.ad.generate(req))
         await asyncio.wait_for(self.block_poll.wait(), 5)
         job = json.loads(self.calls("/v1/jobs")[0].content)

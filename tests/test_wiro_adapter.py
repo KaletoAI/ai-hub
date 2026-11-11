@@ -185,7 +185,7 @@ class WiroAdapterTest(unittest.IsolatedAsyncioTestCase):
         """A `fileinput` slot sends the file AND an empty `{id}Url` form field — the empty
         field used to crash the adapter (`_mime_and_kind(None)`) on every upload."""
         await self.ad.generate(self.req(model="acme/animate", endpoint="video",
-                                        upload_images={"inputImage": self.png}))
+                                        upload_images={"input_image": self.png}))
         raw = self.calls("/Run/acme/animate")[0].content
         self.assertIn(b'name="inputImage"; filename="inputImage.png"', raw)
         self.assertIn(b'name="inputImageUrl"\r\n\r\n\r\n', raw)
@@ -259,9 +259,9 @@ class WiroAdapterTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_uploaded_images_go_multipart_as_repeated_field(self):
         """Uploaded images replace the sample defaults: multipart with one `inputImage`
-        part per slot (inputImage, inputImage_2 …) in slot order."""
-        await self.ad.generate(self.req(upload_images={"inputImage": self.png,
-                                                       "inputImage_2": self.png}))
+        part per slot (input_image, input_image_2 …) in slot order."""
+        await self.ad.generate(self.req(upload_images={"input_image": self.png,
+                                                       "input_image_2": self.png}))
         run = self.calls("/Run/google/nano-banana")[0]
         self.assertTrue(run.headers["content-type"].startswith("multipart/form-data"))
         raw = run.content

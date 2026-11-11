@@ -959,9 +959,18 @@ main's text side reads the catalog key `tts`, and a paid media catalog there bec
 LLM-routable — review 2026-11-10), music/voice →
 audio, any video → video, any image → image, everything else — llm, chat,
 captioning — skipped). Ids come from the CLEAN slugs (`slugproject` may contain
-spaces). Parameter items drive `public_fields` (file items whose id names an image
-are image slots, expanded `id, id_2 … id_N` by `maxinputlenght`; other file items
-are uploads) and `build_request`: client > alias `options_json` > `_vendor_default`.
+spaces). **Public names are the gateway's, not wiro's** (`_public_names`): camelCase
+ids become snake_case (`aspectRatio` → `aspect_ratio`, `inputImage2` →
+`input_image_2`, end-frame spellings → `input_image_last`). The Playground keeps
+uploads and carries values per NAME across model switches — with wiro's ids every
+image loaded on Venice (`input_image`) was lost on the switch (2026-11-11). Names that
+would collide (incl. an expanded slot) keep wiro's ids; the live Tool/List had none.
+Params and `options_json` also accept wiro's ids (`_to_vendor`, public name wins);
+upload slots have one spelling, since main drops unpublished image keys anyway.
+The wire always carries wiro's ids. Parameter items drive `public_fields` (file items
+whose id names an image are image slots, expanded `name, name_2 … name_N` by
+`maxinputlenght`; other file items are uploads) and `build_request`: client > alias
+`options_json` > `_vendor_default`.
 **Vendor defaults are sent only for controls** (select, number, float, checkbox,
 multiselect, and a REQUIRED `text` whose default is a number like seed `"0"` — an
 optional seed sent on every run pinned every result to it) and verbatim —
@@ -970,7 +979,8 @@ checkbox `"--use_pe"`), and validating them refused every run of those models.
 **File defaults are wiro SAMPLE URLs and prose defaults sample prompts**: sending
 either generated from the vendor's samples instead of the request, so they never go
 out and a required one is a 400. Blank client values are "not set" (main always
-passes `prompt`/`negative_prompt`); `negative_prompt` maps onto `negativePrompt`.
+passes `prompt`/`negative_prompt`); `negative_prompt` is `negativePrompt`'s public
+name and falls back onto a `negative` control.
 `_openai_generics`: the OpenAI Images shim passes `size`/`quality`/`style`/… for every
 client — `size` maps onto width/height or a matching aspect ratio, `n` onto `samples`,
 the rest is dropped (refusing them made Open WebUI a 400 on most models). Image uploads
@@ -990,12 +1000,16 @@ Pure LU Labs helpers. The create catalog's JSON is unpublished, so
 types/kinds and unsupported ops (lora-train, studio) are skipped, a `tools` block
 publishes model-less `removebg`/`upscale`; only a payload with no list at all is an
 error (an empty snapshot would hide every model). `image` and `video` each hold two
-ops — `op_for` picks edit/animate when a `source_image` is sent — so one model has
+ops — `op_for` picks edit/animate when an `input_image` is sent — so one model has
 one id and the OpenAI edits shim reaches the edit. `validate_request` returns the
 job params (op included) and refuses unknown keys, `n` > 1, unpublished durations,
 a mask without its image and missing inputs before any upload; `options_json`
 cannot set op, model, paths, `max_credits` or `client_request_id`. `sniff` names a
 result by its bytes (LU's `/content` redirect says nothing about the type).
+Slot names are the gateway's (`input_image`, `input_image_mask`, `input_audio`,
+`input_video`; LU's roles only in `SLOT_ROLES`): the Playground keeps uploads per slot
+NAME across model switches, and LU's own `source_image`/`audio` lost every image a user
+had loaded on Venice (2026-11-11).
 
 ### `nanogpt.py`
 
@@ -3241,7 +3255,9 @@ Every test file also says this in its own docstring; this is the overview.
   independent groups, cap reloads, disabled/draining members and streams held to EOF.
 - `test_wiro.py`: category mapping (realtime/llm skipped), clean-slug ids, signature
   and key-only headers, redaction, value precedence, sample defaults never sent,
-  vendor control defaults verbatim, hidden items, slot expansion, task states.
+  vendor control defaults verbatim, hidden items, slot expansion, task states,
+  gateway-convention public names (snake_case, `input_image…`) with wiro ids on the
+  wire, wiro ids still accepted as params, collisions keeping wiro's ids.
 - `test_wiro_adapter.py`: paginated public `Tool/List`, `limit=1000`, Bearer
   `KEY:SECRET` on chat, signed runs, `task_end` not terminal, credential-free
   downloads, multipart repeats, 400 before any POST, failed exit code final, 96/97
