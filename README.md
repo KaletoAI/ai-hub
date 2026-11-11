@@ -1381,7 +1381,8 @@ chat sends it verbatim as `Authorization: Bearer …`, the task API signs every 
 Media ids are `wiro/<owner>/<project>` (`wiro/google/nano-banana`) and are callable
 without an alias. Request parameters are the model's own wiro parameters under the
 gateway's snake_case names (`aspectRatio` → `aspect_ratio`, `negativePrompt` →
-`negative_prompt`), listed by `GET /v1/generations/schema` and the Playground; wiro's
+`negative_prompt`), listed by `GET /v1/generations/wiro/<owner>/<project>/schema` and
+the Playground; wiro's
 own ids are still accepted as params (and in `options_json`), and go out on the wire.
 Image inputs use the same slot names as Venice/NanoGPT — `input_image`,
 `input_image_2` … (`inputImage2` → `input_image_2`), named extras like
@@ -2044,7 +2045,8 @@ ComfyUI's cache), so the first job after one frees.
   `params`), a Meshy or Tripo rigging alias lists
   `{"name": "input_mesh_path", "required": true, "accept": ["glb"]}`. It is the
   machine-readable source of truth — a client builds a valid request from it without
-  out-of-band docs.
+  out-of-band docs. `{alias}` may be a catalog id with slashes
+  (`/v1/generations/wiro/google/nano-banana/schema`); `/loras` takes the same ids.
 
 **Playground.** In the console's **Media** playground a mesh parameter takes a real
 file (glb/gltf/obj/fbx/stl/ply — sent as `files`) or, as before, a path that already

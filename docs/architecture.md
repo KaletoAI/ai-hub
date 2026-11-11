@@ -487,6 +487,12 @@ catalogs were absent when the restart (or mid-refresh) index was built.
 Native file decoding uses the resolved candidate's current schema, including
 direct video/audio uploads; an unavailable schema refuses the call instead of
 dropping files before a later discovery could make the model callable.
+The self-description routes (`/v1/generations/{alias}/schema`, `/loras`, `/loras/{name}`)
+take `{alias:path}`: a catalog id has slashes (`wiro/google/nano-banana`), and a plain
+segment 404ed EVERY catalog model. They resolve through `_gen_alias_cands` (store →
+`image_models` → `_catalog_direct_candidates`, the `_gen_routes` order), and
+`_schema_cand` attaches the live catalog row a stored alias does not hold — without it
+a stored wiro/Venice alias described no fields (`test_wiro_lulabs_routing.py`).
 
 `store.migrate_nanogpt` moves legacy type/candidate blocks transactionally,
 preserving encrypted secrets verbatim, caps and discovery caches. Name collisions

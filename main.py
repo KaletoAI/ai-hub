@@ -5294,13 +5294,34 @@ def _alias_paired(cands) -> bool:
     return False
 
 
+def _gen_alias_cands(alias: str) -> list:
+    """The candidates the self-description routes read: a stored alias, a config
+    `image_models` alias, else a catalog id (`venice.ai/x`, `wiro/owner/project`) —
+    the same order `_gen_routes` resolves a generation by. [] = unknown. Blocking."""
+    return ((store.get(alias) if store.is_active() else None) or image_models.get(alias)
+            or _catalog_direct_candidates(alias))
+
+
+def _schema_cand(alias: str, cands: list) -> dict:
+    """The FIRST candidate (the shape the editor and Playground read), with the
+    backend's live catalog row attached when its kind needs one: a catalog candidate's
+    fields (wiro, Venice, …) come from `model_metadata`, which a stored alias does not
+    hold — `_gen_routes` attaches it, so take that copy. Blocking."""
+    cand = cands[0]
+    if cand.get("model_metadata") is not None:
+        return cand
+    for _b, routed in get_gen_routes(alias):
+        if routed.get("backend") == cand.get("backend") and routed.get("model") == cand.get("model"):
+            return routed
+    return cand
+
+
 async def _alias_lora_items(alias: str, request: Request, authorization: Optional[str]) -> tuple:
     """(sorted LoRA names valid for the alias, their trigger-word items). The names are
     the union installed across the alias's backends, as always; the items come from the
     in-memory snapshot only — never a hash, a listing or Civitai (N1)."""
     await gate_request(authorization, request, alias, media=True)                # auth + allow-list
-    cands = ((await asyncio.to_thread(store.get, alias)) if store.is_active() else None) \
-        or image_models.get(alias)
+    cands = await asyncio.to_thread(_gen_alias_cands, alias)
     if not cands:
         raise HTTPException(404, f"generation alias '{alias}' not found")
     loras: set = set()
@@ -5312,7 +5333,7 @@ async def _alias_lora_items(alias: str, request: Request, authorization: Optiona
                                  adapters.lora_counterpart if paired else None)
 
 
-@app.get("/v1/generations/{alias}/loras")
+@app.get("/v1/generations/{alias:path}/loras")
 async def gen_alias_loras(alias: str, request: Request, authorization: Optional[str] = Header(None)):
     """LoRA filenames valid for a generation alias — the union of what's installed on
     the alias's backends (`loras`, unchanged), plus `items`: per name its trigger words
@@ -5322,7 +5343,7 @@ async def gen_alias_loras(alias: str, request: Request, authorization: Optional[
     return {"object": "list", "alias": alias, "loras": names, "items": its}
 
 
-@app.get("/v1/generations/{alias}/loras/{name:path}")
+@app.get("/v1/generations/{alias:path}/loras/{name:path}")
 async def gen_alias_lora(alias: str, name: str, request: Request,
                          authorization: Optional[str] = Header(None)):
     """One LoRA's trigger-word item for an alias; 404 when the name is not valid there."""
@@ -5333,7 +5354,7 @@ async def gen_alias_lora(alias: str, name: str, request: Request,
     raise HTTPException(404, f"LoRA '{name}' is not valid for generation alias '{alias}'")
 
 
-@app.get("/v1/generations/{alias}/schema")
+@app.get("/v1/generations/{alias:path}/schema")
 async def gen_alias_schema(alias: str, request: Request, authorization: Optional[str] = Header(None)):
     """Self-description of a generation alias — enough for a client (or an agent)
     to build a valid request without out-of-band docs: params under their EXTERNAL
@@ -5342,11 +5363,10 @@ async def gen_alias_schema(alias: str, request: Request, authorization: Optional
     are not images — a mesh a rig/shrink alias works on), fps/frames raster, and
     where to list valid LoRAs."""
     await gate_request(authorization, request, alias, media=True)                # auth + allow-list
-    cands = ((await asyncio.to_thread(store.get, alias)) if store.is_active() else None) \
-        or image_models.get(alias)
+    cands = await asyncio.to_thread(_gen_alias_cands, alias)
     if not cands:
         raise HTTPException(404, f"generation alias '{alias}' not found")
-    cand = cands[0]
+    cand = await asyncio.to_thread(_schema_cand, alias, cands)
     # ONE seam for both candidate kinds (ComfyUI: workflow + mapping labels; a cloud
     # backend: the endpoint's fixed label table) — see adapters.public_fields.
     params, images, files = adapters.public_fields(cand)

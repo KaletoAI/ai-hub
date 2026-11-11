@@ -119,6 +119,28 @@ class WiroRouting(_Routing):
         self.assertEqual(sent, [{"prompt": "blue lamp", "aspectRatio": "16:9"}])
         self.assertEqual(response.json()["status"], "done", response.text)
 
+    def test_schema_answers_for_slash_ids_and_stored_aliases(self):
+        """`GET /v1/generations/{alias}/schema` is how a client learns the field names.
+        A catalog id carries slashes (`wiro/google/nano-banana`) — a plain `{alias}`
+        segment never matched it (404 for EVERY catalog model) — and catalog ids live
+        in no alias table. A stored alias holds no catalog row either, so its wiro
+        fields were empty: the live row is attached as `_gen_routes` does."""
+        r = self.c.get("/v1/generations/wiro/google/nano-banana/schema")
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual([i["name"] for i in body["images"]],
+                         ["input_image", "input_image_2", "input_image_3"])
+        self.assertIn("aspect_ratio", {p["name"] for p in body["params"]})
+        self.assertEqual(body["loras_url"], "/v1/generations/wiro/google/nano-banana/loras")
+        loras = self.c.get("/v1/generations/wiro/google/nano-banana/loras")
+        self.assertEqual((loras.status_code, loras.json()["loras"]), (200, []))
+        self.assertEqual(self.c.get("/v1/generations/wiro/no/such/schema").status_code, 404)
+        import wiro
+        store.upsert("nano", [wiro.candidate_for("wiro", "google/nano-banana", "image")])
+        stored = self.c.get("/v1/generations/nano/schema")
+        self.assertEqual(stored.status_code, 200, stored.text)
+        self.assertEqual(stored.json()["images"][0]["name"], "input_image")
+
     def test_paid_speech_models_never_become_llm_routable(self):
         """main's text side reads the catalog key `tts`; a media speech catalog under that
         key made paid task-API models LLM speech models. They are `?type=tts` media only."""
