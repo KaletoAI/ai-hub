@@ -1699,6 +1699,10 @@ the `/ui` inspection view ONLY (`add_idle(glb) → glb`), so bad skin weights sh
 spikes/rings once it deforms. Pure struct/json on the glTF binary, append-only; the
 result route applies it on `?anim=idle`, never to the delivered file.
 
+Output IMAGES on the job page carry their real pixel size under the 260 px thumbnail
+(`admin._image_dims`: PIL reads the header only, cached per path+size+mtime; anything
+unreadable gets no caption, never an error) — pinned by `test_job_image_dims.py`.
+
 `admin._glb_stats` reads just the JSON chunk once per artifact render and supplies
 both the geometry line (`_glb_stats_html`) and native clip/skin metadata to
 `_media_tag`. Media Playground results and Job detail GLBs play exported native

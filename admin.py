@@ -9889,8 +9889,41 @@ def _job_thumbs(jid: str, kind: str, entries: list) -> str:
             # as a broken image.
             cells += _dl_card(src, label, dl=dl, mime=(r.get("mime") or "file"))
         else:
-            cells += (f"<a href='{src}' target='_blank'><img src='{src}' style='{style}'></a>")
+            img = f"<a href='{src}' target='_blank'><img src='{src}' style='{style}'></a>"
+            dims = None
+            if kind == "result":
+                rp = jobs.result_path(jid, r["n"])
+                dims = _image_dims(rp[0]) if rp else None
+            if dims:
+                # the delivered file's real pixel size — the thumbnail is scaled to
+                # 260 px, so "did the upscale / the 1536² request actually land?" was
+                # unanswerable without downloading the file
+                cells += (f"<div>{img}<div class='muted' style='font-size:12px;margin-top:2px'>"
+                          f"{dims[0]} × {dims[1]} px</div></div>")
+            else:
+                cells += img
     return f"<div style='display:flex;gap:10px;flex-wrap:wrap;margin:8px 0'>{cells}</div>"
+
+
+_IMG_DIMS: dict = {}         # (path, size, mtime) → (w, h) | None — results never change
+
+
+def _image_dims(path: str) -> Optional[tuple]:
+    """(width, height) of an image file from its HEADER (PIL opens lazily; no pixel
+    decode), cached per file. None for anything PIL cannot identify — the caption is
+    decoration, never an error."""
+    try:
+        st = os.stat(path)
+        key = (path, st.st_size, st.st_mtime_ns)
+        if key not in _IMG_DIMS:
+            from PIL import Image
+            with Image.open(path) as im:
+                _IMG_DIMS[key] = (int(im.size[0]), int(im.size[1]))
+            if len(_IMG_DIMS) > 2048:
+                _IMG_DIMS.pop(next(iter(_IMG_DIMS)))
+        return _IMG_DIMS[key]
+    except Exception:
+        return None
 
 
 def _runpod_table(m: dict) -> str:
