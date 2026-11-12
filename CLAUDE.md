@@ -63,7 +63,8 @@ silently break voice shipping and DB writes — `test_service_unit.py` pins both
 must be in both AND in `.gitignore`, or `rsync --delete` wipes it on prod: `config.yaml`,
 `store.db` + `secret.key`, `stats.db*`, `jobs.db*`, `faults.db*`, `jobs/`, `calls/`,
 `voiceref/`, `thunder.key*`, `thunder-known_hosts/`, `thunder-ctl/`,
-`modelsrc.key*`, `modelsrc-known_hosts`. Never commit any of them.
+`modelsrc.key*`, `modelsrc-known_hosts`, `power-keys/`, `power-known_hosts/`. Never commit any
+of them.
 
 ## Architecture map
 
@@ -93,6 +94,7 @@ hot-reload-safe. Modules marked *pure* do no I/O and import neither `main` nor
 | `admin.py` | The `/ui` console (tabs, live morph, forms). |
 | `previewanim.py` | Idle animation injected into a rigged GLB for the `/ui` inspection view only. |
 | `netscan.py` | *Pure* LAN scan behind Backends → Scan network. |
+| `power.py` | *Pure* half of backend power control (switch a device off/on safely via a host script over ssh): the fixed command contract, `parse_result`, state mapping, boot reconciliation, the `authorized_keys` line. |
 | `thunder.py` / `hostapi.py` | Thunder Compute provider: *pure* half / HTTP half + the `PROVIDERS` registry. |
 | `hostctl.py` | One lifecycle `Controller` per managed host: start/stop via snapshots, tunnel, services, model sync. |
 | `services.py` | What runs a backend on a managed VM, by type (ComfyUI loop, generic command service). |
@@ -172,6 +174,16 @@ Each of these once failed without an error; the full story is in `docs/architect
   growth or deletion requires its id in a fresh matching list. A fetch job or open
   multipart upload saved in `runpod_volume_state` is settled before any new writer
   (`docs/architecture.md`, RunPod volume sync).
+
+**Backend power control** (`power.py`; real hardware — read `docs/architecture.md`)
+- Only `safe_to_power_off == true` on a successful `off` shows "Safe to switch off now";
+  only `power.COMMANDS` go over ssh (strict, pinned host key, per-backend key).
+- A generation job admitted BEFORE the switch-off keeps the backend (`_gen_routes(…,
+  admitted)`); the disable + `off` run only after in-flight AND those jobs are done
+  (queue copied on the loop, in-flight read AFTER the thread hop). `_run_job` claims
+  nothing `_power_dispatch_ok` refuses (failover tails included); a held-off backend is
+  enabled only by "Switched on again" (`_power_holds`; ▶ and hostctl refused).
+- A restart never re-runs a power action (`power.reconcile_boot` → `error`).
 
 **Every new silently-failing mechanism gets a test** in `tests/` whose docstring says
 what it guards, and a line in `docs/architecture.md`.

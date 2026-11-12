@@ -213,10 +213,12 @@ def prepare_ctl_path(ctl_path: str) -> str:
 
 
 def exec_argv(key: str, known_hosts: str, host: str, port: int,
-              remote_cmd: str) -> list[str]:
+              remote_cmd: str, strict: str = "accept-new") -> list[str]:
     """`ssh … -- host <remote_cmd>`. `remote_cmd` is ONE string the remote shell
-    parses — every argument inside it must already have gone through `q()`."""
-    return ssh_base(key, known_hosts, port=port) + ["--", host, remote_cmd]
+    parses — every argument inside it must already have gone through `q()`. `strict`
+    "yes" for a host whose key the operator pinned (backend power control): no first
+    connect may trust whatever answers."""
+    return ssh_base(key, known_hosts, strict=strict, port=port) + ["--", host, remote_cmd]
 
 
 def q(s) -> str:

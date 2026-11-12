@@ -8,7 +8,7 @@ look (grep the symbol) before changing a mechanism. Moved out of `CLAUDE.md` on
 
 ## Contents
 
-- [Modules](#modules): [main.py](#mainpy), [adapters.py](#adapterspy), [RunPod Serverless](#runpod-serverless-runpodadapter), [RunPod volume sync](#runpod-volume-sync-rpvolume--s3vol), [meshy.py](#meshypy), [cloudtask.py](#cloudtaskpy), [tripo.py](#tripopy), [faults.py](#faultspy), [jobs.py](#jobspy), [store.py](#storepy), [admin.py](#adminpy), [Media statistics](#media-statistics--the-job-store-not-the-call-log), [stats.py](#statspy), [responses_bridge.py](#responses_bridgepy), [anthropic_bridge.py](#anthropic_bridgepy), [openai_image_bridge.py](#openai_image_bridgepy), [reasoning.py](#reasoningpy), [previewanim.py](#previewanimpy), [netscan.py](#netscanpy), [Managed hosts](#managed-hosts), [thunder.py](#thunderpy), [hostapi.py](#hostapipy), [services.py](#servicespy), [sshrun.py](#sshrunpy), [hostctl.py](#hostctlpy), [modelsync.py](#modelsyncpy), [loratags.py](#loratagspy), [Model sources](#model-sources), [ops/](#ops)
+- [Modules](#modules): [main.py](#mainpy), [adapters.py](#adapterspy), [RunPod Serverless](#runpod-serverless-runpodadapter), [RunPod volume sync](#runpod-volume-sync-rpvolume--s3vol), [meshy.py](#meshypy), [cloudtask.py](#cloudtaskpy), [tripo.py](#tripopy), [faults.py](#faultspy), [jobs.py](#jobspy), [store.py](#storepy), [admin.py](#adminpy), [Media statistics](#media-statistics--the-job-store-not-the-call-log), [stats.py](#statspy), [responses_bridge.py](#responses_bridgepy), [anthropic_bridge.py](#anthropic_bridgepy), [openai_image_bridge.py](#openai_image_bridgepy), [reasoning.py](#reasoningpy), [previewanim.py](#previewanimpy), [netscan.py](#netscanpy), [power.py](#powerpy--backend-power-control), [Managed hosts](#managed-hosts), [thunder.py](#thunderpy), [hostapi.py](#hostapipy), [services.py](#servicespy), [sshrun.py](#sshrunpy), [hostctl.py](#hostctlpy), [modelsync.py](#modelsyncpy), [loratags.py](#loratagspy), [Model sources](#model-sources), [ops/](#ops)
 - [Request flow](#request-flow)
 - [Routing rules](#routing-rules-resolve_routesget_gen_routes--alias_entry)
 - [Auth / multi-user](#auth--multi-user)
@@ -1769,6 +1769,159 @@ re-offered. `main.start_scan`/`scan_status` own the ONE task and the settings
 `scan_cidrs`/`scan_ports`; `admin._scan_panel` renders it live (`data-sk="scan"`),
 *Add* opens `_backend_form(prefill=…)`. Manual only, never writes the store.
 
+### `power.py` — backend power control
+
+(spec `2026-11-12-backend-power-control-design.md`, local only.) Some backends sit on
+hardware a person switches off by hand — the first is an RTX 4070 eGPU on USB4 behind a
+ComfyUI. Cutting its power while the OS still holds the device is a surprise removal:
+with NVIDIA 595 the PCIe hotplug thread then hangs in the driver holding the global
+rescan lock (measured 2026-11-12: Xid 79 + 154, the card was never seen again, and only
+a reboot of the host helped — which also takes down the OTHER backends there). A
+host-side script detaches the device cleanly first; the gateway drains the backend,
+runs that script and says WHEN the power may be cut. The switch stays manual; nothing
+in code is device-specific.
+
+**The contract** (`power.COMMANDS`/`TIMEOUTS`, the only remote commands ever sent —
+no admin text reaches an argv): `status --json` 60 s, `off --stop-ct --json` 240 s,
+`on --start-ct --json` 360 s. One JSON object on stdout (the LAST line that parses as
+one), diagnostics on stderr; exit 0 ok|absent|ready, 1 busy|absent (on: not on the
+bus), 2 hung, 3 call error (a gateway bug), 4 error|degraded. `parse_result(action, rc,
+stdout, stderr)` is the one judge: **only `safe_to_power_off == true` on a successful
+`off` is `safe`** (an `off` exit 0 without it is an error, so the green banner never
+appears by accident); `hotplug_hung: true` is `hung` whatever the exit code; stdout
+without a JSON object is an error; ssh's own exit 255 is `unreachable` (an on-demand
+host that is off is a state, F3) unless its stderr names a host-key or key refusal,
+which need the operator; sshrun's timeout (124) is an error — the device state is
+unknown. `off_state`/`on_state`/`status_state` map an outcome onto the state.
+
+**Configuration** (backend entry, form → Behavior → "Power control", rendered for
+EVERY type — a field not rendered is read as cleared): `power_ssh` (`user@host`, the
+feature's switch; `power.target_ok`), `power_ssh_port` (blank = 22), `power_script`
+(display only: the suggested `authorized_keys` line `restrict,command="<script>
+--ssh-forced" ssh-ed25519 … ai-hub-power-<backend>`; `power.script_ok` keeps quotes and
+spaces out of it). One ed25519 key PER BACKEND (each device has its own forced command)
+at `<datadir>/power-keys/<name>-<type>.key` (`power.file_slug`; `sshrun.keygen`),
+generated after a Save that set `power_ssh` (`power_keys_ensure` from
+`apply_backend_change`, and at boot) or by the form's "Generate key" — never by a page
+view. The host key is pinned like the LAN source's: "Fetch host key" (`power_scan`:
+`ssh-keyscan -t ed25519 -p <port> -- host`, `hostctl.parse_keyscan` against
+`power.known_hosts_name` — `[host]:port` off port 22, or the pin would never match the
+connect) keeps the fingerprint in memory; "Confirm" (`power_pin`) writes
+`<datadir>/power-known_hosts/<name>-<type>` (0600, atomic) only for the fingerprint the
+button carried. `_power_ready` refuses every ssh action without key or pin, or with a
+pin for another host/port ("confirm the host key first"). ssh runs as
+`sshrun.exec_argv(key, pin, user@host, port, <fixed command>, strict="yes")` —
+`-F /dev/null`, BatchMode, IdentitiesOnly, ending `-- user@host <cmd>`. Both
+directories are in `.gitignore` and BOTH `deploy.sh` exclude lists
+(`test_hostctl.test_deploy_and_gitignore_exclude_keys`).
+
+**State** (main `_power_states`, persisted as store setting `power_state` {bid: record},
+a `_BULK_SETTINGS` key): `on`, `draining`, `switching_off`, `off`, `busy`, `hung`,
+`error`, `switching_on`, `starting`, `unreachable`. ONE action per backend
+(`_power_tasks`; a second click is refused, `power.action_refusal`). At boot
+`power.reconcile_boot` turns `draining`/`switching_off`/`switching_on` into `error`
+"interrupted by gateway restart — run Status" — NEVER re-run (the device may be
+anywhere in between); a `starting` record gets its watcher back.
+
+**Switch off** (`power_action(bid, "off")` → `_power_off_flow`): records the pre-click
+`enabled` and `t0`, and — if enabled — puts the backend into `_power_draining`
+{bid: t0} (`time.monotonic()`). `is_draining` includes it, so LLM routing treats it as
+a plain drain. Generation is where it differs: **a job keeps the backend when it was
+ADMITTED before t0** (`run_generation` stamps `admitted` at its start and carries it
+through `_run_gen_now`/`_run_gen_parked` into `_gen_routes(alias, gated, admitted)`,
+whose `_power_keeps(admitted)` re-admits exactly those backends; `_entry_can_use`
+memoises per (alias, that set)). Without it the drain removed the backend from the
+2 s re-pick of parked jobs, and a job already waiting for that GPU failed as "no
+healthy backend". A job admitted after t0 whose ONLY candidate it is gets a 503
+"<backend> is being switched off" at once (`_power_held` adds it to `gated`,
+`_gen_no_route_error` joins it; the text "'<alias>': <backend> is switched off and no
+other backend can take it" — another candidate may merely be down) instead of parking
+until the park timeout; with another candidate it simply goes there. The flow polls
+(`_POWER_POLL_S`) until in-flight == 0 AND `power_waiting_jobs` == 0 (pre-t0 waiters in
+`_gen_waiting` that could still run there — their own force/LoRA/exclude filters
+applied) — the row shows "waiting for N jobs" live. **Order matters**: the queue is
+copied ON the loop (`_gen_waiting_pool()`, passed in), the count runs in a thread, and
+the in-flight count is read AFTER that hop. With the count read first, a pre-click job
+that claimed the backend during the hop (claim and `_inflight_inc` are one synchronous
+step) was in neither number, and disable + `off` ran under a job between its claim and
+its prompt POST (review 2026-11-12). Then, with no await between, it disables
+(`set_backend_enabled(bid, False)`, persisted, record `held=True`), leaves
+`_power_draining` and runs `off`. `off` → `off` ("Safe to switch off now", backend
+stays disabled); `busy` → the pre-click `enabled` comes back, with `backend_healthy`
+reset (`off --stop-ct` may have stopped the service before the script found the device
+busy — the pre-click "healthy" is stale) and `held` cleared (a note when the script
+reports its container stopped); `hung` → red "Do NOT switch off", stays disabled,
+nothing automatic; error/unreachable → `error`, stays disabled (the device state is
+unknown). A failure BEFORE the disable restores routing. "Cancel" (state `draining`
+only) cancels the task, leaves `_power_draining` and restores the power state the click
+found (`prev_state`, not a blanket `on`). Every drain exit goes through
+`_power_undrain(bid, t0)`: only the entry this flow began is removed — a cancelled task
+resumes at its next await, and after a quick re-click the entry is the NEW flow's.
+
+**Pre-click `enabled`**: a backend under a plain take-offline drain (`_draining`, not a
+managed host's `_drain_hold`) counts as NOT enabled — `busy` must not re-enable what the
+operator was taking offline — and gets no `_power_draining` entry (the plain drain
+already keeps it out; its finalize disables it). A managed host's restart hold
+(`_hold_routing`) also lives in `_draining`, and `_gen_routes` checks `_draining` before
+the pre-click exception: during such a hold a pre-click job does NOT keep the backend
+(it parks like everyone else until the hold ends) — accepted: the hold is short, and a
+power-controlled device on a rented VM is not a real setup.
+
+**Dispatch guard** (`_power_dispatch_ok`, in `_run_job` before every claim — the
+designated first candidate and each failover target): a candidate list is computed
+before awaits, and a pre-click job running on ANOTHER backend carries this one in its
+failover tail, which the drain does not wait for. So a backend that is disabled (the
+LIVE dict — a rebuild replaces them), in `power.NO_DISPATCH` (`switching_off`, `off`,
+`hung`, `switching_on`) or `starting` without a healthy discovery is skipped there.
+In `draining` a listed candidate is legit (lists made after t0 drop it unless the job
+was admitted before; its claim is in-flight, which the drain waits for). A job whose
+candidates were ALL skipped this way fails "'<alias>': <backend> was switched off
+before the job could start there and no other backend can take it".
+
+**Held off** (`_power_holds`: power control configured, backend disabled, and the
+record `held` or state `off`/`hung`): only "Switched on again" (which runs
+`on --start-ct`) may enable it. The console's ▶ is hidden and refused
+(`console_set_backend_enabled`), and hostctl's `set_enabled` is `_host_set_enabled`,
+which skips (and logs) an ENABLE while a power action runs or the backend is held — a
+disable always goes through (the safe direction). While an action runs ▶ enable / ⊘
+drain are refused (`console_set_backend_enabled` / `console_begin_drain`) and hidden.
+Removing `power_ssh` from the backend is the way out when the script itself is
+broken.
+
+**Switched on again** (states off/hung/error/unreachable AND the backend disabled —
+an enabled, serving backend whose last status said `unreachable` is refused and not
+offered: the flow would mark it unhealthy and run `on` on a device nobody switched off
+→ `_power_on_flow`): `on`;
+ok → `backend_healthy[bid] = False` and `backend_error` cleared (a backend disabled
+while healthy KEEPS that flag — enabled as is, it would be routed to before its service
+is up), `starting` persisted, THEN `set_backend_enabled(bid, True)`, and
+`_power_watch_start` waits for the first healthy discovery → `on`, or
+`power.START_TIMEOUT_S` (10 min) → `error` "did not come up" (left enabled; unhealthy,
+so routing skips it). absent → "device not found — is it powered on and its cable
+connected?". **F4**: `refresh_backend` opens no fault while `_power_quiet(bid)`
+(`starting`); a disabled backend is not polled anyway, so `off`/`hung` write none.
+
+**Check status** (`_power_status_flow`, a POST — never a timer or page view: the
+script starts `nvidia-smi`): stores the JSON (`power.summary`: present, driver, users,
+ct status, safe_to_power_off, hotplug_hung) and maps the state (`status_state`;
+unreachable is informational; a `starting` record keeps its state unless hung). For a
+HELD backend a good answer without `safe_to_power_off` (device powered on again and
+attached by the host) stays `off` with `safe` false — mapped to `on` it dropped
+"Switched on again" and left the plain enable, which skips `on --start-ct`. The green
+banner needs state `off` AND `safe`.
+
+**Console**: `gateway_info`/`/health` carry `power` per configured backend
+(`power_info`: state, message, waiting counts, summary, the running action and the
+`_power_ready` refusal — memory plus two small files, no network) and the three config
+fields (the config backend's editor falls back to that summary). `admin._power_line`
+renders the row's line (state chip, the banners, the count, buttons POSTing
+`/ui/backends/power?do=off|on|status|cancel`, or the refusal instead of a dead button),
+keyed `data-k="pwr-<bid>"`; the Backends tab is live (3 s) while an action runs or a
+backend is `starting`. `admin._power_section` is the form block (fields, public key,
+the `authorized_keys` line with a copy button, Fetch/Confirm host key, Generate key —
+`/ui/backends/power-key|power-scan|power-pin`, all in `_POST_ACTIONS`).
+`test_power_control.py`.
+
 ### Managed hosts
 
 (spec `docs/superpowers/specs/2026-09-29-managed-hosts-design.md` on
@@ -2850,6 +3003,10 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   A removed/re-grouped backend is no longer a member; drain active work before
   changing group membership. `test_concurrency_group.py` pins the cross-type cap,
   disabled/draining members, cap changes and complete/aborted stream lifecycles.
+- **Power switch-off** (`_power_draining`, see `power.py` above): draining for LLM
+  routing and for every generation job admitted AFTER the click; a job admitted BEFORE
+  it keeps the backend (`_gen_routes(…, admitted)` / `_power_keeps`), and a new job
+  whose only candidate it is gets "<backend> is being switched off" at once.
 - **Re-routing onto a returning backend**: waiting work is never pinned to the
   backend it queued for. `refresh_backend` calls `_notify_slot_free()` on DOWN→UP
   and on a model-set change (parked calls re-evaluate); `apply_backend_change` and
@@ -3503,6 +3660,17 @@ looks exactly like a healthy fleet — it pins the recording points in `refresh_
 and `_dispatch_over` incl. a failover that ends in 200, the bundling, the downtime
 clipping and open outage, persistence across a restart, and what Dashboard/Statistic
 render).
+`test_power_control.py` (backend power control: "Safe to switch off now" is the
+operator's only signal to cut power, and a wrong one wedges the host's hotplug — it
+pins `parse_result` for every exit code/result incl. garbage stdout, a missing
+`safe_to_power_off`, `hotplug_hung` over exit 0 and ssh's 255; the argv being exactly
+the fixed command after `-- user@host` with a strict pinned host key; a pin for another
+host refusing; pre-click jobs keeping the backend while post-click ones get the named
+503; the disable and the `off` run only after in-flight AND pre-click jobs; `busy`
+restoring the pre-click `enabled`; hung/unreachable staying disabled; Cancel restoring
+routing; no work before the first healthy discovery after `on`; no fault while
+`starting`; restart reconciliation never re-running an action; the row's banners and
+POST buttons).
 `test_ui_session.py` (the /ui session cookie: a forgeable session looks exactly like a
 working login. `store.decrypt_secret`'s legacy-plaintext passthrough made a hand-typed
 `gw_session={"u":"admin",…}` an admin session (review 2026-09-23), so `_session_user`

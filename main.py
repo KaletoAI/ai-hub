@@ -39,6 +39,7 @@ import scheduler
 import netscan
 import nodeprofile
 import os
+import power
 import socket
 import stats
 import store
@@ -558,10 +559,16 @@ _drain_host: dict = {}
 # backend ids in `_draining` only for a managed host's automatic restart (hostctl
 # `hold_routing`): routing skips them, but they are never finalized (disabled)
 _drain_hold: set = set()
+# backend id → t0 (time.monotonic()) of a power switch-off (power.py): routing skips the
+# backend like a drain — but a generation job ADMITTED before t0 keeps it as a candidate
+# (`_power_keeps`), and nothing here finalizes: the power flow disables it itself once
+# in-flight work AND those earlier jobs are done.
+_power_draining: dict = {}
 
 
 def is_draining(backend: dict) -> bool:
-    return backend_id(backend) in _draining
+    bid = backend_id(backend)
+    return bid in _draining or bid in _power_draining
 
 
 def _inflight_inc(name: str) -> None:
@@ -1056,7 +1063,10 @@ async def refresh_backend(backend: dict, client: httpx.AsyncClient) -> None:
             # `_err_text`: an httpx timeout stringifies to "" — the journal read "DOWN —"
             # with nothing after it (measured 2026-09-12/13 on prod, a dozen times).
             logger.warning(f"[{label}] DOWN — {info['detail']}{hint}")
-        if fault_since is None and info["kind"] not in faults.NOT_FAULT_KINDS:
+        # A backend the power control is bringing back (`starting`: its device was just
+        # attached, its service is still booting) is not failing — F4, no fault noise.
+        if (fault_since is None and info["kind"] not in faults.NOT_FAULT_KINDS
+                and not _power_quiet(bid)):
             fault_since = int(time.time())
             _note_fault(backend, "health", info["kind"], info["detail"], status=info["status"])
         info["fault_since"] = fault_since
@@ -1329,6 +1339,10 @@ async def lifespan(app: FastAPI):
     faults_cfg = config.get("faults") or {} if isinstance(config, dict) else {}
     faults.init(faults_cfg.get("db_path", "faults.db"))
     faults_prune_task = asyncio.create_task(faults.prune_loop(faults_cfg.get("retention_days", 7)))
+    # Backend power control: the persisted states BEFORE the first discovery, so a
+    # `starting` backend's first failing poll is already quiet (F4) and an action the
+    # restart interrupted shows as such.
+    power_boot()
 
     log_config_summary()
     # The first round is the scheduler's; boot waits for it only so long — a slow vendor
@@ -3706,7 +3720,8 @@ def generation_candidate(model: str) -> Optional[dict]:
     return routes[0][1] if routes else None
 
 
-def _gen_routes(alias: str, gated: Optional[list] = None) -> tuple[list, list]:
+def _gen_routes(alias: str, gated: Optional[list] = None,
+                admitted: Optional[float] = None) -> tuple[list, list]:
     """(ready, all) (backend, candidate) pairs for a generation alias, each ordered
     **unpaid before paid, then fastest first** (`gen_speed` EMA per alias+backend; an
     unmeasured backend sorts first, probe-once) and filtered to enabled + healthy
@@ -3724,6 +3739,13 @@ def _gen_routes(alias: str, gated: Optional[list] = None) -> tuple[list, list]:
     the sync instead of parking for hours behind it. `gated`, when given, collects
     (backend name, reason) of every such candidate — the 503's text.
 
+    A backend being switched off (`_power_draining`) is skipped like a drained one —
+    except for a job `admitted` (time.monotonic() of its request) BEFORE the switch-off
+    click: such a job keeps it as a candidate (spec "Abwarten"; the switch-off waits for
+    it). A candidate held by the power flow is named in `gated` too, so a NEW job whose
+    only candidate it is gets "<backend> is being switched off" at once instead of
+    parking until the park timeout.
+
     Reads from the writable store (UI source of truth) when active, falling back
     to the `image_models` config for aliases the store doesn't hold. Blocking
     (store read) — call via asyncio.to_thread from async code."""
@@ -3736,10 +3758,16 @@ def _gen_routes(alias: str, gated: Optional[list] = None) -> tuple[list, list]:
     # shared with an LLM backend resolves to the right one — and, since backends are keyed
     # (name, type), the candidate's own KIND picks between a same-named ComfyUI and
     # cloud backend (see _gen_backend_for).
-    gen = [b for b in _gen_backends if not is_draining(b)]
+    keep = _power_keeps(admitted)
+    gen = [b for b in _gen_backends
+           if not is_draining(b) or (backend_id(b) in keep and backend_id(b) not in _draining)]
     allc = []
     for cand in candidates:
         b = _gen_backend_for(cand.get("backend"), cand, gen)
+        if b is None and gated is not None:
+            held = _power_held(cand, alias)
+            if held is not None:
+                gated.append(held)
         if b is None or not backend_healthy.get(backend_id(b)):
             continue
         if b.get("type") in adapters.DYNAMIC_CATALOG_TYPES:
@@ -3807,10 +3835,13 @@ def _entry_can_use(entry: dict, backend: dict, memo: Optional[dict] = None) -> b
     if entry.get("eligible") is not None and backend.get("name") not in entry["eligible"]:
         return False
     memo = {} if memo is None else memo
-    ids = memo.get(entry["alias"])
+    # keyed on the power switch-offs this waiter is old enough to keep using too: two
+    # waiters of one alias may see a backend being switched off differently
+    mkey = (entry["alias"], _power_keeps(entry.get("admitted")))
+    ids = memo.get(mkey)
     if ids is None:
-        ready, _allc = _gen_routes(entry["alias"])
-        ids = memo[entry["alias"]] = {backend_id(b) for b, _cand in ready}
+        ready, _allc = _gen_routes(entry["alias"], admitted=entry.get("admitted"))
+        ids = memo[mkey] = {backend_id(b) for b, _cand in ready}
     return backend_id(backend) in ids
 
 
@@ -4513,10 +4544,14 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req,
     # (measured 2026-09-03, job 9cf448115b4b). Last writer wins: the candidate the job
     # actually died on is the one worth describing.
     cloud_trace: dict = st.get("cloud_trace") or {}
+    power_skipped: list = []
     for backend, cand in candidates:
         bid = backend_id(backend)
         adapter = backend_adapters.get(bid)
         if adapter is None or bid in tried:
+            continue
+        if not _power_dispatch_ok(backend):    # disabled / being switched off since the
+            power_skipped.append(backend["name"])   # list was made (failover tail too)
             continue
         try:
             tries = 1 + max(0, int(backend.get("self_retries") or 0))
@@ -4655,6 +4690,12 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req,
     # that was never involved. And no fault is charged to anyone here: when they all
     # failed, the request is the common factor, not the backends (this is what keeps one
     # bad workflow from quarantining every backend an alias has).
+    if last is None and not exec_faults and power_skipped:
+        await asyncio.to_thread(jobs.fail, job_id,
+                                f"'{alias}': {', '.join(power_skipped)} was switched off "
+                                "before the job could start there and no other backend "
+                                "can take it", _gen_fail_meta(attempts, cloud_trace))
+        return True
     if exec_faults:
         msg = _err_text(exec_faults[0][2])
         if len(exec_faults) > 1:
@@ -4762,17 +4803,18 @@ async def cancel_generation(job_id: str) -> bool:
     return True
 
 
-async def _run_gen_now(job_id, alias, force, routes, build_req, eligible: Optional[set] = None):
+async def _run_gen_now(job_id, alias, force, routes, build_req, eligible: Optional[set] = None,
+                       admitted: Optional[float] = None):
     """A job that found a free backend at request time: run it on `routes`, and if the
     backend was claimed by someone else before this job could (_run_job returns False),
     queue it like any parked job — with the failover bookkeeping carried over."""
     st: dict = {}
     if not await _run_job(job_id, alias, routes, build_req, st):
-        await _run_gen_parked(job_id, alias, force, build_req, eligible, st)
+        await _run_gen_parked(job_id, alias, force, build_req, eligible, st, admitted=admitted)
 
 
 async def _run_gen_parked(job_id, alias, force, build_req, eligible: Optional[set] = None,
-                          run_state: Optional[dict] = None):
+                          run_state: Optional[dict] = None, admitted: Optional[float] = None):
     """Hold a generation job until a backend frees (polls backend-busy), then run it —
     so a busy backend queues instead of 503'ing (async/playground). `eligible` keeps
     the LoRA constraint through the park: the job waits for a LoRA-capable backend
@@ -4786,7 +4828,11 @@ async def _run_gen_parked(job_id, alias, force, build_req, eligible: Optional[se
 
     `run_state` is `_run_job`'s bookkeeping across claims: a claim can be lost to a
     faster job between the designation and the claim (_run_job then returns False), and
-    the job simply keeps parking — the backends it already ran on stay tried."""
+    the job simply keeps parking — the backends it already ran on stay tried.
+
+    `admitted` (time.monotonic() of the request) decides whether a backend being
+    switched off is still this job's: one admitted before the click keeps it (and the
+    switch-off waits for it — `power_waiting_jobs`), a later one does not."""
     run_state = run_state if run_state is not None else {}
     park_s = park_timeout_s
     deadline = time.monotonic() + park_s
@@ -4796,11 +4842,13 @@ async def _run_gen_parked(job_id, alias, force, build_req, eligible: Optional[se
     # _designated_gen_index. Removed again on every exit path (finally).
     entry = {"job_id": job_id, "alias": alias, "enqueued_at": time.monotonic(),
              "eligible": eligible, "force": force}
+    entry["admitted"] = admitted if admitted is not None else entry["enqueued_at"]
     _gen_waiting.append(entry)
     try:
         while True:
             _gen_wait_ping()                     # this job is waiting → keep the fast probe awake
-            ready, allc = await asyncio.to_thread(_gen_routes, alias)   # fresh health/busy per poll
+            ready, allc = await asyncio.to_thread(_gen_routes, alias, None,
+                                                  entry["admitted"])   # fresh health/busy per poll
             ready, allc = _force_filter(ready, force), _force_filter(allc, force)
             if eligible is not None:
                 ready = [r for r in ready if r[0].get("name") in eligible]
@@ -5054,6 +5102,9 @@ async def run_generation(body: dict, request: Request,
         raise HTTPException(503, f"too many queued generation jobs ({max_queued_gen}) — retry "
                                  f"later", headers={"Retry-After": "10"})
     force = (body.get("backend") or "").strip()          # pin to one backend (playground testing)
+    # The moment this request was admitted: a backend switched off AFTER it stays this
+    # job's candidate (power control "Abwarten" — see _gen_routes).
+    admitted = time.monotonic()
 
     routes, parked, eligible = await _gen_pick(alias, force, body)
     inputs, params = _gen_inputs_params(body)
@@ -5148,11 +5199,13 @@ async def run_generation(body: dict, request: Request,
 
     if parked:
         if mode == "async":                              # queue and hand back a job id
-            _spawn_gen(job_id, _run_gen_parked(job_id, alias, force, build_req, eligible))
+            _spawn_gen(job_id, _run_gen_parked(job_id, alias, force, build_req, eligible,
+                                               admitted=admitted))
             return {"job_id": job_id, "status": "queued"}
-        await _run_gen_sync(job_id, _run_gen_parked(job_id, alias, force, build_req, eligible))
+        await _run_gen_sync(job_id, _run_gen_parked(job_id, alias, force, build_req, eligible,
+                                                    admitted=admitted))
         return await _job_view(job_id, request)                  # sync: blocked through the park
-    runner = _run_gen_now(job_id, alias, force, routes, build_req, eligible)
+    runner = _run_gen_now(job_id, alias, force, routes, build_req, eligible, admitted=admitted)
     if mode == "async":
         _spawn_gen(job_id, runner)
         return {"job_id": job_id, "status": "queued"}
@@ -6208,7 +6261,10 @@ def gateway_info() -> dict:
             "name": b["name"], "type": b.get("type", "openai"),
             "enabled": is_enabled(b), "healthy": backend_healthy.get(backend_id(b), False),
             "error": backend_error.get(backend_id(b)),      # why it is down (kind/status/detail)
-            "inflight": backend_inflight.get(backend_id(b), 0), "draining": is_draining(b),
+            # the plain drain only (its badge offers "cancel drain"); a power switch-off
+            # shows in `power` below with its own buttons
+            "inflight": backend_inflight.get(backend_id(b), 0),
+            "draining": backend_id(b) in _draining,
             "models": len(backend_models.get(backend_id(b), set())), "url": b["url"],
             "max_concurrent": b.get("max_concurrent"),
             "concurrency_group": b.get("concurrency_group"),
@@ -6235,7 +6291,12 @@ def gateway_info() -> dict:
             "host": backend_hosts.get(backend_id(b), ""),
             "host_explicit": bool((b.get("host") or "").strip()),
             "source": "config" if backend_id(b) in config_ids else "ui",
+            # power control fields — the editor falls back to this summary for a config
+            # backend, and a field it omits would be saved back blank (= cleared)
+            **{k: b.get(k) for k in ("power_ssh", "power_ssh_port", "power_script")
+               if b.get(k) not in (None, "")},
             **_comfy_watch_info(b), **_cloud_info(b), **_runpod_info(b), **_model_filter_info(b), **_loaded_info(b),
+            **power_info(b),
         } for b in backends],
         "virtual_models": list(virtual_models.keys()),
         "alias_types": {alias: sorted(_chat_alias_types(alias)) for alias in virtual_models},
@@ -6268,6 +6329,7 @@ def apply_backend_change() -> None:
     build_backend_adapters()
     _activate_generation_jobs()
     _notify_slot_free()
+    power_keys_ensure()                      # a backend just given power_ssh gets its key
 
     # Only the backends this change touched are polled now: an unchanged backend kept
     # its adapter instance (build_backend_adapters), so _poll_is_due leaves it on its
@@ -6382,6 +6444,681 @@ def _finalize_drain(bid: str) -> None:
         return
     set_backend_enabled(bid, False)
     logger.info(f"backends changed → {len(backends)} effective")
+
+
+# ── Backend power control (power.py; spec 2026-11-12-backend-power-control) ────────
+# A backend on hardware a person switches off by hand (an eGPU on USB4) gets three
+# console actions: Switch off (drain → disable → the host script's `off` → "safe to
+# switch off now"), Switched on again (`on` → enable → `starting` until the first
+# healthy discovery) and Check status. Configured per backend (`power_ssh` user@host,
+# `power_ssh_port`, `power_script` — display only); the ssh key is one per backend under
+# `<datadir>/power-keys/`, the host key pinned by the operator under
+# `<datadir>/power-known_hosts/`. The gateway sends ONLY power.COMMANDS — never admin
+# text. The state record per backend is the store setting `power_state` {bid: record},
+# so a restart still shows "switched off"; an action a restart interrupted turns into
+# `error` (power.reconcile_boot) and is never re-run by itself.
+_POWER_STATE_KEY = "power_state"
+_power_states: dict = {}           # bid → {state, at, action, result, message, json, …}
+_power_tasks: dict = {}            # bid → (action, task): the ONE action running per backend
+_power_watchers: dict = {}         # bid → the `starting` watcher task
+_power_scanned: dict = {}          # bid → (known_hosts name, key line, fingerprint)
+_power_key_tasks: dict = {}        # bid → a running key generation
+_POWER_POLL_S = 1.0                # the drain wait's poll
+_POWER_START_POLL_S = 2.0          # the `starting` watcher's poll
+_POWER_KEYSCAN_TIMEOUT_S = 20
+# the process runners — tests replace them (no test ever reaches a real host)
+_power_run = sshrun.run
+_power_keygen_fn = sshrun.keygen
+
+
+def _power_keeps(admitted: Optional[float]) -> frozenset:
+    """Backends being switched off that a job admitted at `admitted` may still use: those
+    whose switch-off was clicked AFTER it (spec "Abwarten"). None = a new request."""
+    if admitted is None or not _power_draining:
+        return frozenset()
+    return frozenset(bid for bid, t0 in _power_draining.items() if admitted < t0)
+
+
+def _power_cfg(b: Optional[dict]) -> Optional[dict]:
+    """A backend's power settings, None when power control is off for it (blank
+    `power_ssh`). `ok` = the target is a plain user@host (Save refuses others)."""
+    if not isinstance(b, dict):
+        return None
+    target = str(b.get("power_ssh") or "").strip()
+    if not target:
+        return None
+    return {"target": target, "ok": power.target_ok(target),
+            "port": power.port_of(b.get("power_ssh_port") or 22),
+            "script": str(b.get("power_script") or "").strip()}
+
+
+def _power_paths(b: dict) -> tuple[str, str]:
+    """(private key, pinned known_hosts) of one backend — next to store.db, one key per
+    backend because each device has its own forced command on the host."""
+    slug = power.file_slug(b["name"], b.get("type", "openai"))
+    d = _thunder_datadir()
+    return (os.path.join(d, "power-keys", slug + ".key"),
+            os.path.join(d, "power-known_hosts", slug))
+
+
+def _power_rec(bid: str) -> dict:
+    return dict(_power_states.get(bid) or {"state": power.ON})
+
+
+def _power_state(bid: str) -> str:
+    return (_power_states.get(bid) or {}).get("state", power.ON)
+
+
+def _power_save() -> None:
+    if not store.is_active():
+        return
+    try:
+        store.set_settings({_POWER_STATE_KEY: _power_states})
+    except Exception as e:                               # the state stays in memory
+        logger.warning(f"power: state not persisted: {type(e).__name__}: {e}")
+
+
+def _power_set(bid: str, **kw) -> dict:
+    """Update one backend's record (in memory AND the store setting)."""
+    rec = _power_rec(bid)
+    rec.update(kw)
+    rec["at"] = int(time.time())
+    _power_states[bid] = rec
+    _power_save()
+    return rec
+
+
+def _power_quiet(bid: str) -> bool:
+    """Discovery failures of this backend are not faults right now (F4): it is
+    `starting` — its device was just attached and its service is booting."""
+    return _power_state(bid) == power.STARTING
+
+
+def _power_holds(bid: str) -> bool:
+    """The power flow keeps this backend disabled: it switched it off (`held`, set when
+    its off flow disabled it) or its device is off/hung — and the backend still has
+    power control and is disabled. Then only "Switched on again" (which runs
+    `on --start-ct`) may enable it: the console's ▶ and a managed host's enable are
+    refused. Removing `power_ssh` from the backend is the way out without the script."""
+    b = _live_backend(bid)
+    if b is None or _power_cfg(b) is None or is_enabled(b):
+        return False
+    rec = _power_states.get(bid) or {}
+    return bool(rec.get("held")) or rec.get("state") in (power.OFF, power.HUNG)
+
+
+def _power_dispatch_ok(b: dict) -> bool:
+    """May a job CLAIM `b` right now (`_run_job`, the designated first candidate and
+    every failover target)? A candidate list is computed before awaits — and a pre-click
+    job running elsewhere carries this backend in its failover tail — so a backend the
+    power flow has disabled or is detaching (power.NO_DISPATCH), or one `starting`
+    before its first healthy discovery, must be skipped HERE. In `draining` a listed
+    candidate is legit: lists computed after the click leave it out unless the job was
+    admitted before it, and a claim counts as in-flight, which the drain waits for."""
+    bid = backend_id(b)
+    live = _live_backend(bid)            # a rebuild replaces the dicts: the list's is stale
+    if not is_enabled(b) or (live is not None and not is_enabled(live)):
+        return False
+    if not _power_states:
+        return True
+    st = _power_state(bid)
+    if st in power.NO_DISPATCH:
+        return False
+    return st != power.STARTING or bool(backend_healthy.get(bid))
+
+
+def _power_undrain(bid: str, t0: Optional[float]) -> None:
+    """End THIS flow's switch-off drain: only when the entry is still the one it began
+    (t0). After a Cancel and a new click the entry is the NEW flow's — the cancelled
+    task's cleanup must not give its backend back to routing."""
+    if t0 is not None and _power_draining.get(bid) == t0:
+        _power_draining.pop(bid, None)
+
+
+def _power_held(cand: dict, alias: str = "") -> Optional[tuple]:
+    """(backend name, the 503 text) when `cand`'s backend is out of routing BECAUSE of the
+    power flow (being switched off, or disabled in a power state) — else None. Read
+    only on the no-route path (`_gen_routes` with `gated`), i.e. when NO candidate of
+    `alias` is usable: the text says so (another one may merely be down)."""
+    if not _power_states and not _power_draining:
+        return None
+    pool = [x for x in backends if _is_gen(x)
+            and (backend_id(x) in _power_states or backend_id(x) in _power_draining)]
+    b = _gen_backend_for(cand.get("backend"), cand, pool)
+    if b is None:
+        return None
+    bid = backend_id(b)
+    if bid not in _power_draining and is_enabled(b):
+        return None
+    st = _power_state(bid)
+    if bid in _power_draining and not power.job_refusal("x", st):
+        st = power.DRAINING
+    msg = power.job_refusal(b["name"], st, alias)
+    return (b["name"], msg) if msg else None
+
+
+def power_waiting_jobs(bid: str, pool: Optional[list] = None) -> int:
+    """Generation jobs admitted BEFORE this backend's switch-off that wait in the media
+    queue and could still run on it — the switch-off waits for them ("waiting for N
+    jobs"). Their own filters apply (force pin, LoRA eligibility, exclude); a job
+    already holding a slot is in-flight, not waiting. Blocking (store read): the off
+    flow passes `pool`, a copy of `_gen_waiting_pool()` taken ON the event loop — the
+    loop mutates `_gen_waiting` while this runs in a worker thread."""
+    t0 = _power_draining.get(bid)
+    b = _live_backend(bid)
+    if t0 is None or b is None:
+        return 0
+    n, memo = 0, {}
+    for e in (pool if pool is not None else _gen_waiting_pool()):
+        adm = e.get("admitted")
+        if adm is None or adm >= t0:
+            continue
+        if b["name"] in (e.get("exclude") or ()):
+            continue
+        if e.get("force") and e["force"] != b["name"]:
+            continue
+        if e.get("eligible") is not None and b["name"] not in e["eligible"]:
+            continue
+        ids = memo.get(e["alias"])
+        if ids is None:                      # every adm < t0 keeps `bid`: one read per alias
+            _ready, allc = _gen_routes(e["alias"], admitted=adm)
+            ids = memo[e["alias"]] = {backend_id(x) for x, _c in allc}
+        if bid in ids:
+            n += 1
+    return n
+
+
+def _power_pin_parts(kh: str) -> list:
+    try:
+        with open(kh, encoding="utf-8") as f:
+            return f.readline().split()
+    except OSError:
+        return []
+
+
+def _power_pin_name(cfg: dict) -> str:
+    return power.known_hosts_name(cfg["target"].rsplit("@", 1)[-1], cfg["port"])
+
+
+def _power_ready(b: dict) -> str:
+    """Why an ssh action cannot run for `b` now ("" = it can): configured, a plain
+    target, the key generated, the host key pinned FOR THIS host/port (a pin for the
+    previous host would make every action fail as "unreachable")."""
+    cfg = _power_cfg(b)
+    if cfg is None:
+        return "power control is not configured (power ssh is blank)"
+    if not cfg["ok"]:
+        return f"power ssh {cfg['target']!r} is not a plain user@host"
+    key, kh = _power_paths(b)
+    if not os.path.exists(key):
+        return "no power key yet — generate it in the backend form"
+    parts = _power_pin_parts(kh)
+    if len(parts) < 3:
+        return "confirm the host key first"
+    want = _power_pin_name(cfg)
+    if parts[0] != want:
+        return f"the host key is pinned for {parts[0]}, not {want} — fetch and confirm it again"
+    return ""
+
+
+async def _power_ssh(b: dict, action: str) -> dict:
+    """Run ONE fixed host-script command for `b` → power.parse_result. The argv is
+    sshrun's (`-F /dev/null`, BatchMode, the per-backend key, StrictHostKeyChecking=yes
+    against the pinned file) and ends `-- user@host <fixed command>`."""
+    cfg = _power_cfg(b) or {}
+    key, kh = _power_paths(b)
+    argv = sshrun.exec_argv(key, kh, cfg.get("target", ""), cfg.get("port", 22),
+                            power.remote_command(action), strict="yes")
+    try:
+        rc, out, err = await _power_run(argv, timeout=power.TIMEOUTS[action])
+    except OSError as e:                     # no ssh binary: a broken install, said as such
+        return {"outcome": "error", "rc": None, "result": "", "json": None, "safe": False,
+                "message": f"ssh could not run: {e}"}
+    p = power.parse_result(action, rc, out, err)
+    logger.info(f"[{b['name']}] power {action}: exit {rc} → {p['outcome']}"
+                + (f" — {p['message']}" if p.get("message") else ""))
+    return p
+
+
+def _power_record(bid: str, action: str, p: dict, state: str, msg: str, **kw) -> dict:
+    js = p.get("json")
+    if js is not None and len(json.dumps(js, default=str)) > 8000:
+        js = {"note": "status JSON too large to keep"}
+    return _power_set(bid, state=state, action=action, result=p.get("result") or "",
+                      message=msg, json=js, safe=bool(p.get("safe")),
+                      checked=int(time.time()), waiting=0, **kw)
+
+
+def _power_task_done(bid: str) -> None:
+    cur = _power_tasks.get(bid)
+    if cur is not None and cur[1] is asyncio.current_task():
+        _power_tasks.pop(bid, None)
+
+
+async def _power_off_flow(bid: str, t0: Optional[float] = None) -> None:
+    """Switch off: wait for in-flight work AND the earlier jobs, disable (persisted),
+    run `off`, map the result. busy restores the backend's pre-click `enabled` (health
+    reset: `off --stop-ct` may have stopped its service). `t0` = this flow's entry in
+    `_power_draining` (None: the backend was not enabled, nothing to drain)."""
+    try:
+        b = None
+        while True:
+            b = _live_backend(bid)
+            if b is None:
+                _power_undrain(bid, t0)
+                _power_set(bid, state=power.ERROR, waiting=0,
+                           message="the backend was removed during the switch-off")
+                return
+            # The queue is copied ON the loop, the in-flight count read AFTER the thread
+            # hop: a pre-click job claiming the backend during the hop is then either
+            # still in the copy or already counted in-flight — never neither (with the
+            # count read first, a claim in the hop let disable + `off` run under it).
+            pool = [dict(e) for e in _gen_waiting_pool()]
+            w = await asyncio.to_thread(power_waiting_jobs, bid, pool)
+            n = backend_inflight.get(bid, 0)
+            rec = _power_states.get(bid)
+            if rec is not None:              # the live count: memory only, no store write
+                rec.update(waiting=n + w, inflight=n, jobs=w)
+            if n <= 0 and w <= 0:
+                break
+            await asyncio.sleep(_POWER_POLL_S)
+        # no await from here to the state write: a Cancel can no longer race the disable
+        b = _live_backend(bid) or b
+        if is_enabled(b):
+            set_backend_enabled(bid, False)
+        _power_undrain(bid, t0)
+        _power_set(bid, state=power.SWITCHING_OFF, waiting=0, inflight=0, jobs=0, held=True,
+                   message="running the off script")
+        _notify_slot_free()
+        p = await _power_ssh(_live_backend(bid) or b, "off")
+        st, msg = power.off_state(p)
+        held = True
+        if st == power.BUSY:
+            held = False                     # nothing was detached: the flow lets go
+            b2 = _live_backend(bid)
+            if ((_power_states.get(bid) or {}).get("prev_enabled") and b2 is not None
+                    and not is_enabled(b2)):
+                # `off --stop-ct` may have stopped the service before it found the device
+                # busy: the "healthy" from before the click is stale — work only after a
+                # fresh healthy discovery (as after Switched on again)
+                backend_healthy[bid] = False
+                backend_error.pop(bid, None)
+                set_backend_enabled(bid, True)
+            js = p.get("json") if isinstance(p.get("json"), dict) else {}
+            ct = js.get("ct") if isinstance(js.get("ct"), dict) else {}
+            if ct.get("status") == "stopped":
+                msg += " — note: the script reports the service container as stopped"
+        _power_record(bid, "off", p, st, msg, held=held)
+    except asyncio.CancelledError:
+        _power_undrain(bid, t0)              # Cancel: routing back (the state says why)
+        _notify_slot_free()
+        raise
+    except Exception as e:                   # noqa: BLE001 — the row must say it
+        logger.exception(f"power: switch-off of {bid} crashed")
+        _power_undrain(bid, t0)              # routing back (a disable already done stays)
+        _notify_slot_free()
+        _power_set(bid, state=power.ERROR, waiting=0,
+                   message=f"switch-off failed: {type(e).__name__}: {e}")
+    finally:
+        _power_task_done(bid)
+
+
+def _power_watch(bid: str, until: float) -> None:
+    old = _power_watchers.get(bid)
+    if old is not None and not old.done():
+        old.cancel()
+    _power_watchers[bid] = _bg(_power_watch_start(bid, until))
+
+
+async def _power_watch_start(bid: str, until: float) -> None:
+    """`starting` → `on` at the first healthy discovery; after power.START_TIMEOUT_S
+    without one → `error` (the backend stays enabled: unhealthy, routing skips it)."""
+    try:
+        while _power_state(bid) == power.STARTING:
+            if backend_healthy.get(bid):
+                _power_set(bid, state=power.ON, message="back online")
+                _notify_slot_free()
+                return
+            if time.time() >= until:
+                _power_set(bid, state=power.ERROR,
+                           message=f"backend did not come up within "
+                                   f"{power.START_TIMEOUT_S // 60} min (left enabled)")
+                return
+            await asyncio.sleep(_POWER_START_POLL_S)
+    finally:
+        if _power_watchers.get(bid) is asyncio.current_task():
+            _power_watchers.pop(bid, None)
+
+
+async def _power_on_flow(bid: str) -> None:
+    """Switched on again: run `on`; ok → mark the backend unhealthy, persist `starting`
+    (so its first failing polls write no fault), THEN enable it — it gets work only after
+    its first healthy discovery."""
+    try:
+        b = _live_backend(bid)
+        if b is None:
+            _power_set(bid, state=power.ERROR, message="the backend was removed")
+            return
+        p = await _power_ssh(b, "on")
+        st, msg = power.on_state(p)
+        if st != power.STARTING:
+            _power_record(bid, "on", p, st, msg)
+            return
+        b = _live_backend(bid)
+        if b is None:
+            _power_record(bid, "on", p, power.ERROR, "the backend was removed")
+            return
+        backend_healthy[bid] = False         # a stale "healthy" from before the switch-off
+        backend_error.pop(bid, None)         # must not route to it before discovery says so
+        until = time.time() + power.START_TIMEOUT_S
+        _power_record(bid, "on", p, power.STARTING, msg, until=int(until), held=False)
+        if not is_enabled(b):
+            set_backend_enabled(bid, True)
+        _power_watch(bid, until)
+    except Exception as e:                   # noqa: BLE001
+        logger.exception(f"power: switch-on of {bid} crashed")
+        _power_set(bid, state=power.ERROR, message=f"switch-on failed: {type(e).__name__}: {e}")
+    finally:
+        _power_task_done(bid)
+
+
+async def _power_status_flow(bid: str) -> None:
+    """Check status: run `status` and keep its JSON. Never on a timer or a page view.
+    While `starting` the state stays (its watcher decides), unless the host says hung."""
+    try:
+        b = _live_backend(bid)
+        if b is None:
+            return
+        p = await _power_ssh(b, "status")
+        b = _live_backend(bid)
+        rec = _power_states.get(bid) or {}
+        held = bool(rec.get("held")) or rec.get("state") in (power.OFF, power.HUNG)
+        st, msg = power.status_state(p, bool(b is not None and is_enabled(b)), held)
+        if _power_state(bid) == power.STARTING and st != power.HUNG:
+            st = power.STARTING
+        _power_record(bid, "status", p, st, msg)
+    except Exception as e:                   # noqa: BLE001
+        logger.exception(f"power: status of {bid} crashed")
+        _power_set(bid, message=f"status failed: {type(e).__name__}: {e}")
+    finally:
+        _power_task_done(bid)
+
+
+def power_cancel(bid: str) -> str:
+    """Cancel a switch-off that is still DRAINING → routing restored, the power state
+    the click found (`prev_state`) back — not a blanket `on`."""
+    b = _live_backend(bid)
+    name = b["name"] if b else bid
+    if _power_state(bid) != power.DRAINING:
+        return f"{name}: nothing to cancel — the switch-off is not waiting any more"
+    cur = _power_tasks.pop(bid, None)
+    if cur is not None:
+        cur[1].cancel()
+    _power_draining.pop(bid, None)
+    rec = _power_states.get(bid) or {}
+    prev = rec.pop("prev_state", None)
+    rec.pop("prev_enabled", None)
+    if prev not in power.OFF_FROM:
+        prev = power.ON
+    _power_set(bid, state=prev, waiting=0, inflight=0, jobs=0,
+               message="switch-off cancelled — back in rotation")
+    _notify_slot_free()
+    logger.info(f"[{name}] power switch-off cancelled")
+    return f"{name}: switch-off cancelled — back in rotation"
+
+
+async def power_action(bid: str, action: str) -> str:
+    """The console's power buttons (POST) → the message to show. One action per backend
+    at a time; each refusal says why. Switch off/on/status run in the background."""
+    b = _live_backend(bid)
+    if b is None:
+        return "unknown backend"
+    name = b["name"]
+    if _power_cfg(b) is None:
+        return f"{name}: power control is not configured"
+    if action == "cancel":
+        return power_cancel(bid)
+    if action not in power.ACTIONS:
+        return f"{name}: unknown power action"
+    if bid in _power_tasks:
+        return f"{name}: refused — '{_power_tasks[bid][0]}' is still running"
+    state = _power_state(bid)
+    why = (power.action_refusal(state, action) if action != "status"
+           else (f"an action is already running ({state})" if state in power.RUNNING else ""))
+    if not why:
+        why = _power_ready(b)
+    if why:
+        return f"{name}: refused — {why}"
+    if action == "on" and is_enabled(b):
+        return (f"{name}: refused — the backend is enabled; Switched on again is for a "
+                "backend the power control switched off")
+    if action == "off":
+        # a take-offline already draining it (not a managed host's restart hold) is the
+        # operator's: busy must not re-enable a backend they were taking offline
+        plain_drain = bid in _draining and bid not in _drain_hold
+        en = is_enabled(b) and not plain_drain
+        _power_set(bid, state=power.DRAINING, action="off", prev_enabled=en, prev_state=state,
+                   waiting=0, message="waiting for running work before the off script")
+        t0 = None
+        if en:
+            t0 = _power_draining[bid] = time.monotonic()
+            _notify_slot_free()          # parked calls re-evaluate: it is out for new work
+        _power_tasks[bid] = ("off", _bg(_power_off_flow(bid, t0)))
+        logger.info(f"[{name}] power switch-off requested — draining first")
+        return f"{name}: switching off — new jobs for it are refused, running work finishes first"
+    if action == "on":
+        _power_set(bid, state=power.SWITCHING_ON, action="on", message="running the on script")
+        _power_tasks[bid] = ("on", _bg(_power_on_flow(bid)))
+        logger.info(f"[{name}] power switch-on requested")
+        return f"{name}: switching on — running the on script"
+    _power_tasks[bid] = ("status", _bg(_power_status_flow(bid)))
+    return f"{name}: checking status"
+
+
+def power_info(b: dict) -> dict:
+    """`{"power": {…}}` for gateway_info and /health — {} when the backend has no power
+    control. In memory plus two small file reads; never a network call."""
+    cfg = _power_cfg(b)
+    if cfg is None:
+        return {}
+    bid = backend_id(b)
+    rec = _power_rec(bid)
+    run = _power_tasks.get(bid)
+    return {"power": {
+        "state": rec.get("state", power.ON), "message": rec.get("message") or "",
+        "at": rec.get("at"), "checked": rec.get("checked"),
+        "waiting": rec.get("waiting") or 0, "inflight": rec.get("inflight") or 0,
+        "jobs": rec.get("jobs") or 0, "safe": bool(rec.get("safe")),
+        "summary": power.summary(rec.get("json")), "until": rec.get("until"),
+        "running": run[0] if run else "", "target": cfg["target"],
+        "held": _power_holds(bid), "ready": _power_ready(b)}}
+
+
+def power_setup(bid: str) -> Optional[dict]:
+    """The backend form's Power control block: the public key, the suggested
+    authorized_keys line, the pin and a fetched-but-unconfirmed fingerprint. Reads two
+    small files; never generates a key, never connects."""
+    b = _live_backend(bid)
+    cfg = _power_cfg(b)
+    if b is None or cfg is None:
+        return None
+    key, kh = _power_paths(b)
+    try:
+        with open(key + ".pub", encoding="utf-8") as f:
+            pub = f.read().strip()
+    except OSError:
+        pub = ""
+    parts = _power_pin_parts(kh)
+    want = _power_pin_name(cfg)
+    pinned_fp, pin_for = "", ""
+    if len(parts) >= 3:
+        pin_for = parts[0]
+        try:
+            pinned_fp = hostctl.host_key_fingerprint(parts[2])
+        except ValueError:
+            pinned_fp = ""
+    sc = _power_scanned.get(bid)
+    return {"target": cfg["target"], "port": cfg["port"], "target_ok": cfg["ok"],
+            "script": cfg["script"], "public_key": pub,
+            "key_file": os.path.relpath(key, _thunder_datadir()),
+            "generating": bid in _power_key_tasks,
+            "line": power.authorized_keys_line(cfg["script"], pub, b["name"]),
+            "pinned_fp": pinned_fp if pin_for == want else "",
+            "pin_stale": pin_for if (pin_for and pin_for != want) else "",
+            "scanned_fp": sc[2] if sc is not None and sc[0] == want else "",
+            "ready": _power_ready(b)}
+
+
+async def power_keygen(bid: str) -> str:
+    """Generate the backend's power key (explicit POST, or after a Save that set
+    power_ssh) → message. Idempotent: an existing key is kept."""
+    b = _live_backend(bid)
+    if b is None or _power_cfg(b) is None:
+        return "power control is not configured for this backend"
+    key, _kh = _power_paths(b)
+    try:
+        os.makedirs(os.path.dirname(key), mode=0o700, exist_ok=True)
+        os.chmod(os.path.dirname(key), 0o700)
+        await _power_keygen_fn(key)
+    except Exception as e:                   # noqa: BLE001
+        return f"{b['name']}: key not generated: {type(e).__name__}: {e}"
+    return f"{b['name']}: power key ready — install the authorized_keys line on the host"
+
+
+def power_keys_ensure() -> None:
+    """Start a key generation for every backend with power_ssh and no key yet (after a
+    backend change — a Save, never a page view)."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    for b in backends:
+        if _power_cfg(b) is None:
+            continue
+        bid = backend_id(b)
+        key, _kh = _power_paths(b)
+        if os.path.exists(key) or bid in _power_key_tasks:
+            continue
+
+        async def gen(bid=bid):
+            try:
+                logger.info(f"power: {await power_keygen(bid)}")
+            finally:
+                _power_key_tasks.pop(bid, None)
+        _power_key_tasks[bid] = _bg(gen())
+
+
+async def power_scan(bid: str) -> str:
+    """"Fetch host key": ssh-keyscan the power host → its fingerprint (kept in memory
+    until Confirm; nothing is trusted yet)."""
+    b = _live_backend(bid)
+    cfg = _power_cfg(b)
+    if b is None or cfg is None:
+        return "power control is not configured for this backend"
+    if not cfg["ok"]:
+        return f"power ssh {cfg['target']!r} is not a plain user@host"
+    host = cfg["target"].rsplit("@", 1)[-1]
+    name = _power_pin_name(cfg)
+    try:
+        rc, out, err = await _power_run(["ssh-keyscan", "-t", "ed25519", "-p", str(cfg["port"]),
+                                         "--", host], timeout=_POWER_KEYSCAN_TIMEOUT_S)
+    except OSError as e:
+        return f"{b['name']}: host key not fetched: {e}"
+    line = hostctl.parse_keyscan((out or b"").decode("utf-8", "replace"), name) if rc == 0 else None
+    if line is None:
+        return f"{b['name']}: no ed25519 host key from {name} (rc {rc})"
+    fp = hostctl.host_key_fingerprint(line.split()[2])
+    _power_scanned[bid] = (name, line, fp)
+    logger.info(f"[{b['name']}] power host key of {name} fetched: {fp} (not trusted yet)")
+    return (f"{b['name']}: host key of {name}: {fp} — compare it with "
+            "ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub on that host, then Confirm")
+
+
+def power_pin(bid: str, fingerprint: str) -> str:
+    """"Confirm": write the fetched key to power-known_hosts/<backend> (0600, atomic) —
+    only when it is still the key whose fingerprint the operator confirmed."""
+    b = _live_backend(bid)
+    cfg = _power_cfg(b)
+    if b is None or cfg is None:
+        return "power control is not configured for this backend"
+    sc = _power_scanned.get(bid)
+    name = _power_pin_name(cfg)
+    if sc is None or sc[0] != name:
+        return f"{b['name']}: no host key fetched for {name} — fetch it first"
+    if str(fingerprint or "").strip() != sc[2]:
+        return f"{b['name']}: the fetched host key is not the one confirmed — fetch it again"
+    _key, kh = _power_paths(b)
+    d = os.path.dirname(kh)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    os.chmod(d, 0o700)
+    tmp = kh + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        os.write(fd, (sc[1] + "\n").encode())
+    finally:
+        os.close(fd)
+    os.replace(tmp, kh)
+    _power_scanned.pop(bid, None)
+    logger.info(f"[{b['name']}] power host key of {name} pinned: {sc[2]}")
+    return f"{b['name']}: host key {sc[2]} pinned"
+
+
+def power_boot() -> None:
+    """lifespan: the persisted states, reconciled — an action a restart interrupted is
+    an error to check, never re-run; a `starting` backend gets its watcher back."""
+    raw = store.get_setting(_POWER_STATE_KEY) if store.is_active() else None
+    states, changed = power.reconcile_boot(raw or {})
+    _power_states.clear()
+    _power_states.update(states)
+    if changed:
+        _power_save()
+        logger.warning("power: an action was interrupted by the restart — run Check status")
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    for bid, rec in states.items():
+        if rec.get("state") == power.STARTING:
+            _power_watch(bid, float(rec.get("until") or time.time() + power.START_TIMEOUT_S))
+    power_keys_ensure()
+
+
+def console_set_backend_enabled(bid: str, on: bool) -> bool:
+    """The console's ▶ bring-online, refused while a power action runs (enabling a
+    backend whose device is being detached would route work onto it) and while the power
+    flow holds it switched off (`_power_holds`: the plain enable would skip
+    `on --start-ct` — Switched on again is the way back)."""
+    if bid in _power_tasks or _power_state(bid) in power.RUNNING:
+        logger.warning(f"ui: enable/disable of {bid} refused — a power action is running")
+        return False
+    if on and _power_holds(bid):
+        logger.warning(f"ui: enable of {bid} refused — switched off by power control; "
+                       "use Switched on again")
+        return False
+    return set_backend_enabled(bid, on)
+
+
+def _host_set_enabled(bid: str, on: bool) -> bool:
+    """hostctl's `set_enabled`: an ENABLE is skipped (and logged) while a power action
+    runs on the backend or the power flow holds it switched off — a managed host's
+    lifecycle must not route work onto a device being detached or detached. A disable
+    always goes through (the safe direction; the off flow then finds it disabled)."""
+    if on and (bid in _power_tasks or _power_state(bid) in power.RUNNING
+               or _power_holds(bid)):
+        logger.warning(f"host: enable of {bid} skipped — power control has it "
+                       f"({_power_state(bid)})")
+        return False
+    return set_backend_enabled(bid, on)
+
+
+def console_begin_drain(bid: str) -> bool:
+    """The console's take-offline, refused while a power action runs (the power flow
+    owns the backend's `enabled` until it ends)."""
+    if bid in _power_tasks or _power_state(bid) in power.RUNNING:
+        logger.warning(f"ui: drain of {bid} refused — a power action is running")
+        return False
+    return begin_drain(bid)
 
 
 # ── Managed hosts (hostctl.py) ────────────────────────────────────────────────────
@@ -8054,7 +8791,7 @@ def _host_deps() -> "hostctl.Deps":
         # not compete with proxied traffic for the shared pool, nor outlive a closed one
         client_factory=lambda: httpx.AsyncClient(),
         load_state=_host_load_state, save_state=_host_save_state,
-        set_enabled=set_backend_enabled, begin_drain=begin_drain, cancel_drain=cancel_drain,
+        set_enabled=_host_set_enabled, begin_drain=begin_drain, cancel_drain=cancel_drain,
         hold_routing=_hold_routing,
         inflight=lambda bid: backend_inflight.get(bid, 0),
         is_draining=lambda bid: bid in _draining,
@@ -9282,8 +10019,11 @@ admin.bind(runpod_probe=runpod_probe, runpod_object_info=runpod_object_info,
                (b.get("api_key") for b in backends
                 if b["name"] == name and b.get("type", "openai") == typ), None),
            dashboard_snapshot=dashboard_snapshot, cancel_generation=cancel_generation,
-           drain_backend=begin_drain, cancel_drain=cancel_drain,
-           set_backend_enabled=set_backend_enabled,
+           drain_backend=console_begin_drain, cancel_drain=cancel_drain,
+           set_backend_enabled=console_set_backend_enabled,
+           # backend power control (power.py): row buttons, the form's key/pin block
+           power_action=power_action, power_setup=power_setup, power_keygen=power_keygen,
+           power_scan=power_scan, power_pin=power_pin,
            restart_comfy=restart_comfy_backend,
            llm_backend_names=lambda: sorted({b["name"] for b in backends
                                              if _is_llm(b)}),
@@ -9378,6 +10118,7 @@ async def health(verbose: bool = True) -> dict:
                 "faults_24h": {k: (fmap.get(backend_id(b)) or {}).get(k, 0)
                                for k in ("faults", "outages", "downtime_s")},
                 **_comfy_watch_info(b), **_cloud_info(b), **_runpod_info(b), **_model_filter_info(b), **_loaded_info(b),
+                **power_info(b),
             }
             for b in backends
         },

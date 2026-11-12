@@ -27,6 +27,7 @@ code, image clients like anima-verse, …) and a fleet of backends.
 - [Claude Code / Anthropic Messages](#claude-code--anthropic-messages) — `/v1/messages`, mixed Anthropic + open-weight
 - [Media generation](#media-generation) — ComfyUI image/video/audio, RunPod Serverless ComfyUI + Meshy.ai and Tripo3D cloud meshes & rigging, aliases, mapping, chains, LoRA, jobs
 - [Managed hosts](#managed-hosts-thunder-compute-runpod-later) — on-demand GPU machines (Thunder Compute) the gateway starts and stops; ComfyUI and OpenAI-compatible backends attach to them, with model sync
+- [Backend power control](#backend-power-control) — drain, detach and switch a backend's device off safely (host script over ssh)
 - [The `/ui` console](#the-ui-console)
 - [Stats & routing dashboard](#stats--routing-dashboard)
 - [Endpoint reference](#endpoint-reference)
@@ -2701,6 +2702,106 @@ The instance key, the LAN key, the known_hosts files and the tunnel sockets
 
 ---
 
+## Backend power control
+
+Some backends run on hardware you switch off by hand — an eGPU on USB4/Thunderbolt, a
+box on a power strip. Cutting the power while the OS still holds the device is a
+*surprise removal*: with some drivers the host's PCI hotplug then hangs until a reboot,
+and every OTHER backend on that host goes down with it. A small script on the host can
+detach the device cleanly first. The gateway drives that script per backend:
+
+- **Switch off** — the backend is drained (running work and jobs that were already
+  waiting for it finish; new jobs that could only run there are refused at once with
+  `<backend> is being switched off`), then disabled, then the script's `off` runs. When
+  it answers `safe_to_power_off: true` the Backends row shows **Safe to switch off now**
+  — that is the moment to cut the power, never earlier. A *Cancel* button aborts while
+  it still waits ("waiting for N jobs").
+- **Switched on again** — after you powered the device on: the script's `on` runs, the
+  backend is enabled and gets work only after its first healthy discovery (up to 10 min;
+  no fault-log noise meanwhile).
+- **Check status** — runs the script's read-only `status` and shows its summary
+  (present, driver, users, container, `safe_to_power_off`, `hotplug_hung`). Never on a
+  timer: the script may start `nvidia-smi`.
+
+If the script reports a hung hotplug the row says **Do NOT switch off — the host needs
+a reboot** and nothing happens automatically. `busy` (the device is in use) puts the
+backend back the way it was before the click. A host that is not reachable over ssh is
+shown as *host unreachable* (an on-demand host that is off is a state, not an error).
+A gateway restart in the middle of an action never re-runs it: the row shows
+*interrupted by gateway restart — run Status*. One action per backend at a time.
+
+### Setting it up
+
+In the backend's form, **Behavior → Power control**:
+
+| field | meaning |
+|---|---|
+| `power ssh` | `user@host` the gateway runs the script as (blank = no power control) |
+| `power ssh port` | ssh port, blank = 22 |
+| `power script` | the script's absolute path on that host — **display only**, used to build the `authorized_keys` line below; never sent |
+
+Save. The gateway generates one ed25519 key **per backend** (`power-keys/<name>-<type>.key`
+next to `store.db`; or press *Generate key*) and the form shows its public key and the
+line to install. Append that ONE line to `~user/.ssh/authorized_keys` on the host — a
+forced command, so the key can run that script and nothing else:
+
+```
+restrict,command="/usr/local/sbin/egpu-power --ssh-forced" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA… ai-hub-power-rtx-4070
+```
+
+Then press *Fetch host key*, compare the fingerprint with `ssh-keygen -lf
+/etc/ssh/ssh_host_ed25519_key.pub` on the host and *Confirm fingerprint* (pinned in
+`power-known_hosts/<name>-<type>`; every later connect is `StrictHostKeyChecking=yes`).
+Until key and pin exist the row says why instead of offering buttons.
+
+Key, pin and the power record belong to the backend's NAME: **renaming a power-controlled
+backend means a new key** (install its `authorized_keys` line, remove the old one) **and
+a new host-key pin**; the old files under `power-keys/` / `power-known_hosts/` are left
+behind and can be deleted. While the power control holds a backend switched off, the
+plain ▶ enable is refused — use *Switched on again*; if the host script itself is
+broken, clear `power ssh` to take the backend out of power control.
+
+### The host-script contract (v1)
+
+The gateway sends exactly one of these three commands — never anything an admin typed
+(with the forced command above the script reads it from `SSH_ORIGINAL_COMMAND`, and must
+refuse anything else with exit 3):
+
+| action | remote command | timeout |
+|---|---|---|
+| status | `status --json` | 60 s |
+| off | `off --stop-ct --json` | 240 s |
+| on | `on --start-ct --json` | 360 s |
+
+`off` must stop the device's service (`--stop-ct`), wait until no process holds the
+device and detach it; `on` must attach it, wait for the driver and start the service.
+The script prints ONE JSON object on stdout (the gateway takes the last line that
+parses as one), diagnostics on stderr, and exits with:
+
+| exit | `result` | the gateway shows |
+|---|---|---|
+| 0 | `ok` | `off`: **Safe to switch off now** (only with `safe_to_power_off: true`); `on`: backend enabled, `starting` |
+| 0 | `absent` | device not on the bus — already off / detached (safe when `safe_to_power_off: true`) |
+| 0 | `ready` | `status` only: normal operation |
+| 1 | `busy` | not possible right now (in use); the message is shown, the backend restored |
+| 1 | `absent` | `on` only: "device not found — is it powered on and its cable connected?" |
+| 2 | `hung` | **Do NOT switch off — the host needs a reboot**; backend stays disabled |
+| 3 | – | call error — a gateway bug |
+| 4 | `error` / `degraded` | the message |
+
+```json
+{"action": "off", "result": "ok", "exit_code": 0, "message": "detached, safe to power off",
+ "gpu": {"present": false, "driver": null, "users": []},
+ "hotplug_hung": false, "ct": {"id": 462, "status": "stopped"},
+ "safe_to_power_off": true}
+```
+
+`safe_to_power_off == true` is the ONLY thing that earns "Safe to switch off now";
+`hotplug_hung: true` is treated as `hung` whatever the exit code. ssh's own failure
+(exit 255) is "host unreachable", unless ssh reports a host-key or key refusal.
+
+---
+
 ## The `/ui` console
 
 A server-rendered console mounted at `/ui` (sign in with an admin key once
@@ -3123,7 +3224,8 @@ new index (`idx_calls_ts_backend`, the old `idx_calls_ts` is dropped) and `fault
 > **Secrets & data never to commit:** `config.yaml`, `store.db` (+ `secret.key` —
 > they travel together, keys encrypted at rest), `stats.db*`, `jobs.db*`,
 > `jobs/`, `*.key`, and the managed-host files `thunder.key*`, `thunder-known_hosts/`,
-> `thunder-ctl/`, `modelsrc.key*`, `modelsrc-known_hosts`. All gitignored.
+> `thunder-ctl/`, `modelsrc.key*`, `modelsrc-known_hosts`, and the power-control files
+> `power-keys/`, `power-known_hosts/`. All gitignored.
 
 ## License
 

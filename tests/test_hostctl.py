@@ -4238,7 +4238,8 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         m.sync_host_controllers()
         deps = m.host_controllers["tc"].deps
         self.assertEqual(deps.datadir, self.tmp)
-        self.assertIs(deps.set_enabled, m.set_backend_enabled)
+        # the power-aware wrapper (an enable is skipped while power control holds it)
+        self.assertIs(deps.set_enabled, m._host_set_enabled)
         self.assertIs(deps.begin_drain, m.begin_drain)
         self.assertIs(deps.cancel_drain, m.cancel_drain)
         self.assertIs(deps.hold_routing, m._hold_routing)
@@ -4636,7 +4637,9 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         # thunder-ctl: the ControlMaster sockets — a deploy's rsync --delete must not
         # pull the live socket out from under a running master
         names = ["thunder.key", "thunder.key.pub", "thunder-known_hosts", "thunder-ctl",
-                 "modelsrc.key", "modelsrc.key.pub", "modelsrc-known_hosts"]
+                 "modelsrc.key", "modelsrc.key.pub", "modelsrc-known_hosts",
+                 # backend power control: one key + one pinned host key per backend
+                 "power-keys", "power-known_hosts"]
         with open(os.path.join(root, ".gitignore")) as f:
             gi = {ln.strip().rstrip("/") for ln in f}
         with open(os.path.join(root, "deploy.sh")) as f:

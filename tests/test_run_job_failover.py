@@ -478,7 +478,8 @@ class ClaimIsAtomic(unittest.TestCase):
     def test_a_lost_claim_at_request_time_queues_the_job(self):
         parked = []
 
-        async def _park(job_id, alias, force, build_req, eligible=None, run_state=None):
+        async def _park(job_id, alias, force, build_req, eligible=None, run_state=None,
+                        admitted=None):
             parked.append(run_state)
         orig = main._run_gen_parked
         main._run_gen_parked = _park
@@ -692,7 +693,7 @@ class DesignationReadsTheStoreOncePerAlias(unittest.TestCase):
         calls = []
         backs = [{"name": f"g{i}", "type": "comfyui"} for i in range(4)]
 
-        def routes(alias):
+        def routes(alias, gated=None, admitted=None):
             calls.append(alias)
             return [(b, {}) for b in backs], [(b, {}) for b in backs]
         orig, saved = main._gen_routes, main._gen_waiting[:]
