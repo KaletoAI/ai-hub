@@ -1262,7 +1262,7 @@ def _power_line(b: dict) -> str:
     running = str(pw.get("running") or "")
     label, kind = _POWER_BADGE.get(st, (st, "muted"))
     parts = [f'<span class="badge {kind}" style="margin-left:0">{_esc(label)}</span>']
-    if st == power.OFF:
+    if st == power.OFF and pw.get("safe"):     # only the script's safe_to_power_off earns it
         parts.append('<span class="pwrsafe" role="status">✓ Safe to switch off now</span>')
     elif st == power.HUNG:
         parts.append('<span class="pwrhung" role="alert">⚠ Do NOT switch off — the host '
@@ -1297,7 +1297,7 @@ def _power_line(b: dict) -> str:
                                      "there are refused from now on; running and already "
                                      "queued work finishes first. Cut the power only when "
                                      "the console says so.")
-            if st in power.ON_FROM:
+            if st in power.ON_FROM and b.get("enabled") is False:   # main refuses it too
                 btns += _btn("Switched on again", href("on"), sm=True,
                              title="The device is powered on: run the host's on script and "
                                    "bring the backend back",
@@ -2736,12 +2736,14 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
         badge += _filter_badge(b.get("models_filtered"))
         badge += _extras_badge(b.get("models_added"))
         acts_list = [("✎", f"/ui/backends?edit={quote(bid)}", "secondary", "Edit")]
-        # While the power control owns the backend (an action runs, or its device is off
-        # or hung) the plain drain/enable buttons step aside: enabling a backend whose
-        # device is being detached would route work onto it (main refuses it too).
+        # While the power control owns the backend (an action runs, its device is off or
+        # hung, or the power flow switched it off and it is still disabled — `held`) the
+        # plain drain/enable buttons step aside: enabling a backend whose device is being
+        # detached, or is detached, skips `on --start-ct` (main refuses it too).
         pw = b.get("power") if isinstance(b.get("power"), dict) else {}
         pw_lock = bool(pw) and bool(pw.get("running") or pw.get("state") in power.RUNNING
-                                    or pw.get("state") in (power.OFF, power.HUNG))
+                                    or pw.get("state") in (power.OFF, power.HUNG)
+                                    or pw.get("held"))
         if pw_lock and not draining:
             pass
         elif draining:

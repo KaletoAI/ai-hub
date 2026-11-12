@@ -270,11 +270,11 @@ class PreClickJobsKeepTheBackend(_Env):
         gated: list = []
         ready, allc = main._gen_routes("pa", gated)
         self.assertEqual((ready, allc), ([], []))
-        self.assertEqual(gated, [("egpu", "egpu is being switched off")])
+        held = "'pa': egpu is being switched off and no other backend can take it"
+        self.assertEqual(gated, [("egpu", held)])
         with self.assertRaises(main.HTTPException) as cm:
             asyncio.run(main._gen_pick("pa", "", {}))
-        self.assertEqual((cm.exception.status_code, cm.exception.detail),
-                         (503, "egpu is being switched off"))
+        self.assertEqual((cm.exception.status_code, cm.exception.detail), (503, held))
 
     def test_waiting_count_and_designation(self):
         t0 = time.monotonic()
@@ -289,12 +289,25 @@ class PreClickJobsKeepTheBackend(_Env):
         self.assertFalse(main._entry_can_use(new, self.b))
 
     def test_switched_off_backend_names_itself(self):
+        """With a SECOND candidate merely down, the 503 must still say the alias has no
+        other usable backend — not just "egpu is switched off", which sends the caller
+        to the box that was switched off on purpose instead of the one that is down."""
+        other = {"name": "down", "type": "comfyui", "url": "http://127.0.0.1:2",
+                 "enabled": True}
+        main.backends = [self.b, other]
+        main.backend_healthy["comfyui:down"] = False
+        main.image_models = {"pa": [{"backend": "egpu", "workflow": "w.json"},
+                                    {"backend": "down", "workflow": "w.json"}]}
         self.b["enabled"] = False
-        main._gen_backends = []
+        main._gen_backends = [other]
         main._power_states[self.BID] = {"state": power.OFF}
-        gated: list = []
-        main._gen_routes("pa", gated)
-        self.assertEqual(gated, [("egpu", "egpu is switched off")])
+        try:
+            gated: list = []
+            self.assertEqual(main._gen_routes("pa", gated), ([], []))
+            self.assertEqual(gated, [("egpu", "'pa': egpu is switched off and no other "
+                                              "backend can take it")])
+        finally:
+            main.backend_healthy.pop("comfyui:down", None)
 
 
 class OffFlow(_Env):
@@ -453,10 +466,36 @@ class ConsoleRow(_Env):
     def _row(self, rec):
         main._power_states[self.BID] = rec
         info = main.power_info(self.b)
-        return admin._power_line({"name": "egpu", "type": "comfyui", **info})
+        return admin._power_line({"name": "egpu", "type": "comfyui",
+                                  "enabled": self.b["enabled"], **info})
+
+    def test_switched_on_again_only_for_a_disabled_backend(self):
+        """An ENABLED, serving backend whose last status was `unreachable`/`error` must
+        not be offered "Switched on again" — and the POST is refused too: the on flow
+        marks it unhealthy (no work until the next discovery) and runs `on` on a device
+        nobody switched off."""
+        for st in (power.UNREACHABLE, power.ERROR):
+            row = self._row({"state": st})
+            self.assertNotIn("do=on", row, st)
+            self.assertIn("do=off", row, st)
+        msg = asyncio.run(main.power_action(self.BID, "on"))
+        self.assertIn("refused", msg)
+        self.assertEqual(self.calls, [])
+        self.assertTrue(main.backend_healthy[self.BID])
+        self.b["enabled"] = False
+        self.assertIn("do=on", self._row({"state": power.ERROR}))
+
+    def test_off_without_the_safe_flag_shows_no_green_banner(self):
+        """`off` state reached by a status that found the device PRESENT again (#4)
+        carries safe=False: the row must not say "Safe to switch off now"."""
+        self.b["enabled"] = False
+        row = self._row({"state": power.OFF, "held": True, "safe": False})
+        self.assertNotIn("Safe to switch off", row)
+        self.assertIn("do=on", row)
 
     def test_banners_and_buttons(self):
-        off = self._row({"state": power.OFF, "message": "detached"})
+        self.b["enabled"] = False
+        off = self._row({"state": power.OFF, "message": "detached", "safe": True})
         self.assertIn("Safe to switch off now", off)
         self.assertIn('formaction="/ui/backends/power?id=comfyui%3Aegpu&amp;do=on"', off)
         self.assertNotIn("do=off", off)
@@ -464,6 +503,7 @@ class ConsoleRow(_Env):
         self.assertIn("Do NOT switch off", hung)
         self.assertNotIn("Safe to switch off", hung)
         self.assertNotIn("do=off", hung)
+        self.b["enabled"] = True
         on = self._row({"state": power.ON})
         self.assertNotIn("Safe to switch off", on)
         self.assertIn("do=off", on)
@@ -479,6 +519,199 @@ class ConsoleRow(_Env):
         self.assertIn("confirm the host key first", nopin)
         self.assertNotIn("do=off", nopin)
         self.assertTrue(admin._is_post_action("/ui/backends/power"))
+
+
+class ReviewFollowUps(_Env):
+    """Follow-ups of the 2026-11-12 review: each is a path where the flow ends in a
+    plausible state while a device is detached under work, or a switched-off backend
+    silently comes back without `on --start-ct`."""
+
+    def _old_job(self):
+        return {"job_id": "j1", "alias": "pa", "admitted": time.monotonic() - 5,
+                "eligible": None, "force": ""}
+
+    def test_a_claim_during_the_thread_hop_is_still_waited_for(self):
+        """The drain wait used to read the in-flight count BEFORE its thread hop: a
+        pre-click job that claimed the backend during the hop was neither waiting nor
+        counted, so disable + `off` ran under a job between claim and prompt POST."""
+        real = main.power_waiting_jobs
+        job = self._old_job()
+        hop = {"n": 0}
+
+        def claim_during_hop(bid, pool=None):
+            hop["n"] += 1
+            if hop["n"] == 1:                 # the job claims while the count runs
+                job["claimed"] = True
+                main.backend_inflight[self.BID] = 1
+            return real(bid, pool)
+
+        async def go():
+            main._gen_waiting.append(job)
+            with mock.patch.object(main, "power_waiting_jobs", claim_during_hop):
+                await main.power_action(self.BID, "off")
+                await self.settle(lambda: hop["n"] >= 3)
+                self.assertEqual(self.events, [])         # nothing disabled under the job
+                main.backend_inflight[self.BID] = 0
+                main._gen_waiting.clear()
+                await self.settle(lambda: main._power_states[self.BID]["state"] == power.OFF)
+        asyncio.run(go())
+        self.assertEqual(self.events[0], ("enabled", False))
+
+    def _run_job(self, cands, adapters):
+        fake = mock.MagicMock()
+        fake.set_status.return_value = True
+
+        async def nothing(*a, **kw):
+            return None
+        saved = dict(main.backend_adapters)
+        main.backend_adapters.update(adapters)
+        try:
+            with mock.patch.object(main, "jobs", fake), \
+                    mock.patch.object(main, "_claim_gen_backend", nothing), \
+                    mock.patch.object(main, "_unload_host_llms", nothing), \
+                    mock.patch.object(main, "_free_comfy_vram", nothing), \
+                    mock.patch.object(main, "_note_fault", lambda *a, **kw: None):
+                asyncio.run(main._run_job("job1", "pa", cands,
+                                          lambda b, c: mock.MagicMock(slot_held=False)))
+        finally:
+            main.backend_adapters.clear()
+            main.backend_adapters.update(saved)
+        return fake
+
+    def test_failover_never_lands_on_a_switched_off_backend(self):
+        """A pre-click job running on ANOTHER backend still carries this one in its
+        failover tail; once the switch-off disabled it and runs `off`, a connection
+        failure elsewhere must not dispatch the job onto the device being detached.
+        While still `draining` (enabled) the same tail entry is a legit target."""
+        other = {"name": "other", "type": "comfyui", "url": "http://127.0.0.1:2"}
+        main.backends = [self.b, other]
+
+        class Ad:
+            def __init__(self, boom=None):
+                self.boom, self.calls = boom, 0
+
+            async def generate(self, req):
+                self.calls += 1
+                if self.boom:
+                    raise self.boom
+                return mock.MagicMock(blobs=[b"x"], meta={})
+        cands = [(other, {"backend": "other"}), (self.b, {"backend": "egpu"})]
+        for state, enabled, used in ((power.SWITCHING_OFF, False, 0), (power.OFF, False, 0),
+                                     (power.DRAINING, True, 1)):
+            self.b["enabled"] = enabled
+            main._power_states[self.BID] = {"state": state}
+            eg = Ad()
+            fake = self._run_job(cands, {"comfyui:other": Ad(ConnectionError("down")),
+                                         self.BID: eg})
+            self.assertEqual(eg.calls, used, state)
+            if not used:
+                msg = fake.fail.call_args[0][1]
+                self.assertNotIn("switched off before", msg)   # `other` ran: its error
+        # nothing else ran: the report says the backend was switched off, not "unreachable"
+        self.b["enabled"] = False
+        main._power_states[self.BID] = {"state": power.OFF}
+        fake = self._run_job([(self.b, {"backend": "egpu"})], {self.BID: Ad()})
+        self.assertIn("egpu was switched off before the job could start",
+                      fake.fail.call_args[0][1])
+
+    def test_busy_restore_needs_a_fresh_healthy_discovery(self):
+        """`off --stop-ct` may stop the service before the script finds the device busy;
+        re-enabling with the stale pre-click "healthy" routed work to a stopped
+        container until the next failing poll."""
+        self.answer = (1, _js(result="busy", message="in use",
+                              ct={"id": 462, "status": "stopped"}), b"")
+
+        async def go():
+            await main.power_action(self.BID, "off")
+            await self.settle(lambda: main._power_states[self.BID]["state"] == power.BUSY)
+        asyncio.run(go())
+        self.assertTrue(self.b["enabled"])
+        self.assertFalse(main.backend_healthy.get(self.BID))
+        self.assertFalse(main._power_states[self.BID].get("held"))
+
+    def test_status_keeps_a_switched_off_backend_off(self):
+        """A status after the switch-off that finds the device present (powered on
+        again, attached by the host) mapped to `on`: "Switched on again" vanished and
+        the plain ▶ enable — which skips `on --start-ct` — was the only way back."""
+        async def off():
+            await main.power_action(self.BID, "off")
+            await self.settle(lambda: main._power_states[self.BID]["state"] == power.OFF)
+        asyncio.run(off())
+        self.assertTrue(main._power_states[self.BID]["held"])
+        self.answer = (0, _js(action="status", result="ready", safe_to_power_off=False,
+                              hotplug_hung=False), b"")
+
+        async def status():
+            await main.power_action(self.BID, "status")
+            await self.settle(lambda: self.BID not in main._power_tasks)
+        asyncio.run(status())
+        rec = main._power_states[self.BID]
+        self.assertEqual(rec["state"], power.OFF)
+        self.assertFalse(rec["safe"])
+        self.assertTrue(main._power_holds(self.BID))
+        self.assertFalse(main.console_set_backend_enabled(self.BID, True))   # ▶ refused
+        self.assertFalse(main._host_set_enabled(self.BID, True))             # hostctl too
+        self.assertFalse(self.b["enabled"])
+        row = admin._power_line({"name": "egpu", "type": "comfyui", "enabled": False,
+                                 **main.power_info(self.b)})
+        self.assertIn("do=on", row)
+        self.assertNotIn("Safe to switch off", row)
+        # the pure mapping: a plain-disabled backend (not held) is still `on`
+        p = {"outcome": "ok", "safe": False, "message": ""}
+        self.assertEqual(power.status_state(p, False)[0], power.ON)
+        self.assertEqual(power.status_state(p, False, held=True)[0], power.OFF)
+
+    def test_cancel_restores_the_pre_click_state(self):
+        """Cancel wrote `on` whatever the state was before the click: an `error` or
+        `unreachable` row lost its warning on a Cancel."""
+        main._power_states[self.BID] = {"state": power.UNREACHABLE, "message": "x"}
+
+        async def go():
+            main.backend_inflight[self.BID] = 1
+            await main.power_action(self.BID, "off")
+            await main.power_action(self.BID, "cancel")
+            await asyncio.sleep(0.02)
+        asyncio.run(go())
+        rec = main._power_states[self.BID]
+        self.assertEqual(rec["state"], power.UNREACHABLE)
+        self.assertNotIn("prev_enabled", rec)
+
+    def test_cancel_then_new_click_keeps_the_new_drain(self):
+        """The cancelled task's cleanup popped `_power_draining[bid]` at its next await —
+        after a quick re-click that entry was the NEW flow's, and the backend went back
+        into routing while its switch-off still waited."""
+        async def go():
+            main.backend_inflight[self.BID] = 1
+            await main.power_action(self.BID, "off")
+            await asyncio.sleep(0.03)              # the old flow is inside its poll wait
+            await main.power_action(self.BID, "cancel")
+            await main.power_action(self.BID, "off")   # re-click before the old task resumes
+            t_new = main._power_draining[self.BID]
+            await asyncio.sleep(0.05)              # the old task's CancelledError ran
+            self.assertEqual(main._power_draining.get(self.BID), t_new)
+            await main.power_action(self.BID, "cancel")
+            await asyncio.sleep(0.02)
+        asyncio.run(go())
+
+    def test_a_plain_drain_before_the_click_is_not_undone_by_busy(self):
+        """The operator was taking the backend offline (plain drain) when they clicked
+        Switch off; `busy` used to re-enable it because it was still `enabled` at the
+        click."""
+        self.answer = (1, _js(result="busy", message="in use"), b"")
+        main._draining.add(self.BID)
+        try:
+            async def go():
+                await main.power_action(self.BID, "off")
+                self.assertFalse(main._power_states[self.BID]["prev_enabled"])
+                self.assertNotIn(self.BID, main._power_draining)
+                # the plain drain finalizes (disables) as its last request ends
+                self.b["enabled"] = False
+                await self.settle(lambda: main._power_states[self.BID]["state"] == power.BUSY)
+            asyncio.run(go())
+        finally:
+            main._draining.discard(self.BID)
+        self.assertNotIn(("enabled", True), self.events)
+        self.assertFalse(self.b["enabled"])
 
 
 if __name__ == "__main__":

@@ -2750,6 +2750,13 @@ Then press *Fetch host key*, compare the fingerprint with `ssh-keygen -lf
 `power-known_hosts/<name>-<type>`; every later connect is `StrictHostKeyChecking=yes`).
 Until key and pin exist the row says why instead of offering buttons.
 
+Key, pin and the power record belong to the backend's NAME: **renaming a power-controlled
+backend means a new key** (install its `authorized_keys` line, remove the old one) **and
+a new host-key pin**; the old files under `power-keys/` / `power-known_hosts/` are left
+behind and can be deleted. While the power control holds a backend switched off, the
+plain ▶ enable is refused — use *Switched on again*; if the host script itself is
+broken, clear `power ssh` to take the backend out of power control.
+
 ### The host-script contract (v1)
 
 The gateway sends exactly one of these three commands — never anything an admin typed

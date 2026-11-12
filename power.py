@@ -60,6 +60,9 @@ STATES = (ON, DRAINING, SWITCHING_OFF, OFF, BUSY, HUNG, ERROR, SWITCHING_ON, STA
 # an action of the flow is running — a second click is refused, and a gateway restart in
 # one of these is an interruption (never re-run automatically)
 RUNNING = frozenset({DRAINING, SWITCHING_OFF, SWITCHING_ON})
+# no job may CLAIM the backend in these (a failover tail computed before the click
+# included): its device is being detached, is detached, or is being attached
+NO_DISPATCH = frozenset({SWITCHING_OFF, OFF, HUNG, SWITCHING_ON})
 # the console's buttons, by state
 OFF_FROM = frozenset({ON, BUSY, ERROR, UNREACHABLE})
 ON_FROM = frozenset({OFF, HUNG, ERROR, UNREACHABLE})
@@ -200,10 +203,13 @@ def on_state(p: dict) -> tuple[str, str]:
     return ERROR, m
 
 
-def status_state(p: dict, enabled: bool) -> tuple[str, str]:
+def status_state(p: dict, enabled: bool, held: bool = False) -> tuple[str, str]:
     """`status` run → (state, message). Unreachable is informational; a device the
     script calls safe to cut while the backend is disabled reads as OFF; any other
-    good answer is ON (normal / nothing to do)."""
+    good answer is ON (normal / nothing to do) — EXCEPT for a backend the power flow
+    switched off (`held`, still disabled): a device that is present again (powered on,
+    attached by the host) stays OFF without the safe flag. ON there would drop
+    "Switched on again" and leave the plain enable, which skips `on --start-ct`."""
     o, m = p.get("outcome"), p.get("message") or ""
     if o == "unreachable":
         return UNREACHABLE, m or UNREACHABLE_MSG
@@ -213,6 +219,9 @@ def status_state(p: dict, enabled: bool) -> tuple[str, str]:
         return ERROR, m
     if p.get("safe") and not enabled:
         return OFF, m or "safe to switch off"
+    if held and not enabled:
+        return OFF, ((m + " — ") if m else "") + ("not safe to cut the power now; "
+                                                  "Switched on again brings the backend back")
     return ON, m
 
 
@@ -274,16 +283,20 @@ def action_refusal(state: str, action: str) -> str:
     return ""
 
 
-def job_refusal(name: str, state: str) -> str:
-    """The 503 text for a new job whose only candidate is `name` in power state
-    `state` ("" = not held by the power flow)."""
+def job_refusal(name: str, state: str, alias: str = "") -> str:
+    """The 503 text for a new job of `alias` that has no usable backend while its
+    candidate `name` is held by the power flow in `state` ("" = not held). Says the
+    ALIAS has no other backend: another candidate may merely be down, and naming only
+    the power backend would send the caller to the wrong box."""
     if state in (DRAINING, SWITCHING_OFF):
-        return f"{name} is being switched off"
-    if state in (SWITCHING_ON, STARTING):
-        return f"{name} is being switched on"
-    if state in (OFF, HUNG, ERROR, UNREACHABLE, BUSY):
-        return f"{name} is switched off"
-    return ""
+        what = f"{name} is being switched off"
+    elif state in (SWITCHING_ON, STARTING):
+        what = f"{name} is being switched on"
+    elif state in (OFF, HUNG, ERROR, UNREACHABLE, BUSY):
+        what = f"{name} is switched off"
+    else:
+        return ""
+    return (f"'{alias}': {what} and no other backend can take it" if alias else what)
 
 
 # ── configuration and keys ────────────────────────────────────────────────────

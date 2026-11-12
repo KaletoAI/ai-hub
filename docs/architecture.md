@@ -1792,21 +1792,64 @@ memoises per (alias, that set)). Without it the drain removed the backend from t
 2 s re-pick of parked jobs, and a job already waiting for that GPU failed as "no
 healthy backend". A job admitted after t0 whose ONLY candidate it is gets a 503
 "<backend> is being switched off" at once (`_power_held` adds it to `gated`,
-`_gen_no_route_error` joins it) instead of parking until the park timeout; with
-another candidate it simply goes there. The flow polls (`_POWER_POLL_S`) until in-flight
-== 0 AND `power_waiting_jobs` == 0 (pre-t0 waiters in `_gen_waiting` that could still
-run there — their own force/LoRA/exclude filters applied) — the row shows "waiting for
-N jobs" live — then, with no await between, disables (`set_backend_enabled(bid,
-False)`, persisted), leaves `_power_draining` and runs `off`. `off` → `off` ("Safe to
-switch off now", backend stays disabled); `busy` → the pre-click `enabled` comes back
-(a note when the script reports its container stopped); `hung` → red "Do NOT switch
-off", stays disabled, nothing automatic; error/unreachable → `error`, stays disabled
-(the device state is unknown). A failure BEFORE the disable restores routing. "Cancel"
-(state `draining` only) cancels the task and leaves `_power_draining` → `on`. While an
-action runs the console's ▶ enable / ⊘ drain are refused (`console_set_backend_enabled`
-/ `console_begin_drain`) and hidden.
+`_gen_no_route_error` joins it; the text "'<alias>': <backend> is switched off and no
+other backend can take it" — another candidate may merely be down) instead of parking
+until the park timeout; with another candidate it simply goes there. The flow polls
+(`_POWER_POLL_S`) until in-flight == 0 AND `power_waiting_jobs` == 0 (pre-t0 waiters in
+`_gen_waiting` that could still run there — their own force/LoRA/exclude filters
+applied) — the row shows "waiting for N jobs" live. **Order matters**: the queue is
+copied ON the loop (`_gen_waiting_pool()`, passed in), the count runs in a thread, and
+the in-flight count is read AFTER that hop. With the count read first, a pre-click job
+that claimed the backend during the hop (claim and `_inflight_inc` are one synchronous
+step) was in neither number, and disable + `off` ran under a job between its claim and
+its prompt POST (review 2026-11-12). Then, with no await between, it disables
+(`set_backend_enabled(bid, False)`, persisted, record `held=True`), leaves
+`_power_draining` and runs `off`. `off` → `off` ("Safe to switch off now", backend
+stays disabled); `busy` → the pre-click `enabled` comes back, with `backend_healthy`
+reset (`off --stop-ct` may have stopped the service before the script found the device
+busy — the pre-click "healthy" is stale) and `held` cleared (a note when the script
+reports its container stopped); `hung` → red "Do NOT switch off", stays disabled,
+nothing automatic; error/unreachable → `error`, stays disabled (the device state is
+unknown). A failure BEFORE the disable restores routing. "Cancel" (state `draining`
+only) cancels the task, leaves `_power_draining` and restores the power state the click
+found (`prev_state`, not a blanket `on`). Every drain exit goes through
+`_power_undrain(bid, t0)`: only the entry this flow began is removed — a cancelled task
+resumes at its next await, and after a quick re-click the entry is the NEW flow's.
 
-**Switched on again** (states off/hung/error/unreachable → `_power_on_flow`): `on`;
+**Pre-click `enabled`**: a backend under a plain take-offline drain (`_draining`, not a
+managed host's `_drain_hold`) counts as NOT enabled — `busy` must not re-enable what the
+operator was taking offline — and gets no `_power_draining` entry (the plain drain
+already keeps it out; its finalize disables it). A managed host's restart hold
+(`_hold_routing`) also lives in `_draining`, and `_gen_routes` checks `_draining` before
+the pre-click exception: during such a hold a pre-click job does NOT keep the backend
+(it parks like everyone else until the hold ends) — accepted: the hold is short, and a
+power-controlled device on a rented VM is not a real setup.
+
+**Dispatch guard** (`_power_dispatch_ok`, in `_run_job` before every claim — the
+designated first candidate and each failover target): a candidate list is computed
+before awaits, and a pre-click job running on ANOTHER backend carries this one in its
+failover tail, which the drain does not wait for. So a backend that is disabled (the
+LIVE dict — a rebuild replaces them), in `power.NO_DISPATCH` (`switching_off`, `off`,
+`hung`, `switching_on`) or `starting` without a healthy discovery is skipped there.
+In `draining` a listed candidate is legit (lists made after t0 drop it unless the job
+was admitted before; its claim is in-flight, which the drain waits for). A job whose
+candidates were ALL skipped this way fails "'<alias>': <backend> was switched off
+before the job could start there and no other backend can take it".
+
+**Held off** (`_power_holds`: power control configured, backend disabled, and the
+record `held` or state `off`/`hung`): only "Switched on again" (which runs
+`on --start-ct`) may enable it. The console's ▶ is hidden and refused
+(`console_set_backend_enabled`), and hostctl's `set_enabled` is `_host_set_enabled`,
+which skips (and logs) an ENABLE while a power action runs or the backend is held — a
+disable always goes through (the safe direction). While an action runs ▶ enable / ⊘
+drain are refused (`console_set_backend_enabled` / `console_begin_drain`) and hidden.
+Removing `power_ssh` from the backend is the way out when the script itself is
+broken.
+
+**Switched on again** (states off/hung/error/unreachable AND the backend disabled —
+an enabled, serving backend whose last status said `unreachable` is refused and not
+offered: the flow would mark it unhealthy and run `on` on a device nobody switched off
+→ `_power_on_flow`): `on`;
 ok → `backend_healthy[bid] = False` and `backend_error` cleared (a backend disabled
 while healthy KEEPS that flag — enabled as is, it would be routed to before its service
 is up), `starting` persisted, THEN `set_backend_enabled(bid, True)`, and
@@ -1819,7 +1862,11 @@ connected?". **F4**: `refresh_backend` opens no fault while `_power_quiet(bid)`
 **Check status** (`_power_status_flow`, a POST — never a timer or page view: the
 script starts `nvidia-smi`): stores the JSON (`power.summary`: present, driver, users,
 ct status, safe_to_power_off, hotplug_hung) and maps the state (`status_state`;
-unreachable is informational; a `starting` record keeps its state unless hung).
+unreachable is informational; a `starting` record keeps its state unless hung). For a
+HELD backend a good answer without `safe_to_power_off` (device powered on again and
+attached by the host) stays `off` with `safe` false — mapped to `on` it dropped
+"Switched on again" and left the plain enable, which skips `on --start-ct`. The green
+banner needs state `off` AND `safe`.
 
 **Console**: `gateway_info`/`/health` carry `power` per configured backend
 (`power_info`: state, message, waiting counts, summary, the running action and the

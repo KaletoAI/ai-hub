@@ -4238,7 +4238,8 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         m.sync_host_controllers()
         deps = m.host_controllers["tc"].deps
         self.assertEqual(deps.datadir, self.tmp)
-        self.assertIs(deps.set_enabled, m.set_backend_enabled)
+        # the power-aware wrapper (an enable is skipped while power control holds it)
+        self.assertIs(deps.set_enabled, m._host_set_enabled)
         self.assertIs(deps.begin_drain, m.begin_drain)
         self.assertIs(deps.cancel_drain, m.cancel_drain)
         self.assertIs(deps.hold_routing, m._hold_routing)

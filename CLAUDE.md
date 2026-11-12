@@ -178,7 +178,10 @@ Each of these once failed without an error; the full story is in `docs/architect
 - Only `safe_to_power_off == true` on a successful `off` shows "Safe to switch off now";
   only `power.COMMANDS` go over ssh (strict, pinned host key, per-backend key).
 - A generation job admitted BEFORE the switch-off keeps the backend (`_gen_routes(…,
-  admitted)`); the disable + `off` run only after in-flight AND those jobs are done.
+  admitted)`); the disable + `off` run only after in-flight AND those jobs are done
+  (queue copied on the loop, in-flight read AFTER the thread hop). `_run_job` claims
+  nothing `_power_dispatch_ok` refuses (failover tails included); a held-off backend is
+  enabled only by "Switched on again" (`_power_holds`; ▶ and hostctl refused).
 - A restart never re-runs a power action (`power.reconcile_boot` → `error`).
 
 **Every new silently-failing mechanism gets a test** in `tests/` whose docstring says
