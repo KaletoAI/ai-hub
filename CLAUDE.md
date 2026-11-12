@@ -68,7 +68,7 @@ of them.
 
 ## Architecture map
 
-Thirty-four Python files at the top level (`ls *.py` is the count of record), tests in
+Thirty-five Python files at the top level (`ls *.py` is the count of record), tests in
 `tests/`, scripts that run on OTHER boxes in `ops/` (`ops/runpod/` is the RunPod worker's Docker build context). `main.py` owns all app state as
 module globals; **no other module imports `main`** — they get what they need through
 injected callables (`AdapterContext`, `admin.bind(...)`, hostctl `Deps`) and stay
