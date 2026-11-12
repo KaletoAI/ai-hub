@@ -1313,7 +1313,8 @@ unchanged; anything else is never searched. Only jobs `owner` may see count (own
 `default`/NULL — `_check_owner`'s rule; `None` = admin), so a foreign job neither resolves
 nor turns a prefix ambiguous: the same 404 as no match, never a 403/409 that confirms it
 exists. `main._require_job_owner` is the ONE caller — it answers 409 "ambiguous job id
-prefix, N matches" (never the first match) and hands the full id to all four routes, so
+prefix, N matches: <ids>" (never the first match; the ids come from `jobs.prefix_ids`
+under the same visibility rule, so a 409 never names another owner's job) and hands the full id to all four routes, so
 the view and its result URLs carry it (`test_job_id_prefix`). The /ui job heading keeps
 the short form with the full id as `title` and a `data-copy` button (`_COPY_JS`, in
 `_CONFIRM_JS`: delegated, so it survives the live morph; `navigator.clipboard` only in a

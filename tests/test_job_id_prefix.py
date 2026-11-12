@@ -7,7 +7,8 @@ copies exactly that, and the API answered a plain 404 "not found" for a job that
 — reads like a pruned job, not like a lookup that never tried. The prefix lookup in turn
 must not become an oracle: a prefix that matches only someone else's job must be the same
 404 as no match (never a 403 "not your job", never counted into a 409), and an ambiguous
-prefix must be a 409, never silently the first match.
+prefix must be a 409, never silently the first match — and the 409 lists only the
+candidates this caller may see.
 
 Run: venv/bin/python -m unittest tests.test_job_id_prefix -v
 """
@@ -128,6 +129,20 @@ class JobApiPrefix(_Base):
         r = self._get("/v1/jobs/aaaaaaaa")
         self.assertEqual(r.status_code, 409)
         self.assertIn("ambiguous job id prefix, 2 matches", r.json()["detail"])
+        # the 409 names the candidates, so the client can pick one
+        self.assertIn(A1, r.json()["detail"])
+        self.assertIn(A2, r.json()["detail"])
+
+    def test_the_409_never_lists_a_foreign_job(self):
+        """The candidate list follows the caller's visibility — naming bob's job in
+        alice's 409 would leak its id, which is a full capability for an admin key."""
+        foreign = "aaaaaaaa" + "9" * 24
+        jobs.create("txt2img", "al", "b", owner="bob", job_id=foreign)
+        r = self._get("/v1/jobs/aaaaaaaa")
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("2 matches", r.json()["detail"])
+        self.assertNotIn(foreign, r.json()["detail"])
+        self.assertIn(foreign, self._get("/v1/jobs/aaaaaaaa", key="k-admin").json()["detail"])
 
     def test_too_short_prefix_is_404(self):
         self.assertEqual(self._get("/v1/jobs/aaaaaaa").status_code, 404)

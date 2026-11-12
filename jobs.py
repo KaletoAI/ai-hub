@@ -596,16 +596,24 @@ def resolve_id(job_id: str, owner: Optional[str]) -> tuple[Optional[str], int]:
     ambiguous (no existence leak). (None, n > 1) = ambiguous; the caller says so."""
     if len(job_id) >= 32:
         return job_id, 1
-    prefix = job_id.lower()
+    ids = prefix_ids(job_id, owner)
+    return (ids[0] if len(ids) == 1 else None), len(ids)
+
+
+def prefix_ids(job_id: str, owner: Optional[str]) -> list:
+    """Every job id starting with `job_id` (>= 8 hex chars) that `owner` may see —
+    the same visibility rule as resolve_id, so the ids an ambiguous-prefix 409 lists
+    never include someone else's job. Newest first; [] for anything not a hex prefix."""
+    prefix = (job_id or "").lower()
     if not _active or not _ID_PREFIX.fullmatch(prefix):
-        return None, 0
+        return []
     sql, args = "SELECT id FROM jobs WHERE id LIKE ?", [prefix + "%"]   # hex only: no wildcards
     if owner is not None:
         sql += " AND (owner=? OR owner IS NULL OR owner='default')"
         args.append(owner)
+    sql += " ORDER BY created DESC"
     with _conn() as c:
-        ids = [r[0] for r in c.execute(sql, args).fetchall()]
-    return (ids[0] if len(ids) == 1 else None), len(ids)
+        return [r[0] for r in c.execute(sql, args).fetchall()]
 
 
 def get(job_id: str) -> Optional[dict]:

@@ -5474,6 +5474,9 @@ async def gen_alias_schema(alias: str, request: Request, authorization: Optional
     return out
 
 
+_PREFIX_409_MAX = 20          # ids listed in an ambiguous-prefix 409
+
+
 async def _require_job_owner(authorization: Optional[str], request: Request, job_id: str) -> str:
     """A caller may only touch its own jobs: non-admin users by name, and — open
     mode — anonymous callers by IP (_check_owner does the matching). admin/master
@@ -5489,7 +5492,11 @@ async def _require_job_owner(authorization: Optional[str], request: Request, job
     caller = None if admin else (user.get("name") if user else anon)
     full, matches = await asyncio.to_thread(jobs.resolve_id, job_id, caller)
     if matches > 1:
-        raise HTTPException(409, f"ambiguous job id prefix, {matches} matches")
+        # name the candidates (only jobs this caller may see — prefix_ids applies the
+        # same rule), so a client can pick the right one instead of guessing more digits
+        ids = await asyncio.to_thread(jobs.prefix_ids, job_id, caller)
+        shown = ", ".join(ids[:_PREFIX_409_MAX]) + (", …" if len(ids) > _PREFIX_409_MAX else "")
+        raise HTTPException(409, f"ambiguous job id prefix, {matches} matches: {shown}")
     if full is None:
         raise HTTPException(404, f"job '{job_id}' not found")
     if not admin:

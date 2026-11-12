@@ -3071,8 +3071,9 @@ The gateway therefore keeps a **voice reference library** (Playground → Voice)
 
 `{id}` in the four `/v1/jobs/…` routes may also be a unique prefix of at least 8 hex
 characters — e.g. the 12-character short id the console shows. Answers always carry the
-full `job_id`. An ambiguous prefix is `409` ("ambiguous job id prefix, N matches"); a
-prefix that matches nothing — or only another owner's job — is `404`.
+full `job_id`. An ambiguous prefix is `409` ("ambiguous job id prefix, N matches: <id>,
+<id>, …" — the full ids the caller may see, newest first, at most 20); a prefix that
+matches nothing — or only another owner's job — is `404`.
 
 ### Other
 
