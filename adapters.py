@@ -56,6 +56,7 @@ import tripo
 import venice
 import wiro
 import lulabs
+import nodeprofile
 
 logger = logging.getLogger(__name__)
 
@@ -773,6 +774,10 @@ class AdapterContext:
     # Fed by ComfyUI's /ws feed (see _ws_progress), read by the job view. A no-op
     # default keeps every non-main construction (and every test) valid.
     note_progress: Callable[[str, Optional[dict]], None] = lambda job_id, info: None
+    # Per-node timing profile of an alias on a backend (nodeprofile.build over the
+    # recent done jobs' meta.node_times), or None without one. (alias, backend name)
+    # → profile. Blocking (SQLite) — called once per run, in a worker thread.
+    gen_profile: Callable[[str, str], Optional[dict]] = lambda alias, backend: None
     # Normalized reasoning toggle: (backend, model, requested, payload) -> (payload, control).
     # Default no-op (auto) so non-main constructions stay valid.
     apply_reasoning: Callable[[dict, Optional[str], Optional[str], dict], Any] = \
@@ -2381,6 +2386,16 @@ def _view_params(item) -> Optional[tuple]:
     return None
 
 
+_PROGRESS_TICK_S = 1.0   # live progress re-computed this often while the feed is silent
+_WS_READY_WAIT_S = 2.0   # how long the submit waits for the progress socket to connect
+
+
+def _node_titles(wf: dict) -> dict:
+    """node id → what a person calls it: the workflow's own title, else the class."""
+    return {str(nid): str((n.get("_meta") or {}).get("title") or n.get("class_type") or nid)
+            for nid, n in (wf or {}).items() if isinstance(n, dict)}
+
+
 def _comfy_prompt_error(status: int, text: str, wf: dict, mapping: dict) -> str:
     """Human-readable ComfyUI /prompt rejection. Raw node_errors name only node ids —
     meaningless in the console, where everything is wired by node TITLE. Each error
@@ -3934,30 +3949,52 @@ class ComfyUIAdapter(BackendAdapter):
         # 0.30 broadcasts progress to everyone, 0.34 measurably does not — sending
         # the id is what makes the feed work on both, and it is inert otherwise.
         client_id = f"gw-{req.job_id or uuid.uuid4().hex[:12]}"
-        pr = await client.post(f"{url}/prompt",
-                               json={"prompt": wf, "client_id": client_id})
-        if pr.status_code != 200:
-            raise RuntimeError(_comfy_prompt_error(pr.status_code, pr.text, wf, mapping))
-        submitted = pr.json() or {}
-        # A PARTLY invalid workflow still returns 200 AND a prompt_id: ComfyUI
-        # queues the branches it can run and reports the rest in `node_errors`
-        # (measured — one wrong link type). Letting that run would deliver
-        # silently less than the alias configures, so a non-empty node_errors
-        # fails the job here, before anything occupies the GPU.
-        if submitted.get("node_errors"):
-            raise RuntimeError(_comfy_prompt_error(pr.status_code, pr.text, wf, mapping))
-        prompt_id = submitted.get("prompt_id")
-        if not prompt_id:
-            raise RuntimeError("ComfyUI returned no prompt_id")
-        if log_on:
-            logger.info(f"→ [{bname}] queued {prompt_id} (workflow {os.path.basename(req.workflow or '?')})")
+        profile = await self._load_profile(req)
         # Live progress runs BESIDE the /history poll, never instead of it: the
         # poll owns the job's outcome (and its timeout, disconnect grace and
         # failover), the socket only says how far along it is. If the socket
         # never connects the job is completely unaffected.
-        ws_state = {"prompt_id": prompt_id, "began": time.monotonic()}
+        # `run` times every node (nodeprofile.fold): it becomes this job's
+        # meta.node_times on success, and with a `profile` from earlier runs the
+        # feed reports the WHOLE workflow's progress instead of one node's.
+        # The socket connects BEFORE the submit: ComfyUI drops messages addressed
+        # to a client that is not connected yet, and on an idle box the first
+        # `executing` (the loader) goes out right after /prompt answers. Until the
+        # prompt_id is known, messages are buffered (`early`) and replayed through
+        # the prompt_id gate.
+        ws_state = {"prompt_id": None, "began": time.monotonic(),
+                    "run": {}, "plan": list(wf),
+                    "titles": _node_titles(wf), "profile": profile,
+                    "ready": asyncio.Event()}
         ws_task = asyncio.create_task(
             self._ws_progress(url, client_id, req.job_id, ws_state))
+        try:
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(ws_state["ready"].wait(), _WS_READY_WAIT_S)
+            ws_state["run"]["submit_at"] = time.monotonic()
+            pr = await client.post(f"{url}/prompt",
+                                   json={"prompt": wf, "client_id": client_id})
+            if pr.status_code != 200:
+                raise RuntimeError(_comfy_prompt_error(pr.status_code, pr.text, wf, mapping))
+            submitted = pr.json() or {}
+            # A PARTLY invalid workflow still returns 200 AND a prompt_id: ComfyUI
+            # queues the branches it can run and reports the rest in `node_errors`
+            # (measured — one wrong link type). Letting that run would deliver
+            # silently less than the alias configures, so a non-empty node_errors
+            # fails the job here, before anything occupies the GPU.
+            if submitted.get("node_errors"):
+                raise RuntimeError(_comfy_prompt_error(pr.status_code, pr.text, wf, mapping))
+            prompt_id = submitted.get("prompt_id")
+            if not prompt_id:
+                raise RuntimeError("ComfyUI returned no prompt_id")
+        except BaseException:
+            ws_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await ws_task
+            raise
+        ws_state["prompt_id"] = prompt_id
+        if log_on:
+            logger.info(f"→ [{bname}] queued {prompt_id} (workflow {os.path.basename(req.workflow or '?')})")
         if req.job_id:
             self._prompts[req.job_id] = prompt_id      # what a cancel may stop
         try:
@@ -3978,10 +4015,29 @@ class ComfyUIAdapter(BackendAdapter):
                 if self._prompts.get(req.job_id) == prompt_id:
                     self._prompts.pop(req.job_id, None)
 
+        # Success only: the ws task is gone (finally above), so the run state is ours.
+        # The record lands in the job's meta and feeds the next run's profile.
+        extra = {}
+        rec = nodeprofile.record(ws_state["run"], ws_state["titles"], time.monotonic())
+        if rec:
+            extra["node_times"] = rec
+
         async def fetch(params: dict):
             r = await client.get(f"{url}/view", params=params)
             return r.status_code, r.content
-        return outputs, fetch, {}
+        return outputs, fetch, extra
+
+    async def _load_profile(self, req: NormalizedRequest) -> Optional[dict]:
+        """The alias's per-node timing profile for this backend (or, flagged foreign,
+        from its other backends) — None without history. Best-effort: a store hiccup
+        just means the node-level progress of before."""
+        if not req.job_id or not req.alias:
+            return None
+        try:
+            return await asyncio.to_thread(self.ctx.gen_profile, req.alias, self.name)
+        except Exception as e:
+            logger.debug(f"[{self.name}] node profile unavailable: {e}")
+            return None
 
     async def _deliver(self, req: NormalizedRequest, wf: dict, outputs: dict, fetch):
         """Turn the outputs into the delivery (cases / node / globs, normalisation,
@@ -4038,14 +4094,26 @@ class ComfyUIAdapter(BackendAdapter):
         `state` is the caller's dict, so the poll loop can read what arrived (and notice
         that nothing has arrived for a while) while this task runs.
         """
+        ready = state.get("ready")
         try:
             import websockets                       # ships with uvicorn[standard], like watchfiles
         except ImportError:
+            if ready:
+                ready.set()
             return
         ws_url = re.sub(r"^http", "ws", url) + f"/ws?clientId={quote(client_id)}"
+        ticker = None
+
+        def emit(view):
+            if view is not None:
+                state["emit_at"] = time.monotonic()
+                self.ctx.note_progress(job_id, view)
         try:
             async with websockets.connect(ws_url, max_size=None,
                                           open_timeout=10) as ws:
+                if ready:
+                    ready.set()
+                ticker = asyncio.create_task(self._progress_ticker(state, emit))
                 while True:
                     raw = await ws.recv()
                     if isinstance(raw, (bytes, bytearray)):
@@ -4054,18 +4122,53 @@ class ComfyUIAdapter(BackendAdapter):
                         msg = json.loads(raw)
                     except ValueError:
                         continue
-                    view = self._progress_apply(state, msg, time.monotonic())
-                    if view is not None:
-                        self.ctx.note_progress(job_id, view)
+                    now = time.monotonic()
+                    if state.get("prompt_id") is None:          # submit still in flight
+                        early = state.setdefault("early", [])
+                        if len(early) < 500:
+                            early.append((now, msg))
+                        continue
+                    emit(self._drain_early(state))
+                    emit(self._progress_apply(state, msg, now))
         except asyncio.CancelledError:
             raise
         except Exception as e:                      # never a reason for a job to fail
+            # A feed that dies mid-run leaves its node timings incomplete — the run
+            # must not become a record (nodeprofile.record checks `broken`).
+            state.setdefault("run", {})["broken"] = True
             logger.debug(f"[{self.backend.get('name')}] ws progress unavailable: {e}")
+        finally:
+            if ready:
+                ready.set()
+            if ticker is not None:
+                ticker.cancel()
+
+    async def _progress_ticker(self, state: dict, emit) -> None:
+        """A VAE decode or a mesh export sends nothing for minutes; with a profile the
+        bar still moves (elapsed vs expected), so the view is recomputed on a CLOCK.
+        A separate task, not a recv() timeout: a box that broadcasts something (a
+        resource monitor) more often than the tick would starve a timeout forever."""
+        while True:
+            await asyncio.sleep(_PROGRESS_TICK_S)
+            now = time.monotonic()
+            emit(self._drain_early(state))
+            if now - (state.get("emit_at") or 0.0) >= _PROGRESS_TICK_S:
+                emit(self._progress_tick(state, now))
+
+    def _drain_early(self, state: dict) -> Optional[dict]:
+        """Replay the messages that arrived before the prompt_id was known, through
+        the same gate as every other message. Returns the last view, if any."""
+        early = state.pop("early", None) if state.get("prompt_id") else None
+        view = None
+        for t, msg in early or []:
+            view = self._progress_apply(state, msg, t) or view
+        return view
 
     def _progress_apply(self, state: dict, msg: dict, now: float) -> Optional[dict]:
         """Fold one /ws message into `state`; return the view to report, or None to
         ignore the message. Pure apart from `state` — this is where every rule that
-        would fail SILENTLY lives, so it is unit-tested (`test_ws_progress.py`).
+        would fail SILENTLY lives, so it is unit-tested (`test_ws_progress.py`,
+        `test_node_profile.py`).
 
         The `prompt_id` gate is the important one: ComfyUI 0.30 broadcasts progress for
         EVERY prompt on the box to every listener, so without it a job would happily
@@ -4074,6 +4177,8 @@ class ComfyUIAdapter(BackendAdapter):
         if data.get("prompt_id") != state.get("prompt_id"):
             return None                             # another job on the same backend
         kind = msg.get("type")
+        run = state.setdefault("run", {})
+        state["msg_at"] = now
         if kind == "progress":
             val, mx = data.get("value"), data.get("max")
             if not (isinstance(val, (int, float)) and isinstance(mx, (int, float)) and mx > 0):
@@ -4087,7 +4192,8 @@ class ComfyUIAdapter(BackendAdapter):
             if node != state.get("node") or val < state.get("value", 0):
                 state.update({"first_at": now, "first_val": float(val)})
             state.update({"value": float(val), "max": float(mx), "node": node, "at": now})
-            return self._progress_view(state)
+            nodeprofile.note_steps(run, node, float(val), float(mx))
+            return self._progress_view(state, now)
         if kind == "progress_state":
             nodes = data.get("nodes") or {}
             if not nodes:
@@ -4095,27 +4201,72 @@ class ComfyUIAdapter(BackendAdapter):
             done = sum(1 for n in nodes.values()
                        if isinstance(n, dict) and n.get("state") == "finished")
             state.update({"nodes_done": done, "nodes_total": len(nodes), "at": now})
-            return self._progress_view(state)
+            return self._progress_view(state, now)
+        if nodeprofile.fold(run, kind, data, now):
+            if kind == "executing" and run.get("cur") != state.get("node"):
+                # the sampler counter belongs to the node that was counting — a node
+                # that follows it must not keep showing "35/35"
+                for k in ("value", "max", "node", "first_at", "first_val"):
+                    state.pop(k, None)
+            return self._progress_view(state, now) if state.get("profile") else None
         return None
 
-    def _progress_view(self, state: dict) -> dict:
+    def _progress_tick(self, state: dict, now: float) -> Optional[dict]:
+        """The clock-driven re-computation between messages: only a profile view
+        changes with time alone, and only while a node is running."""
+        if state.get("profile") and (state.get("run") or {}).get("cur"):
+            return self._progress_view(state, now)
+        return None
+
+    def _progress_view(self, state: dict, now: Optional[float] = None) -> dict:
         """The public shape of live progress: fraction + an ETA derived from the
         MEASURED seconds per step of THIS run — far better than a median over past
-        jobs, which cannot know that this one is a 1536² render on a busy box."""
+        jobs, which cannot know that this one is a 1536² render on a busy box.
+
+        With a node profile from earlier runs (nodeprofile) `fraction`/`eta_s` cover
+        the WHOLE workflow (`basis: "profile"`); the sampler's own counter stays in
+        `step`/`steps`/`step_fraction`/`node_eta_s`. The overall fraction never goes
+        backwards — a bar that jumps back reads as broken."""
+        now = state.get("at") if now is None else now
         val, mx = state.get("value"), state.get("max")
+        run = state.get("run") or {}
+        cur = run.get("cur") or state.get("node") or None
         out = {"basis": "live", "backend": self.backend.get("name"),
-               "node": state.get("node") or None,
+               "node": cur,
                "nodes_done": state.get("nodes_done"), "nodes_total": state.get("nodes_total"),
                "updated_ago_s": 0}
+        if now is not None and state.get("msg_at") is not None:
+            # seconds since the feed last SAID something: the clock tick re-emits the
+            # view every second, and a stalled node must still read as stalled
+            out["quiet_s"] = max(0, int(now - state["msg_at"]))
+        title = (state.get("titles") or {}).get(cur) if cur else None
+        if title:
+            out["node_title"] = title
+        step = None
         if isinstance(val, (int, float)) and isinstance(mx, (int, float)) and mx > 0:
             out.update({"step": int(val), "steps": int(mx),
                         "fraction": round(min(val / mx, 1.0), 3)})
+            out["step_fraction"] = out["fraction"]
             # Needs at least one step-to-step interval; before that there is no rate to
             # extrapolate from and NO eta is far better than a wrong one.
             first_at, first_val, t0 = state.get("first_at"), state.get("first_val"), state.get("at")
             if first_at and t0 and val > (first_val or 0):
                 per_step = (t0 - first_at) / (val - first_val)
                 out["eta_s"] = max(0, int(per_step * (mx - val)))
+                out["node_eta_s"] = out["eta_s"]
+            step = (state.get("node") or "", float(val), float(mx), out.get("node_eta_s"))
+        prof = state.get("profile")
+        if prof and now is not None:
+            ov = nodeprofile.overall(prof, run, state.get("plan") or [], now, step)
+            if ov is not None:
+                best = max(ov["fraction"], state.get("best_fraction") or 0.0)
+                state["best_fraction"] = best
+                out.update({"basis": "profile", "fraction": best,
+                            "expected_s": ov["expected_s"], "profile_runs": prof.get("runs"),
+                            "profile_foreign": bool(prof.get("foreign"))})
+                out.pop("eta_s", None)          # a node's ETA is not the job's
+                if ov.get("eta_s") is not None:
+                    out["eta_s"] = ov["eta_s"]
         return out
 
     async def _poll(self, client, url, prompt_id, poll_interval, max_wait) -> dict:

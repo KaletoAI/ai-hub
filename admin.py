@@ -9481,7 +9481,9 @@ def _job_status_text(j: dict) -> str:
     txt = st
     if st == "running":
         live = _job_progress(j.get("id") or "") or {}
-        if live.get("step") is not None and live.get("steps"):
+        if live.get("basis") == "profile" and live.get("fraction") is not None:
+            txt += f" {min(99, int(live['fraction'] * 100))}%"     # whole workflow
+        elif live.get("step") is not None and live.get("steps"):
             txt += f" {live['step']}/{live['steps']}"
     return txt
 
@@ -9946,6 +9948,34 @@ def _runpod_table(m: dict) -> str:
     return f"<h3>RunPod</h3><table>{body}</table>"
 
 
+def _node_times_table(m: dict) -> str:
+    """Where a ComfyUI run's time went: seconds and share per node, in execution
+    order — the record (`meta.node_times`, nodeprofile.record) the next run of the
+    alias reads its whole-workflow progress against. '' without one."""
+    rec = m.get("node_times")
+    if not isinstance(rec, dict) or not rec.get("nodes"):
+        return ""
+    total = float(rec.get("total_s") or 0) or sum(float(n.get("s") or 0) for n in rec["nodes"]) or 1.0
+    rows = []
+    for n in rec["nodes"]:
+        sec = float(n.get("s") or 0)
+        pct = min(100.0, sec * 100.0 / total)
+        steps = f" <span class='muted'>· {int(n['steps'])} steps</span>" if n.get("steps") else ""
+        rows.append(
+            f"<tr><td>{_esc(n.get('title') or n.get('id'))} <span class='muted'>#{_esc(n.get('id'))}</span>{steps}</td>"
+            f"<td style='text-align:right;white-space:nowrap'>{_dur(sec * 1000)}</td>"
+            f"<td style='width:160px'><div style='height:6px;background:#232a35;border-radius:3px;overflow:hidden'>"
+            f"<div style='height:6px;width:{pct:.1f}%;background:#6cb0ef'></div></div></td>"
+            f"<td class='muted' style='text-align:right'>{pct:.0f}%</td></tr>")
+    foot = [f"total {_dur(total * 1000)}"]
+    if rec.get("cached"):
+        foot.append(f"{len(rec['cached'])} node(s) served from ComfyUI's cache")
+    if isinstance(rec.get("wait_s"), (int, float)) and rec["wait_s"] >= 1:
+        foot.append(f"{_dur(rec['wait_s'] * 1000)} before the first node ran")
+    return (f"<h3>Time per node</h3><table>{''.join(rows)}</table>"
+            f"<p class='muted' style='margin:4px 0 0'>{' · '.join(foot)}</p>")
+
+
 def _cloud_table(title: str, m: dict) -> str:
     """One cloud run (Meshy, Tripo) in the job view: the body actually sent (image data
     replaced by its size) plus the task id — the id is what the vendor's own dashboard is
@@ -10139,21 +10169,37 @@ async def job_detail_page(job_id: str, request: Request):
             pct = min(100, int(live["fraction"] * 100))
             eta = (f" · ~{_dur(live['eta_s'] * 1000)} left"
                    if live.get("eta_s") is not None else "")
-            node = f" · node {_esc(live['node'])}" if live.get("node") else ""
-            nodes = (f" · {live['nodes_done']}/{live['nodes_total']} nodes"
-                     if live.get("nodes_total") else "")
+            name = (f"{_esc(live['node_title'])} <span class='muted'>#{_esc(live['node'])}</span>"
+                    if live.get("node_title") and live.get("node")
+                    else (f"node {_esc(live['node'])}" if live.get("node") else ""))
+            counter = (f" {live['step']}/{live['steps']}"
+                       if live.get("step") is not None and live.get("steps") else "")
+            if live.get("basis") == "profile":
+                # whole workflow, read against the node times of earlier runs; the
+                # running node (and its sampler counter) is the detail line
+                runs = live.get("profile_runs") or 0
+                src = ("other backends" if live.get("profile_foreign") else "this backend")
+                text = (f"{pct}% of the workflow{eta}"
+                        f"<br><span style='font-size:12px'>{name}{counter}"
+                        f" · based on {runs} earlier run{'s' if runs != 1 else ''} on {src}</span>")
+            else:
+                nodes = (f" · {live['nodes_done']}/{live['nodes_total']} nodes"
+                         if live.get("nodes_total") else "")
+                text = (f"step {live.get('step')}/{live.get('steps')} ({pct}%){eta}"
+                        f"{' · ' + name if name else ''}{nodes}")
             outbox += (
                 f"<div style='max-width:520px;margin:6px 0 2px'>"
                 f"<div style='height:8px;background:#232a35;border-radius:4px;overflow:hidden'>"
                 f"<div style='height:8px;width:{pct}%;background:#6cb0ef'></div></div>"
-                f"<p class='muted' style='margin:4px 0 0'>step {live.get('step')}/"
-                f"{live.get('steps')} ({pct}%){eta}{node}{nodes}</p></div>")
+                f"<p class='muted' style='margin:4px 0 0'>{text}</p></div>")
     elif st == "failed":
         outbox = f"<p class='bad'>✗ failed</p><pre class='err'>{_esc(job.get('error'))}</pre>"
     elif job.get("results"):
         outbox = _job_thumbs(job_id, "result", job["results"])
     else:
         outbox = "<p class='muted'>No artifacts.</p>"
+    if st not in ("queued", "running"):
+        outbox += _node_times_table(meta)
     exp = " · <span class='bad'>expired</span>" if job.get("expired") else ""
     cost = _job_cost_text(meta, job.get("alias") or "", st)
     cost_html = (f" <span class='muted' style='font-weight:normal;font-size:14px'>· {_esc(cost)}</span>"

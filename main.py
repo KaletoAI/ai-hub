@@ -37,6 +37,7 @@ import mediaprice
 import reasoning
 import scheduler
 import netscan
+import nodeprofile
 import os
 import socket
 import stats
@@ -349,6 +350,18 @@ def _note_gen_speed(alias: str, bid: str, seconds: float) -> None:
         return
     k = f"{alias}|{bid}"
     gen_speed[k] = scheduler.ema(gen_speed.get(k), seconds)
+
+
+def _gen_profile(alias: str, backend: str) -> Optional[dict]:
+    """Adapter hook (`AdapterContext.gen_profile`, called in a worker thread once per
+    ComfyUI run): the alias's per-node timing profile from its recent done jobs ON THIS
+    backend — or, when this backend has none yet, from the alias's other backends,
+    flagged `foreign` (node shares only: another GPU's seconds are no ETA here)."""
+    recs = jobs.node_time_records(alias, backend, nodeprofile.MAX_RECORDS)
+    if recs:
+        return nodeprofile.build(recs)
+    recs = jobs.node_time_records(alias, None, nodeprofile.MAX_RECORDS)
+    return nodeprofile.build(recs, foreign=True) if recs else None
 
 
 def _settle_exec_faults(alias: str, ok_bid: str, exec_faults: list) -> None:
@@ -2592,6 +2605,7 @@ adapter_ctx = AdapterContext(
     record_call=stats.record_call,
     note_speed=_note_speed,
     note_progress=_note_progress,
+    gen_profile=_gen_profile,
     log_enabled=lambda: log_per_call,
     active_register=_active_register,
     active_done=_active_done,
@@ -3977,13 +3991,22 @@ async def _job_view(job_id: str, request: Request) -> dict:
             live = gen_progress.get(job_id)
             if live and live.get("fraction") is not None:
                 view["progress"] = round(min(live["fraction"], 0.99), 2)
-                view["progress_basis"] = "live"
-                view["progress_step"] = f"{live.get('step')}/{live.get('steps')}"
+                # "profile": progress/eta_s cover the WHOLE workflow, read against the
+                # node timings recorded in earlier runs (nodeprofile); "live": the
+                # sampler's own counter only (no recorded run yet).
+                view["progress_basis"] = live.get("basis") or "live"
+                if live.get("step") is not None and live.get("steps"):
+                    view["progress_step"] = f"{live.get('step')}/{live.get('steps')}"
                 if live.get("node"):
                     view["progress_node"] = live["node"]
+                if live.get("node_title"):
+                    view["progress_node_title"] = live["node_title"]
                 if live.get("eta_s") is not None:
                     view["eta_s"] = live["eta_s"]
-                view["progress_age_s"] = max(0, int(time.time() - (live.get("at") or 0)))
+                # age of the last real feed MESSAGE (quiet_s), not of the last
+                # clock-driven recomputation — a hung node must show as stale
+                view["progress_age_s"] = max(0, int(time.time() - (live.get("at") or 0))
+                                             + int(live.get("quiet_s") or 0))
                 return view
             med = (await asyncio.to_thread(jobs.median_duration, job["alias"], job["backend"])
                    or await asyncio.to_thread(jobs.median_duration, job["alias"]))
