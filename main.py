@@ -3721,7 +3721,7 @@ def generation_candidate(model: str) -> Optional[dict]:
 
 
 def _gen_routes(alias: str, gated: Optional[list] = None,
-                admitted: Optional[float] = None) -> tuple[list, list]:
+                admitted: Optional[float] = None, force: str = "") -> tuple[list, list]:
     """(ready, all) (backend, candidate) pairs for a generation alias, each ordered
     **unpaid before paid, then fastest first** (`gen_speed` EMA per alias+backend; an
     unmeasured backend sorts first, probe-once) and filtered to enabled + healthy
@@ -3738,6 +3738,12 @@ def _gen_routes(alias: str, gated: Optional[list] = None,
     managed host's ComfyUI) leaves BOTH lists: such an alias then 503s at once naming
     the sync instead of parking for hours behind it. `gated`, when given, collects
     (backend name, reason) of every such candidate — the 503's text.
+
+    A force pin (`force`, a backend NAME) filters BEFORE the per-alias `retries` cap:
+    the cap keeps the first 1+retries candidates by speed, and a pinned backend that
+    measured slower fell out of it — `retries: "0"` + a pin to the slower box then
+    503'd "no healthy backend … on backend X" with X healthy and free (2026-11-12,
+    MiniMax-H3-Image pinned to rtx-3090 after one slow run). Pinned, the cap is moot.
 
     A backend being switched off (`_power_draining`) is skipped like a drained one —
     except for a job `admitted` (time.monotonic() of its request) BEFORE the switch-off
@@ -3782,6 +3788,7 @@ def _gen_routes(alias: str, gated: Optional[list] = None,
                 gated.append((b.get("name"), why))
             continue
         allc.append((b, cand))
+    allc = _force_filter(allc, force)
     allc = scheduler.order_ready(allc, _gen_speed_of(alias), lambda b: bool(b.get("paid")))
     # A candidate under execution-fault quarantine drops out of `ready` but stays at the
     # END of `allc`. Both halves matter: out of `ready` so it is never CHOSEN while a
@@ -3837,10 +3844,12 @@ def _entry_can_use(entry: dict, backend: dict, memo: Optional[dict] = None) -> b
     memo = {} if memo is None else memo
     # keyed on the power switch-offs this waiter is old enough to keep using too: two
     # waiters of one alias may see a backend being switched off differently
-    mkey = (entry["alias"], _power_keeps(entry.get("admitted")))
+    # and on the pin: it filters before the retries cap, so a pinned waiter's list differs
+    mkey = (entry["alias"], _power_keeps(entry.get("admitted")), entry.get("force") or "")
     ids = memo.get(mkey)
     if ids is None:
-        ready, _allc = _gen_routes(entry["alias"], admitted=entry.get("admitted"))
+        ready, _allc = _gen_routes(entry["alias"], admitted=entry.get("admitted"),
+                                   force=entry.get("force") or "")
         ids = memo[mkey] = {backend_id(b) for b, _cand in ready}
     return backend_id(backend) in ids
 
@@ -4848,8 +4857,7 @@ async def _run_gen_parked(job_id, alias, force, build_req, eligible: Optional[se
         while True:
             _gen_wait_ping()                     # this job is waiting → keep the fast probe awake
             ready, allc = await asyncio.to_thread(_gen_routes, alias, None,
-                                                  entry["admitted"])   # fresh health/busy per poll
-            ready, allc = _force_filter(ready, force), _force_filter(allc, force)
+                                                  entry["admitted"], force)   # fresh health/busy per poll
             if eligible is not None:
                 ready = [r for r in ready if r[0].get("name") in eligible]
                 allc = [r for r in allc if r[0].get("name") in eligible]
@@ -4961,8 +4969,7 @@ async def _gen_pick(alias: str, force: str, body: dict) -> tuple[list, bool, Opt
     force-pin filter, LoRA eligibility, ready/busy split. Returns
     (routes, parked, eligible_names); raises 503 when nothing is eligible."""
     gated: list = []
-    ready, allc = await asyncio.to_thread(_gen_routes, alias, gated)
-    ready, allc = _force_filter(ready, force), _force_filter(allc, force)
+    ready, allc = await asyncio.to_thread(_gen_routes, alias, gated, None, force)
     if not allc:
         raise _gen_no_route_error(alias, gated, force)
     eligible = None if force else _lora_eligible_names(allc, body)   # a pin is never overridden
@@ -6626,10 +6633,11 @@ def power_waiting_jobs(bid: str, pool: Optional[list] = None) -> int:
             continue
         if e.get("eligible") is not None and b["name"] not in e["eligible"]:
             continue
-        ids = memo.get(e["alias"])
-        if ids is None:                      # every adm < t0 keeps `bid`: one read per alias
-            _ready, allc = _gen_routes(e["alias"], admitted=adm)
-            ids = memo[e["alias"]] = {backend_id(x) for x, _c in allc}
+        mkey = (e["alias"], e.get("force") or "")   # a pin filters before the retries cap
+        ids = memo.get(mkey)
+        if ids is None:                      # every adm < t0 keeps `bid`: one read per alias+pin
+            _ready, allc = _gen_routes(e["alias"], admitted=adm, force=e.get("force") or "")
+            ids = memo[mkey] = {backend_id(x) for x, _c in allc}
         if bid in ids:
             n += 1
     return n

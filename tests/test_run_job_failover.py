@@ -693,7 +693,7 @@ class DesignationReadsTheStoreOncePerAlias(unittest.TestCase):
         calls = []
         backs = [{"name": f"g{i}", "type": "comfyui"} for i in range(4)]
 
-        def routes(alias, gated=None, admitted=None):
+        def routes(alias, gated=None, admitted=None, force=""):
             calls.append(alias)
             return [(b, {}) for b in backs], [(b, {}) for b in backs]
         orig, saved = main._gen_routes, main._gen_waiting[:]

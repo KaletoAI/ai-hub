@@ -3068,6 +3068,13 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   LoRA-backend rather than spilling); a LoRA on no backend is ignored (the normal
   ordering wins); an explicit `backend` force is never overridden. Per-backend LoRA sets
   come from discovery (`backend_loras`).
+- **Force pin before the `retries` cap**: an alias's `retries` caps its candidates to
+  1+retries, fastest first. `_gen_routes(…, force=)` drops every candidate but the pinned
+  backend BEFORE that cap — applied after it (as it was), `retries: "0"` left only the
+  fastest backend, and a pin to a slower one 503'd "No healthy backend … on backend X"
+  with X healthy and idle (2026-11-12, MiniMax-H3-Image pinned to rtx-3090 after one
+  slow run). `_gen_pick`, the park loop, `_entry_can_use` (memo keyed alias + keeps +
+  pin) and the power-switch-off waiter count all pass the pin in. `test_gen_pin_retries.py`.
 - **Model-sync gate** (managed hosts): `main.modelsync_gate(backend, alias)` inside
   `_gen_routes` — a `comfyui` backend attached to a managed host (backend → `host` →
   controller → service, R-W7; by backend NAME the lookup finds nothing) whose
@@ -4033,6 +4040,9 @@ back as a plausible "value not in list". Pins leaving `ready` AND `allc`, other
 backends untouched, a force pin not bypassing it, `_entry_can_use` following, the
 lookup through the backend's `host`, and the 503
 carrying the sync progress or the block reason instead of "no healthy backend");
+`test_gen_pin_retries.py` (a force pin survives `retries: "0"`: pinned to the slower
+of two measured backends it routes, parks when that one is busy, and the waiter
+designation agrees — the unpinned cap stays);
 `test_modelsrc_serve.py` (the forced command on the share host, run by subprocess
 against a tmp share: a path escaping the share hands out /etc as model bytes,
 `hf-cache/token` leaks the HF credential, a `;id` that reaches a shell is remote code
