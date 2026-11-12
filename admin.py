@@ -36,6 +36,7 @@ import cloudtask
 import hostapi
 import jobs
 import model_kinds
+import power
 import scheduler
 import reasoning
 import rpvolume
@@ -156,6 +157,15 @@ _restart_comfy = None
 _runpod_probe = None
 _runpod_object_info: Callable[[str], Optional[dict]] = lambda name: None
 _set_backend_enabled = None
+# Backend power control (main.power_*; power.py): the row's buttons (async (bid, action)
+# → message; off | on | status | cancel), the form's key/pin block (bid → dict | None,
+# no network), and its three actions (async keygen / scan → message, pin (bid, fp) →
+# message). Every one of them is a POST.
+_power_action: Callable = None
+_power_setup: Callable[[str], Optional[dict]] = lambda bid: None
+_power_keygen: Callable = None
+_power_scan: Callable = None
+_power_pin: Callable = None
 _apply_backends: Callable[[], None] = lambda: None
 _llm_backends: Callable[[], list] = lambda: []
 # Price summary of a catalog id (main.price_info: per field [lo, hi] USD per 1M tokens +
@@ -430,6 +440,13 @@ tr.sel td{background:var(--sel)}
 .item-sub{color:var(--muted);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .item-acts{white-space:nowrap;flex:none}
 .item-acts .btn{margin:0 0 0 6px}
+/* backend power control: the line under a backend row (state, message, buttons) */
+.pwr{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;margin-top:4px;font-size:12px;color:var(--dim)}
+.pwr .btn{margin:0}
+.pwrsafe{background:#16361f;color:var(--ok);font-weight:700;font-size:13px;padding:3px 10px;border-radius:6px}
+.pwrhung{background:#3a1b1b;color:var(--bad);font-weight:700;font-size:13px;padding:3px 10px;border-radius:6px}
+details.optblock pre.tlog{white-space:pre-wrap;word-break:break-all;background:var(--input);border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin:6px 0;font:12px/1.45 ui-monospace,monospace}
+details.optblock .tacts{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 4px}
 .badge{font-size:11px;font-weight:500;padding:1px 7px;border-radius:10px;margin-left:7px;white-space:nowrap}
 .badge.ok{background:#16361f;color:var(--ok)}.badge.bad{background:#3a1b1b;color:var(--bad)}.badge.muted{background:#23262d;color:var(--dim-2)}
 .badge.warn{background:#3a2f12;color:var(--warn)}
@@ -1015,6 +1032,10 @@ def _field(label: str, control: str, short: bool = False, wide: bool = False,
 _POST_ACTIONS = frozenset((
     "/ui/backends/delete", "/ui/backends/drain", "/ui/backends/undrain",
     "/ui/backends/restart", "/ui/backends/enable", "/ui/backends/runpod-probe",
+    # backend power control: the row's buttons (do=off|on|status|cancel), the form's
+    # key generation and host-key pin
+    "/ui/backends/power", "/ui/backends/power-key", "/ui/backends/power-scan",
+    "/ui/backends/power-pin",
     "/ui/volumes/save", "/ui/volumes/sync", "/ui/volumes/delete-unknown", "/ui/volumes/delete",
     # managed hosts (Ruling M1: one prefix, the host as field `host`, a service as `bid`)
     "/ui/hosts/managed/save", "/ui/hosts/managed/delete",
@@ -1163,12 +1184,13 @@ def _checkbox(name: str, checked: bool, label: str, title: str = "") -> str:
             f'{_esc(label)}</label>')
 
 
-def _item(title: str, sub: str, acts: str, sel: bool = False) -> str:
+def _item(title: str, sub: str, acts: str, sel: bool = False, extra: str = "") -> str:
     """A compact two-line list item: bold title (may contain a badge) + a muted,
-    single-line truncated sub line, with right-aligned actions."""
+    single-line truncated sub line, with right-aligned actions. `extra` is raw HTML
+    (the caller escapes its own text) under the sub line — the power control's line."""
     return (f'<div class="item{" sel" if sel else ""}"><div class="item-main">'
             f'<div class="item-title">{title}</div>'
-            f'<div class="item-sub" title="{_esc(sub)}">{_esc(sub)}</div></div>'
+            f'<div class="item-sub" title="{_esc(sub)}">{_esc(sub)}</div>{extra}</div>'
             f'<div class="item-acts">{acts}</div></div>')
 
 
@@ -1212,7 +1234,81 @@ def _down_badge(err: Optional[dict]) -> str:
     return _badge(label, "bad", " · ".join(p for p in parts if p))
 
 
-_MODELVIEWER_SRC = "/ui/static/model-viewer.min.js"   # bundled locally (no CDN); served by static_asset
+# Backend power control: the row's state chip per power state (label, badge kind).
+_POWER_BADGE = {
+    power.ON: ("power on", "ok"),
+    power.DRAINING: ("⏳ switching off — draining", "warn"),
+    power.SWITCHING_OFF: ("⏳ switching off", "warn"),
+    power.OFF: ("off", "ok"),
+    power.BUSY: ("✋ not switched off — busy", "warn"),
+    power.HUNG: ("⚠ hotplug hung", "bad"),
+    power.ERROR: ("⚠ power error", "bad"),
+    power.SWITCHING_ON: ("⏳ switching on", "warn"),
+    power.STARTING: ("⏳ starting", "warn"),
+    power.UNREACHABLE: ("⇥ host unreachable", "muted"),
+}
+
+
+def _power_line(b: dict) -> str:
+    """The power control's line under a backend row ("" without power control): state
+    chip, the big "Safe to switch off now" / "Do NOT switch off", the drain's count, the
+    last message and status summary, and the buttons the state allows — every one a
+    POST (`/ui/backends/power?do=…`). Keyed (`data-k`) for the live morph."""
+    pw = b.get("power")
+    if not isinstance(pw, dict):
+        return ""
+    bid = _bid(b)
+    st = str(pw.get("state") or power.ON)
+    running = str(pw.get("running") or "")
+    label, kind = _POWER_BADGE.get(st, (st, "muted"))
+    parts = [f'<span class="badge {kind}" style="margin-left:0">{_esc(label)}</span>']
+    if st == power.OFF:
+        parts.append('<span class="pwrsafe" role="status">✓ Safe to switch off now</span>')
+    elif st == power.HUNG:
+        parts.append('<span class="pwrhung" role="alert">⚠ Do NOT switch off — the host '
+                     'needs a reboot</span>')
+    if st == power.DRAINING:
+        n = int(pw.get("waiting") or 0)
+        parts.append(f"<span>waiting for {n} job{'' if n == 1 else 's'} "
+                     f"({int(pw.get('inflight') or 0)} running, "
+                     f"{int(pw.get('jobs') or 0)} queued)</span>")
+    elif pw.get("message"):
+        parts.append(f"<span>{_esc(str(pw['message'])[:300])}</span>")
+    if running == "status":
+        parts.append("<span>checking status…</span>")
+    if pw.get("summary"):
+        when = (f" ({_age(int(pw['checked']))} ago)" if pw.get("checked") else "")
+        parts.append(f'<span class="muted">{_esc(pw["summary"])}{_esc(when)}</span>')
+    ready = str(pw.get("ready") or "")
+    href = lambda do: f"/ui/backends/power?id={_q(bid)}&do={do}"
+    btns = ""
+    if st == power.DRAINING:
+        btns += _btn("Cancel", href("cancel"), "secondary", sm=True,
+                     title="Abort the switch-off — the backend goes back into rotation")
+    elif not running and st not in power.RUNNING:
+        if ready:
+            parts.append(f'<span class="warn">{_esc(ready)}</span>')
+        else:
+            if st in power.OFF_FROM:
+                btns += _btn("Switch off", href("off"), "secondary", sm=True,
+                             title="Drain, then run the host's off script — it says when "
+                                   "the power may be cut",
+                             confirm=f"Switch {b['name']} off? New jobs that could only run "
+                                     "there are refused from now on; running and already "
+                                     "queued work finishes first. Cut the power only when "
+                                     "the console says so.")
+            if st in power.ON_FROM:
+                btns += _btn("Switched on again", href("on"), sm=True,
+                             title="The device is powered on: run the host's on script and "
+                                   "bring the backend back",
+                             confirm=f"Is {b['name']}'s device powered on and connected? The "
+                                     "host script attaches it and starts its service.")
+            btns += _btn("Check status", href("status"), "secondary", sm=True,
+                         title="Run the host script's read-only status (never automatic)")
+    return (f'<div class="pwr" data-k="pwr-{_esc(bid)}">{"".join(parts)}{btns}</div>')
+
+
+_MODELVIEWER_SRC ="/ui/static/model-viewer.min.js"   # bundled locally (no CDN); served by static_asset
 
 
 def _dl_card(src: str, label: str = "download", *, dl: str = " download",
@@ -1973,6 +2069,83 @@ _MHOST_JS = ("var f=this.form,on=!!this.value;"
              "if(f.url){f.url.readOnly=on}")
 
 
+def _power_section(src: dict, oid: str) -> str:
+    """The backend form's "Power control" block (power.py): the three fields — rendered
+    for every type, inside the form — and, for a SAVED backend with `power_ssh`, its
+    key, the authorized_keys line to install on the host (copy button) and the host-key
+    pin (Fetch → compare → Confirm). The buttons are POSTs on the page's action form
+    (`form=gw-act`), never a submit of this form. Never generates or connects."""
+    g = lambda k: str(src.get(k) if src.get(k) is not None else "")
+    out = ('<details class="optblock"' + (" open" if g("power_ssh") else "") + ">"
+           "<summary>Power control <span class='muted'>— switch the device off and on "
+           "safely (host script over ssh)</span></summary>"
+           + _field("power ssh", _inp("power_ssh", g("power_ssh"), placeholder="root@gpu-host"),
+                    hint="<code>user@host</code> the gateway runs the host script as. Blank = "
+                         "no power control for this backend.")
+           + _field("power ssh port", _inp("power_ssh_port", g("power_ssh_port"),
+                                           placeholder="22", typ="number"))
+           + _field("power script", _inp("power_script", g("power_script"),
+                                         placeholder="/usr/local/sbin/egpu-power"),
+                    hint="The script's path on that host — only used to show the "
+                         "<code>authorized_keys</code> line below; the gateway never sends it.")
+           + "<p class='hint'>The gateway sends only <code>status --json</code>, "
+             "<code>off --stop-ct --json</code> and <code>on --start-ct --json</code> — the "
+             "host's <code>authorized_keys</code> forces its script on the key, so the key can "
+             "run nothing else. <b>Switch off</b> drains the backend (new jobs that could only "
+             "run here are refused, running and already queued ones finish), disables it and "
+             "runs <code>off</code>; the row says when the power may be cut. Contract: "
+             "README → Backend power control.</p>")
+    st = _power_setup(oid) if oid else None
+    if not st:
+        hint = ("Save with <b>power ssh</b> set — the key and the host-key pin appear here "
+                "afterwards." if not oid or not g("power_ssh") else
+                "Save first — the key and the host-key pin follow the saved settings.")
+        return out + f"<p class='hint'>{hint}</p></details>"
+    bq = _q(oid)
+    pub = str(st.get("public_key") or "")
+    line = str(st.get("line") or "")
+    rows = []
+    if pub:
+        rows.append(f"<p class='hint'>Public key (<code>{_esc(st.get('key_file'))}</code>):</p>"
+                    f'<pre class="tlog">{_esc(pub)}</pre>')
+        if line:
+            rows.append("<p class='hint'>Append this ONE line to the <code>authorized_keys</code> "
+                        f"of <code>{_esc(st.get('target'))}</code> on the host:</p>"
+                        f'<pre class="tlog">{_esc(line)}</pre>'
+                        "<button type='button' class='btn secondary sm' "
+                        f'data-copy="{_esc(line)}">Copy line</button>')
+        else:
+            rows.append("<p class='hint'>Set <b>power script</b> to see the "
+                        "<code>authorized_keys</code> line.</p>")
+    elif st.get("generating"):
+        rows.append("<p class='hint'>Generating the key… reload in a moment.</p>")
+    else:
+        rows.append("<p class='hint'>No key yet.</p>"
+                    + _btn("Generate key", f"/ui/backends/power-key?id={bq}", "secondary",
+                           sm=True, title="Create this backend's ed25519 key (once)"))
+    if st.get("pinned_fp"):
+        rows.append(f"<p class='hint'>Host key <code>{_esc(st['pinned_fp'])}</code> pinned.</p>")
+    elif st.get("pin_stale"):
+        rows.append(f"<p class='bad'>The host key is pinned for <code>{_esc(st['pin_stale'])}"
+                    "</code>, not this host — fetch and confirm it again.</p>")
+    else:
+        rows.append("<p class='hint'>No host key pinned yet — actions are refused until it "
+                    "is.</p>")
+    acts = _btn("Fetch host key", f"/ui/backends/power-scan?id={bq}", "secondary", sm=True,
+                title="ssh-keyscan the host and show its fingerprint (nothing trusted yet)")
+    fp = str(st.get("scanned_fp") or "")
+    if fp:
+        rows.append(f"<p class='hint'>Fetched host key: <code>{_esc(fp)}</code> — compare it "
+                    "with <code>ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub</code> on the "
+                    "host before confirming.</p>")
+        acts += _btn("Confirm fingerprint", f"/ui/backends/power-pin?id={bq}&fp={_q(fp)}",
+                     sm=True, title="Trust this host key for the power control",
+                     confirm=f"Pin host key {fp}? Only if the host shows exactly this "
+                             "fingerprint.")
+    rows.append(f'<div class="tacts">{acts}</div>')
+    return out + "".join(rows) + "</details>"
+
+
 def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None,
                   orig_id: Optional[str] = None, err: str = "", raw: Optional[dict] = None) -> str:
     # A scan finding arrives as `prefill` (name/type/url; `local` ticked for an openai
@@ -2223,6 +2396,8 @@ def _backend_form(b: Optional[dict], hosts: list, prefill: Optional[dict] = None
                            "<p class='hint'>An Anthropic backend is a <b>verbatim</b> passthrough: "
                            "sampling defaults, the reasoning toggle and cache rewriting are deliberately "
                            "not applied to it — the client's own request reaches the API unchanged.</p>")
+            # rendered for EVERY type: a field not rendered is read as cleared on Save
+            + _power_section(src, oid)
             + "</div>"
 
             # ── <type> ────────────────────────────────────────────────────────────
@@ -2561,7 +2736,15 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
         badge += _filter_badge(b.get("models_filtered"))
         badge += _extras_badge(b.get("models_added"))
         acts_list = [("✎", f"/ui/backends?edit={quote(bid)}", "secondary", "Edit")]
-        if draining:
+        # While the power control owns the backend (an action runs, or its device is off
+        # or hung) the plain drain/enable buttons step aside: enabling a backend whose
+        # device is being detached would route work onto it (main refuses it too).
+        pw = b.get("power") if isinstance(b.get("power"), dict) else {}
+        pw_lock = bool(pw) and bool(pw.get("running") or pw.get("state") in power.RUNNING
+                                    or pw.get("state") in (power.OFF, power.HUNG))
+        if pw_lock and not draining:
+            pass
+        elif draining:
             acts_list.append(("↺", f"/ui/backends/undrain?id={quote(bid)}", "secondary",
                               "Cancel drain — put back in rotation"))
         elif b["enabled"]:
@@ -2638,7 +2821,8 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
             else:
                 rpi += " · not probed — node types and models unknown until ⚡ Probe"
         sub = f"{b['url']}{host} · {b['models']} models{ld}{flags}{smp}{fr}{qn}{cr}{rpi}{rst}{src}"
-        return _item(f"{_esc(b['name'])}{_type_badge(b['type'])}{badge}", sub, acts, sel=(bid == edit_id))
+        return _item(f"{_esc(b['name'])}{_type_badge(b['type'])}{badge}", sub, acts,
+                     sel=(bid == edit_id), extra=_power_line(b))
 
     # group by kind: LLM (openai-compatible) vs Media (every generation type — ComfyUI,
     # Meshy, Tripo, …), alphabetical within each
@@ -2722,8 +2906,15 @@ async def _backends_view(qp, detail: Optional[str] = None, status: int = 200,
     # in that phase); a ready volume's card has nothing that moves on its own
     vol_busy = any(v.get("phase") in ("syncing", "off") or v.get("transfers") or v.get("fetch_job")
                    for _n, v in vviews)
+    # a power action runs (or a backend is `starting`): its state changes on its own
+    power_busy = any(isinstance(b.get("power"), dict)
+                     and (b["power"].get("running")
+                          or b["power"].get("state") in power.RUNNING
+                          or b["power"].get("state") == power.STARTING)
+                     for b in binfo)
     live = 4 if draining_now else (2 if scan_st.get("running") else
-                                   (3 if (host_busy or probing or vol_busy) else None))
+                                   (3 if (host_busy or probing or vol_busy or power_busy)
+                                    else None))
     return HTMLResponse(_page("Backends", body, "backends", refresh=None if static else live),
                         status_code=status)
 
@@ -3338,6 +3529,35 @@ async def backend_save(request: Request):
     else:
         b.pop("auth_mode", None)
         b.pop("models", None)
+    # ── power control (power.py): rendered for EVERY type, so read for every type ──
+    # Blank `power ssh` = no power control. The port and the script are kept on their
+    # own (a script typed before the host is known is not thrown away).
+    pssh = (f.get("power_ssh", "") or "").strip()
+    pport_typed = (f.get("power_ssh_port", "") or "").strip()
+    pscript = (f.get("power_script", "") or "").strip()
+    if pssh:
+        b["power_ssh"] = pssh
+        if not power.target_ok(pssh):
+            problems.append(f"power ssh: '{pssh}' is not user@host (plain letters, digits, "
+                            ". _ -; the user is required)")
+    else:
+        b.pop("power_ssh", None)
+    pport, pport_err = _int_field(pport_typed, "power ssh port", "22", minimum=1)
+    if not pport_err and pport is not None and pport > 65535:
+        pport_err = f"power ssh port: '{pport_typed}' is not a port (1–65535)"
+    if pport_err:
+        problems.append(pport_err)
+    if pport is not None and not pport_err and pport != 22:
+        b["power_ssh_port"] = pport
+    else:
+        b.pop("power_ssh_port", None)            # blank/22 = the default
+    if pscript:
+        b["power_script"] = pscript
+        if not power.script_ok(pscript):
+            problems.append(f"power script: '{pscript}' must be an absolute path without "
+                            "spaces, quotes or '..' (it goes into the authorized_keys line)")
+    else:
+        b.pop("power_script", None)
     sd, sd_err = _parse_sampling_form(f)
     if sd_err:
         problems.append(sd_err)
@@ -3425,7 +3645,8 @@ async def _refuse_backend(msg: str, b: dict, f: dict, orig: str) -> HTMLResponse
                      ("poll_interval", "cloud_poll_interval" if cloud else
                       ("rp_poll_interval" if rp else "poll_interval")),
                      ("max_image_pixels", "max_image_pixels"),
-                     ("queue_max_s", "queue_max_s"), ("cost_per_hour", "cost_per_hour")):
+                     ("queue_max_s", "queue_max_s"), ("cost_per_hour", "cost_per_hour"),
+                     ("power_ssh_port", "power_ssh_port")):
         typed = (f.get(src, "") or "").strip()
         if typed:
             shown[key] = typed                  # the bad value too — the reason names it
@@ -3562,6 +3783,81 @@ async def backend_enable(request: Request):
     if _set_backend_enabled and bid:
         _set_backend_enabled(bid, True)
     return RedirectResponse("/ui/backends", status_code=303)
+
+
+# ── Backend power control (power.py): the row's buttons and the form's key/pin ──
+
+def _power_msg(msg: str, bid: str = "") -> RedirectResponse:
+    """A power action's answer → the Backends tab (the form again for the form's own
+    actions, `bid` set), the text as `msg`."""
+    edit = f"edit={_q(bid)}&" if bid else ""
+    return RedirectResponse(f"/ui/backends?{edit}msg=" + _q(str(msg)[:600]), status_code=303)
+
+
+async def backend_power(request: Request):
+    """Switch off / Switched on again / Check status / Cancel (`do`): runs in the
+    background; the row follows live, the answer comes back as the message."""
+    f = await _form(request)
+    bid = (f.get("id") or request.query_params.get("id", "") or "").strip()
+    do = (f.get("do") or request.query_params.get("do", "") or "").strip()
+    if _power_action is None or not bid:
+        msg = "power control is not available"
+    elif do not in ("off", "on", "status", "cancel"):
+        msg = "unknown power action"
+    else:
+        try:
+            msg = str(await _power_action(bid, do))
+        except Exception as e:                          # noqa: BLE001 — say it, don't 500
+            msg = f"power {do} failed: {type(e).__name__}: {e}"
+    logger.info(f"ui: power {do!r} on {bid!r} → {msg}")
+    return _power_msg(msg)
+
+
+async def backend_power_key(request: Request):
+    """Generate the backend's power key (idempotent) — an explicit POST, never a view."""
+    bid = (request.query_params.get("id", "") or "").strip()
+    if _power_keygen is None or not bid:
+        msg = "power control is not available"
+    else:
+        try:
+            msg = str(await _power_keygen(bid))
+        except Exception as e:                          # noqa: BLE001
+            msg = f"key not generated: {type(e).__name__}: {e}"
+    return _power_msg(msg, bid)
+
+
+async def backend_power_scan(request: Request):
+    """"Fetch host key": ssh-keyscan the power host; the fingerprint comes back as the
+    message and is kept in memory until Confirm."""
+    bid = (request.query_params.get("id", "") or "").strip()
+    if _power_scan is None or not bid:
+        msg = "power control is not available"
+    else:
+        try:
+            msg = str(await _power_scan(bid))
+        except Exception as e:                          # noqa: BLE001
+            msg = f"host key not fetched: {type(e).__name__}: {e}"
+    logger.info(f"ui: power host-key scan {bid!r} → {msg}")
+    return _power_msg(msg, bid)
+
+
+async def backend_power_pin(request: Request):
+    """"Confirm": pin the fetched key — only if it is still the one whose fingerprint
+    the button carried."""
+    f = await _form(request)
+    bid = (f.get("id") or request.query_params.get("id", "") or "").strip()
+    fp = (f.get("fp") or request.query_params.get("fp", "") or "").strip()
+    if _power_pin is None or not bid:
+        msg = "power control is not available"
+    elif not fp:
+        msg = "no fingerprint confirmed — nothing pinned"
+    else:
+        try:
+            msg = str(_power_pin(bid, fp))
+        except Exception as e:                          # noqa: BLE001
+            msg = f"host key not pinned: {type(e).__name__}: {e}"
+    logger.info(f"ui: power host-key pin {bid!r} → {msg}")
+    return _power_msg(msg, bid)
 
 
 # ── Managed hosts: form, lifecycle card with its service table, actions ─────────
@@ -12598,6 +12894,10 @@ def register(app) -> None:
     app.add_api_route("/ui/backends/restart", backend_restart, methods=["POST"])
     app.add_api_route("/ui/backends/runpod-probe", backend_runpod_probe, methods=["POST"])
     app.add_api_route("/ui/backends/enable", backend_enable, methods=["POST"])
+    app.add_api_route("/ui/backends/power", backend_power, methods=["POST"])
+    app.add_api_route("/ui/backends/power-key", backend_power_key, methods=["POST"])
+    app.add_api_route("/ui/backends/power-scan", backend_power_scan, methods=["POST"])
+    app.add_api_route("/ui/backends/power-pin", backend_power_pin, methods=["POST"])
     app.add_api_route("/ui/volumes/save", volume_save, methods=["POST"])
     app.add_api_route("/ui/volumes/sync", volume_sync, methods=["POST"])
     app.add_api_route("/ui/volumes/delete-unknown", volume_delete_unknown, methods=["POST"])

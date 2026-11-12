@@ -33,6 +33,7 @@ RSYNC_EXCLUDES=(
     --exclude='thunder.key'  --exclude='thunder.key.pub'  --exclude='thunder-known_hosts/'
     --exclude='thunder-ctl/'
     --exclude='modelsrc.key' --exclude='modelsrc.key.pub' --exclude='modelsrc-known_hosts'
+    --exclude='power-keys/'  --exclude='power-known_hosts/'
     --exclude='deploy.sh'
 )
 TAR_EXCLUDES=(
@@ -52,6 +53,7 @@ TAR_EXCLUDES=(
     --exclude='./thunder.key'  --exclude='./thunder.key.pub'  --exclude='./thunder-known_hosts'
     --exclude='./thunder-ctl'
     --exclude='./modelsrc.key' --exclude='./modelsrc.key.pub' --exclude='./modelsrc-known_hosts'
+    --exclude='./power-keys'  --exclude='./power-known_hosts'
     --exclude='./deploy.sh'
 )
 

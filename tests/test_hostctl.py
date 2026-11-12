@@ -4636,7 +4636,9 @@ class MainWiring(unittest.IsolatedAsyncioTestCase):
         # thunder-ctl: the ControlMaster sockets — a deploy's rsync --delete must not
         # pull the live socket out from under a running master
         names = ["thunder.key", "thunder.key.pub", "thunder-known_hosts", "thunder-ctl",
-                 "modelsrc.key", "modelsrc.key.pub", "modelsrc-known_hosts"]
+                 "modelsrc.key", "modelsrc.key.pub", "modelsrc-known_hosts",
+                 # backend power control: one key + one pinned host key per backend
+                 "power-keys", "power-known_hosts"]
         with open(os.path.join(root, ".gitignore")) as f:
             gi = {ln.strip().rstrip("/") for ln in f}
         with open(os.path.join(root, "deploy.sh")) as f:

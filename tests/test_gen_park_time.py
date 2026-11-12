@@ -14,7 +14,7 @@ class GenerationParkTime(unittest.TestCase):
         failures = []
         ran = []
 
-        def routes(alias):
+        def routes(alias, gated=None, admitted=None):
             return ([candidate] if clock[0] >= release_after else [], [candidate])
 
         async def sleep(seconds):

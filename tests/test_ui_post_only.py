@@ -64,7 +64,8 @@ _MUTATING_CALLBACKS = {"_cancel_generation", "_drain_backend", "_cancel_drain", 
                        "_save_modelsync_catalog", "_modelsrc_scan",
                        "_modelsrc_pin", "_modelsrc_list", "_save_modelsrc_host",
                        "_save_hf_token", "_save_provider_token",
-                       "_check_source", "_check_dir_source", "_remove_source"}
+                       "_check_source", "_check_dir_source", "_remove_source",
+                       "_power_action", "_power_keygen", "_power_scan", "_power_pin"}
 # Views that may write despite being a GET: none. (The Users page's reverse-DNS names
 # used to be persisted from the render; they now stay in memory until the operator
 # presses "Save resolved names", a POST.)

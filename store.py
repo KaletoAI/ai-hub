@@ -519,7 +519,8 @@ PROVIDER_TOKEN_PREFIX = "provider_token_"
 # only through get_setting() by their own accessor, never part of `get_settings()`:
 # every "all settings" reader (the Server tab, the startup overlay) would parse and hold
 # them for nothing.
-_BULK_SETTINGS = {"modelsrc_sha", "runpod_probe", "runpod_volumes", "runpod_volume_state"}
+_BULK_SETTINGS = {"modelsrc_sha", "runpod_probe", "runpod_volumes", "runpod_volume_state",
+                  "power_state"}
 
 
 def _is_secret(key: str) -> bool:
