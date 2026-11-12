@@ -1,0 +1,86 @@
+{
+  "1": {
+    "inputs": {
+      "model_file": "none",
+      "viewport_state": "",
+      "width": 1024,
+      "height": 1024
+    },
+    "class_type": "Load3DAdvanced",
+    "_meta": {
+      "title": "1 · Upload your static textured source GLB"
+    }
+  },
+  "3": {
+    "inputs": {
+      "source_glb": [
+        "1",
+        0
+      ],
+      "render_resolution": 768,
+      "yaw": 0.0,
+      "depth_window": 0.3
+    },
+    "class_type": "GLBFaceRegions",
+    "_meta": {
+      "title": "3 · GLB Face Regions (Locate Only)"
+    }
+  },
+  "4": {
+    "inputs": {
+      "model_3d": [
+        "3",
+        0
+      ],
+      "camera_info": [
+        "1",
+        2
+      ],
+      "viewport_state": "",
+      "width": 1024,
+      "height": 1024
+    },
+    "class_type": "Preview3DAdvanced",
+    "_meta": {
+      "title": "4 · Labelled GLB — native 3D viewer"
+    }
+  },
+  "5": {
+    "inputs": {
+      "images": [
+        "3",
+        1
+      ]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "5 · Region preview"
+    }
+  },
+  "6": {
+    "inputs": {
+      "mesh": [
+        "3",
+        0
+      ],
+      "filename_prefix": "3d/GLBFaceRegions"
+    },
+    "class_type": "SaveGLB",
+    "_meta": {
+      "title": "output_final"
+    }
+  },
+  "8": {
+    "inputs": {
+      "images": [
+        "3",
+        1
+      ],
+      "filename_prefix": "GLB-Face-Regions_Preview"
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "8 · Save diagnostic region preview PNG"
+    }
+  }
+}

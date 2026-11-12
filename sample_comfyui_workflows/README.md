@@ -170,6 +170,29 @@ Keine Geometrie- oder Facecount-Generierung.
 Konkreter Client-Ablauf und Installation:
 [Anima-Versa Face Retexture](../docs/anima-versa-face-retexture.md).
 
+#### GLB-Face-Regions — Original-GLB → GLB mit Gesichtsregionen pro Vertex
+
+`mesh-face-regions_api.json`, Task `mesh2mesh`, Alias `GLB-Face-Regions`
+(Backends `rtx-3090`, `rtx-4070`; dx10-02 erst nach ComfyUI-Neustart dort).
+Braucht Node **ComfyUI-GLB-Face-Retexture ≥ 1.6.0**. Kein Foto: MediaPipe-Landmarken
+auf dem Kopf-Render; etwa 2 s, CPU.
+
+| Request-Feld | Node | Feld | Default |
+|---|---|---|---|
+| `files.input_mesh_path` | 1 `Load3DAdvanced` | `model_file` | leer |
+| `params.render_resolution` | 3 `GLBFaceRegions` | `render_resolution` | 768 |
+| `params.yaw` | 3 | `yaw` | 0 |
+| `params.depth_window` | 3 | `depth_window` | 0.3 (Augenabstände) |
+
+Node 6 `SaveGLB` (`output_final`, Prefix `3d/GLBFaceRegions`) liefert die GLB,
+Node 8 die Vorschau (`output_globs: ["GLB-Face-Regions_Preview_*.png"]`, nur Diagnose).
+Die GLB ist die Quelle byte-gleich (Original-Binary als exakter Präfix) plus
+Vertex-Attribute `_FACE_REGION` (0 keine, 1/2 rechtes/linkes Auge mit Lidrand,
+3/4 rechte/linke Braue, 5 Lippen, 6 Nase; rechts = aus Sicht der Person) und
+`_FACE_DEPTH` (Abstand hinter der sichtbaren Oberfläche in Augenabständen) sowie
+`extras.glb_face_regions` (Legende, Augenabstand in Modelleinheiten, 12 Landmarken
+in Szenenkoordinaten). Eingang wie GLB-Face-Retexture: unriggtes Single-Primitive-GLB.
+
 #### Wan-LowRAM — Bild → Video
 
 `img2video_wan_lowram_api.json`, Task `img2vid`; der produktive Alias
