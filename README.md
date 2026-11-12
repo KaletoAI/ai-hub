@@ -2052,6 +2052,18 @@ ComfyUI's cache), so the first job after one frees.
   machine-readable source of truth — a client builds a valid request from it without
   out-of-band docs. `{alias}` may be a catalog id with slashes
   (`/v1/generations/wiro/google/nano-banana/schema`); `/loras` takes the same ids.
+- **Prompt length limit.** The schema carries
+  `prompt_limit: {"max_chars": 1500, "unit": "characters", "status": "known",
+  "candidates": [{"backend", "model", "max_chars"}]}` — the **strictest** limit over
+  every candidate the alias may run on (a failover onto the strictest one would refuse
+  the prompt too). `status` is `known` (every candidate states one), `partial` (some)
+  or `unknown` (`max_chars: null`). Every media entry of `/v1/models` (and
+  `GET /v1/models/{id}`) carries the same number as **`prompt_max_chars`** (`null` =
+  unknown). Today only Venice states a limit (its catalog's `promptCharacterLimit` /
+  `prompt_character_limit`); ComfyUI workflows and the other vendors are `null`. The
+  gateway never shortens a prompt: a longer one is refused with `400` before any job
+  exists, naming both numbers (`Venice prompt is too long: 1551 characters, the model
+  allows at most 1500`) — the client shortens.
 
 **Playground.** In the console's **Media** playground a mesh parameter takes a real
 file (glb/gltf/obj/fbx/stl/ply — sent as `files`) or, as before, a path that already
@@ -3061,7 +3073,7 @@ The gateway therefore keeps a **voice reference library** (Playground → Voice)
 | Method | Path | Notes |
 |---|---|---|
 | `POST` | `/v1/generations` | run a generation alias (sync or `mode:"async"`); per-field reference images via `images: {param: base64\|URL}`, other file inputs (meshes) via `files: {param: base64\|URL}` |
-| `GET` | `/v1/generations/{alias}/schema` | alias self-description: `params`, `images`, `files` (mesh uploads), LoRA/fps info |
+| `GET` | `/v1/generations/{alias}/schema` | alias self-description: `params`, `images`, `files` (mesh uploads), LoRA/fps info, `prompt_limit` |
 | `GET` | `/v1/generations/{alias}/loras` | LoRAs valid for an alias (+ trigger words) |
 | `GET` | `/v1/generations/{alias}/loras/{name}` | One LoRA's trigger words + status |
 | `GET` | `/v1/jobs/{id}` | job status + results |

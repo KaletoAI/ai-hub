@@ -2637,6 +2637,16 @@ def slot_empty_mode(m: dict) -> str:
     return "required" if (m or {}).get("no_placeholder") else "placeholder"
 
 
+def prompt_max_chars(cand: dict) -> Optional[int]:
+    """The prompt character limit a candidate's backend enforces, None = unknown. Only a
+    cloud kind whose catalog states one implements `<kind>.prompt_max_chars` (Venice);
+    a ComfyUI workflow and every other vendor answer None — never a guess. Cheap (no
+    workflow read): `/v1/models` asks it for every media id."""
+    k = cloud_kind(cand)
+    fn = getattr(cloud_module(k), "prompt_max_chars", None) if k else None
+    return fn(cand) if fn else None
+
+
 def public_fields(cand: dict) -> tuple[list, list, list]:
     """The public request fields of a generation alias candidate — what the schema
     endpoint advertises, the playground renders and the OpenAI shims map reference

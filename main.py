@@ -3113,10 +3113,15 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
     # Media from-prices: one worker thread for all of them (store reads), never per entry.
     store_aliases = img_aliases if store.is_active() else None
     prices = await asyncio.to_thread(
-        lambda: {m: _media_request_pricing(m, store_aliases) for m in media_ids})
+        lambda: {m: (_media_request_pricing(m, store_aliases),
+                     _prompt_limit(m, store_aliases)["max_chars"]) for m in media_ids})
     for entry in data:
-        if prices.get(entry["id"]):
-            entry["pricing"] = prices[entry["id"]]
+        if entry["id"] not in prices:
+            continue
+        pricing, prompt_max = prices[entry["id"]]
+        if pricing:
+            entry["pricing"] = pricing
+        entry["prompt_max_chars"] = prompt_max        # null = unknown (schema: prompt_limit)
     return {"object": "list", "data": data}
 
 
@@ -3157,6 +3162,7 @@ async def get_model(model_id: str, authorization: Optional[str] = Header(None),
         pricing = await asyncio.to_thread(_media_request_pricing, model_id)
         if pricing:
             entry["pricing"] = pricing
+        entry["prompt_max_chars"] = (await asyncio.to_thread(_prompt_limit, model_id))["max_chars"]
         return entry
     raise HTTPException(404, f"Model '{model_id}' not found")
 
@@ -3713,6 +3719,22 @@ def _media_request_pricing(model_id: str, aliases: Optional[dict] = None) -> Opt
     if not floors or any(f is None for f in floors):
         return None
     return {"request": mediaprice.usd_str(min(floors))}
+
+
+def _prompt_limit(model_id: str, aliases: Optional[dict] = None) -> dict:
+    """The prompt character limit of a media id, for a client that shortens BEFORE
+    sending (the hub refuses an over-long prompt with a 400 and never shortens it).
+    Over every candidate the id may run on (_media_price_pairs: no health flicker): the
+    STRICTEST known limit, since a failover onto that candidate refuses the prompt
+    too. status `known` = every candidate has one, `partial` = some, `unknown` = none
+    (max_chars null). Blocking (store read)."""
+    rows = [{"backend": b.get("name"), "model": c.get("model"),
+             "max_chars": adapters.prompt_max_chars(c)}
+            for b, c in _media_price_pairs(model_id, aliases)]
+    known = [r["max_chars"] for r in rows if r["max_chars"] is not None]
+    return {"max_chars": min(known) if known else None, "unit": "characters",
+            "status": ("unknown" if not known else "known" if len(known) == len(rows) else "partial"),
+            "candidates": rows}
 
 
 def generation_candidate(model: str) -> Optional[dict]:
@@ -5471,7 +5493,10 @@ async def gen_alias_schema(alias: str, request: Request, authorization: Optional
                            "request": "loras: [{name, strength}]",
                            **({"paired_stacks": kinds,
                                "note": "send ONE pair half; the counterpart is resolved server-side"}
-                              if len(kinds) > 1 else {})}}
+                              if len(kinds) > 1 else {})},
+                 # strictest prompt limit over the candidates; null = unknown. The hub
+                 # refuses a longer prompt (400) and never shortens it.
+                 "prompt_limit": await asyncio.to_thread(_prompt_limit, alias)}
     if cand.get("fps"):
         out["fps"] = cand["fps"]
         if cand.get("frames_snap"):

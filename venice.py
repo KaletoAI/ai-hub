@@ -453,6 +453,21 @@ def _image_limit(cand):
     return 0
 
 
+def prompt_max_chars(cand):
+    """The `prompt` character limit the preflight enforces for this candidate — the
+    catalog's `promptCharacterLimit` / `prompt_character_limit`, else the endpoint's
+    documented default. None when the candidate has no catalog row (the hub's fallback
+    is not the vendor's limit), no prompt, or a malformed limit (unknown, not a guess).
+    What `/v1/models` and the alias schema publish so a client shortens before sending."""
+    if not isinstance(cand.get("model_metadata"), dict):
+        return None
+    try:
+        limit = _parameter_specs(cand).get("prompt", {}).get("max_length")
+    except (VeniceInput, TypeError, ValueError, AttributeError, KeyError, IndexError):
+        return None
+    return limit if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0 else None
+
+
 def slot_names(cand):
     return ["input_image" if i == 1 else f"input_image_{i}" for i in range(1, _image_limit(cand) + 1)]
 
@@ -578,8 +593,13 @@ def _values(cand, values):
                 raise VeniceInput(f"Venice {key} exceeds the model's item bounds")
         elif not isinstance(value, str):
             raise VeniceInput(f"Venice {key} must be text")
-        if isinstance(value, str) and (len(value) < field.get("min_length", 0) or len(value) > field.get("max_length", math.inf)):
-            raise VeniceInput(f"Venice {key} is outside the model's text length bounds")
+        if isinstance(value, str) and len(value) > field.get("max_length", math.inf):
+            # length AND limit: a client shortening its prompt needs both (anima-verse)
+            raise VeniceInput(f"Venice {key} is too long: {len(value)} characters, "
+                              f"the model allows at most {field['max_length']}")
+        if isinstance(value, str) and len(value) < field.get("min_length", 0):
+            raise VeniceInput(f"Venice {key} is too short: {len(value)} characters, "
+                              f"the model needs at least {field['min_length']}")
         if "choices" in field and value not in field["choices"]:
             raise VeniceInput(f"Venice {key} must be one of the model's advertised choices")
         body[key] = value

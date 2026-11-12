@@ -602,6 +602,17 @@ before the first snapshot (a key/URL change starts a fresh adapter) is a 503 wit
 `build_request` and `validate_image_dimensions` run under `_metadata_guard`: a
 malformed catalog constraint (None/0 divisor, list for dict) is a `VeniceInput`
 (400 before the paid POST), not a TypeError the preflight let through (500).
+The prompt character limit is published, not just enforced: anima-verse sent 1551
+characters to `qwen-edit-uncensored` (`promptCharacterLimit: 1500`, its siblings
+10000) and got a bare "outside the model's text length bounds" 400 with no way to
+learn the limit (2026-11-12). `venice.prompt_max_chars` reads the same `max_length` the
+preflight enforces (None without a catalog row or with a malformed limit — never the
+hub's fallback guess); `adapters.prompt_max_chars` dispatches to a cloud module that
+implements it (others: None = unknown, no workflow read, so `/v1/models` can ask per
+media id); `main._prompt_limit` takes the STRICTEST known limit over
+`_media_price_pairs` (a failover onto that candidate refuses too) → schema
+`prompt_limit` and `/v1/models` `prompt_max_chars`. The 400 now names length and limit.
+The gateway never shortens a prompt — the client does.
 
 An optional tenth GET, `/v1/api_keys/rate_limits`, publishes sanitized
 `account_info` alongside discovery. `venice.normalize_account_info` trusts exact
@@ -3503,7 +3514,9 @@ Every test file also says this in its own docstring; this is the overview.
 - `test_venice_routing.py`: alias-free media delivery, retained chat aliases,
   modality grants, `@backends` never opening account media, a 503 before the first
   catalog, workflow audio tasks in Venice's type families, every billed variant
-  delivered, failed-refresh availability and native video durations.
+  delivered, failed-refresh availability, native video durations, and the prompt
+  limit in schema/`/v1/models` (strictest over an alias's candidates) plus a 400
+  naming length and limit (`test_venice.py` pins `prompt_max_chars` itself).
 - `test_venice_console.py`: shared account controls, metadata-native forms,
   optional false values, typed speech inputs, JSON/text result downloads, billing
   signs with preserved model IDs, dynamic filtering, mixed-account assurances,

@@ -114,6 +114,23 @@ class VeniceSchemaTests(unittest.TestCase):
             with self.subTest(values=values), self.assertRaises(venice.INPUT_ERROR):
                 venice.validate_request(cand, values, [], [])
 
+    def test_prompt_limit_is_readable_and_the_refusal_names_it(self):
+        """anima-verse sent 1551 characters to an editor whose catalog says
+        `promptCharacterLimit: 1500` and got a bare "outside the model's text length
+        bounds" — no way to learn the limit up front, none in the 400. The limit must be
+        readable per candidate (None = unknown, never the hub's fallback guess without a
+        catalog row) and the refusal must name length and limit."""
+        cand = candidate("edit", {"constraints": {"promptCharacterLimit": 1500}})
+        self.assertEqual(venice.prompt_max_chars(cand), 1500)
+        self.assertEqual(venice.prompt_max_chars(candidate("edit")), 32768)
+        self.assertIsNone(venice.prompt_max_chars(venice.candidate_for("venice-host", "x", "edit")))
+        self.assertIsNone(venice.prompt_max_chars(candidate("upscale")))
+        self.assertIsNone(venice.prompt_max_chars(candidate("images", {"constraints": {"promptCharacterLimit": "lots"}})))
+        with self.assertRaises(venice.INPUT_ERROR) as caught:
+            venice.validate_request(cand, {"prompt": "x" * 1551}, ["input_image"], [])
+        self.assertIn("1551", str(caught.exception))
+        self.assertIn("1500", str(caught.exception))
+
     def test_image_safe_mode_defaults_off_but_explicit_choices_win(self):
         for endpoint in ("images", "edit"):
             images = {"input_image": PNG} if endpoint == "edit" else {}

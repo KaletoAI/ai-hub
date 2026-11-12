@@ -145,6 +145,45 @@ class VeniceRouting(_Fixture):
                 "mask": ("mask.png", _png(), "image/png")})
             self.assertEqual(response.status_code, 400, response.text)
 
+    def test_prompt_limit_reaches_schema_and_catalog(self):
+        """A client must be able to shorten BEFORE sending: the strictest prompt limit
+        of every candidate an id may run on is published in the alias schema
+        (`prompt_limit`) and on each media entry of `/v1/models` (`prompt_max_chars`),
+        null when no candidate knows one — and the 400 names length and limit."""
+        import venice
+        self.catalogs["edit"]["tight-edit"] = {"model_spec": {"constraints": {
+            "promptCharacterLimit": 1500, "maxInputImages": 1}}}
+        self.ad._publish_catalogs(self.catalogs)
+        main.backend_models["venice:venice"] = set().union(*self.catalogs.values())
+        main.rebuild_route_index()
+        schema = self.c.get("/v1/generations/venice/tight-edit/schema").json()
+        self.assertEqual(schema["prompt_limit"]["max_chars"], 1500)
+        self.assertEqual(schema["prompt_limit"]["status"], "known")
+        self.assertEqual(schema["prompt_limit"]["unit"], "characters")
+        self.assertEqual(self.c.get("/v1/generations/venice/upscaler/schema").json()["prompt_limit"],
+                         {"max_chars": None, "status": "unknown", "unit": "characters",
+                          "candidates": [{"backend": "venice", "model": "upscaler", "max_chars": None}]})
+        # an alias over two candidates: the strictest known limit wins (a failover must not 400)
+        store.upsert("edits", [venice.candidate_for("venice", "edit-model", "edit"),
+                               venice.candidate_for("venice", "tight-edit", "edit")])
+        limit = self.c.get("/v1/generations/edits/schema").json()["prompt_limit"]
+        self.assertEqual((limit["max_chars"], limit["status"]), (1500, "known"))
+        listed = {m["id"]: m for m in self.c.get("/v1/models?type=image").json()["data"]}
+        self.assertEqual(listed["venice/tight-edit"]["prompt_max_chars"], 1500)
+        self.assertEqual(listed["edits"]["prompt_max_chars"], 1500)
+        self.assertIn("prompt_max_chars", listed["venice/upscaler"])
+        self.assertIsNone(listed["venice/upscaler"]["prompt_max_chars"])
+        self.assertEqual(self.c.get("/v1/models/venice/tight-edit").json()["prompt_max_chars"], 1500)
+        def provider(request):
+            self.fail("an over-long prompt must not buy a Venice generation")
+        with self.vendor(provider):
+            response = self.c.post("/v1/images/edits", data={
+                "model": "venice/tight-edit", "prompt": "x" * 1551},
+                files={"image": ("source.png", _png(), "image/png")})
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn("1551", response.text)
+        self.assertIn("1500", response.text)
+
     def test_media_grant_cannot_call_colliding_chat_alias(self):
         main.virtual_models = {"image-model": "chat-model"}
         main.rebuild_route_index()
