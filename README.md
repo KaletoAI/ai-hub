@@ -50,6 +50,10 @@ code, image clients like anima-verse, …) and a fleet of backends.
   off its websocket, so a running job shows `running 25/35` with a bar and an ETA
   computed from the seconds per step measured in that very run — not a guess from past
   jobs. Backends that do not report it simply fall back to the old estimate.
+  Every finished ComfyUI run also records how long each node took; from the next run of
+  the same alias on, bar and ETA cover the WHOLE workflow (`progress_basis: "profile"`)
+  instead of the one sampler — decode, remesh and export included — and the job page
+  shows a finished run's time per node.
 - **A backend that burns jobs is taken out of rotation.** A generation backend can
   answer every health check and still fail every prompt (a broken driver update, a
   missing custom node). Such a job now moves on to the next backend instead of dying,

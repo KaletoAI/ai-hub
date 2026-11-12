@@ -273,6 +273,44 @@ for a job that took 15 (measured 2026-09-04). Fed to `main.gen_progress` via
 restart forgets it, which is correct); `_job_view` prefers it (`progress_basis:
 "live"`) over the median, and the console shows `running 25/35`, `~8.9 min left` and
 a bar on the job page. Covered by `test_ws_progress.py`.
+**Whole-workflow progress from recorded node timings** (`nodeprofile.py`, pure; folded
+in by `_progress_apply`): the step counter covers the ONE node that samples, so a mesh
+workflow read `35/35`, 100 %, while decode/remesh/texture still had minutes to go. The
+feed therefore also folds `execution_start`, `execution_cached`, `executing` and
+`execution_success|error|interrupted` (shapes verified against ComfyUI's execution.py
+/ main.py, 2026-11-12) into per-node seconds; a successful run returns them from
+`_execute` as `meta.node_times` (`{v, nodes:[{id,title,s,steps?}], cached, total_s,
+wait_s}`, execution order). The next run fetches a PROFILE once
+(`AdapterContext.gen_profile` → `main._gen_profile` → `jobs.node_time_records`, in a
+worker thread): the median seconds per node over the last 10 done runs of the alias ON
+THIS backend, else of its other backends flagged `foreign`. `nodeprofile.overall` reads
+the live state against it: (expected seconds of finished nodes + the running node's
+share) / expected total of the nodes that will execute. The rules, each pinned in
+`test_node_profile.py`: nodes in `execution_cached` and nodes the submitted workflow
+does not contain leave the plan (a warm rerun skips the loaders — counting them stalls
+the bar); time is booked on `display_node` (an expanded node runs as internal children);
+the running node's share comes from its step counter when it counts, else from elapsed
+vs expected (capped at 95 %); a different step count scales that node; the ETA is the
+remaining expected seconds × this run's pace (actual/expected of finished nodes, clamped
+0.33–3) plus the sampler's own measured ETA for the running node; a `foreign` profile
+gives shares only — no ETA until this run has measured its pace (another GPU's seconds
+are not this one's); the overall fraction never goes backwards; and because a VAE decode
+or mesh export sends nothing for minutes, the ws loop re-computes the view every
+`_PROGRESS_TICK_S` (1 s) — a separate ticker task, not a `recv()` timeout (a box that
+broadcasts anything more often than the tick would starve a timeout). Review fixes
+(2026-11-12): a FINISHED node keeps this run's step scale (else a 40-step sampler over a
+20-step profile reads as "twice as slow" and doubles the ETA); a node whose counter
+restarts or changes its max counts several `phases` and is timed by elapsed, never by
+its counter; a finished visit shorter than 1 s and 10 % of its expected time is a LAZY
+node's first pass, not "done"; the socket connects BEFORE `/prompt` (ComfyUI drops
+messages for a client not yet connected — the loader's `executing` was lost on an idle
+box) and buffers until the prompt_id is known, then replays through the gate; a feed that
+dies mid-run (`run.broken`) records nothing; and `quiet_s` (seconds since the last real
+message) keeps `progress_age_s` honest despite the per-second re-emits. The view then says `basis: "profile"` and
+`fraction`/`eta_s` are the WHOLE workflow's (the API's `progress`/`eta_s`/
+`progress_basis: "profile"`); the node detail stays in `step`/`steps`/`node_eta_s`/
+`node_title`. No profile (first run, no feed) → exactly the node-level feed of before.
+The job page lists a finished run's `node_times` as "Time per node".
 `suggest_mapping()` is only an auto-detect pre-fill. ComfyUI `/prompt`
 rejections are translated to readable per-node errors (node title, class,
 field, offending request param) via `_comfy_prompt_error`; raw body stays the
@@ -3369,6 +3407,10 @@ BROADCASTS every prompt's progress to every listener, so a missing prompt_id gat
 shows a job a stranger's step count — a lying feature, not an absent one — and an ETA
 looks plausible whatever it says, which is how timing the steps from job start
 predicted 250 s for a 15 s job);
+`test_node_profile.py` (whole-workflow progress from recorded node timings: cached
+nodes must leave the plan, a foreign profile must give no ETA, the overall ETA replaces
+the node's, expanded children book on the display node, the bar never goes backwards
+and moves on a clock, only DONE jobs of the alias(+backend) feed a profile);
 `test_config_watch.py` (the config hot reload's own watch: `awatch` on the config FILE
 keeps a watch on that file's INODE, and sed/vim/most editors save by renaming a sibling
 over it — measured 2026-09-08 on a fresh Debian 13 install, one of four edits detected,

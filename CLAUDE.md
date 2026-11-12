@@ -67,7 +67,7 @@ must be in both AND in `.gitignore`, or `rsync --delete` wipes it on prod: `conf
 
 ## Architecture map
 
-Thirty-three Python files at the top level (`ls *.py` is the count of record), tests in
+Thirty-four Python files at the top level (`ls *.py` is the count of record), tests in
 `tests/`, scripts that run on OTHER boxes in `ops/` (`ops/runpod/` is the RunPod worker's Docker build context). `main.py` owns all app state as
 module globals; **no other module imports `main`** — they get what they need through
 injected callables (`AdapterContext`, `admin.bind(...)`, hostctl `Deps`) and stay
@@ -99,6 +99,7 @@ hot-reload-safe. Modules marked *pure* do no I/O and import neither `main` nor
 | `sshrun.py` | System-`ssh` argv builders, ControlMaster tunnel `Supervisor`, streams. |
 | `modelsync.py` | *Pure*: which model files a ComfyUI alias needs, where they come from (LAN share, catalog URL, derived HF URL). |
 | `mediaprice.py` | *Pure* media "from" price per candidate (NanoGPT/Venice catalog prices, Tripo/Meshy credits, RunPod $/h); feeds `/v1/models` `pricing.request` and the console. |
+| `nodeprofile.py` | *Pure* per-node timing of a ComfyUI run: record (`meta.node_times`), profile (median per node), whole-workflow progress + ETA for the next run of the alias. |
 | `loratags.py` | *Pure* half of LoRA trigger words (stored and delivered, never put into a prompt); metadata keyed on the share file's sha256, Civitai by hash. |
 
 Requests: chat/completions/embeddings/speech, `/v1/systemone` and `/v1/messages` all funnel through

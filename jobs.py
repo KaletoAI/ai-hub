@@ -245,6 +245,32 @@ def median_duration(alias: str, backend: Optional[str] = None, limit: int = 10) 
     return float(vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2)
 
 
+def node_time_records(alias: str, backend: Optional[str] = None, limit: int = 10) -> list:
+    """The `meta.node_times` of the last `limit` DONE jobs of an alias (optionally one
+    backend) that carry one, newest first — the input of nodeprofile.build. Jobs that
+    ran without the ws feed (no record) are skipped, not counted against `limit`."""
+    if not _active:
+        return []
+    q = ("SELECT meta_json FROM jobs WHERE status = 'done' AND alias = ? "
+         "AND meta_json LIKE '%\"node_times\"%'")
+    args: list = [alias]
+    if backend:
+        q += " AND backend = ?"
+        args.append(backend)
+    q += " ORDER BY created DESC LIMIT ?"
+    args.append(limit)
+    out = []
+    with _conn() as c:
+        for (raw,) in c.execute(q, args):
+            try:
+                rec = (json.loads(raw) or {}).get("node_times")
+            except Exception:
+                continue
+            if isinstance(rec, dict):
+                out.append(rec)
+    return out
+
+
 def gen_stats_rows() -> list:
     """(alias, backend, done, failed, avg_done_ms, last_ts) per alias+backend over media
     jobs — the aggregate behind the console's "Media generation" panel.
