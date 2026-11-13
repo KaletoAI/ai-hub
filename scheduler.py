@@ -61,6 +61,7 @@ _INPUT_LOADER = re.compile(r"image|mask|mesh|path|video|audio", re.I)
 # this key exists to avoid.
 _WEIGHT_INPUT = re.compile(r"name|model|ckpt|unet|clip|vae|lora|gguf|weight", re.I)
 _HOW_INPUT = re.compile(r"dtype|precision|device|backend|attn", re.I)   # …but these are "how"
+_LORA_INPUT = re.compile(r"lora", re.I)   # a LoRA rides on the loaded weights, see model_set_key
 
 
 def model_set_key(workflow: dict, skip_ids: Iterable = ()) -> Optional[str]:
@@ -69,8 +70,9 @@ def model_set_key(workflow: dict, skip_ids: Iterable = ()) -> Optional[str]:
     = one workflow = one model set"), which is wrong in both directions: two aliases can
     load the same weights (trellis2 high and low both load `microsoft/TRELLIS.2-4B` —
     alternating them freed and reloaded a multi-GB model on every switch), and one
-    alias can load different weights per request (a mapped model choice, a LoRA
-    cascade) under the same name and never free.
+    alias can load different weights per request (a mapped model choice) under the
+    same name and never free. LoRA names are NOT part of the key: ComfyUI patches them
+    onto the loaded base model and swaps them in place.
 
     Derived from the loader nodes: class name matching /load/ minus the input
     loaders (image, mask, mesh, path…), and of their inputs only the ones that name a
@@ -95,6 +97,12 @@ def model_set_key(workflow: dict, skip_ids: Iterable = ()) -> Optional[str]:
             # a weight set is NAMED (a filename, a hub id) — a bool/number on a loader
             # (`keep_models_loaded`, `low_vram`, a strength) is always a how
             if not isinstance(v, str) or not _WEIGHT_INPUT.search(k) or _HOW_INPUT.search(k):
+                continue
+            # A LoRA is patched onto the loaded base weights inside ComfyUI and swapped
+            # there in seconds; keying on it freed and reloaded the whole set (Qwen2.1:
+            # 9 GB text encoder + 7 GB DiT + VAE) on every Qwen2.1 <-> Turbo switch and on
+            # every change of a client LoRA (2026-11-13). The base weights decide the key.
+            if _LORA_INPUT.search(k):
                 continue
             parts.append((cls, k, v))
     if not parts:

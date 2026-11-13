@@ -128,12 +128,22 @@ class TestModelSetKey(unittest.TestCase):
         b = {"1": self.LOAD, "2": {"class_type": "LoadImage", "inputs": {"image": "gw_job2_x.png"}}}
         self.assertEqual(scheduler.model_set_key(a), scheduler.model_set_key(b))
 
-    def test_a_lora_slot_counts(self):
+    def test_a_lora_does_not_count(self):
+        """Qwen2.1 vs Qwen2.1-Turbo differ only in a stack LoRA: ComfyUI swaps it on the
+        loaded weights, a free in between reloaded ~17 GB for nothing (2026-11-13)."""
         a = {"1": self.LOAD, "2": {"class_type": "Lora Loader Stack (rgthree)",
                                    "inputs": {"lora_01": "None", "strength_01": 1}}}
         b = {"1": self.LOAD, "2": {"class_type": "Lora Loader Stack (rgthree)",
                                    "inputs": {"lora_01": "style.safetensors", "strength_01": 1}}}
-        self.assertNotEqual(scheduler.model_set_key(a), scheduler.model_set_key(b))
+        c = {"1": self.LOAD, "2": {"class_type": "LoraLoaderModelOnly",
+                                   "inputs": {"lora_name": "turbo.safetensors", "strength_model": 1}}}
+        self.assertEqual(scheduler.model_set_key(a), scheduler.model_set_key(b))
+        self.assertEqual(scheduler.model_set_key(a), scheduler.model_set_key(c))
+
+    def test_a_lora_loader_alone_is_no_key(self):
+        """A workflow whose only named loader input is a LoRA has no weight set of its own."""
+        self.assertIsNone(scheduler.model_set_key(
+            {"1": {"class_type": "LoraLoaderModelOnly", "inputs": {"lora_name": "x.safetensors"}}}))
 
     def test_a_bypassed_loader_loads_nothing(self):
         a = {"1": self.LOAD, "2": {"class_type": "LoaderGGUF", "inputs": {"gguf_name": "x.gguf"}}}

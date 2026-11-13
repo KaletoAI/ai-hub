@@ -3276,12 +3276,13 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   `test_scheduler.py`; host flag `comfy_free_before_job`, default on for EVERY ComfyUI
   box). What it loads is the **model-set key** — `scheduler.model_set_key` over the
   workflow's loader nodes (class /load/ minus image/mask/mesh/path loaders; only their
-  STRING-valued weight inputs — name/model/ckpt/unet/clip/vae/lora/gguf — never node
-  ids, links, dtype/device/`keep_models_loaded`), computed by
+  STRING-valued weight inputs — name/model/ckpt/unet/clip/vae/gguf — never node
+  ids, links, dtype/device/`keep_models_loaded`, and never LoRA names: ComfyUI swaps a
+  LoRA on the loaded weights, keying on it reloaded Qwen on every Turbo switch, 2026-11-13), computed by
   `ComfyUIAdapter.model_set_key(req)` AFTER pins, the LoRA list/cascade and the mapped
   params, so the request is built before the claim. The alias was the key at first and
   is wrong both ways: `img2mesh-trellis2_high`/`_low` both load `microsoft/TRELLIS.2-4B`
-  and were freed+reloaded on every switch, while a mapped model choice or a LoRA under
+  and were freed+reloaded on every switch, while a mapped model choice under
   ONE alias never freed. Alias stays the FALLBACK (no loader recognised) and the
   affinity key. The two records are separate on purpose: `backend_vram_key` is written from
   the free's VERDICT (`_comfy_free` returns one), never from the attempt — a failed or
