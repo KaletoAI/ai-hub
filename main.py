@@ -4333,7 +4333,10 @@ def _shared_host(host: str) -> bool:
 
 _FREE_SETTLE_S = 30.0            # how long a free may take to SHOW in /system_stats before we stop trusting it
 _FREE_REPOST_S = 2.0             # re-post /free this often while the VRAM has not moved (see below)
-_FREE_FLOOR_BYTES = 256 << 20    # torch's reserved pool at or under this = "nothing loaded"
+_FREE_FLOOR_BYTES = 1 << 30      # torch's reserved pool at or under this = "nothing loaded".
+# Not 256 MiB: an emptied ComfyUI keeps ~390-610 MiB reserved (CUDA context, kitchen/cuDNN
+# workspaces), so "<= 256 MiB" was never reached and 217 of 222 settles in a week ran the
+# full _FREE_SETTLE_S on an already-empty GPU (journal 2026-11-06..13, "still 408 of 408 MiB").
 
 
 async def _comfy_vram_reserved(url: str) -> Optional[int]:
