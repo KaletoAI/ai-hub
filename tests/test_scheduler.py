@@ -8,12 +8,24 @@ def _e(name, age, key):
     return {"name": name, "enqueued_at": 1000.0 - age, "key": key}
 
 
-class TestEma(unittest.TestCase):
-    def test_first_sample_is_taken_verbatim(self):
-        self.assertEqual(scheduler.ema(None, 12.0), 12.0)
+class TestSpeedRuns(unittest.TestCase):
+    """The media routing speed is the median of the last 3 runs (see speed_of_runs)."""
 
-    def test_ema_blends_with_alpha(self):
-        self.assertAlmostEqual(scheduler.ema(10.0, 20.0, alpha=0.3), 13.0)
+    def test_first_run_is_the_speed(self):
+        self.assertEqual(scheduler.speed_of_runs(scheduler.speed_runs(None, 12.0)), 12.0)
+
+    def test_only_the_last_three_runs_count(self):
+        runs = None
+        for s in (235, 232, 231, 236, 235, 57, 67):     # rtx-4070 Qwen2.1, 2026-11-13/14
+            runs = scheduler.speed_runs(runs, s)
+        self.assertEqual(runs, [235.0, 57.0, 67.0])
+        self.assertEqual(scheduler.speed_of_runs(runs), 67.0)   # was 163 s as EMA → ranked last
+
+    def test_one_cold_start_moves_nothing(self):
+        self.assertEqual(scheduler.speed_of_runs([60.0, 230.0, 62.0]), 62.0)
+
+    def test_no_runs_is_unmeasured(self):
+        self.assertIsNone(scheduler.speed_of_runs([]))
 
 
 class TestOrderReady(unittest.TestCase):

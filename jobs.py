@@ -298,11 +298,11 @@ def gen_stats_rows() -> list:
     return [(r[0], r[1], r[2] or 0, r[3] or 0, r[4], r[5] or 0) for r in rows]
 
 
-def gen_speed_rows() -> list:
-    """(alias, backend, avg_duration_ms) over all DONE jobs — boot seed for the
-    scheduler's gen-speed EMA, so a restart routes on measured durations instead of
-    probing every backend once per alias. The job store is the only place media
-    runtimes are kept (stats.calls never sees a ComfyUI generation).
+def gen_speed_runs(keep: int = 3) -> list:
+    """(alias, backend, [run seconds, oldest first]) — the last `keep` DONE media jobs
+    per alias+backend: the boot seed of the scheduler's speed (median of the last runs,
+    scheduler.speed_of_runs), so a restart routes on what the backends do NOW. An
+    all-time average kept a backend that got 4× faster ranked last (2026-11-14).
 
     The queue wait is NOT in it (`RUN_S` starts at the claim).
     Empty if the job store is off."""
@@ -310,12 +310,19 @@ def gen_speed_rows() -> list:
         return []
     with _conn() as c:
         rows = c.execute(
-            f"SELECT alias, backend, AVG(({RUN_S}) * 1000.0) FROM jobs "
-            f"WHERE status = 'done' AND task NOT IN ({','.join('?' * len(_NON_MEDIA_TASKS))}) "
-            "AND alias IS NOT NULL AND alias != '' "
-            "AND backend IS NOT NULL AND backend != '' "
-            "GROUP BY alias, backend", _NON_MEDIA_TASKS).fetchall()
-    return [(r[0], r[1], r[2]) for r in rows]
+            f"SELECT alias, backend, run_s FROM ("
+            f"  SELECT alias, backend, updated, ({RUN_S}) AS run_s, ROW_NUMBER() OVER ("
+            f"    PARTITION BY alias, backend ORDER BY updated DESC, rowid DESC) AS rn "
+            f"  FROM jobs WHERE status = 'done' "
+            f"  AND task NOT IN ({','.join('?' * len(_NON_MEDIA_TASKS))}) "
+            "  AND alias IS NOT NULL AND alias != '' "
+            "  AND backend IS NOT NULL AND backend != '') "
+            "WHERE rn <= ? ORDER BY alias, backend, updated", (*_NON_MEDIA_TASKS, keep)).fetchall()
+    out: dict = {}
+    for alias, backend, secs in rows:
+        if secs is not None and secs > 0:
+            out.setdefault((alias, backend), []).append(float(secs))
+    return [(a, b, runs) for (a, b), runs in out.items()]
 
 
 def neighbors(job_id: str, media_only: bool = True) -> tuple:

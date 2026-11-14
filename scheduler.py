@@ -7,14 +7,25 @@ unpaid-then-fastest ordering, freed-backend type affinity, and an overdue guard.
 """
 import hashlib
 import re
+import statistics
 from typing import Callable, Iterable, Optional
 
-EMA_ALPHA = 0.3
+SPEED_RUNS = 3          # a media alias+backend's speed = median of its last N successful runs
 
 
-def ema(prev: Optional[float], sample: float, alpha: float = EMA_ALPHA) -> float:
-    """Exponential moving average; the first sample is taken verbatim."""
-    return sample if prev is None else alpha * sample + (1 - alpha) * prev
+def speed_runs(prev: Optional[list], sample: float, keep: int = SPEED_RUNS) -> list:
+    """The last `keep` run times (oldest first) after one more successful run."""
+    return (list(prev or []) + [float(sample)])[-keep:]
+
+
+def speed_of_runs(runs: list) -> Optional[float]:
+    """The routing speed (seconds) from the last runs: their MEDIAN. Not an average
+    over the whole history: Qwen2.1 on the rtx-4070 went from ~233 s to ~60 s once
+    ComfyUI stopped reloading the model per job (2026-11-13), and an all-time average
+    (boot seed) blended by a 0.3-EMA still ranked it LAST a day later — 163 s against
+    dx10-02's real 120 s. With three runs one cold start (model load) moves nothing,
+    and a real change wins after two."""
+    return statistics.median(runs) if runs else None
 
 
 def order_ready(cands: list, speed_of: Callable, paid_of: Callable) -> list:

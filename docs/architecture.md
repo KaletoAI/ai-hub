@@ -1626,7 +1626,7 @@ JOB, not a forwarded call, so it never reaches `stats.calls` and every table in 
 Statistic tab was blind to it (it looked unmeasured; it never was). `jobs.gen_stats_rows()`
 aggregates done/failed/avg per alias+backend and `admin._media_gen_panel()` renders it
 as **Media generation** — including the `routing` column, which is the live
-`gen_speed` EMA the scheduler actually orders on (`main.gen_speed_info()`, bound into
+`gen_speed` (median of the last 3 runs) the scheduler actually orders on (`main.gen_speed_info()`, bound into
 admin), so "why did it pick THAT backend?" is answerable in the console instead of
 from the source. `avg` counts DONE jobs only: averaging a three-second failure into a
 two-minute render would make a broken backend look like the fastest one. The panel
@@ -2974,7 +2974,13 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   bare-model-id pass-through are **precomputed** (insertion order, no sort);
   `resolve_routes()` evaluates the live flags (healthy/busy/draining) per request and
   applies the scheduler ordering — unpaid before paid, then fastest (`backend_tps` /
-  `gen_speed`), unmeasured first. A freed backend takes the waiter the scheduler
+  `gen_speed`), unmeasured first. A media alias+backend's `gen_speed` is the MEDIAN of
+  its last 3 successful runs (`scheduler.speed_runs`/`speed_of_runs`; boot seed
+  `jobs.gen_speed_runs`): the old 0.3-EMA on an all-time-average seed kept Qwen2.1 on the
+  rtx-4070 ranked last (163 s) a day after it went from ~233 s to ~60 s — dx10-02 (120 s)
+  got the jobs (2026-11-14; `test_scheduler.TestSpeedRuns`,
+  `test_job_run_time`). One cold start moves the median nothing; a real change wins after
+  two runs. A freed backend takes the waiter the scheduler
   designates for it (`scheduler.designated_taker`: overdue > same type key > oldest;
   `affinity_max_wait_s`, default 120, Server tab). `priority` routes nothing any more —
   it only keeps the backend LIST order stable. Rebuilt by `rebuild_backends()`/`rebuild_virtual_models()` and on every

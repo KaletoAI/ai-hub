@@ -319,7 +319,8 @@ backend_tps: dict[str, float] = {}                             # bid → EWMA ou
 host_backends: dict[str, list] = {}                            # host → [bid, …] (rebuild_backends)
 hosts_meta: dict[str, dict] = {}                               # host → {label, avoid_llm_during_media, …}
 backend_adapters: dict = {}                                    # name → BackendAdapter instance
-gen_speed: dict = {}                                           # "alias|bid" → EMA seconds of a successful media job
+gen_speed: dict = {}                                           # "alias|bid" → routing seconds: median of gen_speed_runs
+gen_speed_runs: dict = {}                                      # "alias|bid" → last successful run times (scheduler.speed_runs)
 gen_exec_faults: dict = {}                                     # "alias|bid" → proven execution-fault record (scheduler.exec_fault_*)
 gen_progress: dict = {}                                        # job id → live progress from the backend's ws feed
 
@@ -344,13 +345,15 @@ backend_vram_key: dict = {}                                    # bid → alias w
 
 
 def _note_gen_speed(alias: str, bid: str, seconds: float) -> None:
-    """Fold one successful media generation into the alias+backend duration EMA.
-    This is the media counterpart of _note_speed (tok/s): a mesh/image job has no
-    token count, so wall-clock seconds per job is the only comparable signal."""
+    """Record one successful media generation: the alias+backend speed is the median of
+    its last runs (scheduler.speed_runs / speed_of_runs). This is the media counterpart
+    of _note_speed (tok/s): a mesh/image job has no token count, so wall-clock seconds
+    per job is the only comparable signal."""
     if seconds <= 0:
         return
     k = f"{alias}|{bid}"
-    gen_speed[k] = scheduler.ema(gen_speed.get(k), seconds)
+    gen_speed_runs[k] = scheduler.speed_runs(gen_speed_runs.get(k), seconds)
+    gen_speed[k] = scheduler.speed_of_runs(gen_speed_runs[k])
 
 
 def _gen_profile(alias: str, backend: str) -> Optional[dict]:
@@ -1320,16 +1323,17 @@ async def lifespan(app: FastAPI):
                   jobs_cfg.get("default_ttl_s", 86400))
         jobs_prune_task = asyncio.create_task(jobs.prune_loop(jobs_cfg.get("prune_interval_s", 3600)))
         _bg(_cancel_orphaned_runpod(jobs.last_orphans()))
-        # Seed the media gen-speed EMA from the job store so a restart does not have
-        # to re-probe every backend once per alias. Best-effort: a missing/odd jobs DB
-        # must never hold up the boot.
+        # Seed the media speeds from the job store's LAST runs so a restart does not
+        # have to re-probe every backend once per alias. Best-effort: a missing/odd jobs
+        # DB must never hold up the boot.
         try:
-            for seed_alias, seed_bname, seed_avg_ms in jobs.gen_speed_rows():
+            for seed_alias, seed_bname, seed_runs in jobs.gen_speed_runs(scheduler.SPEED_RUNS):
                 seed_b = next((b for b in backends if b["name"] == seed_bname
                                and _is_gen(b)), None)
-                if seed_b is not None and seed_avg_ms:
-                    gen_speed.setdefault(f"{seed_alias}|{backend_id(seed_b)}",
-                                         float(seed_avg_ms) / 1000.0)
+                k = f"{seed_alias}|{backend_id(seed_b)}" if seed_b is not None else ""
+                if k and seed_runs and k not in gen_speed:
+                    gen_speed_runs[k] = list(seed_runs)
+                    gen_speed[k] = scheduler.speed_of_runs(seed_runs)
         except Exception as e:
             logger.info(f"gen-speed seed skipped: {e}")
 
@@ -3745,7 +3749,7 @@ def generation_candidate(model: str) -> Optional[dict]:
 def _gen_routes(alias: str, gated: Optional[list] = None,
                 admitted: Optional[float] = None, force: str = "") -> tuple[list, list]:
     """(ready, all) (backend, candidate) pairs for a generation alias, each ordered
-    **unpaid before paid, then fastest first** (`gen_speed` EMA per alias+backend; an
+    **unpaid before paid, then fastest first** (`gen_speed`: median of the last runs per alias+backend; an
     unmeasured backend sorts first, probe-once) and filtered to enabled + healthy
     backends; `ready` additionally drops busy ones. ONE store read serves both lists.
     Priority sorts nothing any more (spec 2026-09-01).
@@ -6037,7 +6041,8 @@ def _faults_info(window_s: int = faults.WINDOW_S) -> dict:
 def gen_speed_info() -> dict:
     """What the media scheduler is actually routing on, keyed "alias|backend name".
 
-    `speed` is the live EMA in seconds (`gen_speed`, seeded at boot from the job store)
+    `speed` is the routing time in seconds (`gen_speed`: median of the last runs, seeded
+    at boot from the job store's last runs)
     — the number `order_ready` sorts by; `None` there means UNMEASURED, which sorts
     FIRST (probe-once) unless the candidate has spent its probe on a fault. `quarantine`
     carries the seconds remaining per key. Keyed by backend NAME, not `backend_id`,

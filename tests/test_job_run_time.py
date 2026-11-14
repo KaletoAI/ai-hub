@@ -56,7 +56,17 @@ class StartedStamp(unittest.TestCase):
         jobs.fail(jid, "x")                              # terminal, then fix the clock
         self._set(jid, status="done", created=1000, started=1600, updated=1660)
         self.assertEqual(jobs.median_duration("a"), 60.0)
-        self.assertEqual(jobs.gen_speed_rows(), [("a", "gpu", 60000.0)])
+        self.assertEqual(jobs.gen_speed_runs(), [("a", "gpu", [60.0])])
+
+    def test_speed_seed_is_the_last_three_runs_oldest_first(self):
+        """The boot seed of the routing speed: an all-time average kept a backend that
+        had become 4× faster ranked last after a restart (2026-11-14)."""
+        for i, run in enumerate((235, 232, 231, 57, 67)):
+            jid = jobs.create("text2img", "a", "gpu")
+            jobs.fail(jid, "x")
+            self._set(jid, status="done", created=1000 + i * 1000, started=1000 + i * 1000,
+                      updated=1000 + i * 1000 + run)
+        self.assertEqual(jobs.gen_speed_runs(3), [("a", "gpu", [231.0, 57.0, 67.0])])
 
     def test_rows_before_the_column_fall_back_to_created(self):
         jid = jobs.create("text2img", "a", "gpu")

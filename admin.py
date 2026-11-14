@@ -11320,7 +11320,7 @@ def _media_gen_panel() -> str:
     `stats.calls` and every table on this page was blind to it — media looked entirely
     unmeasured. It is measured, and by exactly the number in the `routing` column: the
     scheduler orders candidates unpaid-first, then fastest, on that per alias+backend
-    EMA. An unmeasured pair sorts FIRST once (probe-once), which is why a brand-new
+    median of the last runs. An unmeasured pair sorts FIRST once (probe-once), which is why a brand-new
     backend gets one job before the ordering settles."""
     rows = jobs.gen_stats_rows()
     if not rows:
@@ -11356,7 +11356,7 @@ def _media_gen_panel() -> str:
             f"look like the fastest one.</p>"
             f"<table class='filterable sortable' data-sk='stat-media'>"
             f"<tr><th>alias</th><th>backend</th><th>done</th><th>failed</th><th>ok</th>"
-            f"<th>avg</th><th title='the EMA the scheduler routes on'>routing</th>"
+            f"<th>avg</th><th title='median of the last 3 runs — what the scheduler routes on'>routing</th>"
             f"<th>last</th><th></th></tr>{tr}</table>")
 
 
