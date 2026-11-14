@@ -3752,20 +3752,22 @@ def _gen_routes(alias: str, gated: Optional[list] = None,
 
     An alias holds a flat list of *allowed* backends (no primary/fallback). They are
     tried in that order; on a connection error the job runner moves to the
-    next. An optional per-alias `retries` caps how many backends are attempted (1 +
-    retries); blank = try all eligible. Each list is capped independently — same
-    result as the old per-include_busy filtering.
+    next. The per-alias `retries` (1 + retries backends per job, blank = all) is NOT
+    applied here: both lists keep every eligible candidate, and `_run_job` stops once
+    that many backends have run the job (`_gen_attempt_cap`). Cutting the lists to the
+    1+retries fastest hid a free, slower backend from the choice, the LoRA eligibility
+    and the queue — a Qwen2.1 job with a LoRA waited for a busy box while the free
+    rtx-4070 held the LoRA (2026-11-14, `test_gen_retries_failover.py`).
 
     A candidate whose backend has not synced this alias's models (`modelsync_gate`, a
     managed host's ComfyUI) leaves BOTH lists: such an alias then 503s at once naming
     the sync instead of parking for hours behind it. `gated`, when given, collects
     (backend name, reason) of every such candidate — the 503's text.
 
-    A force pin (`force`, a backend NAME) filters BEFORE the per-alias `retries` cap:
-    the cap keeps the first 1+retries candidates by speed, and a pinned backend that
-    measured slower fell out of it — `retries: "0"` + a pin to the slower box then
-    503'd "no healthy backend … on backend X" with X healthy and free (2026-11-12,
-    MiniMax-H3-Image pinned to rtx-3090 after one slow run). Pinned, the cap is moot.
+    A force pin (`force`, a backend NAME) keeps only that backend's candidates. (When
+    the lists were still cut to 1+retries, the pin had to filter first: `retries: "0"`
+    + a pin to the slower box 503'd "no healthy backend … on backend X" with X healthy
+    and free — 2026-11-12, MiniMax-H3-Image pinned to rtx-3090.)
 
     A backend being switched off (`_power_draining`) is skipped like a drained one —
     except for a job `admitted` (time.monotonic() of its request) BEFORE the switch-off
@@ -3821,14 +3823,24 @@ def _gen_routes(alias: str, gated: Optional[list] = None,
         allc, lambda bx: f"{alias}|{backend_id(bx[0])}", gen_exec_faults, time.time())
     allc = usable + held
     ready = [r for r in usable if not backend_busy(r[0])]   # busy → only parkable, not ready
-    raw = next((c.get("retries") for c in candidates if c.get("retries") not in (None, "")), None)
-    if raw is not None:
-        try:
-            cap = max(1, int(raw) + 1)                      # first attempt + N retries
-            allc, ready = allc[:cap], ready[:cap]
-        except (ValueError, TypeError):
-            pass
     return ready, allc
+
+
+def _gen_attempt_cap(cands) -> Optional[int]:
+    """How many backends one generation job may RUN on: 1 + the alias's `retries`, or
+    None (blank = every eligible backend). `cands` are candidate dicts or (backend,
+    candidate) pairs. Enforced by `_run_job` over `tried` — never by cutting the route
+    lists (see _gen_routes)."""
+    for c in cands or ():
+        c = c[1] if isinstance(c, tuple) else c
+        raw = (c or {}).get("retries")
+        if raw in (None, ""):
+            continue
+        try:
+            return max(1, int(raw) + 1)                     # first attempt + N retries
+        except (ValueError, TypeError):
+            return None
+    return None
 
 
 def get_gen_routes(alias: str) -> list[tuple[dict, dict]]:
@@ -3866,7 +3878,7 @@ def _entry_can_use(entry: dict, backend: dict, memo: Optional[dict] = None) -> b
     memo = {} if memo is None else memo
     # keyed on the power switch-offs this waiter is old enough to keep using too: two
     # waiters of one alias may see a backend being switched off differently
-    # and on the pin: it filters before the retries cap, so a pinned waiter's list differs
+    # and on the pin: a pinned waiter's list holds only the pinned backend
     mkey = (entry["alias"], _power_keeps(entry.get("admitted")), entry.get("force") or "")
     ids = memo.get(mkey)
     if ids is None:
@@ -4579,11 +4591,19 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req,
     # actually died on is the one worth describing.
     cloud_trace: dict = st.get("cloud_trace") or {}
     power_skipped: list = []
+    # The alias's `retries`: at most this many backends RUN the job, counted over `tried`
+    # so a lost claim and a re-park do not reset it. Only here — the route lists carry
+    # every eligible backend so a job can START on any of them (_gen_routes).
+    cap = _gen_attempt_cap(candidates)
+    capped = False
     for backend, cand in candidates:
         bid = backend_id(backend)
         adapter = backend_adapters.get(bid)
         if adapter is None or bid in tried:
             continue
+        if cap is not None and len(tried) >= cap:
+            capped = True                      # 1 + retries backends ran it — report, never park
+            break
         if not _power_dispatch_ok(backend):    # disabled / being switched off since the
             power_skipped.append(backend["name"])   # list was made (failover tail too)
             continue
@@ -4714,7 +4734,7 @@ async def _run_job(job_id: str, alias: str, candidates: list, build_req,
                     raise
         finally:
             _inflight_dec(bid)
-    if busy_skipped:
+    if busy_skipped and not capped:
         # A candidate was taken by someone else between our pick and our claim: park
         # again for it (the caller re-resolves) instead of reporting the job as exhausted.
         st.update(last=last, attempts=attempts, cloud_trace=cloud_trace)
@@ -4888,10 +4908,12 @@ async def _run_gen_parked(job_id, alias, force, build_req, eligible: Optional[se
                 allc = [r for r in allc if r[0].get("name") in eligible]
             tried = run_state.get("tried")
             if tried:                            # back from a lost claim: never re-run a backend
+                cap = _gen_attempt_cap(allc)
                 ready = [r for r in ready if backend_id(r[0]) not in tried]
                 allc = [r for r in allc if backend_id(r[0]) not in tried]
-                if not allc:                     # everything has run → report how it ended
-                    await _run_job(job_id, alias, [], build_req, run_state)
+                if not allc or (cap is not None and len(tried) >= cap):
+                    # everything has run, or 1 + retries backends have → report how it ended
+                    await _run_job(job_id, alias, allc, build_req, run_state)
                     return
             # A free candidate is only ours if the scheduler designates it for us;
             # otherwise it belongs to another waiter and we keep parking (2 s poll).
@@ -6661,7 +6683,7 @@ def power_waiting_jobs(bid: str, pool: Optional[list] = None) -> int:
             continue
         if e.get("eligible") is not None and b["name"] not in e["eligible"]:
             continue
-        mkey = (e["alias"], e.get("force") or "")   # a pin filters before the retries cap
+        mkey = (e["alias"], e.get("force") or "")   # a pinned waiter's list differs
         ids = memo.get(mkey)
         if ids is None:                      # every adm < t0 keeps `bid`: one read per alias+pin
             _ready, allc = _gen_routes(e["alias"], admitted=adm, force=e.get("force") or "")

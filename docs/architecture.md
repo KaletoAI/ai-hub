@@ -3089,13 +3089,19 @@ maps the alias, and exposes the resolved model. Recurring concepts:
   LoRA-backend rather than spilling); a LoRA on no backend is ignored (the normal
   ordering wins); an explicit `backend` force is never overridden. Per-backend LoRA sets
   come from discovery (`backend_loras`).
-- **Force pin before the `retries` cap**: an alias's `retries` caps its candidates to
-  1+retries, fastest first. `_gen_routes(…, force=)` drops every candidate but the pinned
-  backend BEFORE that cap — applied after it (as it was), `retries: "0"` left only the
-  fastest backend, and a pin to a slower one 503'd "No healthy backend … on backend X"
-  with X healthy and idle (2026-11-12, MiniMax-H3-Image pinned to rtx-3090 after one
-  slow run). `_gen_pick`, the park loop, `_entry_can_use` (memo keyed alias + keeps +
-  pin) and the power-switch-off waiter count all pass the pin in. `test_gen_pin_retries.py`.
+- **`retries` limits the failover, not the choice**: an alias's `retries` = how many
+  backends ONE job may run on (1 + retries; blank = all). `_run_job` enforces it over
+  `tried` (`_gen_attempt_cap`; a lost claim and a re-park keep the count, and the park
+  loop reports instead of waiting once it is used up). `_gen_routes` does NOT cut its
+  lists: it used to keep only the 1+retries fastest, so a free slower backend never
+  existed for `_gen_pick`, the LoRA eligibility, the queue designation or the power
+  waiter count — Qwen2.1 (`retries: "1"`) with a client LoRA waited for a busy box while
+  the free rtx-4070 held the LoRA (2026-11-14, job 98ed4ce0;
+  `test_gen_retries_failover.py`). The same cut once made a force pin to a slower
+  backend 503 (2026-11-12, MiniMax-H3-Image → rtx-3090); the pin filters in
+  `_gen_routes(…, force=)` and `_gen_pick`, the park loop, `_entry_can_use` (memo keyed
+  alias + keeps + pin) and the power-switch-off waiter count all pass it in
+  (`test_gen_pin_retries.py`).
 - **Model-sync gate** (managed hosts): `main.modelsync_gate(backend, alias)` inside
   `_gen_routes` — a `comfyui` backend attached to a managed host (backend → `host` →
   controller → service, R-W7; by backend NAME the lookup finds nothing) whose

@@ -1,12 +1,13 @@
-"""A force pin must survive the per-alias `retries` cap.
+"""A force pin must route to the pinned backend whatever the alias's `retries` says.
 
-Why this file exists (it fails SILENTLY until someone pins): `_gen_routes` caps an
-alias's candidates to 1+retries, ordered fastest first. The pin used to be applied
-AFTER that cap, so with `retries: "0"` only the fastest backend was left and a pin
-to any slower one 503'd "No healthy backend for generation model X on backend Y" —
-with Y healthy and idle (2026-11-12: MiniMax-H3-Image pinned to rtx-3090 right after
-one slow run there). The pin has to filter first; the cap still applies unpinned. The
-waiter designation (`_entry_can_use`) must agree, or a pinned job parks until timeout.
+Why this file exists (it fails SILENTLY until someone pins): `_gen_routes` used to cap
+an alias's candidates to 1+retries, ordered fastest first, and the pin was applied
+AFTER that cap — with `retries: "0"` only the fastest backend was left and a pin to any
+slower one 503'd "No healthy backend for generation model X on backend Y" with Y
+healthy and idle (2026-11-12: MiniMax-H3-Image pinned to rtx-3090 right after one slow
+run there). Since 2026-11-14 the lists are not cut at all (`retries` limits the
+failover in `_run_job`, see test_gen_retries_failover.py); these cases keep the pin
+honest, and the waiter designation (`_entry_can_use`) must agree with it.
 
 Run: python -m unittest tests.test_gen_pin_retries -v
 """
@@ -78,10 +79,10 @@ class PinBeforeCap(unittest.TestCase):
     def names(routes):
         return [b["name"] for b, _c in routes]
 
-    def test_unpinned_cap_keeps_only_the_fastest(self):
-        ready, allc = main._gen_routes("img")
-        self.assertEqual(self.names(allc), ["fast"])
-        self.assertEqual(self.names(ready), ["fast"])
+    def test_unpinned_lists_keep_every_backend_fastest_first(self):
+        ready, allc = main._gen_routes("img")             # retries "0" no longer cuts them
+        self.assertEqual(self.names(allc), ["fast", "slow"])
+        self.assertEqual(self.names(ready), ["fast", "slow"])
 
     def test_pin_to_the_slower_backend_routes_despite_retries_0(self):
         ready, allc = main._gen_routes("img", force="slow")
@@ -102,10 +103,12 @@ class PinBeforeCap(unittest.TestCase):
         entry = {"alias": "img", "enqueued_at": 0.0, "force": "slow"}
         self.assertTrue(main._entry_can_use(entry, SLOW))
         self.assertFalse(main._entry_can_use(entry, FAST))
-        # an unpinned waiter of the same alias in the same pass still sees the cap
+        # one pass (shared memo): the pinned waiter's list must not leak into an unpinned
+        # waiter's, nor the other way round
         memo = {}
-        self.assertTrue(main._entry_can_use(entry, SLOW, memo))
-        self.assertFalse(main._entry_can_use({"alias": "img", "enqueued_at": 0.0}, SLOW, memo))
+        self.assertFalse(main._entry_can_use(entry, FAST, memo))
+        self.assertTrue(main._entry_can_use({"alias": "img", "enqueued_at": 0.0}, FAST, memo))
+        self.assertFalse(main._entry_can_use(entry, FAST, memo))
 
     def test_unknown_pin_still_503s_with_the_backend_named(self):
         with self.assertRaises(HTTPException) as cm:
