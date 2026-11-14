@@ -187,7 +187,7 @@ class FakeGenRequest:
         return self._body
 
 
-class GenerateBody(unittest.TestCase):
+class _GenerateHarness(unittest.TestCase):
     def setUp(self):
         import store
         self.tmp = tempfile.TemporaryDirectory()
@@ -225,6 +225,8 @@ class GenerateBody(unittest.TestCase):
         self.sent.clear()                       # so "no API call" stays observable
         return asyncio.run(admin.generate(FakeGenRequest(parts)))
 
+
+class GenerateBody(_GenerateHarness):
     def test_mesh_upload_rides_as_a_file_not_an_image(self):
         self._post([("model", "mesh-rig"), ("p__input_mesh_path", "/backend/old.glb"),
                     ("file__input_mesh_path", b"GLBBYTES", "hero.glb")])
@@ -340,6 +342,90 @@ class DrawnFieldsStayBlank(unittest.TestCase):
         self.assertIn('value=""', seed)
         self.assertIn("🎲 random", seed)
         self.assertIn('value="42"', self._input(html, "p__value_8"))   # Send to Playground value
+
+
+# ── Send to Playground → another alias: WHICH reference image goes out ──────────
+# Prod 2026-11-14: a Multiview job (slot input_image_front) sent to the Playground,
+# switched to Trellis2-Low (slot input_image), Generate — and the job ran with an OLD
+# upload. The stash only ever ADDED the job's image, so an earlier input_image entry
+# still matched Trellis2-Low by name and won; nothing on the page showed which picture
+# was kept. Now Send to Playground replaces the kept images with the job's, a slot
+# nothing matches by name takes the kept images in order, and "✓ kept" shows a thumb.
+
+PNG_OLD = b"\x89PNG\r\n\x1a\n" + b"OLD-UPLOAD"
+PNG_JOB = b"\x89PNG\r\n\x1a\n" + b"JOB-FRONT"
+PNG_BACK = b"\x89PNG\r\n\x1a\n" + b"JOB-BACK"
+
+
+def _img_alias(*slots):
+    wf = {str(i): {"class_type": "LoadImage", "inputs": {"image": "x.png"}}
+          for i, _ in enumerate(slots, 1)}
+    return [{"backend": "comfy-a", "task": "img2mesh", "workflow_json": wf,
+             "mapping": {s: {"node": str(i), "field": "image"} for i, s in enumerate(slots, 1)}}]
+
+
+class SendToPlaygroundImages(_GenerateHarness):
+    def setUp(self):
+        super().setUp()
+        import store
+        store.upsert("multiview", _img_alias("input_image_front", "input_image_back"))
+        store.upsert("low", _img_alias("input_image"))
+        store.upsert("pair", _img_alias("image1", "image2"))
+
+    def _send_job(self, refs):
+        jid = jobs.create("img2mesh", "multiview", "comfy-a")
+        jobs.set_inputs(jid, {"params": {}}, refs)
+        asyncio.run(admin.job_to_playground(jid, FakeGenRequest([])))
+        return jid
+
+    def test_job_image_beats_an_older_upload_on_another_alias(self):
+        self._post([("model", "low"), ("img__input_image", PNG_OLD, "old.png")])
+        self._send_job([("input_image_front", PNG_JOB)])
+        self._post([("model", "low")])
+        self.assertEqual(self.sent["images"],                 # ← the bug: PNG_OLD went out
+                         {"input_image": admin.base64.b64encode(PNG_JOB).decode()})
+
+    def test_rerun_of_the_job_alias_sends_only_the_jobs_images(self):
+        self._post([("model", "multiview"), ("img__input_image_back", PNG_OLD, "old.png")])
+        self._send_job([("input_image_front", PNG_JOB)])
+        self._post([("model", "multiview")])
+        self.assertEqual(set(self.sent["images"]), {"input_image_front"})
+
+    def test_first_kept_image_fills_a_differently_named_single_slot(self):
+        self._send_job([("input_image_front", PNG_JOB), ("input_image_back", PNG_BACK)])
+        self._post([("model", "low")])
+        self.assertEqual(admin.base64.b64decode(self.sent["images"]["input_image"]), PNG_JOB)
+
+    def test_a_name_match_turns_the_order_fallback_off(self):
+        stash = admin._pg_images.setdefault("default", {})
+        stash["input_image_front"] = ("a.png", PNG_JOB)
+        stash["image1"] = ("b.png", PNG_BACK)
+        self._post([("model", "pair")])
+        self.assertEqual(set(self.sent["images"]), {"image1"})   # image2 stays empty
+
+    def test_clear_on_a_carried_slot_drops_it(self):
+        self._send_job([("input_image_front", PNG_JOB)])
+        self._post([("model", "low"), ("clear__input_image", "on")])
+        self.assertNotIn("images", self.sent)
+        self._post([("model", "low")])                          # and it stays gone
+        self.assertNotIn("images", self.sent)
+
+    def test_send_to_playground_keeps_a_kept_mesh(self):
+        admin._pg_images.setdefault("default", {})["input_mesh_path"] = ("hero.glb", b"GLBBYTES")
+        self._send_job([("input_image_front", PNG_JOB)])
+        self.assertIn("input_mesh_path", admin._pg_images["default"])
+
+    def test_kept_row_shows_the_thumbnail_of_what_will_be_sent(self):
+        import store
+        self._send_job([("input_image_front", PNG_JOB)])
+        kept = dict(admin._pg_images["default"])
+        html = admin._playground_form([{"id": "low", "name": "low", "group": "Aliases"}],
+                                      {"model": "low"}, store.get("low")[0], kept=kept)
+        self.assertIn("✓ kept", html)
+        self.assertIn('src="/ui/playground/kept/input_image_front?v=', html)
+        resp = asyncio.run(admin.playground_kept("input_image_front", FakeGenRequest([])))
+        self.assertEqual(resp.body, PNG_JOB)
+        self.assertEqual(resp.media_type, "image/png")
 
 
 class MultipartFilename(unittest.TestCase):

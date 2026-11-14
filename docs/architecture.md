@@ -208,7 +208,17 @@ Send to Playground (`admin.job_to_playground`) also carries the values the gatew
 — `meta.seed` and the 🎲 `meta.random` (node.field) mapped back to their params by
 `_job_drawn_values` — because `inputs.params` holds only what the client sent: without
 them the rerun drew a new seed and the picked result could not be reproduced
-(`test_playground_files.SendToPlaygroundSeed`). The playground renders such a drawn
+(`test_playground_files.SendToPlaygroundSeed`). Its reference images REPLACE the kept
+images in the per-user stash (`_pg_images`; kept meshes/audio stay — a job does not
+store uploaded files): adding them next to an older upload let that upload still match
+the next alias by slot name, so a Multiview job (`input_image_front`) rerun on
+Trellis-Low (`input_image`) went out with the OLD picture (prod 2026-11-14). Which kept
+image fills which slot is ONE rule, `admin._pg_slot_sources`, shared by the form and
+`generate()`: same-named entries; only when no slot of the alias matches by name, the
+kept images in stash order. `generate()` turns such a carried entry into the slot's own
+(or drops it on "clear"), and "✓ kept" shows a thumbnail of exactly that entry
+(`/ui/playground/kept/<key>?v=<hash>`) — before, nothing on the page said which picture
+was kept (`test_playground_files.SendToPlaygroundImages`). The playground renders such a drawn
 param (`admin._drawn_param`) BLANK — `_alias_defaults` skips it — because it sends
 every filled field: prefilled with the workflow's value, every playground run used
 that one seed while the API drew a fresh one (`DrawnFieldsStayBlank`);

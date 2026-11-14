@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import hmac
 import html
 import ipaddress
@@ -8505,6 +8506,31 @@ async def copy(request: Request):
 # alone (a .fbx and a .glb are both "some binary"); images carry theirs in the bytes.
 _pg_images: dict = {}
 
+
+def _pg_is_image(data) -> bool:
+    """A stash entry is an IMAGE (vs. a mesh/audio/video file) by its magic bytes —
+    the stash key cannot tell (a slot named `image` may come from any alias)."""
+    b = bytes(data or b"")[:12]
+    return (b[:8] == b"\x89PNG\r\n\x1a\n" or b[:2] == b"\xff\xd8" or b[:4] == b"GIF8"
+            or (b[:4] == b"RIFF" and b[8:12] == b"WEBP"))
+
+
+def _pg_slot_sources(stash: dict, slots) -> dict:
+    """{image slot of the alias: stash key that fills it} — the ONE rule the form's
+    "✓ kept" row and generate() share, so what is shown is what is sent.
+
+    Same-named entries fill their slots. Only when NONE of the alias's slots matches by
+    name do the kept images fill its slots in stash order (Send to Playground puts a
+    job's inputs there in their order): a Multiview job's `input_image_front` then lands
+    in Trellis-Low's `input_image`. A single name match turns that off, so a kept image
+    never slides into a slot it was not meant for next to a real match."""
+    slots = list(slots or [])
+    named = {s: s for s in slots if s in stash}
+    if named or not slots:
+        return named
+    spare = [k for k, v in stash.items() if isinstance(v, tuple) and _pg_is_image(v[1])]
+    return dict(zip(slots, spare))
+
 # Mesh uploads the file picker offers, and what a stashed extension means on the
 # wire. Deliberately NOT adapters._mime_and_kind: that maps .fbx/.ply to
 # application/octet-stream (right for storage, wrong here — the API recovers the
@@ -8897,13 +8923,23 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
         return (f'<div class="pg-model pg-hist" data-pg-hist data-live-skip>'
                 f'<select name="hist__{_esc(param)}">{opts}</select></div>')
 
-    def kept_badge(param: str, show_name: bool = False) -> str:
-        name = (kept or {}).get(param)
+    def kept_badge(param: str, show_name: bool = False, src: str = "") -> str:
+        # `src` = the stash key that fills an IMAGE slot (_pg_slot_sources) — then the
+        # row shows that picture as a thumbnail, like a history pick does, plus the slot
+        # it was kept from when that is another one. Clear always names THIS slot.
+        name = (kept or {}).get(src or param)
+        thumb = ""
+        if src and isinstance(name, tuple) and _pg_is_image(name[1]):
+            url = (f"/ui/playground/kept/{_q(src)}?v="
+                   f"{hashlib.sha1(bytes(name[1])).hexdigest()[:12]}")
+            thumb = (f'<div><a class="pg-hist-thumb pg-kept" href="{url}" target="_blank" rel="noopener">'
+                     f'<img src="{url}" alt="kept image" loading="lazy"></a></div>')
         name = name[0] if isinstance(name, tuple) else ""
         return (' <span class="badge ok">✓ kept</span>'
                 + (f' <span class="muted">{_esc(name)}</span>' if show_name and name else "")
+                + (f' <span class="muted">from {_esc(src)}</span>' if src and src != param else "")
                 + ' <label class="muted" style="font-weight:normal">'
-                  f'<input type="checkbox" name="clear__{_esc(param)}"> clear</label>')
+                  f'<input type="checkbox" name="clear__{_esc(param)}"> clear</label>' + thumb)
     # Keep the grouped select as the form value; enhance it with an inline search picker.
     groups = {}
     for row in aliases:
@@ -8937,6 +8973,7 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
     mapping = (cand.get("mapping") if cand else {}) or {}
     wf = (cand.get("workflow_json") if cand else {}) or {}
     imgset = set(adapters.image_params(wf, mapping))
+    img_src = _pg_slot_sources(kept or {}, [p for p in mapping if p in imgset])
     defaults = _alias_defaults(cand) if cand else {}
     rows = ""
     # A cloud alias (Meshy, Tripo) has no workflow to read fields off — its public fields
@@ -8944,6 +8981,7 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
     # rendered from adapters.public_fields and the workflow-driven loop below is skipped.
     if cand and adapters.cloud_kind(cand):
         params, images, mfiles = adapters.public_fields(cand)
+        img_src = _pg_slot_sources(kept or {}, [i["name"] for i in images])
         for x in mfiles:
             # Same row as a ComfyUI mesh param (upload or an earlier job's artifact) —
             # WITHOUT the "path on the backend" field: Meshy/Tripo read the bytes out of
@@ -8955,8 +8993,8 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
             rows += _field(x["name"], f'<input type="file" name="file__{_esc(x["name"])}" '
                                       f'accept="{_esc(acc)}"> {hist(x["name"], "file")}{extra}')
         for i in images:
-            extra = (kept_badge(i["name"])
-                     if kept and i["name"] in kept else
+            extra = (kept_badge(i["name"], src=img_src[i["name"]])
+                     if i["name"] in img_src else
                      ' <span class="muted">required</span>' if i["required"] else
                      ' <span class="muted">optional · empty → not sent</span>')
             rows += _field(i["name"], f'<input type="file" name="img__{_esc(i["name"])}" '
@@ -8990,8 +9028,8 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
         label = (m or {}).get("label") or p
         if p in imgset:
             emode = adapters.slot_empty_mode(m)
-            if kept and p in kept:
-                extra = kept_badge(p)
+            if p in img_src:
+                extra = kept_badge(p, src=img_src[p])
             elif emode == "required":
                 extra = ' <span class="muted">required — no placeholder</span>'
             elif emode == "disable":
@@ -9294,6 +9332,27 @@ async def generate(request: Request):
                                                    providers=_media_providers(all_rows)),
                                   "playground", subnav=_subnav("playground", "media")))
 
+    # only the slots/params this alias actually has ride along — the stash may carry
+    # another alias's inputs (that is the point of it surviving a model switch).
+    if cand and adapters.cloud_kind(cand):
+        _, m_imgs, m_files = adapters.public_fields(cand)
+        slot_order = [i["name"] for i in m_imgs]
+        fset = {x["name"] for x in m_files}           # a rigging alias: input_mesh_path
+    else:
+        slot_order = list(adapters.image_params(wf_i, map_i)) if wf_i else []
+        fset = set(adapters.file_params(wf_i, map_i))
+    slots = set(slot_order)
+    # A kept image the form showed in a DIFFERENTLY named slot (_pg_slot_sources) becomes
+    # that slot's own entry now — or, with "clear" ticked, the kept image is dropped, so
+    # the next render does not carry it into the slot again.
+    if cand is not None:
+        for p, src in _pg_slot_sources(stash, slot_order).items():
+            if src == p:
+                continue
+            if f.get(f"clear__{p}") is not None:
+                stash.pop(src, None)
+            else:
+                stash[p] = stash[src]
     # One pass PER PARAM, so the three ways an input arrives have a defined precedence:
     # clear drops what was kept, a fresh upload beats it, a history pick fills what is
     # then still empty. (`__filename` companions are skipped — they are not params.)
@@ -9319,15 +9378,6 @@ async def generate(request: Request):
                 return _err(f"job {jid} #{rest.partition(':')[2]} is no longer available — "
                             f"its files were deleted (job TTL)")
             stash[p] = got
-    # only the slots/params this alias actually has ride along — the stash may carry
-    # another alias's inputs (that is the point of it surviving a model switch).
-    if cand and adapters.cloud_kind(cand):
-        _, m_imgs, m_files = adapters.public_fields(cand)
-        slots = {i["name"] for i in m_imgs}
-        fset = {x["name"] for x in m_files}           # a rigging alias: input_mesh_path
-    else:
-        slots = set(adapters.image_params(wf_i, map_i)) if wf_i else set()
-        fset = set(adapters.file_params(wf_i, map_i))
     if cand is not None:
         images = {p: v for p, v in stash.items() if p in slots}
         files = {p: v for p, v in stash.items() if p in fset}
@@ -10547,6 +10597,18 @@ async def job_detail_page(job_id: str, request: Request):
     return HTMLResponse(_page("Job", page, "jobs", refresh=(2 if st in ("queued", "running") else None)))
 
 
+async def playground_kept(param: str, request: Request):
+    """GET: the session user's kept Playground image for one stash key — the thumbnail
+    next to "✓ kept". Images only (a kept mesh is never served as a picture); the URL
+    carries ?v=<content hash>, so a replaced image is a new URL and may be cached."""
+    entry = _pg_images.get(_session_user(request) or "default", {}).get(param)
+    if not isinstance(entry, tuple) or not _pg_is_image(entry[1]):
+        raise HTTPException(404, "no kept image")
+    data = bytes(entry[1])
+    return Response(content=data, media_type=jobs._img_mime(data),
+                    headers={"Cache-Control": "private, max-age=3600"})
+
+
 async def job_input(job_id: str, n: int):
     ip = jobs.input_path(job_id, n)
     if ip is None:
@@ -10613,6 +10675,12 @@ async def job_to_playground(job_id: str, request: Request):
         q[f"p__{p}"] = val
     user = _session_user(request) or "default"
     stash = _pg_images.setdefault(user, {})
+    # The job's images REPLACE the kept ones: an older upload left under another slot
+    # name would otherwise still match the next alias by name and go out instead of the
+    # job's picture (prod 2026-11-14: Multiview job → Trellis-Low ran an old upload). Kept
+    # meshes/audio stay — a job does not store its uploaded files, so it cannot restore them.
+    for k in [k for k, v in stash.items() if isinstance(v, tuple) and _pg_is_image(v[1])]:
+        stash.pop(k, None)
     for r in meta.get("input_images", []):
         ip = jobs.input_path(job_id, r.get("n"))
         if ip:
@@ -13049,6 +13117,7 @@ def register(app) -> None:
     app.add_api_route("/ui/playground/voice-lib/{name}", voice_lib_play, methods=["GET"])
     app.add_api_route("/ui/playground/generate", generate, methods=["POST"])
     app.add_api_route("/ui/playground/result/{job_id}/{n}", result, methods=["GET"])
+    app.add_api_route("/ui/playground/kept/{param}", playground_kept, methods=["GET"])
     app.add_api_route("/ui/jobs", jobs_page, methods=["GET"])
     app.add_api_route("/ui/job/{job_id}", job_detail_page, methods=["GET"])
     app.add_api_route("/ui/job/{job_id}/input/{n}", job_input, methods=["GET"])
