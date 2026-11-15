@@ -9160,6 +9160,12 @@ def _job_result_html(job_id: str, job: Optional[dict]):
     tex_url = _fbx_tex_url(job.get("results", []), base)
     for r in job.get("results", []):
         src = f"{base}{r['n']}"
+        rp = jobs.result_path(job_id, r["n"]) if os.path.splitext(r.get("name") or "")[1].lower() == ".ply" else None
+        if _is_splat_ply(r, rp[0] if rp else None):  # 3DGS PLY → splat viewer (hoisted module)
+            name = r.get("name") or ""
+            dl = f' download="{_esc(name)}"' if name else " download"
+            cells.append(_splat_cell(src, name or f"artifact {r['n']}", dl, "width:720px;max-width:100%;height:520px"))
+            continue
         if _is_bvh(r) or _is_fbx(r):                  # three.js viewers (hoisted module)
             name = r.get("name") or ""
             label = name or f"artifact {r['n']}"
@@ -10111,6 +10117,26 @@ _FBX_VIEWER_JS = (
     "});"
     # BVH (motion clip, no mesh): the skeleton as a SkeletonHelper stick figure playing
     # its clip on loop over a floor grid, framed on frame 0. Same stage as the FBX one.
+    "document.querySelectorAll('.splatview:not([data-init])').forEach(function(el){"
+    " el.dataset.init='1'; el.style.position='relative';"
+    " import('/ui/static/gaussian-splats-3d/gaussian-splats-3d.module.js').then(function(G){"
+    "  var v=new G.Viewer({rootElement:el,selfDrivenMode:true,useBuiltInControls:true,sharedMemoryForWorkers:false,"
+    "   dynamicScene:false,gpuAcceleratedSort:false,cameraUp:[0,-1,0],initialCameraPosition:[0,0,3],"
+    "   initialCameraLookAt:[0,0,0],logLevel:G.LogLevel.None});"
+    "  return v.addSplatScene(el.dataset.src,{format:G.SceneFormat.Ply,progressiveLoad:false,showLoadingUI:true,"
+    "   splatAlphaRemovalThreshold:5}).then(function(){"
+    "   var b=v.splatMesh.computeBoundingBox(true),s=b.getSize(new THREE.Vector3()),ce=b.getCenter(new THREE.Vector3());"
+    "   var md=Math.max(s.x,s.y,s.z)||1;"
+    "   v.camera.position.set(ce.x+md*1.7,ce.y-md*0.25,ce.z); v.camera.near=md/200; v.camera.far=md*200;"
+    "   v.camera.updateProjectionMatrix(); v.controls.target.copy(ce); v.controls.update(); v.start();"
+    "   var cap=document.createElement('div');"
+    "   cap.textContent=v.splatMesh.getSplatCount().toLocaleString()+' gaussians \\u00b7 drag = orbit, wheel = zoom';"
+    "   cap.style.cssText='position:absolute;left:10px;bottom:8px;font-size:12px;color:#8a96a8;pointer-events:none';"
+    "   el.appendChild(cap);"
+    "  });"
+    " }).catch(function(e){ el.innerHTML='<p style=\"padding:14px;color:#e89\">Splat-Vorschau fehlgeschlagen</p>'; });"
+    "});"
+    # BVH: see above
     "document.querySelectorAll('.bvhview:not([data-init])').forEach(function(el){"
     " el.dataset.init='1';"
     " var W=el.clientWidth||480,H=el.clientHeight||420;"
@@ -10185,6 +10211,42 @@ def _fbx_cell(src: str, tex_url: Optional[str], label: str, dl: str, box: str) -
             f"<div>{_dl_card(src, label, dl=dl, compact=True)}</div></div>")
 
 
+_SPLAT_PLY: dict = {}        # (path, size, mtime) → bool — results never change
+
+
+def _is_splat_ply(r: dict, path: Optional[str]) -> bool:
+    """A result entry is a 3D Gaussian Splatting PLY (IDOL, Budget3D, …): .ply by name AND
+    a header with the 3DGS vertex properties (f_dc_0 + opacity, no faces). A mesh or plain
+    point-cloud PLY stays a download card. Header-only read (≤ 16 KB), cached per file."""
+    name = r.get("name") or r.get("filename") or ""
+    if os.path.splitext(name)[1].lower() != ".ply" or not path:
+        return False
+    try:
+        st = os.stat(path)
+        key = (path, st.st_size, st.st_mtime_ns)
+        if key not in _SPLAT_PLY:
+            with open(path, "rb") as fh:
+                head = fh.read(16384)
+            end = head.find(b"end_header")
+            hdr = head[:end] if end >= 0 else b""
+            _SPLAT_PLY[key] = (hdr.startswith(b"ply") and b" f_dc_0" in hdr and b" opacity" in hdr
+                               and b"element face" not in hdr)
+            if len(_SPLAT_PLY) > 2048:
+                _SPLAT_PLY.pop(next(iter(_SPLAT_PLY)))
+        return _SPLAT_PLY[key]
+    except OSError:
+        return False
+
+
+def _splat_cell(src: str, label: str, dl: str, box: str) -> str:
+    """Gaussian-splat viewer (gaussian-splats-3d, MIT, bundled under /ui/static) + download
+    card. Rendered EMPTY and filled client-side by gwFbxScan's .splatview half, which
+    imports the library only when a splat is on the page; data-live-skip as for FBX."""
+    return (f'<div><div class="splatview" data-live-skip data-src="{src}" '
+            f'style="{box};background:#0c0e12;border:1px solid #313a46;border-radius:10px;overflow:hidden"></div>'
+            f"<div>{_dl_card(src, label, dl=dl, compact=True)}</div></div>")
+
+
 def _bvh_cell(src: str, label: str, dl: str, box: str) -> str:
     """BVH viewer + download card. The div is rendered EMPTY and filled client-side by
     gwFbxScan's .bvhview half (_FBX_VIEWER_JS), so the page showing it must hoist that
@@ -10232,6 +10294,9 @@ def _job_thumbs(jid: str, kind: str, entries: list) -> str:
             cells += _fbx_cell(src, tex_url, label, dl, box3d)
         elif _is_bvh(r):                                  # BVH → animated skeleton + download
             cells += _bvh_cell(src, label, dl, box3d)
+        elif _is_splat_ply(r, (lambda rp: rp[0] if rp else None)(
+                jobs.result_path(jid, r["n"]) if kind == "result" else jobs.input_path(jid, r["n"]))):
+            cells += _splat_cell(src, label, dl, box3d)   # 3DGS PLY → splat viewer + download
         elif (mk == "file" or m.startswith("text/") or m == "application/json"
               or (m and not m.startswith("image/"))):
             # Last clause: a non-image mime is never an <img> — the old fallback label
