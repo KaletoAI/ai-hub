@@ -17,6 +17,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 _here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # repo root (tests/ is one level down)
 _prev = os.getcwd()
@@ -151,6 +152,99 @@ class ProgressState(unittest.TestCase):
     def test_another_jobs_node_state_is_ignored(self):
         self.assertIsNone(self.ad._progress_apply(
             self.state, self._msg({"1": {"state": "finished"}}, pid="other"), 1.0))
+
+
+def _monitor(util=80, used=-1, total=-1):
+    return {"type": "crystools.monitor",
+            "data": {"cpu_utilization": 9.4,
+                     "gpus": [{"gpu_utilization": util, "vram_used": used,
+                               "vram_total": total}]}}
+
+
+class HwMonitor(unittest.TestCase):
+    """GPU load from the Crystools broadcast + VRAM from the /system_stats probe.
+
+    guards: a resource-monitor broadcast (no prompt_id, once a second) mistaken for
+    job progress — it must neither reset `quiet_s` nor fill the pre-submit buffer;
+    readings booked before OUR prompt runs; and a failing stats probe failing, or
+    hiding the result of, the job it only watches."""
+
+    def setUp(self):
+        self.ad = _adapter()
+        self.state = {"prompt_id": PID, "run": {"cur": "5", "cur_at": 0.0}}
+
+    def test_monitor_folds_without_prompt_gate(self):
+        self.assertTrue(self.ad._note_monitor(self.state, _monitor(80), 1.0))
+        self.assertEqual(self.state["run"]["hw"]["nodes"]["5"][:2], [80.0, 1])
+        self.assertNotIn("msg_at", self.state)
+
+    def test_monitor_before_prompt_ignored(self):
+        state = {"prompt_id": None, "run": {}}
+        self.assertTrue(self.ad._note_monitor(state, _monitor(80), 1.0))
+        self.assertNotIn("hw", state["run"])
+        self.assertNotIn("early", state)
+
+    def test_other_message_not_monitor(self):
+        self.assertFalse(self.ad._note_monitor(self.state, _progress(3), 1.0))
+        self.assertFalse(self.ad._note_monitor(self.state, {"type": None}, 1.0))
+
+    def test_crystools_vram_only_as_fallback(self):
+        self.ad._note_monitor(self.state, _monitor(50, 5 << 30, 8 << 30), 1.0)
+        self.assertEqual(len(self.state["run"]["hw"]["vram"]), 1)
+        self.state["run"]["hw_stats"] = True          # /system_stats has answered
+        self.ad._note_monitor(self.state, _monitor(50, 6 << 30, 8 << 30), 2.0)
+        self.assertEqual(len(self.state["run"]["hw"]["vram"]), 1)
+        self.assertEqual(len(self.state["run"]["hw"]["gpu"]), 2)
+
+    def test_malformed_monitor_is_harmless(self):
+        for data in (None, "x", {"gpus": "x"}, {"gpus": [None]}):
+            self.assertTrue(self.ad._note_monitor(
+                self.state, {"type": "crystools.monitor", "data": data}, 1.0))
+        self.assertNotIn("hw", self.state["run"])
+
+
+class _Resp:
+    def __init__(self, body, status=200):
+        self._body, self.status_code = body, status
+
+    def json(self):
+        return self._body
+
+
+class _PollClient:
+    """/history answers "not there yet" once, then the finished entry."""
+
+    def __init__(self):
+        self.history = 0
+
+    async def get(self, url, **kw):
+        if "/history/" in url:
+            self.history += 1
+            return _Resp({} if self.history < 2 else {"p1": {"outputs": {"9": {"ok": 1}}}})
+        return _Resp({"queue_running": [[0, "p1"]], "queue_pending": []})
+
+
+class HwPollSample(unittest.TestCase):
+    """The probe rides on the /history poll and must never matter to it."""
+
+    def _poll(self, sample):
+        import asyncio
+        ad = _adapter()
+        with mock.patch("adapters._HW_SAMPLE_S", 0.0):
+            return asyncio.run(ad._poll(_PollClient(), "http://x:8188", "p1", 0.01, 5,
+                                        sample=sample))
+
+    def test_poll_sample_failure_is_swallowed(self):
+        calls = []
+
+        async def boom():
+            calls.append(1)
+            raise RuntimeError("stats probe broke")
+        self.assertEqual(self._poll(boom), {"9": {"ok": 1}})
+        self.assertEqual(len(calls), 1)               # once: while the job still ran
+
+    def test_poll_without_sample_unchanged(self):
+        self.assertEqual(self._poll(None), {"9": {"ok": 1}})
 
 
 if __name__ == "__main__":

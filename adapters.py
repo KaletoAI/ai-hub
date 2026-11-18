@@ -2387,6 +2387,7 @@ def _view_params(item) -> Optional[tuple]:
 
 
 _PROGRESS_TICK_S = 1.0   # live progress re-computed this often while the feed is silent
+_HW_SAMPLE_S = 2.0       # VRAM probe (/system_stats) at most this often while a prompt runs
 _WS_READY_WAIT_S = 2.0   # how long the submit waits for the progress socket to connect
 
 
@@ -4003,12 +4004,26 @@ class ComfyUIAdapter(BackendAdapter):
                 await ws_task
             raise
         ws_state["prompt_id"] = prompt_id
+
+        async def sample_vram():
+            # VRAM in use, booked on the node that runs right now (nodeprofile.note_hw).
+            # /system_stats works on every ComfyUI; GPU LOAD is not in it — that comes
+            # from the Crystools broadcast on the socket (_note_monitor), where present.
+            r = await client.get(f"{url}/system_stats", timeout=3.0)
+            if r.status_code != 200:
+                return
+            used, total = nodeprofile.parse_system_stats(r.json())
+            if used is not None:
+                run = ws_state["run"]
+                run["hw_stats"] = True          # Crystools' VRAM is the fallback only
+                nodeprofile.note_hw(run, time.monotonic(), vram=used, vram_total=total)
         if log_on:
             logger.info(f"→ [{bname}] queued {prompt_id} (workflow {os.path.basename(req.workflow or '?')})")
         if req.job_id:
             self._prompts[req.job_id] = prompt_id      # what a cancel may stop
         try:
-            outputs = await self._poll(client, url, prompt_id, poll_interval, max_wait)
+            outputs = await self._poll(client, url, prompt_id, poll_interval, max_wait,
+                                       sample=sample_vram)
         except asyncio.CancelledError:
             # The job was cancelled (main.cancel_generation cancels this task): stop
             # OUR prompt on the way out — targeted, see _stop_prompt — or it keeps
@@ -4133,6 +4148,8 @@ class ComfyUIAdapter(BackendAdapter):
                     except ValueError:
                         continue
                     now = time.monotonic()
+                    if self._note_monitor(state, msg, now):
+                        continue                    # a device reading, not job progress
                     if state.get("prompt_id") is None:          # submit still in flight
                         early = state.setdefault("early", [])
                         if len(early) < 500:
@@ -4152,6 +4169,26 @@ class ComfyUIAdapter(BackendAdapter):
                 ready.set()
             if ticker is not None:
                 ticker.cancel()
+
+    def _note_monitor(self, state: dict, msg: dict, now: float) -> bool:
+        """True when `msg` is a resource-monitor broadcast (ComfyUI-Crystools sends
+        `crystools.monitor` about once a second, to everyone, without a prompt_id) —
+        the only place a ComfyUI box tells us its GPU LOAD. It is folded into the run's
+        device readings and goes no further: it is not progress, so it must not reset
+        `quiet_s`, and it must not fill the pre-submit buffer (500 messages would be
+        gone in minutes behind a long queue). Readings before OUR prompt is known are
+        dropped. Its VRAM counts only until /system_stats has answered once: that
+        probe is the better source (Crystools says -1 on unified memory)."""
+        if not isinstance(msg, dict) or msg.get("type") != "crystools.monitor":
+            return False
+        if state.get("prompt_id") is None:
+            return True
+        run = state.setdefault("run", {})
+        gpu, used, total = nodeprofile.parse_monitor(msg.get("data"))
+        if run.get("hw_stats"):
+            used = total = None
+        nodeprofile.note_hw(run, now, gpu=gpu, vram=used, vram_total=total)
+        return True
 
     async def _progress_ticker(self, state: dict, emit) -> None:
         """A VAE decode or a mesh export sends nothing for minutes; with a profile the
@@ -4279,7 +4316,34 @@ class ComfyUIAdapter(BackendAdapter):
                     out["eta_s"] = ov["eta_s"]
         return out
 
-    async def _poll(self, client, url, prompt_id, poll_interval, max_wait) -> dict:
+    async def _poll(self, client, url, prompt_id, poll_interval, max_wait,
+                    sample=None) -> dict:
+        """Wait for the prompt's /history entry (`_poll_run`). `sample` is an optional
+        coroutine function probed while the prompt is still running, at most every
+        `_HW_SAMPLE_S`: it runs as its OWN single-flight task, so a slow or failing
+        probe can neither delay a poll tick nor end the job, and it never counts as
+        "the backend answered" for the disconnect grace."""
+        probe = {"task": None, "at": 0.0}
+
+        async def guarded():
+            with contextlib.suppress(Exception):
+                await sample()
+
+        def tick():
+            now = time.monotonic()
+            t = probe["task"]
+            if (t is None or t.done()) and now - probe["at"] >= _HW_SAMPLE_S:
+                probe["at"] = now
+                probe["task"] = asyncio.create_task(guarded())
+        try:
+            return await self._poll_run(client, url, prompt_id, poll_interval, max_wait,
+                                        tick if sample else None)
+        finally:
+            if probe["task"] is not None:
+                probe["task"].cancel()
+
+    async def _poll_run(self, client, url, prompt_id, poll_interval, max_wait,
+                        tick=None) -> dict:
         # If /history stops responding *after* the run was reachable for a while,
         # ComfyUI most likely crashed ("Reconnecting"). Fail fast with a clear
         # ConnectionError (→ the router can fail over) instead of waiting out the
@@ -4320,6 +4384,8 @@ class ComfyUIAdapter(BackendAdapter):
                 # vanished prompt fails fast instead of polling out the full max_wait.
                 # Throttled: a skipped tick leaves `still = None` (unknown), so the
                 # gone-timer carries over exactly as an errored probe would.
+                if tick:
+                    tick()
                 still = None
                 now = time.monotonic()
                 if now - last_queue_check >= queue_every:
