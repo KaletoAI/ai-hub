@@ -23,6 +23,7 @@ import os
 import re
 import socket
 import struct
+import contextvars
 import time
 from typing import Callable, Optional
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
@@ -8560,6 +8561,36 @@ def _pg_file_mime(name: str) -> str:
 _PG_HISTORY_JOBS = 200     # jobs offered by the playground's "from a job…" pickers
 
 
+# The playground's live tick. While `?job=<id>` is queued/running the page re-fetches
+# itself every 2 s (_job_result_html), and only the result column can have changed —
+# yet each fetch rebuilt, on the event loop, the model list over every alias and catalog
+# model (a price per row) and the artifact picker over the last 200 jobs: tens to
+# hundreds of ms per tick in which no stream is forwarded and no request dispatched,
+# for as long as one tab watched a video render. A LIVE render therefore reuses those
+# two results for `_PG_LIVE_MEMO_S`. A normal render never reads the memo (a just-saved
+# alias must be there on the next load) but refreshes it.
+_PG_LIVE_MEMO_S = 6.0
+_pg_memo: dict = {}                   # key → (expires, value); keys: a handful, fixed
+_pg_live = contextvars.ContextVar("pg_live", default=False)
+
+
+def _pg_cached(key, fn, live: bool):
+    now = time.monotonic()
+    hit = _pg_memo.get(key)
+    if live and hit and hit[0] > now:
+        return hit[1]
+    val = fn()
+    _pg_memo[key] = (now + _PG_LIVE_MEMO_S, val)
+    return val
+
+
+def _pg_model_rows(kind: str, live: bool, build=None) -> list:
+    """`_media_models(kind)` through the live memo — as COPIES: a render may annotate
+    its rows, and that must not reach the next one."""
+    rows = _pg_cached(("models", kind), lambda: (build or _media_models)(kind), live)
+    return [dict(r) for r in rows]
+
+
 def _pg_history_opts() -> dict:
     """{"image": [(value, label, thumb url)…], "file": […]} — every artifact of the
     recent jobs, newest first, as picker options (thumb url only for images, else ""). `value` is "<job>:r:<n>" (a result) or
@@ -8918,7 +8949,7 @@ def _playground_form(aliases: list, vals: dict, cand: Optional[dict], oi: Option
 
     def hist(param: str, kind: str) -> str:
         if not hist_cache:
-            hist_cache.append(_pg_history_opts())
+            hist_cache.append(_pg_cached(("hist",), _pg_history_opts, _pg_live.get()))
         # A plain <select> stays the form value (hist__<param>); _PG_HIST_JS turns it
         # into a search box (job id / alias / name) plus a thumbnail of the picked image.
         # data-live-skip: a live morph must not strip the enhanced picker back out.
@@ -9231,7 +9262,11 @@ async def playground_page(request: Request):
     if not store.is_active():
         return _inactive()
     kind = _media_kind(qp.get("type"))
-    all_rows = _media_models(kind)
+    job_id = qp.get("job", "")
+    job = jobs.get(job_id) if job_id else None
+    live = bool(job and job.get("status") in ("queued", "running"))   # a 2 s live tick
+    _pg_live.set(live)
+    all_rows = _pg_model_rows(kind, live)
     aliases, provider = _media_by_provider(all_rows, qp.get("provider", ""))
     selected = qp.get("model", "")
     model = selected if any(row["id"] == selected for row in aliases) else (aliases[0]["id"] if aliases else "")
@@ -9275,10 +9310,9 @@ async def playground_page(request: Request):
                     invalid = True
                 if invalid:
                     vals[name] = ""
-    job_id = qp.get("job", "")
     refresh = None
     if job_id:
-        result_html, refresh = _job_result_html(job_id, jobs.get(job_id))
+        result_html, refresh = _job_result_html(job_id, job)
     else:
         result_html = "<h2>Result</h2><p class='hint'>Generate to see the result here.</p>"
     wf = (cand.get("workflow_json") if cand else {}) or {}
