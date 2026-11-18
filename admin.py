@@ -10361,31 +10361,110 @@ def _runpod_table(m: dict) -> str:
     return f"<h3>RunPod</h3><table>{body}</table>"
 
 
+def _hw_num(v):
+    """A device reading from a job row as a float, or None — the row was written by
+    whatever version (and whatever backend monitor) ran the job."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v or v < 0:
+        return None
+    return float(v)
+
+
+def _mem(mib) -> str:
+    """MiB as the job page prints memory: below 1 GiB in MB, else GB with one decimal."""
+    return f"{mib:.0f} MB" if mib < 1024 else f"{mib / 1024:.1f} GB"
+
+
+def _spark(vals, top, color: str) -> str:
+    """A 64x14 inline-SVG curve of `vals` against `top` (area + line) — '' with fewer
+    than two usable points. Pure markup: the job page is a live page and gets no
+    script for this."""
+    pts = [x for x in map(_hw_num, vals if isinstance(vals, list) else []) if x is not None]
+    if len(pts) < 2:
+        return ""
+    top = max(_hw_num(top) or 0.0, max(pts)) or 1.0
+    w, h = 64.0, 14.0
+    xy = [(i * w / (len(pts) - 1), h - 1 - min(v / top, 1.0) * (h - 2))
+          for i, v in enumerate(pts)]
+    line = " ".join(f"{x:.1f},{y:.1f}" for x, y in xy)
+    return (f"<svg width='64' height='14' viewBox='0 0 64 14' "
+            f"style='vertical-align:-2px;margin:0 4px' aria-hidden='true'>"
+            f"<polygon points='0,{h:.0f} {line} {w:.0f},{h:.0f}' fill='{color}' fill-opacity='.22'/>"
+            f"<polyline points='{line}' fill='none' stroke='{color}' stroke-width='1.2' "
+            f"stroke-linejoin='round'/></svg>")
+
+
+_HW_GPU_COLOR, _HW_VRAM_COLOR = "#7fd18b", "#d6a85c"
+
+
 def _node_times_table(m: dict) -> str:
     """Where a ComfyUI run's time went: seconds and share per node, in execution
     order — the record (`meta.node_times`, nodeprofile.record) the next run of the
-    alias reads its whole-workflow progress against. '' without one."""
+    alias reads its whole-workflow progress against. '' without one.
+
+    With device readings in the record (nodeprofile.note_hw) each node also shows its
+    mean GPU load and peak VRAM, and the heading carries the run's two curves. Only
+    the columns that HAVE data are rendered: a record without readings is the table
+    it always was, and a box without a load monitor shows VRAM alone."""
     rec = m.get("node_times")
     if not isinstance(rec, dict) or not rec.get("nodes"):
         return ""
     total = float(rec.get("total_s") or 0) or sum(float(n.get("s") or 0) for n in rec["nodes"]) or 1.0
+    hw = rec.get("hw") if isinstance(rec.get("hw"), dict) else {}
+    gpu_avg, vram_max, vram_total = (_hw_num(hw.get(k)) for k in ("gpu_avg", "vram_max", "vram_total"))
+    has_gpu = gpu_avg is not None or any(_hw_num(n.get("gpu")) is not None for n in rec["nodes"])
+    has_vram = vram_max is not None or any(_hw_num(n.get("vram")) is not None for n in rec["nodes"])
+    num = "text-align:right;white-space:nowrap;padding-left:10px"
     rows = []
     for n in rec["nodes"]:
         sec = float(n.get("s") or 0)
         pct = min(100.0, sec * 100.0 / total)
         steps = f" <span class='muted'>· {int(n['steps'])} steps</span>" if n.get("steps") else ""
+        g, v = _hw_num(n.get("gpu")), _hw_num(n.get("vram"))
+        cells = ""
+        if has_gpu:
+            cells += (f"<td style='{num};color:{_HW_GPU_COLOR}'>"
+                      f"{'' if g is None else f'{min(g, 100.0):.0f}%'}</td>")
+        if has_vram:
+            cells += (f"<td style='{num};color:{_HW_VRAM_COLOR}'>"
+                      f"{'' if v is None else _mem(v)}</td>")
         rows.append(
             f"<tr><td>{_esc(n.get('title') or n.get('id'))} <span class='muted'>#{_esc(n.get('id'))}</span>{steps}</td>"
             f"<td style='text-align:right;white-space:nowrap'>{_dur(sec * 1000)}</td>"
-            f"<td style='width:160px'><div style='height:6px;background:#232a35;border-radius:3px;overflow:hidden'>"
+            f"<td style='width:{110 if cells else 160}px'><div style='height:6px;background:#232a35;border-radius:3px;overflow:hidden'>"
             f"<div style='height:6px;width:{pct:.1f}%;background:#6cb0ef'></div></div></td>"
-            f"<td class='muted' style='text-align:right'>{pct:.0f}%</td></tr>")
+            f"<td class='muted' style='text-align:right'>{pct:.0f}%</td>{cells}</tr>")
+    head = ""
+    if has_gpu or has_vram:
+        head = ("<tr class='muted' style='font-size:11px'><td colspan='4'></td>"
+                + (f"<td style='{num}'>GPU</td>" if has_gpu else "")
+                + (f"<td style='{num}'>VRAM</td>" if has_vram else "") + "</tr>")
+    summary = []
+    if gpu_avg is not None:
+        summary.append(f"<span style='white-space:nowrap'>GPU{_spark(hw.get('gpu'), 100, _HW_GPU_COLOR)}"
+                       f"⌀ {min(gpu_avg, 100.0):.0f}%</span>")
+    if vram_max is not None:
+        of = f" / {_mem(vram_total)}" if vram_total else ""
+        peak = _mem(vram_max)
+        if of and peak.endswith(" GB") and of.endswith(" GB"):
+            peak = peak[:-3]                  # "3.0 / 8.0 GB", the unit once
+        summary.append(f"<span style='white-space:nowrap'>VRAM"
+                       f"{_spark(hw.get('vram'), vram_total or vram_max, _HW_VRAM_COLOR)}"
+                       f"max {peak}{of}</span>")
+    title = "<h3>Time per node</h3>"
+    if summary:
+        title = ("<div style='display:flex;align-items:baseline;justify-content:space-between;"
+                 "gap:12px;flex-wrap:wrap'><h3>Time per node</h3>"
+                 f"<span class='muted' style='font-size:12px'>{' &nbsp;·&nbsp; '.join(summary)}</span></div>")
     foot = [f"total {_dur(total * 1000)}"]
     if rec.get("cached"):
         foot.append(f"{len(rec['cached'])} node(s) served from ComfyUI's cache")
     if isinstance(rec.get("wait_s"), (int, float)) and rec["wait_s"] >= 1:
         foot.append(f"{_dur(rec['wait_s'] * 1000)} before the first node ran")
-    return (f"<h3>Time per node</h3><table>{''.join(rows)}</table>"
+    if has_gpu or has_vram:
+        foot.append(("GPU load is the mean, VRAM the peak while the node ran" if has_gpu and has_vram
+                     else "GPU load is the mean while the node ran" if has_gpu
+                     else "VRAM is the peak while the node ran") + " — whole device, not this job alone")
+    return (f"{title}<table>{head}{''.join(rows)}</table>"
             f"<p class='muted' style='margin:4px 0 0'>{' · '.join(foot)}</p>")
 
 
