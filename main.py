@@ -454,13 +454,38 @@ def _is_llm(b: dict) -> bool:
     return b.get("type") in adapters.DYNAMIC_CATALOG_TYPES or not _is_gen(b)
 
 
+# bid → (discovered set, catalogs, backend dict, answer, sizes): `_llm_models` of a catalog
+# account. Callers ask once or twice PER MODEL (/v1/models, the route index, the
+# console), and the answer took three set copies, a union and an intersection each
+# time — quadratic. Valid while all three inputs are the SAME OBJECTS: each is only
+# ever replaced (discovery assigns backend_models[bid] and adapter.model_catalogs; a
+# config change rebuilds the backend dicts), never edited in place — the invariant the
+# route index already rests on. tests/test_llm_models_memo.py.
+_llm_models_memo: dict = {}
+
+
 def _llm_models(b: dict) -> set:
-    models = backend_models.get(backend_id(b), set())
+    """The ids `b` serves as an LLM (chat/tts/embedding). The returned set is shared —
+    read it, never change it (true before the memo too: a plain backend gets the
+    discovered set itself)."""
+    bid = backend_id(b)
+    models = backend_models.get(bid)
+    if models is None:
+        return set()
     if b.get("type") not in adapters.DYNAMIC_CATALOG_TYPES:
         return models
-    catalogs = getattr(backend_adapters.get(backend_id(b)), "model_catalogs", {})
-    text = set().union(*(set(catalogs.get(k, {})) for k in ("text", "tts", "embedding")))
-    return models & adapters.add_model_extras(text, b)
+    catalogs = getattr(backend_adapters.get(bid), "model_catalogs", None)
+    # + the sizes: belt and braces against an in-place add/remove (no production code
+    # does one; fixtures do), at the price of four len() calls
+    size = (len(models),) + tuple(len((catalogs or {}).get(k, ())) for k in ("text", "tts", "embedding"))
+    hit = _llm_models_memo.get(bid)
+    if (hit is not None and hit[0] is models and hit[1] is catalogs and hit[2] is b
+            and hit[4] == size):
+        return hit[3]
+    text = set().union(*(set((catalogs or {}).get(k, {})) for k in ("text", "tts", "embedding")))
+    out = models & adapters.add_model_extras(text, b)
+    _llm_models_memo[bid] = (models, catalogs, b, out, size)
+    return out
 
 
 def _backend_model_types(backend: dict, model: str) -> set[str]:
@@ -1229,6 +1254,7 @@ def reload_config() -> None:
         backend_healthy.pop(stale, None)
         backend_error.pop(stale, None)
         backend_models.pop(stale, None)
+        _llm_models_memo.pop(stale, None)
         backend_model_metadata.pop(stale, None)
         backend_pricing.pop(stale, None)
         backend_loras.pop(stale, None)
