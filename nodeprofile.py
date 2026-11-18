@@ -23,6 +23,14 @@ Rules that would fail silently (pinned in tests/test_node_profile.py):
     measured its own pace.
   - Time is attributed to `display_node` when ComfyUI reports one: an expanded node
     runs as internal children, and the record must name the node of the workflow.
+
+Beside the seconds a run records what the DEVICE was doing (`note_hw`): GPU load and
+VRAM in use, booked on the node that was running, plus a short curve of the whole run.
+Display only — `build`/`overall` never read it. Its silent traps:
+  - a monitor that cannot read a value says -1 (Crystools' VRAM on unified memory):
+    that is "no sample", never a number;
+  - a sample taken while no node runs belongs to the curve, to no node;
+  - a run of hours must not grow the state without bound (`HW_RAW_MAX`).
 """
 from __future__ import annotations
 
@@ -38,6 +46,8 @@ SPEED_MIN_EVIDENCE_SHARE = 0.10  # … or this share of the expected total
 LAZY_VISIT_S = 1.0               # a finished visit shorter than this AND than …
 LAZY_VISIT_SHARE = 0.10          # … this share of the node's expected time is a lazy
                                  # node's first pass, not the node being done
+HW_POINTS = 60                   # points of a recorded GPU/VRAM curve (`record` → `hw`)
+HW_RAW_MAX = 600                 # raw samples kept per curve while the run is live
 
 
 # ── folding the live feed ────────────────────────────────────────────────────────────
@@ -126,6 +136,127 @@ def _owner(run: dict, node: str) -> Optional[str]:
     return node
 
 
+# ── device samples (GPU load, VRAM) ─────────────────────────────────────────────────
+
+def _num(v, top: Optional[float] = None) -> Optional[float]:
+    """A usable reading, or None: not a number, negative (the monitors' "unknown"),
+    or above `top`."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v or v < 0:
+        return None
+    if top is not None and v > top:
+        return None
+    return float(v)
+
+
+def parse_system_stats(body) -> tuple:
+    """(VRAM bytes in use, VRAM bytes total) of the first real device in ComfyUI's
+    /system_stats, or (None, None). In use = total - free: what the whole device
+    holds, other processes included — that is what decides whether a model fits."""
+    devs = body.get("devices") if isinstance(body, dict) else None
+    for d in devs if isinstance(devs, list) else []:
+        if not isinstance(d, dict):
+            continue
+        total, free = _num(d.get("vram_total")), _num(d.get("vram_free"))
+        if total and free is not None:
+            return int(max(0.0, total - free)), int(total)
+    return None, None
+
+
+def parse_monitor(data) -> tuple:
+    """(GPU load %, VRAM bytes in use, VRAM bytes total) from a `crystools.monitor`
+    /ws message — each None when the plugin could not read it (it sends -1)."""
+    gpus = data.get("gpus") if isinstance(data, dict) else None
+    g = gpus[0] if isinstance(gpus, list) and gpus and isinstance(gpus[0], dict) else {}
+    used, total = _num(g.get("vram_used")), _num(g.get("vram_total"))
+    return (_num(g.get("gpu_utilization"), 100.0),
+            None if used is None else int(used),
+            int(total) if total else None)
+
+
+def note_hw(run: dict, now: float, gpu=None, vram=None, vram_total=None) -> None:
+    """Book one device reading: on the running node (mean GPU load, peak VRAM) and on
+    the run's curves. `run["hw"]`: nodes {node: [gpu_sum, gpu_n, vram_peak]}, gpu /
+    vram [[t, value]…], vram_total."""
+    gpu, vram, vram_total = _num(gpu, 100.0), _num(vram), _num(vram_total)
+    if gpu is None and vram is None:
+        return
+    hw = run.setdefault("hw", {"nodes": {}, "gpu": [], "vram": [], "vram_total": 0.0})
+    if vram_total:
+        hw["vram_total"] = max(hw["vram_total"], vram_total)
+    cur = run.get("cur")
+    acc = hw["nodes"].setdefault(cur, [0.0, 0, None]) if cur is not None else None
+    if gpu is not None:
+        _raw_add(hw["gpu"], now, gpu, _mean2)
+        if acc is not None:
+            acc[0] += gpu
+            acc[1] += 1
+    if vram is not None:
+        _raw_add(hw["vram"], now, vram, max)
+        if acc is not None:
+            acc[2] = vram if acc[2] is None else max(acc[2], vram)
+
+
+def _mean2(a: float, b: float) -> float:
+    return (a + b) / 2.0
+
+
+def _raw_add(series: list, t: float, v: float, merge) -> None:
+    series.append([t, v])
+    if len(series) > HW_RAW_MAX:           # halve the resolution, keep the whole span
+        series[:] = [[series[i][0], merge(series[i][1], series[i + 1][1])]
+                     if i + 1 < len(series) else series[i]
+                     for i in range(0, len(series), 2)]
+
+
+def _condense(series: list, t0: float, t1: float, n: int, agg) -> list:
+    """`series` in `n` equally wide time buckets over [t0, t1]; an empty bucket
+    repeats its neighbour (the earlier one, or the first value at the very start)."""
+    buckets = [[] for _ in range(n)]
+    span = (t1 - t0) or 1.0
+    for t, v in series:
+        buckets[min(n - 1, max(0, int((t - t0) / span * n)))].append(v)
+    out, last = [], series[0][1]
+    for b in buckets:
+        last = agg(b) if b else last
+        out.append(last)
+    return out
+
+
+def _mib(v: float) -> int:
+    return int(round(v / 1048576.0))
+
+
+def _hw_record(hw: dict) -> dict:
+    """The run-level `hw` block of a record ({} without samples): two curves of at
+    most HW_POINTS points over the same time span, mean load, peak and total VRAM
+    (MiB — bytes would triple the size of every job row)."""
+    gpu, vram = hw.get("gpu") or [], hw.get("vram") or []
+    if not gpu and not vram:
+        return {}
+    ts = [p[0] for p in gpu + vram]
+    t0, t1 = min(ts), max(ts)
+    n = max(1, min(HW_POINTS, max(len(gpu), len(vram))))
+    out = {}
+    if gpu:
+        out["gpu"] = [int(round(v)) for v in
+                      _condense(gpu, t0, t1, n, lambda b: sum(b) / len(b))]
+        out["gpu_avg"] = int(round(sum(p[1] for p in gpu) / len(gpu)))
+    if vram:
+        out["vram"] = [_mib(v) for v in _condense(vram, t0, t1, n, max)]
+        out["vram_max"] = _mib(max(p[1] for p in vram))
+        if hw.get("vram_total"):
+            out["vram_total"] = _mib(hw["vram_total"])
+    return out
+
+
+def _hw_node(hw: dict, node: str) -> dict:
+    acc = (hw.get("nodes") or {}).get(node)
+    if not acc:
+        return {}
+    return {**({"gpu": int(round(acc[0] / acc[1]))} if acc[1] else {}),
+            **({"vram": _mib(acc[2])} if acc[2] is not None else {})}
+
+
 # ── record (end of a successful run) ────────────────────────────────────────────────
 
 def record(run: dict, titles: dict, now: float) -> Optional[dict]:
@@ -144,13 +275,18 @@ def record(run: dict, titles: dict, now: float) -> Optional[dict]:
         if _phases(run, n) > 1:
             return {"phases": _phases(run, n)}
         return {"steps": steps[n]} if steps.get(n) else {}
-    nodes = [{"id": n, "title": str(titles.get(n) or n), "s": round(done[n], 2), **_steps(n)}
+    hw = run.get("hw") or {}
+    nodes = [{"id": n, "title": str(titles.get(n) or n), "s": round(done[n], 2), **_steps(n),
+              **_hw_node(hw, n)}
              for n in run.get("order") or [] if n in done]
     out = {"v": VERSION, "nodes": nodes,
            "cached": sorted(run.get("cached") or [], key=_id_key),
            "total_s": round(sum(done.values()), 2)}
     if run.get("exec_at") is not None and run.get("submit_at") is not None:
         out["wait_s"] = round(max(0.0, run["exec_at"] - run["submit_at"]), 2)
+    hwrec = _hw_record(hw)
+    if hwrec:
+        out["hw"] = hwrec
     return out
 
 

@@ -301,5 +301,102 @@ class Records(unittest.TestCase):
         self.assertEqual(got, [10.0, 20.0])
 
 
+class HwSamples(unittest.TestCase):
+    """GPU load / VRAM recorded beside the node times (`nodeprofile.note_hw`).
+
+    guards: a -1 from Crystools (no reading, e.g. unified memory) booked as a value;
+    samples booked on the wrong node; a run of hours growing `run` without bound; a
+    record with `hw` changing what the timing profile computes."""
+
+    def _run(self):
+        run = {}
+        nodeprofile.fold(run, "executing", {"node": "A"}, 0.0)
+        nodeprofile.note_hw(run, 1.0, gpu=50, vram=2 << 30, vram_total=8 << 30)
+        nodeprofile.note_hw(run, 2.0, gpu=100, vram=1 << 30)
+        nodeprofile.fold(run, "executing", {"node": "B"}, 3.0)
+        nodeprofile.note_hw(run, 4.0, vram=3 << 30)
+        return run
+
+    def test_parse_monitor_minus_one(self):
+        pm = nodeprofile.parse_monitor
+        self.assertEqual(pm({"gpus": [{"gpu_utilization": 92, "vram_used": -1,
+                                       "vram_total": -1}]}), (92.0, None, None))
+        self.assertEqual(pm({}), (None, None, None))
+        self.assertEqual(pm(None), (None, None, None))
+        self.assertIsNone(pm({"gpus": [{"gpu_utilization": "x"}]})[0])
+        self.assertIsNone(pm({"gpus": [{"gpu_utilization": 250}]})[0])
+        self.assertIsNone(pm({"gpus": [{"gpu_utilization": True}]})[0])
+        self.assertEqual(pm({"gpus": [{"gpu_utilization": 0, "vram_used": 5,
+                                       "vram_total": 10}]}), (0.0, 5, 10))
+
+    def test_parse_system_stats(self):
+        ps = nodeprofile.parse_system_stats
+        self.assertEqual(ps({"devices": [{"vram_total": 100, "vram_free": 30}]}), (70, 100))
+        self.assertEqual(ps({"devices": [{"vram_total": 0, "vram_free": 0},
+                                         {"vram_total": 10, "vram_free": 4}]}), (6, 10))
+        for bad in ({}, {"devices": []}, None, {"devices": "x"},
+                    {"devices": [{"vram_total": "a", "vram_free": 1}]},
+                    {"devices": [{"vram_total": 10}]}):
+            self.assertEqual(ps(bad), (None, None))
+        # free > total (a driver glitch) is "0 used", never negative
+        self.assertEqual(ps({"devices": [{"vram_total": 10, "vram_free": 12}]}), (0, 10))
+
+    def test_samples_go_to_running_node(self):
+        rec = nodeprofile.record(self._run(), {}, 5.0)
+        a, b = rec["nodes"]
+        self.assertEqual((a["gpu"], a["vram"]), (75, 2048))
+        self.assertNotIn("gpu", b)
+        self.assertEqual(b["vram"], 3072)
+        self.assertEqual(rec["hw"]["vram_max"], 3072)
+        self.assertEqual(rec["hw"]["gpu_avg"], 75)
+        self.assertEqual(rec["hw"]["vram_total"], 8192)
+
+    def test_sample_without_node_only_in_series(self):
+        run = {}
+        nodeprofile.note_hw(run, 0.5, gpu=40)
+        self.assertEqual(run["hw"]["nodes"], {})
+        self.assertTrue(run["hw"]["gpu"])
+        nodeprofile.fold(run, "executing", {"node": "A"}, 1.0)
+        rec = nodeprofile.record(run, {}, 2.0)
+        self.assertNotIn("gpu", rec["nodes"][0])
+        self.assertEqual(rec["hw"]["gpu"], [40])
+
+    def test_invalid_values_are_no_sample(self):
+        run = {}
+        nodeprofile.fold(run, "executing", {"node": "A"}, 0.0)
+        nodeprofile.note_hw(run, 1.0, gpu=-1, vram=-1)
+        nodeprofile.note_hw(run, 1.0, gpu="9", vram=None)
+        nodeprofile.note_hw(run, 1.0)
+        self.assertNotIn("hw", nodeprofile.record(run, {}, 2.0))
+
+    def test_series_bounded(self):
+        run = {}
+        nodeprofile.fold(run, "executing", {"node": "A"}, 0.0)
+        for i in range(5000):
+            nodeprofile.note_hw(run, float(i), gpu=i % 100, vram=(i % 7) << 30)
+        self.assertLessEqual(len(run["hw"]["gpu"]), nodeprofile.HW_RAW_MAX)
+        self.assertLessEqual(len(run["hw"]["vram"]), nodeprofile.HW_RAW_MAX)
+        rec = nodeprofile.record(run, {}, 5000.0)
+        self.assertLessEqual(len(rec["hw"]["gpu"]), nodeprofile.HW_POINTS)
+        self.assertLessEqual(len(rec["hw"]["vram"]), nodeprofile.HW_POINTS)
+        self.assertEqual(rec["hw"]["vram_max"], 6 * 1024)     # the peak survives merging
+        self.assertEqual(rec["nodes"][0]["vram"], 6 * 1024)
+
+    def test_no_samples_no_hw(self):
+        run = {}
+        nodeprofile.fold(run, "executing", {"node": "A"}, 0.0)
+        rec = nodeprofile.record(run, {"A": "Load"}, 2.0)
+        self.assertEqual(rec, {"v": 1, "nodes": [{"id": "A", "title": "Load", "s": 2.0}],
+                               "cached": [], "total_s": 2.0})
+
+    def test_build_ignores_hw(self):
+        with_hw = nodeprofile.record(self._run(), {}, 5.0)
+        run = {}
+        nodeprofile.fold(run, "executing", {"node": "A"}, 0.0)
+        nodeprofile.fold(run, "executing", {"node": "B"}, 3.0)
+        plain = nodeprofile.record(run, {}, 5.0)
+        self.assertEqual(nodeprofile.build([with_hw]), nodeprofile.build([plain]))
+
+
 if __name__ == "__main__":
     unittest.main()
