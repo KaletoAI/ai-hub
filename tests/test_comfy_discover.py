@@ -66,6 +66,44 @@ class Discover(unittest.TestCase):
         self.assertEqual(caps.loras, {"style.safetensors"})
         self.assertEqual(a._node_types["KSampler"]["out"], ["LATENT"])
 
+    def test_unchanged_object_info_is_not_parsed_again(self):
+        """Several MB every 30 s per ComfyUI box (every 3 s while one is DOWN and calls
+        wait), and the parse holds the GIL even in a worker thread — the loop stalled
+        ~16 ms per poll (measured 2026-11-18). An unchanged body (the sha256 is cheap
+        and GIL-free) reuses the last result; a CHANGED one must be parsed, or a newly
+        installed node/model/LoRA never appears — and what a caller does to the
+        returned sets must not leak into the next poll."""
+        calls = []
+        orig = adapters._parse_object_info
+
+        def spy(raw):
+            calls.append(len(raw))
+            return orig(raw)
+        body = {"oi": dict(_OBJECT_INFO)}
+
+        def handler(request):
+            if request.url.path == "/object_info":
+                return httpx.Response(200, content=json.dumps(body["oi"]).encode())
+            return httpx.Response(200, json={"queue_running": [], "queue_pending": []})
+        a, _ = _adapter({})
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        adapters._parse_object_info = spy
+        try:
+            first = asyncio.run(a.discover(client))
+            first.models.add("poison.safetensors")
+            first.loras.clear()
+            second = asyncio.run(a.discover(client))
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(second.models, {"sdxl.safetensors", "flux.gguf"})
+            self.assertEqual(second.loras, {"style.safetensors"})
+            self.assertEqual(a._node_types["KSampler"]["out"], ["LATENT"])
+            body["oi"] = {**_OBJECT_INFO, "NewNode": {"input": {"required": {}}, "output": ["IMAGE"]}}
+            asyncio.run(a.discover(client))
+            self.assertEqual(len(calls), 2)
+            self.assertIn("NewNode", a._node_types)
+        finally:
+            adapters._parse_object_info = orig
+
     def test_the_executor_watchdog_still_runs(self):
         a, client = _adapter({"queue_running": [], "queue_pending": [[0, "p1", {}, {}, []]]})
         asyncio.run(a.discover(client))                              # baseline

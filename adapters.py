@@ -3403,16 +3403,25 @@ class ComfyUIAdapter(BackendAdapter):
         self.last_restart: float = 0.0        # ts of the last restart() call (cooldown)
         self.last_restart_result: str = ""    # "" | running | ok | timeout | no-manager
         self._prompts: dict = {}              # job id → the ComfyUI prompt it runs (cancel target)
+        self._oi_cache: Optional[tuple] = None  # (sha256 of /object_info, its parsed result)
 
     async def discover(self, client: httpx.AsyncClient) -> Capabilities:
         url = self.backend["url"].rstrip("/")
         resp = await client.get(f"{url}/object_info", timeout=_COMFY_DISCOVERY_TIMEOUT)
         resp.raise_for_status()
         # Several MB of JSON per poll (every 30 s, every 3 s while DOWN and calls wait):
-        # parsed and walked in a worker thread, never on the event loop.
-        node_types, models, loras = await asyncio.to_thread(_parse_object_info, resp.content)
+        # parsed and walked in a worker thread, never on the event loop. A thread does
+        # not free the loop from json.loads, though — it holds the GIL (~16 ms stall per
+        # poll, measured 2026-11-18) — so an UNCHANGED body is not parsed at all: its
+        # sha256 (hashlib releases the GIL) is compared with the last poll's.
+        raw = resp.content
+        digest = await asyncio.to_thread(lambda: hashlib.sha256(raw).digest())
+        if self._oi_cache is None or self._oi_cache[0] != digest:
+            self._oi_cache = (digest, await asyncio.to_thread(_parse_object_info, raw))
+        node_types, models, loras = self._oi_cache[1]
         self._node_types = node_types                 # cache slot types for bypass (free — same fetch)
-        caps = Capabilities(models=models, loras=loras, pricing={})
+        # copies: what a caller does to the sets must not reach the next poll's result
+        caps = Capabilities(models=set(models), loras=set(loras), pricing={})
         qr = await client.get(f"{url}/queue", timeout=_COMFY_DISCOVERY_TIMEOUT)
         qr.raise_for_status()
         self._check_executor(qr.json())               # raises ComfyExecutorStuck → DOWN path
@@ -3457,6 +3466,7 @@ class ComfyUIAdapter(BackendAdapter):
         the old host says nothing about the new one)."""
         if isinstance(old, ComfyUIAdapter) and old.backend.get("url") == self.backend.get("url"):
             self._node_types = old._node_types
+            self._oi_cache = old._oi_cache
             self._stuck_head, self._stuck_since = old._stuck_head, old._stuck_since
             self.exec_stuck = old.exec_stuck
 
