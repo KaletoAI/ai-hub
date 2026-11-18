@@ -445,7 +445,14 @@ errors, 5xx and 429 are about the SERVICE and get `disconnect_grace` — a poll-
 429 must not end a task that is running and already paid for; every parsed poll feeds
 the vendor's percentage to `ctx.note_progress` as step N/100 — `_note_cloud_progress`,
 keyed by the `_CLOUD_JOB` ContextVar `generate()` sets per request and clears with
-`None` at the end), `_download` (NO auth
+`None` at the end), `_download` → `_download_asset` (the artifact URL is the vendor's
+DATA and is fetched from inside the LAN: `_checked_asset_url` refuses, on EVERY redirect
+hop, anything but plain http(s), credentials in the URL, and a host that is or resolves
+to a non-public address — except the (host, port) the operator configured as the
+backend's own `url`/`media_url`, a LAN stub or proxy; not pinned, unlike
+`main._fetch_ref_url`; the body is streamed under `_CLOUD_DOWNLOAD_MAX_BYTES`, 1 GiB; a
+refusal is a final RuntimeError, never retried — `test_cloudtask.ArtifactUrlFence`, and
+`tests/__init__.py` keeps the suite from doing DNS; NO auth
 header: signed CDN urls, the bearer must not leak there; a dropped transfer or a 5xx
 is retried — `_CLOUD_DOWNLOAD_ATTEMPTS`, 1/2/4 s backoff — because the GET is free
 and assets.meshy.ai's CloudFront cuts bodies mid-transfer: measured 2026-10-15, 1 in 3

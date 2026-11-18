@@ -179,7 +179,7 @@ class ArtifactDownloadRetry(unittest.TestCase):
 
         async def run():
             async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-                return await self.adapters.CloudTaskAdapter._download(client, "https://cdn/x.glb")
+                return await self.adapters._download_asset(client, "https://cdn/x.glb")
         return run, calls
 
     def test_dropped_transfer_is_retried(self):
@@ -208,6 +208,128 @@ class ArtifactDownloadRetry(unittest.TestCase):
         with self.assertRaises(httpx.TransportError):
             asyncio.run(run())
         self.assertEqual(len(calls), self.adapters._CLOUD_DOWNLOAD_ATTEMPTS)
+
+
+class ArtifactUrlFence(unittest.TestCase):
+    """The artifact URL is data from the vendor (or a redirect of its CDN) and the
+    gateway fetches it from INSIDE the LAN, handing the body to the caller as the job's
+    file. Without a fence a compromised vendor answer — or one redirect — reads
+    `http://127.0.0.1:4000/…`, a backend's admin port or the metadata service through
+    the gateway; and a body without end is buffered until the process dies. Silent
+    both ways: the job just "succeeds" with the wrong bytes, or the box runs out of
+    memory. Pinned: literal and RESOLVED private addresses are refused on every hop,
+    refusals are final (never retried), and the body is capped."""
+
+    def setUp(self):
+        import adapters
+        self.adapters = adapters
+        self._saved = (adapters._CLOUD_DOWNLOAD_BACKOFF_S, adapters._resolve_asset_host,
+                       adapters._CLOUD_DOWNLOAD_MAX_BYTES)
+        adapters._CLOUD_DOWNLOAD_BACKOFF_S = 0.0
+        self.dns = {"cdn.vendor.example": ["93.184.216.34"], "evil.example": ["10.0.0.7"],
+                    "mapped.example": ["::ffff:127.0.0.1"],
+                    "mixed.example": ["93.184.216.34", "192.168.8.10"]}
+
+        async def resolve(host, port):
+            if host not in self.dns:
+                raise OSError("nxdomain")
+            return self.dns[host]
+        adapters._resolve_asset_host = resolve
+
+    def tearDown(self):
+        a = self.adapters
+        a._CLOUD_DOWNLOAD_BACKOFF_S, a._resolve_asset_host, a._CLOUD_DOWNLOAD_MAX_BYTES = self._saved
+
+    def _fetch(self, url, handler):
+        import httpx
+        calls = []
+
+        def h(request):
+            calls.append(str(request.url))
+            return handler(request)
+
+        async def run():
+            async with httpx.AsyncClient(transport=httpx.MockTransport(h)) as client:
+                return await self.adapters._download_asset(client, url)
+        return run, calls
+
+    def _ok(self, request):
+        import httpx
+        return httpx.Response(200, content=b"GLB")
+
+    def test_private_targets_are_refused_before_any_request(self):
+        for url in ("http://127.0.0.1:4000/health", "https://192.168.8.34:8188/system_stats",
+                    "http://169.254.169.254/latest/meta-data/", "https://[::1]/x",
+                    "https://[::ffff:10.0.0.1]/x", "https://100.64.0.1/x",
+                    "https://evil.example/x.glb", "https://mapped.example/x",
+                    "https://mixed.example/x", "ftp://cdn.vendor.example/x",
+                    "file:///etc/passwd", "https://user:pw@cdn.vendor.example/x", ""):
+            run, calls = self._fetch(url, self._ok)
+            with self.assertRaises(RuntimeError, msg=url):
+                asyncio.run(run())
+            self.assertEqual(calls, [], url)           # refused, and not retried
+
+    def test_public_and_unresolvable_hosts_pass(self):
+        for url in ("https://cdn.vendor.example/x.glb?sig=1", "https://93.184.216.34/x",
+                    "https://no-such-host.example/x"):
+            run, calls = self._fetch(url, self._ok)
+            self.assertEqual(asyncio.run(run()), b"GLB")
+            self.assertEqual(calls, [url])
+
+    def test_only_the_operators_own_endpoint_is_trusted(self):
+        """A vendor stub/proxy on the LAN serves its files from the configured URL —
+        that host AND port, nothing else on the box."""
+        a = self.adapters
+        trusted = frozenset({a._asset_endpoint("http://192.168.8.50:9000/api")})
+        self.assertEqual(trusted, {("192.168.8.50", 9000)})
+        ok = asyncio.run(a._checked_asset_url("http://192.168.8.50:9000/files/a.glb", trusted))
+        self.assertTrue(ok)
+        for url in ("http://192.168.8.50:4000/ui", "http://192.168.8.51:9000/a", "http://127.0.0.1:9000/a"):
+            with self.assertRaises(RuntimeError, msg=url):
+                asyncio.run(a._checked_asset_url(url, trusted))
+        self.assertIsNone(a._asset_endpoint(None))
+        self.assertIsNone(a._asset_endpoint("not a url"))
+
+    def test_redirect_into_the_lan_is_refused(self):
+        import httpx
+
+        def handler(request):
+            return httpx.Response(302, headers={"location": "http://192.168.8.10:4000/ui"})
+        run, calls = self._fetch("https://cdn.vendor.example/x.glb", handler)
+        with self.assertRaises(RuntimeError):
+            asyncio.run(run())
+        self.assertEqual(calls, ["https://cdn.vendor.example/x.glb"])
+
+    def test_public_redirect_is_followed(self):
+        import httpx
+
+        def handler(request):
+            if request.url.path == "/a":
+                return httpx.Response(302, headers={"location": "/b"})
+            return httpx.Response(200, content=b"GLB")
+        run, calls = self._fetch("https://cdn.vendor.example/a", handler)
+        self.assertEqual(asyncio.run(run()), b"GLB")
+        self.assertEqual(len(calls), 2)
+
+    def test_redirect_loop_ends(self):
+        import httpx
+        run, calls = self._fetch("https://cdn.vendor.example/a",
+                                 lambda r: httpx.Response(302, headers={"location": "/a"}))
+        with self.assertRaises(RuntimeError):
+            asyncio.run(run())
+        self.assertEqual(len(calls), self.adapters._CLOUD_DOWNLOAD_REDIRECTS + 1)
+
+    def test_body_is_capped(self):
+        import httpx
+        self.adapters._CLOUD_DOWNLOAD_MAX_BYTES = 10
+        run, calls = self._fetch("https://cdn.vendor.example/a",
+                                 lambda r: httpx.Response(200, content=b"x" * 11))
+        with self.assertRaises(RuntimeError):
+            asyncio.run(run())
+        self.assertEqual(len(calls), 1)                # final, not retried
+        run, _ = self._fetch("https://cdn.vendor.example/a",
+                             lambda r: httpx.Response(200, content=b"x" * 10))
+        self.assertEqual(asyncio.run(run()), b"x" * 10)
 
 
 if __name__ == "__main__":

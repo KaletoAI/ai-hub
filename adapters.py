@@ -31,6 +31,7 @@ import math
 import os
 import random
 import re
+import socket
 import struct
 import time
 import uuid
@@ -4595,6 +4596,93 @@ _CLOUD_HTTP_TIMEOUT = 30.0
 _CLOUD_DOWNLOAD_TIMEOUT = 120.0
 _CLOUD_DOWNLOAD_ATTEMPTS = 4          # artifact GETs are free — see CloudTaskAdapter._download
 _CLOUD_DOWNLOAD_BACKOFF_S = 1.0       # 1, 2, 4 s between the tries
+_CLOUD_DOWNLOAD_MAX_BYTES = 1 << 30   # one artifact; a body past this is refused, not buffered
+_CLOUD_DOWNLOAD_REDIRECTS = 5
+
+
+async def _resolve_asset_host(host: str, port: int) -> list:
+    """Every address `host` resolves to (the tests replace this: they never do DNS)."""
+    infos = await asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    return [i[4][0] for i in infos]
+
+
+async def _checked_asset_url(url: str, trusted: frozenset = frozenset()) -> str:
+    """`url` if a vendor's artifact may be fetched from it, else RuntimeError.
+
+    The URL is DATA from the vendor's task answer (or a redirect of its CDN), and the
+    gateway fetches it from inside the LAN and hands the body to the caller as the
+    job's artifact — so it must not name the gateway itself, a backend's admin port or
+    a metadata service. Refused: anything but http(s), credentials in the URL, and a
+    host that IS or RESOLVES TO a non-public address (loopback, RFC 1918, link-local,
+    CGNAT, ULA; an IPv4-mapped address is judged as its IPv4). A name that does not
+    resolve is let through — the GET fails on its own. Not pinned: a name that changes
+    its answer between this check and the connect gets past it (client-supplied URLs,
+    where that attack is cheap, go through main._fetch_ref_url, which pins).
+    `trusted` = the (host, port) pairs the OPERATOR configured as this backend's API:
+    a vendor stub or proxy on the LAN serves its artifacts from there, and that address
+    was the operator's choice, not the vendor's data."""
+    p = urlsplit(str(url or ""))
+    host = p.hostname
+    if p.scheme not in ("http", "https") or not host or p.username or p.password:
+        raise RuntimeError(f"refused artifact URL (not a plain http(s) URL): {str(url).split('?')[0][:120]}")
+    port = p.port or (443 if p.scheme == "https" else 80)
+    if (host.lower(), port) in trusted:
+        return url
+    try:
+        addrs = [str(ipaddress.ip_address(host))]
+    except ValueError:
+        try:
+            addrs = await _resolve_asset_host(host, port)
+        except (OSError, UnicodeError):
+            addrs = []
+    for a in addrs:
+        try:
+            ip = ipaddress.ip_address(a.split("%", 1)[0])
+        except ValueError:
+            continue
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        if not ip.is_global or ip.is_multicast:
+            raise RuntimeError(f"refused artifact URL: {host} is a private, loopback or "
+                               f"link-local address ({ip})")
+    return url
+
+
+def _asset_endpoint(url) -> Optional[tuple]:
+    """(host, port) of a configured API URL, for `_checked_asset_url(trusted=…)`."""
+    try:
+        p = urlsplit(str(url or ""))
+        if p.scheme in ("http", "https") and p.hostname:
+            return p.hostname.lower(), p.port or (443 if p.scheme == "https" else 80)
+    except ValueError:
+        pass
+    return None
+
+
+async def _get_asset_once(client, url: str, trusted: frozenset = frozenset()):
+    """One credential-free GET of an artifact: every redirect hop re-checked
+    (`_checked_asset_url`), the body streamed under `_CLOUD_DOWNLOAD_MAX_BYTES`.
+    Returns (status, bytes) — bytes only for a 200."""
+    for _ in range(_CLOUD_DOWNLOAD_REDIRECTS + 1):
+        url = await _checked_asset_url(url, trusted)
+        async with client.stream("GET", url, timeout=_CLOUD_DOWNLOAD_TIMEOUT,
+                                 follow_redirects=False) as r:
+            if r.is_redirect and r.headers.get("location"):
+                url = urljoin(url, r.headers["location"])
+                continue
+            if r.status_code != 200:
+                return r.status_code, b""
+            limit = _CLOUD_DOWNLOAD_MAX_BYTES
+            too_big = RuntimeError(f"artifact exceeds {limit // (1 << 20)} MB: {url.split('?')[0]}")
+            if r.headers.get("content-length", "").isdigit() and int(r.headers["content-length"]) > limit:
+                raise too_big
+            buf = bytearray()
+            async for chunk in r.aiter_bytes():
+                buf += chunk
+                if len(buf) > limit:
+                    raise too_big
+            return 200, bytes(buf)
+    raise RuntimeError(f"artifact download redirected too many times: {url.split('?')[0]}")
 
 
 class _TaskVerdict(RuntimeError):
@@ -4758,6 +4846,33 @@ class ArliAIImageAdapter(BackendAdapter):
             "backend": self.name, "cloud": arliai.KIND, "endpoint": "txt2img",
             "ai_model": req.real_model, "request": arliai.request_summary(body),
             "info": info, "elapsed_ms": int((time.monotonic() - started) * 1000)})
+
+
+async def _download_asset(client, url: str, trusted: frozenset = frozenset()) -> bytes:
+    # NO auth header: signed asset URLs on a CDN host; the bearer must not leak there.
+    # A GET of a finished task's artifact is free and idempotent, so a dropped
+    # transfer or a 5xx is retried here. assets.meshy.ai (CloudFront) cuts a download
+    # mid-body now and then (measured 2026-10-15: 1 in 3 GETs of one 9 MB GLB died
+    # after 1–2 MB, the next took 0.4 s); with one try that failed two paid meshes.
+    # A 4xx (expired/wrong signed URL) is final at once — and so is a URL (or a
+    # redirect hop) that points into a private network, or a body past the cap
+    # (`_get_asset_once`): both are RuntimeErrors, never retried.
+    for attempt in range(_CLOUD_DOWNLOAD_ATTEMPTS):
+        last = attempt == _CLOUD_DOWNLOAD_ATTEMPTS - 1
+        try:
+            status, data = await _get_asset_once(client, url, trusted)
+        except httpx.TransportError as e:
+            if last:
+                raise
+            logger.warning(f"cloud artifact download {attempt + 1}/{_CLOUD_DOWNLOAD_ATTEMPTS} "
+                           f"broke ({e}) — retrying {url.split('?')[0]}")
+        else:
+            if status == 200:
+                return data
+            if status < 500 or last:
+                raise RuntimeError(f"asset download failed ({status}) for "
+                                   f"{url.split('?')[0]}")
+        await asyncio.sleep(_CLOUD_DOWNLOAD_BACKOFF_S * 2 ** attempt)
 
 
 class CloudTaskAdapter(BackendAdapter):
@@ -5055,30 +5170,13 @@ class CloudTaskAdapter(BackendAdapter):
             self.ctx.note_progress(job_id, {"basis": "live", "backend": self.name, "step": pct,
                                             "steps": 100, "fraction": round(pct / 100, 3)})
 
-    @staticmethod
-    async def _download(client, url: str) -> bytes:
-        # NO auth header: signed asset URLs on a CDN host; the bearer must not leak there.
-        # A GET of a finished task's artifact is free and idempotent, so a dropped
-        # transfer or a 5xx is retried here. assets.meshy.ai (CloudFront) cuts a download
-        # mid-body now and then (measured 2026-10-15: 1 in 3 GETs of one 9 MB GLB died
-        # after 1–2 MB, the next took 0.4 s); with one try that failed two paid meshes.
-        # A 4xx (expired/wrong signed URL) is final at once.
-        for attempt in range(_CLOUD_DOWNLOAD_ATTEMPTS):
-            last = attempt == _CLOUD_DOWNLOAD_ATTEMPTS - 1
-            try:
-                r = await client.get(url, timeout=_CLOUD_DOWNLOAD_TIMEOUT, follow_redirects=True)
-            except httpx.TransportError as e:
-                if last:
-                    raise
-                logger.warning(f"cloud artifact download {attempt + 1}/{_CLOUD_DOWNLOAD_ATTEMPTS} "
-                               f"broke ({e}) — retrying {url.split('?')[0]}")
-            else:
-                if r.status_code == 200:
-                    return r.content
-                if r.status_code < 500 or last:
-                    raise RuntimeError(f"asset download failed ({r.status_code}) for "
-                                       f"{url.split('?')[0]}")
-            await asyncio.sleep(_CLOUD_DOWNLOAD_BACKOFF_S * 2 ** attempt)
+    def _trusted_asset_hosts(self) -> frozenset:
+        """The backend's own configured API endpoints — see `_checked_asset_url`."""
+        return frozenset(e for e in (_asset_endpoint(self.backend.get(k))
+                                     for k in ("url", "media_url")) if e)
+
+    async def _download(self, client, url: str) -> bytes:
+        return await _download_asset(client, url, self._trusted_asset_hosts())
 
 
 class NanoGPTMediaAdapter(CloudTaskAdapter):
@@ -6183,7 +6281,7 @@ class WiroMediaAdapter(CloudTaskAdapter):
     async def _download(self, client, url: str) -> bytes:
         if url.startswith(_WIRO_MEM):
             return self._fetched.pop(url[len(_WIRO_MEM):])
-        return await CloudTaskAdapter._download(client, url)
+        return await CloudTaskAdapter._download(self, client, url)
 
     def _api(self, path: str) -> str:
         return (self.backend.get("media_url") or wiro.MEDIA_URL).rstrip("/") + path
@@ -6735,18 +6833,18 @@ class LuLabsMediaAdapter(CloudTaskAdapter):
     async def _download(self, client, url: str) -> bytes:
         if url.startswith(_LULABS_MEM):
             return self._fetched.pop(url[len(_LULABS_MEM):])
-        return await CloudTaskAdapter._download(client, url)
+        return await CloudTaskAdapter._download(self, client, url)
 
     async def _fetch_result(self, client, url: str) -> bytes:
         """`/jobs/{id}/content` is authenticated and REDIRECTS to the file: fetch it with
         the key and without following, then the target WITHOUT the key (a CDN must never
         see it). A result URL from the job JSON is a plain credential-free download."""
         if not url.startswith(self._api("/jobs/")):
-            return await CloudTaskAdapter._download(client, url)
+            return await CloudTaskAdapter._download(self, client, url)
         resp = await client.get(url, headers=self._headers(), follow_redirects=False,
                                 timeout=_CLOUD_DOWNLOAD_TIMEOUT)
         if resp.is_redirect and resp.headers.get("location"):
-            return await CloudTaskAdapter._download(client, urljoin(url, resp.headers["location"]))
+            return await CloudTaskAdapter._download(self, client, urljoin(url, resp.headers["location"]))
         if resp.status_code == 200:
             return resp.content
         raise RuntimeError(f"LU Labs result download failed ({resp.status_code})")
