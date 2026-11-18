@@ -10387,7 +10387,7 @@ def _spark(vals, top, color: str) -> str:
           for i, v in enumerate(pts)]
     line = " ".join(f"{x:.1f},{y:.1f}" for x, y in xy)
     return (f"<svg width='64' height='14' viewBox='0 0 64 14' "
-            f"style='vertical-align:-2px;margin:0 4px' aria-hidden='true'>"
+            f"style='vertical-align:-2px;margin:0 3px' aria-hidden='true'>"
             f"<polygon points='0,{h:.0f} {line} {w:.0f},{h:.0f}' fill='{color}' fill-opacity='.22'/>"
             f"<polyline points='{line}' fill='none' stroke='{color}' stroke-width='1.2' "
             f"stroke-linejoin='round'/></svg>")
@@ -10413,7 +10413,7 @@ def _node_times_table(m: dict) -> str:
     gpu_avg, vram_max, vram_total = (_hw_num(hw.get(k)) for k in ("gpu_avg", "vram_max", "vram_total"))
     has_gpu = gpu_avg is not None or any(_hw_num(n.get("gpu")) is not None for n in rec["nodes"])
     has_vram = vram_max is not None or any(_hw_num(n.get("vram")) is not None for n in rec["nodes"])
-    num = "text-align:right;white-space:nowrap;padding-left:10px"
+    num = "text-align:right;white-space:nowrap;padding-left:6px"
     rows = []
     for n in rec["nodes"]:
         sec = float(n.get("s") or 0)
@@ -10430,9 +10430,9 @@ def _node_times_table(m: dict) -> str:
         rows.append(
             f"<tr><td>{_esc(n.get('title') or n.get('id'))} <span class='muted'>#{_esc(n.get('id'))}</span>{steps}</td>"
             f"<td style='text-align:right;white-space:nowrap'>{_dur(sec * 1000)}</td>"
-            f"<td style='width:{110 if cells else 160}px'><div style='height:6px;background:#232a35;border-radius:3px;overflow:hidden'>"
+            f"<td style='width:{90 if cells else 160}px'><div style='height:6px;background:#232a35;border-radius:3px;overflow:hidden'>"
             f"<div style='height:6px;width:{pct:.1f}%;background:#6cb0ef'></div></div></td>"
-            f"<td class='muted' style='text-align:right'>{pct:.0f}%</td>{cells}</tr>")
+            f"<td class='muted' style='text-align:right;white-space:nowrap'>{pct:.0f}%</td>{cells}</tr>")
     head = ""
     if has_gpu or has_vram:
         head = ("<tr class='muted' style='font-size:11px'><td colspan='4'></td>"
@@ -10453,8 +10453,9 @@ def _node_times_table(m: dict) -> str:
     title = "<h3>Time per node</h3>"
     if summary:
         title = ("<div style='display:flex;align-items:baseline;justify-content:space-between;"
-                 "gap:12px;flex-wrap:wrap'><h3>Time per node</h3>"
-                 f"<span class='muted' style='font-size:12px'>{' &nbsp;·&nbsp; '.join(summary)}</span></div>")
+                 "gap:4px 12px;flex-wrap:wrap'><h3 style='flex:0 0 auto'>Time per node</h3>"
+                 f"<span class='muted' style='font-size:12px;display:flex;gap:12px;flex-wrap:wrap'>"
+                 f"{''.join(summary)}</span></div>")
     foot = [f"total {_dur(total * 1000)}"]
     if rec.get("cached"):
         foot.append(f"{len(rec['cached'])} node(s) served from ComfyUI's cache")

@@ -321,6 +321,28 @@ message) keeps `progress_age_s` honest despite the per-second re-emits. The view
 `progress_basis: "profile"`); the node detail stays in `step`/`steps`/`node_eta_s`/
 `node_title`. No profile (first run, no feed) → exactly the node-level feed of before.
 The job page lists a finished run's `node_times` as "Time per node".
+**GPU load and VRAM beside the node times** (`nodeprofile.note_hw`, display only —
+`build`/`overall` never read it): while a prompt runs, two sources book device readings
+on the node that is running. VRAM comes from `GET /system_stats` (`total − free` of the
+first device), probed by `_poll` at most every `_HW_SAMPLE_S` (2 s) while the prompt is
+not done; GPU LOAD is not in ComfyUI's REST at all and comes from the
+`crystools.monitor` broadcast on the progress socket (`_note_monitor`), where that
+plugin is installed. The record gains per node `gpu` (mean %) and `vram` (peak MiB) and
+a run block `hw {gpu[], vram[], gpu_avg, vram_max, vram_total}` (curves of ≤ 60 points,
+MiB); `VERSION` stays 1. Rules, pinned in `test_node_profile.py` (`HwSamples`),
+`test_ws_progress.py` (`HwMonitor`, `HwPollSample`) and `test_node_times_table.py`:
+a monitor's −1 is "no reading", never a value (measured 2026-11-18: Crystools reports
+VRAM −1 on the unified-memory box while `/system_stats` is right — hence Crystools'
+VRAM is only a fallback until `/system_stats` has answered once, `run.hw_stats`); a
+reading while no node runs goes to the curve only; the raw curves halve their
+resolution past `HW_RAW_MAX` (a run of hours stays bounded); the monitor message is
+consumed BEFORE the pre-submit buffer and the prompt_id gate and never sets `msg_at`
+(it arrives every second without a prompt_id — it would fill the 500-message buffer
+behind a long queue and make a stalled node look alive); the `/system_stats` probe runs
+as its own single-flight task, so a hanging probe never delays a poll tick, its failure
+never ends a job, and it never counts as "reachable" for `disconnect_grace`. The job
+page shows only the columns that have data (no monitor → VRAM only; old rows → the
+old table) and says the values are the whole device's, not the job's.
 `suggest_mapping()` is only an auto-detect pre-fill. ComfyUI `/prompt`
 rejections are translated to readable per-node errors (node title, class,
 field, offending request param) via `_comfy_prompt_error`; raw body stays the
