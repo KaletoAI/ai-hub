@@ -52,7 +52,11 @@ pre-closed `<|channel>thought` tail, although the model can only emit plain
 answer text then) and
 `ComfyUIAdapter` (`type: comfyui`; `discover()` via `/object_info` →
 models + **installed LoRAs** (the MB-sized body parsed in a worker thread,
-`_parse_object_info` — never on the loop; `test_comfy_discover.py`), plus an
+`_parse_object_info` — never on the loop; and since a thread does NOT free the loop
+from `json.loads`, which holds the GIL for the whole call — ~16 ms stall per poll,
+measured 2026-11-18 — an UNCHANGED body is not parsed at all: its sha256, which does
+release the GIL, is compared with the last poll's, `_oi_cache`; the returned sets are
+copies; `test_comfy_discover.py`), plus an
 **executor watchdog** via `/queue`:
 same head prompt pending with an idle executor across ≥2 checks and
 ≥`stuck_after_s` (default 90) → `ComfyExecutorStuck` → the normal DOWN path
@@ -2888,6 +2892,38 @@ Unsupported rigged/compressed/multi-primitive inputs fail explicitly.
 `tests/test_face_texture_only.py` guards attribute/triangle preservation,
 shared-UV body isolation, texel centers/gutters and occlusion; it skips when
 the optional worker's scientific dependencies are absent from the gateway venv.
+
+## Review 2026-11-18 — what changed and why
+
+Each of these failed silently; each has a test whose docstring carries the detail.
+
+- **`admin._self_api` is in-process** (`httpx.ASGITransport(app=request.app)`). It
+  carries the admin's or the master key and once built its target from
+  `request.base_url` — the caller's Host header: a session cookie plus
+  `Host: attacker.tld` made the gateway POST the key there. `test_self_api.py`.
+- **httpx's request log loses the query string** (`main._RedactQuery` on the `httpx`
+  logger): signed asset URLs and tokens in reference-image URLs were in the journal.
+- **No `/docs`, `/redoc`, `/openapi.json`**: unauthenticated, and their JS comes from a
+  third-party CDN into the console's origin.
+- **Cloud artifact downloads are fenced** — see `_download_asset` under `adapters.py`.
+- **`jobs` indexes** `jobs_alias(alias, status, created)`, `jobs_status(status, task)`,
+  `jobs_owner(owner, task)`, and the short-id lookup is a primary-key RANGE
+  (`id >= p AND id < p||'g'`), not `LIKE 'p%'` (case-insensitive LIKE cannot use the
+  index). Rows carry workflows, so every scan read megabytes. `test_jobs_indexes.py`
+  pins the plans with EXPLAIN.
+- **The Media Playground's live tick** (every 2 s while `?job=` runs) reuses the model
+  list and the artifact picker for `_PG_LIVE_MEMO_S` (`_pg_cached`); a render without a
+  running job never reads the memo. `test_playground_live_memo.py`.
+- **`main._llm_models` is memoized** for catalog accounts, valid while its three inputs
+  are the same objects (and sizes) — they are replaced, never edited in place.
+  `test_llm_models_memo.py`.
+- **A worker thread only helps GIL-free work.** `asyncio.to_thread` keeps the loop
+  responsive for hashlib, zlib, PIL, file and socket I/O and for pure-Python code (the
+  interpreter switches threads), but NOT for one long C call that holds the GIL:
+  `json.dumps`/`json.loads`/base64 of a 93 MB body stall the loop ~100–150 ms from
+  inside a thread (measured 2026-11-18). Statements elsewhere in this document that
+  such work is "off the loop" mean off the loop's CALL STACK, not that the loop runs
+  meanwhile. Open: streaming large bodies in slices (Meshy rig upload, S3 parts).
 
 ## Request flow
 
