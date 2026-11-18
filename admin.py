@@ -6567,9 +6567,14 @@ async def _self_api(request: Request, method: str, path: str, **kw) -> httpx.Res
     headers = {"x-source": "playground"}
     if key:
         headers["authorization"] = f"Bearer {key}"
-    url = str(request.base_url).rstrip("/") + path       # our own listener, whatever host/port serves /ui
-    async with httpx.AsyncClient(timeout=600.0) as c:    # sync calls may park before running
-        return await c.request(method, url, headers=headers, **kw)
+    # IN-PROCESS, through the whole ASGI app (middleware included) — never a URL built
+    # from the request: `request.base_url` is the caller's Host header, so anyone
+    # holding a session cookie could name their own server there and be SENT the key
+    # (a 12-hour session turned into a permanent credential, the master key included).
+    transport = httpx.ASGITransport(app=request.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ai-hub.internal",
+                                 timeout=600.0) as c:    # sync calls may park before running
+        return await c.request(method, path, headers=headers, **kw)
 
 
 # On submit, show immediate feedback: replace the (possibly stale) result with a

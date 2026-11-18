@@ -62,6 +62,24 @@ from responses_bridge import (chat_to_responses, response_shell, responses_strea
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
+
+class _RedactQuery(logging.Filter):
+    """httpx logs every outgoing request at INFO as `HTTP Request: GET <full url> …`.
+    The lines are worth keeping (which backend was asked what, and what it answered),
+    but a query string is where credentials travel: a vendor's signed asset URL, a
+    client's reference image with a token. So the journal gets the URL without it."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 2:
+            url = str(args[1])
+            if "?" in url:
+                record.args = (args[0], url.split("?", 1)[0] + "?…") + args[2:]
+        return True
+
+
+logging.getLogger("httpx").addFilter(_RedactQuery())
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 CONFIG_PATH = Path("config.yaml")
@@ -1404,7 +1422,11 @@ async def lifespan(app: FastAPI):
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="AI-Hub", lifespan=lifespan)
+# No interactive docs: /docs and /redoc are unauthenticated, list every route (the
+# console's POST actions included) and load their JS from a third-party CDN INTO this
+# origin — where it could act with a logged-in admin's session cookie.
+app = FastAPI(title="AI-Hub", lifespan=lifespan,
+              docs_url=None, redoc_url=None, openapi_url=None)
 
 # Request bodies are read whole (request.json()/body()) — nothing bounded them, so one
 # client could hand the gateway an arbitrarily large body to hold in memory (review S10).
