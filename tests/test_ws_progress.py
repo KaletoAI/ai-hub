@@ -171,7 +171,7 @@ class HwMonitor(unittest.TestCase):
 
     def setUp(self):
         self.ad = _adapter()
-        self.state = {"prompt_id": PID, "run": {"cur": "5", "cur_at": 0.0}}
+        self.state = {"prompt_id": PID, "run": {"cur": "5", "cur_at": 0.0, "exec_at": 0.0}}
 
     def test_monitor_folds_without_prompt_gate(self):
         self.assertTrue(self.ad._note_monitor(self.state, _monitor(80), 1.0))
@@ -189,12 +189,10 @@ class HwMonitor(unittest.TestCase):
         self.assertFalse(self.ad._note_monitor(self.state, {"type": None}, 1.0))
 
     def test_crystools_vram_only_as_fallback(self):
+        """The monitor's VRAM goes to the FALLBACK series, never beside the probe's."""
         self.ad._note_monitor(self.state, _monitor(50, 5 << 30, 8 << 30), 1.0)
-        self.assertEqual(len(self.state["run"]["hw"]["vram"]), 1)
-        self.state["run"]["hw_stats"] = True          # /system_stats has answered
-        self.ad._note_monitor(self.state, _monitor(50, 6 << 30, 8 << 30), 2.0)
-        self.assertEqual(len(self.state["run"]["hw"]["vram"]), 1)
-        self.assertEqual(len(self.state["run"]["hw"]["gpu"]), 2)
+        hw = self.state["run"]["hw"]
+        self.assertEqual((len(hw["vram"]), len(hw["vram2"]), len(hw["gpu"])), (0, 1, 1))
 
     def test_malformed_monitor_is_harmless(self):
         for data in (None, "x", {"gpus": "x"}, {"gpus": [None]}):

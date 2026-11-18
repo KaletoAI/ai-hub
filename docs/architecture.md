@@ -331,14 +331,19 @@ plugin is installed. The record gains per node `gpu` (mean %) and `vram` (peak M
 a run block `hw {gpu[], vram[], gpu_avg, vram_max, vram_total}` (curves of ≤ 60 points,
 MiB); `VERSION` stays 1. Rules, pinned in `test_node_profile.py` (`HwSamples`),
 `test_ws_progress.py` (`HwMonitor`, `HwPollSample`) and `test_node_times_table.py`:
-a monitor's −1 is "no reading", never a value (measured 2026-11-18: Crystools reports
-VRAM −1 on the unified-memory box while `/system_stats` is right — hence Crystools'
-VRAM is only a fallback until `/system_stats` has answered once, `run.hw_stats`); a
-reading while no node runs goes to the curve only; the raw curves halve their
-resolution past `HW_RAW_MAX` (a run of hours stays bounded); the monitor message is
-consumed BEFORE the pre-submit buffer and the prompt_id gate and never sets `msg_at`
-(it arrives every second without a prompt_id — it would fill the 500-message buffer
-behind a long queue and make a stalled node look alive); the `/system_stats` probe runs
+a monitor's −1 (or a non-finite value) is "no reading", never a value (measured
+2026-11-18: Crystools reports VRAM −1 on the unified-memory box while `/system_stats`
+is right); the two VRAM sources count differently and the peak is a max, so Crystools'
+VRAM goes to its own series (`vram2`) and `record` uses it only when the probe never
+answered; nothing is booked before the run executes (`exec_at`) — a prompt queued
+behind another one would record THAT job's load and peak as its own; a reading while
+no node runs goes to the curve only; the raw curves halve their resolution past
+`HW_RAW_MAX` (a run of hours stays bounded) and the run's mean load is therefore summed
+separately, not read off the merged curve; the monitor message is consumed BEFORE the
+pre-submit buffer and the prompt_id gate (it carries no prompt_id and arrives every
+second), never sets `msg_at` and never raises (an exception in the ws loop marks the
+feed `broken` and costs the timing record — `record` likewise drops the hw part rather
+than the record on any trouble); the `/system_stats` probe runs
 as its own single-flight task, so a hanging probe never delays a poll tick, its failure
 never ends a job, and it never counts as "reachable" for `disconnect_grace`. The job
 page shows only the columns that have data (no monitor → VRAM only; old rows → the

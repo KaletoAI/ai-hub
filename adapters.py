@@ -4015,9 +4015,8 @@ class ComfyUIAdapter(BackendAdapter):
                 return
             used, total = nodeprofile.parse_system_stats(r.json())
             if used is not None:
-                run = ws_state["run"]
-                run["hw_stats"] = True          # Crystools' VRAM is the fallback only
-                nodeprofile.note_hw(run, time.monotonic(), vram=used, vram_total=total)
+                nodeprofile.note_hw(ws_state["run"], time.monotonic(),
+                                    vram=used, vram_total=total)
         if log_on:
             logger.info(f"→ [{bname}] queued {prompt_id} (workflow {os.path.basename(req.workflow or '?')})")
         if req.job_id:
@@ -4176,19 +4175,20 @@ class ComfyUIAdapter(BackendAdapter):
         `crystools.monitor` about once a second, to everyone, without a prompt_id) —
         the only place a ComfyUI box tells us its GPU LOAD. It is folded into the run's
         device readings and goes no further: it is not progress, so it must not reset
-        `quiet_s`, and it must not fill the pre-submit buffer (500 messages would be
-        gone in minutes behind a long queue). Readings before OUR prompt is known are
-        dropped. Its VRAM counts only until /system_stats has answered once: that
-        probe is the better source (Crystools says -1 on unified memory)."""
+        `quiet_s`, and it must not fill the pre-submit buffer (500 messages can be
+        gone while a slow submit is in flight). Readings before OUR prompt executes
+        are dropped (`note_hw`). Its VRAM is the FALLBACK series only (`vram2`): the
+        /system_stats probe is the better source — Crystools says -1 on unified memory
+        and counts "used" its own way. Never raises: a failure here would mark the
+        feed broken and cost the run its timing record."""
         if not isinstance(msg, dict) or msg.get("type") != "crystools.monitor":
             return False
         if state.get("prompt_id") is None:
             return True
-        run = state.setdefault("run", {})
-        gpu, used, total = nodeprofile.parse_monitor(msg.get("data"))
-        if run.get("hw_stats"):
-            used = total = None
-        nodeprofile.note_hw(run, now, gpu=gpu, vram=used, vram_total=total)
+        with contextlib.suppress(Exception):
+            gpu, used, total = nodeprofile.parse_monitor(msg.get("data"))
+            nodeprofile.note_hw(state.setdefault("run", {}), now, gpu=gpu,
+                                vram2=used, vram2_total=total)
         return True
 
     async def _progress_ticker(self, state: dict, emit) -> None:
@@ -4340,8 +4340,10 @@ class ComfyUIAdapter(BackendAdapter):
             return await self._poll_run(client, url, prompt_id, poll_interval, max_wait,
                                         tick if sample else None)
         finally:
-            if probe["task"] is not None:
+            if probe["task"] is not None:       # gone before the caller reads the run state
                 probe["task"].cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await probe["task"]
 
     async def _poll_run(self, client, url, prompt_id, poll_interval, max_wait,
                         tick=None) -> dict:

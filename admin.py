@@ -10467,9 +10467,10 @@ def _node_times_table(m: dict) -> str:
     if isinstance(rec.get("wait_s"), (int, float)) and rec["wait_s"] >= 1:
         foot.append(f"{_dur(rec['wait_s'] * 1000)} before the first node ran")
     if has_gpu or has_vram:
-        foot.append(("GPU load is the mean, VRAM the peak while the node ran" if has_gpu and has_vram
+        foot.append(("GPU load is the mean, VRAM the highest reading while the node ran" if has_gpu and has_vram
                      else "GPU load is the mean while the node ran" if has_gpu
-                     else "VRAM is the peak while the node ran") + " — whole device, not this job alone")
+                     else "VRAM is the highest reading while the node ran")
+                    + " (sampled every 1–2 s) — whole device, not this job alone")
     return (f"{title}<table>{head}{''.join(rows)}</table>"
             f"<p class='muted' style='margin:4px 0 0'>{' · '.join(foot)}</p>")
 

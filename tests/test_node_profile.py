@@ -353,6 +353,7 @@ class HwSamples(unittest.TestCase):
 
     def test_sample_without_node_only_in_series(self):
         run = {}
+        nodeprofile.fold(run, "execution_start", {}, 0.2)
         nodeprofile.note_hw(run, 0.5, gpu=40)
         self.assertEqual(run["hw"]["nodes"], {})
         self.assertTrue(run["hw"]["gpu"])
@@ -360,6 +361,66 @@ class HwSamples(unittest.TestCase):
         rec = nodeprofile.record(run, {}, 2.0)
         self.assertNotIn("gpu", rec["nodes"][0])
         self.assertEqual(rec["hw"]["gpu"], [40])
+
+    def test_waiting_behind_another_prompt_is_not_this_run(self):
+        """Queued behind someone else's 22 GB job, the device readings are THEIR job:
+        nothing before our own execution starts may reach the curve, the mean or the
+        peak — "max 22 GB" over a run that used 4 would be a plain lie."""
+        run = {"submit_at": 0.0}
+        for t in range(100):
+            nodeprofile.note_hw(run, float(t), gpu=99, vram=22 << 30, vram_total=24 << 30)
+        self.assertNotIn("hw", run)
+        nodeprofile.fold(run, "executing", {"node": "A"}, 100.0)
+        nodeprofile.note_hw(run, 101.0, gpu=10, vram=4 << 30, vram_total=24 << 30)
+        rec = nodeprofile.record(run, {}, 110.0)
+        self.assertEqual((rec["hw"]["gpu_avg"], rec["hw"]["vram_max"]), (10, 4096))
+
+    def test_mean_survives_merging(self):
+        """Past HW_RAW_MAX the raw curve halves its resolution; the run's mean must
+        still weigh every reading once (600 s idle + 299 s flat out is 33 %, not 50)."""
+        run = {}
+        nodeprofile.fold(run, "executing", {"node": "A"}, 0.0)
+        for i in range(899):
+            nodeprofile.note_hw(run, float(i), gpu=0 if i < 600 else 100)
+        rec = nodeprofile.record(run, {}, 900.0)
+        self.assertEqual(rec["hw"]["gpu_avg"], 33)
+        self.assertEqual(rec["nodes"][0]["gpu"], 33)
+
+    def test_fallback_vram_never_mixes_with_the_probe(self):
+        """Two sources measure VRAM differently (/system_stats: total - free; the
+        monitor: its own "used"). One early monitor reading in the same series would
+        BE the peak. The monitor's VRAM counts only when the probe never answered."""
+        run = {}
+        nodeprofile.fold(run, "executing", {"node": "A"}, 0.0)
+        nodeprofile.note_hw(run, 0.5, vram2=20 << 30, vram2_total=24 << 30)
+        nodeprofile.note_hw(run, 1.0, vram=12 << 30, vram_total=24 << 30)
+        rec = nodeprofile.record(dict(run), {}, 2.0)
+        self.assertEqual((rec["hw"]["vram_max"], rec["nodes"][0]["vram"]), (12288, 12288))
+        self.assertEqual(rec["hw"]["vram"], [12288])
+        run = {}
+        nodeprofile.fold(run, "executing", {"node": "A"}, 0.0)
+        nodeprofile.note_hw(run, 0.5, vram2=20 << 30, vram2_total=24 << 30)
+        rec = nodeprofile.record(run, {}, 2.0)
+        self.assertEqual((rec["hw"]["vram_max"], rec["nodes"][0]["vram"],
+                          rec["hw"]["vram_total"]), (20480, 20480, 24576))
+
+    def test_infinite_reading_is_no_sample(self):
+        inf = float("inf")
+        self.assertEqual(nodeprofile.parse_monitor(
+            {"gpus": [{"gpu_utilization": inf, "vram_used": inf, "vram_total": inf}]}),
+            (None, None, None))
+        self.assertEqual(nodeprofile.parse_system_stats(
+            {"devices": [{"vram_total": inf, "vram_free": 1}]}), (None, None))
+
+    def test_broken_hw_state_never_costs_the_record(self):
+        """The timing record feeds the next run's progress; a display extra must not
+        be able to lose it."""
+        run = {}
+        nodeprofile.fold(run, "executing", {"node": "A"}, 0.0)
+        run["hw"] = {"nodes": {"A": "junk"}, "gpu": [["x"]], "vram": None}
+        rec = nodeprofile.record(run, {}, 2.0)
+        self.assertEqual(rec["nodes"][0]["s"], 2.0)
+        self.assertNotIn("hw", rec)
 
     def test_invalid_values_are_no_sample(self):
         run = {}
