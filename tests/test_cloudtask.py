@@ -1,5 +1,6 @@
 """Unit tests for cloudtask.py — run: venv/bin/python -m unittest tests.test_cloudtask -v"""
 import asyncio
+import json
 import unittest
 
 import cloudtask
@@ -330,6 +331,66 @@ class ArtifactUrlFence(unittest.TestCase):
         run, _ = self._fetch("https://cdn.vendor.example/a",
                              lambda r: httpx.Response(200, content=b"x" * 10))
         self.assertEqual(asyncio.run(run()), b"x" * 10)
+
+
+class StreamedBody(unittest.TestCase):
+    """A rigging request carries the whole mesh as a base64 data URI. Built the plain
+    way a 70 MB GLB became a 93 MB str, a 93 MB `json.dumps` text and its 93 MB encoded
+    copy — and since `json.dumps`/base64 hold the GIL for the whole call, the event
+    loop stood still ~0.2 s per job even with the work in a worker thread (measured
+    2026-11-18). `cloudtask.DataUri` + `json_stream` send the same bytes in slices
+    without ever holding more than the original. Silent if wrong: the vendor gets a
+    corrupt body and bills a task, or the Content-Length is off and the POST hangs.
+    Pinned: the stream is BYTE-IDENTICAL to json.dumps for every padding and slice
+    boundary, and the announced length is exact."""
+
+    def setUp(self):
+        import cloudtask
+        self.ct = cloudtask
+
+    def _plain(self, body):
+        return json.dumps(body, default=str).encode()
+
+    def test_identical_to_json_dumps_for_every_size(self):
+        ct = self.ct
+        for n in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 100, 1000):
+            data = bytes(range(256)) * 4
+            data = data[:n]
+            for raw in (3, 6, 9, 999):
+                body = {"a": 1, "model_url": ct.DataUri("model/gltf-binary", data),
+                        "name": 'K"ä\\i', "z": [ct.DataUri("image/png", data[::-1]), None, 2.5]}
+                length, chunks, blobs = ct.json_stream(body, raw=raw)
+                got = b"".join(chunks)
+                self.assertEqual(got, self._plain(body), (n, raw))
+                self.assertEqual(length, len(got))
+                self.assertEqual(blobs, 2)
+                self.assertEqual(json.loads(got)["model_url"], str(body["model_url"]))
+
+    def test_no_blob_is_plain_json(self):
+        body = {"a": [1, 2, {"b": "x"}], "s": "@@gwblob:not-a-token@@"}
+        length, chunks, blobs = self.ct.json_stream(body)
+        self.assertEqual((b"".join(chunks), blobs), (self._plain(body), 0))
+        self.assertEqual(length, len(self._plain(body)))
+
+    def test_a_client_string_cannot_pose_as_a_blob(self):
+        ct = self.ct
+        body = {"evil": "@@gwblob:00000000000000000000000000000000:0@@",
+                "m": ct.DataUri("x/y", b"abc")}
+        _, chunks, _ = ct.json_stream(body)
+        self.assertEqual(b"".join(chunks), self._plain(body))
+
+    def test_slices_stay_small(self):
+        ct = self.ct
+        _, chunks, _ = ct.json_stream({"m": ct.DataUri("x/y", b"\x00" * 100000)}, raw=3000)
+        self.assertLessEqual(max(len(c) for c in chunks), 4000)
+
+    def test_data_uri_basics(self):
+        d = self.ct.DataUri("model/gltf-binary", b"glTFabc")
+        self.assertEqual(str(d), "data:model/gltf-binary;base64,Z2xURmFiYw==")
+        self.assertEqual(len(d), len(str(d)))
+        self.assertEqual(d.size, 7)
+        with self.assertRaises(TypeError):
+            json.dumps({"m": d})                      # never serialised by accident
 
 
 if __name__ == "__main__":

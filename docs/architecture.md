@@ -944,7 +944,8 @@ Execution cost is `execution_ms / 3.6e6 * cost_per_hour`, accumulated in `sync_c
 
 One LAN stream runs per volume, using the shared LanSource hash slot (transfer hash
 has priority). Files below `PART_SIZE = 128 * 1024 * 1024` use a single put; others
-save the multipart id before streaming `cat_argv(path, 0)` into 128 MiB parts. Byte
+save the multipart id before streaming `cat_argv(path, 0)` into 128 MiB parts. (Each
+part reaches the socket in 1 MiB slices, `s3vol._slices`.) Byte
 count, subprocess exit and sha256 must match the share hash before completion; an
 independent HEAD must match before manifest ownership. Failure aborts the upload; a
 second failure blocks with “share file changing?”. A hash mismatch evicts the share
@@ -2923,7 +2924,18 @@ Each of these failed silently; each has a test whose docstring carries the detai
   `json.dumps`/`json.loads`/base64 of a 93 MB body stall the loop ~100–150 ms from
   inside a thread (measured 2026-11-18). Statements elsewhere in this document that
   such work is "off the loop" mean off the loop's CALL STACK, not that the loop runs
-  meanwhile. Open: streaming large bodies in slices (Meshy rig upload, S3 parts).
+  meanwhile.
+- **Large request bodies go out in slices.** A Meshy rigging body holds its mesh as a
+  `cloudtask.DataUri` (the caller's bytes, no copy; deliberately not a str and not
+  JSON-serialisable) and `CloudTaskAdapter._create` sends it through
+  `cloudtask.json_stream`: the bytes of `json.dumps(body)` in ~2 MB slices with the
+  exact Content-Length. Measured with a 70 MB GLB: longest loop stall 264 ms → 6 ms,
+  extra memory 303 MiB → 5 MiB. `S3Volume._req` sends a body above `_SLICE_BYTES`
+  (1 MiB) as memoryview slices, Content-Length added AFTER signing (it is not a signed
+  header); `PART_SIZE` stays 128 MiB (other sizes are unverified against RunPod's S3).
+  Still whole: `readexactly(PART_SIZE)` copies each part once on the loop (~30 ms).
+  `test_cloudtask.StreamedBody` (byte-identical to json.dumps for every padding and
+  slice boundary), `test_s3vol` (slices, length, unchanged payload hash).
 
 ## Request flow
 

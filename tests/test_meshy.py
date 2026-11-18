@@ -298,7 +298,8 @@ class TestRigging(unittest.TestCase):
     def test_build_request(self):
         body = meshy.build_request(self.C, {"input_name": "Kai", "input_height_m": 1.8},
                                    {}, {"input_mesh_path": ("hero.glb", GLB)})
-        self.assertTrue(body["model_url"].startswith("data:model/gltf-binary;base64,"))
+        self.assertTrue(str(body["model_url"]).startswith("data:model/gltf-binary;base64,"))
+        self.assertIs(body["model_url"].data, GLB)        # the caller's bytes, not a copy
         self.assertEqual(body["height_meters"], 1.8)
         self.assertEqual(body["name"], "Kai")
         for k in ("ai_model", "image_url", "should_texture", "target_formats"):

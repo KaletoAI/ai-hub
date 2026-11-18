@@ -13,6 +13,7 @@ import base64
 import copy
 from typing import Optional
 
+import cloudtask
 from cloudtask import TaskState                # shared with tripo.py; re-exported for callers
 
 # The cloud-kind interface every cloud task module declares (see the design spec
@@ -157,13 +158,15 @@ def _slot_images(endpoint: str, images: dict) -> list[str]:
     return [data_uri(b) for _, b in present]
 
 
-def glb_data_uri(data: bytes) -> str:
-    """Mesh bytes → base64 data URI for `model_url`. A binary glTF is the only container
+def glb_data_uri(data: bytes) -> cloudtask.DataUri:
+    """Mesh bytes → the data URI for `model_url`, as a `cloudtask.DataUri`: the text is
+    only produced while the request is sent, in slices (a 70 MB mesh as one string was
+    three 93 MB copies and a stalled event loop). A binary glTF is the only container
     the rigging endpoint takes, sniffed by magic — so a mislabelled .glb (an OBJ someone
     renamed) is refused HERE, not after 5 credits are spent."""
     if data[:4] != b"glTF":
         raise MeshyInput("Meshy rigging takes a binary glTF (.glb) mesh")
-    return f"data:model/gltf-binary;base64,{base64.b64encode(data).decode()}"
+    return cloudtask.DataUri("model/gltf-binary", data)
 
 
 def _build_rigging(cand: dict, values: dict, files: dict) -> dict:
@@ -244,7 +247,9 @@ def build_request(cand: dict, values: dict, images: dict, files: Optional[dict] 
 
 def request_summary(body: dict) -> dict:
     """The request as recorded on the job: image data replaced by its byte size."""
-    def _sz(uri: str) -> str:
+    def _sz(uri) -> str:
+        if isinstance(uri, cloudtask.DataUri):
+            return f"<{uri.size} bytes>"
         # The byte count is ARITHMETIC on the base64 text: decoding a rigging body's
         # 93 MB mesh only to measure it stalled the event loop and held 4-5× its size in
         # memory (P10). `uri` is one the builder produced, so the text is canonical base64.

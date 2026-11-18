@@ -127,6 +127,20 @@ class S3AuthError(S3Error):
 _AUTH_CODES = {"SignatureDoesNotMatch", "InvalidAccessKeyId", "AccessDenied"}
 
 
+_SLICE_BYTES = 1024 * 1024       # a body above this goes to the socket in slices
+
+
+async def _slices(body: bytes):
+    """`body` a megabyte at a time. Handed to httpx whole, a 128 MiB part is ONE
+    synchronous TLS write: the event loop stood still ~0.1 s per part and the process
+    held the part several times over (plaintext, ciphertext, the transport's copy —
+    measured 2026-11-18). Slices of a memoryview copy nothing and let the loop run
+    between writes."""
+    view = memoryview(body)
+    for i in range(0, len(view), _SLICE_BYTES):
+        yield bytes(view[i:i + _SLICE_BYTES])
+
+
 def endpoint_for(dc: str) -> str:
     return f"https://s3api-{str(dc).lower()}.runpod.io"
 
@@ -150,7 +164,12 @@ class S3Volume:
                       self._ak, self._sk, self.region, self._now()))
         q = encode_query(query or {})
         url = self.endpoint + encode_path(path) + (f"?{q}" if q else "")
-        r = await self.client.request(method, url, content=body or None, headers=h, timeout=timeout)
+        content = body or None
+        if len(body) > _SLICE_BYTES:
+            # the length is announced (S3 takes no chunked transfer here) but added AFTER
+            # signing: it is not one of the signed headers
+            content, h = _slices(body), {**h, "content-length": str(len(body))}
+        r = await self.client.request(method, url, content=content, headers=h, timeout=timeout)
         if missing_ok and r.status_code == 404:
             return None
         # Completion (a POST) can report an S3 error inside an HTTP 200 response; a GET's

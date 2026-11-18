@@ -226,6 +226,40 @@ class HTTPClient(unittest.TestCase):
                 self.assertEqual(await v.mpu_list("models/"), [])
         asyncio.run(run())
 
+    def test_large_body_is_sent_in_slices_with_an_exact_length(self):
+        """A 128 MiB part handed to httpx as ONE bytes object goes through TLS in one
+        synchronous write: the event loop stood still ~0.1 s per part and the process
+        held the part several times over (measured 2026-11-18). It is sent in slices —
+        with the Content-Length announced (no chunked transfer: S3 wants the length)
+        and the SIGNED payload hash unchanged, or every upload answers 403."""
+        import hashlib
+        import s3vol
+        seen = {}
+
+        class Spy(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request):
+                sizes = []
+                async for chunk in request.stream:
+                    sizes.append(len(chunk))
+                seen.update(sizes=sizes, headers=dict(request.headers))
+                return httpx.Response(200, headers={"etag": '"e1"'})
+
+        async def run(data):
+            async with httpx.AsyncClient(transport=Spy()) as c:
+                v = s3vol.S3Volume(c, "https://s3api-eu-ro-1.runpod.io", "vol1", "AK", "SK", "eu-ro-1")
+                return await v.mpu_part("models/x", "U1", 1, data)
+        data = bytes(range(256)) * 40                     # 10240 bytes
+        with patch.object(s3vol, "_SLICE_BYTES", 4096):
+            self.assertEqual(asyncio.run(run(data)), '"e1"')
+        self.assertEqual(seen["sizes"], [4096, 4096, 2048])
+        self.assertEqual(seen["headers"]["content-length"], "10240")
+        self.assertNotIn("transfer-encoding", seen["headers"])
+        self.assertEqual(seen["headers"]["x-amz-content-sha256"], hashlib.sha256(data).hexdigest())
+        self.assertNotIn("content-length", seen["headers"]["authorization"])
+        with patch.object(s3vol, "_SLICE_BYTES", 4096):   # a small body: one piece, as before
+            asyncio.run(run(b"tiny"))
+        self.assertEqual((seen["sizes"], seen["headers"]["content-length"]), ([4], "4"))
+
     def test_complete_200_with_error_body_raises(self):
         """S3 may send an error under HTTP 200; accepting it loses the model."""
         async def run():

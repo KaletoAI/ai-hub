@@ -3,9 +3,83 @@ adapters poll towards, and the admin-option form schema every cloud kind declare
 (`OPTION_FIELDS`) so ONE console editor serves all of them. No main/adapters imports."""
 from __future__ import annotations
 
+import base64
+import json
 import re
+import uuid
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Iterator, Optional
+
+
+class DataUri:
+    """`data:<mime>;base64,<data>` that is NOT built until it is sent.
+
+    A rigging request carries the whole mesh this way. As a plain str a 70 MB GLB was a
+    93 MB string, then a 93 MB `json.dumps` text, then its 93 MB encoded copy — and
+    `json.dumps`/base64 hold the GIL for the whole call, so the event loop stood still
+    ~0.2 s per job even from a worker thread (measured 2026-11-18). This object keeps
+    the caller's bytes (no copy) and `json_stream` encodes them in slices.
+
+    Deliberately NOT a str and not JSON-serialisable: a body holding one must go out
+    through `json_stream`; anything else fails loudly instead of quietly rebuilding
+    the 93 MB."""
+    __slots__ = ("mime", "data")
+
+    def __init__(self, mime: str, data: bytes):
+        self.mime, self.data = mime, data
+
+    @property
+    def prefix(self) -> str:
+        return f"data:{self.mime};base64,"
+
+    @property
+    def size(self) -> int:                    # bytes of the payload itself
+        return len(self.data)
+
+    def __len__(self) -> int:                 # characters of the URI text
+        return len(self.prefix) + 4 * ((len(self.data) + 2) // 3)
+
+    def __str__(self) -> str:                 # the whole text — small inputs and tests only
+        return self.prefix + base64.b64encode(self.data).decode()
+
+    def chunks(self, raw: int = 1572864) -> Iterator[bytes]:
+        """The URI text as ASCII bytes, `raw` payload bytes (a multiple of 3, so the
+        base64 of the slices concatenates to the base64 of the whole) at a time."""
+        raw = max(3, raw - raw % 3)
+        yield self.prefix.encode()
+        view = memoryview(self.data)
+        for i in range(0, len(view), raw):
+            yield base64.b64encode(view[i:i + raw])
+
+
+def json_stream(body, raw: int = 1572864) -> tuple:
+    """(content length, [byte chunks…] lazily, number of DataUri values) — the exact
+    bytes of `json.dumps(body)` with every DataUri written as its text, without ever
+    holding that text. The skeleton is dumped with a random token in each DataUri's
+    place and cut there; a string from a client cannot pose as the token (it carries a
+    fresh uuid), and base64 needs no JSON escaping."""
+    tag = uuid.uuid4().hex
+    blobs: list = []
+
+    def default(o):
+        if isinstance(o, DataUri):
+            blobs.append(o)
+            return f"@@gwblob:{tag}:{len(blobs) - 1}@@"
+        raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
+    parts = re.split(rf'"@@gwblob:{tag}:(\d+)@@"', json.dumps(body, default=default))
+    texts = [p.encode() for p in parts[0::2]]
+    order = [blobs[int(i)] for i in parts[1::2]]
+    length = sum(map(len, texts)) + sum(len(b) + 2 for b in order)
+
+    def chunks() -> Iterator[bytes]:
+        for i, text in enumerate(texts):
+            if text:
+                yield text
+            if i < len(order):
+                yield b'"'
+                yield from order[i].chunks(raw)
+                yield b'"'
+    return length, chunks(), len(order)
 
 
 @dataclass

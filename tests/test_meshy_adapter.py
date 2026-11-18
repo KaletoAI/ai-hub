@@ -309,6 +309,10 @@ class TestMeshyAdapter(unittest.TestCase):
         self.assertEqual(out.meta["rig"], "meshy")   # job view reads meta["rig"]
         self.assertTrue(out.meta["request"]["model_url"].startswith("<"))
         self.assertNotIn("data:", json.dumps(out.meta))
+        # the mesh went out streamed (cloudtask.json_stream) and arrived intact
+        import base64
+        sent = _Stub.posted[0][1]["model_url"]
+        self.assertEqual(base64.b64decode(sent.split(",", 1)[1]), GLB)
 
     def test_rigging_animations_option(self):
         _Stub.script = [{"status": "SUCCEEDED", "progress": 100, "consumed_credits": 5,

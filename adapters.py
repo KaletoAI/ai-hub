@@ -5066,15 +5066,28 @@ class CloudTaskAdapter(BackendAdapter):
         # client timeout, and httpx's WriteTimeout has an EMPTY str() — the job died as
         # "chain failed: " with nothing after the colon. So the create gets its OWN
         # size-scaled budget (~4 s per MiB ≈ a 256 KiB/s floor) without slowing the polls.
-        # Serialised ONCE, straight to the bytes httpx sends, and in a worker thread: a
-        # rigging body is ~93 MB of base64, and dumping it on the loop stalled every other
-        # request for a third of a second (P10).
-        raw = await asyncio.to_thread(lambda: json.dumps(body).encode())
-        mb = len(raw) / (1024 * 1024)
+        # Serialised ONCE, straight to the bytes httpx sends. A rigging body is ~93 MB of
+        # base64: dumping it on the loop stalled every other request for a third of a
+        # second (P10) — and so did dumping it in a worker thread, because json.dumps
+        # and base64 hold the GIL for the whole call (measured 2026-11-18). So a body
+        # that carries a mesh (`cloudtask.DataUri`) is never one object: json_stream
+        # yields it in ~2 MB slices (a few ms each, the socket write between them), with
+        # the exact Content-Length announced. A body without one is small — as before.
+        length, chunks, blobs = cloudtask.json_stream(body)
+        headers = {**self._headers(), "Content-Type": "application/json"}
+        if blobs:
+            async def stream():
+                for chunk in chunks:
+                    yield chunk
+            raw = stream()
+            headers["Content-Length"] = str(length)
+        else:
+            raw = b"".join(chunks)
+        mb = length / (1024 * 1024)
         try:
             pr = await client.post(
                 url, content=raw,
-                headers={**self._headers(), "Content-Type": "application/json"},
+                headers=headers,
                 timeout=httpx.Timeout(connect=30.0, read=max(120.0, mb * 4),
                                       write=max(60.0, mb * 4), pool=30.0))
         except (httpx.ReadTimeout, httpx.ReadError, httpx.RemoteProtocolError):
