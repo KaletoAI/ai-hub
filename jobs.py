@@ -66,6 +66,13 @@ def init(db_path: str = "jobs.db", blob_dir: str = "jobs", default_ttl_s: int = 
             )
         """)
         c.execute("CREATE INDEX IF NOT EXISTS jobs_created ON jobs(created)")
+        # Rows carry whole workflows in meta_json, so a table scan reads megabytes to
+        # answer a count. Each of these serves one frequent query (pinned with EXPLAIN
+        # in tests/test_jobs_indexes.py): per-alias history (ETA median, node-time
+        # profile), the dashboard's status counts, the Media Jobs owner list.
+        c.execute("CREATE INDEX IF NOT EXISTS jobs_alias ON jobs(alias, status, created)")
+        c.execute("CREATE INDEX IF NOT EXISTS jobs_status ON jobs(status, task)")
+        c.execute("CREATE INDEX IF NOT EXISTS jobs_owner ON jobs(owner, task)")
         cols = {r[1] for r in c.execute("PRAGMA table_info(jobs)").fetchall()}
         if "stage" in cols:                    # remove obsolete multi-stage progress
             c.execute("ALTER TABLE jobs DROP COLUMN stage")
@@ -614,7 +621,10 @@ def prefix_ids(job_id: str, owner: Optional[str]) -> list:
     prefix = (job_id or "").lower()
     if not _active or not _ID_PREFIX.fullmatch(prefix):
         return []
-    sql, args = "SELECT id FROM jobs WHERE id LIKE ?", [prefix + "%"]   # hex only: no wildcards
+    # A RANGE on the primary key, not `LIKE 'abc%'`: SQLite's LIKE is case-insensitive
+    # by default and then cannot use the index — every short-id poll scanned the table.
+    # Ids are lowercase hex, so everything starting with the prefix sorts below prefix+'g'.
+    sql, args = "SELECT id FROM jobs WHERE id >= ? AND id < ?", [prefix, prefix + "g"]
     if owner is not None:
         sql += " AND (owner=? OR owner IS NULL OR owner='default')"
         args.append(owner)
