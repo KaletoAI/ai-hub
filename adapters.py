@@ -28,6 +28,7 @@ import ipaddress
 import json
 import logging
 import math
+import mimetypes
 import os
 import random
 import re
@@ -44,6 +45,7 @@ from urllib.parse import quote, urljoin, urlsplit
 
 import httpx
 
+import model_kinds
 import scheduler
 from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -2542,6 +2544,35 @@ def is_image_field(wf: dict, node: str) -> bool:
     return is_img_loader_class((wf or {}).get(node, {}).get("class_type"))
 
 
+_AUDIO_LOADER_CLASSES = ("LoadAudio", "VHS_LoadAudioUpload")
+_AUDIO_ACCEPT = ("wav", "flac", "mp3", "ogg")
+
+
+def is_audio_loader_class(cls) -> bool:
+    """True for ComfyUI input-dir audio loaders (LoadAudio, VHS_LoadAudioUpload, …)
+    that expect a bare filename inside ComfyUI/input/ — like LoadImage — rather than
+    an absolute filesystem path. Path loaders (*LoadAudioPath, VHS_LoadAudio) stay False."""
+    s = str(cls or "")
+    low = s.lower()
+    if s in _AUDIO_LOADER_CLASSES:
+        return True
+    return "loadaudio" in low and "path" not in low and low != "vhs_loadaudio"
+
+
+def _is_audio_file_param(wf: dict, param: str, m: Optional[dict]) -> bool:
+    """True when a mapped file param carries audio (for `files[].accept` and TTS
+    voice-override detection), never true for mesh/rig paths."""
+    m = m or {}
+    cls = str(((wf or {}).get(m.get("node")) or {}).get("class_type") or "")
+    if is_audio_loader_class(cls) or "audio" in cls.lower():
+        return True
+    for raw in (param, m.get("label"), m.get("field")):
+        s = str(raw or "").lower()
+        if any(tok in s for tok in ("audio", "voice", "speaker", "speech", "wav")):
+            return True
+    return False
+
+
 _WF_FILE_CACHE: dict = {}                    # path -> ((mtime_ns, size), workflow)
 
 
@@ -2649,24 +2680,145 @@ def prompt_max_chars(cand: dict) -> Optional[int]:
     return fn(cand) if fn else None
 
 
-def public_fields(cand: dict) -> tuple[list, list, list]:
+_MING_DEFAULT_LANGUAGES = [
+    "German", "English", "Chinese", "French", "Spanish",
+    "Japanese", "Korean", "Italian", "Portuguese", "Russian",
+]
+_ENGLISH_LANG_NAMES = frozenset({
+    "arabic", "bengali", "bulgarian", "cantonese", "catalan", "chinese", "croatian",
+    "czech", "danish", "dutch", "english", "estonian", "finnish", "french", "german",
+    "greek", "hebrew", "hindi", "hungarian", "indonesian", "italian", "japanese",
+    "korean", "latvian", "lithuanian", "malay", "mandarin", "norwegian", "persian",
+    "polish", "portuguese", "romanian", "russian", "serbian", "slovak", "slovenian",
+    "spanish", "swedish", "thai", "turkish", "ukrainian", "urdu", "vietnamese",
+})
+_LANG_SENTINELS = frozenset({"", "auto", "none", "default", "all", "multilingual"})
+_VOICE_SENTINELS = ("", "None", "none", "off", "Off", "custom", "Custom",
+                    "clone", "Clone", "reference", "Reference")
+_VOICE_SENTINELS_LOWER = frozenset(s.lower() for s in _VOICE_SENTINELS)
+_TTS_TEXT_PARAMS = ("text", "input", "prompt", "script", "tts_text", "transcript")
+_TTS_LANG_PARAMS = ("language", "lang", "language_code", "lang_code", "language_type", "target_language")
+_TTS_VOICE_PARAMS = ("voice", "voice_id", "speaker", "speaker_name", "voice_name",
+                     "preset_voice", "voice_preset")
+_TTS_REF_TEXT_PARAMS = ("reference_text", "ref_text", "prompt_text", "reference_transcript",
+                        "ref_transcript", "audio_text", "transcript")
+_TTS_SPEED_PARAMS = ("speed", "speaking_rate", "speech_rate", "rate", "tempo",
+                     "speed_factor", "voice_speed")
+_TTS_STYLE_PARAMS = ("instruction", "instructions", "style", "style_prompt",
+                     "style_instruction", "style_instructions", "prompt", "emotion",
+                     "emotion_prompt", "instruct", "voice_instruction", "delivery")
+_TTS_AUDIO_SLOTS = ("reference_audio", "input_audio", "ref_audio", "speaker_audio",
+                    "voice_audio", "prompt_audio", "audio")
+_KOKORO_LANG_PREFIX = {"a": "en", "b": "en", "e": "es", "f": "fr", "h": "hi",
+                       "i": "it", "j": "ja", "p": "pt", "z": "zh"}
+
+
+def _is_ming_tts(alias: str, wf: dict, cand: dict) -> bool:
+    hay = " ".join([
+        str(alias or ""),
+        str((cand or {}).get("model") or ""),
+        *(str(n.get("class_type") or "") for n in (wf or {}).values() if isinstance(n, dict)),
+    ]).lower()
+    return "ming" in hay
+
+
+def _is_zonos_tts(alias: str, wf: dict, cand: dict) -> bool:
+    hay = " ".join([
+        str(alias or ""),
+        str((cand or {}).get("model") or ""),
+        *(str(n.get("class_type") or "") for n in (wf or {}).values() if isinstance(n, dict)),
+    ]).lower()
+    return "zonos" in hay
+
+
+def _downstream_targets(wf: dict, node: str, max_hops: int = 2) -> list[tuple[str, str]]:
+    """Follow outgoing links `[node, slot]` in `wf` up to `max_hops` and yield
+    `(target_node_id, target_field)` pairs — lets a mapped PrimitiveString/Float inherit
+    combo choices and numeric bounds from the TTS/sampler node it feeds."""
+    out: list[tuple[str, str]] = []
+    frontier = [str(node)]
+    seen = {str(node)}
+    for _ in range(max_hops):
+        nxt: list[str] = []
+        for src in frontier:
+            for cid, cnode in (wf or {}).items():
+                if not isinstance(cnode, dict):
+                    continue
+                for dfld, val in (cnode.get("inputs") or {}).items():
+                    if _is_link(val) and str(val[0]) == src:
+                        out.append((str(cid), str(dfld)))
+                        if str(cid) not in seen:
+                            seen.add(str(cid))
+                            nxt.append(str(cid))
+        frontier = nxt
+        if not frontier:
+            break
+    return out
+
+
+def comfy_schema_classes(wf: dict, mapping: dict) -> set[str]:
+    """Node class names whose `/object_info` specs `public_fields` needs for this
+    workflow: every mapped node plus up to 2 hops of downstream consumers."""
+    classes: set[str] = set()
+    for m in (mapping or {}).values():
+        nid = (m or {}).get("node")
+        if not nid:
+            continue
+        cls = ((wf or {}).get(str(nid)) or {}).get("class_type")
+        if cls:
+            classes.add(str(cls))
+        for cid, _ in _downstream_targets(wf, str(nid)):
+            ccls = ((wf or {}).get(cid) or {}).get("class_type")
+            if ccls:
+                classes.add(str(ccls))
+    return classes
+
+
+def _resolve_comfy_field_spec(wf: dict, node: Optional[str], fld: Optional[str],
+                              field_specs: Optional[dict]) -> dict:
+    """Widget spec (`choices`, `min`, `max`, `step`, `audio_upload`) for `(node, fld)`,
+    following outgoing workflow links when the mapped node is a primitive/passthrough."""
+    if not (field_specs and node and fld):
+        return {}
+    cls = ((wf or {}).get(str(node)) or {}).get("class_type")
+    direct = ((field_specs.get(cls) or {}).get(fld) or {}) if cls else {}
+    if direct.get("choices") or "min" in direct or "max" in direct or direct.get("audio_upload"):
+        return direct
+    for cid, dfld in _downstream_targets(wf, str(node)):
+        ccls = ((wf or {}).get(cid) or {}).get("class_type")
+        spec = ((field_specs.get(ccls) or {}).get(dfld) or {}) if ccls else {}
+        if spec.get("choices") or "min" in spec or "max" in spec or spec.get("audio_upload"):
+            return spec
+    return direct
+
+
+def public_fields(cand: dict, field_specs: Optional[dict] = None,
+                  alias: str = "") -> tuple[list, list, list]:
     """The public request fields of a generation alias candidate — what the schema
     endpoint advertises, the playground renders and the OpenAI shims map reference
     images onto. ONE seam for both candidate kinds: a ComfyUI candidate derives them
-    from workflow + mapping (labels are the external names), a cloud candidate from
-    its fixed label table (<kind>.public_fields).
+    from workflow + mapping (labels are the external names) enriched with `/object_info`
+    `field_specs` when supplied, a cloud candidate from its fixed label table.
 
     Three lists: params (scalars), images (loader slots) and files (uploads that are
-    not images — a mesh). A ComfyUI file param ALSO stays in `params`: there it is the
-    backend-side path, which is the second, upload-free way to name the same input."""
+    not images — a mesh or reference audio). A ComfyUI file param ALSO stays in `params`:
+    there it is the backend-side path, which is the second, upload-free way to name the
+    same input."""
     k = cloud_kind(cand)
     if k:
         return cloud_module(k).public_fields(cand)
     wf = cand_workflow(cand) or {}
     mapping = cand.get("mapping") or {}
-    files = [{"name": ((mapping.get(p) or {}).get("label") or "").strip() or p,
-              "required": bool((mapping.get(p) or {}).get("required"))}   # main._missing_required_file
-             for p in file_params(wf, mapping)]
+    files = []
+    for p in file_params(wf, mapping):
+        m = mapping.get(p) or {}
+        fentry: dict = {"name": (m.get("label") or "").strip() or p,
+                        "required": bool(m.get("required"))}   # main._missing_required_file
+        if isinstance(m.get("accept"), list) and m["accept"]:
+            fentry["accept"] = list(m["accept"])
+        elif _is_audio_file_param(wf, p, m):
+            fentry["accept"] = list(_AUDIO_ACCEPT)
+        files.append(fentry)
     params, images = [], []
     for p, m in mapping.items():
         m = m or {}
@@ -2689,10 +2841,256 @@ def public_fields(cand: dict) -> tuple[list, list, list]:
         # stable label. Set a label on every param for a fully node-id-free schema.
         if cur is not None:
             entry["default"] = cur
-        if name == "seed" or (p == "seed" and name == p) or m.get("random"):
+        is_auto_seed = name == "seed" or (p == "seed" and name == p) or bool(m.get("random"))
+        if is_auto_seed:
             entry["auto"] = "random unless sent"
+        is_file = is_file_param(p, m)
+        fspec = _resolve_comfy_field_spec(wf, node, fld, field_specs)
+        if isinstance(m.get("choices"), list) and m["choices"]:
+            entry["choices"] = list(m["choices"])
+        elif not is_file and not fspec.get("audio_upload") and fspec.get("choices"):
+            entry["choices"] = list(fspec["choices"])
+        elif not is_file and name.lower() in ("language", "lang") and _is_ming_tts(alias, wf, cand):
+            langs = list(_MING_DEFAULT_LANGUAGES)
+            if isinstance(cur, str) and cur.strip() and cur.strip() not in langs:
+                langs.insert(0, cur.strip())
+            entry["choices"] = langs
+        if typ in ("int", "float") and not is_auto_seed and fspec:
+            for bk in ("min", "max"):
+                bv = fspec.get(bk)
+                if isinstance(bv, (int, float)) and not isinstance(bv, bool) and -1e9 <= bv <= 1e9:
+                    entry[bk] = bv
         params.append(entry)
     return params, images, files
+
+
+def _infer_language_format(choices: list, default: Any, param_name: str) -> str:
+    samples = [str(x).strip() for x in (choices or []) if str(x).strip().lower() not in _LANG_SENTINELS]
+    if not samples and isinstance(default, str) and default.strip().lower() not in _LANG_SENTINELS:
+        samples = [default.strip()]
+    if not samples:
+        return "iso639_1" if "code" in (param_name or "").lower() else "raw"
+    if all(re.fullmatch(r"[a-z]{2,3}[-_][A-Za-z]{2,4}", s) for s in samples):
+        return "bcp47"
+    if all(re.fullmatch(r"[a-z]{2}", s) for s in samples):
+        return "iso639_1"
+    if all(s.lower() in _ENGLISH_LANG_NAMES for s in samples):
+        if all(s == s.lower() for s in samples):
+            return "english_name_lower"
+        return "english_name"
+    return "raw"
+
+
+def _normalize_tts_voice(raw: Any, fallback_langs: Optional[list] = None) -> Optional[dict]:
+    if isinstance(raw, dict):
+        vid = str(raw.get("id") or raw.get("name") or raw.get("voice") or "").strip()
+        if not vid or vid.lower() in _VOICE_SENTINELS_LOWER:
+            return None
+        label = str(raw.get("label") or raw.get("display_name") or vid).strip()
+        gender = raw.get("gender")
+        gender = str(gender).strip().lower() if isinstance(gender, str) and gender.strip() else None
+        langs_raw = raw.get("languages") or ([raw["language"]] if raw.get("language") else [])
+        langs = [str(x).strip() for x in langs_raw if str(x).strip()] if isinstance(langs_raw, list) else []
+        return {"id": vid, "label": label, "gender": gender, "languages": langs}
+    vid = str(raw or "").strip()
+    if not vid or vid.lower() in _VOICE_SENTINELS_LOWER:
+        return None
+    low = vid.lower()
+    gender: Optional[str] = None
+    langs: list[str] = []
+    # Kokoro-style voice IDs: af_bella (American female), bm_george (British male), …
+    m_kokoro = re.fullmatch(r"([abefhijpz])([fm])_[a-z0-9_]+", low)
+    if m_kokoro:
+        langs = [_KOKORO_LANG_PREFIX[m_kokoro.group(1)]]
+        gender = "female" if m_kokoro.group(2) == "f" else "male"
+    else:
+        if re.search(r"(?:^|[_\-\s(])female(?:$|[_\-\s)])", low):
+            gender = "female"
+        elif re.search(r"(?:^|[_\-\s(])male(?:$|[_\-\s)])", low):
+            gender = "male"
+        m_lang = re.match(r"^([a-z]{2})[-_]", low) or re.search(r"\(([a-z]{2})\)", low)
+        if m_lang and m_lang.group(1) not in ("af", "am", "bf", "bm"):
+            langs = [m_lang.group(1)]
+    if not langs and fallback_langs and len(fallback_langs) == 1:
+        langs = list(fallback_langs)
+    return {"id": vid, "label": vid, "gender": gender, "languages": langs}
+
+
+def _tts_output_format(cand: dict, params: list, wf: dict) -> str:
+    ext = str((cand or {}).get("output_ext") or "").strip().lstrip(".").lower()
+    if ext:
+        return ext
+    for p in params:
+        if str(p.get("name") or "").lower() in ("response_format", "output_format", "format"):
+            d = str(p.get("default") or "").strip().lower()
+            if d:
+                return d
+    if cloud_kind(cand) == "venice":
+        return "mp3"
+    for node in (wf or {}).values():
+        if not isinstance(node, dict):
+            continue
+        cls = str(node.get("class_type") or "").lower()
+        if "saveaudiomp3" in cls:
+            return "mp3"
+        if "saveaudioopus" in cls:
+            return "opus"
+        if "saveaudioflac" in cls:
+            return "flac"
+    return "wav"
+
+
+def tts_schema(alias: str, cand: dict, params: list, files: list, *,
+               is_local: bool = False) -> Optional[dict]:
+    """Standardized top-level `tts` semantic block for `GET /v1/generations/{alias}/schema`.
+    Returns None for non-TTS aliases (image, video, 3D, music, STT, SFX)."""
+    k = cloud_kind(cand)
+    wf = {} if k else (cand_workflow(cand) or {})
+    if model_kinds.audio_task(cand, alias=alias, workflow=wf) != "tts":
+        return None
+    file_names = {str(f.get("name") or "").lower() for f in (files or [])}
+    by_lower = {str(p.get("name") or "").lower(): p for p in (params or []) if p.get("name")}
+
+    def pick_param(names: tuple[str, ...], *, exclude: set[str] = frozenset(),
+                   allow_file: bool = False) -> Optional[dict]:
+        for nm in names:
+            if nm in exclude:
+                continue
+            if not allow_file and nm in file_names:
+                continue
+            if nm in by_lower:
+                return by_lower[nm]
+        return None
+
+    text_p = pick_param(_TTS_TEXT_PARAMS)
+    text_param = text_p["name"] if text_p else None
+    used_text = {text_param.lower()} if text_param else set()
+
+    lang_p = pick_param(_TTS_LANG_PARAMS)
+    language_param = lang_p["name"] if lang_p else None
+    language_choices = list(lang_p.get("choices") or []) if lang_p else []
+    language_format = (_infer_language_format(language_choices, lang_p.get("default"), language_param)
+                       if lang_p else None)
+
+    voice_p = pick_param(_TTS_VOICE_PARAMS)
+    voice_param = voice_p["name"] if voice_p else None
+    raw_voices: list = []
+    if voice_p and isinstance(voice_p.get("choices"), list) and voice_p["choices"]:
+        raw_voices = list(voice_p["choices"])
+    elif k == "venice":
+        spec = ((cand.get("model_metadata") or {}).get("model_spec") or {})
+        if isinstance(spec.get("voices"), list) and spec["voices"]:
+            raw_voices = list(spec["voices"])
+    if not raw_voices and voice_p and isinstance(voice_p.get("default"), str) and voice_p["default"].strip():
+        raw_voices = [voice_p["default"].strip()]
+    iso_langs = [c for c in language_choices if isinstance(c, str) and re.fullmatch(r"[a-z]{2}", c)]
+    voices = []
+    for rv in raw_voices:
+        item = _normalize_tts_voice(rv, fallback_langs=iso_langs)
+        if item is not None:
+            voices.append(item)
+
+    ref_text_p = pick_param(_TTS_REF_TEXT_PARAMS, exclude=used_text)
+    ref_text_param = ref_text_p["name"] if ref_text_p else None
+
+    audio_file = next((f for f in (files or [])
+                       if str(f.get("name") or "").lower() in _TTS_AUDIO_SLOTS
+                       or any(ext in (f.get("accept") or []) for ext in ("wav", "mp3", "flac", "ogg"))),
+                      None)
+    if audio_file is not None:
+        clone_required = bool(audio_file.get("required"))
+        if not clone_required and not k and voice_param is None:
+            # Zero-shot local TTS workflows (e.g. ming-3.0-tts-0.5b) have no preset voice
+            # parameter: cloning via `reference_audio` is required when paired with a
+            # reference transcript or an empty loader default.
+            mapping = (cand or {}).get("mapping") or {}
+            am = next((m for p, m in mapping.items()
+                       if ((m or {}).get("label") or p) == audio_file["name"]), None)
+            default_audio = ((wf.get((am or {}).get("node"), {}).get("inputs") or {}).get(
+                (am or {}).get("field")) if am else None)
+            if ref_text_param is not None or not str(default_audio or "").strip():
+                clone_required = True
+        max_dur: Optional[int] = None
+        if k == "venice":
+            vc = ((cand.get("model_metadata") or {}).get("model_spec") or {}).get("voice_cloning") or {}
+            if isinstance(vc, dict):
+                raw_md = vc.get("max_duration_s") or vc.get("max_duration_seconds")
+                if isinstance(raw_md, (int, float)) and not isinstance(raw_md, bool) and raw_md > 0:
+                    max_dur = int(raw_md)
+        elif _is_zonos_tts(alias, wf, cand):
+            max_dur = 15
+        elif _is_ming_tts(alias, wf, cand):
+            max_dur = 10
+        clone = {
+            "supported": True,
+            "required": clone_required,
+            "file_slot": audio_file["name"],
+            "accept": list(audio_file.get("accept") or _AUDIO_ACCEPT),
+            "max_duration_s": max_dur,
+            "reference_text_param": ref_text_param,
+            "overrides_voice": True,
+        }
+    else:
+        clone = {
+            "supported": False,
+            "required": False,
+            "file_slot": None,
+            "accept": [],
+            "max_duration_s": None,
+            "reference_text_param": ref_text_param,
+            "overrides_voice": False,
+        }
+
+    speed_p = pick_param(_TTS_SPEED_PARAMS)
+    speed_ctrl: Optional[dict] = None
+    if speed_p is not None:
+        lo = speed_p.get("min")
+        hi = speed_p.get("max")
+        dval = speed_p.get("default")
+        has_num_default = isinstance(dval, (int, float)) and not isinstance(dval, bool)
+        signed = (isinstance(lo, (int, float)) and lo < 0
+                  and (hi is None or (isinstance(hi, (int, float)) and hi > 0)))
+        if not has_num_default:
+            dval = 0.0 if (signed or "speaking_rate" in speed_p["name"].lower()) else 1.0
+        else:
+            dval = float(dval)
+        if signed or (dval == 0.0 and "speaking_rate" in speed_p["name"].lower()):
+            neutral = 0.0
+        elif (isinstance(lo, (int, float)) and isinstance(hi, (int, float))
+              and lo <= 1.0 <= hi and dval == 1.0):
+            neutral = 1.0
+        elif isinstance(lo, (int, float)) and lo > 0 and (hi is None or hi >= 1.0) and lo <= 1.0:
+            neutral = 1.0
+        else:
+            neutral = dval
+        speed_ctrl = {
+            "param": speed_p["name"],
+            "default": dval,
+            "min": lo,
+            "max": hi,
+            "neutral": neutral,
+        }
+
+    style_exclude = used_text | ({ref_text_param.lower()} if ref_text_param else set())
+    style_p = pick_param(_TTS_STYLE_PARAMS, exclude=style_exclude)
+    style_ctrl = {"param": style_p["name"]} if style_p is not None else None
+
+    return {
+        "task": "tts",
+        "text_param": text_param,
+        "language_param": language_param,
+        "language_format": language_format,
+        "language_choices": language_choices,
+        "voice_param": voice_param,
+        "voices": voices,
+        "clone": clone,
+        "controls": {
+            "speed": speed_ctrl,
+            "style": style_ctrl,
+        },
+        "preferred_mode": "sync",
+        "output_format": _tts_output_format(cand, params, wf),
+    }
 
 
 def slot_empty_bypass(m: dict) -> list:
@@ -3263,6 +3661,48 @@ def _node_type_entry(info: dict) -> dict:
     return {"out": outs, "in": ins, "req": req}
 
 
+def _field_spec_entry(info: dict) -> dict:
+    """Extract combo choices, numeric bounds and audio_upload flags for each input
+    field of ONE `/object_info` class entry (both legacy `[options]` and ComfyUI V3
+    `["COMBO", {"options": [...]}]` forms)."""
+    fields: dict = {}
+    inp = info.get("input") or {}
+    for section in ("required", "optional"):
+        for fn, fspec in (inp.get(section) or {}).items():
+            if not (isinstance(fspec, list) and fspec):
+                continue
+            head = fspec[0]
+            meta = fspec[1] if len(fspec) > 1 and isinstance(fspec[1], dict) else {}
+            entry: dict = {}
+            if isinstance(head, list):
+                entry["choices"] = list(head)
+            elif head == "COMBO" and isinstance(meta.get("options"), list):
+                entry["choices"] = list(meta["options"])
+            elif head in ("INT", "FLOAT") and meta:
+                for k in ("min", "max", "step", "default"):
+                    v = meta.get(k)
+                    if isinstance(v, (int, float)) and not isinstance(v, bool):
+                        entry[k] = v
+            if meta.get("audio_upload"):
+                entry["audio_upload"] = True
+            if entry:
+                fields[fn] = entry
+    return fields
+
+
+def _comfy_field_specs(object_info: dict) -> dict:
+    """`{class: {field: {"choices": [...], "min": ..., "audio_upload": ...}}}` for
+    every class in `/object_info` — feeds schema choices/ranges and LoadAudio upload
+    detection without any extra HTTP request."""
+    out: dict = {}
+    for cls, info in (object_info or {}).items():
+        if isinstance(info, dict):
+            spec = _field_spec_entry(info)
+            if spec:
+                out[cls] = spec
+    return out
+
+
 def _comfy_node_types(object_info: dict) -> dict:
     """`{class: {"out":[type],"in":{field:type}}}` for every class in /object_info —
     the slot-type map the bypass rewiring needs. Built once at discovery from the same
@@ -3300,10 +3740,10 @@ def input_path_ref(backend: dict, stored: str) -> str:
 
 
 def _parse_object_info(raw: bytes) -> tuple:
-    """(node_types, models, loras) from a raw /object_info body — the CPU part of a
-    ComfyUI discovery, run via asyncio.to_thread."""
+    """(node_types, models, loras, field_specs) from a raw /object_info body — the CPU
+    part of a ComfyUI discovery, run via asyncio.to_thread."""
     oi = json.loads(raw)
-    return _comfy_node_types(oi), _comfy_models(oi), _comfy_loras(oi)
+    return _comfy_node_types(oi), _comfy_models(oi), _comfy_loras(oi), _comfy_field_specs(oi)
 
 
 @dataclass
@@ -3349,6 +3789,9 @@ class GenIO:
     async def node_types(self, wf: dict, ids: list) -> dict:
         raise NotImplementedError
 
+    async def field_specs(self, classes: set) -> dict:
+        return {}
+
     async def cleanup(self, names: list) -> None:
         return None
 
@@ -3382,6 +3825,9 @@ class ComfyIO(GenIO):
     async def node_types(self, wf: dict, ids: list) -> dict:
         return await self.a._node_types_for(wf, ids)
 
+    async def field_specs(self, classes: set) -> dict:
+        return await self.a.field_specs_for(classes)
+
     async def cleanup(self, names: list) -> None:
         await self.a._cleanup_uploads(names)
 
@@ -3396,6 +3842,7 @@ class ComfyUIAdapter(BackendAdapter):
     def __init__(self, backend: dict, ctx: AdapterContext):
         super().__init__(backend, ctx)
         self._node_types: dict = {}      # {class: {"out":[type],"in":{field:type}}} — bypass slot types
+        self._field_specs: dict = {}     # {class: {field: {"choices":[...], "min":..., "audio_upload":...}}}
         # executor watchdog (discover-driven): pending head seen while nothing ran
         self._stuck_head: Optional[str] = None
         self._stuck_since: float = 0.0
@@ -3418,8 +3865,9 @@ class ComfyUIAdapter(BackendAdapter):
         digest = await asyncio.to_thread(lambda: hashlib.sha256(raw).digest())
         if self._oi_cache is None or self._oi_cache[0] != digest:
             self._oi_cache = (digest, await asyncio.to_thread(_parse_object_info, raw))
-        node_types, models, loras = self._oi_cache[1]
+        node_types, models, loras, field_specs = self._oi_cache[1]
         self._node_types = node_types                 # cache slot types for bypass (free — same fetch)
+        self._field_specs = field_specs               # cache combo choices + numeric bounds for schema
         # copies: what a caller does to the sets must not reach the next poll's result
         caps = Capabilities(models=set(models), loras=set(loras), pricing={})
         qr = await client.get(f"{url}/queue", timeout=_COMFY_DISCOVERY_TIMEOUT)
@@ -3466,6 +3914,7 @@ class ComfyUIAdapter(BackendAdapter):
         the old host says nothing about the new one)."""
         if isinstance(old, ComfyUIAdapter) and old.backend.get("url") == self.backend.get("url"):
             self._node_types = old._node_types
+            self._field_specs = old._field_specs
             self._oi_cache = old._oi_cache
             self._stuck_head, self._stuck_since = old._stuck_head, old._stuck_since
             self.exec_stuck = old.exec_stuck
@@ -3560,10 +4009,43 @@ class ComfyUIAdapter(BackendAdapter):
                         info = (r.json() or {}).get(cls)
                         if isinstance(info, dict):
                             self._node_types[cls] = _node_type_entry(info)
+                            spec = _field_spec_entry(info)
+                            if spec:
+                                self._field_specs[cls] = spec
                 except Exception as e:
                     logger.warning(f"[{self.name}] object_info for bypass class '{cls}' "
                                    f"unavailable ({type(e).__name__}) — single-link fallback")
         return self._node_types
+
+    async def field_specs_for(self, classes: set) -> dict:
+        """Widget specs (`choices`, numeric bounds, `audio_upload`) for `classes` from
+        the discovery cache, lazily fetching `/object_info/{cls}` only before the first
+        full discovery poll (once `_oi_cache` is populated, every installed class is
+        already in `_node_types` / `_field_specs`)."""
+        if self._oi_cache is not None:
+            return self._field_specs
+        need = {str(c) for c in (classes or ())
+                if c and str(c) not in self._field_specs and str(c) not in self._node_types}
+        if not need:
+            return self._field_specs
+        url = (self.backend.get("url") or "").rstrip("/")
+        if not url:
+            return self._field_specs
+        async with _pooled_client(self.ctx) as c:
+            for cls in need:
+                try:
+                    r = await c.get(f"{url}/object_info/{cls}", timeout=5.0)
+                    if r.status_code == 200:
+                        info = (r.json() or {}).get(cls)
+                        if isinstance(info, dict):
+                            self._node_types[cls] = _node_type_entry(info)
+                            spec = _field_spec_entry(info)
+                            if spec:
+                                self._field_specs[cls] = spec
+                except Exception as e:
+                    logger.debug(f"[{self.name}] object_info for schema class '{cls}' "
+                                 f"unavailable ({type(e).__name__})")
+        return self._field_specs
 
     def _load_workflow(self, path: Optional[str]) -> dict:
         if not path:
@@ -3641,10 +4123,12 @@ class ComfyUIAdapter(BackendAdapter):
         """Upload an arbitrary input file into this backend's ComfyUI input dir
         and return its stored name. Raises on failure rather than letting a
         workflow run against an absent or stale input."""
+        if content_type == "application/octet-stream" and name:
+            content_type = mimetypes.guess_type(name)[0] or content_type
         async with _pooled_client(self.ctx) as c:
             r = await self._post_upload(c, data, name, content_type)
         if r.status_code != 200:
-            raise RuntimeError(f"mesh upload to '{self.backend.get('name')}' failed "
+            raise RuntimeError(f"file upload '{name}' to '{self.backend.get('name')}' failed "
                                f"(HTTP {r.status_code}: {r.text[:200]})")
         j = r.json() or {}
         sub = (j.get("subfolder") or "").strip("/")
@@ -3712,32 +4196,64 @@ class ComfyUIAdapter(BackendAdapter):
             applied.append(p)
         return applied
 
+    def _is_input_dir_file_target(self, wf: dict, nid: str, fld: str,
+                                  field_specs: Optional[dict] = None) -> bool:
+        """True when `(nid, fld)` is a ComfyUI input-dir loader (e.g. `LoadAudio` or any
+        field declaring `audio_upload: true` in `/object_info`) that expects the bare
+        stored filename inside `ComfyUI/input/` rather than an absolute filesystem path."""
+        cls = ((wf or {}).get(str(nid)) or {}).get("class_type")
+        if is_audio_loader_class(cls):
+            return True
+        specs = field_specs if field_specs is not None else self._field_specs
+        return bool(((specs.get(cls) or {}).get(fld) or {}).get("audio_upload")) if cls else False
+
     async def _apply_file_params(self, wf: dict, mapping: dict, files: dict,
                                  protected: set, prefix: str, used: list,
                                  io: "GenIO") -> list:
-        """Client-supplied non-image files (`files:{param: …}`, e.g. the mesh a shrink
-        alias works on): upload each into THIS backend's input dir under a JOB-UNIQUE
-        name (`<prefix>_<param>.<ext>`; the client's filename only contributes the
-        extension) and inject the file's ABSOLUTE path into the mapped param. Runs per
-        dispatch, so parking and failover simply re-upload onto the backend that
-        actually runs the job — the client never deals with backend paths.
+        """Client-supplied non-image files (`files:{param: …}`, e.g. a mesh or reference
+        audio): upload each into THIS backend's input dir under a JOB-UNIQUE name
+        (`<prefix>_<param>.<ext>`; the client's filename only contributes the extension)
+        and inject it into the mapped param.
 
-        Absolute, because the consumers are plain path loaders (`PrimitiveString`/
-        `GeomPackLoadMeshPath`): a bare input name would not resolve, so a backend whose
-        input dir is unknown fails the job instead of running it against a phantom path."""
+        Input-dir loaders (`LoadAudio`, `audio_upload: true`) receive the bare stored
+        filename inside `ComfyUI/input/` (just like `LoadImage`) and do not require
+        `comfy_input_dir`. Path loaders (`PrimitiveString`, `GeomPackLoadMeshPath`,
+        `VHS_LoadAudio`) receive the ABSOLUTE path via `io.input_ref(stored)` and fail
+        if `comfy_input_dir` is unknown."""
         if not files:
             return []
-        why = io.files_unsupported()
-        if why:
-            raise RuntimeError(why)
-        applied = []
-        for p, (name, data) in files.items():
+        targets = {}
+        needs_abs = False
+        file_classes = set()
+        for p in files:
+            m = mapping.get(p) or {}
+            nid, fld = m.get("node"), m.get("field")
+            if nid and fld:
+                cls = ((wf or {}).get(str(nid)) or {}).get("class_type")
+                if cls:
+                    file_classes.add(str(cls))
+        fspecs = await io.field_specs(file_classes) if file_classes else {}
+        for p in files:
             m = mapping.get(p) or {}                    # keyed by param — the endpoint already
             nid, fld = m.get("node"), m.get("field")    # resolved label→param against the mapping
             if not (nid and fld):
                 raise RuntimeError(f"uploaded file for '{p}' has no mapping on this backend's "
                                    "workflow — cannot place it")
-            if (nid, fld) in protected:                 # admin pin stays authoritative (repo-wide rule)
+            if (nid, fld) in protected:
+                targets[p] = (nid, fld, True, False)
+                continue
+            bare = self._is_input_dir_file_target(wf, nid, fld, fspecs)
+            targets[p] = (nid, fld, False, bare)
+            if not bare:
+                needs_abs = True
+        if needs_abs:
+            why = io.files_unsupported()
+            if why:
+                raise RuntimeError(why)
+        applied = []
+        for p, (name, data) in files.items():
+            nid, fld, is_prot, bare = targets[p]
+            if is_prot:                                 # admin pin stays authoritative (repo-wide rule)
                 logger.warning(f"[{self.name}] uploaded file for '{p}' ignored — "
                                f"node {nid}.{fld} is pinned by the alias")
                 continue
@@ -3747,7 +4263,7 @@ class ComfyUIAdapter(BackendAdapter):
                 raise RuntimeError(why)
             stored = await io.put_file(slot, bytes(data))   # raises → job fails with the reply
             used.append(slot)
-            wf.setdefault(nid, {}).setdefault("inputs", {})[fld] = io.input_ref(stored)
+            wf.setdefault(nid, {}).setdefault("inputs", {})[fld] = stored if bare else io.input_ref(stored)
             applied.append(p)
         return applied
 
@@ -3854,15 +4370,75 @@ class ComfyUIAdapter(BackendAdapter):
             lbl = ((mapping.get(p) or {}).get("label") or "").strip()
             if lbl and lbl != p and lbl in uploads and p not in uploads:
                 uploads[p] = uploads.pop(lbl)
+        upload_files = dict(req.upload_files or {})
+        for p, m in mapping.items():
+            lbl = ((m or {}).get("label") or "").strip()
+            if lbl and lbl != p and lbl in upload_files and p not in upload_files:
+                upload_files[p] = upload_files.pop(lbl)
         for p in img_params:
             values.pop(p, None)
-        for p in (req.upload_files or {}):
+        for p in upload_files:
             values.pop(p, None)              # the uploaded file feeds this param, not a stale scalar
+        # TTS voice cloning: when a reference audio file is uploaded alongside a preset
+        # `voice` param (e.g. ZONOS3-Mini), the reference audio overrides the preset —
+        # drop any client `voice` value and neutralize the workflow's baked-in default.
+        has_audio_upload = any(_is_audio_file_param(wf, p, mapping.get(p)) for p in upload_files)
+        voice_targets: list[tuple[str, str, str]] = []
+        if has_audio_upload:
+            for p, m in mapping.items():
+                if p in upload_files:
+                    continue
+                m = m or {}
+                nid, fld = m.get("node"), m.get("field")
+                if (not (nid and fld) or (nid, fld) in protected
+                        or is_file_param(p, m) or is_image_field(wf, nid)):
+                    continue
+                ext_name = ((m.get("label") or "").strip() or p).lower()
+                if ext_name in _TTS_VOICE_PARAMS or p.lower() in _TTS_VOICE_PARAMS:
+                    voice_targets.append((p, str(nid), str(fld)))
+                    values.pop(p, None)
         # `loras:[{name,strength}]` first (pairs resolved per group), then the flat
         # legacy lora_N params → remaining free slots.
         lora_placed = _apply_lora_list(wf, mapping, req.loras or [], self.ctx.loras_of(self.bid))
         lora_placed += _apply_lora_cascade(wf, values)    # client loras → next free stack slots
         applied = _apply_mapping(wf, mapping, values, protected)
+        voice_overridden: list[str] = []
+        if voice_targets:
+            vnode_ids: list[str] = []
+            vclasses: set[str] = set()
+            for _, nid, _ in voice_targets:
+                vnode_ids.append(nid)
+                cls = ((wf.get(nid) or {}).get("class_type"))
+                if cls:
+                    vclasses.add(str(cls))
+                for cid, _ in _downstream_targets(wf, nid):
+                    vnode_ids.append(cid)
+                    ccls = ((wf.get(cid) or {}).get("class_type"))
+                    if ccls:
+                        vclasses.add(str(ccls))
+            vfspecs = await io.field_specs(vclasses) if vclasses else {}
+            vntypes = await io.node_types(wf, vnode_ids) if vnode_ids else {}
+            for p, nid, fld in voice_targets:
+                if nid not in wf:
+                    continue
+                inputs = wf[nid].setdefault("inputs", {})
+                fspec = _resolve_comfy_field_spec(wf, nid, fld, vfspecs)
+                choices = fspec.get("choices") or []
+                cls = ((wf.get(nid) or {}).get("class_type")) or ""
+                req_fields = (vntypes.get(cls) or {}).get("req")
+                if choices:
+                    sentinel = next((s for s in _VOICE_SENTINELS if s in choices), None)
+                    if sentinel is not None:
+                        inputs[fld] = sentinel
+                    elif req_fields is not None and fld not in req_fields:
+                        inputs.pop(fld, None)
+                    # Required combo without a neutral sentinel: leave the valid workflow
+                    # default so ComfyUI validation succeeds while reference_audio runs.
+                elif req_fields is not None and fld not in req_fields:
+                    inputs.pop(fld, None)
+                elif isinstance(inputs.get(fld), str):
+                    inputs[fld] = ""
+                voice_overridden.append(p)
         for p in rolled:
             m = mapping[p]
             if p in applied:                 # not shadowed by a pin on the same node/field
@@ -3891,7 +4467,7 @@ class ComfyUIAdapter(BackendAdapter):
                 f"{(mapping.get(culprit) or {}).get('node')} and everything downstream that "
                 f"requires it, including the alias's output node {req.output_node} — "
                 f"this slot is not optional in this workflow")
-        files_applied = await self._apply_file_params(wf, mapping, req.upload_files or {},
+        files_applied = await self._apply_file_params(wf, mapping, upload_files,
                                                       protected, prefix, uploaded, io)
         autofilled = await self._autofill_empty_images(wf, mapping, io)
         # Bypass LAST — after every injection, so it rewires the FINAL link graph
@@ -3913,6 +4489,7 @@ class ComfyUIAdapter(BackendAdapter):
                    "images": sorted(img_applied), "autofilled_images": autofilled,
                    **({"disabled_nodes": pruned} if pruned else {}),
                    **({"files": sorted(files_applied)} if files_applied else {}),
+                   **({"voice_overridden": sorted(voice_overridden)} if voice_overridden else {}),
                    **({"bypassed": bypassed} if bypassed else {})}
         return BuiltPrompt(wf, mapping, summary, uploaded, io)
 
@@ -7373,6 +7950,9 @@ class RunpodIO(GenIO):
     async def node_types(self, wf: dict, ids: list) -> dict:
         return self.a._node_types
 
+    async def field_specs(self, classes: set) -> dict:
+        return self.a._field_specs
+
 
 class RunpodAdapter(ComfyUIAdapter):
     """A ComfyUI workflow run on a RunPod Serverless endpoint. The build is ComfyUI's
@@ -7447,7 +8027,10 @@ class RunpodAdapter(ComfyUIAdapter):
     def _new_io(self, req: NormalizedRequest) -> GenIO:
         return RunpodIO(self)
 
-    _SNAP_FIELDS = ("object_info_full", "models_index", "_models", "_loras", "_node_types")
+    _SNAP_FIELDS = ("object_info_full", "models_index", "_models", "_loras", "_node_types", "_field_specs")
+
+    async def field_specs_for(self, classes: set) -> dict:
+        return self._field_specs
 
     def _settled_probe(self) -> dict:
         """probe_state without a probe in flight: a "running" state belongs to the instance
@@ -7492,9 +8075,10 @@ class RunpodAdapter(ComfyUIAdapter):
     def _apply_snapshot(self, rec: dict) -> None:
         """Parse a probe record (CPU work — call via asyncio.to_thread)."""
         raw = gzip.decompress(base64.b64decode(rec["object_info_gz"]))
-        node_types, models, loras = _parse_object_info(raw)
+        node_types, models, loras, field_specs = _parse_object_info(raw)
         self.object_info_full = json.loads(raw)
         self._node_types, self._models, self._loras = node_types, models, loras
+        self._field_specs = field_specs
         self.models_index = rec.get("models") or {}
         self.probe_state = {"state": "ok", "at": rec.get("at"),
                             "worker_version": rec.get("worker_version")}

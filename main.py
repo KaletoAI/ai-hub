@@ -45,7 +45,8 @@ import stats
 import store
 import modelsync
 import loratags
-from model_kinds import MEDIA_TYPES, generation_types, model_types
+from model_kinds import (MEDIA_TYPES, audio_task, audio_task_from_types,
+                         generation_types, model_types)
 import hostapi
 import hostctl
 import rpvolume
@@ -3095,6 +3096,17 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
 
     img_aliases = (await asyncio.to_thread(store.list_aliases)
                    if store.is_active() else image_models)
+    alias_wfs: dict = {}
+    if any(not adapters.cloud_kind(c) and c.get("workflow_json") is None and c.get("workflow")
+           for cands in img_aliases.values() for c in (cands or [])):
+        alias_wfs = await asyncio.to_thread(
+            lambda: {a: [adapters.cand_workflow(c) if not adapters.cloud_kind(c) else None
+                         for c in (cs or [])]
+                     for a, cs in img_aliases.items()})
+    else:
+        alias_wfs = {a: [(c.get("workflow_json") if not adapters.cloud_kind(c) else None)
+                         for c in (cs or [])]
+                     for a, cs in img_aliases.items()}
     chat_aliases = set(virtual_models)
     # The LLM protocol catalog can also contain embeddings, speech and multimodal
     # outputs. Classification narrows only this view, never dispatch's model set.
@@ -3103,6 +3115,7 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
     for backend in offered:
         bname = backend["name"]
         expose_bare = backend.get("local", False)
+        b_local = _backend_is_local(backend)
         for mid in sorted(_llm_models(backend)):
             kinds = (_callable_model_types(backend, mid) if model_prefix
                      else _backend_model_types(backend, mid))
@@ -3110,18 +3123,27 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
             if (_matches_model_type(kinds, typ) and disp not in seen
                     and disp not in chat_aliases and visible({disp, mid, bname})):
                 seen.add(disp)
-                data.append(_with_pricing(_with_context(
+                entry = _with_pricing(_with_context(
                     {"id": disp, "object": "model", "created": now, "owned_by": bname},
                     model_context(backend, (resolve_for_backend(mid, bname) or mid) if model_prefix else mid)),
-                    disp))
+                    disp)
+                atask = audio_task_from_types(kinds, mid)
+                if atask:
+                    _with_audio_meta(entry, atask, b_local)
+                data.append(entry)
             # A bare local ID still carries the smallest context across its hosts.
+            b_kinds = _backend_model_types(backend, mid)
             if (expose_bare and mid not in seen and mid not in chat_aliases
-                    and _matches_model_type(_backend_model_types(backend, mid), typ)
+                    and _matches_model_type(b_kinds, typ)
                     and visible({mid, bname})):
                 seen.add(mid)
-                data.append(_with_pricing(_with_context(
+                entry = _with_pricing(_with_context(
                     {"id": mid, "object": "model", "created": now, "owned_by": bname},
-                    _context_min((b2, mid) for b2 in offered if mid in _llm_models(b2))), mid))
+                    _context_min((b2, mid) for b2 in offered if mid in _llm_models(b2))), mid)
+                atask = audio_task_from_types(b_kinds, mid)
+                if atask:
+                    _with_audio_meta(entry, atask, b_local)
+                data.append(entry)
         cur = f"{bname}/{adapters.CURRENT_MODEL}"
         if (_matches_model_type(_callable_model_types(backend, adapters.CURRENT_MODEL), typ)
                 and _is_current(backend, adapters.CURRENT_MODEL)
@@ -3131,23 +3153,38 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
     # Virtual aliases keep their grants and context calculation; their type is the
     # union of actual backend targets, not the alias name or merely its first target.
     for alias in virtual_models:
-        if (_matches_model_type(_chat_alias_types(alias), typ)
+        vkinds = _chat_alias_types(alias)
+        if (_matches_model_type(vkinds, typ)
                 and alias not in seen and visible({alias})):
             seen.add(alias)
-            data.append(_with_pricing(_with_context(
+            entry = _with_pricing(_with_context(
                 {"id": alias, "object": "model", "created": now, "owned_by": "ai-hub (virtual)"},
-                _alias_context(alias, offered)), alias))
+                _alias_context(alias, offered)), alias)
+            atask = audio_task_from_types(vkinds, alias)
+            if atask:
+                v_targets = [b for b in offered
+                             if (t := alias_entry(alias, b["name"])[0])
+                             and (t in _llm_models(b) or _is_current(b, t))]
+                _with_audio_meta(entry, atask, any(_backend_is_local(b) for b in v_targets))
+            data.append(entry)
     media_ids: list = []
     for alias, cands in img_aliases.items():
-        kinds = set().union(*(generation_types(cand) for cand in cands)) if cands else {"image"}
+        wfs = alias_wfs.get(alias) or [None] * len(cands)
+        kinds = (set().union(*(generation_types(cand, alias=alias, workflow=wf)
+                               for cand, wf in zip(cands, wfs)))
+                 if cands else {"image"})
         if not _matches_model_type(kinds, typ):
             continue
         if alias not in seen and visible({alias, GRANT_ALL_IMAGE}):
             seen.add(alias)
             # Preserve the existing owner label for single-kind aliases.
-            kind = _generation_type(cands[0]) if cands else "image"
-            data.append({"id": alias, "object": "model", "created": now,
-                         "owned_by": f"ai-hub ({kind})"})
+            kind = _generation_type(cands[0], alias=alias, workflow=wfs[0]) if cands else "image"
+            atask = next((t for cand, wf in zip(cands, wfs)
+                          if (t := audio_task(cand, alias=alias, workflow=wf))), None)
+            is_local = any(_cand_is_local(c) for c in cands) if cands else True
+            data.append(_with_audio_meta(
+                {"id": alias, "object": "model", "created": now,
+                 "owned_by": f"ai-hub ({kind})"}, atask, is_local))
             media_ids.append(alias)
     for row in generation_models_info():
         kinds = generation_types(row["candidate"])
@@ -3159,8 +3196,11 @@ async def list_models(request: Request, authorization: Optional[str] = Header(No
         account = {row["backend"]} if row["backend"] in raw_allow else set()
         if disp not in seen and visible({disp, mid, GRANT_ALL_IMAGE} | account):
             seen.add(disp)
-            data.append({"id": disp, "object": "model", "created": now,
-                         "owned_by": row["backend"]})
+            atask = audio_task(row["candidate"], alias=disp)
+            is_local = _cand_is_local(row["candidate"])
+            data.append(_with_audio_meta(
+                {"id": disp, "object": "model", "created": now,
+                 "owned_by": row["backend"]}, atask, is_local))
             media_ids.append(disp)
     # Media from-prices: one worker thread for all of them (store reads), never per entry.
     store_aliases = img_aliases if store.is_active() else None
@@ -3189,28 +3229,50 @@ async def get_model(model_id: str, authorization: Optional[str] = Header(None),
     now = int(time.time())
     llm = [b for b in enabled_backends() if _is_llm(b)]
     if model_id in virtual_models:
-        return _with_pricing(_with_context(
+        entry = _with_pricing(_with_context(
             {"id": model_id, "object": "model", "created": now, "owned_by": "ai-hub (virtual)"},
             _alias_context(model_id, llm)), model_id)
+        atask = audio_task_from_types(_chat_alias_types(model_id), model_id)
+        if atask:
+            v_targets = [b for b in llm
+                         if (t := alias_entry(model_id, b["name"])[0])
+                         and (t in _llm_models(b) or _is_current(b, t))]
+            _with_audio_meta(entry, atask, any(_backend_is_local(b) for b in v_targets))
+        return entry
     bname, bare = split_backend_prefix(model_id)
     if bname is not None:
         b = next((b for b in llm if b["name"] == bname), None)
         if b is not None and bare in _llm_models(b):
-            return _with_pricing(_with_context(
+            entry = _with_pricing(_with_context(
                 {"id": model_id, "object": "model", "created": now, "owned_by": bname},
                 model_context(b, bare)), model_id)
+            atask = audio_task_from_types(_callable_model_types(b, bare), bare)
+            if atask:
+                _with_audio_meta(entry, atask, _backend_is_local(b))
+            return entry
         if b is not None and _is_current(b, bare):
             return _with_pricing({"id": model_id, "object": "model", "created": now, "owned_by": bname},
                                  model_id)
     else:
         hosts = [b for b in llm if model_id in _llm_models(b)]
         if hosts:      # a bare id routes across every host → the smallest window, as in the listing
-            return _with_pricing(_with_context(
+            entry = _with_pricing(_with_context(
                 {"id": model_id, "object": "model", "created": now, "owned_by": hosts[0]["name"]},
                 _context_min((b, model_id) for b in hosts)), model_id)
+            kinds = set().union(*(_backend_model_types(b, model_id) for b in hosts))
+            atask = audio_task_from_types(kinds, model_id)
+            if atask:
+                _with_audio_meta(entry, atask, any(_backend_is_local(b) for b in hosts))
+            return entry
     routes = await asyncio.to_thread(get_gen_routes, model_id)
     if routes:
-        entry = {"id": model_id, "object": "model", "created": now, "owned_by": routes[0][0]["name"]}
+        c0 = routes[0][1]
+        wf0 = (await asyncio.to_thread(adapters.cand_workflow, c0)
+               if not adapters.cloud_kind(c0) else None)
+        entry = _with_audio_meta(
+            {"id": model_id, "object": "model", "created": now, "owned_by": routes[0][0]["name"]},
+            audio_task(c0, alias=model_id, workflow=wf0),
+            any(_cand_is_local(c) for _, c in routes))
         pricing = await asyncio.to_thread(_media_request_pricing, model_id)
         if pricing:
             entry["pricing"] = pricing
@@ -3675,11 +3737,44 @@ def _gen_backend_for(name: str, cand: Optional[dict],
     return None
 
 
-def _generation_type(cand: dict) -> str:
+def _backend_is_local(b: dict) -> bool:
+    """Whether a backend is local (LAN GPU / self-hosted) vs cloud/paid/rented."""
+    t = (b or {}).get("type", "openai")
+    if t in adapters.CLOUD_TYPES or t in adapters.BILLING_TYPES or t == "anthropic":
+        return False
+    if b.get("paid") or b.get("host") or b.get("thunder"):
+        return False
+    if t == "comfyui":
+        return True
+    return bool(b.get("local"))
+
+
+def _cand_is_local(cand: dict) -> bool:
+    """Whether a generation candidate runs locally (ComfyUI on LAN) vs in the cloud."""
+    if adapters.cloud_kind(cand):
+        return False
+    b = _gen_backend_for(cand.get("backend"), cand)
+    if b is None:
+        want = adapters.cand_kind(cand or {})
+        b = next((x for x in backends
+                  if x.get("name") == cand.get("backend") and adapters.backend_kind(x) == want), None)
+    return _backend_is_local(b) if b is not None else True
+
+
+def _with_audio_meta(entry: dict, task: Optional[str] = None,
+                     local: Optional[bool] = None) -> dict:
+    if task:
+        entry["task"] = task
+    if local is not None:
+        entry["local"] = bool(local)
+    return entry
+
+
+def _generation_type(cand: dict, alias: str = "", workflow: Optional[dict] = None) -> str:
     kind = adapters.cand_kind(cand)
     if kind in adapters.DYNAMIC_CATALOG_TYPES:
         adapters.cloud_module(kind).endpoint_of(cand)  # preserve the dispatch-time endpoint validation
-    return next(iter(generation_types(cand)))
+    return next(iter(generation_types(cand, alias=alias, workflow=workflow)))
 
 
 def _catalog_direct_candidates(model: str, pool=None) -> list[dict]:
@@ -5400,6 +5495,8 @@ async def _decode_upload_files(alias: str, files: dict) -> dict:
                 raise HTTPException(400, f"unknown `files` key '{key}' — this alias takes "
                                          f"{', '.join(sorted(allowed))} (see GET "
                                          f"/v1/generations/<alias>/schema)")
+            if val in (None, ""):
+                continue
             out[key] = await _decode_one_file(key, key, val)
         return out
     if not mapping:
@@ -5407,6 +5504,8 @@ async def _decode_upload_files(alias: str, files: dict) -> dict:
     out = {}
     for key, val in files.items():
         param = _file_param(wf, mapping, key)
+        if val in (None, ""):
+            continue
         out[param] = await _decode_one_file(key, param, val)
     return out
 
@@ -5536,24 +5635,72 @@ async def gen_alias_lora(alias: str, name: str, request: Request,
     raise HTTPException(404, f"LoRA '{name}' is not valid for generation alias '{alias}'")
 
 
+async def _schema_field_specs(cands: list, wf: dict, mapping: dict) -> dict:
+    """Gather ComfyUI/RunPod `/object_info` field specs (`choices`, numeric bounds) for
+    the mapped + downstream nodes of `wf` from cached adapter discovery, falling back to
+    a targeted `/object_info/{cls}` lookup on a healthy ComfyUI candidate when absent."""
+    if not (wf and mapping):
+        return {}
+    classes = adapters.comfy_schema_classes(wf, mapping)
+    if not classes:
+        return {}
+    merged: dict = {}
+    live_ads: list = []
+    for c in cands or []:
+        if adapters.cloud_kind(c):
+            continue
+        b = _gen_backend_for(c.get("backend"), c)
+        if b is None:
+            want = adapters.cand_kind(c)
+            b = next((x for x in backends
+                      if x.get("name") == c.get("backend") and adapters.backend_kind(x) == want), None)
+        if b is None:
+            continue
+        ad = backend_adapters.get(backend_id(b))
+        if ad is None:
+            continue
+        cached = getattr(ad, "_field_specs", None)
+        if isinstance(cached, dict):
+            for cls, spec in cached.items():
+                if cls in classes and cls not in merged:
+                    merged[cls] = spec
+        if hasattr(ad, "field_specs_for") and b.get("type") == "comfyui":
+            live_ads.append((bool(backend_healthy.get(backend_id(b))), ad))
+    missing = classes - set(merged)
+    if missing and live_ads:
+        live_ads.sort(key=lambda pair: not pair[0])          # healthy backend first
+        for _, ad in live_ads:
+            fetched = await ad.field_specs_for(missing)
+            for cls in list(missing):
+                if cls in fetched:
+                    merged[cls] = fetched[cls]
+                    missing.discard(cls)
+            if not missing:
+                break
+    return merged
+
+
 @app.get("/v1/generations/{alias:path}/schema")
 async def gen_alias_schema(alias: str, request: Request, authorization: Optional[str] = Header(None)):
     """Self-description of a generation alias — enough for a client (or an agent)
     to build a valid request without out-of-band docs: params under their EXTERNAL
     names (label, else param; both are accepted on requests) with type + default
-    from the workflow, image slots with their empty behaviour, `files` (uploads that
-    are not images — a mesh a rig/shrink alias works on), fps/frames raster, and
-    where to list valid LoRAs."""
+    from the workflow (plus `/object_info` choices/bounds for ComfyUI), image slots
+    with their empty behaviour, `files` (uploads that are not images — a mesh or
+    reference audio), optional `tts` semantic block, fps/frames raster, and where to
+    list valid LoRAs."""
     await gate_request(authorization, request, alias, media=True)                # auth + allow-list
     cands = await asyncio.to_thread(_gen_alias_cands, alias)
     if not cands:
         raise HTTPException(404, f"generation alias '{alias}' not found")
     cand = await asyncio.to_thread(_schema_cand, alias, cands)
-    # ONE seam for both candidate kinds (ComfyUI: workflow + mapping labels; a cloud
-    # backend: the endpoint's fixed label table) — see adapters.public_fields.
-    params, images, files = adapters.public_fields(cand)
-    wf = adapters.cand_workflow(cand) or {}
+    wf = await asyncio.to_thread(adapters.cand_workflow, cand) or {}
     mapping = cand.get("mapping") or {}
+    field_specs = (await _schema_field_specs(cands, wf, mapping)
+                   if not adapters.cloud_kind(cand) else None)
+    # ONE seam for both candidate kinds (ComfyUI: workflow + mapping labels + /object_info;
+    # a cloud backend: the endpoint's fixed label table) — see adapters.public_fields.
+    params, images, files = adapters.public_fields(cand, field_specs=field_specs, alias=alias)
     kinds = sorted(k for _, k in lora_groups(wf, mapping) if k)
     out: dict = {"object": "generation.schema", "alias": alias,
                  "backends": [c.get("backend") for c in cands],
@@ -5574,6 +5721,10 @@ async def gen_alias_schema(alias: str, request: Request, authorization: Optional
                  # strictest prompt limit over the candidates; null = unknown. The hub
                  # refuses a longer prompt (400) and never shortens it.
                  "prompt_limit": await asyncio.to_thread(_prompt_limit, alias)}
+    tts_block = adapters.tts_schema(alias, cand, params, files,
+                                    is_local=any(_cand_is_local(c) for c in cands))
+    if tts_block is not None:
+        out["tts"] = tts_block
     if cand.get("fps"):
         out["fps"] = cand["fps"]
         if cand.get("frames_snap"):

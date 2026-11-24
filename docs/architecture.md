@@ -579,6 +579,22 @@ segment 404ed EVERY catalog model. They resolve through `_gen_alias_cands` (stor
 `image_models` → `_catalog_direct_candidates`, the `_gen_routes` order), and
 `_schema_cand` attaches the live catalog row a stored alias does not hold — without it
 a stored wiro/Venice alias described no fields (`test_wiro_lulabs_routing.py`).
+For ComfyUI/RunPod aliases, `ComfyUIAdapter.discover()` caches `/object_info` widget
+specs (`_field_specs`: combo `choices`, numeric `min`/`max`, `audio_upload`) off the
+loop alongside `_node_types`, and `gen_alias_schema` enriches `params[]` (following
+outgoing links from mapped primitive nodes while skipping `LoadAudio` file combos so
+`ComfyUI/input/` filenames never leak into `choices`), fills `files[].accept` on audio
+upload slots, and adds a standardized top-level `"tts"` semantic block (`adapters.tts_schema`)
+for TTS aliases (and cloud TTS models). `/v1/models` and `/v1/models/{id}` carry
+optional `"task"` (`tts|music|stt|sfx` via `model_kinds.audio_task`) and `"local"`
+(`true` for LAN ComfyUI/local backends, `false` for cloud/paid/managed hosts), so
+music generators like `ACE-Step-1.5-XL` stored under legacy `text2audio` classify as
+`music`/`audio` instead of `tts`. In `ComfyUIAdapter._apply_file_params`, input-dir
+audio loaders (`LoadAudio`, `VHS_LoadAudioUpload`, or `audio_upload: true`) receive
+the bare uploaded filename instead of an absolute `comfy_input_dir` path, and an
+uploaded reference audio file overrides any mapped preset `voice` (dropping client
+`params.voice` and neutralizing the workflow default safely against `/object_info`
+combo choices/optionality) (`test_tts_discovery_schema.py`).
 
 `store.migrate_nanogpt` moves legacy type/candidate blocks transactionally,
 preserving encrypted secrets verbatim, caps and discovery caches. Name collisions

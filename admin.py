@@ -1137,7 +1137,8 @@ def _select(name: str, options: list, selected=None) -> str:
 
 
 _TASK_OPTIONS = ("text2img", "img2img", "text2vid", "img2vid", "text2mesh", "img2mesh",
-                 "mesh2mesh", "mesh2rig", "text2audio", "audio2audio", "audio2text")
+                 "mesh2mesh", "mesh2rig", "tts", "music", "sfx",
+                 "text2audio", "audio2audio", "audio2text")
 # JS that shows the Video section (fps/frames) only for a video task, driven by the
 # task dropdown; matched loosely so img2vid / img2video / text2video all count.
 _TASK_VIDEO_JS = ("var v=document.getElementById('gw-video');"
@@ -6959,8 +6960,9 @@ async def _mapping_view(qp, detail: Optional[str] = None, err: str = "",
 
 
 # Registering a catalog-cloud alias: audio tasks → the catalog endpoint they name.
-_AUDIO_TASK_ENDPOINTS = {"text2audio": "music", "audio2audio": "voice-changer",
-                         "audio2text": "transcription"}
+_AUDIO_TASK_ENDPOINTS = {"tts": "speech", "music": "music", "text2audio": "music",
+                         "audio2audio": "voice-changer", "audio2text": "transcription",
+                         "stt": "transcription"}
 
 
 async def register_post(request: Request):
