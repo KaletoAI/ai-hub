@@ -275,6 +275,18 @@ class ModelsTaskAndLocal(_TtsFixture):
             self.assertEqual((d.get("task"), d.get("local")), (want_task, want_local), mid)
 
 
+    def test_lan_host_coordination_stays_local_and_gpt_audio_is_not_music(self):
+        # LAN GPU with host-coordination tag `host: "k12-3090"` is local; a managed cloud
+        # host (`thunder-1` in managed_hosts) is NOT local.
+        lan_b = {"name": "rtx-3090", "type": "comfyui", "url": "http://127.0.0.1:9", "host": "k12-3090"}
+        cld_b = {"name": "thunder-comfy", "type": "comfyui", "url": "http://127.0.0.1:10", "host": "thunder-1"}
+        with patch.object(main, "managed_hosts", {"thunder-1": {"provider": "thunder"}}):
+            self.assertTrue(main._backend_is_local(lan_b))
+            self.assertFalse(main._backend_is_local(cld_b))
+        self.assertIsNone(model_kinds.audio_task_from_types({"chat", "audio"}, "openai/gpt-audio"))
+        self.assertEqual(model_kinds.audio_task_from_types({"chat", "audio"}, "google/lyria-3-pro"), "music")
+
+
 class SchemaChoicesAndTtsBlock(_TtsFixture):
     def _schema(self, alias):
         r = self.c.get(f"/v1/generations/{alias}/schema")
@@ -400,6 +412,55 @@ class SchemaChoicesAndTtsBlock(_TtsFixture):
         self.assertIsNone(ltts["controls"]["style"])
         self.assertEqual(ltts["clone"]["file_slot"], "input_audio")
         self.assertFalse(ltts["clone"]["required"])
+
+    def test_dynamic_combo_v3_and_zonos_tooltip_voices_and_mixed_iso_langs(self):
+        # Prod-exact MingGenerate COMFY_DYNAMICCOMBO_V3 + ZONOS3MiniTTS STRING voice tooltip
+        oi = {
+            "MingGenerate": {"input": {"required": {
+                "text": ["STRING", {}],
+                "task": ["COMFY_DYNAMICCOMBO_V3", {"options": [
+                    {"key": "clone", "inputs": {"required": {
+                        "reference_text": ["STRING", {}],
+                        "language": ["COMBO", {"options": ["Chinese", "English", "German", "Spanish", "French", "Korean", "Japanese"]}],
+                    }}},
+                ]}],
+            }}},
+            "ZONOS3MiniTTS": {"input": {"required": {
+                "text": ["STRING", {}],
+                "language": [["de", "en_us", "en_gb", "fr_fr", "es", "it", "ja", "ko", "cmn"]],
+                "voice": ["STRING", {"default": "Wolfgang",
+                                     "tooltip": "Release voice (German: Wolfgang, Liesel; English: Savannah, Wyatt, Imogen, Rupert, ...). Ignored when reference_audio is set."}],
+            }}},
+        }
+        parsed = adapters._parse_object_info(json.dumps(oi).encode())
+        fspecs = parsed[3]
+        ming_wf = {"3": {"class_type": "MingGenerate", "inputs": {
+            "text": "Hallo", "task": "clone", "task.language": "German", "task.reference_text": "Hi"}}}
+        ming_cand = {"backend": "gpu-3090", "task": "tts", "workflow_json": ming_wf, "mapping": {
+            "text": {"node": "3", "field": "text"},
+            "language": {"node": "3", "field": "task.language"},
+            "reference_text": {"node": "3", "field": "task.reference_text"},
+        }}
+        mp, _, _ = adapters.public_fields(ming_cand, field_specs=fspecs, alias="ming-3.0-tts-0.5b")
+        self.assertEqual(next(p for p in mp if p["name"] == "language")["choices"],
+                         ["Chinese", "English", "German", "Spanish", "French", "Korean", "Japanese"])
+
+        zonos_wf = {"1": {"class_type": "ZONOS3MiniTTS", "inputs": {
+            "text": "Hallo", "language": "de", "voice": "Wolfgang"}}}
+        zonos_cand = {"backend": "gpu-3090", "task": "tts", "workflow_json": zonos_wf, "mapping": {
+            "text": {"node": "1", "field": "text"},
+            "language": {"node": "1", "field": "language"},
+            "voice": {"node": "1", "field": "voice"},
+        }}
+        zp, _, zf = adapters.public_fields(zonos_cand, field_specs=fspecs, alias="ZONOS3-Mini")
+        self.assertEqual(next(p for p in zp if p["name"] == "voice")["choices"],
+                         ["Wolfgang", "Liesel", "Savannah", "Wyatt", "Imogen", "Rupert"])
+        ztts = adapters.tts_schema("ZONOS3-Mini", zonos_cand, zp, zf, is_local=True, field_specs=fspecs)
+        self.assertEqual(ztts["language_format"], "iso639_1")
+        vmap = {v["id"]: v["languages"] for v in ztts["voices"]}
+        self.assertEqual(vmap["Wolfgang"], ["de"])
+        self.assertEqual(vmap["Liesel"], ["de"])
+        self.assertEqual(vmap["Savannah"], ["en"])
 
 
 class TtsBuildAndUpload(unittest.TestCase):

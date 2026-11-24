@@ -2774,20 +2774,75 @@ def comfy_schema_classes(wf: dict, mapping: dict) -> set[str]:
     return classes
 
 
+_LANG_NAME_TO_ISO = {
+    "german": "de", "english": "en", "french": "fr", "spanish": "es", "italian": "it",
+    "portuguese": "pt", "dutch": "nl", "polish": "pl", "russian": "ru", "chinese": "zh",
+    "mandarin": "zh", "japanese": "ja", "korean": "ko", "arabic": "ar", "hindi": "hi",
+    "turkish": "tr", "swedish": "sv", "norwegian": "no", "danish": "da", "finnish": "fi",
+    "czech": "cs", "greek": "el", "hebrew": "he", "ukrainian": "uk", "vietnamese": "vi",
+}
+
+
+def _parse_tooltip_voices(tooltip: str) -> tuple[list[str], dict[str, list[str]]]:
+    """Extract documented voice names (and optional language tags) from a STRING voice
+    widget tooltip like `"Release voice (German: Wolfgang, Liesel; English: Savannah, …)"`."""
+    if not isinstance(tooltip, str) or "(" not in tooltip:
+        return [], {}
+    m = re.search(r"\(([^()]+)\)", tooltip)
+    if not m:
+        return [], {}
+    inside = m.group(1)
+    if ":" not in inside:
+        return [], {}
+    names: list[str] = []
+    langs_by_name: dict[str, list[str]] = {}
+    for seg in inside.split(";"):
+        if ":" not in seg:
+            continue
+        lang_part, _, rest = seg.partition(":")
+        iso = _LANG_NAME_TO_ISO.get(lang_part.strip().lower())
+        if not iso:
+            continue
+        for raw in rest.split(","):
+            tok = raw.strip().strip(".…").strip()
+            if tok and re.fullmatch(r"[A-Za-z][A-Za-z0-9 _-]{0,40}", tok) and tok not in names:
+                names.append(tok)
+                langs_by_name[tok] = [iso]
+    return names, langs_by_name
+
+
+def _lookup_field_spec(class_specs: dict, fld: str, node_inputs: Optional[dict] = None) -> dict:
+    if not class_specs or not fld:
+        return {}
+    if "." in fld:
+        parent, _, sub = fld.partition(".")
+        branch = (node_inputs or {}).get(parent)
+        if isinstance(branch, str) and branch:
+            hit = class_specs.get(f"{parent}[{branch}].{sub}")
+            if hit:
+                return hit
+    return class_specs.get(fld) or {}
+
+
 def _resolve_comfy_field_spec(wf: dict, node: Optional[str], fld: Optional[str],
                               field_specs: Optional[dict]) -> dict:
-    """Widget spec (`choices`, `min`, `max`, `step`, `audio_upload`) for `(node, fld)`,
-    following outgoing workflow links when the mapped node is a primitive/passthrough."""
+    """Widget spec (`choices`, `min`, `max`, `step`, `audio_upload`, `tooltip_voices`)
+    for `(node, fld)`, resolving `COMFY_DYNAMICCOMBO_V3` dotted fields (`task.language`)
+    and following outgoing workflow links from primitive/passthrough nodes."""
     if not (field_specs and node and fld):
         return {}
-    cls = ((wf or {}).get(str(node)) or {}).get("class_type")
-    direct = ((field_specs.get(cls) or {}).get(fld) or {}) if cls else {}
-    if direct.get("choices") or "min" in direct or "max" in direct or direct.get("audio_upload"):
+    nd = (wf or {}).get(str(node)) or {}
+    cls = nd.get("class_type")
+    direct = _lookup_field_spec(field_specs.get(cls) or {}, fld, nd.get("inputs")) if cls else {}
+    if (direct.get("choices") or direct.get("tooltip_voices")
+            or "min" in direct or "max" in direct or direct.get("audio_upload")):
         return direct
     for cid, dfld in _downstream_targets(wf, str(node)):
-        ccls = ((wf or {}).get(cid) or {}).get("class_type")
-        spec = ((field_specs.get(ccls) or {}).get(dfld) or {}) if ccls else {}
-        if spec.get("choices") or "min" in spec or "max" in spec or spec.get("audio_upload"):
+        cnd = (wf or {}).get(cid) or {}
+        ccls = cnd.get("class_type")
+        spec = _lookup_field_spec(field_specs.get(ccls) or {}, dfld, cnd.get("inputs")) if ccls else {}
+        if (spec.get("choices") or spec.get("tooltip_voices")
+                or "min" in spec or "max" in spec or spec.get("audio_upload")):
             return spec
     return direct
 
@@ -2850,6 +2905,11 @@ def public_fields(cand: dict, field_specs: Optional[dict] = None,
             entry["choices"] = list(m["choices"])
         elif not is_file and not fspec.get("audio_upload") and fspec.get("choices"):
             entry["choices"] = list(fspec["choices"])
+        elif not is_file and name.lower() in _TTS_VOICE_PARAMS and fspec.get("tooltip_voices"):
+            tv = list(fspec["tooltip_voices"])
+            if isinstance(cur, str) and cur.strip() and cur.strip() not in tv:
+                tv.insert(0, cur.strip())
+            entry["choices"] = tv
         elif not is_file and name.lower() in ("language", "lang") and _is_ming_tts(alias, wf, cand):
             langs = list(_MING_DEFAULT_LANGUAGES)
             if isinstance(cur, str) and cur.strip() and cur.strip() not in langs:
@@ -2873,6 +2933,10 @@ def _infer_language_format(choices: list, default: Any, param_name: str) -> str:
     if all(re.fullmatch(r"[a-z]{2,3}[-_][A-Za-z]{2,4}", s) for s in samples):
         return "bcp47"
     if all(re.fullmatch(r"[a-z]{2}", s) for s in samples):
+        return "iso639_1"
+    # Mixed ISO-639-1 + regional codes (e.g. Zonos: de, es, it, en_us, fr_fr, cmn)
+    if (all(re.fullmatch(r"[a-z]{2,3}(?:[-_][A-Za-z]{2,4})?", s) for s in samples)
+            and sum(1 for s in samples if re.fullmatch(r"[a-z]{2}", s)) * 2 >= len(samples)):
         return "iso639_1"
     if all(s.lower() in _ENGLISH_LANG_NAMES for s in samples):
         if all(s == s.lower() for s in samples):
@@ -2941,7 +3005,7 @@ def _tts_output_format(cand: dict, params: list, wf: dict) -> str:
 
 
 def tts_schema(alias: str, cand: dict, params: list, files: list, *,
-               is_local: bool = False) -> Optional[dict]:
+               is_local: bool = False, field_specs: Optional[dict] = None) -> Optional[dict]:
     """Standardized top-level `tts` semantic block for `GET /v1/generations/{alias}/schema`.
     Returns None for non-TTS aliases (image, video, 3D, music, STT, SFX)."""
     k = cloud_kind(cand)
@@ -2984,10 +3048,19 @@ def tts_schema(alias: str, cand: dict, params: list, files: list, *,
     if not raw_voices and voice_p and isinstance(voice_p.get("default"), str) and voice_p["default"].strip():
         raw_voices = [voice_p["default"].strip()]
     iso_langs = [c for c in language_choices if isinstance(c, str) and re.fullmatch(r"[a-z]{2}", c)]
+    tooltip_langs: dict[str, list[str]] = {}
+    if not k and voice_param and field_specs:
+        vm = next((m for p, m in ((cand or {}).get("mapping") or {}).items()
+                   if (((m or {}).get("label") or "").strip() or p) == voice_param), None)
+        if vm:
+            vspec = _resolve_comfy_field_spec(wf, vm.get("node"), vm.get("field"), field_specs)
+            tooltip_langs = vspec.get("tooltip_voice_langs") or {}
     voices = []
     for rv in raw_voices:
         item = _normalize_tts_voice(rv, fallback_langs=iso_langs)
         if item is not None:
+            if not item["languages"] and item["id"] in tooltip_langs:
+                item["languages"] = list(tooltip_langs[item["id"]])
             voices.append(item)
 
     ref_text_p = pick_param(_TTS_REF_TEXT_PARAMS, exclude=used_text)
@@ -3662,9 +3735,9 @@ def _node_type_entry(info: dict) -> dict:
 
 
 def _field_spec_entry(info: dict) -> dict:
-    """Extract combo choices, numeric bounds and audio_upload flags for each input
-    field of ONE `/object_info` class entry (both legacy `[options]` and ComfyUI V3
-    `["COMBO", {"options": [...]}]` forms)."""
+    """Extract combo choices (legacy, V3 `COMBO` and V3 `COMFY_DYNAMICCOMBO_V3` dotted
+    sub-fields), numeric bounds, tooltip voice hints and `audio_upload` flags for ONE
+    `/object_info` class entry."""
     fields: dict = {}
     inp = info.get("input") or {}
     for section in ("required", "optional"):
@@ -3678,11 +3751,33 @@ def _field_spec_entry(info: dict) -> dict:
                 entry["choices"] = list(head)
             elif head == "COMBO" and isinstance(meta.get("options"), list):
                 entry["choices"] = list(meta["options"])
+            elif head == "COMFY_DYNAMICCOMBO_V3" and isinstance(meta.get("options"), list):
+                opt_keys = []
+                for opt in meta["options"]:
+                    if not isinstance(opt, dict):
+                        continue
+                    okey = opt.get("key")
+                    if okey not in (None, ""):
+                        opt_keys.append(okey)
+                    sub_inp = opt.get("inputs")
+                    if isinstance(sub_inp, dict):
+                        sub_fields = _field_spec_entry({"input": sub_inp})
+                        for sfn, sspec in sub_fields.items():
+                            if okey not in (None, ""):
+                                fields[f"{fn}[{okey}].{sfn}"] = sspec
+                            fields.setdefault(f"{fn}.{sfn}", sspec)
+                if opt_keys:
+                    entry["choices"] = opt_keys
             elif head in ("INT", "FLOAT") and meta:
                 for k in ("min", "max", "step", "default"):
                     v = meta.get(k)
                     if isinstance(v, (int, float)) and not isinstance(v, bool):
                         entry[k] = v
+            elif head == "STRING" and fn.lower() in _TTS_VOICE_PARAMS and meta.get("tooltip"):
+                vnames, vlangs = _parse_tooltip_voices(meta["tooltip"])
+                if vnames:
+                    entry["tooltip_voices"] = vnames
+                    entry["tooltip_voice_langs"] = vlangs
             if meta.get("audio_upload"):
                 entry["audio_upload"] = True
             if entry:

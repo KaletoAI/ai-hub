@@ -263,7 +263,13 @@ def audio_task_from_types(kinds: set[str], model_id: str = "") -> str | None:
     if "asr" in kinds:
         return "stt"
     if "audio" in kinds:
-        return "sfx" if _SFX_NAME_RE.search(model_id or "") else "music"
+        if _SFX_NAME_RE.search(model_id or ""):
+            return "sfx"
+        if _MUSIC_NAME_RE.search(model_id or ""):
+            return "music"
+        # Multimodal chat models (e.g. gpt-audio) carry {"chat", "audio"} — not music.
+        if "chat" not in kinds:
+            return "music"
     return None
 
 

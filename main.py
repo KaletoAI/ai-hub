@@ -3742,7 +3742,8 @@ def _backend_is_local(b: dict) -> bool:
     t = (b or {}).get("type", "openai")
     if t in adapters.CLOUD_TYPES or t in adapters.BILLING_TYPES or t == "anthropic":
         return False
-    if b.get("paid") or b.get("host") or b.get("thunder"):
+    hn = (b.get("host") or "").strip()
+    if b.get("paid") or b.get("thunder") or (hn and (hn in managed_hosts or hn in host_controllers)):
         return False
     if t == "comfyui":
         return True
@@ -5722,7 +5723,8 @@ async def gen_alias_schema(alias: str, request: Request, authorization: Optional
                  # refuses a longer prompt (400) and never shortens it.
                  "prompt_limit": await asyncio.to_thread(_prompt_limit, alias)}
     tts_block = adapters.tts_schema(alias, cand, params, files,
-                                    is_local=any(_cand_is_local(c) for c in cands))
+                                    is_local=any(_cand_is_local(c) for c in cands),
+                                    field_specs=field_specs)
     if tts_block is not None:
         out["tts"] = tts_block
     if cand.get("fps"):
