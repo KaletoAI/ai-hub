@@ -15,7 +15,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # `llm-gateway-protocol` is Anthropic's Claude Code doc page (code.claude.com/docs/en/…),
 # a live link in the README — not our old name; renaming it would break the link.
 OLD = re.compile(r"llm[-_ ]gateway(?!-protocol)", re.I)
-# Historical records keep their name; the migration note in the README/CLAUDE.md and
+# Historical records keep their name; the migration note in the README/AGENTS.md and
 # the README's upgrade paragraph may name it, because an operator coming from the old
 # install has to be told which unit to stop and which directory to move.
 EXCLUDE_DIRS = ("docs/superpowers/", "docs/archive/")
@@ -27,13 +27,13 @@ ALLOWED_MENTIONS = {
     # "Upgrading an install from before 2026-09-08" paragraph under
     # "Running & deploying" (stop / mv / disable / rm the old unit).
     "README.md": 5,
-    "CLAUDE.md": 1,           # the migration note
+    "AGENTS.md": 1,           # the migration note (CLAUDE.md only imports it)
     "tests/test_project_name.py": 99,
 }
 # A budget alone is too weak: it lets a stale path ANYWHERE in those two files pass
 # as long as the total still fits. So every surviving mention must also SIT in the
 # migration note or the upgrade paragraph — nothing else may carry the old name.
-MIGRATION_FILES = ("README.md", "CLAUDE.md")
+MIGRATION_FILES = ("README.md", "AGENTS.md")
 MIGRATION_LINE = re.compile(
     r"formerly|Renamed from|Upgrading an install|llm-gateway\.service|/opt/llm-gateway")
 
